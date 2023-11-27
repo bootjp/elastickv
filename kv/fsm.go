@@ -49,7 +49,6 @@ func (f *kv) Restore(r io.ReadCloser) error {
 }
 
 type snapshot struct {
-	words []string
 }
 
 func (s *snapshot) Persist(sink raft.SnapshotSink) error {
