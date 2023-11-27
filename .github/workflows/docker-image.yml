@@ -11,14 +11,14 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-#      - name: Set up QEMU
-#        uses: docker/setup-qemu-action@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -34,8 +34,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/${{ github.REPOSITORY }}-analytics:latest
+          tags: ghcr.io/${{ github.REPOSITORY }}:latest
 #          cache-from: type=gha
 #          cache-to: type=gha,mode=max

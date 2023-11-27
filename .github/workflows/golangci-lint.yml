@@ -11,7 +11,7 @@ concurrency:
 jobs:
   golangci-lint:
     name: golangci-lint
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v4
