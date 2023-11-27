@@ -1,0 +1,23 @@
+on: [ push ]
+
+# どこのテストで失敗するようになったのかを特定するために、
+# pull request とは別に、push に対してもテストを実行する。
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-go-test-push
+  cancel-in-progress: true
+
+name: Test
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [ 1.21.x ]
+        os: [ [self-hosted, linux] ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+      - uses: actions/checkout@v4
+      - run: go test ./...

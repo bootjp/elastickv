@@ -1,0 +1,27 @@
+name: Reviewdog
+
+on:
+  pull_request:
+    types: [ opened, synchronize ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-reviewdog
+  cancel-in-progress: true
+
+jobs:
+  golangci-lint:
+    name: golangci-lint
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+      - name: golangci-lint
+        uses: reviewdog/action-golangci-lint@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          level: warning
+          golangci_lint_flags: "--config=.golangci.yaml"
+          filter_mode: nofilter
+          reporter: github-pr-review
+          cache: false
+          fail_on_error: true

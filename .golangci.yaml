@@ -1,0 +1,32 @@
+run:
+  concurrency: 4
+  timeout: 10m
+
+linters:
+  enable:
+    - cyclop
+    - dupl
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - exportloopref
+    - forcetypeassert
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - gofmt
+    - gomnd
+    - gosec
+    - ifshort
+    - makezero
+    - nakedret
+    - nestif
+    - nilerr
+    - noctx
+    - prealloc
+    - unconvert
+    - unparam
+    - wastedassign
+    - wrapcheck
+    - gci
