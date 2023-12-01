@@ -55,8 +55,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	defer r.store.mtx.RUnlock()
 
 	h := murmur3.New64()
-	_, err := h.Write(req.Key)
-	if err != nil {
+	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 

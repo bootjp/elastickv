@@ -15,11 +15,15 @@ import (
 	_ "google.golang.org/grpc/health"
 )
 
+const retryCount = 3
+
+var backoffDuration = 100 * time.Millisecond
+
 func main() {
 	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
 	retryOpts := []retry.CallOption{
-		retry.WithBackoff(retry.BackoffExponential(100 * time.Millisecond)),
-		retry.WithMax(3),
+		retry.WithBackoff(retry.BackoffExponential(backoffDuration)),
+		retry.WithMax(retryCount),
 	}
 	conn, err := grpc.Dial("multi:///localhost:50051,localhost:50052,localhost:50053",
 		grpc.WithDefaultServiceConfig(serviceConfig),

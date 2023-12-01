@@ -63,6 +63,8 @@ func main() {
 	}
 }
 
+const snapshotRetainCount = 3
+
 func NewRaft(_ context.Context, myID, myAddress string, fsm raft.FSM) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
@@ -79,7 +81,7 @@ func NewRaft(_ context.Context, myID, myAddress string, fsm raft.FSM) (*raft.Raf
 		return nil, nil, errors.WithStack(err)
 	}
 
-	fss, err := raft.NewFileSnapshotStore(baseDir, 3, os.Stderr)
+	fss, err := raft.NewFileSnapshotStore(baseDir, snapshotRetainCount, os.Stderr)
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}

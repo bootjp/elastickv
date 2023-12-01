@@ -49,8 +49,7 @@ func (f *store) Apply(l *raft.Log) interface{} {
 	}
 
 	h := murmur3.New64()
-	_, err := h.Write(req.Key)
-	if err != nil {
+	if _, err := h.Write(req.Key); err != nil {
 		return errors.WithStack(err)
 	}
 	key := h.Sum64()
