@@ -51,8 +51,7 @@ func run() error {
 			Value: []byte(time.Now().String()),
 		})
 		if err != nil {
-			_ = conn.Close()
-			log.Fatalf("Put RPC failed: %v", err)
+			return errors.WithStack(err)
 		}
 		fmt.Print("Put key-" + strconv.Itoa(i) + " ")
 		fmt.Println(resp)
