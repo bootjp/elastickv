@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
+
 	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
 	retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
@@ -20,6 +22,12 @@ const retryCount = 3
 var backoffDuration = 100 * time.Millisecond
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
 	retryOpts := []retry.CallOption{
 		retry.WithBackoff(retry.BackoffExponential(backoffDuration)),
@@ -31,8 +39,9 @@ func main() {
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 		grpc.WithUnaryInterceptor(retry.UnaryClientInterceptor(retryOpts...)),
 	)
+
 	if err != nil {
-		log.Fatalf("dialing failed: %v", err)
+		return errors.WithStack(err)
 	}
 	defer conn.Close()
 	c := pb.NewRawKVClient(conn)
@@ -55,11 +64,9 @@ func main() {
 			Key: []byte("key-" + strconv.Itoa(i)),
 		})
 		if err != nil {
-			_ = conn.Close()
-			log.Fatalf("Get RPC failed: %v", err)
+			return errors.WithStack(err)
 		}
 		fmt.Print("Get key-" + strconv.Itoa(i) + " ")
 		fmt.Printf("%s\n", resp.Value)
 	}
-
 }
