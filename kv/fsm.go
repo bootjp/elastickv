@@ -1,27 +1,37 @@
 package kv
 
 import (
+	"context"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
+	"os"
 	"sync"
 
-	"google.golang.org/protobuf/proto"
-
-	"github.com/hashicorp/raft"
-
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/hashicorp/raft"
+	"github.com/spaolacci/murmur3"
+	"google.golang.org/protobuf/proto"
 )
 
 type store struct {
 	mtx sync.RWMutex
-	m   map[*[]byte][]byte
+	m   map[uint64][]byte
+	log *slog.Logger
 }
+
+type Store interface {
+	raft.FSM
+}
+
+// ignore lint
+var _ = Store(&store{})
 
 func NewStore() *store {
 	return &store{
 		mtx: sync.RWMutex{},
-		m:   make(map[*[]byte][]byte),
+		m:   make(map[uint64][]byte),
+		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
 	}
 }
 
@@ -36,9 +46,20 @@ func (f *store) Apply(l *raft.Log) interface{} {
 		return err
 	}
 
-	f.m[&req.Key] = req.Value
-	log.Println("Put", req.Key, req.Value)
-	log.Println("map", f.m)
+	h := murmur3.New64()
+	_, err := h.Write(req.Key)
+	if err != nil {
+		return err
+	}
+	key := h.Sum64()
+
+	f.m[key] = req.Value
+
+	f.log.InfoContext(context.Background(), "applied raft log",
+		slog.String("key", string(req.Key)),
+		slog.String("value", string(req.Value)),
+		slog.Uint64("hash", key),
+	)
 
 	return nil
 }
@@ -49,14 +70,14 @@ func (f *store) Snapshot() (raft.FSMSnapshot, error) {
 	return &snapshot{}, ErrNotImplemented
 }
 
-func (f *store) Restore(r io.ReadCloser) error {
+func (f *store) Restore(_ io.ReadCloser) error {
 	return ErrNotImplemented
 }
 
 type snapshot struct {
 }
 
-func (s *snapshot) Persist(sink raft.SnapshotSink) error {
+func (s *snapshot) Persist(_ raft.SnapshotSink) error {
 	return ErrNotImplemented
 }
 

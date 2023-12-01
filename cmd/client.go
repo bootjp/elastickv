@@ -9,23 +9,24 @@ import (
 
 	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
+	retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
 )
 
 func main() {
-	//serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
-	//retryOpts := []grpc_retry.CallOption{
-	//	grpc_retry.WithBackoff(grpc_retry.BackoffExponential(100 * time.Millisecond)),
-	//	grpc_retry.WithMax(1),
-	//}
+	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
+	retryOpts := []retry.CallOption{
+		retry.WithBackoff(retry.BackoffExponential(100 * time.Millisecond)),
+		retry.WithMax(3),
+	}
 	conn, err := grpc.Dial("multi:///localhost:50051,localhost:50052,localhost:50053",
-		//grpc.WithDefaultServiceConfig(serviceConfig),
+		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		//grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		grpc.WithUnaryInterceptor(retry.UnaryClientInterceptor(retryOpts...)),
 	)
-	//grpc.WithUnaryInterceptor(grpc_retry.UnaryClientInterceptor(retryOpts...)))
 	if err != nil {
 		log.Fatalf("dialing failed: %v", err)
 	}
@@ -52,7 +53,7 @@ func main() {
 			log.Fatalf("Get RPC failed: %v", err)
 		}
 		fmt.Print("Get key-" + strconv.Itoa(i) + " ")
-		fmt.Println(resp.Value)
+		fmt.Printf("%s\n", resp.Value)
 	}
 
 }
