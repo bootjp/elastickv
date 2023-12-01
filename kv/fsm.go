@@ -2,15 +2,13 @@ package kv
 
 import (
 	"context"
-
-	"github.com/cockroachdb/errors"
-
 	"io"
 	"log/slog"
 	"os"
 	"sync"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"github.com/spaolacci/murmur3"
 	"google.golang.org/protobuf/proto"

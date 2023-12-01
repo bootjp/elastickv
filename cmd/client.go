@@ -43,6 +43,7 @@ func main() {
 			Value: []byte(time.Now().String()),
 		})
 		if err != nil {
+			_ = conn.Close()
 			log.Fatalf("Put RPC failed: %v", err)
 		}
 		fmt.Print("Put key-" + strconv.Itoa(i) + " ")
@@ -54,6 +55,7 @@ func main() {
 			Key: []byte("key-" + strconv.Itoa(i)),
 		})
 		if err != nil {
+			_ = conn.Close()
 			log.Fatalf("Get RPC failed: %v", err)
 		}
 		fmt.Print("Get key-" + strconv.Itoa(i) + " ")
