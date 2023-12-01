@@ -7,10 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cockroachdb/errors"
-
 	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -69,4 +68,6 @@ func run() error {
 		fmt.Print("Get key-" + strconv.Itoa(i) + " ")
 		fmt.Printf("%s\n", resp.Value)
 	}
+
+	return nil
 }
