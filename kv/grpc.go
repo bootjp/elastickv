@@ -2,12 +2,12 @@ package kv
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"os"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"github.com/spaolacci/murmur3"
 	"google.golang.org/protobuf/proto"
@@ -36,11 +36,12 @@ func NewGRPCServer(store *store, raft *raft.Raft) *GRPCServer {
 func (r GRPCServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	b, err := proto.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	f := r.raft.Apply(b, time.Second)
 	if err := f.Error(); err != nil {
+		r.log.ErrorContext(context.Background(), "failed to apply raft log", slog.String("error", err.Error()))
 		return nil, ErrRetryable
 	}
 
@@ -56,7 +57,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	h := murmur3.New64()
 	_, err := h.Write(req.Key)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	key := h.Sum64()

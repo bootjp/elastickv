@@ -10,14 +10,15 @@ import (
 	"path/filepath"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
-
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -62,7 +63,7 @@ func main() {
 	}
 }
 
-func NewRaft(ctx context.Context, myID, myAddress string, fsm raft.FSM) (*raft.Raft, *transport.Manager, error) {
+func NewRaft(_ context.Context, myID, myAddress string, fsm raft.FSM) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
 
@@ -70,24 +71,26 @@ func NewRaft(ctx context.Context, myID, myAddress string, fsm raft.FSM) (*raft.R
 
 	ldb, err := boltdb.NewBoltStore(filepath.Join(baseDir, "logs.dat"))
 	if err != nil {
-		return nil, nil, fmt.Errorf(`boltdb.NewBoltStore(%q): %v`, filepath.Join(baseDir, "logs.dat"), err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	sdb, err := boltdb.NewBoltStore(filepath.Join(baseDir, "stable.dat"))
 	if err != nil {
-		return nil, nil, fmt.Errorf(`boltdb.NewBoltStore(%q): %v`, filepath.Join(baseDir, "stable.dat"), err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	fss, err := raft.NewFileSnapshotStore(baseDir, 3, os.Stderr)
 	if err != nil {
-		return nil, nil, fmt.Errorf(`raft.NewFileSnapshotStore(%q, ...): %v`, baseDir, err)
+		return nil, nil, errors.WithStack(err)
 	}
 
-	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{grpc.WithInsecure()})
+	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	})
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return nil, nil, fmt.Errorf("raft.NewRaft: %v", err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	if *raftBootstrap {
@@ -102,7 +105,7 @@ func NewRaft(ctx context.Context, myID, myAddress string, fsm raft.FSM) (*raft.R
 		}
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
-			return nil, nil, fmt.Errorf("raft.Raft.BootstrapCluster: %v", err)
+			return nil, nil, errors.WithStack(err)
 		}
 	}
 

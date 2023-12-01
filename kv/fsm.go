@@ -2,7 +2,9 @@ package kv
 
 import (
 	"context"
-	"errors"
+
+	"github.com/cockroachdb/errors"
+
 	"io"
 	"log/slog"
 	"os"
@@ -43,13 +45,13 @@ func (f *store) Apply(l *raft.Log) interface{} {
 
 	var req pb.PutRequest
 	if err := proto.Unmarshal(l.Data, &req); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	h := murmur3.New64()
 	_, err := h.Write(req.Key)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	key := h.Sum64()
 
