@@ -10,66 +10,62 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	"github.com/spaolacci/murmur3"
 	"google.golang.org/protobuf/proto"
 )
 
-type store struct {
-	mtx sync.RWMutex
-	m   map[uint64][]byte
-	log *slog.Logger
+type kvFSM struct {
+	mtx   sync.RWMutex
+	store Store
+	log   *slog.Logger
 }
 
-type Store interface {
+type FSM interface {
 	raft.FSM
 }
 
-// ignore lint
-var _ = Store(&store{})
-
-func NewStore() *store {
-	return &store{
-		mtx: sync.RWMutex{},
-		m:   make(map[uint64][]byte),
-		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+func NewKvFSM(store Store) FSM {
+	return &kvFSM{
+		mtx:   sync.RWMutex{},
+		store: store,
+		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
 	}
 }
 
-var _ raft.FSM = &store{}
+var _ FSM = &kvFSM{}
+var _ raft.FSM = &kvFSM{}
 
-func (f *store) Apply(l *raft.Log) interface{} {
+var ErrUnknownRequestType = errors.New("unknown request type")
+
+func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
+	ctx := context.TODO()
 
-	var req pb.PutRequest
+	// var req proto.Message
+	req := pb.PutRequest{}
 	if err := proto.Unmarshal(l.Data, &req); err != nil {
 		return errors.WithStack(err)
 	}
 
-	h := murmur3.New64()
-	if _, err := h.Write(req.Key); err != nil {
-		return errors.WithStack(err)
-	}
-	key := h.Sum64()
+	//switch {
+	//case r pb.PutRequest:
+	f.log.InfoContext(ctx, "applied raft log", slog.String("type", "PutRequest"))
+	return f.store.Put(ctx, req.Key, req.Value)
 
-	f.m[key] = req.Value
-
-	f.log.InfoContext(context.Background(), "applied raft log",
-		slog.String("key", string(req.Key)),
-		slog.String("value", string(req.Value)),
-		slog.Uint64("hash", key),
-	)
-
-	return nil
+	//default:
+	//	f.log.ErrorContext(ctx, "unknown request type",
+	//		slog.String("type", req.String()),
+	//	)
+	//	return ErrUnknownRequestType
 }
 
 var ErrNotImplemented = errors.New("not implemented")
 
-func (f *store) Snapshot() (raft.FSMSnapshot, error) {
+func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &snapshot{}, ErrNotImplemented
 }
 
-func (f *store) Restore(_ io.ReadCloser) error {
+func (f *kvFSM) Restore(_ io.ReadCloser) error {
 	return ErrNotImplemented
 }
 

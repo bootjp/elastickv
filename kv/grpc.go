@@ -17,16 +17,17 @@ var _ pb.RawKVServer = &GRPCServer{}
 
 type GRPCServer struct {
 	pb.UnimplementedRawKVServer
-
-	store *store
+	fsm   FSM
+	store Store
 	raft  *raft.Raft
 	log   *slog.Logger
 }
 
 var ErrRetryable = errors.New("retryable error")
 
-func NewGRPCServer(store *store, raft *raft.Raft) *GRPCServer {
+func NewGRPCServer(fsm FSM, store Store, raft *raft.Raft) *GRPCServer {
 	return &GRPCServer{
+		fsm:   fsm,
 		store: store,
 		raft:  raft,
 		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
@@ -51,19 +52,22 @@ func (r GRPCServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse,
 }
 
 func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	r.store.mtx.RLock()
-	defer r.store.mtx.RUnlock()
-
 	h := murmur3.New64()
 	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	key := h.Sum64()
-	r.log.InfoContext(ctx, "Get", slog.String("key", string(req.Key)), slog.Uint64("hash", key), slog.String("value", string(r.store.m[key])))
+	v, err := r.store.Get(ctx, req.Key)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	r.log.InfoContext(ctx, "Get",
+		slog.String("key", string(req.Key)),
+		slog.String("value", string(v)))
 
 	return &pb.GetResponse{
 		ReadAtIndex: r.raft.AppliedIndex(),
-		Value:       r.store.m[key],
+		Value:       v,
 	}, nil
 }
