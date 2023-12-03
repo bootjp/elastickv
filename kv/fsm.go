@@ -41,22 +41,13 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	defer f.mtx.Unlock()
 	ctx := context.TODO()
 
-	// var req proto.Message
 	req := pb.PutRequest{}
 	if err := proto.Unmarshal(l.Data, &req); err != nil {
 		return errors.WithStack(err)
 	}
 
-	// switch {
-	//case r pb.PutRequest:
 	f.log.InfoContext(ctx, "applied raft log", slog.String("type", "PutRequest"))
 	return errors.WithStack(f.store.Put(ctx, req.Key, req.Value))
-
-	//default:
-	//	f.log.ErrorContext(ctx, "unknown request type",
-	//		slog.String("type", req.String()),
-	//	)
-	//	return ErrUnknownRequestType
 }
 
 var ErrNotImplemented = errors.New("not implemented")
