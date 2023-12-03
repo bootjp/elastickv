@@ -47,10 +47,10 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		return errors.WithStack(err)
 	}
 
-	//switch {
+	// switch {
 	//case r pb.PutRequest:
 	f.log.InfoContext(ctx, "applied raft log", slog.String("type", "PutRequest"))
-	return f.store.Put(ctx, req.Key, req.Value)
+	return errors.WithStack(f.store.Put(ctx, req.Key, req.Value))
 
 	//default:
 	//	f.log.ErrorContext(ctx, "unknown request type",
