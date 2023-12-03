@@ -47,13 +47,13 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	store := kv.NewStore()
-
-	r, tm, err := NewRaft(ctx, *raftId, *myAddr, store)
+	kvFSM := kv.NewKvFSM(store)
+	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {
 		log.Fatalf("failed to start raft: %v", err)
 	}
 	s := grpc.NewServer()
-	pb.RegisterRawKVServer(s, kv.NewGRPCServer(store, r))
+	pb.RegisterRawKVServer(s, kv.NewGRPCServer(kvFSM, store, r))
 	tm.Register(s)
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
 	raftadmin.Register(s, r)
