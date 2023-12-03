@@ -1,6 +1,6 @@
 module github.com/bootjp/elastickv
 
-go 1.21.0
+go 1.21.4
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
@@ -8,9 +8,13 @@ require (
 	github.com/Jille/raft-grpc-leader-rpc v1.1.0
 	github.com/Jille/raft-grpc-transport v1.5.0
 	github.com/Jille/raftadmin v1.2.1
+	github.com/cockroachdb/errors v1.11.1
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
+	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.0.1
 	github.com/hashicorp/raft v1.6.0
-	github.com/hashicorp/raft-boltdb v0.0.0-20231115180007-027066e4d245
+	github.com/hashicorp/raft-boltdb v0.0.0-20230125174641-2a8082862702
+	github.com/hashicorp/raft-boltdb/v2 v2.3.0
+	github.com/spaolacci/murmur3 v1.1.0
 	google.golang.org/grpc v1.59.0
 	google.golang.org/protobuf v1.31.0
 	moul.io/number-to-words v0.7.0
@@ -19,7 +23,6 @@ require (
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
-	github.com/cockroachdb/errors v1.11.1 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/fatih/color v1.15.0 // indirect
@@ -39,7 +42,6 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
-	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	golang.org/x/net v0.16.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect
