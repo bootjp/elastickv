@@ -1,22 +1,13 @@
-# ElasticKV
+# Elastickv
 
-ElasticKV is an open-source, distributed key-value store leveraging the Raft consensus algorithm for high availability and consistent, infinitely scalable storage solutions. Designed with the modern demands of data management in mind, ElasticKV provides a robust platform for a wide range of applications, from simple caching layers to complex distributed systems.
+## Overview
+Elastickv is an experimental project dedicated to building a distributed key-value store, akin to DynamoDB, but optimized for cloud environments. This initiative focuses on achieving high data consistency and availability, integrating key features like Raft-based data replication, dynamic node scaling, and automatic hot spot re-allocation. Elastickv is envisioned as a next-generation solution for efficient and scalable cloud data storage.
 
 ## Features
+- **Raft-based Data Replication**: Implements data consistency and fault tolerance using the Raft consensus algorithm, essential for distributed systems.
+- **Dynamic Node Scaling**: Adapts node sizes and key partitions dynamically, mirroring DynamoDB's approach for optimized cloud scalability.
+- **Automatic Hot Spot Re-allocation**: Identifies and reallocates hot spots in real-time, enhancing the system's performance and efficiency in cloud environments.
 
-- **Distributed Key-Value Storage**: Efficiently store and retrieve data with a simple key-value mechanism.
-- **Raft-Based Consensus**: Ensures data consistency and high availability, even in the event of node failures.
-- **Scalable Architecture**: Designed to scale seamlessly with your needs, handling increasing loads and data sizes effortlessly.
-- **Fault Tolerant**: Automatically handles node failures and network partitions.
-- **Easy to Use API**: Intuitive APIs for various operations, making it easy for developers to integrate and use.
+## Development Status
 
-## Getting Started
-
-### Prerequisites
-
-- [List any prerequisites here, like Node.js version, Java version, etc.]
-
-### Installation
-
-```bash
-# Provide installation commands here
+Elastickv, in its experimental stage, strives to emulate and extend the capabilities of renowned cloud-based solutions like DynamoDB. As we develop this distributed key-value store, we invite collaboration and feedback to help shape a robust, scalable, and efficient solution for modern cloud infrastructures.
