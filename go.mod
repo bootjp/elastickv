@@ -4,20 +4,16 @@ go 1.21.4
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
-	github.com/Jille/raft-grpc-example v0.0.0-20230824192955-047da3cb40f1
 	github.com/Jille/raft-grpc-leader-rpc v1.1.0
 	github.com/Jille/raft-grpc-transport v1.5.0
 	github.com/Jille/raftadmin v1.2.1
 	github.com/cockroachdb/errors v1.11.1
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
-	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.0.1
 	github.com/hashicorp/raft v1.6.0
 	github.com/hashicorp/raft-boltdb v0.0.0-20230125174641-2a8082862702
-	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/spaolacci/murmur3 v1.1.0
 	google.golang.org/grpc v1.59.0
 	google.golang.org/protobuf v1.31.0
-	moul.io/number-to-words v0.7.0
 )
 
 require (
