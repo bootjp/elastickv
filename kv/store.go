@@ -13,6 +13,8 @@ import (
 type Store interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error
+
+	hash([]byte) (uint64, error)
 }
 
 type store struct {
@@ -35,43 +37,47 @@ func (s *store) Get(ctx context.Context, key []byte) ([]byte, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	h := murmur3.New64()
-	if _, err := h.Write(key); err != nil {
+	h, err := s.hash(key)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	hash := h.Sum64()
 
 	slog.InfoContext(ctx, "Get",
 		slog.String("key", string(key)),
-		slog.Uint64("hash", hash),
+		slog.Uint64("hash", h),
 	)
 
-	v, ok := s.m[hash]
+	v, ok := s.m[h]
 	if !ok {
 		return nil, nil
 	}
 
 	return v, nil
-
 }
 
 func (s *store) Put(ctx context.Context, key []byte, value []byte) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	h := murmur3.New64()
-	if _, err := h.Write(key); err != nil {
+	h, err := s.hash(key)
+	if err != nil {
 		return errors.WithStack(err)
 	}
-	hash := h.Sum64()
 
-	s.m[hash] = value
-
+	s.m[h] = value
 	s.log.InfoContext(ctx, "Put",
 		slog.String("key", string(key)),
-		slog.Uint64("hash", hash),
+		slog.Uint64("hash", h),
 		slog.String("value", string(value)),
 	)
 
 	return nil
+}
+
+func (s *store) hash(key []byte) (uint64, error) {
+	h := murmur3.New64()
+	if _, err := h.Write(key); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return h.Sum64(), nil
 }
