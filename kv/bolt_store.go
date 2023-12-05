@@ -18,8 +18,10 @@ type boltStore struct {
 	bbolt *bbolt.DB
 }
 
+const mode = 0666
+
 func NewBoltStore(path string) (Store, error) {
-	db, err := bbolt.Open(path, 0666, nil)
+	db, err := bbolt.Open(path, mode, nil)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
