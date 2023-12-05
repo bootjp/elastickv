@@ -12,6 +12,7 @@ require (
 	github.com/hashicorp/raft v1.6.0
 	github.com/hashicorp/raft-boltdb v0.0.0-20230125174641-2a8082862702
 	github.com/spaolacci/murmur3 v1.1.0
+	go.etcd.io/bbolt v1.3.8
 	google.golang.org/grpc v1.59.0
 	google.golang.org/protobuf v1.31.0
 )
