@@ -20,8 +20,8 @@ type boltStore struct {
 	bbolt *bbolt.DB
 }
 
-func NewBoltStore() (Store, error) {
-	db, err := bbolt.Open("my.db", 0666, nil)
+func NewBoltStore(path string) (Store, error) {
+	db, err := bbolt.Open(path, 0666, nil)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
