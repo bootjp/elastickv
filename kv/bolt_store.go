@@ -64,7 +64,7 @@ func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		return b.Put(key, value)
+		return errors.WithStack(b.Put(key, value))
 	})
 
 	return errors.WithStack(err)
