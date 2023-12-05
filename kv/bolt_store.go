@@ -2,14 +2,12 @@ package kv
 
 import (
 	"context"
-
 	"log/slog"
 	"os"
 	"sync"
 
-	"go.etcd.io/bbolt"
-
 	"github.com/cockroachdb/errors"
+	"go.etcd.io/bbolt"
 )
 
 var defaultBucket = []byte("default")
