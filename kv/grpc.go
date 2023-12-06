@@ -48,6 +48,7 @@ func (r GRPCServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse,
 
 	return &pb.PutResponse{
 		CommitIndex: f.Index(),
+		Success:     true,
 	}, nil
 }
 
