@@ -34,7 +34,7 @@ func NewGRPCServer(fsm FSM, store Store, raft *raft.Raft) *GRPCServer {
 	}
 }
 
-func (r GRPCServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	b, err := proto.Marshal(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -42,12 +42,13 @@ func (r GRPCServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse,
 
 	f := r.raft.Apply(b, time.Second)
 	if err := f.Error(); err != nil {
-		r.log.ErrorContext(context.Background(), "failed to apply raft log", slog.String("error", err.Error()))
+		r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
 		return nil, ErrRetryable
 	}
 
 	return &pb.PutResponse{
 		CommitIndex: f.Index(),
+		Success:     true,
 	}, nil
 }
 
@@ -72,7 +73,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	}, nil
 }
 
-func (r GRPCServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	b, err := proto.Marshal(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -80,7 +81,7 @@ func (r GRPCServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.Delete
 
 	f := r.raft.Apply(b, time.Second)
 	if err := f.Error(); err != nil {
-		r.log.ErrorContext(context.Background(), "failed to apply raft log", slog.String("error", err.Error()))
+		r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
 		return nil, ErrRetryable
 	}
 
