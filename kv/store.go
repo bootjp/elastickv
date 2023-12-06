@@ -13,6 +13,7 @@ import (
 type Store interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error
+	Delete(ctx context.Context, key []byte) error
 
 	hash([]byte) (uint64, error)
 }
@@ -69,6 +70,24 @@ func (s *store) Put(ctx context.Context, key []byte, value []byte) error {
 		slog.String("key", string(key)),
 		slog.Uint64("hash", h),
 		slog.String("value", string(value)),
+	)
+
+	return nil
+}
+
+func (s *store) Delete(ctx context.Context, key []byte) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	h, err := s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	delete(s.m, h)
+	s.log.InfoContext(ctx, "Delete",
+		slog.String("key", string(key)),
+		slog.Uint64("hash", h),
 	)
 
 	return nil
