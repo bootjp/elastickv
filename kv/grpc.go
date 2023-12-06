@@ -71,3 +71,20 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 		Value:       v,
 	}, nil
 }
+
+func (r GRPCServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	b, err := proto.Marshal(req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	f := r.raft.Apply(b, time.Second)
+	if err := f.Error(); err != nil {
+		r.log.ErrorContext(context.Background(), "failed to apply raft log", slog.String("error", err.Error()))
+		return nil, ErrRetryable
+	}
+
+	return &pb.DeleteResponse{
+		CommitIndex: f.Index(),
+	}, nil
+}

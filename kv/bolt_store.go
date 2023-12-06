@@ -72,6 +72,26 @@ func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
 	return errors.WithStack(err)
 }
 
+func (s *boltStore) Delete(ctx context.Context, key []byte) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	s.log.InfoContext(ctx, "Delete",
+		slog.String("key", string(key)),
+	)
+
+	err := s.bbolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultBucket)
+		if b == nil {
+			return nil
+		}
+
+		return errors.WithStack(b.Delete(key))
+	})
+
+	return errors.WithStack(err)
+}
+
 func (s *boltStore) hash(_ []byte) (uint64, error) {
 	return 0, ErrNotImplemented
 }
