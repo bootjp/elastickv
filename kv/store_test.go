@@ -37,13 +37,14 @@ func Test(t *testing.T) {
 			assert.NoError(t, st.Delete(ctx, []byte("foo")))
 
 			// bolt store does not support NotFound
+			// todo migrate Store.SupportedNotFound()
 			if st.Name() != "bolt" {
-
 				res, err = st.Get(ctx, []byte("foo"))
 				assert.ErrorIs(t, ErrNotFound, err)
 				assert.Nil(t, res)
 				res, err = st.Get(ctx, []byte("aaaaaa"))
 				assert.ErrorIs(t, ErrNotFound, err)
+				assert.Nil(t, res)
 			}
 		})
 	}

@@ -101,5 +101,5 @@ func (s *boltStore) Name() string {
 }
 
 func (s *boltStore) Close() error {
-	return s.bbolt.Close()
+	return errors.WithStack(s.bbolt.Close())
 }
