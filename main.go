@@ -46,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-	store := kv.NewStore()
+	store := kv.NewMemoryStore()
 	kvFSM := kv.NewKvFSM(store)
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {

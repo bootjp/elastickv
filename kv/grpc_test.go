@@ -75,7 +75,7 @@ func createNode(n int) []*grpc.Server {
 			log.Fatalf("failed to listen: %v", err)
 		}
 
-		st := NewStore()
+		st := NewMemoryStore()
 		fsm := NewKvFSM(st)
 
 		kvs[strconv.Itoa(i)] = st
