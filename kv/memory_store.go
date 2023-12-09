@@ -39,8 +39,8 @@ func NewMemoryStore() Store {
 var _ Store = &memoryStore{}
 
 func (s *memoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
 	h, err := s.hash(key)
 	if err != nil {
