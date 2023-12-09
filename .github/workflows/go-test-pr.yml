@@ -2,7 +2,7 @@ on: [ pull_request ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-go-test-pr
-  cancel-in-progress: true
+#  cancel-in-progress: true
 
 name: Test
 jobs:
