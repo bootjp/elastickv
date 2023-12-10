@@ -28,7 +28,9 @@ func NewBoltStore(path string) (Store, error) {
 	return &boltStore{
 		mtx:   sync.RWMutex{},
 		bbolt: db,
-		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+		})),
 	}, nil
 }
 

@@ -25,12 +25,11 @@ func TestMemoryStore(t *testing.T) {
 			assert.NoError(t, st.Delete(ctx, key))
 
 			res, err = st.Get(ctx, key)
+			assert.ErrorIs(t, ErrNotFound, err)
 			assert.Nil(t, res)
-			assert.NoError(t, err)
 			res, err = st.Get(ctx, []byte("aaaaaa"))
+			assert.ErrorIs(t, ErrNotFound, err)
 			assert.Nil(t, res)
-			assert.NoError(t, err)
-
 		}(i)
 	}
 }
