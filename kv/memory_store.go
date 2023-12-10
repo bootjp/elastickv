@@ -32,7 +32,9 @@ func NewMemoryStore() Store {
 	return &memoryStore{
 		mtx: sync.RWMutex{},
 		m:   map[uint64][]byte{},
-		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+		})),
 	}
 }
 

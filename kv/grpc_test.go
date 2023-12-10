@@ -131,31 +131,69 @@ func Test_value_can_be_deleted(t *testing.T) {
 	}
 }
 
-func Test_consistency_satisfy_write_after_read(t *testing.T) {
+func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	c := client()
 
-	key := []byte("test-key")
+	for i := 0; i < 1000; i++ {
+		go func(i int) {
+			key := []byte("test-key-parallel" + strconv.Itoa(i))
+			want := []byte(strconv.Itoa(i))
+			_, err := c.Put(
+				context.Background(),
+				&pb.PutRequest{Key: key, Value: want},
+			)
+			if err != nil {
+				t.Errorf("Add RPC failed: %v", err)
+				return
+			}
+			_, err = c.Put(context.TODO(), &pb.PutRequest{Key: key, Value: want})
+			if err != nil {
+				t.Errorf("Add RPC failed: %v", err)
+				return
+			}
+			resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
+			if err != nil {
+				t.Errorf("Get RPC failed: %v", err)
+				return
+			}
+
+			if !reflect.DeepEqual(want, resp.Value) {
+				t.Errorf("consistency check failed want %v got %v", want, resp.Value)
+				return
+			}
+		}(i)
+	}
+}
+
+func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
+	c := client()
+
+	key := []byte("test-key-sequence")
 
 	for i := 0; i < 99999; i++ {
-		want := []byte(strconv.Itoa(i))
+		want := []byte("sequence" + strconv.Itoa(i))
 		_, err := c.Put(
 			context.Background(),
 			&pb.PutRequest{Key: key, Value: want},
 		)
 		if err != nil {
-			log.Fatalf("Add RPC failed: %v", err)
+			t.Errorf("Add RPC failed: %v", err)
+			return
 		}
 		_, err = c.Put(context.TODO(), &pb.PutRequest{Key: key, Value: want})
 		if err != nil {
-			t.Fatalf("Add RPC failed: %v", err)
+			t.Errorf("Add RPC failed: %v", err)
+			return
 		}
 		resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
 		if err != nil {
-			t.Fatalf("Get RPC failed: %v", err)
+			t.Errorf("Get RPC failed: %v", err)
+			return
 		}
 
 		if !reflect.DeepEqual(want, resp.Value) {
-			t.Fatalf("consistency check failed want %v got %v", want, resp.Value)
+			t.Errorf("consistency check failed want %v got %v", want, resp.Value)
+			return
 		}
 	}
 }
