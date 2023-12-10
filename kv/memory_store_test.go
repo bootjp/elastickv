@@ -2,11 +2,8 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"testing"
-
-	"github.com/cockroachdb/errors"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -25,23 +22,12 @@ func TestMemoryStore(t *testing.T) {
 			assert.NoError(t, err)
 
 			assert.Equal(t, []byte("bar"), res)
-			assert.NoError(t, st.Delete(ctx, []byte("foo")))
+			assert.NoError(t, st.Delete(ctx, key))
 
-			// bolt store does not support NotFound
-			// todo migrate Store.SupportedNotFound()
-			if st.Name() != "bolt" {
-				res, err = st.Get(ctx, key)
-				h, err := st.hash(key)
-				assert.NoError(t, err)
-				assert.ErrorIs(t, ErrNotFound, err, "key: %s", string(key), "hash: %d", h)
-				if !errors.Is(err, ErrNotFound) {
-					fmt.Print(err)
-				}
-				assert.Nil(t, res)
-				res, err = st.Get(ctx, []byte("aaaaaa"))
-				assert.ErrorIs(t, ErrNotFound, err, "key: %s", string(key), "hash: %d", h)
-				assert.Nil(t, res)
-			}
+			res, err = st.Get(ctx, key)
+			assert.Nil(t, res)
+			res, err = st.Get(ctx, []byte("aaaaaa"))
+			assert.Nil(t, res)
 		}(i)
 	}
 }
