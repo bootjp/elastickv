@@ -15,10 +15,6 @@ import (
 	_ "google.golang.org/grpc/health"
 )
 
-const retryCount = 3
-
-var backoffDuration = 100 * time.Millisecond
-
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
