@@ -11,7 +11,7 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.0.1
 	github.com/hashicorp/raft v1.6.0
-	github.com/hashicorp/raft-boltdb v0.0.0-20230125174641-2a8082862702
+	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.8.4
