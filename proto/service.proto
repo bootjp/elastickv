@@ -8,6 +8,15 @@ service RawKV {
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
 }
 
+service TransactionalKV {
+  rpc Begin(BeginRequest) returns (BeginResponse) {}
+  rpc Commit(CommitRequest) returns (CommitResponse) {}
+  rpc Rollback(RollbackRequest) returns (RollbackResponse) {}
+  rpc Put(PutRequest) returns (PutResponse) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+}
+
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -32,6 +41,32 @@ message DeleteRequest {
 }
 
 message DeleteResponse {
+  uint64 commit_index = 1;
+  bool success = 2;
+}
+
+message BeginRequest {
+  bool readonly = 1;
+}
+
+message BeginResponse {
+  uint64 transaction_id = 1;
+}
+
+message CommitRequest {
+  uint64 transaction_id = 1;
+}
+
+message CommitResponse {
+  uint64 commit_index = 1;
+  bool success = 2;
+}
+
+message RollbackRequest {
+  uint64 transaction_id = 1;
+}
+
+message RollbackResponse {
   uint64 commit_index = 1;
   bool success = 2;
 }

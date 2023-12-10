@@ -10,15 +10,10 @@ import (
 	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
 )
-
-const retryCount = 3
-
-var backoffDuration = 100 * time.Millisecond
 
 func main() {
 	if err := run(); err != nil {
@@ -28,15 +23,10 @@ func main() {
 
 func run() error {
 	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
-	retryOpts := []retry.CallOption{
-		retry.WithBackoff(retry.BackoffExponential(backoffDuration)),
-		retry.WithMax(retryCount),
-	}
 	conn, err := grpc.Dial("multi:///localhost:50051,localhost:50052,localhost:50053",
 		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-		grpc.WithUnaryInterceptor(retry.UnaryClientInterceptor(retryOpts...)),
 	)
 
 	if err != nil {
