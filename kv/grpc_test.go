@@ -15,7 +15,6 @@ import (
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	"github.com/Jille/raftadmin"
 	pb "github.com/bootjp/elastickv/proto"
-	grpcretry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
@@ -199,14 +198,10 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 }
 
 func client() pb.RawKVClient {
-	retryOpts := []grpcretry.CallOption{
-		grpcretry.WithBackoff(grpcretry.BackoffExponential(100 * time.Millisecond)),
-		grpcretry.WithMax(1),
-	}
 	conn, err := grpc.Dial("multi:///localhost:50000,localhost:50001,localhost:50002",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-		grpc.WithUnaryInterceptor(grpcretry.UnaryClientInterceptor(retryOpts...)))
+	)
 	if err != nil {
 		log.Fatalf("dialing failed: %v", err)
 	}
