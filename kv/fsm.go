@@ -2,7 +2,6 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -65,19 +64,19 @@ func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
 
 	putReq := &pb.PutRequest{}
 	if err := proto.Unmarshal(b, putReq); err == nil {
-		fmt.Println("Unmarshaled as PutRequest:", putReq)
+		f.log.Info("unmarshaled as PutRequest:", putReq)
 		return putReq, nil
 	}
 
 	delReq := &pb.DeleteRequest{}
 	if err := proto.Unmarshal(b, delReq); err == nil {
-		fmt.Println("Unmarshaled as DeleteRequest:", delReq)
+		f.log.Info("Unmarshaled as DeleteRequest:", delReq)
 		return delReq, nil
 	}
 
 	getReq := &pb.GetRequest{}
 	if err := proto.Unmarshal(b, getReq); err == nil {
-		fmt.Println("Unmarshaled as GetRequest:", getReq)
+		f.log.Info("Unmarshaled as GetRequest:", getReq)
 		return getReq, nil
 	}
 
