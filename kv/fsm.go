@@ -1,11 +1,11 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"os"
-	"sync"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -14,7 +14,6 @@ import (
 )
 
 type kvFSM struct {
-	mtx   sync.RWMutex
 	store Store
 	log   *slog.Logger
 }
@@ -25,7 +24,6 @@ type FSM interface {
 
 func NewKvFSM(store Store) FSM {
 	return &kvFSM{
-		mtx:   sync.RWMutex{},
 		store: store,
 		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
 	}
@@ -37,8 +35,6 @@ var _ raft.FSM = &kvFSM{}
 var ErrUnknownRequestType = errors.New("unknown request type")
 
 func (f *kvFSM) Apply(l *raft.Log) interface{} {
-	f.mtx.Lock()
-	defer f.mtx.Unlock()
 	ctx := context.TODO()
 
 	req, err := f.Unmarshal(l.Data)
@@ -86,19 +82,52 @@ func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
-	return &snapshot{}, ErrNotImplemented
+	buf, err := f.store.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &kvFSMSnapshotSink{
+		writer: buf,
+	}, nil
 }
 
-func (f *kvFSM) Restore(_ io.ReadCloser) error {
-	return ErrNotImplemented
+func (f *kvFSM) Restore(r io.ReadCloser) error {
+	defer r.Close()
+
+	return errors.WithStack(f.store.Restore(r))
 }
 
-type snapshot struct {
+var _ raft.FSMSnapshot = &kvFSMSnapshotSink{}
+
+type kvFSMSnapshotSink struct {
+	writer io.ReadWriter
 }
 
-func (s *snapshot) Persist(_ raft.SnapshotSink) error {
-	return ErrNotImplemented
+type FSMSnapshotSink struct {
+	io.WriteCloser
+
+	buf bytes.Buffer
 }
 
-func (s *snapshot) Release() {
+func (f *kvFSMSnapshotSink) ID() string {
+	return ""
+}
+
+func (f *kvFSMSnapshotSink) Cancel() error {
+	return nil
+}
+
+func (f *kvFSMSnapshotSink) Persist(sink raft.SnapshotSink) error {
+	defer sink.Close()
+
+	_, err := io.Copy(sink, f.writer)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
+func (f *kvFSMSnapshotSink) Release() {
 }

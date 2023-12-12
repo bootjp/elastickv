@@ -1,7 +1,10 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -18,6 +21,8 @@ type Store interface {
 	Delete(ctx context.Context, key []byte) error
 	Close() error
 	Name() string
+	Snapshot() (io.ReadWriter, error)
+	Restore(buf io.Reader) error
 
 	hash([]byte) (uint64, error)
 }
@@ -113,4 +118,33 @@ func (s *memoryStore) Close() error {
 
 func (s *memoryStore) Name() string {
 	return "memory"
+}
+
+func (s *memoryStore) Snapshot() (io.ReadWriter, error) {
+	s.mtx.RLock()
+	cl := make(map[uint64][]byte, len(s.m))
+	for k, v := range s.m {
+		cl[k] = v
+	}
+	s.mtx.RUnlock()
+
+	buf := &bytes.Buffer{}
+	err := gob.NewEncoder(buf).Encode(cl)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return buf, nil
+}
+func (s *memoryStore) Restore(buf io.Reader) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	s.m = make(map[uint64][]byte)
+	err := gob.NewDecoder(buf).Decode(&s.m)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
