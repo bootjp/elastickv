@@ -107,10 +107,10 @@ func (s *boltStore) Close() error {
 	return errors.WithStack(s.bbolt.Close())
 }
 
-func (s *boltStore) Snapshot() (io.Writer, error) {
+func (s *boltStore) Snapshot() (io.ReadWriter, error) {
 	return nil, ErrNotImplemented
 }
 
-func (s *boltStore) Restore(_ io.Reader) error {
+func (s *boltStore) Restore(buf io.Reader) error {
 	return ErrNotImplemented
 }
