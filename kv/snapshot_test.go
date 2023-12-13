@@ -4,12 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
-	"google.golang.org/protobuf/proto"
-
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestSnapshot(t *testing.T) {
@@ -43,7 +41,8 @@ func TestSnapshot(t *testing.T) {
 	store2 := NewMemoryStore()
 	fsm2 := NewKvFSM(store2)
 
-	kvFSMSnap := snapshot.(*kvFSMSnapshot)
+	kvFSMSnap, ok := snapshot.(*kvFSMSnapshot)
+	assert.True(t, ok)
 	assert.NoError(t, err)
 
 	err = fsm2.Restore(kvFSMSnap)
