@@ -38,7 +38,6 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	ctx := context.TODO()
 
 	req, err := f.Unmarshal(l.Data)
-
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -60,19 +59,16 @@ func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
 
 	putReq := &pb.PutRequest{}
 	if err := proto.Unmarshal(b, putReq); err == nil {
-		f.log.Info("unmarshaled as PutRequest:", putReq)
 		return putReq, nil
 	}
 
 	delReq := &pb.DeleteRequest{}
 	if err := proto.Unmarshal(b, delReq); err == nil {
-		f.log.Info("Unmarshaled as DeleteRequest:", delReq)
 		return delReq, nil
 	}
 
 	getReq := &pb.GetRequest{}
 	if err := proto.Unmarshal(b, getReq); err == nil {
-		f.log.Info("Unmarshaled as GetRequest:", getReq)
 		return getReq, nil
 	}
 
