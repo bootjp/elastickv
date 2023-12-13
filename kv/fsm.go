@@ -2,11 +2,9 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"sync"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -15,7 +13,6 @@ import (
 )
 
 type kvFSM struct {
-	mtx   sync.RWMutex
 	store Store
 	log   *slog.Logger
 }
@@ -26,24 +23,20 @@ type FSM interface {
 
 func NewKvFSM(store Store) FSM {
 	return &kvFSM{
-		mtx:   sync.RWMutex{},
 		store: store,
 		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
 	}
 }
 
-var _ FSM = &kvFSM{}
-var _ raft.FSM = &kvFSM{}
+var _ FSM = (*kvFSM)(nil)
+var _ raft.FSM = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
 
 func (f *kvFSM) Apply(l *raft.Log) interface{} {
-	f.mtx.Lock()
-	defer f.mtx.Unlock()
 	ctx := context.TODO()
 
 	req, err := f.Unmarshal(l.Data)
-
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -65,19 +58,16 @@ func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
 
 	putReq := &pb.PutRequest{}
 	if err := proto.Unmarshal(b, putReq); err == nil {
-		fmt.Println("Unmarshaled as PutRequest:", putReq)
 		return putReq, nil
 	}
 
 	delReq := &pb.DeleteRequest{}
 	if err := proto.Unmarshal(b, delReq); err == nil {
-		fmt.Println("Unmarshaled as DeleteRequest:", delReq)
 		return delReq, nil
 	}
 
 	getReq := &pb.GetRequest{}
 	if err := proto.Unmarshal(b, getReq); err == nil {
-		fmt.Println("Unmarshaled as GetRequest:", getReq)
 		return getReq, nil
 	}
 
@@ -87,19 +77,18 @@ func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
-	return &snapshot{}, ErrNotImplemented
+	buf, err := f.store.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &kvFSMSnapshot{
+		buf,
+	}, nil
 }
 
-func (f *kvFSM) Restore(_ io.ReadCloser) error {
-	return ErrNotImplemented
-}
+func (f *kvFSM) Restore(r io.ReadCloser) error {
+	defer r.Close()
 
-type snapshot struct {
-}
-
-func (s *snapshot) Persist(_ raft.SnapshotSink) error {
-	return ErrNotImplemented
-}
-
-func (s *snapshot) Release() {
+	return errors.WithStack(f.store.Restore(r))
 }

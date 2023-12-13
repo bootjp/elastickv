@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -104,4 +105,12 @@ func (s *boltStore) Name() string {
 
 func (s *boltStore) Close() error {
 	return errors.WithStack(s.bbolt.Close())
+}
+
+func (s *boltStore) Snapshot() (io.ReadWriter, error) {
+	return nil, ErrNotImplemented
+}
+
+func (s *boltStore) Restore(buf io.Reader) error {
+	return ErrNotImplemented
 }

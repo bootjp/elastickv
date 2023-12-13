@@ -2,9 +2,9 @@ package kv
 
 import (
 	"context"
-	"fmt"
 
 	transport "github.com/Jille/raft-grpc-transport"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -26,13 +26,13 @@ func NewRaft(_ context.Context, myID, myAddress string, fsm raft.FSM, bootstrap 
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return nil, nil, fmt.Errorf("raft.NewRaft: %w", err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	if bootstrap {
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
-			return nil, nil, fmt.Errorf("raft.Raft.BootstrapCluster: %w", err)
+			return nil, nil, errors.WithStack(err)
 		}
 	}
 

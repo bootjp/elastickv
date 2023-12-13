@@ -35,7 +35,7 @@ func run() error {
 	defer conn.Close()
 	c := pb.NewRawKVClient(conn)
 
-	for i := 0; 10 > i; i++ {
+	for i := 0; 100 > i; i++ {
 		resp, err := c.Put(context.Background(), &pb.PutRequest{
 			Key:   []byte("key-" + strconv.Itoa(i)),
 			Value: []byte(time.Now().String()),
@@ -47,7 +47,7 @@ func run() error {
 		fmt.Println(resp)
 	}
 
-	for i := 0; 10 > i; i++ {
+	for i := 0; 100 > i; i++ {
 		resp, err := c.Get(context.Background(), &pb.GetRequest{
 			Key: []byte("key-" + strconv.Itoa(i)),
 		})
