@@ -1,7 +1,6 @@
 package kv
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -29,8 +28,8 @@ func NewKvFSM(store Store) FSM {
 	}
 }
 
-var _ FSM = &kvFSM{}
-var _ raft.FSM = &kvFSM{}
+var _ FSM = (*kvFSM)(nil)
+var _ raft.FSM = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
 
@@ -83,8 +82,8 @@ func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	return &kvFSMSnapshotSink{
-		writer: buf,
+	return &kvFSMSnapshot{
+		buf,
 	}, nil
 }
 
@@ -92,38 +91,4 @@ func (f *kvFSM) Restore(r io.ReadCloser) error {
 	defer r.Close()
 
 	return errors.WithStack(f.store.Restore(r))
-}
-
-var _ raft.FSMSnapshot = &kvFSMSnapshotSink{}
-
-type kvFSMSnapshotSink struct {
-	writer io.ReadWriter
-}
-
-type FSMSnapshotSink struct {
-	io.WriteCloser
-
-	buf bytes.Buffer
-}
-
-func (f *kvFSMSnapshotSink) ID() string {
-	return ""
-}
-
-func (f *kvFSMSnapshotSink) Cancel() error {
-	return nil
-}
-
-func (f *kvFSMSnapshotSink) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
-
-	_, err := io.Copy(sink, f.writer)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	return nil
-}
-
-func (f *kvFSMSnapshotSink) Release() {
 }
