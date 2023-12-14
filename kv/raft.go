@@ -5,7 +5,13 @@ import (
 	"net"
 
 	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+)
+
+const (
+	defaultTimeout = 10
+	maxPool        = 3
 )
 
 func NewRaft(
@@ -32,10 +38,13 @@ func NewRaft(
 	raftTransport, err := raft.NewTCPTransportWithLogger(
 		myAddress,
 		advertise,
-		3,
-		10,
-		nil,
-	)
+		maxPool,
+		defaultTimeout,
+		hclog.New(&hclog.LoggerOptions{
+			Name:   "raft-net",
+			Output: hclog.DefaultOutput,
+			Level:  hclog.DefaultLevel,
+		}))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
