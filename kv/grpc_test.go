@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
+var raftHostformat = "localhost:6000%d"
 var hostformat = "localhost:5000%d"
 
 var kvs map[string]Store
@@ -65,6 +66,7 @@ func createNode(n int) []*grpc.Server {
 	for i := 0; i < n; i++ {
 		ctx := context.Background()
 		addr := fmt.Sprintf(hostformat, i)
+		raftAddr := fmt.Sprintf(raftHostformat, i)
 		_, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			log.Fatalf("failed to parse local address (%q): %v", fmt.Sprintf(hostformat, i), err)
@@ -78,13 +80,12 @@ func createNode(n int) []*grpc.Server {
 		fsm := NewKvFSM(st)
 
 		kvs[strconv.Itoa(i)] = st
-		r, tm, err := NewRaft(ctx, strconv.Itoa(i), addr, fsm, i == 0, cfg)
+		r, err := NewRaft(ctx, strconv.Itoa(i), raftAddr, fsm, i == 0, cfg)
 		if err != nil {
 			log.Fatalf("failed to start raft: %v", err)
 		}
 		s := grpc.NewServer()
 		pb.RegisterRawKVServer(s, NewGRPCServer(fsm, st, r))
-		tm.Register(s)
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 		reflection.Register(s)
