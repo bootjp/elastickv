@@ -8,7 +8,7 @@ require (
 	github.com/Jille/raft-grpc-transport v1.5.0
 	github.com/Jille/raftadmin v1.2.1
 	github.com/cockroachdb/errors v1.11.1
-	github.com/hashicorp/go-hclog v1.5.0
+	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.6.0
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/spaolacci/murmur3 v1.1.0
