@@ -30,10 +30,12 @@ var ErrRetryable = errors.New("retryable error")
 
 func NewGRPCServer(fsm FSM, store Store, raft *raft.Raft) *GRPCServer {
 	return &GRPCServer{
-		fsm:     fsm,
-		store:   store,
-		raft:    raft,
-		log:     slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+		fsm:   fsm,
+		store: store,
+		raft:  raft,
+		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+		})),
 		convert: Convert{},
 	}
 }
