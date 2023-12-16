@@ -108,25 +108,25 @@ func Test_value_can_be_deleted(t *testing.T) {
 	c := client(t)
 	key := []byte("test-key")
 	want := []byte("v")
-	_, err := c.Put(
+	_, err := c.RawPut(
 		context.Background(),
-		&pb.PutRequest{Key: key, Value: want},
+		&pb.RawPutRequest{Key: key, Value: want},
 	)
 	assert.Nil(t, err)
-	_, err = c.Put(context.TODO(), &pb.PutRequest{Key: key, Value: want})
+	_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
 	assert.Nil(t, err)
 
-	resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
+	resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 	assert.Nil(t, err)
 
 	assert.Equal(t, want, resp.Value)
 
-	_, err = c.Delete(context.TODO(), &pb.DeleteRequest{Key: key})
+	_, err = c.RawDelete(context.TODO(), &pb.RawDeleteRequest{Key: key})
 	if err != nil {
 		t.Fatalf("Delete RPC failed: %v", err)
 	}
 
-	_, err = c.Get(context.TODO(), &pb.GetRequest{Key: key})
+	_, err = c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 	if err != nil {
 		t.Fatalf("RawGet RPC failed: %v", err)
 	}
@@ -139,20 +139,20 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 		go func(i int) {
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
 			want := []byte(strconv.Itoa(i))
-			_, err := c.Put(
+			_, err := c.RawPut(
 				context.Background(),
-				&pb.PutRequest{Key: key, Value: want},
+				&pb.RawPutRequest{Key: key, Value: want},
 			)
 			if err != nil {
 				t.Errorf("Add RPC failed: %v", err)
 				return
 			}
-			_, err = c.Put(context.TODO(), &pb.PutRequest{Key: key, Value: want})
+			_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
 			if err != nil {
 				t.Errorf("Add RPC failed: %v", err)
 				return
 			}
-			resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
+			resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 			if err != nil {
 				t.Errorf("Get RPC failed: %v", err)
 				return
@@ -173,20 +173,20 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 
 	for i := 0; i < 99999; i++ {
 		want := []byte("sequence" + strconv.Itoa(i))
-		_, err := c.Put(
+		_, err := c.RawPut(
 			context.Background(),
-			&pb.PutRequest{Key: key, Value: want},
+			&pb.RawPutRequest{Key: key, Value: want},
 		)
 		if err != nil {
 			t.Errorf("Add RPC failed: %v", err)
 			return
 		}
-		_, err = c.Put(context.TODO(), &pb.PutRequest{Key: key, Value: want})
+		_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
 		if err != nil {
 			t.Errorf("Add RPC failed: %v", err)
 			return
 		}
-		resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
+		resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 		if err != nil {
 			t.Errorf("Get RPC failed: %v", err)
 			return

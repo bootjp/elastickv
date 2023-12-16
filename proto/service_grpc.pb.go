@@ -19,18 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	RawKV_Put_FullMethodName    = "/RawKV/Put"
-	RawKV_Get_FullMethodName    = "/RawKV/Get"
-	RawKV_Delete_FullMethodName = "/RawKV/Delete"
+	RawKV_RawPut_FullMethodName    = "/RawKV/RawPut"
+	RawKV_RawGet_FullMethodName    = "/RawKV/RawGet"
+	RawKV_RawDelete_FullMethodName = "/RawKV/RawDelete"
 )
 
 // RawKVClient is the client API for RawKV service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RawKVClient interface {
-	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
-	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
-	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	RawPut(ctx context.Context, in *RawPutRequest, opts ...grpc.CallOption) (*RawPutResponse, error)
+	RawGet(ctx context.Context, in *RawGetRequest, opts ...grpc.CallOption) (*RawGetResponse, error)
+	RawDelete(ctx context.Context, in *RawDeleteRequest, opts ...grpc.CallOption) (*RawDeleteResponse, error)
 }
 
 type rawKVClient struct {
@@ -41,27 +41,27 @@ func NewRawKVClient(cc grpc.ClientConnInterface) RawKVClient {
 	return &rawKVClient{cc}
 }
 
-func (c *rawKVClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
-	out := new(PutResponse)
-	err := c.cc.Invoke(ctx, RawKV_Put_FullMethodName, in, out, opts...)
+func (c *rawKVClient) RawPut(ctx context.Context, in *RawPutRequest, opts ...grpc.CallOption) (*RawPutResponse, error) {
+	out := new(RawPutResponse)
+	err := c.cc.Invoke(ctx, RawKV_RawPut_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *rawKVClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
-	out := new(GetResponse)
-	err := c.cc.Invoke(ctx, RawKV_Get_FullMethodName, in, out, opts...)
+func (c *rawKVClient) RawGet(ctx context.Context, in *RawGetRequest, opts ...grpc.CallOption) (*RawGetResponse, error) {
+	out := new(RawGetResponse)
+	err := c.cc.Invoke(ctx, RawKV_RawGet_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *rawKVClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
-	out := new(DeleteResponse)
-	err := c.cc.Invoke(ctx, RawKV_Delete_FullMethodName, in, out, opts...)
+func (c *rawKVClient) RawDelete(ctx context.Context, in *RawDeleteRequest, opts ...grpc.CallOption) (*RawDeleteResponse, error) {
+	out := new(RawDeleteResponse)
+	err := c.cc.Invoke(ctx, RawKV_RawDelete_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -72,9 +72,9 @@ func (c *rawKVClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grp
 // All implementations must embed UnimplementedRawKVServer
 // for forward compatibility
 type RawKVServer interface {
-	Put(context.Context, *PutRequest) (*PutResponse, error)
-	Get(context.Context, *GetRequest) (*GetResponse, error)
-	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	RawPut(context.Context, *RawPutRequest) (*RawPutResponse, error)
+	RawGet(context.Context, *RawGetRequest) (*RawGetResponse, error)
+	RawDelete(context.Context, *RawDeleteRequest) (*RawDeleteResponse, error)
 	mustEmbedUnimplementedRawKVServer()
 }
 
@@ -82,14 +82,14 @@ type RawKVServer interface {
 type UnimplementedRawKVServer struct {
 }
 
-func (UnimplementedRawKVServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
+func (UnimplementedRawKVServer) RawPut(context.Context, *RawPutRequest) (*RawPutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RawPut not implemented")
 }
-func (UnimplementedRawKVServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
+func (UnimplementedRawKVServer) RawGet(context.Context, *RawGetRequest) (*RawGetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RawGet not implemented")
 }
-func (UnimplementedRawKVServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
+func (UnimplementedRawKVServer) RawDelete(context.Context, *RawDeleteRequest) (*RawDeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RawDelete not implemented")
 }
 func (UnimplementedRawKVServer) mustEmbedUnimplementedRawKVServer() {}
 
@@ -104,56 +104,56 @@ func RegisterRawKVServer(s grpc.ServiceRegistrar, srv RawKVServer) {
 	s.RegisterService(&RawKV_ServiceDesc, srv)
 }
 
-func _RawKV_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PutRequest)
+func _RawKV_RawPut_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RawPutRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RawKVServer).Put(ctx, in)
+		return srv.(RawKVServer).RawPut(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: RawKV_Put_FullMethodName,
+		FullMethod: RawKV_RawPut_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RawKVServer).Put(ctx, req.(*PutRequest))
+		return srv.(RawKVServer).RawPut(ctx, req.(*RawPutRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RawKV_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetRequest)
+func _RawKV_RawGet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RawGetRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RawKVServer).Get(ctx, in)
+		return srv.(RawKVServer).RawGet(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: RawKV_Get_FullMethodName,
+		FullMethod: RawKV_RawGet_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RawKVServer).Get(ctx, req.(*GetRequest))
+		return srv.(RawKVServer).RawGet(ctx, req.(*RawGetRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RawKV_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DeleteRequest)
+func _RawKV_RawDelete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RawDeleteRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RawKVServer).Delete(ctx, in)
+		return srv.(RawKVServer).RawDelete(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: RawKV_Delete_FullMethodName,
+		FullMethod: RawKV_RawDelete_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RawKVServer).Delete(ctx, req.(*DeleteRequest))
+		return srv.(RawKVServer).RawDelete(ctx, req.(*RawDeleteRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -166,16 +166,16 @@ var RawKV_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*RawKVServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "Put",
-			Handler:    _RawKV_Put_Handler,
+			MethodName: "RawPut",
+			Handler:    _RawKV_RawPut_Handler,
 		},
 		{
-			MethodName: "Get",
-			Handler:    _RawKV_Get_Handler,
+			MethodName: "RawGet",
+			Handler:    _RawKV_RawGet_Handler,
 		},
 		{
-			MethodName: "Delete",
-			Handler:    _RawKV_Delete_Handler,
+			MethodName: "RawDelete",
+			Handler:    _RawKV_RawDelete_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -183,26 +183,26 @@ var RawKV_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	TransactionalKV_PreWrite_FullMethodName = "/TransactionalKV/PreWrite"
-	TransactionalKV_Commit_FullMethodName   = "/TransactionalKV/Commit"
-	TransactionalKV_Rollback_FullMethodName = "/TransactionalKV/Rollback"
 	TransactionalKV_Put_FullMethodName      = "/TransactionalKV/Put"
 	TransactionalKV_Get_FullMethodName      = "/TransactionalKV/Get"
 	TransactionalKV_Delete_FullMethodName   = "/TransactionalKV/Delete"
 	TransactionalKV_Scan_FullMethodName     = "/TransactionalKV/Scan"
+	TransactionalKV_PreWrite_FullMethodName = "/TransactionalKV/PreWrite"
+	TransactionalKV_Commit_FullMethodName   = "/TransactionalKV/Commit"
+	TransactionalKV_Rollback_FullMethodName = "/TransactionalKV/Rollback"
 )
 
 // TransactionalKVClient is the client API for TransactionalKV service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type TransactionalKVClient interface {
-	PreWrite(ctx context.Context, in *PreWriteRequest, opts ...grpc.CallOption) (*PreCommitResponse, error)
-	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
-	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
+	PreWrite(ctx context.Context, in *PreWriteRequest, opts ...grpc.CallOption) (*PreCommitResponse, error)
+	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
+	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
 }
 
 type transactionalKVClient struct {
@@ -211,33 +211,6 @@ type transactionalKVClient struct {
 
 func NewTransactionalKVClient(cc grpc.ClientConnInterface) TransactionalKVClient {
 	return &transactionalKVClient{cc}
-}
-
-func (c *transactionalKVClient) PreWrite(ctx context.Context, in *PreWriteRequest, opts ...grpc.CallOption) (*PreCommitResponse, error) {
-	out := new(PreCommitResponse)
-	err := c.cc.Invoke(ctx, TransactionalKV_PreWrite_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *transactionalKVClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
-	out := new(CommitResponse)
-	err := c.cc.Invoke(ctx, TransactionalKV_Commit_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *transactionalKVClient) Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error) {
-	out := new(RollbackResponse)
-	err := c.cc.Invoke(ctx, TransactionalKV_Rollback_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *transactionalKVClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
@@ -276,17 +249,44 @@ func (c *transactionalKVClient) Scan(ctx context.Context, in *ScanRequest, opts 
 	return out, nil
 }
 
+func (c *transactionalKVClient) PreWrite(ctx context.Context, in *PreWriteRequest, opts ...grpc.CallOption) (*PreCommitResponse, error) {
+	out := new(PreCommitResponse)
+	err := c.cc.Invoke(ctx, TransactionalKV_PreWrite_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transactionalKVClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
+	out := new(CommitResponse)
+	err := c.cc.Invoke(ctx, TransactionalKV_Commit_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transactionalKVClient) Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error) {
+	out := new(RollbackResponse)
+	err := c.cc.Invoke(ctx, TransactionalKV_Rollback_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TransactionalKVServer is the server API for TransactionalKV service.
 // All implementations must embed UnimplementedTransactionalKVServer
 // for forward compatibility
 type TransactionalKVServer interface {
-	PreWrite(context.Context, *PreWriteRequest) (*PreCommitResponse, error)
-	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
-	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
+	PreWrite(context.Context, *PreWriteRequest) (*PreCommitResponse, error)
+	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
+	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)
 	mustEmbedUnimplementedTransactionalKVServer()
 }
 
@@ -294,15 +294,6 @@ type TransactionalKVServer interface {
 type UnimplementedTransactionalKVServer struct {
 }
 
-func (UnimplementedTransactionalKVServer) PreWrite(context.Context, *PreWriteRequest) (*PreCommitResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method PreWrite not implemented")
-}
-func (UnimplementedTransactionalKVServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Commit not implemented")
-}
-func (UnimplementedTransactionalKVServer) Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Rollback not implemented")
-}
 func (UnimplementedTransactionalKVServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
 }
@@ -315,6 +306,15 @@ func (UnimplementedTransactionalKVServer) Delete(context.Context, *DeleteRequest
 func (UnimplementedTransactionalKVServer) Scan(context.Context, *ScanRequest) (*ScanResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Scan not implemented")
 }
+func (UnimplementedTransactionalKVServer) PreWrite(context.Context, *PreWriteRequest) (*PreCommitResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PreWrite not implemented")
+}
+func (UnimplementedTransactionalKVServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Commit not implemented")
+}
+func (UnimplementedTransactionalKVServer) Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Rollback not implemented")
+}
 func (UnimplementedTransactionalKVServer) mustEmbedUnimplementedTransactionalKVServer() {}
 
 // UnsafeTransactionalKVServer may be embedded to opt out of forward compatibility for this service.
@@ -326,60 +326,6 @@ type UnsafeTransactionalKVServer interface {
 
 func RegisterTransactionalKVServer(s grpc.ServiceRegistrar, srv TransactionalKVServer) {
 	s.RegisterService(&TransactionalKV_ServiceDesc, srv)
-}
-
-func _TransactionalKV_PreWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PreWriteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(TransactionalKVServer).PreWrite(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: TransactionalKV_PreWrite_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TransactionalKVServer).PreWrite(ctx, req.(*PreWriteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _TransactionalKV_Commit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CommitRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(TransactionalKVServer).Commit(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: TransactionalKV_Commit_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TransactionalKVServer).Commit(ctx, req.(*CommitRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _TransactionalKV_Rollback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RollbackRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(TransactionalKVServer).Rollback(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: TransactionalKV_Rollback_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TransactionalKVServer).Rollback(ctx, req.(*RollbackRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _TransactionalKV_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -454,6 +400,60 @@ func _TransactionalKV_Scan_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TransactionalKV_PreWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreWriteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionalKVServer).PreWrite(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionalKV_PreWrite_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionalKVServer).PreWrite(ctx, req.(*PreWriteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TransactionalKV_Commit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionalKVServer).Commit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionalKV_Commit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionalKVServer).Commit(ctx, req.(*CommitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TransactionalKV_Rollback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RollbackRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionalKVServer).Rollback(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionalKV_Rollback_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionalKVServer).Rollback(ctx, req.(*RollbackRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // TransactionalKV_ServiceDesc is the grpc.ServiceDesc for TransactionalKV service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -461,18 +461,6 @@ var TransactionalKV_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "TransactionalKV",
 	HandlerType: (*TransactionalKVServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "PreWrite",
-			Handler:    _TransactionalKV_PreWrite_Handler,
-		},
-		{
-			MethodName: "Commit",
-			Handler:    _TransactionalKV_Commit_Handler,
-		},
-		{
-			MethodName: "Rollback",
-			Handler:    _TransactionalKV_Rollback_Handler,
-		},
 		{
 			MethodName: "Put",
 			Handler:    _TransactionalKV_Put_Handler,
@@ -488,6 +476,18 @@ var TransactionalKV_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Scan",
 			Handler:    _TransactionalKV_Scan_Handler,
+		},
+		{
+			MethodName: "PreWrite",
+			Handler:    _TransactionalKV_PreWrite_Handler,
+		},
+		{
+			MethodName: "Commit",
+			Handler:    _TransactionalKV_Commit_Handler,
+		},
+		{
+			MethodName: "Rollback",
+			Handler:    _TransactionalKV_Rollback_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

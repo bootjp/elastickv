@@ -36,7 +36,7 @@ func run() error {
 	c := pb.NewRawKVClient(conn)
 
 	for i := 0; 100 > i; i++ {
-		resp, err := c.Put(context.Background(), &pb.PutRequest{
+		resp, err := c.RawPut(context.Background(), &pb.PutRequest{
 			Key:   []byte("key-" + strconv.Itoa(i)),
 			Value: []byte(time.Now().String()),
 		})
@@ -48,7 +48,7 @@ func run() error {
 	}
 
 	for i := 0; 100 > i; i++ {
-		resp, err := c.Get(context.Background(), &pb.GetRequest{
+		resp, err := c.RawGet(context.Background(), &pb.GetRequest{
 			Key: []byte("key-" + strconv.Itoa(i)),
 		})
 		if err != nil {
