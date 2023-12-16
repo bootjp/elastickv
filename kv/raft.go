@@ -3,9 +3,9 @@ package kv
 import (
 	"context"
 	"net"
+	"os"
 
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
@@ -35,16 +35,13 @@ func NewRaft(
 		return nil, errors.WithStack(err)
 	}
 
-	raftTransport, err := raft.NewTCPTransportWithLogger(
+	raftTransport, err := raft.NewTCPTransport(
 		myAddress,
 		advertise,
 		maxPool,
 		defaultTimeout,
-		hclog.New(&hclog.LoggerOptions{
-			Name:   "raft-net",
-			Output: hclog.DefaultOutput,
-			Level:  hclog.DefaultLevel,
-		}))
+		os.Stdout,
+	)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

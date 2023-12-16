@@ -14,12 +14,13 @@ func TestSnapshot(t *testing.T) {
 	store := NewMemoryStore()
 	fsm := NewKvFSM(store)
 
-	put := pb.PutRequest{
+	mutation := pb.Mutation{
+		Op:    pb.Mutation_PUT,
 		Key:   []byte("hoge"),
 		Value: []byte("fuga"),
 	}
 
-	b, err := proto.Marshal(&put)
+	b, err := proto.Marshal(&mutation)
 	assert.NoError(t, err)
 
 	fsm.Apply(&raft.Log{

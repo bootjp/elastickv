@@ -3,18 +3,48 @@ syntax = "proto3";
 option go_package = "github.com/bootjp/elastickv/proto";
 
 service RawKV {
-  rpc Put(PutRequest) returns (PutResponse) {}
-  rpc Get(GetRequest) returns (GetResponse) {}
-  rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  rpc RawPut(RawPutRequest) returns (RawPutResponse) {}
+  rpc RawGet(RawGetRequest) returns (RawGetResponse) {}
+  rpc RawDelete(RawDeleteRequest) returns (RawDeleteResponse) {}
 }
 
 service TransactionalKV {
-  rpc Begin(BeginRequest) returns (BeginResponse) {}
-  rpc Commit(CommitRequest) returns (CommitResponse) {}
-  rpc Rollback(RollbackRequest) returns (RollbackResponse) {}
   rpc Put(PutRequest) returns (PutResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  rpc Scan(ScanRequest) returns (ScanResponse) {}
+
+  rpc PreWrite(PreWriteRequest) returns (PreCommitResponse) {}
+  rpc Commit(CommitRequest) returns (CommitResponse) {}
+  rpc Rollback(RollbackRequest) returns (RollbackResponse) {}
+}
+
+message RawPutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message RawPutResponse {
+  uint64 commit_index = 1;
+  bool success = 2;
+}
+
+message RawGetRequest {
+  bytes key = 1;
+}
+
+message RawGetResponse {
+  uint64 read_at_index = 1;
+  bytes value = 2;
+}
+
+message RawDeleteRequest {
+  bytes key = 1;
+}
+
+message RawDeleteResponse {
+  uint64 commit_index = 1;
+  bool success = 2;
 }
 
 message PutRequest {
@@ -23,6 +53,15 @@ message PutRequest {
 }
 
 message PutResponse {
+  uint64 commit_index = 1;
+  bool success = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {
   uint64 commit_index = 1;
   bool success = 2;
 }
@@ -36,37 +75,57 @@ message GetResponse {
   bytes value = 2;
 }
 
-message DeleteRequest {
-  bytes key = 1;
+message KeyError {
+  string message = 1;
+  bool retryable = 2;
 }
 
-message DeleteResponse {
-  uint64 commit_index = 1;
-  bool success = 2;
+message Kv {
+  KeyError error = 1;
+  bytes key = 2;
+  bytes value = 3;
 }
 
-message BeginRequest {
-  bool readonly = 1;
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint64 limit = 3;
 }
 
-message BeginResponse {
-  uint64 transaction_id = 1;
+message ScanResponse {
+  repeated Kv kv = 1;
+}
+
+message PreWriteRequest {
+  // mutations is the list of mutations to apply atomically.
+  repeated Kv mutations = 2;
+  // start_ts is the timestamp of the transaction.
+  uint64 start_ts = 3;
+  // lock_ttl is the TTL of the lock in milliseconds.
+  uint64 lock_ttl = 4;
+}
+
+message PreCommitResponse {
+  repeated KeyError errors = 1;
 }
 
 message CommitRequest {
-  uint64 transaction_id = 1;
+  // start_ts is the timestamp of prewrite request.
+  uint64 start_ts = 1;
+
+  repeated bytes keys = 2;
 }
 
 message CommitResponse {
   uint64 commit_index = 1;
   bool success = 2;
+  repeated KeyError errors = 3;
 }
 
 message RollbackRequest {
-  uint64 transaction_id = 1;
+  uint64 start_ts = 1;
 }
 
 message RollbackResponse {
-  uint64 commit_index = 1;
-  bool success = 2;
+  bool success = 1;
 }
