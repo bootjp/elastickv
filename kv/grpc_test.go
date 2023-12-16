@@ -3,7 +3,6 @@ package kv
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"reflect"
@@ -31,7 +30,10 @@ var node []*grpc.Server
 
 func TestMain(m *testing.M) {
 	kvs = make(map[string]Store)
-	_ = createNode(3)
+	_, err := createNode(3)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("finish create node")
 	code := m.Run()
 	shutdown()
@@ -44,10 +46,9 @@ func shutdown() {
 	}
 }
 
-func createNode(n int) []*grpc.Server {
+func createNode(n int) ([]*grpc.Server, error) {
 	cfg := raft.Configuration{}
 	for i := 0; i < n; i++ {
-		fmt.Println("create node", fmt.Sprintf(hostformat, i))
 		var suffrage raft.ServerSuffrage
 		if i == 0 {
 			suffrage = raft.Voter
@@ -69,11 +70,11 @@ func createNode(n int) []*grpc.Server {
 		raftAddr := fmt.Sprintf(raftHostformat, i)
 		_, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			log.Fatalf("failed to parse local address (%q): %v", fmt.Sprintf(hostformat, i), err)
+			return nil, err
 		}
 		sock, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%s", port))
 		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
+			return nil, err
 		}
 
 		st := NewMemoryStore()
@@ -82,7 +83,7 @@ func createNode(n int) []*grpc.Server {
 		kvs[strconv.Itoa(i)] = st
 		r, err := NewRaft(ctx, strconv.Itoa(i), raftAddr, fsm, i == 0, cfg)
 		if err != nil {
-			log.Fatalf("failed to start raft: %v", err)
+			return nil, err
 		}
 		s := grpc.NewServer()
 		pb.RegisterRawKVServer(s, NewGRPCServer(fsm, st, r))
@@ -93,18 +94,18 @@ func createNode(n int) []*grpc.Server {
 		node = append(node, s)
 		go func() {
 			if err := s.Serve(sock); err != nil {
-				log.Fatalf("failed to serve: %v", err)
+				panic(err)
 			}
 		}()
 	}
 
 	time.Sleep(10 * time.Second)
 
-	return node
+	return node, nil
 }
 
 func Test_value_can_be_deleted(t *testing.T) {
-	c := client()
+	c := client(t)
 	key := []byte("test-key")
 	want := []byte("v")
 	_, err := c.Put(
@@ -132,7 +133,7 @@ func Test_value_can_be_deleted(t *testing.T) {
 }
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
-	c := client()
+	c := client(t)
 
 	for i := 0; i < 1000; i++ {
 		go func(i int) {
@@ -166,7 +167,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
-	c := client()
+	c := client(t)
 
 	key := []byte("test-key-sequence")
 
@@ -198,13 +199,13 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	}
 }
 
-func client() pb.RawKVClient {
+func client(t *testing.T) pb.RawKVClient {
 	conn, err := grpc.Dial("multi:///localhost:50000,localhost:50001,localhost:50002",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	if err != nil {
-		log.Fatalf("dialing failed: %v", err)
+		t.Errorf("failed to dial: %v", err)
 	}
 	return pb.NewRawKVClient(conn)
 }

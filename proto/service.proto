@@ -9,12 +9,13 @@ service RawKV {
 }
 
 service TransactionalKV {
-  rpc Begin(BeginRequest) returns (BeginResponse) {}
+  rpc PreWrite(PreWriteRequest) returns (PreCommitResponse) {}
   rpc Commit(CommitRequest) returns (CommitResponse) {}
   rpc Rollback(RollbackRequest) returns (RollbackResponse) {}
   rpc Put(PutRequest) returns (PutResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  rpc Scan(ScanRequest) returns (ScanResponse) {}
 }
 
 message PutRequest {
@@ -45,28 +46,57 @@ message DeleteResponse {
   bool success = 2;
 }
 
-message BeginRequest {
-  bool readonly = 1;
+message KeyError {
+  string message = 1;
+  bool retryable = 2;
 }
 
-message BeginResponse {
-  uint64 transaction_id = 1;
+message Kv {
+  KeyError error = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint64 limit = 3;
+}
+
+message ScanResponse {
+  repeated Kv kv = 1;
+}
+
+message PreWriteRequest {
+  // mutations is the list of mutations to apply atomically.
+  repeated Kv mutations = 2;
+  // start_ts is the timestamp of the transaction.
+  uint64 start_ts = 3;
+  // lock_ttl is the TTL of the lock in milliseconds.
+  uint64 lock_ttl = 4;
+}
+
+message PreCommitResponse {
+  repeated KeyError errors = 1;
 }
 
 message CommitRequest {
-  uint64 transaction_id = 1;
+  // start_ts is the timestamp of prewrite request.
+  uint64 start_ts = 1;
+
+  repeated bytes keys = 2;
 }
 
 message CommitResponse {
   uint64 commit_index = 1;
   bool success = 2;
+  repeated KeyError errors = 3;
 }
 
 message RollbackRequest {
-  uint64 transaction_id = 1;
+  uint64 start_ts = 1;
 }
 
 message RollbackResponse {
-  uint64 commit_index = 1;
-  bool success = 2;
+  bool success = 1;
 }
