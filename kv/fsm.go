@@ -54,6 +54,9 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		if err != nil {
 			return errors.WithStack(err)
 		}
+	case pb.Mutation_UNKNOWN,
+		pb.Mutation_GET: // GETはレプリケーションされない
+		return errors.WithStack(ErrUnknownRequestType)
 	}
 
 	return errors.WithStack(ErrUnknownRequestType)
