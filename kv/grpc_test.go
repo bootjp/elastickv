@@ -3,7 +3,6 @@ package kv
 import (
 	"context"
 	"net"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +19,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
-	"google.golang.org/grpc/reflection"
 )
 
 func shutdown(nodes []*grpc.Server) {
@@ -56,7 +54,7 @@ func portAssigner() portsAdress {
 	}
 }
 
-func createNode(n int) ([]*grpc.Server, []string, error) {
+func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 	var grpcAdders []string
 	var nodes []*grpc.Server
 
@@ -94,26 +92,22 @@ func createNode(n int) ([]*grpc.Server, []string, error) {
 		port := ports[i]
 
 		r, tm, err := NewRaft(ctx, strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
-		if err != nil {
-			return nil, nil, err
-		}
+		assert.NoError(t, err)
+
 		s := grpc.NewServer()
+		gs := NewGRPCServer(fsm, st, r)
 		tm.Register(s)
-		pb.RegisterRawKVServer(s, NewGRPCServer(fsm, st, r))
+		pb.RegisterRawKVServer(s, gs)
+		pb.RegisterTransactionalKVServer(s, gs)
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
-		reflection.Register(s)
 
 		grpcSock, err := net.Listen("tcp", port.grpcAddress)
-		if err != nil {
-			return nil, nil, err
-		}
+		assert.NoError(t, err)
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
 		go func() {
-			if err := s.Serve(grpcSock); err != nil {
-				panic(err)
-			}
+			assert.NoError(t, s.Serve(grpcSock))
 		}()
 
 		nodes = append(nodes, s)
@@ -121,46 +115,43 @@ func createNode(n int) ([]*grpc.Server, []string, error) {
 
 	time.Sleep(10 * time.Second)
 
-	return nodes, grpcAdders, nil
+	return nodes, grpcAdders
 }
 
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
-	nodes, adders, err := createNode(3)
-	assert.NoError(t, err)
+	nodes, adders := createNode(t, 3)
 	c := client(t, adders)
 	defer shutdown(nodes)
 
 	key := []byte("test-key")
 	want := []byte("v")
 
-	_, err = c.RawPut(
+	_, err := c.RawPut(
 		context.Background(),
 		&pb.RawPutRequest{Key: key, Value: want},
 	)
-	assert.Nil(t, err)
+	assert.NoError(t, err, "Put RPC failed")
+
 	_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
+	assert.NoError(t, err, "Put RPC failed")
 	assert.Nil(t, err)
 
 	resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+	assert.NoError(t, err, "Get RPC failed")
 	assert.Nil(t, err)
 	assert.Equal(t, want, resp.Value)
 
 	_, err = c.RawDelete(context.TODO(), &pb.RawDeleteRequest{Key: key})
-	if err != nil {
-		t.Fatalf("Delete RPC failed: %v", err)
-	}
+	assert.NoError(t, err, "Delete RPC failed")
 
 	_, err = c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-	if err != nil {
-		t.Fatalf("RawGet RPC failed: %v", err)
-	}
+	assert.NoError(t, err, "Get RPC failed")
 }
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
-	nodes, adders, err := createNode(3)
-	assert.NoError(t, err)
+	nodes, adders := createNode(t, 3)
 	c := client(t, adders)
 
 	wg := sync.WaitGroup{}
@@ -189,9 +180,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	t.Parallel()
-
-	nodes, adders, err := createNode(3)
-	assert.NoError(t, err)
+	nodes, adders := createNode(t, 3)
 	c := client(t, adders)
 	defer shutdown(nodes)
 
@@ -203,26 +192,15 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			context.Background(),
 			&pb.RawPutRequest{Key: key, Value: want},
 		)
-		if err != nil {
-			t.Errorf("Add RPC failed: %v", err)
-			return
-		}
-		_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
-		if err != nil {
-			t.Errorf("Add RPC failed: %v", err)
-			return
-		}
-		resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-		if err != nil {
-			t.Errorf("Get RPC failed: %v", err)
-			return
-		}
-		t.Logf("sequence %d", i)
+		assert.NoError(t, err, "Put RPC failed")
 
-		if !reflect.DeepEqual(want, resp.Value) {
-			t.Errorf("consistency check failed want %v got %v", want, resp.Value)
-			return
-		}
+		_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
+		assert.NoError(t, err, "Put RPC failed")
+
+		resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+		assert.NoError(t, err, "Get RPC failed")
+
+		assert.Equal(t, want, resp.Value, "consistency check failed")
 	}
 }
 
@@ -231,8 +209,7 @@ func client(t *testing.T, hosts []string) pb.RawKVClient {
 	conn, err := grpc.Dial(dials,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-	if err != nil {
-		t.Errorf("failed to dial: %v", err)
-	}
+
+	assert.NoError(t, err)
 	return pb.NewRawKVClient(conn)
 }
