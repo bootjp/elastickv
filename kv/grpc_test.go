@@ -2,11 +2,11 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"os"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,32 +22,51 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-var raftHostformat = "localhost:6000%d"
-var hostformat = "localhost:5000%d"
-
-var kvs map[string]Store
-var node []*grpc.Server
-
-func TestMain(m *testing.M) {
-	kvs = make(map[string]Store)
-	_, err := createNode(3)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("finish create node")
-	code := m.Run()
-	shutdown()
-	os.Exit(code)
-}
-
-func shutdown() {
-	for _, server := range node {
-		server.Stop()
+func shutdown(nodes []*grpc.Server) {
+	for _, n := range nodes {
+		n.Stop()
 	}
 }
 
-func createNode(n int) ([]*grpc.Server, error) {
+type portsAdress struct {
+	grpc        int
+	raft        int
+	grpcAddress string
+	raftAddress string
+}
+
+var portGrpc atomic.Int32
+var portRaft atomic.Int32
+
+func init() {
+	portGrpc.Store(50000)
+	portRaft.Store(50000)
+}
+
+func portAssigner() portsAdress {
+	gp := portGrpc.Add(1)
+	rp := portRaft.Add(1)
+	return portsAdress{
+		grpc:        int(gp),
+		raft:        int(rp),
+		grpcAddress: net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
+		raftAddress: net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
+	}
+}
+
+func createNode(n int) ([]*grpc.Server, []string, error) {
+	var grpcAdders []string
+	var nodes []*grpc.Server
+
 	cfg := raft.Configuration{}
+	ports := make([]portsAdress, n)
+
+	// port assign
+	for i := 0; i < n; i++ {
+		ports[i] = portAssigner()
+	}
+
+	// build raft node config
 	for i := 0; i < n; i++ {
 		var suffrage raft.ServerSuffrage
 		if i == 0 {
@@ -55,60 +74,65 @@ func createNode(n int) ([]*grpc.Server, error) {
 		} else {
 			suffrage = raft.Nonvoter
 		}
-		addr := fmt.Sprintf(hostformat, i)
+
 		server := raft.Server{
 			Suffrage: suffrage,
 			ID:       raft.ServerID(strconv.Itoa(i)),
-			Address:  raft.ServerAddress(addr),
+			Address:  raft.ServerAddress(ports[i].raftAddress),
 		}
 		cfg.Servers = append(cfg.Servers, server)
 	}
 
-	for i := 0; i < n; i++ {
-		ctx := context.Background()
-		addr := fmt.Sprintf(hostformat, i)
-		raftAddr := fmt.Sprintf(raftHostformat, i)
-		_, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		sock, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%s", port))
-		if err != nil {
-			return nil, err
-		}
+	ctx := context.Background()
 
+	for i := 0; i < n; i++ {
 		st := NewMemoryStore()
 		fsm := NewKvFSM(st)
 
-		kvs[strconv.Itoa(i)] = st
-		r, err := NewRaft(ctx, strconv.Itoa(i), raftAddr, fsm, i == 0, cfg)
+		port := ports[i]
+
+		r, tm, err := NewRaft(ctx, strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		s := grpc.NewServer()
+		tm.Register(s)
 		pb.RegisterRawKVServer(s, NewGRPCServer(fsm, st, r))
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 		reflection.Register(s)
 
-		node = append(node, s)
+		grpcSock, err := net.Listen("tcp", port.grpcAddress)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		grpcAdders = append(grpcAdders, port.grpcAddress)
 		go func() {
-			if err := s.Serve(sock); err != nil {
+			if err := s.Serve(grpcSock); err != nil {
 				panic(err)
 			}
 		}()
+
+		nodes = append(nodes, s)
 	}
 
 	time.Sleep(10 * time.Second)
 
-	return node, nil
+	return nodes, grpcAdders, nil
 }
 
 func Test_value_can_be_deleted(t *testing.T) {
-	c := client(t)
+	t.Parallel()
+	nodes, adders, err := createNode(3)
+	assert.NoError(t, err)
+	c := client(t, adders)
+	defer shutdown(nodes)
+
 	key := []byte("test-key")
 	want := []byte("v")
-	_, err := c.RawPut(
+
+	_, err = c.RawPut(
 		context.Background(),
 		&pb.RawPutRequest{Key: key, Value: want},
 	)
@@ -133,7 +157,10 @@ func Test_value_can_be_deleted(t *testing.T) {
 }
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
-	c := client(t)
+	t.Parallel()
+	_, adders, err := createNode(3)
+	assert.NoError(t, err)
+	c := client(t, adders)
 
 	for i := 0; i < 1000; i++ {
 		go func(i int) {
@@ -167,7 +194,12 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
-	c := client(t)
+	t.Parallel()
+
+	nodes, adders, err := createNode(3)
+	assert.NoError(t, err)
+	c := client(t, adders)
+	defer shutdown(nodes)
 
 	key := []byte("test-key-sequence")
 
@@ -199,7 +231,17 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	}
 }
 
-func client(t *testing.T) pb.RawKVClient {
+func client(t *testing.T, hosts []string) pb.RawKVClient {
+	dials := "multi://"
+	for _, h := range hosts {
+		dials += h + ","
+	}
+	dials = strings.TrimSuffix(dials, ",")
+
+	//conn, err := grpc.Dial(dials,
+	//	grpc.WithTransportCredentials(insecure.NewCredentials()),
+	//	grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	//)
 	conn, err := grpc.Dial("multi:///localhost:50000,localhost:50001,localhost:50002",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
