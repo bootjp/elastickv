@@ -14,10 +14,16 @@ func TestSnapshot(t *testing.T) {
 	store := NewMemoryStore()
 	fsm := NewKvFSM(store)
 
-	mutation := pb.Mutation{
-		Op:    pb.Op_PUT,
-		Key:   []byte("hoge"),
-		Value: []byte("fuga"),
+	mutation := pb.Request{
+		IsTxn: false,
+		Phase: pb.Phase_NONE,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte("hoge"),
+				Value: []byte("fuga"),
+			},
+		},
 	}
 
 	b, err := proto.Marshal(&mutation)
