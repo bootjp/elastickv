@@ -31,7 +31,8 @@ func NewRaft(_ context.Context, myID string, myAddress string, fsm raft.FSM, boo
 	fss := raft.NewInmemSnapshotStore()
 
 	c.Logger = hclog.New(&hclog.LoggerOptions{
-		Name: "raft-" + myID,
+		Name:  "raft-" + myID,
+		Level: hclog.LevelFromString("WARN"),
 	})
 
 	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
