@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +45,7 @@ func init() {
 }
 
 func portAssigner() portsAdress {
+
 	gp := portGrpc.Add(1)
 	rp := portRaft.Add(1)
 	return portsAdress{
@@ -142,7 +144,6 @@ func Test_value_can_be_deleted(t *testing.T) {
 
 	resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 	assert.Nil(t, err)
-
 	assert.Equal(t, want, resp.Value)
 
 	_, err = c.RawDelete(context.TODO(), &pb.RawDeleteRequest{Key: key})
@@ -158,10 +159,12 @@ func Test_value_can_be_deleted(t *testing.T) {
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
-	_, adders, err := createNode(3)
+	nodes, adders, err := createNode(3)
 	assert.NoError(t, err)
 	c := client(t, adders)
 
+	wg := sync.WaitGroup{}
+	wg.Add(1000)
 	for i := 0; i < 1000; i++ {
 		go func(i int) {
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
@@ -170,27 +173,18 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 				context.Background(),
 				&pb.RawPutRequest{Key: key, Value: want},
 			)
-			if err != nil {
-				t.Errorf("Add RPC failed: %v", err)
-				return
-			}
+			assert.NoError(t, err, "Put RPC failed")
 			_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
-			if err != nil {
-				t.Errorf("Add RPC failed: %v", err)
-				return
-			}
-			resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-			if err != nil {
-				t.Errorf("Get RPC failed: %v", err)
-				return
-			}
+			assert.NoError(t, err, "Put RPC failed")
 
-			if !reflect.DeepEqual(want, resp.Value) {
-				t.Errorf("consistency check failed want %v got %v", want, resp.Value)
-				return
-			}
+			resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+			assert.NoError(t, err, "Get RPC failed")
+			assert.Equal(t, want, resp.Value, "consistency check failed")
+			wg.Done()
 		}(i)
 	}
+	wg.Wait()
+	shutdown(nodes)
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
@@ -223,6 +217,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			t.Errorf("Get RPC failed: %v", err)
 			return
 		}
+		t.Logf("sequence %d", i)
 
 		if !reflect.DeepEqual(want, resp.Value) {
 			t.Errorf("consistency check failed want %v got %v", want, resp.Value)
@@ -232,19 +227,9 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 }
 
 func client(t *testing.T, hosts []string) pb.RawKVClient {
-	dials := "multi://"
-	for _, h := range hosts {
-		dials += h + ","
-	}
-	dials = strings.TrimSuffix(dials, ",")
-
-	//conn, err := grpc.Dial(dials,
-	//	grpc.WithTransportCredentials(insecure.NewCredentials()),
-	//	grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	//)
-	conn, err := grpc.Dial("multi:///localhost:50000,localhost:50001,localhost:50002",
+	dials := "multi:///" + strings.Join(hosts, ",")
+	conn, err := grpc.Dial(dials,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	if err != nil {
 		t.Errorf("failed to dial: %v", err)
