@@ -37,7 +37,6 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	ctx := context.TODO()
 
 	m := &pb.Mutation{}
-
 	err := proto.Unmarshal(l.Data, m)
 	if err != nil {
 		return errors.WithStack(err)
@@ -60,27 +59,6 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	}
 
 	return errors.WithStack(ErrUnknownRequestType)
-}
-
-func (f *kvFSM) Unmarshal(b []byte) (proto.Message, error) {
-	// todo パフォーマンス上の問題があるので、もっと良い方法を考える
-
-	putReq := &pb.PutRequest{}
-	if err := proto.Unmarshal(b, putReq); err == nil {
-		return putReq, nil
-	}
-
-	delReq := &pb.DeleteRequest{}
-	if err := proto.Unmarshal(b, delReq); err == nil {
-		return delReq, nil
-	}
-
-	getReq := &pb.GetRequest{}
-	if err := proto.Unmarshal(b, getReq); err == nil {
-		return getReq, nil
-	}
-
-	return nil, errors.WithStack(ErrUnknownRequestType)
 }
 
 var ErrNotImplemented = errors.New("not implemented")

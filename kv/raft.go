@@ -2,26 +2,16 @@ package kv
 
 import (
 	"context"
-	"net"
-	"os"
 
+	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-const (
-	defaultTimeout = 10
-	maxPool        = 3
-)
-
-func NewRaft(
-	_ context.Context,
-	myID string,
-	myAddress string,
-	fsm raft.FSM,
-	bootstrap bool,
-	cfg raft.Configuration) (
-	*raft.Raft, error) {
+func NewRaft(_ context.Context, myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
 
@@ -30,33 +20,26 @@ func NewRaft(
 	sdb := raft.NewInmemStore()
 	fss := raft.NewInmemSnapshotStore()
 
-	advertise, err := net.ResolveTCPAddr("tcp", myAddress)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	c.Logger = hclog.New(&hclog.LoggerOptions{
+		Name:  "raft-" + myID,
+		Level: hclog.LevelFromString("WARN"),
+	})
 
-	raftTransport, err := raft.NewTCPTransport(
-		myAddress,
-		advertise,
-		maxPool,
-		defaultTimeout,
-		os.Stdout,
-	)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	})
 
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, raftTransport)
+	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	if bootstrap {
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
-			return nil, errors.WithStack(err)
+			return nil, nil, errors.WithStack(err)
 		}
 	}
 
-	return r, nil
+	return r, tm, nil
 }
