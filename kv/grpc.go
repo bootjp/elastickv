@@ -65,7 +65,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 }
 
 func (r GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
-	m, err := r.convert.RawPutToMutation(req)
+	m, err := r.convert.RawPutToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -88,7 +88,7 @@ func (r GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawP
 }
 
 func (r GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
-	m, err := r.convert.RawDeleteToMutation(req)
+	m, err := r.convert.RawDeleteToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

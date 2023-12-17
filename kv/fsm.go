@@ -36,26 +36,27 @@ var ErrUnknownRequestType = errors.New("unknown request type")
 func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	ctx := context.TODO()
 
-	m := &pb.Mutation{}
-	err := proto.Unmarshal(l.Data, m)
+	r := &pb.Request{}
+	err := proto.Unmarshal(l.Data, r)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	switch m.Op {
-	case pb.Mutation_PUT:
-		err := f.store.Put(ctx, m.Key, m.Value)
-		if err != nil {
-			return errors.WithStack(err)
+	for _, mut := range r.Mutations {
+		switch mut.Op {
+		case pb.Op_PUT:
+			err := f.store.Put(ctx, mut.Key, mut.Value)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		case pb.Op_DEL:
+			err := f.store.Delete(ctx, mut.Key)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		default:
+			return errors.WithStack(ErrUnknownRequestType)
 		}
-	case pb.Mutation_DELETE:
-		err := f.store.Delete(ctx, m.Key)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	case pb.Mutation_UNKNOWN,
-		pb.Mutation_GET: // GETはレプリケーションされない
-		return errors.WithStack(ErrUnknownRequestType)
 	}
 
 	return errors.WithStack(ErrUnknownRequestType)

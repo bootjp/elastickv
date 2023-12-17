@@ -15,7 +15,7 @@ func TestSnapshot(t *testing.T) {
 	fsm := NewKvFSM(store)
 
 	mutation := pb.Mutation{
-		Op:    pb.Mutation_PUT,
+		Op:    pb.Op_PUT,
 		Key:   []byte("hoge"),
 		Value: []byte("fuga"),
 	}
