@@ -4,21 +4,11 @@ import (
 	"context"
 
 	transport "github.com/Jille/raft-grpc-transport"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	//"k8s.io/client-go/transport"
-
-	//"k8s.io/client-go/transport"
-
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
-)
-
-const (
-	defaultTimeout = 10
-	maxPool        = 3
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func NewRaft(_ context.Context, myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration) (*raft.Raft, *transport.Manager, error) {
