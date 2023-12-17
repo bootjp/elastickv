@@ -10,3 +10,13 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 
 ## Development Status
 Elastickv is in the experimental and developmental phase, aspiring to bring to life features that resonate with industry standards like DynamoDB, tailored for cloud infrastructures. We welcome contributions, ideas, and feedback as we navigate through the intricacies of developing a scalable and efficient cloud-optimized distributed key-value store.
+
+
+
+### Development
+
+
+### Setup pre-commit hooks
+```bash
+git config --local core.hooksPath .githooks
+```
