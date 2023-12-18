@@ -19,3 +19,7 @@ addNodes:
 
 lint:
 	golangci-lint --config=.golangci.yaml run --fix
+
+
+gen:
+	@$(MAKE)  -C proto gen

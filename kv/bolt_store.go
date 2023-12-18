@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"sync"
 
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/bbolt"
@@ -14,7 +13,6 @@ import (
 var defaultBucket = []byte("default")
 
 type boltStore struct {
-	mtx   sync.RWMutex
 	log   *slog.Logger
 	bbolt *bbolt.DB
 }
@@ -27,7 +25,6 @@ func NewBoltStore(path string) (Store, error) {
 		return nil, errors.WithStack(err)
 	}
 	return &boltStore{
-		mtx:   sync.RWMutex{},
 		bbolt: db,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
@@ -38,9 +35,6 @@ func NewBoltStore(path string) (Store, error) {
 var _ Store = &boltStore{}
 
 func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
 	slog.InfoContext(ctx, "Get",
 		slog.String("key", string(key)),
 	)
@@ -56,9 +50,6 @@ func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 }
 
 func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	s.log.InfoContext(ctx, "Put",
 		slog.String("key", string(key)),
 		slog.String("value", string(value)),
@@ -76,9 +67,6 @@ func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
 }
 
 func (s *boltStore) Delete(ctx context.Context, key []byte) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	s.log.InfoContext(ctx, "Delete",
 		slog.String("key", string(key)),
 	)
@@ -93,6 +81,37 @@ func (s *boltStore) Delete(ctx context.Context, key []byte) error {
 	})
 
 	return errors.WithStack(err)
+}
+
+type boltStoreTxn struct {
+	tx *bbolt.Tx
+}
+
+func (s *boltStore) NewBoltStoreTxn(tx *bbolt.Tx) Txn {
+	return &boltStoreTxn{
+		tx: tx,
+	}
+}
+
+func (t *boltStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
+	return t.tx.Bucket(defaultBucket).Get(key), nil
+}
+
+func (t *boltStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
+	return errors.WithStack(t.tx.Bucket(defaultBucket).Put(key, value))
+}
+
+func (t *boltStoreTxn) Delete(_ context.Context, key []byte) error {
+	return errors.WithStack(t.tx.Bucket(defaultBucket).Delete(key))
+}
+
+func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Txn) error) error {
+	btxn, err := s.bbolt.Begin(true)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	txn := s.NewBoltStoreTxn(btxn)
+	return fn(ctx, txn)
 }
 
 func (s *boltStore) hash(_ []byte) (uint64, error) {
