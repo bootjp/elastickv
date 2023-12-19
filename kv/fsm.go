@@ -42,6 +42,19 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		return errors.WithStack(err)
 	}
 
+	return errors.WithStack(f.handleRequest(ctx, r))
+}
+
+func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request) error {
+	switch {
+	case r.IsTxn:
+		return f.handleTxnRequest(ctx, r)
+	default:
+		return f.handleRawRequest(ctx, r)
+	}
+}
+
+func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request) error {
 	for _, mut := range r.Mutations {
 		switch mut.Op {
 		case pb.Op_PUT:
@@ -59,7 +72,7 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		}
 	}
 
-	return errors.WithStack(ErrUnknownRequestType)
+	return nil
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -77,6 +90,33 @@ func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 func (f *kvFSM) Restore(r io.ReadCloser) error {
 	defer r.Close()
-
 	return errors.WithStack(f.store.Restore(r))
+}
+
+func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
+	switch r.Phase {
+	case pb.Phase_PREPARE:
+		return f.handlePrepareRequest(ctx, r)
+	case pb.Phase_COMMIT:
+		return f.handleCommitRequest(ctx, r)
+	case pb.Phase_ABORT:
+		return f.handleAbortRequest(ctx, r)
+	case pb.Phase_NONE:
+		// not reached
+		return errors.WithStack(ErrUnknownRequestType)
+	default:
+		return errors.WithStack(ErrUnknownRequestType)
+	}
+}
+
+func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
+	return nil
+}
+
+func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
+	return nil
+}
+
+func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request) error {
+	return nil
 }

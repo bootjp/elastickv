@@ -19,7 +19,7 @@ enum Phase {
   NONE = 0;
   PREPARE = 1;
   COMMIT = 2;
-  ROLLBACK = 3;
+  ABORT = 3;
 }
 
 message Request {
