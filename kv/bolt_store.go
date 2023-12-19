@@ -24,6 +24,19 @@ func NewBoltStore(path string) (Store, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	tx, err := db.Begin(true)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	_, err = tx.CreateBucketIfNotExists(defaultBucket)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	err = tx.Commit()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	return &boltStore{
 		bbolt: db,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -50,7 +63,7 @@ func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 }
 
 func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
-	s.log.InfoContext(ctx, "Put",
+	s.log.InfoContext(ctx, "put",
 		slog.String("key", string(key)),
 		slog.String("value", string(value)),
 	)
@@ -84,13 +97,11 @@ func (s *boltStore) Delete(ctx context.Context, key []byte) error {
 }
 
 type boltStoreTxn struct {
-	tx     *bbolt.Tx
 	bucket *bbolt.Bucket
 }
 
 func (s *boltStore) NewBoltStoreTxn(tx *bbolt.Tx) Txn {
 	return &boltStoreTxn{
-		tx:     tx,
 		bucket: tx.Bucket(defaultBucket),
 	}
 }
@@ -104,7 +115,7 @@ func (t *boltStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
 }
 
 func (t *boltStoreTxn) Delete(_ context.Context, key []byte) error {
-	return errors.WithStack(t.tx.Bucket(defaultBucket).Delete(key))
+	return errors.WithStack(t.bucket.Delete(key))
 }
 
 func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Txn) error) error {
