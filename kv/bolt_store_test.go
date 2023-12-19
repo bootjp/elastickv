@@ -2,7 +2,6 @@ package kv
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"testing"
 
@@ -19,7 +18,8 @@ func mustStore(store Store, err error) Store {
 func TestBoltStore(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
-	st := mustStore(NewBoltStore(os.TempDir() + "/bolt.db"))
+	d := t.TempDir()
+	st := mustStore(NewBoltStore(d + "/bolt.db"))
 
 	for i := 0; i < 99999; i++ {
 		go func(i int) {
@@ -39,3 +39,55 @@ func TestBoltStore(t *testing.T) {
 		}(i)
 	}
 }
+
+//func TestBoltStore_Txn(t *testing.T) {
+//	t.Parallel()
+//	t.Run("success", func(t *testing.T) {
+//		ctx := context.Background()
+//		d := t.TempDir()
+//		st := mustStore(NewBoltStore(d + "bolt.db"))
+//		err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
+//			err := txn.Put(ctx, []byte("foo"), []byte("bar"))
+//			assert.NoError(t, err)
+//
+//			res, err := txn.Get(ctx, []byte("foo"))
+//			assert.NoError(t, err)
+//
+//			assert.Equal(t, []byte("bar"), res)
+//			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
+//
+//			res, err = txn.Get(ctx, []byte("foo"))
+//			assert.NoError(t, err)
+//			assert.Nil(t, res)
+//			res, err = txn.Get(ctx, []byte("aaaaaa"))
+//			assert.NoError(t, err)
+//			assert.Nil(t, res)
+//			return nil
+//		})
+//		assert.NoError(t, err)
+//	})
+//	t.Run("error", func(t *testing.T) {
+//		ctx := context.Background()
+//		d := t.TempDir()
+//		st := mustStore(NewBoltStore(d + "bolt.db"))
+//		err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
+//			err := txn.Put(ctx, []byte("foo"), []byte("bar"))
+//			assert.NoError(t, err)
+//
+//			res, err := txn.Get(ctx, []byte("foo"))
+//			assert.NoError(t, err)
+//
+//			assert.Equal(t, []byte("bar"), res)
+//			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
+//
+//			res, err = txn.Get(ctx, []byte("foo"))
+//			assert.NoError(t, err)
+//			assert.Nil(t, res)
+//			res, err = txn.Get(ctx, []byte("aaaaaa"))
+//			assert.NoError(t, err)
+//			assert.Nil(t, res)
+//			return errors.New("error")
+//		})
+//		assert.Error(t, err)
+//	})
+//}

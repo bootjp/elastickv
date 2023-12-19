@@ -35,7 +35,7 @@ func NewBoltStore(path string) (Store, error) {
 var _ Store = &boltStore{}
 
 func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
-	slog.InfoContext(ctx, "Get",
+	s.log.InfoContext(ctx, "Get",
 		slog.String("key", string(key)),
 	)
 
@@ -84,21 +84,23 @@ func (s *boltStore) Delete(ctx context.Context, key []byte) error {
 }
 
 type boltStoreTxn struct {
-	tx *bbolt.Tx
+	tx     *bbolt.Tx
+	bucket *bbolt.Bucket
 }
 
 func (s *boltStore) NewBoltStoreTxn(tx *bbolt.Tx) Txn {
 	return &boltStoreTxn{
-		tx: tx,
+		tx:     tx,
+		bucket: tx.Bucket(defaultBucket),
 	}
 }
 
 func (t *boltStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
-	return t.tx.Bucket(defaultBucket).Get(key), nil
+	return t.bucket.Get(key), nil
 }
 
 func (t *boltStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
-	return errors.WithStack(t.tx.Bucket(defaultBucket).Put(key, value))
+	return errors.WithStack(t.bucket.Put(key, value))
 }
 
 func (t *boltStoreTxn) Delete(_ context.Context, key []byte) error {
@@ -110,8 +112,14 @@ func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Tx
 	if err != nil {
 		return errors.WithStack(err)
 	}
+
 	txn := s.NewBoltStoreTxn(btxn)
-	return fn(ctx, txn)
+	err = fn(ctx, txn)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	return errors.WithStack(btxn.Commit())
 }
 
 func (s *boltStore) hash(_ []byte) (uint64, error) {

@@ -61,7 +61,7 @@ func (s *memoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	slog.InfoContext(ctx, "Get",
+	s.log.InfoContext(ctx, "Get",
 		slog.String("key", string(key)),
 		slog.Uint64("hash", h),
 	)
