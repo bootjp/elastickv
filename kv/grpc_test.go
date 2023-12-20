@@ -87,7 +87,8 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 
 	for i := 0; i < n; i++ {
 		st := NewMemoryStore()
-		fsm := NewKvFSM(st)
+		trxSt := NewMemoryStore()
+		fsm := NewKvFSM(st, trxSt)
 
 		port := ports[i]
 

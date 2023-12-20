@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"os"
@@ -13,18 +14,20 @@ import (
 )
 
 type kvFSM struct {
-	store Store
-	log   *slog.Logger
+	store     Store
+	lockStore Store
+	log       *slog.Logger
 }
 
 type FSM interface {
 	raft.FSM
 }
 
-func NewKvFSM(store Store) FSM {
+func NewKvFSM(store Store, lockStore Store) FSM {
 	return &kvFSM{
-		store: store,
-		log:   slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+		store:     store,
+		lockStore: lockStore,
+		log:       slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
 	}
 }
 
@@ -109,14 +112,80 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
 	}
 }
 
+var ErrKeyAlreadyLocked = errors.New("key already locked")
+
 func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
-	return nil
+	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+		for _, mut := range r.Mutations {
+			if exist, _ := txn.Exists(ctx, mut.Key); exist {
+				return errors.WithStack(ErrKeyAlreadyLocked)
+			}
+			//nolint:gomnd
+			b := make([]byte, 8)
+			binary.LittleEndian.PutUint64(b, r.Ts)
+			err := txn.Put(ctx, mut.Key, b)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		}
+		return nil
+	})
+
+	return errors.WithStack(err)
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
-	return nil
+	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn Txn) error {
+		err := f.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
+			// commit
+			for _, mut := range r.Mutations {
+				switch mut.Op {
+				case pb.Op_PUT:
+					err := f.store.Put(ctx, mut.Key, mut.Value)
+					if err != nil {
+						return errors.WithStack(err)
+					}
+				case pb.Op_DEL:
+					err := f.store.Delete(ctx, mut.Key)
+					if err != nil {
+						return errors.WithStack(err)
+					}
+				}
+			}
+			return nil
+		})
+
+		return errors.WithStack(err)
+	})
+
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	// delete lock
+	err = f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+		for _, mut := range r.Mutations {
+			err := txn.Delete(ctx, mut.Key)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		}
+		return nil
+	})
+
+	return errors.WithStack(err)
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request) error {
-	return nil
+	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+		for _, mut := range r.Mutations {
+			err := txn.Delete(ctx, mut.Key)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		}
+		return nil
+	})
+
+	return errors.WithStack(err)
 }

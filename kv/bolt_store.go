@@ -96,6 +96,20 @@ func (s *boltStore) Delete(ctx context.Context, key []byte) error {
 	return errors.WithStack(err)
 }
 
+func (s *boltStore) Exists(ctx context.Context, key []byte) (bool, error) {
+	s.log.InfoContext(ctx, "Exists",
+		slog.String("key", string(key)),
+	)
+
+	var v []byte
+	err := s.bbolt.View(func(tx *bbolt.Tx) error {
+		v = tx.Bucket(defaultBucket).Get(key)
+		return nil
+	})
+
+	return v != nil, errors.WithStack(err)
+}
+
 type boltStoreTxn struct {
 	bucket *bbolt.Bucket
 }
@@ -116,6 +130,9 @@ func (t *boltStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
 
 func (t *boltStoreTxn) Delete(_ context.Context, key []byte) error {
 	return errors.WithStack(t.bucket.Delete(key))
+}
+func (t *boltStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
+	return t.bucket.Get(key) != nil, nil
 }
 
 func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Txn) error) error {

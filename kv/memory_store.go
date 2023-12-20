@@ -20,6 +20,7 @@ type Store interface {
 	Put(ctx context.Context, key []byte, value []byte) error
 	Delete(ctx context.Context, key []byte) error
 	Close() error
+	Exists(ctx context.Context, key []byte) (bool, error)
 	Name() string
 	Snapshot() (io.ReadWriter, error)
 	Restore(buf io.Reader) error
@@ -32,6 +33,7 @@ type Txn interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error
 	Delete(ctx context.Context, key []byte) error
+	Exists(ctx context.Context, key []byte) (bool, error)
 }
 
 type memoryStore struct {
@@ -109,6 +111,18 @@ func (s *memoryStore) Delete(ctx context.Context, key []byte) error {
 	)
 
 	return nil
+}
+func (s *memoryStore) Exists(ctx context.Context, key []byte) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	h, err := s.hash(key)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+
+	_, ok := s.m[h]
+	return ok, nil
 }
 
 type OpType uint8
@@ -232,6 +246,34 @@ func (t *memoryStoreTxn) Delete(_ context.Context, key []byte) error {
 	})
 
 	return nil
+}
+
+func (t *memoryStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
+	h, err := t.s.hash(key)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	_, ok := t.m[h]
+	if ok {
+		return true, nil
+	}
+
+	// トランザクション中に削除されている場合はfalseを返す
+	for _, op := range t.ops {
+		if op.h != h {
+			continue
+		}
+		if op.op == OpTypeDelete {
+			return false, nil
+		}
+	}
+
+	_, ok = t.s.m[h]
+	return ok, nil
 }
 
 func (s *memoryStore) hash(key []byte) (uint64, error) {

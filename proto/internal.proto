@@ -25,6 +25,7 @@ enum Phase {
 message Request {
   bool is_txn = 1;
   Phase phase = 2;
+  uint64 ts = 3;
   repeated Mutation mutations = 4;
 }
 
