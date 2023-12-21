@@ -27,7 +27,9 @@ func NewKvFSM(store Store, lockStore Store) FSM {
 	return &kvFSM{
 		store:     store,
 		lockStore: lockStore,
-		log:       slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})),
+		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})),
 	}
 }
 
@@ -45,7 +47,12 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		return errors.WithStack(err)
 	}
 
-	return errors.WithStack(f.handleRequest(ctx, r))
+	err = f.handleRequest(ctx, r)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request) error {
@@ -130,6 +137,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		}
 		return nil
 	})
+	f.log.InfoContext(ctx, "handlePrepareRequest finish")
 
 	return errors.WithStack(err)
 }
@@ -141,12 +149,12 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 			for _, mut := range r.Mutations {
 				switch mut.Op {
 				case pb.Op_PUT:
-					err := f.store.Put(ctx, mut.Key, mut.Value)
+					err := txn.Put(ctx, mut.Key, mut.Value)
 					if err != nil {
 						return errors.WithStack(err)
 					}
 				case pb.Op_DEL:
-					err := f.store.Delete(ctx, mut.Key)
+					err := txn.Delete(ctx, mut.Key)
 					if err != nil {
 						return errors.WithStack(err)
 					}

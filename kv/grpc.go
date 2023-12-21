@@ -34,7 +34,7 @@ func NewGRPCServer(fsm FSM, store Store, raft *raft.Raft) *GRPCServer {
 		store: store,
 		raft:  raft,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelWarn,
+			Level: slog.LevelInfo,
 		})),
 		convert: Convert{},
 	}
@@ -138,7 +138,7 @@ func (r GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Comm
 	}
 
 	return &pb.CommitResponse{
-		//CommitIndex: f.Index(),
+		CommitIndex: f.Index(),
 	}, nil
 }
 
@@ -160,19 +160,33 @@ func (r GRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.
 }
 
 func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	b, err := proto.Marshal(req)
+	reqs, err := r.convert.PutToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	f := r.raft.Apply(b, time.Second)
-	if err := f.Error(); err != nil {
-		r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
-		return nil, ErrRetryable
+	r.log.InfoContext(ctx, "Put", slog.Any("reqs", reqs))
+
+	for _, req := range reqs {
+		b, err := proto.Marshal(req)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		f := r.raft.Apply(b, time.Second)
+		err = f.Error()
+		if err != nil {
+			r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
+			return nil, ErrRetryable
+		}
+
+		r.raft.Barrier(time.Second)
 	}
 
+	r.log.InfoContext(ctx, "Put", slog.Any("reqs", reqs))
+
 	return &pb.PutResponse{
-		//CommitIndex: f.Index(),
+		CommitIndex: r.raft.AppliedIndex(),
 	}, nil
 }
 
@@ -192,25 +206,34 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 		slog.String("value", string(v)))
 
 	return &pb.GetResponse{
-		//ReadAtIndex: r.raft.AppliedIndex(),
-		Value: v,
+		ReadAtIndex: r.raft.AppliedIndex(),
+		Value:       v,
 	}, nil
 }
 
 func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	b, err := proto.Marshal(req)
+	reqs, err := r.convert.DeleteToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	f := r.raft.Apply(b, time.Second)
-	if err := f.Error(); err != nil {
-		r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
-		return nil, ErrRetryable
-	}
+	for _, req := range reqs {
+		b, err := proto.Marshal(req)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 
+		f := r.raft.Apply(b, time.Second)
+		err = f.Error()
+		if err != nil {
+			r.log.ErrorContext(ctx, "failed to apply raft log", slog.String("error", err.Error()))
+			return nil, ErrRetryable
+		}
+
+		r.raft.Barrier(time.Second)
+	}
 	return &pb.DeleteResponse{
-		//CommitIndex: f.Index(),
+		CommitIndex: r.raft.LastIndex(),
 	}, nil
 }
 
