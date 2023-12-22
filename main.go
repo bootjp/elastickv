@@ -47,7 +47,8 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	store := kv.NewMemoryStore()
-	kvFSM := kv.NewKvFSM(store)
+	lockStore := kv.NewMemoryStore()
+	kvFSM := kv.NewKvFSM(store, lockStore)
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {
 		log.Fatalf("failed to start raft: %v", err)

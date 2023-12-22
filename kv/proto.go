@@ -56,3 +56,26 @@ func (c *Convert) PutToRequests(m *pb.PutRequest) ([]*pb.Request, error) {
 		},
 	}, nil
 }
+
+func (c *Convert) DeleteToRequests(m *pb.DeleteRequest) ([]*pb.Request, error) {
+	return []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_PREPARE,
+			Mutations: []*pb.Mutation{
+				{
+					Key: m.Key,
+				},
+			},
+		},
+		{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{
+				{
+					Key: m.Key,
+				},
+			},
+		},
+	}, nil
+}

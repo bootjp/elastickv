@@ -54,6 +54,7 @@ func portAssigner() portsAdress {
 	}
 }
 
+//nolint:unparam
 func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 	var grpcAdders []string
 	var nodes []*grpc.Server
@@ -87,7 +88,8 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 
 	for i := 0; i < n; i++ {
 		st := NewMemoryStore()
-		fsm := NewKvFSM(st)
+		trxSt := NewMemoryStore()
+		fsm := NewKvFSM(st, trxSt)
 
 		port := ports[i]
 
@@ -121,7 +123,7 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
 	nodes, adders := createNode(t, 3)
-	c := client(t, adders)
+	c := rawKVClient(t, adders)
 	defer shutdown(nodes)
 
 	key := []byte("test-key")
@@ -152,7 +154,7 @@ func Test_value_can_be_deleted(t *testing.T) {
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
 	nodes, adders := createNode(t, 3)
-	c := client(t, adders)
+	c := rawKVClient(t, adders)
 
 	wg := sync.WaitGroup{}
 	wg.Add(1000)
@@ -181,7 +183,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	t.Parallel()
 	nodes, adders := createNode(t, 3)
-	c := client(t, adders)
+	c := rawKVClient(t, adders)
 	defer shutdown(nodes)
 
 	key := []byte("test-key-sequence")
@@ -204,7 +206,36 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	}
 }
 
-func client(t *testing.T, hosts []string) pb.RawKVClient {
+func Test_grpc_transaction(t *testing.T) {
+	t.Parallel()
+	nodes, adders := createNode(t, 3)
+	c := transactionalKVClient(t, adders)
+	defer shutdown(nodes)
+
+	key := []byte("test-key-sequence")
+
+	for i := 0; i < 9999; i++ {
+		want := []byte("sequence" + strconv.Itoa(i))
+		_, err := c.Put(
+			context.Background(),
+			&pb.PutRequest{Key: key, Value: want},
+		)
+		assert.NoError(t, err, "Put RPC failed")
+		resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
+		assert.NoError(t, err, "Get RPC failed")
+		assert.Equal(t, want, resp.Value, "consistency check failed")
+
+		_, err = c.Delete(context.TODO(), &pb.DeleteRequest{Key: key})
+		assert.NoError(t, err, "Delete RPC failed")
+
+		resp, err = c.Get(context.TODO(), &pb.GetRequest{Key: key})
+		assert.NoError(t, err, "Get RPC failed")
+		assert.Nil(t, resp.Value, "consistency check failed")
+
+	}
+}
+
+func rawKVClient(t *testing.T, hosts []string) pb.RawKVClient {
 	dials := "multi:///" + strings.Join(hosts, ",")
 	conn, err := grpc.Dial(dials,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -212,4 +243,14 @@ func client(t *testing.T, hosts []string) pb.RawKVClient {
 
 	assert.NoError(t, err)
 	return pb.NewRawKVClient(conn)
+}
+
+func transactionalKVClient(t *testing.T, hosts []string) pb.TransactionalKVClient {
+	dials := "multi:///" + strings.Join(hosts, ",")
+	conn, err := grpc.Dial(dials,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+
+	assert.NoError(t, err)
+	return pb.NewTransactionalKVClient(conn)
 }
