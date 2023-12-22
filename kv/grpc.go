@@ -34,7 +34,7 @@ func NewGRPCServer(fsm FSM, store Store, raft *raft.Raft) *GRPCServer {
 		store: store,
 		raft:  raft,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
+			Level: slog.LevelWarn,
 		})),
 		convert: Convert{},
 	}

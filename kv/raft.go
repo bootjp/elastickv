@@ -22,7 +22,7 @@ func NewRaft(_ context.Context, myID string, myAddress string, fsm raft.FSM, boo
 
 	c.Logger = hclog.New(&hclog.LoggerOptions{
 		Name:  "raft-" + myID,
-		Level: hclog.LevelFromString("trace"),
+		Level: hclog.LevelFromString("WARN"),
 	})
 
 	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{

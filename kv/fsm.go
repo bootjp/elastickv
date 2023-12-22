@@ -28,7 +28,7 @@ func NewKvFSM(store Store, lockStore Store) FSM {
 		store:     store,
 		lockStore: lockStore,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
+			Level: slog.LevelWarn,
 		})),
 	}
 }
