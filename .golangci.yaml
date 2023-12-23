@@ -23,7 +23,7 @@ linters:
     - nestif
     - nilerr
     - noctx
-    - prealloc
+#    - prealloc
     - unconvert
     - unparam
     - wastedassign

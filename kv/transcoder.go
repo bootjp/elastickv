@@ -2,10 +2,32 @@ package kv
 
 import pb "github.com/bootjp/elastickv/proto"
 
-type Convert struct {
+func NewTranscoder() *Transcoder {
+	return &Transcoder{}
 }
 
-func (c *Convert) RawPutToRequest(m *pb.RawPutRequest) (*pb.Request, error) {
+type OP int
+
+const (
+	Put OP = iota
+	Del
+)
+
+type Elem[T OP] struct {
+	Op    T
+	Key   []byte
+	Value []byte
+}
+
+type OperationGroup[T OP] struct {
+	Elems []*Elem[T]
+	IsTxn bool
+}
+
+type Transcoder struct {
+}
+
+func (c *Transcoder) RawPutToRequest(m *pb.RawPutRequest) (*pb.Request, error) {
 	return &pb.Request{
 		IsTxn: false,
 		Phase: pb.Phase_NONE,
@@ -19,7 +41,7 @@ func (c *Convert) RawPutToRequest(m *pb.RawPutRequest) (*pb.Request, error) {
 	}, nil
 }
 
-func (c *Convert) RawDeleteToRequest(m *pb.RawDeleteRequest) (*pb.Request, error) {
+func (c *Transcoder) RawDeleteToRequest(m *pb.RawDeleteRequest) (*pb.Request, error) {
 	return &pb.Request{
 		IsTxn: false,
 		Phase: pb.Phase_NONE,
@@ -32,7 +54,7 @@ func (c *Convert) RawDeleteToRequest(m *pb.RawDeleteRequest) (*pb.Request, error
 	}, nil
 }
 
-func (c *Convert) PutToRequests(m *pb.PutRequest) ([]*pb.Request, error) {
+func (c *Transcoder) TransactionalPutToRequests(m *pb.PutRequest) ([]*pb.Request, error) {
 	return []*pb.Request{
 		{
 			IsTxn: true,
@@ -57,7 +79,7 @@ func (c *Convert) PutToRequests(m *pb.PutRequest) ([]*pb.Request, error) {
 	}, nil
 }
 
-func (c *Convert) DeleteToRequests(m *pb.DeleteRequest) ([]*pb.Request, error) {
+func (c *Transcoder) TransactionalDeleteToRequests(m *pb.DeleteRequest) ([]*pb.Request, error) {
 	return []*pb.Request{
 		{
 			IsTxn: true,
