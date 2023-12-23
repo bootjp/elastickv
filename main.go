@@ -14,6 +14,7 @@ import (
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	tran "github.com/bootjp/elastickv/transport"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -23,9 +24,8 @@ import (
 )
 
 var (
-	myAddr = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	raftId = flag.String("raft_id", "", "Node id used by Raft")
-
+	myAddr        = flag.String("address", "localhost:50051", "TCP host+port for this node")
+	raftId        = flag.String("raft_id", "", "Node id used by Raft")
 	raftDir       = flag.String("raft_data_dir", "data/", "Raft data dir")
 	raftBootstrap = flag.Bool("raft_bootstrap", false, "Whether to bootstrap the Raft cluster")
 )
@@ -54,7 +54,7 @@ func main() {
 		log.Fatalf("failed to start raft: %v", err)
 	}
 	s := grpc.NewServer()
-	pb.RegisterRawKVServer(s, kv.NewGRPCServer(kvFSM, store, r))
+	pb.RegisterRawKVServer(s, tran.NewGRPCServer(kvFSM, store, r))
 	tm.Register(s)
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
 	raftadmin.Register(s, r)

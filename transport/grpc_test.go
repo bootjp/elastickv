@@ -1,4 +1,4 @@
-package kv
+package transport
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	_ "github.com/Jille/grpc-multi-resolver"
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	"github.com/Jille/raftadmin"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
@@ -87,13 +88,13 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 	ctx := context.Background()
 
 	for i := 0; i < n; i++ {
-		st := NewMemoryStore()
-		trxSt := NewMemoryStore()
-		fsm := NewKvFSM(st, trxSt)
+		st := kv.NewMemoryStore()
+		trxSt := kv.NewMemoryStore()
+		fsm := kv.NewKvFSM(st, trxSt)
 
 		port := ports[i]
 
-		r, tm, err := NewRaft(ctx, strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
+		r, tm, err := kv.NewRaft(ctx, strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
 		assert.NoError(t, err)
 
 		s := grpc.NewServer()
