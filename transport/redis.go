@@ -2,14 +2,16 @@ package transport
 
 import (
 	"context"
-	"log"
+	"net"
 	"strings"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
 )
 
 type RedisServer struct {
+	listen          net.Listener
 	store           kv.Store
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
@@ -23,8 +25,9 @@ const (
 	delCmdArgsLen = 2
 )
 
-func NewRedisServer(store kv.Store, coordinate *kv.Coordinate) *RedisServer {
+func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordinate) *RedisServer {
 	r := &RedisServer{
+		listen:          listen,
 		store:           store,
 		coordinator:     coordinate,
 		redisTranscoder: newRedisTranscoder(),
@@ -39,9 +42,8 @@ func NewRedisServer(store kv.Store, coordinate *kv.Coordinate) *RedisServer {
 
 	return r
 }
-
-func (r *RedisServer) Run(addr string) {
-	err := redcon.ListenAndServe(addr,
+func (r *RedisServer) Run() error {
+	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			f, ok := r.route[strings.ToUpper(string(cmd.Args[0]))]
 			if ok {
@@ -61,9 +63,12 @@ func (r *RedisServer) Run(addr string) {
 			// log.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
 		},
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
+
+	return errors.WithStack(err)
+}
+
+func (r *RedisServer) Stop() {
+	_ = r.listen.Close()
 }
 
 func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {

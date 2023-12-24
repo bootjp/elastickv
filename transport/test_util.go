@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,49 +18,81 @@ import (
 	"google.golang.org/grpc"
 )
 
-func shutdown(nodes []*grpc.Server) {
+func shutdown(nodes []Node) {
 	for _, n := range nodes {
-		n.Stop()
+		n.grpcServer.Stop()
+		n.redisServer.Stop()
 	}
 }
 
 type portsAdress struct {
-	grpc        int
-	raft        int
-	grpcAddress string
-	raftAddress string
+	grpc         int
+	raft         int
+	redis        int
+	grpcAddress  string
+	raftAddress  string
+	redisAddress string
 }
 
 const (
 	// raft and the grpc requested by the client use grpc and are received on the same port
 	grpcPort = 50000
 	raftPort = 50000
+
+	redisPort = 63790
 )
 
+var mu sync.Mutex
 var portGrpc atomic.Int32
 var portRaft atomic.Int32
+var portRedis atomic.Int32
 
 func init() {
 	portGrpc.Store(raftPort)
 	portRaft.Store(grpcPort)
+	portRedis.Store(redisPort)
+
 }
 
 func portAssigner() portsAdress {
-
+	mu.Lock()
+	defer mu.Unlock()
 	gp := portGrpc.Add(1)
 	rp := portRaft.Add(1)
+	rd := portRedis.Add(1)
 	return portsAdress{
-		grpc:        int(gp),
-		raft:        int(rp),
-		grpcAddress: net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
-		raftAddress: net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
+		grpc:         int(gp),
+		raft:         int(rp),
+		redis:        int(rd),
+		grpcAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
+		raftAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
+		redisAddress: net.JoinHostPort("localhost", strconv.Itoa(int(rd))),
+	}
+}
+
+type Node struct {
+	grpcAddress  string
+	raftAddress  string
+	redisAddress string
+	grpcServer   *grpc.Server
+	redisServer  *RedisServer
+}
+
+func newNode(grpcAddress, raftAddress, redisAddress string, grpcs *grpc.Server, rd *RedisServer) Node {
+	return Node{
+		grpcAddress:  grpcAddress,
+		raftAddress:  raftAddress,
+		redisAddress: redisAddress,
+		grpcServer:   grpcs,
+		redisServer:  rd,
 	}
 }
 
 //nolint:unparam
-func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
+func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	var grpcAdders []string
-	var nodes []*grpc.Server
+	var redisAdders []string
+	var nodes []Node
 
 	cfg := raft.Configuration{}
 	ports := make([]portsAdress, n)
@@ -111,15 +144,30 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 		assert.NoError(t, err)
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
+		redisAdders = append(redisAdders, port.redisAddress)
 		go func() {
 			assert.NoError(t, s.Serve(grpcSock))
 		}()
 
-		nodes = append(nodes, s)
+		l, err := net.Listen("tcp", port.redisAddress)
+		assert.NoError(t, err)
+		rd := NewRedisServer(l, st, coordinator)
+		go func() {
+			assert.NoError(t, rd.Run())
+		}()
+
+		nodes = append(nodes, newNode(
+			port.grpcAddress,
+			port.raftAddress,
+			port.redisAddress,
+			s,
+			rd),
+		)
+
 	}
 
 	//nolint:gomnd
 	time.Sleep(3 * time.Second)
 
-	return nodes, grpcAdders
+	return nodes, grpcAdders, redisAdders
 }

@@ -17,7 +17,7 @@ import (
 
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
-	nodes, adders := createNode(t, 3)
+	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
 	defer shutdown(nodes)
 
@@ -48,7 +48,7 @@ func Test_value_can_be_deleted(t *testing.T) {
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
-	nodes, adders := createNode(t, 3)
+	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
 
 	wg := sync.WaitGroup{}
@@ -77,7 +77,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	t.Parallel()
-	nodes, adders := createNode(t, 3)
+	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
 	defer shutdown(nodes)
 
@@ -103,7 +103,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 
 func Test_grpc_transaction(t *testing.T) {
 	t.Parallel()
-	nodes, adders := createNode(t, 3)
+	nodes, adders, _ := createNode(t, 3)
 	c := transactionalKVClient(t, adders)
 	defer shutdown(nodes)
 
