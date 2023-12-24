@@ -20,9 +20,10 @@ type RedisServer struct {
 }
 
 const (
-	getCmdArgsLen = 2
-	setCmdArgsLen = 3
-	delCmdArgsLen = 2
+	getCmdArgsLen   = 2
+	setCmdArgsLen   = 3
+	delCmdArgsLen   = 2
+	existCmdArgsLen = 2
 )
 
 func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordinate) *RedisServer {
@@ -34,10 +35,11 @@ func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordina
 	}
 
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		"PING": r.ping,
-		"SET":  r.set,
-		"GET":  r.get,
-		"DEL":  r.del,
+		"PING":   r.ping,
+		"SET":    r.set,
+		"GET":    r.get,
+		"DEL":    r.del,
+		"EXISTS": r.Exists,
 	}
 
 	return r
@@ -130,4 +132,24 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	conn.WriteInt(1)
+}
+
+func (r *RedisServer) Exists(conn redcon.Conn, cmd redcon.Command) {
+	if len(cmd.Args) != existCmdArgsLen {
+		//nolint:goconst
+		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+		return
+	}
+
+	ok, err := r.store.Exists(context.Background(), cmd.Args[1])
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	if ok {
+		conn.WriteInt(1)
+		return
+	}
+	conn.WriteInt(0)
 }

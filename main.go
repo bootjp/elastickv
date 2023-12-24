@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
@@ -25,6 +27,7 @@ import (
 
 var (
 	myAddr        = flag.String("address", "localhost:50051", "TCP host+port for this node")
+	redisAddr     = flag.String("redis_address", "localhost:6379", "TCP host+port for redis")
 	raftId        = flag.String("raft_id", "", "Node id used by Raft")
 	raftDir       = flag.String("raft_data_dir", "data/", "Raft data dir")
 	raftBootstrap = flag.Bool("raft_bootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -42,26 +45,46 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to parse local address (%q): %v", *myAddr, err)
 	}
-	sock, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+
+	grpcSock, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
+
 	store := kv.NewMemoryStore()
 	lockStore := kv.NewMemoryStore()
 	kvFSM := kv.NewKvFSM(store, lockStore)
+
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {
 		log.Fatalf("failed to start raft: %v", err)
 	}
+
 	s := grpc.NewServer()
 	coordinate := kv.NewCoordinator(kv.NewTransaction(r))
 	pb.RegisterRawKVServer(s, tran.NewGRPCServer(store, coordinate))
 	pb.RegisterTransactionalKVServer(s, tran.NewGRPCServer(store, coordinate))
 	tm.Register(s)
+
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
 	raftadmin.Register(s, r)
 	reflection.Register(s)
-	if err := s.Serve(sock); err != nil {
+
+	redisL, err := net.Listen("tcp", *redisAddr)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		return errors.WithStack(s.Serve(grpcSock))
+	})
+	eg.Go(func() error {
+		return errors.WithStack(tran.NewRedisServer(redisL, store, coordinate).Run())
+	})
+
+	err = eg.Wait()
+	if err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
