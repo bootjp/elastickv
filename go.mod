@@ -16,6 +16,7 @@ require (
 	github.com/stretchr/testify v1.8.4
 	github.com/tidwall/redcon v1.6.2
 	go.etcd.io/bbolt v1.3.8
+	golang.org/x/sync v0.4.0
 	google.golang.org/grpc v1.60.1
 	google.golang.org/protobuf v1.32.0
 )

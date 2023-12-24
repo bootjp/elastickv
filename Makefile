@@ -4,13 +4,13 @@ clear:
 
 
 runA:
-	go run main.go --raft_bootstrap --raft_id=nodeA --address=localhost:50051 --raft_data_dir /tmp/my-raft-cluster
+	go run main.go --raft_id=nodeA --address=localhost:50051 --redis_address=localhost:63791 --raft_data_dir /tmp/my-raft-cluster --raft_bootstrap
 
 runB:
-	go run main.go --raft_id=nodeB --address=localhost:50052 --raft_data_dir /tmp/my-raft-cluster
+	go run main.go --raft_id=nodeB --address=localhost:50052 --redis_address=localhost:63792 --raft_data_dir /tmp/my-raft-cluster
 
 runC:
-	go run main.go --raft_id=nodeC --address=localhost:50053 --raft_data_dir /tmp/my-raft-cluster
+	go run main.go --raft_id=nodeC --address=localhost:50053 --redis_address=localhost:63793 --raft_data_dir /tmp/my-raft-cluster
 
 
 addNodes:
