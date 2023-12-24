@@ -25,8 +25,6 @@ type GRPCServer struct {
 	pb.UnimplementedTransactionalKVServer
 }
 
-var ErrRetryable = errors.New("retryable error")
-
 func NewGRPCServer(store kv.Store, raft *raft.Raft) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
