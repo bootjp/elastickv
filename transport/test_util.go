@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"context"
 	"net"
 	"strconv"
 	"sync"
@@ -10,12 +9,16 @@ import (
 	"time"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
+	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func shutdown(nodes []Node) {
@@ -119,8 +122,6 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		cfg.Servers = append(cfg.Servers, server)
 	}
 
-	ctx := context.Background()
-
 	for i := 0; i < n; i++ {
 		st := kv.NewMemoryStore()
 		trxSt := kv.NewMemoryStore()
@@ -128,7 +129,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 
 		port := ports[i]
 
-		r, tm, err := kv.NewRaft(ctx, strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
+		r, tm, err := newRaft(strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg)
 		assert.NoError(t, err)
 
 		s := grpc.NewServer()
@@ -170,4 +171,37 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	time.Sleep(3 * time.Second)
 
 	return nodes, grpcAdders, redisAdders
+}
+
+func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration) (*raft.Raft, *transport.Manager, error) {
+	c := raft.DefaultConfig()
+	c.LocalID = raft.ServerID(myID)
+
+	// this config is for development
+	ldb := raft.NewInmemStore()
+	sdb := raft.NewInmemStore()
+	fss := raft.NewInmemSnapshotStore()
+
+	c.Logger = hclog.New(&hclog.LoggerOptions{
+		Name:  "raft-" + myID,
+		Level: hclog.LevelFromString("WARN"),
+	})
+
+	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	})
+
+	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	if bootstrap {
+		f := r.BootstrapCluster(cfg)
+		if err := f.Error(); err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+	}
+
+	return r, tm, nil
 }
