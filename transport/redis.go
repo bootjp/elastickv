@@ -77,6 +77,7 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != setCmdArgsLen {
+		//nolint:goconst
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
@@ -97,6 +98,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != getCmdArgsLen {
+		//nolint:goconst
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
@@ -111,6 +113,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != delCmdArgsLen {
+		//nolint:goconst
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
