@@ -13,6 +13,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.8.4
+	github.com/tidwall/redcon v1.6.2
 	go.etcd.io/bbolt v1.3.8
 	google.golang.org/grpc v1.60.1
 	google.golang.org/protobuf v1.32.0
@@ -40,6 +41,8 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
+	github.com/tidwall/btree v1.1.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
 	golang.org/x/net v0.16.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect

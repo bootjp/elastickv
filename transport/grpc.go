@@ -8,7 +8,6 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"github.com/spaolacci/murmur3"
 )
 
@@ -25,13 +24,13 @@ type GRPCServer struct {
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store kv.Store, raft *raft.Raft) *GRPCServer {
+func NewGRPCServer(store kv.Store, coordinate *kv.Coordinate) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
 		grpcTranscoder: newGrpcGrpcTranscoder(),
-		coordinator:    kv.NewCoordinator(kv.NewTransaction(raft)),
+		coordinator:    coordinate,
 		store:          store,
 	}
 }
