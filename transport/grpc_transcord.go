@@ -5,14 +5,14 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 )
 
-type GrpcTranscoder struct {
+type grpcTranscoder struct {
 }
 
-func NewGrpcGrpcTranscoder() *GrpcTranscoder {
-	return &GrpcTranscoder{}
+func newGrpcGrpcTranscoder() *grpcTranscoder {
+	return &grpcTranscoder{}
 }
 
-func (c *GrpcTranscoder) RawPutToRequest(m *pb.RawPutRequest) (*kv.OperationGroup[kv.OP], error) {
+func (c *grpcTranscoder) RawPutToRequest(m *pb.RawPutRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn: false,
 		Elems: []*kv.Elem[kv.OP]{
@@ -25,7 +25,7 @@ func (c *GrpcTranscoder) RawPutToRequest(m *pb.RawPutRequest) (*kv.OperationGrou
 	}, nil
 }
 
-func (c *GrpcTranscoder) RawDeleteToRequest(m *pb.RawDeleteRequest) (*kv.OperationGroup[kv.OP], error) {
+func (c *grpcTranscoder) RawDeleteToRequest(m *pb.RawDeleteRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn: false,
 		Elems: []*kv.Elem[kv.OP]{
@@ -37,7 +37,7 @@ func (c *GrpcTranscoder) RawDeleteToRequest(m *pb.RawDeleteRequest) (*kv.Operati
 	}, nil
 }
 
-func (c *GrpcTranscoder) TransactionalPutToRequests(m *pb.PutRequest) (*kv.OperationGroup[kv.OP], error) {
+func (c *grpcTranscoder) TransactionalPutToRequests(m *pb.PutRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		Elems: []*kv.Elem[kv.OP]{
@@ -50,7 +50,7 @@ func (c *GrpcTranscoder) TransactionalPutToRequests(m *pb.PutRequest) (*kv.Opera
 	}, nil
 }
 
-func (c *GrpcTranscoder) TransactionalDeleteToRequests(m *pb.DeleteRequest) (*kv.OperationGroup[kv.OP], error) {
+func (c *grpcTranscoder) TransactionalDeleteToRequests(m *pb.DeleteRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		Elems: []*kv.Elem[kv.OP]{

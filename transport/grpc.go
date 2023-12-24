@@ -16,26 +16,25 @@ var _ pb.RawKVServer = (*GRPCServer)(nil)
 var _ pb.TransactionalKVServer = (*GRPCServer)(nil)
 
 type GRPCServer struct {
+	log            *slog.Logger
+	grpcTranscoder *grpcTranscoder
+	coordinator    kv.Coordinator
+	store          kv.Store
+
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
-	fsm            kv.FSM
-	store          kv.Store
-	log            *slog.Logger
-	grpcTranscoder GrpcTranscoder
-	coordinator    kv.Coordinator
 }
 
 var ErrRetryable = errors.New("retryable error")
 
-func NewGRPCServer(fsm kv.FSM, store kv.Store, raft *raft.Raft) *GRPCServer {
+func NewGRPCServer(store kv.Store, raft *raft.Raft) *GRPCServer {
 	return &GRPCServer{
-		fsm:   fsm,
-		store: store,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		grpcTranscoder: GrpcTranscoder{},
+		grpcTranscoder: newGrpcGrpcTranscoder(),
 		coordinator:    kv.NewCoordinator(kv.NewTransaction(raft)),
+		store:          store,
 	}
 }
 

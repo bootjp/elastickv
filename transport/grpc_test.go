@@ -98,7 +98,7 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 		assert.NoError(t, err)
 
 		s := grpc.NewServer()
-		gs := NewGRPCServer(fsm, st, r)
+		gs := NewGRPCServer(st, r)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
@@ -116,7 +116,7 @@ func createNode(t *testing.T, n int) ([]*grpc.Server, []string) {
 		nodes = append(nodes, s)
 	}
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	return nodes, grpcAdders
 }
@@ -232,7 +232,6 @@ func Test_grpc_transaction(t *testing.T) {
 		resp, err = c.Get(context.TODO(), &pb.GetRequest{Key: key})
 		assert.NoError(t, err, "Get RPC failed")
 		assert.Nil(t, resp.Value, "consistency check failed")
-
 	}
 }
 
@@ -240,6 +239,7 @@ func rawKVClient(t *testing.T, hosts []string) pb.RawKVClient {
 	dials := "multi:///" + strings.Join(hosts, ",")
 	conn, err := grpc.Dial(dials,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 
 	assert.NoError(t, err)
@@ -250,6 +250,7 @@ func transactionalKVClient(t *testing.T, hosts []string) pb.TransactionalKVClien
 	dials := "multi:///" + strings.Join(hosts, ",")
 	conn, err := grpc.Dial(dials,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 
 	assert.NoError(t, err)

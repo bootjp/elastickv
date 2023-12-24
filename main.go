@@ -54,7 +54,7 @@ func main() {
 		log.Fatalf("failed to start raft: %v", err)
 	}
 	s := grpc.NewServer()
-	pb.RegisterRawKVServer(s, tran.NewGRPCServer(kvFSM, store, r))
+	pb.RegisterRawKVServer(s, tran.NewGRPCServer(store, r))
 	tm.Register(s)
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
 	raftadmin.Register(s, r)
