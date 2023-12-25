@@ -83,12 +83,15 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 			return nil, errors.WithStack(err)
 		}
 
-		err = t.raft.Apply(b, time.Second).Error()
-		if err != nil {
-			return nil, errors.WithStack(err)
+		af := t.raft.Apply(b, time.Second)
+		if af.Error() != nil {
+			return nil, errors.WithStack(af.Error())
 		}
-		t.raft.Barrier(time.Second)
-		commitIndex = t.raft.LastIndex()
+		f := t.raft.Barrier(time.Second)
+		if f.Error() != nil {
+			return nil, errors.WithStack(f.Error())
+		}
+		commitIndex = af.Index()
 	}
 
 	return &TransactionResponse{
