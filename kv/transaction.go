@@ -29,24 +29,26 @@ type TransactionResponse struct {
 }
 
 func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	var commitIndex uint64
-
-	err := func() error {
+	commitIndex, err := func() (uint64, error) {
+		commitIndex := uint64(0)
 		for _, req := range reqs {
 			b, err := proto.Marshal(req)
 			if err != nil {
-				return errors.WithStack(err)
+				return 0, errors.WithStack(err)
 			}
 
-			err = t.raft.Apply(b, time.Second).Error()
-			if err != nil {
-				return errors.WithStack(err)
+			af := t.raft.Apply(b, time.Second)
+			if af.Error() != nil {
+				return 0, errors.WithStack(af.Error())
 			}
-			t.raft.Barrier(time.Second)
-			commitIndex = t.raft.LastIndex()
+			f := t.raft.Barrier(time.Second)
+			if f.Error() != nil {
+				return 0, errors.WithStack(f.Error())
+			}
+			commitIndex = af.Index()
 		}
 
-		return nil
+		return commitIndex, nil
 	}()
 
 	if err != nil {
