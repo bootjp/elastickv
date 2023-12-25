@@ -20,8 +20,7 @@ var argsLen = map[string]int{
 }
 
 const (
-	indexKey   = 1
-	indexValue = 2
+	indexKey = 1
 )
 
 type RedisServer struct {
@@ -52,29 +51,25 @@ func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordina
 	return r
 }
 func (r *RedisServer) Run() error {
-	err := redcon.Serve(r.listen, func(conn redcon.Conn, cmd redcon.Command) {
-		if err := r.validateCmd(cmd); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		if err := r.validateKey(cmd.Args[indexKey]); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
+	err := redcon.Serve(r.listen,
+		func(conn redcon.Conn, cmd redcon.Command) {
+			if err := r.validateCmd(cmd); err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
+			if err := r.validateKey(cmd.Args[indexKey]); err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
 
-		if err := r.validateValue(cmd.Args[indexValue]); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
+			f, ok := r.route[strings.ToUpper(string(cmd.Args[0]))]
+			if ok {
+				f(conn, cmd)
+				return
+			}
 
-		f, ok := r.route[strings.ToUpper(string(cmd.Args[0]))]
-		if ok {
-			f(conn, cmd)
-			return
-		}
-
-		conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
-	},
+			conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
+		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
 			// log.Printf("accept: %s", conn.RemoteAddr())
@@ -102,13 +97,6 @@ func (r *RedisServer) validateCmd(cmd redcon.Command) error {
 func (r *RedisServer) validateKey(key []byte) error {
 	if len(key) == 0 {
 		return errors.New("ERR wrong number of arguments for '" + string(key) + "' command")
-	}
-	return nil
-}
-
-func (r *RedisServer) validateValue(value []byte) error {
-	if len(value) == 0 {
-		return errors.New("ERR wrong number of arguments for '" + string(value) + "' command")
 	}
 	return nil
 }
