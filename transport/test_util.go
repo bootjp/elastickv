@@ -133,11 +133,14 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		assert.NoError(t, err)
 
 		s := grpc.NewServer()
-		coordinator := kv.NewCoordinator(kv.NewTransaction(r))
+		trx := kv.NewTransaction(r)
+		coordinator := kv.NewCoordinator(trx, r)
 		gs := NewGRPCServer(st, coordinator)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
+		pb.RegisterInternalServer(s, NewInternal(trx, r))
+
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 

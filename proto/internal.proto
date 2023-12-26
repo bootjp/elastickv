@@ -3,6 +3,11 @@ syntax = "proto3";
 option go_package = "github.com/bootjp/elastickv/proto";
 
 
+service Internal {
+  // for internal leader redirect only
+  rpc Forward(ForwardRequest) returns (ForwardResponse) {}
+}
+
 // internal.proto is node to node communication message in raft replication.
 enum Op {
   PUT = 0;
@@ -27,6 +32,17 @@ message Request {
   Phase phase = 2;
   uint64 ts = 3;
   repeated Mutation mutations = 4;
+}
+
+message ForwardRequest {
+  bool is_txn = 1;
+  repeated Request requests = 2;
+}
+
+// for internal leader redirect
+message ForwardResponse {
+  bool success = 1;
+  uint64 commit_index = 2;
 }
 
 

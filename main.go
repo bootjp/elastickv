@@ -60,9 +60,11 @@ func main() {
 	}
 
 	s := grpc.NewServer()
-	coordinate := kv.NewCoordinator(kv.NewTransaction(r))
+	trx := kv.NewTransaction(r)
+	coordinate := kv.NewCoordinator(trx, r)
 	pb.RegisterRawKVServer(s, tran.NewGRPCServer(store, coordinate))
 	pb.RegisterTransactionalKVServer(s, tran.NewGRPCServer(store, coordinate))
+	pb.RegisterInternalServer(s, tran.NewInternal(trx, r))
 	tm.Register(s)
 
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
