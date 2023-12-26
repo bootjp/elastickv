@@ -97,7 +97,7 @@ func (s *boltStore) Delete(ctx context.Context, key []byte) error {
 }
 
 func (s *boltStore) Exists(ctx context.Context, key []byte) (bool, error) {
-	s.log.InfoContext(ctx, "Exists",
+	s.log.InfoContext(ctx, "exists",
 		slog.String("key", string(key)),
 	)
 
