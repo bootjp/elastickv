@@ -41,7 +41,7 @@ func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordina
 		"SET":    r.set,
 		"GET":    r.get,
 		"DEL":    r.del,
-		"EXISTS": r.Exists,
+		"EXISTS": r.exists,
 	}
 
 	return r
@@ -81,7 +81,8 @@ func (r *RedisServer) Stop() {
 
 func (r *RedisServer) validateCmd(cmd redcon.Command) error {
 	if len(cmd.Args) != argsLen[strings.ToUpper(string(cmd.Args[0]))] {
-		return errors.New("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+		//nolint:wrapcheck
+		return errors.Newf("ERR wrong number of arguments for '%s' command", string(cmd.Args[0]))
 	}
 	return nil
 }
@@ -132,7 +133,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(1)
 }
 
-func (r *RedisServer) Exists(conn redcon.Conn, cmd redcon.Command) {
+func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	ok, err := r.store.Exists(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())

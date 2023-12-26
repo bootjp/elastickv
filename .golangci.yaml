@@ -33,8 +33,9 @@ linters:
 
 issues:
   exclude-rules:
-    - path: (.+)_test.go
+    - path: (.*)test(.*).go
       linters:
         - funlen
         - goconst
         - wrapcheck
+        - dupl

@@ -1,13 +1,19 @@
 package kv
 
 import (
+	"context"
+
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/raft"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-func NewCoordinator(txm Transactional) *Coordinate {
+func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
 	return &Coordinate{
 		transactionManager: txm,
+		raft:               r,
 	}
 }
 
@@ -17,15 +23,21 @@ type CoordinateResponse struct {
 
 type Coordinate struct {
 	transactionManager Transactional
+	raft               *raft.Raft
 }
 
 var _ Coordinator = (*Coordinate)(nil)
 
 type Coordinator interface {
 	Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error)
+	IsLeader() bool
 }
 
 func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if !c.IsLeader() {
+		return c.redirect(reqs)
+	}
+
 	switch reqs.IsTxn {
 	case true:
 		return c.dispatchTxn(reqs.Elems)
@@ -34,6 +46,10 @@ func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 	}
 
 	panic("unreachable")
+}
+
+func (c *Coordinate) IsLeader() bool {
+	return c.raft.State() == raft.Leader
 }
 
 func (c *Coordinate) dispatchTxn(reqs []*Elem[OP]) (*CoordinateResponse, error) {
@@ -151,4 +167,55 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 	}
 
 	panic("unreachable")
+}
+
+var ErrInvalidRequest = errors.New("invalid request")
+
+func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	ctx := context.Background()
+
+	if len(reqs.Elems) == 0 {
+		return nil, ErrInvalidRequest
+	}
+
+	addr, _ := c.raft.LeaderWithID()
+
+	conn, err := grpc.Dial(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer conn.Close()
+
+	cli := pb.NewInternalClient(conn)
+
+	var requests []*pb.Request
+	for _, req := range reqs.Elems {
+		requests = append(requests, c.toRawRequest(req))
+	}
+
+	r, err := cli.Forward(ctx, c.toForwardRequest(requests))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &CoordinateResponse{
+		CommitIndex: r.CommitIndex,
+	}, nil
+}
+
+func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	out := &pb.ForwardRequest{
+		IsTxn:    reqs[0].IsTxn,
+		Requests: make([]*pb.Request, 0, len(reqs)),
+	}
+	out.Requests = reqs
+
+	return out
 }
