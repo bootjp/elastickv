@@ -154,10 +154,6 @@ func (s *boltStore) hash(_ []byte) (uint64, error) {
 	return 0, ErrNotImplemented
 }
 
-func (s *boltStore) Name() string {
-	return "bolt"
-}
-
 func (s *boltStore) Close() error {
 	return errors.WithStack(s.bbolt.Close())
 }
