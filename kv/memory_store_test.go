@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -130,5 +131,65 @@ func TestMemoryStore_Txn(t *testing.T) {
 		}
 		wg.Wait()
 	})
+}
 
+func TestMemoryStore_TTL(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	st := NewMemoryStoreWithExpire(time.Second)
+	wg := &sync.WaitGroup{}
+	for i := 0; i < 9999; i++ {
+		wg.Add(1)
+		go func(i int) {
+			key := []byte(strconv.Itoa(i) + "foo")
+			err := st.PutWithTTL(ctx, key, []byte("bar"), 1)
+			assert.NoError(t, err)
+
+			res, err := st.Get(ctx, key)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("bar"), res)
+
+			time.Sleep(11 * time.Second)
+
+			res, err = st.Get(ctx, key)
+			assert.ErrorIs(t, ErrNotFound, err)
+			assert.Nil(t, res)
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestMemoryStore_TTL_Txn(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	st := NewMemoryStoreWithExpire(time.Second)
+	wg := &sync.WaitGroup{}
+	for i := 0; i < 9999; i++ {
+		wg.Add(1)
+		go func(i int) {
+			key := []byte(strconv.Itoa(i) + "foo")
+			err := st.TxnWithTTL(ctx, func(ctx context.Context, txn TTLTxn) error {
+				err := txn.PutWithTTL(ctx, key, []byte("bar"), 1)
+				assert.NoError(t, err)
+
+				res, err := txn.Get(ctx, key)
+				assert.NoError(t, err)
+				assert.Equal(t, []byte("bar"), res)
+
+				// wait for ttl
+				go func(key []byte) {
+					time.Sleep(11 * time.Second)
+
+					res, err = st.Get(ctx, key)
+					assert.ErrorIs(t, ErrNotFound, err)
+					assert.Nil(t, res)
+					wg.Done()
+				}(key)
+				return nil
+			})
+			assert.NoError(t, err)
+		}(i)
+	}
+	wg.Wait()
 }

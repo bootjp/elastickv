@@ -8,48 +8,59 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
 )
 
-var ErrNotFound = errors.New("not found")
-
-type Store interface {
-	Get(ctx context.Context, key []byte) ([]byte, error)
-	Put(ctx context.Context, key []byte, value []byte) error
-	Delete(ctx context.Context, key []byte) error
-	Close() error
-	Exists(ctx context.Context, key []byte) (bool, error)
-	Name() string
-	Snapshot() (io.ReadWriter, error)
-	Restore(buf io.Reader) error
-	Txn(ctx context.Context, f func(ctx context.Context, txn Txn) error) error
-
-	hash([]byte) (uint64, error)
-}
-
-type Txn interface {
-	Get(ctx context.Context, key []byte) ([]byte, error)
-	Put(ctx context.Context, key []byte, value []byte) error
-	Delete(ctx context.Context, key []byte) error
-	Exists(ctx context.Context, key []byte) (bool, error)
-}
-
 type memoryStore struct {
 	mtx sync.RWMutex
-	m   map[uint64][]byte
+	// key -> value
+	m map[uint64][]byte
+	// key -> ttl
+	ttl map[uint64]int64
 	log *slog.Logger
+
+	expire *time.Ticker
 }
 
+const (
+	defaultExpireInterval = 30 * time.Second
+)
+
 func NewMemoryStore() Store {
-	return &memoryStore{
+	m := &memoryStore{
 		mtx: sync.RWMutex{},
 		m:   map[uint64][]byte{},
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
+
+		ttl: nil,
 	}
+
+	m.expire = nil
+
+	return m
+}
+
+func NewMemoryStoreWithExpire(interval time.Duration) TTLStore {
+	//nolint:forcetypeassert
+	m := NewMemoryStore().(*memoryStore)
+	m.expire = time.NewTicker(interval)
+	m.ttl = map[uint64]int64{}
+
+	go func() {
+		for range m.expire.C {
+			m.cleanExpired()
+		}
+	}()
+	return m
+}
+
+func NewMemoryStoreDefaultTTL() TTLStore {
+	return NewMemoryStoreWithExpire(defaultExpireInterval)
 }
 
 var _ Store = &memoryStore{}
@@ -125,87 +136,6 @@ func (s *memoryStore) Exists(ctx context.Context, key []byte) (bool, error) {
 	return ok, nil
 }
 
-type OpType uint8
-
-const (
-	OpTypePut OpType = iota
-	OpTypeDelete
-)
-
-type Op struct {
-	op OpType
-	h  uint64
-	v  []byte
-}
-
-type memoryStoreTxn struct {
-	mu *sync.RWMutex
-	// トランザクション中のメモリデータ
-	m map[uint64][]byte
-	// トランザクション中の時系列操作
-	ops []Op
-	s   *memoryStore
-}
-
-func (s *memoryStore) NewTxn() *memoryStoreTxn {
-	return &memoryStoreTxn{
-		mu:  &sync.RWMutex{},
-		m:   map[uint64][]byte{},
-		ops: []Op{},
-		s:   s,
-	}
-}
-
-func (t *memoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
-	h, err := t.s.hash(key)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	v, ok := t.m[h]
-	if ok {
-		return v, nil
-	}
-
-	// トランザクション中に削除されている場合はErrNotFoundを返す
-	for _, op := range t.ops {
-		if op.h != h {
-			continue
-		}
-		if op.op == OpTypeDelete {
-			return nil, ErrNotFound
-		}
-	}
-
-	v, ok = t.s.m[h]
-	if !ok {
-		return nil, ErrNotFound
-	}
-
-	return v, nil
-}
-
-func (t *memoryStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	h, err := t.s.hash(key)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	t.m[h] = value
-	t.ops = append(t.ops, Op{
-		h:  h,
-		op: OpTypePut,
-		v:  value,
-	})
-	return nil
-}
-
 func (s *memoryStore) Txn(ctx context.Context, f func(ctx context.Context, txn Txn) error) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -217,7 +147,7 @@ func (s *memoryStore) Txn(ctx context.Context, f func(ctx context.Context, txn T
 	}
 
 	for _, op := range txn.ops {
-		switch op.op {
+		switch op.opType {
 		case OpTypePut:
 			s.m[op.h] = op.v
 		case OpTypeDelete:
@@ -230,50 +160,30 @@ func (s *memoryStore) Txn(ctx context.Context, f func(ctx context.Context, txn T
 	return nil
 }
 
-func (t *memoryStoreTxn) Delete(_ context.Context, key []byte) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (s *memoryStore) TxnWithTTL(ctx context.Context, f func(ctx context.Context, txn TTLTxn) error) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	txn := s.NewTTLTxn()
 
-	h, err := t.s.hash(key)
+	err := f(ctx, txn)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	delete(t.m, h)
-	t.ops = append(t.ops, Op{
-		h:  h,
-		op: OpTypeDelete,
-	})
+	for _, op := range txn.ops {
+		switch op.opType {
+		case OpTypePut:
+			s.m[op.h] = op.v
+			s.ttl[op.h] = op.ttl
+		case OpTypeDelete:
+			delete(s.m, op.h)
+			delete(s.ttl, op.h)
+		default:
+			return errors.WithStack(ErrUnknownRequestType)
+		}
+	}
 
 	return nil
-}
-
-func (t *memoryStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
-	h, err := t.s.hash(key)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	_, ok := t.m[h]
-	if ok {
-		return true, nil
-	}
-
-	// トランザクション中に削除されている場合はfalseを返す
-	for _, op := range t.ops {
-		if op.h != h {
-			continue
-		}
-		if op.op == OpTypeDelete {
-			return false, nil
-		}
-	}
-
-	_, ok = t.s.m[h]
-	return ok, nil
 }
 
 func (s *memoryStore) hash(key []byte) (uint64, error) {
@@ -286,10 +196,6 @@ func (s *memoryStore) hash(key []byte) (uint64, error) {
 
 func (s *memoryStore) Close() error {
 	return nil
-}
-
-func (s *memoryStore) Name() string {
-	return "memory"
 }
 
 func (s *memoryStore) Snapshot() (io.ReadWriter, error) {
@@ -317,6 +223,236 @@ func (s *memoryStore) Restore(buf io.Reader) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+
+	return nil
+}
+
+func (s *memoryStore) Expire(ctx context.Context, key []byte, ttl int64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	h, err := s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	s.ttl[h] = time.Now().Unix() + ttl
+	s.log.InfoContext(ctx, "Expire",
+		slog.String("key", string(key)),
+		slog.Uint64("hash", h),
+		slog.Int64("ttl", ttl),
+	)
+
+	return nil
+}
+
+func (s *memoryStore) PutWithTTL(ctx context.Context, key []byte, value []byte, ttl int64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	h, err := s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	s.m[h] = value
+	s.ttl[h] = time.Now().Unix() + ttl
+	s.log.InfoContext(ctx, "Put",
+		slog.String("key", string(key)),
+		slog.Uint64("hash", h),
+		slog.String("value", string(value)),
+	)
+
+	return nil
+}
+
+func (s *memoryStore) cleanExpired() {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	now := time.Now().Unix()
+	for k, v := range s.ttl {
+		if v > now {
+			continue
+		}
+		delete(s.m, k)
+		delete(s.ttl, k)
+	}
+}
+
+type OpType uint8
+
+const (
+	OpTypePut OpType = iota
+	OpTypeDelete
+)
+
+type op struct {
+	opType OpType
+	h      uint64
+	v      []byte
+	ttl    int64
+}
+
+type memoryStoreTxn struct {
+	mu *sync.RWMutex
+	// Memory Structure during Transaction
+	m map[uint64][]byte
+	// Time series operations during a transaction
+	ops []op
+	s   *memoryStore
+}
+
+func (s *memoryStore) NewTxn() *memoryStoreTxn {
+	return &memoryStoreTxn{
+		mu:  &sync.RWMutex{},
+		m:   map[uint64][]byte{},
+		ops: []op{},
+		s:   s,
+	}
+}
+
+func (s *memoryStore) NewTTLTxn() *memoryStoreTxn {
+	return &memoryStoreTxn{
+		mu:  &sync.RWMutex{},
+		m:   map[uint64][]byte{},
+		ops: []op{},
+		s:   s,
+	}
+}
+
+func (t *memoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
+	h, err := t.s.hash(key)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	v, ok := t.m[h]
+	if ok {
+		return v, nil
+	}
+
+	// Return ErrNotFound if deleted during transaction
+	for _, op := range t.ops {
+		if op.h != h {
+			continue
+		}
+		if op.opType == OpTypeDelete {
+			return nil, ErrNotFound
+		}
+	}
+
+	v, ok = t.s.m[h]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	return v, nil
+}
+
+func (t *memoryStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	h, err := t.s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	t.m[h] = value
+	t.ops = append(t.ops, op{
+		h:      h,
+		opType: OpTypePut,
+		v:      value,
+	})
+	return nil
+}
+
+func (t *memoryStoreTxn) Delete(_ context.Context, key []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	h, err := t.s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	delete(t.m, h)
+	t.ops = append(t.ops, op{
+		h:      h,
+		opType: OpTypeDelete,
+	})
+
+	return nil
+}
+
+func (t *memoryStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
+	h, err := t.s.hash(key)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	_, ok := t.m[h]
+	if ok {
+		return true, nil
+	}
+
+	// Returns false if deleted during transaction
+	for _, op := range t.ops {
+		if op.h != h {
+			continue
+		}
+		if op.opType == OpTypeDelete {
+			return false, nil
+		}
+	}
+
+	_, ok = t.s.m[h]
+	return ok, nil
+}
+
+func (t *memoryStoreTxn) Expire(_ context.Context, key []byte, ttl int64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	h, err := t.s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	for i, o := range t.ops {
+		if o.h != h {
+			continue
+		}
+		t.ops[i].ttl = ttl
+		return nil
+	}
+
+	return errors.WithStack(ErrNotFound)
+}
+
+func (t *memoryStoreTxn) PutWithTTL(ctx context.Context, key []byte, value []byte, ttl int64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	h, err := t.s.hash(key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	t.m[h] = value
+	t.ops = append(t.ops, op{
+		h:      h,
+		opType: OpTypePut,
+		v:      value,
+		ttl:    ttl,
+	})
 
 	return nil
 }
