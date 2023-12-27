@@ -51,7 +51,7 @@ func main() {
 	}
 
 	store := kv.NewMemoryStore()
-	lockStore := kv.NewMemoryStore()
+	lockStore := kv.NewMemoryStoreDefaultTTL()
 	kvFSM := kv.NewKvFSM(store, lockStore)
 
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
