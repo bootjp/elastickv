@@ -6,7 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"time"
 
+	"github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
@@ -15,7 +17,7 @@ import (
 
 type kvFSM struct {
 	store     Store
-	lockStore Store
+	lockStore TTLStore
 	log       *slog.Logger
 }
 
@@ -23,7 +25,7 @@ type FSM interface {
 	raft.FSM
 }
 
-func NewKvFSM(store Store, lockStore Store) FSM {
+func NewKvFSM(store Store, lockStore TTLStore) FSM {
 	return &kvFSM{
 		store:     store,
 		lockStore: lockStore,
@@ -120,17 +122,28 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
 }
 
 var ErrKeyAlreadyLocked = errors.New("key already locked")
+var ErrKeyNotLocked = errors.New("key not locked")
+
+func (f *kvFSM) hasLock(txn Txn, key []byte) (bool, error) {
+	//nolint:wrapcheck
+	return internal.WithStacks(txn.Exists(context.Background(), key))
+}
+func (f *kvFSM) lock(txn TTLTxn, key []byte, ttl uint64) error {
+	//nolint:gomnd
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, ttl)
+	expire := time.Now().Unix() + int64(ttl)
+	return errors.WithStack(txn.PutWithTTL(context.Background(), key, b, expire))
+}
 
 func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
-	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+	err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, txn TTLTxn) error {
 		for _, mut := range r.Mutations {
 			if exist, _ := txn.Exists(ctx, mut.Key); exist {
 				return errors.WithStack(ErrKeyAlreadyLocked)
 			}
 			//nolint:gomnd
-			b := make([]byte, 8)
-			binary.LittleEndian.PutUint64(b, r.Ts)
-			err := txn.Put(ctx, mut.Key, b)
+			err := f.lock(txn, mut.Key, r.Ts)
 			if err != nil {
 				return errors.WithStack(err)
 			}
@@ -142,11 +155,23 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return errors.WithStack(err)
 }
 
+// TODO: refactor
+//
+//nolint:gocognit,cyclop
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn Txn) error {
 		err := f.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
 			// commit
 			for _, mut := range r.Mutations {
+				ok, err := f.hasLock(lockTxn, mut.Key)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+
+				if !ok {
+					return errors.WithStack(ErrKeyNotLocked)
+				}
+
 				switch mut.Op {
 				case pb.Op_PUT:
 					err := txn.Put(ctx, mut.Key, mut.Value)

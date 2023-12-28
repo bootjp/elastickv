@@ -124,7 +124,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 
 	for i := 0; i < n; i++ {
 		st := kv.NewMemoryStore()
-		trxSt := kv.NewMemoryStore()
+		trxSt := kv.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
 		port := ports[i]
