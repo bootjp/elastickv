@@ -136,6 +136,10 @@ func (f *kvFSM) lock(txn TTLTxn, key []byte, ttl uint64) error {
 	return errors.WithStack(txn.PutWithTTL(context.Background(), key, b, expire))
 }
 
+func (f *kvFSM) unlock(txn Txn, key []byte) error {
+	return errors.WithStack(txn.Delete(context.Background(), key))
+}
+
 func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, txn TTLTxn) error {
 		for _, mut := range r.Mutations {
@@ -155,10 +159,41 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return errors.WithStack(err)
 }
 
-// TODO: refactor
-//
-//nolint:gocognit,cyclop
+func (f *kvFSM) commit(ctx context.Context, txn Txn, mut *pb.Mutation) error {
+	switch mut.Op {
+	case pb.Op_PUT:
+		err := txn.Put(ctx, mut.Key, mut.Value)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+	case pb.Op_DEL:
+		err := txn.Delete(ctx, mut.Key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	return nil
+}
+
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
+	// Release locks regardless of success or failure
+	defer func() {
+		err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+			for _, mut := range r.Mutations {
+				err := f.unlock(txn, mut.Key)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			f.log.ErrorContext(ctx, "unlock error", err)
+		}
+	}()
+
 	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn Txn) error {
 		err := f.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
 			// commit
@@ -172,38 +207,15 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 					return errors.WithStack(ErrKeyNotLocked)
 				}
 
-				switch mut.Op {
-				case pb.Op_PUT:
-					err := txn.Put(ctx, mut.Key, mut.Value)
-					if err != nil {
-						return errors.WithStack(err)
-					}
-				case pb.Op_DEL:
-					err := txn.Delete(ctx, mut.Key)
-					if err != nil {
-						return errors.WithStack(err)
-					}
+				err = f.commit(ctx, txn, mut)
+				if err != nil {
+					return errors.WithStack(err)
 				}
 			}
 			return nil
 		})
 
 		return errors.WithStack(err)
-	})
-
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	// delete lock
-	err = f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
-		for _, mut := range r.Mutations {
-			err := txn.Delete(ctx, mut.Key)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-		}
-		return nil
 	})
 
 	return errors.WithStack(err)
