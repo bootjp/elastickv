@@ -41,6 +41,29 @@ func TestRbMemoryStore(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRbMemoryStore_Scan(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	st := NewRbMemoryStore()
+
+	for i := 0; i < 9999; i++ {
+		key := []byte("prefix" + strconv.Itoa(i) + "foo")
+		err := st.Put(ctx, key, []byte("bar"))
+		assert.NoError(t, err)
+
+	}
+
+	cnt := 0
+	err := st.Scan(ctx, []byte("prefix"), func(key []byte, value []byte) bool {
+		assert.Equal(t, []byte("bar"), value)
+		cnt++
+		return false
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 9999, cnt)
+}
+
 func TestRbMemoryStore_Txn(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {
