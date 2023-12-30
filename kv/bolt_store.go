@@ -150,10 +150,6 @@ func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Tx
 	return errors.WithStack(btxn.Commit())
 }
 
-func (s *boltStore) hash(_ []byte) (uint64, error) {
-	return 0, ErrNotImplemented
-}
-
 func (s *boltStore) Close() error {
 	return errors.WithStack(s.bbolt.Close())
 }

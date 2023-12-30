@@ -83,7 +83,7 @@ func (s *memoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 	v, ok := s.m[h]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, ErrKeyNotFound
 	}
 
 	return v, nil
@@ -289,7 +289,7 @@ const (
 	OpTypeDelete
 )
 
-type op struct {
+type memOp struct {
 	opType OpType
 	h      uint64
 	v      []byte
@@ -301,7 +301,7 @@ type memoryStoreTxn struct {
 	// Memory Structure during Transaction
 	m map[uint64][]byte
 	// Time series operations during a transaction
-	ops []op
+	ops []memOp
 	s   *memoryStore
 }
 
@@ -309,7 +309,7 @@ func (s *memoryStore) NewTxn() *memoryStoreTxn {
 	return &memoryStoreTxn{
 		mu:  &sync.RWMutex{},
 		m:   map[uint64][]byte{},
-		ops: []op{},
+		ops: []memOp{},
 		s:   s,
 	}
 }
@@ -318,7 +318,7 @@ func (s *memoryStore) NewTTLTxn() *memoryStoreTxn {
 	return &memoryStoreTxn{
 		mu:  &sync.RWMutex{},
 		m:   map[uint64][]byte{},
-		ops: []op{},
+		ops: []memOp{},
 		s:   s,
 	}
 }
@@ -337,19 +337,9 @@ func (t *memoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
 		return v, nil
 	}
 
-	// Return ErrNotFound if deleted during transaction
-	for _, op := range t.ops {
-		if op.h != h {
-			continue
-		}
-		if op.opType == OpTypeDelete {
-			return nil, ErrNotFound
-		}
-	}
-
 	v, ok = t.s.m[h]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, ErrKeyNotFound
 	}
 
 	return v, nil
@@ -365,7 +355,7 @@ func (t *memoryStoreTxn) Put(_ context.Context, key []byte, value []byte) error 
 	}
 
 	t.m[h] = value
-	t.ops = append(t.ops, op{
+	t.ops = append(t.ops, memOp{
 		h:      h,
 		opType: OpTypePut,
 		v:      value,
@@ -383,7 +373,7 @@ func (t *memoryStoreTxn) Delete(_ context.Context, key []byte) error {
 	}
 
 	delete(t.m, h)
-	t.ops = append(t.ops, op{
+	t.ops = append(t.ops, memOp{
 		h:      h,
 		opType: OpTypeDelete,
 	})
@@ -436,7 +426,7 @@ func (t *memoryStoreTxn) Expire(_ context.Context, key []byte, ttl int64) error 
 		return nil
 	}
 
-	return errors.WithStack(ErrNotFound)
+	return errors.WithStack(ErrKeyNotFound)
 }
 
 func (t *memoryStoreTxn) PutWithTTL(ctx context.Context, key []byte, value []byte, ttl int64) error {
@@ -449,7 +439,7 @@ func (t *memoryStoreTxn) PutWithTTL(ctx context.Context, key []byte, value []byt
 	}
 
 	t.m[h] = value
-	t.ops = append(t.ops, op{
+	t.ops = append(t.ops, memOp{
 		h:      h,
 		opType: OpTypePut,
 		v:      value,
