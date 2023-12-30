@@ -45,6 +45,8 @@ func NewMemoryStore() Store {
 	return m
 }
 
+var _ TTLStore = (*memoryStore)(nil)
+
 func NewMemoryStoreWithExpire(interval time.Duration) TTLStore {
 	//nolint:forcetypeassert
 	m := NewMemoryStore().(*memoryStore)

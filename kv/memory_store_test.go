@@ -154,6 +154,20 @@ func TestMemoryStore_TTL(t *testing.T) {
 			res, err = st.Get(ctx, key)
 			assert.ErrorIs(t, ErrNotFound, err)
 			assert.Nil(t, res)
+
+			// ticker is called not only once, but also after the second time
+			err = st.PutWithTTL(ctx, key, []byte("bar"), 1)
+			assert.NoError(t, err)
+
+			res, err = st.Get(ctx, key)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("bar"), res)
+
+			time.Sleep(11 * time.Second)
+
+			res, err = st.Get(ctx, key)
+			assert.ErrorIs(t, ErrNotFound, err)
+			assert.Nil(t, res)
 			wg.Done()
 		}(i)
 	}
