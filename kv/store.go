@@ -7,7 +7,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var ErrNotFound = errors.New("not found")
+var ErrKeyNotFound = errors.New("not found")
 
 type Store interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
@@ -18,8 +18,6 @@ type Store interface {
 	Restore(buf io.Reader) error
 	Txn(ctx context.Context, f func(ctx context.Context, txn Txn) error) error
 	Close() error
-
-	hash([]byte) (uint64, error)
 }
 
 type TTLStore interface {

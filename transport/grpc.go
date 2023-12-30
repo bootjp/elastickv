@@ -39,7 +39,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 	v, err := r.store.Get(ctx, req.Key)
 	if err != nil {
 		switch {
-		case errors.Is(err, kv.ErrNotFound):
+		case errors.Is(err, kv.ErrKeyNotFound):
 			return &pb.RawGetResponse{
 				Value: nil,
 			}, nil

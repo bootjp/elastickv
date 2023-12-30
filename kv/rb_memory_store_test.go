@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestMemoryStore(t *testing.T) {
+func TestRbMemoryStore(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
-	st := NewMemoryStore()
+	st := NewRbMemoryStore()
 	wg := &sync.WaitGroup{}
 	for i := 0; i < 9999; i++ {
 		wg.Add(1)
@@ -41,11 +41,11 @@ func TestMemoryStore(t *testing.T) {
 	wg.Wait()
 }
 
-func TestMemoryStore_Txn(t *testing.T) {
+func TestRbMemoryStore_Txn(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {
 		ctx := context.Background()
-		st := NewMemoryStore()
+		st := NewRbMemoryStore()
 		err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
 			err := txn.Put(ctx, []byte("foo"), []byte("bar"))
 			assert.NoError(t, err)
@@ -56,7 +56,10 @@ func TestMemoryStore_Txn(t *testing.T) {
 			assert.Equal(t, []byte("bar"), res)
 			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
 
-			// delete after put is returned
+			res, err = txn.Get(ctx, []byte("foo"))
+			assert.ErrorIs(t, ErrKeyNotFound, err)
+			assert.Nil(t, res)
+
 			err = txn.Put(ctx, []byte("foo"), []byte("bar"))
 			assert.NoError(t, err)
 
@@ -64,11 +67,6 @@ func TestMemoryStore_Txn(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, []byte("bar"), res)
 
-			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
-
-			res, err = txn.Get(ctx, []byte("foo"))
-			assert.ErrorIs(t, ErrKeyNotFound, err)
-			assert.Nil(t, res)
 			res, err = txn.Get(ctx, []byte("aaaaaa"))
 			assert.ErrorIs(t, ErrKeyNotFound, err)
 			assert.Nil(t, res)
@@ -79,7 +77,7 @@ func TestMemoryStore_Txn(t *testing.T) {
 
 	t.Run("rollback case", func(t *testing.T) {
 		var ErrAbort = errors.New("abort")
-		st := NewMemoryStore()
+		st := NewRbMemoryStore()
 		ctx := context.Background()
 		err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
 
@@ -111,7 +109,7 @@ func TestMemoryStore_Txn(t *testing.T) {
 
 	t.Run("parallel", func(t *testing.T) {
 		ctx := context.Background()
-		st := NewMemoryStore()
+		st := NewRbMemoryStore()
 		wg := &sync.WaitGroup{}
 		for i := 0; i < 9999; i++ {
 			wg.Add(1)
@@ -143,10 +141,10 @@ func TestMemoryStore_Txn(t *testing.T) {
 	})
 }
 
-func TestMemoryStore_TTL(t *testing.T) {
+func TestRbMemoryStore_TTL(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
-	st := NewMemoryStoreWithExpire(time.Second)
+	st := NewRbMemoryStoreWithExpire(time.Second)
 	wg := &sync.WaitGroup{}
 	for i := 0; i < 9999; i++ {
 		wg.Add(1)
@@ -184,10 +182,10 @@ func TestMemoryStore_TTL(t *testing.T) {
 	wg.Wait()
 }
 
-func TestMemoryStore_TTL_Txn(t *testing.T) {
+func TestRbMemoryStore_TTL_Txn(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
-	st := NewMemoryStoreWithExpire(time.Second)
+	st := NewRbMemoryStoreWithExpire(time.Second)
 	wg := &sync.WaitGroup{}
 	for i := 0; i < 9999; i++ {
 		wg.Add(1)
