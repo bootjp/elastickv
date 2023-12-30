@@ -20,6 +20,13 @@ type Store interface {
 	Close() error
 }
 
+type ScanStore interface {
+	Store
+	// Scan iterates over all key-value pairs with the given prefix. If f returns
+	// true, the iteration is stopped.
+	Scan(ctx context.Context, prefix []byte, f func(key []byte, value []byte) bool) error
+}
+
 type TTLStore interface {
 	Store
 	Expire(ctx context.Context, key []byte, ttl int64) error

@@ -34,7 +34,7 @@ func byteSliceComparator(a, b interface{}) int {
 	return bytes.Compare(aAsserted, bAsserted)
 }
 
-func NewRbMemoryStore() Store {
+func NewRbMemoryStore() ScanStore {
 	m := &rbMemoryStore{
 		mtx:  sync.RWMutex{},
 		tree: treemap.NewWith(byteSliceComparator),
@@ -87,6 +87,27 @@ func (s *rbMemoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	}
 
 	return vv, nil
+}
+
+func (s *rbMemoryStore) Scan(ctx context.Context, prefix []byte, f func(key []byte, value []byte) bool) error {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	s.tree.Find(func(key interface{}, value interface{}) bool {
+		k, ok := key.([]byte)
+		if !ok {
+			return false
+		}
+		v, ok := value.([]byte)
+		if !ok {
+			return false
+		}
+		if !bytes.HasPrefix(k, prefix) {
+			return false
+		}
+		return f(k, v)
+	})
+	return nil
 }
 
 func (s *rbMemoryStore) Put(ctx context.Context, key []byte, value []byte) error {
