@@ -343,25 +343,7 @@ func (t *rbMemoryStoreTxn) Delete(_ context.Context, key []byte) error {
 func (t *rbMemoryStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
 	_, ok := t.tree.Get(key)
-
-	// _, ok := t.m[h]
-	//if ok {
-	//	return true, nil
-	//}
-	//
-	//// Returns false if deleted during transaction
-	//for _, op := range t.ops {
-	//	if op.h != h {
-	//		continue
-	//	}
-	//	if op.opType == OpTypeDelete {
-	//		return false, nil
-	//	}
-	//}
-	//
-	//_, ok = t.s.m[h]
 	return ok, nil
 }
 
