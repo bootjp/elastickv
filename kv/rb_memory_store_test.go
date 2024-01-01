@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"strconv"
 	"sync"
 	"testing"
@@ -47,21 +48,41 @@ func TestRbMemoryStore_Scan(t *testing.T) {
 	st := NewRbMemoryStore()
 
 	for i := 0; i < 9999; i++ {
-		key := []byte("prefix" + strconv.Itoa(i) + "foo")
-		err := st.Put(ctx, key, []byte("bar"))
+		keyStr := "prefix " + strconv.Itoa(i) + "foo"
+		key := []byte(keyStr)
+		b := make([]byte, 8)
+		binary.PutVarint(b, int64(i))
+		err := st.Put(ctx, key, b)
 		assert.NoError(t, err)
+	}
 
+	res, err := st.Scan(ctx, []byte("prefix"), []byte("z"), 100)
+	assert.NoError(t, err)
+	assert.Equal(t, 100, len(res))
+
+	sortedKVPairs := make([]*KVPair, 9999)
+
+	for _, re := range res {
+		str := string(re.Key)
+		i, err := strconv.Atoi(str[7 : len(str)-3])
+		assert.NoError(t, err)
+		sortedKVPairs[i] = re
 	}
 
 	cnt := 0
-	err := st.Scan(ctx, []byte("prefix"), func(key []byte, value []byte) bool {
-		assert.Equal(t, []byte("bar"), value)
+	for i, v := range sortedKVPairs {
+		if v == nil {
+			continue
+		}
 		cnt++
-		return false
-	})
+		n, _ := binary.Varint(v.Value)
+		assert.NoError(t, err)
 
-	assert.NoError(t, err)
-	assert.Equal(t, 9999, cnt)
+		assert.Equal(t, int64(i), n)
+		assert.Equal(t, []byte("prefix "+strconv.Itoa(i)+"foo"), v.Key)
+	}
+
+	assert.Equal(t, 100, cnt)
 }
 
 func TestRbMemoryStore_Txn(t *testing.T) {
