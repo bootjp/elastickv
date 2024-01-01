@@ -89,25 +89,41 @@ func (s *rbMemoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	return vv, nil
 }
 
-func (s *rbMemoryStore) Scan(ctx context.Context, prefix []byte, f func(key []byte, value []byte) bool) error {
+func (s *rbMemoryStore) Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	s.tree.Find(func(key interface{}, value interface{}) bool {
+	var result []*KVPair
+
+	s.tree.Each(func(key interface{}, value interface{}) {
 		k, ok := key.([]byte)
 		if !ok {
-			return false
+			return
 		}
 		v, ok := value.([]byte)
 		if !ok {
-			return false
+			return
 		}
-		if !bytes.HasPrefix(k, prefix) {
-			return false
+
+		if bytes.Compare(k, start) < 0 {
+			return
 		}
-		return f(k, v)
+
+		if bytes.Compare(k, end) > 0 {
+			return
+		}
+
+		if len(result) >= limit {
+			return
+		}
+
+		result = append(result, &KVPair{
+			Key:   k,
+			Value: v,
+		})
+
 	})
-	return nil
+	return result, nil
 }
 
 func (s *rbMemoryStore) Put(ctx context.Context, key []byte, value []byte) error {

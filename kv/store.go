@@ -9,6 +9,11 @@ import (
 
 var ErrKeyNotFound = errors.New("not found")
 
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
 type Store interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error
@@ -22,9 +27,7 @@ type Store interface {
 
 type ScanStore interface {
 	Store
-	// Scan iterates over all key-value pairs with the given prefix. If f returns
-	// true, the iteration is stopped.
-	Scan(ctx context.Context, prefix []byte, f func(key []byte, value []byte) bool) error
+	Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error)
 }
 
 type TTLStore interface {
