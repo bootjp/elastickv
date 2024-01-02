@@ -340,7 +340,10 @@ func (t *rbMemoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
 
 	v, ok := t.tree.Get(key)
 	if !ok {
-		return nil, ErrKeyNotFound
+		v, ok = t.s.tree.Get(key)
+		if !ok {
+			return nil, ErrKeyNotFound
+		}
 	}
 
 	vv, ok := v.([]byte)
@@ -349,6 +352,42 @@ func (t *rbMemoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
 	}
 
 	return vv, nil
+}
+
+func (t *rbMemoryStoreTxn) Scan(_ context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var result []*KVPair
+
+	t.tree.Each(func(key interface{}, value interface{}) {
+		k, ok := key.([]byte)
+		if !ok {
+			return
+		}
+		v, ok := value.([]byte)
+		if !ok {
+			return
+		}
+
+		if bytes.Compare(k, start) < 0 {
+			return
+		}
+
+		if bytes.Compare(k, end) > 0 {
+			return
+		}
+
+		if len(result) >= limit {
+			return
+		}
+
+		result = append(result, &KVPair{
+			Key:   k,
+			Value: v,
+		})
+	})
+	return result, nil
 }
 
 func (t *rbMemoryStoreTxn) Put(_ context.Context, key []byte, value []byte) error {
