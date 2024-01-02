@@ -1,27 +1,18 @@
-package main
+package cmd
 
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"time"
 
-	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
-	"github.com/cockroachdb/errors"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	_ "google.golang.org/grpc/health"
 )
 
-func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func run() error {
+func Run() error {
 	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
 	conn, err := grpc.Dial("multi:///localhost:50051,localhost:50052,localhost:50053",
 		grpc.WithDefaultServiceConfig(serviceConfig),
