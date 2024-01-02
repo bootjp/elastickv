@@ -6,10 +6,12 @@ import (
 	"strconv"
 	"time"
 
+	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/health"
 )
 
 func Run() error {
