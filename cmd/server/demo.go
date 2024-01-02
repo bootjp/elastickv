@@ -89,8 +89,7 @@ func run(eg *errgroup.Group) error {
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
 		pb.RegisterInternalServer(s, trans.NewInternal(trx, r))
-
-		leaderhealth.Setup(r, s, []string{"Example"})
+		leaderhealth.Setup(r, s, []string{"RawKV"})
 		raftadmin.Register(s, r)
 
 		grpcSock, err := net.Listen("tcp", grpcAdders[i])
