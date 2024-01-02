@@ -72,7 +72,7 @@ func run(eg *errgroup.Group) error {
 	}
 
 	for i := 0; i < 3; i++ {
-		st := kv.NewMemoryStore()
+		st := kv.NewRbMemoryStore()
 		trxSt := kv.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 

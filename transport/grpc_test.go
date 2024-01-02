@@ -46,6 +46,40 @@ func Test_value_can_be_deleted(t *testing.T) {
 	assert.NoError(t, err, "Get RPC failed")
 }
 
+func Test_grpc_scan(t *testing.T) {
+	t.Parallel()
+	nodes, adders, _ := createNode(t, 3)
+	c := transactionalKVClient(t, adders)
+	defer shutdown(nodes)
+
+	for i := 0; i < 10; i++ {
+		key := []byte("test-key-" + strconv.Itoa(i))
+		want := []byte(strconv.Itoa(i))
+		res, err := c.Put(
+			context.Background(),
+			&pb.PutRequest{Key: key, Value: want},
+		)
+		assert.NoError(t, err, "Put RPC failed")
+		assert.True(t, res.Success, "Put RPC failed")
+		t.Log(res.CommitIndex)
+	}
+
+	resp, err := c.Scan(context.TODO(), &pb.ScanRequest{
+		StartKey: []byte("test-key"),
+		EndKey:   []byte("z" + strconv.Itoa(100)),
+		Limit:    10,
+	})
+	assert.NoError(t, err, "Scan RPC failed")
+	assert.Equal(t, 10, len(resp.Kv), "Scan RPC failed")
+
+	for i := 0; i < 10; i++ {
+		key := []byte("test-key-" + strconv.Itoa(i))
+		want := []byte(strconv.Itoa(i))
+		assert.Equal(t, key, resp.Kv[i].Key, "Scan RPC failed")
+		assert.Equal(t, want, resp.Kv[i].Value, "Scan RPC failed")
+	}
+}
+
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
