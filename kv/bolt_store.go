@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -19,7 +20,7 @@ type boltStore struct {
 
 const mode = 0666
 
-func NewBoltStore(path string) (Store, error) {
+func NewBoltStore(path string) (ScanStore, error) {
 	db, err := bbolt.Open(path, mode, nil)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -45,7 +46,8 @@ func NewBoltStore(path string) (Store, error) {
 	}, nil
 }
 
-var _ Store = &boltStore{}
+var _ Store = (*boltStore)(nil)
+var _ ScanStore = (*boltStore)(nil)
 
 func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	s.log.InfoContext(ctx, "Get",
@@ -60,6 +62,37 @@ func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	})
 
 	return v, errors.WithStack(err)
+}
+
+func (s *boltStore) Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
+	s.log.InfoContext(ctx, "Scan",
+		slog.String("start", string(start)),
+		slog.String("end", string(end)),
+		slog.Int("limit", limit),
+	)
+
+	var res []*KVPair
+
+	err := s.bbolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultBucket)
+		if b == nil {
+			return nil
+		}
+
+		c := b.Cursor()
+		for k, v := c.Seek(start); k != nil && (end == nil || bytes.Compare(k, end) < 0); k, v = c.Next() {
+			res = append(res, &KVPair{
+				Key:   k,
+				Value: v,
+			})
+			if len(res) >= limit {
+				break
+			}
+		}
+		return nil
+	})
+
+	return res, errors.WithStack(err)
 }
 
 func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {

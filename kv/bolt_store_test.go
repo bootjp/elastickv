@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"strconv"
 	"sync"
 	"testing"
@@ -10,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func mustStore(store Store, err error) Store {
+func mustStore[T any](store T, err error) T {
 	if err != nil {
 		panic(err)
 	}
@@ -37,6 +38,49 @@ func TestBoltStore(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Nil(t, res)
 	}
+}
+
+func TestBoltStore_Scan(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	st := mustStore(NewBoltStore(t.TempDir() + "/bolt.db"))
+
+	for i := 0; i < 999; i++ {
+		keyStr := "prefix " + strconv.Itoa(i) + "foo"
+		key := []byte(keyStr)
+		b := make([]byte, 8)
+		binary.PutVarint(b, int64(i))
+		err := st.Put(ctx, key, b)
+		assert.NoError(t, err)
+	}
+
+	res, err := st.Scan(ctx, []byte("prefix"), []byte("z"), 100)
+	assert.NoError(t, err)
+	assert.Equal(t, 100, len(res))
+
+	sortedKVPairs := make([]*KVPair, 999)
+
+	for _, re := range res {
+		str := string(re.Key)
+		i, err := strconv.Atoi(str[7 : len(str)-3])
+		assert.NoError(t, err)
+		sortedKVPairs[i] = re
+	}
+
+	cnt := 0
+	for i, v := range sortedKVPairs {
+		if v == nil {
+			continue
+		}
+		cnt++
+		n, _ := binary.Varint(v.Value)
+		assert.NoError(t, err)
+
+		assert.Equal(t, int64(i), n)
+		assert.Equal(t, []byte("prefix "+strconv.Itoa(i)+"foo"), v.Key)
+	}
+
+	assert.Equal(t, 100, cnt)
 }
 
 func TestBoltStore_Txn(t *testing.T) {
