@@ -37,6 +37,11 @@ type TTLStore interface {
 	TxnWithTTL(ctx context.Context, f func(ctx context.Context, txn TTLTxn) error) error
 }
 
+type ScanTTLStore interface {
+	ScanStore
+	TTLStore
+}
+
 type Txn interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error
@@ -44,8 +49,18 @@ type Txn interface {
 	Exists(ctx context.Context, key []byte) (bool, error)
 }
 
+type ScanTxn interface {
+	Txn
+	Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error)
+}
+
 type TTLTxn interface {
 	Txn
 	Expire(ctx context.Context, key []byte, ttl int64) error
 	PutWithTTL(ctx context.Context, key []byte, value []byte, ttl int64) error
+}
+
+type ScanTTLTxn interface {
+	ScanTxn
+	TTLTxn
 }
