@@ -46,15 +46,28 @@ func TestMemoryStore_Txn(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		ctx := context.Background()
 		st := NewMemoryStore()
+		// put outside txn
+		// this is not a problem
+		assert.NoError(t, st.Put(ctx, []byte("out_txn"), []byte("bar")))
 		err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
-			err := txn.Put(ctx, []byte("foo"), []byte("bar"))
+			res, err := txn.Get(ctx, []byte("out_txn"))
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("bar"), res)
+
+			err = txn.Put(ctx, []byte("foo"), []byte("bar"))
 			assert.NoError(t, err)
 
-			res, err := txn.Get(ctx, []byte("foo"))
+			res, err = txn.Get(ctx, []byte("foo"))
 			assert.NoError(t, err)
 
 			assert.Equal(t, []byte("bar"), res)
 			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
+
+			// overwrite exist key, return new value in txn
+			assert.NoError(t, txn.Put(ctx, []byte("out_txn"), []byte("new")))
+			res, err = txn.Get(ctx, []byte("out_txn"))
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("new"), res)
 
 			// delete after put is returned
 			err = txn.Put(ctx, []byte("foo"), []byte("bar"))
