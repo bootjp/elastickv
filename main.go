@@ -50,7 +50,7 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	store := kv.NewMemoryStore()
+	store := kv.NewRbMemoryStore()
 	lockStore := kv.NewMemoryStoreDefaultTTL()
 	kvFSM := kv.NewKvFSM(store, lockStore)
 

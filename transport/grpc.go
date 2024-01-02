@@ -18,13 +18,13 @@ type GRPCServer struct {
 	log            *slog.Logger
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
-	store          kv.Store
+	store          kv.ScanStore
 
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store kv.Store, coordinate *kv.Coordinate) *GRPCServer {
+func NewGRPCServer(store kv.ScanStore, coordinate *kv.Coordinate) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
@@ -126,6 +126,7 @@ func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 
 	return &pb.PutResponse{
 		CommitIndex: res.CommitIndex,
+		Success:     true,
 	}, nil
 }
 
@@ -166,9 +167,31 @@ func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Dele
 
 	return &pb.DeleteResponse{
 		CommitIndex: res.CommitIndex,
+		Success:     true,
 	}, nil
 }
 
-func (r GRPCServer) Scan(_ context.Context, _ *pb.ScanRequest) (*pb.ScanResponse, error) {
-	return nil, nil
+func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+	res, err := r.store.Scan(ctx, req.StartKey, req.EndKey, int(req.Limit))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	r.log.InfoContext(ctx, "Scan",
+		slog.String("startKey", string(req.StartKey)),
+		slog.String("endKey", string(req.EndKey)),
+		slog.Int("limit", int(req.Limit)),
+	)
+
+	var kvs []*pb.Kv
+	for _, v := range res {
+		kvs = append(kvs, &pb.Kv{
+			Key:   v.Key,
+			Value: v.Value,
+		})
+	}
+
+	return &pb.ScanResponse{
+		Kv: kvs,
+	}, nil
 }

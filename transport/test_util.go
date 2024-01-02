@@ -123,7 +123,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	}
 
 	for i := 0; i < n; i++ {
-		st := kv.NewMemoryStore()
+		st := kv.NewRbMemoryStore()
 		trxSt := kv.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
