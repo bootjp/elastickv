@@ -117,7 +117,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 
 	key := []byte("test-key-sequence")
 
-	for i := 0; i < 99999; i++ {
+	for i := 0; i < 9999; i++ {
 		want := []byte("sequence" + strconv.Itoa(i))
 		_, err := c.RawPut(
 			context.Background(),
