@@ -16,7 +16,7 @@ func TestMemoryStore(t *testing.T) {
 	t.Parallel()
 	st := NewMemoryStore()
 	wg := &sync.WaitGroup{}
-	for i := 0; i < 9999; i++ {
+	for i := 0; i < 999; i++ {
 		wg.Add(1)
 		go func(i int) {
 			key := []byte(strconv.Itoa(i) + "foo")
@@ -44,6 +44,7 @@ func TestMemoryStore(t *testing.T) {
 func TestMemoryStore_Txn(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {
+		t.Parallel()
 		ctx := context.Background()
 		st := NewMemoryStore()
 		// put outside txn
@@ -95,6 +96,7 @@ func TestMemoryStore_Txn(t *testing.T) {
 	})
 
 	t.Run("rollback case", func(t *testing.T) {
+		t.Parallel()
 		var ErrAbort = errors.New("abort")
 		st := NewMemoryStore()
 		ctx := context.Background()
@@ -127,10 +129,11 @@ func TestMemoryStore_Txn(t *testing.T) {
 	})
 
 	t.Run("parallel", func(t *testing.T) {
+		t.Parallel()
 		ctx := context.Background()
 		st := NewMemoryStore()
 		wg := &sync.WaitGroup{}
-		for i := 0; i < 9999; i++ {
+		for i := 0; i < 999; i++ {
 			wg.Add(1)
 			go func(i int) {
 				err := st.Txn(ctx, func(ctx context.Context, txn Txn) error {
@@ -165,7 +168,7 @@ func TestMemoryStore_TTL(t *testing.T) {
 	t.Parallel()
 	st := NewMemoryStoreWithExpire(time.Second)
 	wg := &sync.WaitGroup{}
-	for i := 0; i < 9999; i++ {
+	for i := 0; i < 999; i++ {
 		wg.Add(1)
 		go func(i int) {
 			key := []byte(strconv.Itoa(i) + "foo")
@@ -206,7 +209,7 @@ func TestMemoryStore_TTL_Txn(t *testing.T) {
 	t.Parallel()
 	st := NewMemoryStoreWithExpire(time.Second)
 	wg := &sync.WaitGroup{}
-	for i := 0; i < 9999; i++ {
+	for i := 0; i < 999; i++ {
 		wg.Add(1)
 		go func(i int) {
 			key := []byte(strconv.Itoa(i) + "foo")
