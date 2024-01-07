@@ -14,6 +14,8 @@ type KVPair struct {
 	Value []byte
 }
 
+var Tombstone = []byte{0x00}
+
 type Store interface {
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Put(ctx context.Context, key []byte, value []byte) error

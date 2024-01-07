@@ -63,6 +63,10 @@ func TestMemoryStore_Txn(t *testing.T) {
 			assert.Equal(t, []byte("bar"), res)
 			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
 
+			res, err = txn.Get(ctx, []byte("foo"))
+			assert.ErrorIs(t, ErrKeyNotFound, err)
+			assert.Nil(t, res)
+
 			// overwrite exist key, return new value in txn
 			assert.NoError(t, txn.Put(ctx, []byte("out_txn"), []byte("new")))
 			res, err = txn.Get(ctx, []byte("out_txn"))
