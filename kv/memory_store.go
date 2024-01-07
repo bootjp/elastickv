@@ -333,7 +333,7 @@ func (t *memoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
 	defer t.mu.RUnlock()
 
 	v, ok := t.m[h]
-	if ok {
+	if ok && !bytes.Equal(v, Tombstone) {
 		return v, nil
 	}
 
