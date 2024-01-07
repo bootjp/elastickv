@@ -108,16 +108,17 @@ func TestRbMemoryStore_Txn(t *testing.T) {
 			assert.Equal(t, []byte("bar"), res)
 			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
 
+			res, err = txn.Get(ctx, []byte("foo"))
+			assert.ErrorIs(t, ErrKeyNotFound, err)
+			assert.Nil(t, res)
+
 			// overwrite exist key, return new value in txn
 			assert.NoError(t, txn.Put(ctx, []byte("out_txn"), []byte("new")))
 			res, err = txn.Get(ctx, []byte("out_txn"))
 			assert.NoError(t, err)
 			assert.Equal(t, []byte("new"), res)
 
-			res, err = txn.Get(ctx, []byte("foo"))
-			assert.ErrorIs(t, ErrKeyNotFound, err)
-			assert.Nil(t, res)
-
+			// delete after put is returned
 			err = txn.Put(ctx, []byte("foo"), []byte("bar"))
 			assert.NoError(t, err)
 
@@ -125,6 +126,11 @@ func TestRbMemoryStore_Txn(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, []byte("bar"), res)
 
+			assert.NoError(t, txn.Delete(ctx, []byte("foo")))
+
+			res, err = txn.Get(ctx, []byte("foo"))
+			assert.ErrorIs(t, ErrKeyNotFound, err)
+			assert.Nil(t, res)
 			res, err = txn.Get(ctx, []byte("aaaaaa"))
 			assert.ErrorIs(t, ErrKeyNotFound, err)
 			assert.Nil(t, res)

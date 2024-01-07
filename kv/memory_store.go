@@ -333,8 +333,13 @@ func (t *memoryStoreTxn) Get(_ context.Context, key []byte) ([]byte, error) {
 	defer t.mu.RUnlock()
 
 	v, ok := t.m[h]
-	if ok {
+	if ok && !bytes.Equal(v, Tombstone) {
 		return v, nil
+	}
+
+	// Returns NotFound if deleted during transaction and then get
+	if bytes.Equal(v, Tombstone) {
+		return nil, ErrKeyNotFound
 	}
 
 	v, ok = t.s.m[h]
@@ -372,7 +377,7 @@ func (t *memoryStoreTxn) Delete(_ context.Context, key []byte) error {
 		return errors.WithStack(err)
 	}
 
-	delete(t.m, h)
+	t.m[h] = Tombstone
 	t.ops = append(t.ops, memOp{
 		h:      h,
 		opType: OpTypeDelete,
