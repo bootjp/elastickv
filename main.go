@@ -12,9 +12,9 @@ import (
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
-	tran "github.com/bootjp/elastickv/transport"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -62,9 +62,9 @@ func main() {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	coordinate := kv.NewCoordinator(trx, r)
-	pb.RegisterRawKVServer(s, tran.NewGRPCServer(store, coordinate))
-	pb.RegisterTransactionalKVServer(s, tran.NewGRPCServer(store, coordinate))
-	pb.RegisterInternalServer(s, tran.NewInternal(trx, r))
+	pb.RegisterRawKVServer(s, adapter.NewGRPCServer(store, coordinate))
+	pb.RegisterTransactionalKVServer(s, adapter.NewGRPCServer(store, coordinate))
+	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r))
 	tm.Register(s)
 
 	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
@@ -81,7 +81,7 @@ func main() {
 		return errors.WithStack(s.Serve(grpcSock))
 	})
 	eg.Go(func() error {
-		return errors.WithStack(tran.NewRedisServer(redisL, store, coordinate).Run())
+		return errors.WithStack(adapter.NewRedisServer(redisL, store, coordinate).Run())
 	})
 
 	err = eg.Wait()
