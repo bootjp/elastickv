@@ -9,9 +9,9 @@ import (
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
-	trans "github.com/bootjp/elastickv/transport"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/pkg/errors"
@@ -84,11 +84,11 @@ func run(eg *errgroup.Group) error {
 		s := grpc.NewServer()
 		trx := kv.NewTransaction(r)
 		coordinator := kv.NewCoordinator(trx, r)
-		gs := trans.NewGRPCServer(st, coordinator)
+		gs := adapter.NewGRPCServer(st, coordinator)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, trans.NewInternal(trx, r))
+		pb.RegisterInternalServer(s, adapter.NewInternal(trx, r))
 		leaderhealth.Setup(r, s, []string{"RawKV"})
 		raftadmin.Register(s, r)
 
@@ -105,7 +105,7 @@ func run(eg *errgroup.Group) error {
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		rd := trans.NewRedisServer(l, st, coordinator)
+		rd := adapter.NewRedisServer(l, st, coordinator)
 
 		eg.Go(func() error {
 			return errors.WithStack(rd.Run())
