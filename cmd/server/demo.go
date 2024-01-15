@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/pkg/errors"
@@ -72,8 +73,8 @@ func run(eg *errgroup.Group) error {
 	}
 
 	for i := 0; i < 3; i++ {
-		st := kv.NewRbMemoryStore()
-		trxSt := kv.NewMemoryStoreDefaultTTL()
+		st := store.NewRbMemoryStore()
+		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
 		r, tm, err := newRaft(strconv.Itoa(i), grpcAdders[i], fsm, i == 0, cfg)

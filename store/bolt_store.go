@@ -1,4 +1,4 @@
-package kv
+package store
 
 import (
 	"bytes"
@@ -188,9 +188,9 @@ func (s *boltStore) Close() error {
 }
 
 func (s *boltStore) Snapshot() (io.ReadWriter, error) {
-	return nil, ErrNotImplemented
+	return nil, ErrNotSupported
 }
 
 func (s *boltStore) Restore(buf io.Reader) error {
-	return ErrNotImplemented
+	return ErrNotSupported
 }

@@ -10,14 +10,15 @@ import (
 
 	"github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"google.golang.org/protobuf/proto"
 )
 
 type kvFSM struct {
-	store     Store
-	lockStore TTLStore
+	store     store.Store
+	lockStore store.TTLStore
 	log       *slog.Logger
 }
 
@@ -25,7 +26,7 @@ type FSM interface {
 	raft.FSM
 }
 
-func NewKvFSM(store Store, lockStore TTLStore) FSM {
+func NewKvFSM(store store.Store, lockStore store.TTLStore) FSM {
 	return &kvFSM{
 		store:     store,
 		lockStore: lockStore,
@@ -124,11 +125,11 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
 var ErrKeyAlreadyLocked = errors.New("key already locked")
 var ErrKeyNotLocked = errors.New("key not locked")
 
-func (f *kvFSM) hasLock(txn Txn, key []byte) (bool, error) {
+func (f *kvFSM) hasLock(txn store.Txn, key []byte) (bool, error) {
 	//nolint:wrapcheck
 	return internal.WithStacks(txn.Exists(context.Background(), key))
 }
-func (f *kvFSM) lock(txn TTLTxn, key []byte, ttl uint64) error {
+func (f *kvFSM) lock(txn store.TTLTxn, key []byte, ttl uint64) error {
 	//nolint:gomnd
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, ttl)
@@ -136,12 +137,12 @@ func (f *kvFSM) lock(txn TTLTxn, key []byte, ttl uint64) error {
 	return errors.WithStack(txn.PutWithTTL(context.Background(), key, b, expire))
 }
 
-func (f *kvFSM) unlock(txn Txn, key []byte) error {
+func (f *kvFSM) unlock(txn store.Txn, key []byte) error {
 	return errors.WithStack(txn.Delete(context.Background(), key))
 }
 
 func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
-	err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, txn TTLTxn) error {
+	err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, txn store.TTLTxn) error {
 		for _, mut := range r.Mutations {
 			if exist, _ := txn.Exists(ctx, mut.Key); exist {
 				return errors.WithStack(ErrKeyAlreadyLocked)
@@ -159,7 +160,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return errors.WithStack(err)
 }
 
-func (f *kvFSM) commit(ctx context.Context, txn Txn, mut *pb.Mutation) error {
+func (f *kvFSM) commit(ctx context.Context, txn store.Txn, mut *pb.Mutation) error {
 	switch mut.Op {
 	case pb.Op_PUT:
 		err := txn.Put(ctx, mut.Key, mut.Value)
@@ -179,7 +180,7 @@ func (f *kvFSM) commit(ctx context.Context, txn Txn, mut *pb.Mutation) error {
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	// Release locks regardless of success or failure
 	defer func() {
-		err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+		err := f.lockStore.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
 			for _, mut := range r.Mutations {
 				err := f.unlock(txn, mut.Key)
 				if err != nil {
@@ -194,8 +195,8 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 		}
 	}()
 
-	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn Txn) error {
-		err := f.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
+	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn store.Txn) error {
+		err := f.store.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
 			// commit
 			for _, mut := range r.Mutations {
 				ok, err := f.hasLock(lockTxn, mut.Key)
@@ -222,7 +223,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request) error {
-	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn Txn) error {
+	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
 		for _, mut := range r.Mutations {
 			err := txn.Delete(ctx, mut.Key)
 			if err != nil {

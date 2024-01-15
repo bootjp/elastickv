@@ -5,14 +5,15 @@ import (
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
+	store3 "github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
 )
 
 func TestSnapshot(t *testing.T) {
-	store := NewMemoryStore()
-	txnStore := NewMemoryStoreDefaultTTL()
+	store := store3.NewMemoryStore()
+	txnStore := store3.NewMemoryStoreDefaultTTL()
 	fsm := NewKvFSM(store, txnStore)
 
 	mutation := pb.Request{
@@ -46,8 +47,8 @@ func TestSnapshot(t *testing.T) {
 	snapshot, err := fsm.Snapshot()
 	assert.NoError(t, err)
 
-	store2 := NewMemoryStore()
-	trxnStore2 := NewMemoryStoreDefaultTTL()
+	store2 := store3.NewMemoryStore()
+	trxnStore2 := store3.NewMemoryStoreDefaultTTL()
 	fsm2 := NewKvFSM(store2, trxnStore2)
 
 	kvFSMSnap, ok := snapshot.(*kvFSMSnapshot)

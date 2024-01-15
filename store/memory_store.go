@@ -1,4 +1,4 @@
-package kv
+package store
 
 import (
 	"bytes"
@@ -155,7 +155,7 @@ func (s *memoryStore) Txn(ctx context.Context, f func(ctx context.Context, txn T
 		case OpTypeDelete:
 			delete(s.m, op.h)
 		default:
-			return errors.WithStack(ErrUnknownRequestType)
+			return errors.WithStack(ErrUnknownOp)
 		}
 	}
 
@@ -181,7 +181,7 @@ func (s *memoryStore) TxnWithTTL(ctx context.Context, f func(ctx context.Context
 			delete(s.m, op.h)
 			delete(s.ttl, op.h)
 		default:
-			return errors.WithStack(ErrUnknownRequestType)
+			return errors.WithStack(ErrUnknownOp)
 		}
 	}
 

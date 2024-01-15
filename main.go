@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -50,26 +51,26 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	store := kv.NewRbMemoryStore()
-	lockStore := kv.NewMemoryStoreDefaultTTL()
-	kvFSM := kv.NewKvFSM(store, lockStore)
+	s := store.NewRbMemoryStore()
+	lockStore := store.NewMemoryStoreDefaultTTL()
+	kvFSM := kv.NewKvFSM(s, lockStore)
 
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {
 		log.Fatalf("failed to start raft: %v", err)
 	}
 
-	s := grpc.NewServer()
+	gs := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	coordinate := kv.NewCoordinator(trx, r)
-	pb.RegisterRawKVServer(s, adapter.NewGRPCServer(store, coordinate))
-	pb.RegisterTransactionalKVServer(s, adapter.NewGRPCServer(store, coordinate))
-	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r))
-	tm.Register(s)
+	pb.RegisterRawKVServer(gs, adapter.NewGRPCServer(s, coordinate))
+	pb.RegisterTransactionalKVServer(gs, adapter.NewGRPCServer(s, coordinate))
+	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, r))
+	tm.Register(gs)
 
-	leaderhealth.Setup(r, s, []string{"RawKV", "Example"})
-	raftadmin.Register(s, r)
-	reflection.Register(s)
+	leaderhealth.Setup(r, gs, []string{"RawKV", "Example"})
+	raftadmin.Register(gs, r)
+	reflection.Register(gs)
 
 	redisL, err := net.Listen("tcp", *redisAddr)
 	if err != nil {
@@ -78,10 +79,10 @@ func main() {
 
 	eg := errgroup.Group{}
 	eg.Go(func() error {
-		return errors.WithStack(s.Serve(grpcSock))
+		return errors.WithStack(gs.Serve(grpcSock))
 	})
 	eg.Go(func() error {
-		return errors.WithStack(adapter.NewRedisServer(redisL, store, coordinate).Run())
+		return errors.WithStack(adapter.NewRedisServer(redisL, s, coordinate).Run())
 	})
 
 	err = eg.Wait()
