@@ -1,4 +1,4 @@
-package kv
+package store
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 )
 
 var ErrKeyNotFound = errors.New("not found")
+var ErrUnknownOp = errors.New("unknown op")
+var ErrNotSupported = errors.New("not supported")
 
 type KVPair struct {
 	Key   []byte

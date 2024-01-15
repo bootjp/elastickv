@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
 )
@@ -21,14 +22,14 @@ var argsLen = map[string]int{
 
 type RedisServer struct {
 	listen          net.Listener
-	store           kv.Store
+	store           store.Store
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
-func NewRedisServer(listen net.Listener, store kv.Store, coordinate *kv.Coordinate) *RedisServer {
+func NewRedisServer(listen net.Listener, store store.Store, coordinate *kv.Coordinate) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,

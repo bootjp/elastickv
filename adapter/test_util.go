@@ -13,6 +13,7 @@ import (
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
@@ -123,8 +124,8 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	}
 
 	for i := 0; i < n; i++ {
-		st := kv.NewRbMemoryStore()
-		trxSt := kv.NewMemoryStoreDefaultTTL()
+		st := store.NewRbMemoryStore()
+		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
 		port := ports[i]

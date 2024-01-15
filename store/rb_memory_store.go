@@ -1,4 +1,4 @@
-package kv
+package store
 
 import (
 	"bytes"
@@ -172,7 +172,7 @@ func (s *rbMemoryStore) Txn(ctx context.Context, f func(ctx context.Context, txn
 		case OpTypeDelete:
 			s.tree.Remove(op.key)
 		default:
-			return errors.WithStack(ErrUnknownRequestType)
+			return errors.WithStack(ErrUnknownOp)
 		}
 	}
 
@@ -198,7 +198,7 @@ func (s *rbMemoryStore) TxnWithTTL(ctx context.Context, f func(ctx context.Conte
 			s.tree.Remove(op.key)
 			s.ttl.Remove(op.key)
 		default:
-			return errors.WithStack(ErrUnknownRequestType)
+			return errors.WithStack(ErrUnknownOp)
 		}
 	}
 

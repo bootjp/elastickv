@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
 )
@@ -18,13 +19,13 @@ type GRPCServer struct {
 	log            *slog.Logger
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
-	store          kv.ScanStore
+	store          store.ScanStore
 
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store kv.ScanStore, coordinate *kv.Coordinate) *GRPCServer {
+func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
@@ -39,7 +40,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 	v, err := r.store.Get(ctx, req.Key)
 	if err != nil {
 		switch {
-		case errors.Is(err, kv.ErrKeyNotFound):
+		case errors.Is(err, store.ErrKeyNotFound):
 			return &pb.RawGetResponse{
 				Value: nil,
 			}, nil
