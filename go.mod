@@ -10,7 +10,7 @@ require (
 	github.com/cockroachdb/errors v1.11.1
 	github.com/emirpasic/gods v1.18.1
 	github.com/hashicorp/go-hclog v1.6.2
-	github.com/hashicorp/raft v1.6.0
+	github.com/hashicorp/raft v1.6.1
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.4.0
