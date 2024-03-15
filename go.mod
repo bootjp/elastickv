@@ -1,6 +1,6 @@
 module github.com/bootjp/elastickv
 
-go 1.21.6
+go 1.22.1
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
