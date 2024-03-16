@@ -19,7 +19,7 @@ require (
 	github.com/tidwall/redcon v1.6.2
 	go.etcd.io/bbolt v1.3.9
 	golang.org/x/sync v0.6.0
-	google.golang.org/grpc v1.62.0
+	google.golang.org/grpc v1.62.1
 	google.golang.org/protobuf v1.32.0
 )
 
