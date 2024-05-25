@@ -176,7 +176,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	case bytes.Equal(cmd.Args[1], []byte("*")):
 		start = nil
 	default:
-		start = bytes.Replace(cmd.Args[1], []byte("*"), nil, -1)
+		start = bytes.ReplaceAll(cmd.Args[1], []byte("*"), nil)
 	}
 
 	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
