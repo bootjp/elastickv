@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"math"
 	"net"
 	"strings"
 
@@ -18,18 +19,19 @@ var argsLen = map[string]int{
 	"DEL":    2,
 	"EXISTS": 2,
 	"PING":   1,
+	"KEYS":   2,
 }
 
 type RedisServer struct {
 	listen          net.Listener
-	store           store.Store
+	store           store.ScanStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
-func NewRedisServer(listen net.Listener, store store.Store, coordinate *kv.Coordinate) *RedisServer {
+func NewRedisServer(listen net.Listener, store store.ScanStore, coordinate *kv.Coordinate) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
@@ -43,6 +45,7 @@ func NewRedisServer(listen net.Listener, store store.Store, coordinate *kv.Coord
 		"GET":    r.get,
 		"DEL":    r.del,
 		"EXISTS": r.exists,
+		"KEYS":   r.keys,
 	}
 
 	return r
@@ -146,4 +149,17 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt(0)
+}
+
+func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
+	keys, err := r.store.Scan(context.Background(), nil, nil, math.MaxInt)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteArray(len(keys))
+	for _, kvPair := range keys {
+		conn.WriteBulk(kvPair.Key)
+	}
 }
