@@ -168,6 +168,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 			return
 		}
 		conn.WriteArray(0)
+		return
 	}
 
 	var start []byte
