@@ -95,4 +95,16 @@ func TestRedis_leader_keys(t *testing.T) {
 	res := rdb.Keys(ctx, "*")
 	assert.NoError(t, res.Err())
 	assert.ElementsMatch(t, keys, res.Val())
+
+	res = rdb.Keys(ctx, "test*")
+	assert.NoError(t, res.Err())
+	assert.ElementsMatch(t, keys, res.Val())
+
+	res = rdb.Keys(ctx, "test")
+	assert.NoError(t, res.Err())
+	assert.ElementsMatch(t, []string{}, res.Val())
+
+	res = rdb.Keys(ctx, "test-key1")
+	assert.NoError(t, res.Err())
+	assert.ElementsMatch(t, []string{"test-key1"}, res.Val())
 }

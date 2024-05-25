@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"net"
@@ -152,7 +153,32 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
-	keys, err := r.store.Scan(context.Background(), nil, nil, math.MaxInt)
+
+	// If an asterisk (*) is not included, the match will be exact,
+	// so check if the key exists.
+	if !bytes.Contains(cmd.Args[1], []byte("*")) {
+		res, err := r.store.Exists(context.Background(), cmd.Args[1])
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		if res {
+			conn.WriteArray(1)
+			conn.WriteBulk(cmd.Args[1])
+			return
+		}
+		conn.WriteArray(0)
+	}
+
+	var start []byte
+	switch {
+	case bytes.Equal(cmd.Args[1], []byte("*")):
+		start = nil
+	default:
+		start = bytes.Replace(cmd.Args[1], []byte("*"), nil, -1)
+	}
+
+	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
