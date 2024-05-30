@@ -191,7 +191,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 		})
 
 		if err != nil {
-			f.log.ErrorContext(ctx, "unlock error", err)
+			f.log.ErrorContext(ctx, "unlock error", slog.String("err", err.Error()))
 		}
 	}()
 

@@ -105,11 +105,11 @@ func (s *rbMemoryStore) Scan(ctx context.Context, start []byte, end []byte, limi
 			return
 		}
 
-		if bytes.Compare(k, start) < 0 {
+		if start != nil && bytes.Compare(k, start) < 0 {
 			return
 		}
 
-		if bytes.Compare(k, end) > 0 {
+		if end != nil && bytes.Compare(k, end) > 0 {
 			return
 		}
 
