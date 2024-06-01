@@ -7,5 +7,16 @@
   "postUpdateOptions": [
     "gomodTidy"
   ],
-  "timezone": "Asia/Tokyo"
+  "timezone": "Asia/Tokyo",
+  "packageRules": [
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "automerge": true
+    }
+  ]
 }
