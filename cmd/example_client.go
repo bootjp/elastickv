@@ -16,7 +16,7 @@ import (
 
 func Run() error {
 	serviceConfig := `{"healthCheckConfig": {"serviceName": "RawKV"}, "loadBalancingConfig": [ { "round_robin": {} } ]}`
-	conn, err := grpc.Dial("multi:///localhost:50051,localhost:50052,localhost:50053",
+	conn, err := grpc.NewClient("multi:///localhost:50051,localhost:50052,localhost:50053",
 		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
