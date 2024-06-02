@@ -180,7 +180,7 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 
 	addr, _ := c.raft.LeaderWithID()
 
-	conn, err := grpc.Dial(string(addr),
+	conn, err := grpc.NewClient(string(addr),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
