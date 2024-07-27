@@ -38,14 +38,11 @@ func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 		return c.redirect(reqs)
 	}
 
-	switch reqs.IsTxn {
-	case true:
+	if reqs.IsTxn {
 		return c.dispatchTxn(reqs.Elems)
-	case false:
-		return c.dispatchRaw(reqs.Elems)
 	}
 
-	panic("unreachable")
+	return c.dispatchRaw(reqs.Elems)
 }
 
 func (c *Coordinate) IsLeader() bool {
