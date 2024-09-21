@@ -171,7 +171,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 
 	}
 
-	//nolint:gomnd
+	//nolint:mnd
 	time.Sleep(10 * time.Second)
 
 	return nodes, grpcAdders, redisAdders

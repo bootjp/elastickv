@@ -130,10 +130,14 @@ func (f *kvFSM) hasLock(txn store.Txn, key []byte) (bool, error) {
 	return internal.WithStacks(txn.Exists(context.Background(), key))
 }
 func (f *kvFSM) lock(txn store.TTLTxn, key []byte, ttl uint64) error {
-	//nolint:gomnd
+	ittl, err := internal.Uint64ToInt64(ttl)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	//nolint:mnd
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, ttl)
-	expire := time.Now().Unix() + int64(ttl)
+	expire := time.Now().Unix() + ittl
 	return errors.WithStack(txn.PutWithTTL(context.Background(), key, b, expire))
 }
 
@@ -147,7 +151,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 			if exist, _ := txn.Exists(ctx, mut.Key); exist {
 				return errors.WithStack(ErrKeyAlreadyLocked)
 			}
-			//nolint:gomnd
+			//nolint:mnd
 			err := f.lock(txn, mut.Key, r.Ts)
 			if err != nil {
 				return errors.WithStack(err)

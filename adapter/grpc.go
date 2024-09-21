@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -173,15 +174,23 @@ func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Dele
 }
 
 func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
-	res, err := r.store.Scan(ctx, req.StartKey, req.EndKey, int(req.Limit))
+	limit, err := internal.Uint64ToInt(req.Limit)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return &pb.ScanResponse{
+			Kv: nil,
+		}, errors.WithStack(err)
+	}
+	res, err := r.store.Scan(ctx, req.StartKey, req.EndKey, limit)
+	if err != nil {
+		return &pb.ScanResponse{
+			Kv: nil,
+		}, errors.WithStack(err)
 	}
 
 	r.log.InfoContext(ctx, "Scan",
 		slog.String("startKey", string(req.StartKey)),
 		slog.String("endKey", string(req.EndKey)),
-		slog.Int("limit", int(req.Limit)),
+		slog.Uint64("limit", req.Limit),
 	)
 
 	var kvs []*pb.Kv

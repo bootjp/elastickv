@@ -9,14 +9,14 @@ linters:
     - durationcheck
     - errorlint
     - exhaustive
-    - exportloopref
+    - copyloopvar
     - forcetypeassert
     - gocognit
     - goconst
     - gocritic
     - gocyclo
     - gofmt
-    - gomnd
+    - mnd
     - gosec
     - makezero
     - nakedret

@@ -13,7 +13,7 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-//nolint:gomnd
+//nolint:mnd
 var argsLen = map[string]int{
 	"GET":    2,
 	"SET":    3,
