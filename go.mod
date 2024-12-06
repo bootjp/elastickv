@@ -20,7 +20,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/redcon v1.6.2
 	go.etcd.io/bbolt v1.3.11
-	golang.org/x/sync v0.9.0
+	golang.org/x/sync v0.10.0
 	google.golang.org/grpc v1.68.0
 	google.golang.org/protobuf v1.35.2
 )
