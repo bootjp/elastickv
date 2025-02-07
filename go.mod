@@ -22,7 +22,7 @@ require (
 	go.etcd.io/bbolt v1.3.11
 	golang.org/x/sync v0.10.0
 	google.golang.org/grpc v1.70.0
-	google.golang.org/protobuf v1.36.4
+	google.golang.org/protobuf v1.36.5
 )
 
 require (
