@@ -1,6 +1,6 @@
 module github.com/bootjp/elastickv
 
-go 1.23
+go 1.23.0
 
 toolchain go1.24.1
 
@@ -20,7 +20,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/redcon v1.6.2
 	go.etcd.io/bbolt v1.4.0
-	golang.org/x/sync v0.11.0
+	golang.org/x/sync v0.12.0
 	google.golang.org/grpc v1.70.0
 	google.golang.org/protobuf v1.36.5
 )
