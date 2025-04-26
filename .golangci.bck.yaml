@@ -1,0 +1,41 @@
+run:
+  concurrency: 4
+  timeout: 10m
+
+linters:
+  enable:
+    - cyclop
+    - dupl
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - copyloopvar
+    - forcetypeassert
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - gofmt
+    - mnd
+    - gosec
+    - makezero
+    - nakedret
+    - nestif
+    - nilerr
+    - noctx
+#    - prealloc
+    - unconvert
+    - unparam
+    - wastedassign
+    - wrapcheck
+    - gci
+
+
+issues:
+  exclude-rules:
+    - path: (.*)test(.*).go
+      linters:
+        - funlen
+        - goconst
+        - wrapcheck
+        - dupl
