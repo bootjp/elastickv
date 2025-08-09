@@ -26,6 +26,12 @@ func shutdown(nodes []Node) {
 	for _, n := range nodes {
 		n.grpcServer.Stop()
 		n.redisServer.Stop()
+		if n.raft != nil {
+			n.raft.Shutdown()
+		}
+		if n.tm != nil {
+			_ = n.tm.Close()
+		}
 	}
 }
 
@@ -80,15 +86,19 @@ type Node struct {
 	redisAddress string
 	grpcServer   *grpc.Server
 	redisServer  *RedisServer
+	raft         *raft.Raft
+	tm           *transport.Manager
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress string, grpcs *grpc.Server, rd *RedisServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, rd *RedisServer) Node {
 	return Node{
 		grpcAddress:  grpcAddress,
 		raftAddress:  raftAddress,
 		redisAddress: redisAddress,
 		grpcServer:   grpcs,
 		redisServer:  rd,
+		raft:         r,
+		tm:           tm,
 	}
 }
 
@@ -97,6 +107,11 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	var grpcAdders []string
 	var redisAdders []string
 	var nodes []Node
+
+	const (
+		waitTimeout  = 5 * time.Second
+		waitInterval = 100 * time.Millisecond
+	)
 
 	cfg := raft.Configuration{}
 	ports := make([]portsAdress, n)
@@ -165,14 +180,33 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			port.grpcAddress,
 			port.raftAddress,
 			port.redisAddress,
+			r,
+			tm,
 			s,
-			rd),
-		)
+			rd,
+		))
 
 	}
 
-	//nolint:mnd
-	time.Sleep(10 * time.Second)
+	for _, n := range nodes {
+		assert.Eventually(t, func() bool {
+			conn, err := net.DialTimeout("tcp", n.grpcAddress, time.Second)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			conn, err = net.DialTimeout("tcp", n.redisAddress, time.Second)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			return true
+		}, waitTimeout, waitInterval)
+	}
+
+	assert.Eventually(t, func() bool {
+		return nodes[0].raft.State() == raft.Leader
+	}, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
