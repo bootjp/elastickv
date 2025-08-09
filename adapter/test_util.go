@@ -117,6 +117,9 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	cfg := raft.Configuration{}
 	ports := make([]portsAdress, n)
 
+	ctx := context.Background()
+	var lc net.ListenConfig
+
 	// port assign
 	for i := 0; i < n; i++ {
 		ports[i] = portAssigner()
@@ -161,7 +164,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 
-		grpcSock, err := net.Listen("tcp", port.grpcAddress)
+		grpcSock, err := lc.Listen(ctx, "tcp", port.grpcAddress)
 		assert.NoError(t, err)
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
@@ -170,7 +173,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			assert.NoError(t, s.Serve(grpcSock))
 		}()
 
-		l, err := net.Listen("tcp", port.redisAddress)
+		l, err := lc.Listen(ctx, "tcp", port.redisAddress)
 		assert.NoError(t, err)
 		rd := NewRedisServer(l, st, coordinator)
 		go func() {
