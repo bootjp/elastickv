@@ -26,16 +26,21 @@ func shutdown(nodes []Node) {
 	for _, n := range nodes {
 		n.grpcServer.Stop()
 		n.redisServer.Stop()
+		if n.dynamoServer != nil {
+			n.dynamoServer.Stop()
+		}
 	}
 }
 
 type portsAdress struct {
-	grpc         int
-	raft         int
-	redis        int
-	grpcAddress  string
-	raftAddress  string
-	redisAddress string
+	grpc          int
+	raft          int
+	redis         int
+	dynamo        int
+	grpcAddress   string
+	raftAddress   string
+	redisAddress  string
+	dynamoAddress string
 }
 
 const (
@@ -43,18 +48,21 @@ const (
 	grpcPort = 50000
 	raftPort = 50000
 
-	redisPort = 63790
+	redisPort  = 63790
+	dynamoPort = 28000
 )
 
 var mu sync.Mutex
 var portGrpc atomic.Int32
 var portRaft atomic.Int32
 var portRedis atomic.Int32
+var portDynamo atomic.Int32
 
 func init() {
 	portGrpc.Store(raftPort)
 	portRaft.Store(grpcPort)
 	portRedis.Store(redisPort)
+	portDynamo.Store(dynamoPort)
 
 }
 
@@ -64,31 +72,38 @@ func portAssigner() portsAdress {
 	gp := portGrpc.Add(1)
 	rp := portRaft.Add(1)
 	rd := portRedis.Add(1)
+	dn := portDynamo.Add(1)
 	return portsAdress{
-		grpc:         int(gp),
-		raft:         int(rp),
-		redis:        int(rd),
-		grpcAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
-		raftAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
-		redisAddress: net.JoinHostPort("localhost", strconv.Itoa(int(rd))),
+		grpc:          int(gp),
+		raft:          int(rp),
+		redis:         int(rd),
+		dynamo:        int(dn),
+		grpcAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
+		raftAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
+		redisAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(rd))),
+		dynamoAddress: net.JoinHostPort("localhost", strconv.Itoa(int(dn))),
 	}
 }
 
 type Node struct {
-	grpcAddress  string
-	raftAddress  string
-	redisAddress string
-	grpcServer   *grpc.Server
-	redisServer  *RedisServer
+	grpcAddress   string
+	raftAddress   string
+	redisAddress  string
+	dynamoAddress string
+	grpcServer    *grpc.Server
+	redisServer   *RedisServer
+	dynamoServer  *DynamoDBServer
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress string, grpcs *grpc.Server, rd *RedisServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, grpcs *grpc.Server, rd *RedisServer, ds *DynamoDBServer) Node {
 	return Node{
-		grpcAddress:  grpcAddress,
-		raftAddress:  raftAddress,
-		redisAddress: redisAddress,
-		grpcServer:   grpcs,
-		redisServer:  rd,
+		grpcAddress:   grpcAddress,
+		raftAddress:   raftAddress,
+		redisAddress:  redisAddress,
+		dynamoAddress: dynamoAddress,
+		grpcServer:    grpcs,
+		redisServer:   rd,
+		dynamoServer:  ds,
 	}
 }
 
@@ -161,12 +176,21 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			assert.NoError(t, rd.Run())
 		}()
 
+		dl, err := net.Listen("tcp", port.dynamoAddress)
+		assert.NoError(t, err)
+		ds := NewDynamoDBServer(dl, st, coordinator)
+		go func() {
+			assert.NoError(t, ds.Run())
+		}()
+
 		nodes = append(nodes, newNode(
 			port.grpcAddress,
 			port.raftAddress,
 			port.redisAddress,
+			port.dynamoAddress,
 			s,
-			rd),
+			rd,
+			ds),
 		)
 
 	}
