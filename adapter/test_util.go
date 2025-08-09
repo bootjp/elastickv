@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"sync"
@@ -188,14 +189,16 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 
 	}
 
+	d := &net.Dialer{Timeout: time.Second}
+	ctx := context.Background()
 	for _, n := range nodes {
 		assert.Eventually(t, func() bool {
-			conn, err := net.DialTimeout("tcp", n.grpcAddress, time.Second)
+			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
 			if err != nil {
 				return false
 			}
 			_ = conn.Close()
-			conn, err = net.DialTimeout("tcp", n.redisAddress, time.Second)
+			conn, err = d.DialContext(ctx, "tcp", n.redisAddress)
 			if err != nil {
 				return false
 			}
