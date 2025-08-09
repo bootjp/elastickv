@@ -193,7 +193,6 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	}
 
 	d := &net.Dialer{Timeout: time.Second}
-	ctx := context.Background()
 	for _, n := range nodes {
 		assert.Eventually(t, func() bool {
 			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
