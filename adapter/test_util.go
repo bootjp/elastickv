@@ -31,7 +31,9 @@ func shutdown(nodes []Node) {
 			n.raft.Shutdown()
 		}
 		if n.tm != nil {
-			_ = n.tm.Close()
+			if err := n.tm.Close(); err != nil {
+				log.Printf("error closing transport: %v", err)
+			}
 		}
 	}
 }
