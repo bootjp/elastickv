@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"context"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -26,6 +28,14 @@ func shutdown(nodes []Node) {
 	for _, n := range nodes {
 		n.grpcServer.Stop()
 		n.redisServer.Stop()
+		if n.raft != nil {
+			n.raft.Shutdown()
+		}
+		if n.tm != nil {
+			if err := n.tm.Close(); err != nil {
+				log.Printf("transport close: %v", err)
+			}
+		}
 	}
 }
 
@@ -80,15 +90,19 @@ type Node struct {
 	redisAddress string
 	grpcServer   *grpc.Server
 	redisServer  *RedisServer
+	raft         *raft.Raft
+	tm           *transport.Manager
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress string, grpcs *grpc.Server, rd *RedisServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, rd *RedisServer) Node {
 	return Node{
 		grpcAddress:  grpcAddress,
 		raftAddress:  raftAddress,
 		redisAddress: redisAddress,
 		grpcServer:   grpcs,
 		redisServer:  rd,
+		raft:         r,
+		tm:           tm,
 	}
 }
 
@@ -98,8 +112,16 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	var redisAdders []string
 	var nodes []Node
 
+	const (
+		waitTimeout  = 5 * time.Second
+		waitInterval = 100 * time.Millisecond
+	)
+
 	cfg := raft.Configuration{}
 	ports := make([]portsAdress, n)
+
+	ctx := context.Background()
+	var lc net.ListenConfig
 
 	// port assign
 	for i := 0; i < n; i++ {
@@ -145,7 +167,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 
-		grpcSock, err := net.Listen("tcp", port.grpcAddress)
+		grpcSock, err := lc.Listen(ctx, "tcp", port.grpcAddress)
 		assert.NoError(t, err)
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
@@ -154,7 +176,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			assert.NoError(t, s.Serve(grpcSock))
 		}()
 
-		l, err := net.Listen("tcp", port.redisAddress)
+		l, err := lc.Listen(ctx, "tcp", port.redisAddress)
 		assert.NoError(t, err)
 		rd := NewRedisServer(l, st, coordinator)
 		go func() {
@@ -165,14 +187,34 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			port.grpcAddress,
 			port.raftAddress,
 			port.redisAddress,
+			r,
+			tm,
 			s,
-			rd),
-		)
+			rd,
+		))
 
 	}
 
-	//nolint:mnd
-	time.Sleep(10 * time.Second)
+	d := &net.Dialer{Timeout: time.Second}
+	for _, n := range nodes {
+		assert.Eventually(t, func() bool {
+			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			conn, err = d.DialContext(ctx, "tcp", n.redisAddress)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			return true
+		}, waitTimeout, waitInterval)
+	}
+
+	assert.Eventually(t, func() bool {
+		return nodes[0].raft.State() == raft.Leader
+	}, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }

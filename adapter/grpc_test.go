@@ -3,7 +3,6 @@ package adapter
 import (
 	"context"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 
@@ -164,8 +163,7 @@ func Test_grpc_transaction(t *testing.T) {
 }
 
 func rawKVClient(t *testing.T, hosts []string) pb.RawKVClient {
-	dials := "multi:///" + strings.Join(hosts, ",")
-	conn, err := grpc.NewClient(dials,
+	conn, err := grpc.NewClient(hosts[0],
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
@@ -175,8 +173,7 @@ func rawKVClient(t *testing.T, hosts []string) pb.RawKVClient {
 }
 
 func transactionalKVClient(t *testing.T, hosts []string) pb.TransactionalKVClient {
-	dials := "multi:///" + strings.Join(hosts, ",")
-	conn, err := grpc.NewClient(dials,
+	conn, err := grpc.NewClient(hosts[0],
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
