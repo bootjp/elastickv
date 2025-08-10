@@ -22,6 +22,14 @@ type putItemInput struct {
 	Item      map[string]attributeValue `json:"Item"`
 }
 
+type transactWriteItemsInput struct {
+	TransactItems []transactWriteItem `json:"TransactItems"`
+}
+
+type transactWriteItem struct {
+	Put *putItemInput `json:"Put,omitempty"`
+}
+
 func (t *dynamodbTranscoder) PutItemToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
 	var in putItemInput
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -44,5 +52,37 @@ func (t *dynamodbTranscoder) PutItemToRequest(b []byte) (*kv.OperationGroup[kv.O
 				Value: []byte(valAttr.S),
 			},
 		},
+	}, nil
+}
+
+func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
+	var in transactWriteItemsInput
+	if err := json.Unmarshal(b, &in); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	var elems []*kv.Elem[kv.OP]
+	for _, item := range in.TransactItems {
+		if item.Put == nil {
+			return nil, errors.New("unsupported transact item")
+		}
+		keyAttr, ok := item.Put.Item["key"]
+		if !ok {
+			return nil, errors.New("missing key attribute")
+		}
+		valAttr, ok := item.Put.Item["value"]
+		if !ok {
+			return nil, errors.New("missing value attribute")
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   []byte(keyAttr.S),
+			Value: []byte(valAttr.S),
+		})
+	}
+
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn: true,
+		Elems: elems,
 	}, nil
 }

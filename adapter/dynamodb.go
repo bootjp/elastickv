@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -14,10 +15,14 @@ import (
 )
 
 const (
-	targetPrefix  = "DynamoDB_20120810."
-	putItemTarget = targetPrefix + "PutItem"
-	getItemTarget = targetPrefix + "GetItem"
+	targetPrefix             = "DynamoDB_20120810."
+	putItemTarget            = targetPrefix + "PutItem"
+	getItemTarget            = targetPrefix + "GetItem"
+	updateItemTarget         = targetPrefix + "UpdateItem"
+	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
+
+const updateSplitCount = 2
 
 type DynamoDBServer struct {
 	listen           net.Listener
@@ -59,6 +64,10 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 		d.putItem(w, r)
 	case getItemTarget:
 		d.getItem(w, r)
+	case updateItemTarget:
+		d.updateItem(w, r)
+	case transactWriteItemsTarget:
+		d.transactWriteItems(w, r)
 	default:
 		http.Error(w, "unsupported operation", http.StatusBadRequest)
 	}
@@ -127,4 +136,116 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	_, _ = w.Write(out)
+}
+
+type updateItemInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	UpdateExpression          string                    `json:"UpdateExpression"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
+func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var in updateItemInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	keyAttr, ok := in.Key["key"]
+	if !ok {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	key := []byte(keyAttr.S)
+
+	if err := d.validateCondition(r.Context(), in.ConditionExpression, in.ExpressionAttributeNames, key); err != nil {
+		w.Header().Set("x-amzn-ErrorType", "ConditionalCheckFailedException")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	updExpr := replaceNames(in.UpdateExpression, in.ExpressionAttributeNames)
+	parts := strings.SplitN(updExpr, "=", updateSplitCount)
+	if len(parts) != updateSplitCount {
+		http.Error(w, "invalid update expression", http.StatusBadRequest)
+		return
+	}
+	valPlaceholder := strings.TrimSpace(parts[1])
+	valAttr, ok := in.ExpressionAttributeValues[valPlaceholder]
+	if !ok {
+		http.Error(w, "missing value attribute", http.StatusBadRequest)
+		return
+	}
+
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn: false,
+		Elems: []*kv.Elem[kv.OP]{
+			{
+				Op:    kv.Put,
+				Key:   key,
+				Value: []byte(valAttr.S),
+			},
+		},
+	}
+	if _, err = d.coordinator.Dispatch(req); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	_, _ = w.Write([]byte("{}"))
+}
+
+func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	reqs, err := d.dynamoTranscoder.TransactWriteItemsToRequest(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err = d.coordinator.Dispatch(reqs); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	_, _ = w.Write([]byte("{}"))
+}
+
+func replaceNames(expr string, names map[string]string) string {
+	for k, v := range names {
+		expr = strings.ReplaceAll(expr, k, v)
+	}
+	return expr
+}
+
+func (d *DynamoDBServer) validateCondition(ctx context.Context, expr string, names map[string]string, key []byte) error {
+	expr = replaceNames(expr, names)
+	if expr == "" {
+		return nil
+	}
+	exists, err := d.store.Exists(ctx, key)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	switch {
+	case strings.HasPrefix(expr, "attribute_exists("):
+		if !exists {
+			return errors.New("conditional check failed")
+		}
+	case strings.HasPrefix(expr, "attribute_not_exists("):
+		if exists {
+			return errors.New("conditional check failed")
+		}
+	}
+	return nil
 }
