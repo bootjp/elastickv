@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"os"
@@ -55,6 +56,8 @@ func main() {
 func run(eg *errgroup.Group) error {
 
 	cfg := raft.Configuration{}
+	ctx := context.Background()
+	var lc net.ListenConfig
 
 	for i := 0; i < 3; i++ {
 		var suffrage raft.ServerSuffrage
@@ -93,7 +96,7 @@ func run(eg *errgroup.Group) error {
 		leaderhealth.Setup(r, s, []string{"RawKV"})
 		raftadmin.Register(s, r)
 
-		grpcSock, err := net.Listen("tcp", grpcAdders[i])
+		grpcSock, err := lc.Listen(ctx, "tcp", grpcAdders[i])
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -102,7 +105,7 @@ func run(eg *errgroup.Group) error {
 			return errors.WithStack(s.Serve(grpcSock))
 		})
 
-		l, err := net.Listen("tcp", redisAdders[i])
+		l, err := lc.Listen(ctx, "tcp", redisAdders[i])
 		if err != nil {
 			return errors.WithStack(err)
 		}

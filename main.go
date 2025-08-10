@@ -41,12 +41,14 @@ func main() {
 	}
 
 	ctx := context.Background()
+	var lc net.ListenConfig
+
 	_, port, err := net.SplitHostPort(*myAddr)
 	if err != nil {
 		log.Fatalf("failed to parse local address (%q): %v", *myAddr, err)
 	}
 
-	grpcSock, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	grpcSock, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -72,7 +74,7 @@ func main() {
 	raftadmin.Register(gs, r)
 	reflection.Register(gs)
 
-	redisL, err := net.Listen("tcp", *redisAddr)
+	redisL, err := lc.Listen(ctx, "tcp", *redisAddr)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}

@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"context"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -28,6 +30,14 @@ func shutdown(nodes []Node) {
 		n.redisServer.Stop()
 		if n.dynamoServer != nil {
 			n.dynamoServer.Stop()
+		}
+		if n.raft != nil {
+			n.raft.Shutdown()
+		}
+		if n.tm != nil {
+			if err := n.tm.Close(); err != nil {
+				log.Printf("transport close: %v", err)
+			}
 		}
 	}
 }
@@ -63,7 +73,6 @@ func init() {
 	portRaft.Store(grpcPort)
 	portRedis.Store(redisPort)
 	portDynamo.Store(dynamoPort)
-
 }
 
 func portAssigner() portsAdress {
@@ -93,9 +102,11 @@ type Node struct {
 	grpcServer    *grpc.Server
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
+	raft          *raft.Raft
+	tm            *transport.Manager
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, grpcs *grpc.Server, rd *RedisServer, ds *DynamoDBServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, rd *RedisServer, ds *DynamoDBServer) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
@@ -104,6 +115,8 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, grpcs
 		grpcServer:    grpcs,
 		redisServer:   rd,
 		dynamoServer:  ds,
+		raft:          r,
+		tm:            tm,
 	}
 }
 
@@ -113,8 +126,16 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	var redisAdders []string
 	var nodes []Node
 
+	const (
+		waitTimeout  = 5 * time.Second
+		waitInterval = 100 * time.Millisecond
+	)
+
 	cfg := raft.Configuration{}
 	ports := make([]portsAdress, n)
+
+	ctx := context.Background()
+	var lc net.ListenConfig
 
 	// port assign
 	for i := 0; i < n; i++ {
@@ -160,7 +181,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 
-		grpcSock, err := net.Listen("tcp", port.grpcAddress)
+		grpcSock, err := lc.Listen(ctx, "tcp", port.grpcAddress)
 		assert.NoError(t, err)
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
@@ -169,14 +190,14 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			assert.NoError(t, s.Serve(grpcSock))
 		}()
 
-		l, err := net.Listen("tcp", port.redisAddress)
+		l, err := lc.Listen(ctx, "tcp", port.redisAddress)
 		assert.NoError(t, err)
 		rd := NewRedisServer(l, st, coordinator)
 		go func() {
 			assert.NoError(t, rd.Run())
 		}()
 
-		dl, err := net.Listen("tcp", port.dynamoAddress)
+		dl, err := lc.Listen(ctx, "tcp", port.dynamoAddress)
 		assert.NoError(t, err)
 		ds := NewDynamoDBServer(dl, st, coordinator)
 		go func() {
@@ -188,15 +209,39 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 			port.raftAddress,
 			port.redisAddress,
 			port.dynamoAddress,
+			r,
+			tm,
 			s,
 			rd,
-			ds),
-		)
-
+			ds,
+		))
 	}
 
-	//nolint:mnd
-	time.Sleep(10 * time.Second)
+	d := &net.Dialer{Timeout: time.Second}
+	for _, n := range nodes {
+		assert.Eventually(t, func() bool {
+			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			conn, err = d.DialContext(ctx, "tcp", n.redisAddress)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			conn, err = d.DialContext(ctx, "tcp", n.dynamoAddress)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			return true
+		}, waitTimeout, waitInterval)
+	}
+
+	assert.Eventually(t, func() bool {
+		return nodes[0].raft.State() == raft.Leader
+	}, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
