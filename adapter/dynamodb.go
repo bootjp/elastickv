@@ -192,7 +192,51 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 				Key:   key,
 				Value: []byte(valAttr.S),
 			},
-		},
+
+	// Parse UpdateExpression for SET clause(s)
+	setPrefix := "SET "
+	setIdx := strings.Index(strings.ToUpper(updExpr), setPrefix)
+	if setIdx == -1 {
+		http.Error(w, "only SET clause is supported in update expression", http.StatusBadRequest)
+		return
+	}
+	setExpr := updExpr[setIdx+len(setPrefix):]
+	// Remove any trailing clauses (REMOVE, ADD, DELETE)
+	for _, clause := range []string{" REMOVE ", " ADD ", " DELETE "} {
+		if idx := strings.Index(strings.ToUpper(setExpr), clause); idx != -1 {
+			setExpr = setExpr[:idx]
+		}
+	}
+	assignments := strings.Split(setExpr, ",")
+	elems := make([]*kv.Elem[kv.OP], 0, len(assignments))
+	for _, assign := range assignments {
+		parts := strings.SplitN(assign, "=", 2)
+		if len(parts) != 2 {
+			http.Error(w, "invalid assignment in update expression", http.StatusBadRequest)
+			return
+		}
+		field := strings.TrimSpace(parts[0])
+		valPlaceholder := strings.TrimSpace(parts[1])
+		valAttr, ok := in.ExpressionAttributeValues[valPlaceholder]
+		if !ok {
+			http.Error(w, "missing value attribute: "+valPlaceholder, http.StatusBadRequest)
+			return
+		}
+		// For this example, we only support updating the "value" field
+		if field != "value" {
+			http.Error(w, "only 'value' field can be updated", http.StatusBadRequest)
+			return
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   key,
+			Value: []byte(valAttr.S),
+		})
+	}
+
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn: false,
+		Elems: elems,
 	}
 	if _, err = d.coordinator.Dispatch(req); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
