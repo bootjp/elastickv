@@ -22,6 +22,8 @@ const (
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
+// updateSplitCount defines the number of parts the update expression is split into.
+// This is used to parse and process DynamoDB update expressions.
 const updateSplitCount = 2
 
 type DynamoDBServer struct {
