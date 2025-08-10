@@ -11,6 +11,7 @@ import (
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -89,10 +90,15 @@ func run(eg *errgroup.Group) error {
 		trx := kv.NewTransaction(r)
 		coordinator := kv.NewCoordinator(trx, r)
 		gs := adapter.NewGRPCServer(st, coordinator)
+		distEngine := distribution.NewEngine()
+		distSrv := adapter.NewDistributionServer(distEngine)
+		// example route for demo purposes
+		distSrv.UpdateRoute([]byte("a"), []byte("z"), uint64(i))
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
 		pb.RegisterInternalServer(s, adapter.NewInternal(trx, r))
+		pb.RegisterDistributionServer(s, distSrv)
 		leaderhealth.Setup(r, s, []string{"RawKV"})
 		raftadmin.Register(s, r)
 
