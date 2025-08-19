@@ -67,8 +67,12 @@ func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPut
 
 	res, err := r.coordinator.Dispatch(m)
 	if err != nil {
+		commitIndex := uint64(0)
+		if res != nil {
+			commitIndex = res.CommitIndex
+		}
 		return &pb.RawPutResponse{
-			CommitIndex: res.CommitIndex,
+			CommitIndex: commitIndex,
 			Success:     false,
 		}, errors.WithStack(err)
 	}
@@ -87,8 +91,12 @@ func (r GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*p
 
 	res, err := r.coordinator.Dispatch(m)
 	if err != nil {
+		commitIndex := uint64(0)
+		if res != nil {
+			commitIndex = res.CommitIndex
+		}
 		return &pb.RawDeleteResponse{
-			CommitIndex: res.CommitIndex,
+			CommitIndex: commitIndex,
 			Success:     false,
 		}, errors.WithStack(err)
 	}
@@ -121,8 +129,12 @@ func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 
 	res, err := r.coordinator.Dispatch(reqs)
 	if err != nil {
+		commitIndex := uint64(0)
+		if res != nil {
+			commitIndex = res.CommitIndex
+		}
 		return &pb.PutResponse{
-			CommitIndex: res.CommitIndex,
+			CommitIndex: commitIndex,
 		}, errors.WithStack(err)
 	}
 
@@ -162,8 +174,12 @@ func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Dele
 
 	res, err := r.coordinator.Dispatch(reqs)
 	if err != nil {
+		commitIndex := uint64(0)
+		if res != nil {
+			commitIndex = res.CommitIndex
+		}
 		return &pb.DeleteResponse{
-			CommitIndex: res.CommitIndex,
+			CommitIndex: commitIndex,
 		}, errors.WithStack(err)
 	}
 
