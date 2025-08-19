@@ -38,12 +38,19 @@ func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, e
 			}
 
 			af := t.raft.Apply(b, time.Second)
-			if af.Error() != nil {
-				return 0, errors.WithStack(af.Error())
+			if err := af.Error(); err != nil {
+				return 0, errors.WithStack(err)
 			}
+
+			if resp := af.Response(); resp != nil {
+				if err, ok := resp.(error); ok && err != nil {
+					return 0, errors.WithStack(err)
+				}
+			}
+
 			f := t.raft.Barrier(time.Second)
-			if f.Error() != nil {
-				return 0, errors.WithStack(f.Error())
+			if err := f.Error(); err != nil {
+				return 0, errors.WithStack(err)
 			}
 			commitIndex = af.Index()
 		}

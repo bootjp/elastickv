@@ -243,6 +243,14 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 		return nodes[0].raft.State() == raft.Leader
 	}, waitTimeout, waitInterval)
 
+	for i := 1; i < len(nodes); i++ {
+		f := nodes[0].raft.AddNonvoter(raft.ServerID(strconv.Itoa(i)), raft.ServerAddress(nodes[i].raftAddress), 0, 0)
+		assert.NoError(t, f.Error())
+		assert.Eventually(t, func() bool {
+			return nodes[i].raft.State() == raft.Follower
+		}, waitTimeout, waitInterval)
+	}
+
 	return nodes, grpcAdders, redisAdders
 }
 
