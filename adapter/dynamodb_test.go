@@ -45,8 +45,10 @@ func TestDynamoDB_PutItem_GetItem(t *testing.T) {
 		},
 	})
 	assert.NoError(t, err)
-	keyAttr := out.Item["key"].(*types.AttributeValueMemberS)
-	valueAttr := out.Item["value"].(*types.AttributeValueMemberS)
+	keyAttr, ok := out.Item["key"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	valueAttr, ok := out.Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
 	assert.Equal(t, "test", keyAttr.Value)
 	assert.Equal(t, "v", valueAttr.Value)
 }
@@ -97,7 +99,8 @@ func TestDynamoDB_TransactWriteItems(t *testing.T) {
 		},
 	})
 	assert.NoError(t, err)
-	value1Attr := out1.Item["value"].(*types.AttributeValueMemberS)
+	value1Attr, ok := out1.Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
 	assert.Equal(t, "v1", value1Attr.Value)
 
 	out2, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
@@ -107,7 +110,8 @@ func TestDynamoDB_TransactWriteItems(t *testing.T) {
 		},
 	})
 	assert.NoError(t, err)
-	value2Attr := out2.Item["value"].(*types.AttributeValueMemberS)
+	value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
 	assert.Equal(t, "v2", value2Attr.Value)
 }
 
@@ -159,7 +163,8 @@ func TestDynamoDB_UpdateItem_Condition(t *testing.T) {
 		},
 	})
 	assert.NoError(t, err)
-	valueAttr := out.Item["value"].(*types.AttributeValueMemberS)
+	valueAttr, ok := out.Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
 	assert.Equal(t, "v2", valueAttr.Value)
 
 	_, err = client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
@@ -242,7 +247,8 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 				},
 			})
 			assert.NoError(t, err, "Get failed for key1 in goroutine %d", i)
-			value1Attr := out1.Item["value"].(*types.AttributeValueMemberS)
+			value1Attr, ok := out1.Item["value"].(*types.AttributeValueMemberS)
+			assert.True(t, ok, "Type assertion failed for key1 in goroutine %d", i)
 			assert.Equal(t, value1, value1Attr.Value, "Value mismatch for key1 in goroutine %d", i)
 
 			out2, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
@@ -252,7 +258,8 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 				},
 			})
 			assert.NoError(t, err, "Get failed for key2 in goroutine %d", i)
-			value2Attr := out2.Item["value"].(*types.AttributeValueMemberS)
+			value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
+			assert.True(t, ok, "Type assertion failed for key2 in goroutine %d", i)
 			assert.Equal(t, value2, value2Attr.Value, "Value mismatch for key2 in goroutine %d", i)
 		}(i)
 	}
@@ -299,7 +306,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 
 			// Each goroutine attempts to update multiple shared keys in a transaction
 			counterValue := strconv.Itoa(i)
-			
+
 			_, err := client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
 				TransactItems: []types.TransactWriteItem{
 					{
@@ -352,13 +359,15 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 		})
 		assert.NoError(t, err, "Get failed for key %s", key)
 		assert.NotNil(t, out.Item, "Item should exist for key %s", key)
-		
+
 		if out.Item != nil && out.Item["value"] != nil && out.Item["counter"] != nil {
-			valueAttr := out.Item["value"].(*types.AttributeValueMemberS)
-			counterAttr := out.Item["counter"].(*types.AttributeValueMemberN)
+			valueAttr, ok := out.Item["value"].(*types.AttributeValueMemberS)
+			assert.True(t, ok, "Value type assertion failed for key %s", key)
+			counterAttr, ok := out.Item["counter"].(*types.AttributeValueMemberN)
+			assert.True(t, ok, "Counter type assertion failed for key %s", key)
 			value := valueAttr.Value
 			counter := counterAttr.Value
-			
+
 			// Verify that the value and counter are consistent (both from the same goroutine)
 			assert.Contains(t, value, "updated-by-"+counter, "Value and counter should be consistent for key %s", key)
 		}
