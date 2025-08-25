@@ -93,7 +93,7 @@ func run(eg *errgroup.Group) error {
 		distEngine := distribution.NewEngine()
 		distSrv := adapter.NewDistributionServer(distEngine)
 		// example route for demo purposes
-		distSrv.UpdateRoute([]byte("a"), []byte("z"), uint64(i))
+		distSrv.UpdateRoute([]byte("a"), uint64(i))
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)

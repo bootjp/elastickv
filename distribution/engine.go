@@ -2,20 +2,19 @@ package distribution
 
 import (
 	"bytes"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
 
-// Route represents mapping from key range to raft group.
-// The key range is half-open: [Start, End)
-// meaning Start is inclusive and End is exclusive. If End is nil or empty
-// the range is unbounded and covers all keys >= Start.
+// Route represents a mapping from a starting key to a raft group.
+// Ranges are right half-open infinite intervals: [Start, next Start).
+// Start is inclusive and the range extends up to (but excluding) the next
+// route's start. The last route is unbounded and covers all keys >= Start.
 type Route struct {
 	// Start marks the inclusive beginning of the range.
 	Start []byte
-        // End marks the exclusive end of the range. When empty, the range has
-        // no upper bound.
-        End     []byte
+	// GroupID identifies the raft group for the range starting at Start.
 	GroupID uint64
 }
 
@@ -31,27 +30,34 @@ func NewEngine() *Engine {
 	return &Engine{routes: make([]Route, 0)}
 }
 
-// UpdateRoute registers or updates a route. The range is [start, end). If end
-// is nil or empty the range is treated as unbounded above.
-func (e *Engine) UpdateRoute(start, end []byte, group uint64) {
+// UpdateRoute registers or updates a route starting at the given key.
+// Routes are stored sorted by Start.
+func (e *Engine) UpdateRoute(start []byte, group uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.routes = append(e.routes, Route{Start: start, End: end, GroupID: group})
+	e.routes = append(e.routes, Route{Start: start, GroupID: group})
+	sort.Slice(e.routes, func(i, j int) bool {
+		return bytes.Compare(e.routes[i].Start, e.routes[j].Start) < 0
+	})
 }
 
-// GetRoute finds a route for the given key. The search uses half-open ranges
-// [Start, End). If End is empty the range is treated as unbounded above.
+// GetRoute finds a route for the given key using right half-open infinite
+// intervals.
 func (e *Engine) GetRoute(key []byte) (Route, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-        for _, r := range e.routes {
-                if bytes.Compare(key, r.Start) >= 0 {
-                        if len(r.End) == 0 || bytes.Compare(key, r.End) < 0 {
-                                return r, true
-                        }
-                }
-        }
-	return Route{}, false
+	if len(e.routes) == 0 {
+		return Route{}, false
+	}
+
+	// Find the first route with Start > key.
+	i := sort.Search(len(e.routes), func(i int) bool {
+		return bytes.Compare(e.routes[i].Start, key) > 0
+	})
+	if i == 0 {
+		return Route{}, false
+	}
+	return e.routes[i-1], true
 }
 
 // NextTimestamp returns a monotonic increasing timestamp.

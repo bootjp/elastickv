@@ -19,8 +19,8 @@ func NewDistributionServer(e *distribution.Engine) *DistributionServer {
 }
 
 // UpdateRoute allows updating route information.
-func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
-	s.engine.UpdateRoute(start, end, group)
+func (s *DistributionServer) UpdateRoute(start []byte, group uint64) {
+	s.engine.UpdateRoute(start, group)
 }
 
 // GetRoute returns route for a key.
@@ -31,7 +31,6 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 	}
 	return &pb.GetRouteResponse{
 		Start:       r.Start,
-		End:         r.End,
 		RaftGroupId: r.GroupID,
 	}, nil
 }

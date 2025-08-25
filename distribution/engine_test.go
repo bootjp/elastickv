@@ -3,22 +3,22 @@ package distribution
 import "testing"
 
 func TestEngineRouteLookup(t *testing.T) {
-        e := NewEngine()
-        e.UpdateRoute([]byte("a"), []byte("m"), 1)
-        // second range has no upper bound
-        e.UpdateRoute([]byte("m"), nil, 2)
+	e := NewEngine()
+	e.UpdateRoute([]byte("a"), 1)
+	e.UpdateRoute([]byte("m"), 2)
 
 	cases := []struct {
 		key    []byte
 		group  uint64
 		expect bool
 	}{
-		{[]byte("a"), 1, true}, // start is inclusive
+		{[]byte("0"), 0, false}, // before first route
+		{[]byte("a"), 1, true},  // start is inclusive
 		{[]byte("b"), 1, true},
-                {[]byte("m"), 2, true}, // end is exclusive, so m belongs to second range
-                {[]byte("x"), 2, true},
-                {[]byte("za"), 2, true}, // unbounded range covers keys beyond z
-        }
+		{[]byte("m"), 2, true}, // next start marks new range
+		{[]byte("x"), 2, true},
+		{[]byte("za"), 2, true}, // last route is unbounded
+	}
 
 	for _, c := range cases {
 		r, ok := e.GetRoute(c.key)

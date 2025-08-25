@@ -12,11 +12,10 @@ message GetRouteRequest {
 }
 
 message GetRouteResponse {
-  // start is inclusive
+  // start is inclusive. The range extends up to (but excluding) the next
+  // route's start. If there is no subsequent start, the range is unbounded.
   bytes start = 1;
-  // end is exclusive. empty means the range is unbounded
-  bytes end = 2;
-  uint64 raft_group_id = 3;
+  uint64 raft_group_id = 2;
 }
 
 message GetTimestampRequest {}
