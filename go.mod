@@ -2,32 +2,46 @@ module github.com/bootjp/elastickv
 
 go 1.23.0
 
-toolchain go1.24.6
+toolchain go1.25.0
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
 	github.com/Jille/raft-grpc-leader-rpc v1.1.0
 	github.com/Jille/raft-grpc-transport v1.6.1
 	github.com/Jille/raftadmin v1.2.1
-	github.com/aws/aws-sdk-go v1.55.8
+	github.com/aws/aws-sdk-go-v2 v1.38.1
+	github.com/aws/aws-sdk-go-v2/config v1.31.2
+	github.com/aws/aws-sdk-go-v2/credentials v1.18.6
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.49.1
 	github.com/cockroachdb/errors v1.12.0
 	github.com/emirpasic/gods v1.18.1
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/pkg/errors v0.9.1
-	github.com/redis/go-redis/v9 v9.12.0
+	github.com/redis/go-redis/v9 v9.12.1
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/redcon v1.6.2
-	go.etcd.io/bbolt v1.4.2
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/sync v0.16.0
 	google.golang.org/grpc v1.74.2
-	google.golang.org/protobuf v1.36.7
+	google.golang.org/protobuf v1.36.8
 )
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.4 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.4 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.4 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.11.4 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.4 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.28.2 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.33.2 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.38.0 // indirect
+	github.com/aws/smithy-go v1.22.5 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
@@ -44,7 +58,6 @@ require (
 	github.com/hashicorp/go-msgpack/v2 v2.1.2 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
