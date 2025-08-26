@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+service DistributionAdmin {
+  rpc SplitRange(SplitRangeRequest) returns (SplitRangeResponse) {}
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+}
+
+message SplitRangeRequest {
+  string key = 1;
+}
+
+message SplitRangeResponse {}
+
+message GetStatsRequest {}
+
+message RangeStat {
+  string start = 1;
+  string end = 2;
+  int64 count = 3;
+  int64 timestamp = 4;
+}
+
+message GetStatsResponse {
+  repeated RangeStat stats = 1;
+}
