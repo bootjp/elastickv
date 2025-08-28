@@ -1,0 +1,23 @@
+on: [ push ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-jepsen-test
+
+name: Jepsen Test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Leiningen
+        run: |
+          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
+          chmod +x ~/lein
+          ~/lein version
+      - name: Run Jepsen tests
+        working-directory: jepsen
+        run: ~/lein test

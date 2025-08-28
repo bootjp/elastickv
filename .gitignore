@@ -22,3 +22,8 @@ go.work
 
 # Built binary
 elastickv
+
+# Clojure/Leiningen build artifacts
+jepsen/target/
+jepsen/.lein-*
+jepsen/.nrepl-port
