@@ -33,18 +33,19 @@ type DynamoDBServer struct {
 }
 
 func NewDynamoDBServer(listen net.Listener, st store.ScanStore, coordinate *kv.Coordinate) *DynamoDBServer {
-	return &DynamoDBServer{
+	d := &DynamoDBServer{
 		listen:           listen,
 		store:            st,
 		coordinator:      coordinate,
 		dynamoTranscoder: newDynamoDBTranscoder(),
 	}
-}
-
-func (d *DynamoDBServer) Run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
 	d.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	return d
+}
+
+func (d *DynamoDBServer) Run() error {
 	if err := d.httpServer.Serve(d.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}
