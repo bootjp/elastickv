@@ -71,6 +71,21 @@ quit
 
 ### Development
 
+### Running Jepsen tests
+
+Jepsen tests live in `jepsen/`. Install Leiningen and run tests locally:
+
+```bash
+curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
+chmod +x ~/lein
+(cd jepsen && ~/lein test)
+```
+
+These Jepsen tests execute concurrent read and write operations while a nemesis
+injects random network partitions. Jepsen's linearizability checker verifies the
+history.
+
+
 
 ### Setup pre-commit hooks
 ```bash
