@@ -4,6 +4,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-jepsen-test
 
 name: Jepsen Test
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
