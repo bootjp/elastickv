@@ -7,10 +7,8 @@
              [client :as client]
              [checker :as checker]]
             [jepsen.checker.timeline :as timeline]
-            [jepsen.checker.linearizable :as linear]
-            [jepsen.tests.register :as register]
-            [jepsen.nemesis :as nemesis]
-            [jepsen.nemesis.fs :as fs])
+            [jepsen.tests.linearizable-register :as register]
+            [jepsen.nemesis :as nemesis])
   (:import (redis.clients.jedis Jedis)))
 
 (defrecord RedisClient [port]
@@ -40,12 +38,7 @@
      :db db/noop
      :client (->RedisClient 63791)
      :concurrency 5
-     :nemesis (nemesis/compose
-               {:partition (nemesis/partition-random-halves)
-                :errorfs   (fs/errorfs)})
-     :checker (checker/compose
-               {:linear   (linear/checker)
-                :timeline (timeline/html)})}))
+     :nemesis (nemesis/partition-random-halves)}))
 
 (defn -main
   [& args]

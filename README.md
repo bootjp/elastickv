@@ -82,8 +82,8 @@ chmod +x ~/lein
 ```
 
 These Jepsen tests execute concurrent read and write operations while a nemesis
-injects network partitions and filesystem faults via errorfs. Jepsen's
-linearizability checker verifies the history.
+injects random network partitions. Jepsen's linearizability checker verifies the
+history.
 
 
 
