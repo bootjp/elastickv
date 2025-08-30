@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -17,8 +18,10 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -31,6 +34,7 @@ var (
 	raftId        = flag.String("raft_id", "", "Node id used by Raft")
 	raftDir       = flag.String("raft_data_dir", "data/", "Raft data dir")
 	raftBootstrap = flag.Bool("raft_bootstrap", false, "Whether to bootstrap the Raft cluster")
+	metricsAddr   = flag.String("metrics_address", ":2112", "TCP host+port for Prometheus metrics")
 )
 
 func main() {
@@ -62,7 +66,10 @@ func main() {
 		log.Fatalf("failed to start raft: %v", err)
 	}
 
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(
+		grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
+		grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
+	)
 	trx := kv.NewTransaction(r)
 	coordinate := kv.NewCoordinator(trx, r)
 	pb.RegisterRawKVServer(gs, adapter.NewGRPCServer(s, coordinate))
@@ -73,11 +80,15 @@ func main() {
 	leaderhealth.Setup(r, gs, []string{"RawKV", "Example"})
 	raftadmin.Register(gs, r)
 	reflection.Register(gs)
+	grpc_prometheus.Register(gs)
 
 	redisL, err := lc.Listen(ctx, "tcp", *redisAddr)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 
 	eg := errgroup.Group{}
 	eg.Go(func() error {
@@ -85,6 +96,9 @@ func main() {
 	})
 	eg.Go(func() error {
 		return errors.WithStack(adapter.NewRedisServer(redisL, s, coordinate).Run())
+	})
+	eg.Go(func() error {
+		return errors.WithStack(http.ListenAndServe(*metricsAddr, mux))
 	})
 
 	err = eg.Wait()

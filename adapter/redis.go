@@ -97,6 +97,7 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
+	opCounter.WithLabelValues("set", "redis").Inc()
 	res, err := r.redisTranscoder.SetToRequest(cmd.Args[1], cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -113,6 +114,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
+	opCounter.WithLabelValues("get", "redis").Inc()
 	v, err := r.store.Get(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteNull()
@@ -123,6 +125,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
+	opCounter.WithLabelValues("del", "redis").Inc()
 	res, err := r.redisTranscoder.DeleteToRequest(cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -139,6 +142,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
+	opCounter.WithLabelValues("exists", "redis").Inc()
 	ok, err := r.store.Exists(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -153,6 +157,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
+	opCounter.WithLabelValues("keys", "redis").Inc()
 
 	// If an asterisk (*) is not included, the match will be exact,
 	// so check if the key exists.

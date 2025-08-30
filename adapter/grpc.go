@@ -38,6 +38,7 @@ func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer
 }
 
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	opCounter.WithLabelValues("raw_get", "grpc").Inc()
 	v, err := r.store.Get(ctx, req.Key)
 	if err != nil {
 		switch {
@@ -60,6 +61,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 }
 
 func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
+	opCounter.WithLabelValues("raw_put", "grpc").Inc()
 	m, err := r.grpcTranscoder.RawPutToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -80,6 +82,7 @@ func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPut
 }
 
 func (r GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
+	opCounter.WithLabelValues("raw_delete", "grpc").Inc()
 	m, err := r.grpcTranscoder.RawDeleteToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -112,6 +115,7 @@ func (r GRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.
 }
 
 func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	opCounter.WithLabelValues("put", "grpc").Inc()
 	reqs, err := r.grpcTranscoder.TransactionalPutToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -133,6 +137,7 @@ func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 }
 
 func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	opCounter.WithLabelValues("get", "grpc").Inc()
 	h := murmur3.New64()
 	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
@@ -153,6 +158,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 }
 
 func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	opCounter.WithLabelValues("delete", "grpc").Inc()
 	reqs, err := r.grpcTranscoder.TransactionalDeleteToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -174,6 +180,7 @@ func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Dele
 }
 
 func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+	opCounter.WithLabelValues("scan", "grpc").Inc()
 	limit, err := internal.Uint64ToInt(req.Limit)
 	if err != nil {
 		return &pb.ScanResponse{
