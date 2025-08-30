@@ -112,7 +112,7 @@ func (s *boltStore) ScanKeys(ctx context.Context, start []byte, end []byte, limi
 
 		c := b.Cursor()
 		for k, _ := c.Seek(start); k != nil && (end == nil || bytes.Compare(k, end) < 0); k, _ = c.Next() {
-			res = append(res, k)
+			res = append(res, append([]byte(nil), k...))
 			if len(res) >= limit {
 				break
 			}
