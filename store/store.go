@@ -32,6 +32,7 @@ type Store interface {
 type ScanStore interface {
 	Store
 	Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error)
+	ScanKeys(ctx context.Context, start []byte, end []byte, limit int) ([][]byte, error)
 }
 
 type TTLStore interface {
@@ -56,6 +57,7 @@ type Txn interface {
 type ScanTxn interface {
 	Txn
 	Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error)
+	ScanKeys(ctx context.Context, start []byte, end []byte, limit int) ([][]byte, error)
 }
 
 type TTLTxn interface {
