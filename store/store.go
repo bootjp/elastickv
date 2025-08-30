@@ -10,6 +10,7 @@ import (
 var ErrKeyNotFound = errors.New("not found")
 var ErrUnknownOp = errors.New("unknown op")
 var ErrNotSupported = errors.New("not supported")
+var ErrInvalidChecksum = errors.New("invalid checksum")
 
 type KVPair struct {
 	Key   []byte

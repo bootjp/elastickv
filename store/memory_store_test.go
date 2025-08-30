@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"strconv"
 	"sync"
@@ -202,6 +203,46 @@ func TestMemoryStore_TTL(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestMemoryStore_SnapshotChecksum(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		st := NewMemoryStore()
+		assert.NoError(t, st.Put(ctx, []byte("foo"), []byte("bar")))
+
+		buf, err := st.Snapshot()
+		assert.NoError(t, err)
+
+		st2 := NewMemoryStore()
+		err = st2.Restore(bytes.NewReader(buf.(*bytes.Buffer).Bytes()))
+		assert.NoError(t, err)
+
+		v, err := st2.Get(ctx, []byte("foo"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("bar"), v)
+	})
+
+	t.Run("corrupted", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		st := NewMemoryStore()
+		assert.NoError(t, st.Put(ctx, []byte("foo"), []byte("bar")))
+
+		buf, err := st.Snapshot()
+		assert.NoError(t, err)
+		data := buf.(*bytes.Buffer).Bytes()
+		corrupted := make([]byte, len(data))
+		copy(corrupted, data)
+		corrupted[0] ^= 0xff
+
+		st2 := NewMemoryStore()
+		err = st2.Restore(bytes.NewReader(corrupted))
+		assert.ErrorIs(t, err, ErrInvalidChecksum)
+	})
 }
 
 func TestMemoryStore_TTL_Txn(t *testing.T) {
