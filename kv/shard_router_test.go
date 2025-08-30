@@ -92,33 +92,33 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 	return rafts[0], shutdown
 }
 
-func TestShardedTransactionManagerCommit(t *testing.T) {
+func TestShardRouterCommit(t *testing.T) {
 	e := distribution.NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e.UpdateRoute([]byte("m"), nil, 2)
 
-	stm := NewShardedTransactionManager(e)
+	router := NewShardRouter(e)
 
 	// group 1
 	s1 := store.NewRbMemoryStore()
 	l1 := store.NewRbMemoryStoreWithExpire(time.Minute)
 	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
 	defer stop1()
-	stm.Register(1, NewTransaction(r1))
+	router.Register(1, NewTransaction(r1))
 
 	// group 2
 	s2 := store.NewRbMemoryStore()
 	l2 := store.NewRbMemoryStoreWithExpire(time.Minute)
 	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
 	defer stop2()
-	stm.Register(2, NewTransaction(r2))
+	router.Register(2, NewTransaction(r2))
 
 	reqs := []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
 	}
 
-	_, err := stm.Commit(reqs)
+	_, err := router.Commit(reqs)
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -133,34 +133,34 @@ func TestShardedTransactionManagerCommit(t *testing.T) {
 	}
 }
 
-func TestShardedTransactionManagerSplitAndMerge(t *testing.T) {
+func TestShardRouterSplitAndMerge(t *testing.T) {
 	ctx := context.Background()
 
 	e := distribution.NewEngine()
 	// start with single shard handled by group 1
 	e.UpdateRoute([]byte("a"), nil, 1)
 
-	stm := NewShardedTransactionManager(e)
+	router := NewShardRouter(e)
 
 	// group 1
 	s1 := store.NewRbMemoryStore()
 	l1 := store.NewRbMemoryStoreWithExpire(time.Minute)
 	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
 	defer stop1()
-	stm.Register(1, NewTransaction(r1))
+	router.Register(1, NewTransaction(r1))
 
 	// group 2 (will be used after split)
 	s2 := store.NewRbMemoryStore()
 	l2 := store.NewRbMemoryStoreWithExpire(time.Minute)
 	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
 	defer stop2()
-	stm.Register(2, NewTransaction(r2))
+	router.Register(2, NewTransaction(r2))
 
 	// initial write routed to group 1
 	req := []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
 	}
-	if _, err := stm.Commit(req); err != nil {
+	if _, err := router.Commit(req); err != nil {
 		t.Fatalf("commit group1: %v", err)
 	}
 	v, err := s1.Get(ctx, []byte("b"))
@@ -172,13 +172,13 @@ func TestShardedTransactionManagerSplitAndMerge(t *testing.T) {
 	e2 := distribution.NewEngine()
 	e2.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e2.UpdateRoute([]byte("m"), nil, 2)
-	stm.engine = e2
+	router.engine = e2
 
 	// write routed to group 2 after split
 	req = []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
 	}
-	if _, err := stm.Commit(req); err != nil {
+	if _, err := router.Commit(req); err != nil {
 		t.Fatalf("commit group2: %v", err)
 	}
 	v, err = s2.Get(ctx, []byte("x"))
@@ -189,17 +189,66 @@ func TestShardedTransactionManagerSplitAndMerge(t *testing.T) {
 	// merge shards back: all keys handled by group1
 	e3 := distribution.NewEngine()
 	e3.UpdateRoute([]byte("a"), nil, 1)
-	stm.engine = e3
+	router.engine = e3
 
 	// write routed to group1 after merge
 	req = []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v3")}}},
 	}
-	if _, err := stm.Commit(req); err != nil {
+	if _, err := router.Commit(req); err != nil {
 		t.Fatalf("commit after merge: %v", err)
 	}
 	v, err = s1.Get(ctx, []byte("z"))
 	if err != nil || string(v) != "v3" {
 		t.Fatalf("group1 value after merge: %v %v", v, err)
+	}
+}
+
+type fakeTM struct {
+	commitErr   bool
+	commitCalls int
+	abortCalls  int
+}
+
+func (f *fakeTM) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	f.commitCalls++
+	if f.commitErr {
+		return nil, fmt.Errorf("commit fail")
+	}
+	return &TransactionResponse{}, nil
+}
+
+func (f *fakeTM) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+	f.abortCalls++
+	return &TransactionResponse{}, nil
+}
+
+func TestShardRouterCommitFailure(t *testing.T) {
+	e := distribution.NewEngine()
+	e.UpdateRoute([]byte("a"), []byte("m"), 1)
+	e.UpdateRoute([]byte("m"), nil, 2)
+
+	router := NewShardRouter(e)
+
+	ok := &fakeTM{}
+	fail := &fakeTM{commitErr: true}
+	router.Register(1, ok)
+	router.Register(2, fail)
+
+	reqs := []*pb.Request{
+		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
+		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
+	}
+
+	if _, err := router.Commit(reqs); err == nil {
+		t.Fatalf("expected error")
+	}
+
+	if fail.commitCalls == 0 || ok.commitCalls == 0 {
+		t.Fatalf("expected commits on both groups")
+	}
+
+	if ok.abortCalls != 0 {
+		t.Fatalf("unexpected abort on successful group")
 	}
 }

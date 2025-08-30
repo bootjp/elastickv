@@ -8,54 +8,44 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// ShardedTransactionManager routes requests to multiple raft groups based on key ranges.
-type ShardedTransactionManager struct {
+// ShardRouter routes requests to multiple raft groups based on key ranges.
+// It does not provide transactional guarantees across shards; commits are executed
+// per shard and failures may leave partial results.
+type ShardRouter struct {
 	engine *distribution.Engine
 	mu     sync.RWMutex
 	groups map[uint64]Transactional
 }
 
-// NewShardedTransactionManager creates a new manager.
-func NewShardedTransactionManager(e *distribution.Engine) *ShardedTransactionManager {
-	return &ShardedTransactionManager{
+// NewShardRouter creates a new router.
+func NewShardRouter(e *distribution.Engine) *ShardRouter {
+	return &ShardRouter{
 		engine: e,
 		groups: make(map[uint64]Transactional),
 	}
 }
 
 // Register associates a raft group ID with a Transactional.
-func (s *ShardedTransactionManager) Register(group uint64, tm Transactional) {
+func (s *ShardRouter) Register(group uint64, tm Transactional) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.groups[group] = tm
 }
 
-// Commit dispatches requests to the correct raft group.
-func (s *ShardedTransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	grouped, err := s.groupRequests(reqs)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	var max uint64
-	for gid, rs := range grouped {
-		tm, ok := s.getGroup(gid)
-		if !ok {
-			return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", gid)
-		}
-		r, err := tm.Commit(rs)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		if r.CommitIndex > max {
-			max = r.CommitIndex
-		}
-	}
-	return &TransactionResponse{CommitIndex: max}, nil
+func (s *ShardRouter) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	return s.process(reqs, func(tm Transactional, rs []*pb.Request) (*TransactionResponse, error) {
+		return tm.Commit(rs)
+	})
 }
 
 // Abort dispatches aborts to the correct raft group.
-func (s *ShardedTransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *ShardRouter) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+	return s.process(reqs, func(tm Transactional, rs []*pb.Request) (*TransactionResponse, error) {
+		return tm.Abort(rs)
+	})
+}
+
+func (s *ShardRouter) process(reqs []*pb.Request, fn func(Transactional, []*pb.Request) (*TransactionResponse, error)) (*TransactionResponse, error) {
 	grouped, err := s.groupRequests(reqs)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -67,7 +57,7 @@ func (s *ShardedTransactionManager) Abort(reqs []*pb.Request) (*TransactionRespo
 		if !ok {
 			return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", gid)
 		}
-		r, err := tm.Abort(rs)
+		r, err := fn(tm, rs)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -78,14 +68,14 @@ func (s *ShardedTransactionManager) Abort(reqs []*pb.Request) (*TransactionRespo
 	return &TransactionResponse{CommitIndex: max}, nil
 }
 
-func (s *ShardedTransactionManager) getGroup(id uint64) (Transactional, bool) {
+func (s *ShardRouter) getGroup(id uint64) (Transactional, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	tm, ok := s.groups[id]
 	return tm, ok
 }
 
-func (s *ShardedTransactionManager) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Request, error) {
+func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Request, error) {
 	batches := make(map[uint64][]*pb.Request)
 	for _, r := range reqs {
 		if len(r.Mutations) == 0 {
@@ -101,4 +91,4 @@ func (s *ShardedTransactionManager) groupRequests(reqs []*pb.Request) (map[uint6
 	return batches, nil
 }
 
-var _ Transactional = (*ShardedTransactionManager)(nil)
+var _ Transactional = (*ShardRouter)(nil)
