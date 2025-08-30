@@ -123,8 +123,8 @@ func (e *Engine) splitRange(idx int) {
 	if mid == nil {
 		return
 	}
-	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID}
-	right := Route{Start: mid, End: r.End, GroupID: r.GroupID}
+left := Route{Start: r.Start, End: mid, GroupID: r.GroupID, Load: r.Load / 2}
+right := Route{Start: mid, End: r.End, GroupID: r.GroupID, Load: r.Load - (r.Load / 2)}
 	e.routes = append(append(e.routes[:idx], left, right), e.routes[idx+1:]...)
 }
 
