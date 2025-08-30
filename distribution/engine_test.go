@@ -1,6 +1,9 @@
 package distribution
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestEngineRouteLookup(t *testing.T) {
 	e := NewEngine()
@@ -48,5 +51,38 @@ func TestEngineTimestampMonotonic(t *testing.T) {
 			t.Fatalf("timestamp not monotonic: %d <= %d", ts, last)
 		}
 		last = ts
+	}
+}
+
+func TestEngineRecordAccessAndStats(t *testing.T) {
+	e := NewEngineWithThreshold(0)
+	e.UpdateRoute([]byte("a"), []byte("m"), 1)
+	e.RecordAccess([]byte("b"))
+	e.RecordAccess([]byte("b"))
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(stats))
+	}
+	if stats[0].Load != 2 {
+		t.Fatalf("expected load 2, got %d", stats[0].Load)
+	}
+}
+
+func TestEngineSplitOnHotspot(t *testing.T) {
+	e := NewEngineWithThreshold(2)
+	e.UpdateRoute([]byte("a"), []byte("c"), 1)
+	e.RecordAccess([]byte("b"))
+	e.RecordAccess([]byte("b"))
+	stats := e.Stats()
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 routes after split, got %d", len(stats))
+	}
+	// ensure the key b can still be resolved after split
+	r, ok := e.GetRoute([]byte("b"))
+	if !ok {
+		t.Fatalf("expected route for key b after split")
+	}
+	if r.End != nil && bytes.Compare([]byte("b"), r.End) >= 0 {
+		t.Fatalf("route does not contain key b")
 	}
 }
