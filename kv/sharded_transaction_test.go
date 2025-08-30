@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,35 +12,84 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// helper to create single-node raft
-func newTestRaft(t *testing.T, id string, fsm raft.FSM) *raft.Raft {
+// helper to create a multi-node raft cluster and return the leader
+func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 	t.Helper()
-	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(id)
-	ldb := raft.NewInmemStore()
-	sdb := raft.NewInmemStore()
-	fss := raft.NewInmemSnapshotStore()
-	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id))
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, trans)
-	if err != nil {
-		t.Fatalf("new raft: %v", err)
+
+	const n = 3
+	addrs := make([]raft.ServerAddress, n)
+	trans := make([]*raft.InmemTransport, n)
+	for i := 0; i < n; i++ {
+		addr, tr := raft.NewInmemTransport(raft.ServerAddress(fmt.Sprintf("%s-%d", id, i)))
+		addrs[i] = addr
+		trans[i] = tr
 	}
-	cfg := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(id), Address: addr}}}
-	if err := r.BootstrapCluster(cfg).Error(); err != nil {
-		t.Fatalf("bootstrap: %v", err)
+	// fully connect transports
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			trans[i].Connect(addrs[j], trans[j])
+			trans[j].Connect(addrs[i], trans[i])
+		}
 	}
 
-	// single node should eventually become leader
+	// cluster configuration
+	cfg := raft.Configuration{}
+	for i := 0; i < n; i++ {
+		cfg.Servers = append(cfg.Servers, raft.Server{
+			ID:      raft.ServerID(fmt.Sprintf("%s-%d", id, i)),
+			Address: addrs[i],
+		})
+	}
+
+	rafts := make([]*raft.Raft, n)
+	for i := 0; i < n; i++ {
+		c := raft.DefaultConfig()
+		c.LocalID = cfg.Servers[i].ID
+		if i == 0 {
+			c.HeartbeatTimeout = 200 * time.Millisecond
+			c.ElectionTimeout = 400 * time.Millisecond
+			c.LeaderLeaseTimeout = 100 * time.Millisecond
+		} else {
+			c.HeartbeatTimeout = 1 * time.Second
+			c.ElectionTimeout = 2 * time.Second
+			c.LeaderLeaseTimeout = 500 * time.Millisecond
+		}
+		ldb := raft.NewInmemStore()
+		sdb := raft.NewInmemStore()
+		fss := raft.NewInmemSnapshotStore()
+		var rfsm raft.FSM
+		if i == 0 {
+			rfsm = fsm
+		} else {
+			rfsm = NewKvFSM(store.NewRbMemoryStore(), store.NewRbMemoryStoreWithExpire(time.Minute))
+		}
+		r, err := raft.NewRaft(c, rfsm, ldb, sdb, fss, trans[i])
+		if err != nil {
+			t.Fatalf("new raft %d: %v", i, err)
+		}
+		if err := r.BootstrapCluster(cfg).Error(); err != nil {
+			t.Fatalf("bootstrap %d: %v", i, err)
+		}
+		rafts[i] = r
+	}
+
+	// node 0 should become leader
 	for i := 0; i < 100; i++ {
-		if r.State() == raft.Leader {
+		if rafts[0].State() == raft.Leader {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if r.State() != raft.Leader {
-		t.Fatalf("node %s is not leader", id)
+	if rafts[0].State() != raft.Leader {
+		t.Fatalf("node %s-0 is not leader", id)
 	}
-	return r
+
+	shutdown := func() {
+		for _, r := range rafts {
+			r.Shutdown()
+		}
+	}
+	return rafts[0], shutdown
 }
 
 func TestShardedTransactionManagerCommit(t *testing.T) {
@@ -52,15 +102,15 @@ func TestShardedTransactionManagerCommit(t *testing.T) {
 	// group 1
 	s1 := store.NewRbMemoryStore()
 	l1 := store.NewRbMemoryStoreWithExpire(time.Minute)
-	r1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
-	defer r1.Shutdown()
+	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
+	defer stop1()
 	stm.Register(1, NewTransaction(r1))
 
 	// group 2
 	s2 := store.NewRbMemoryStore()
 	l2 := store.NewRbMemoryStoreWithExpire(time.Minute)
-	r2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
-	defer r2.Shutdown()
+	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
+	defer stop2()
 	stm.Register(2, NewTransaction(r2))
 
 	reqs := []*pb.Request{
@@ -95,15 +145,15 @@ func TestShardedTransactionManagerSplitAndMerge(t *testing.T) {
 	// group 1
 	s1 := store.NewRbMemoryStore()
 	l1 := store.NewRbMemoryStoreWithExpire(time.Minute)
-	r1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
-	defer r1.Shutdown()
+	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1, l1))
+	defer stop1()
 	stm.Register(1, NewTransaction(r1))
 
 	// group 2 (will be used after split)
 	s2 := store.NewRbMemoryStore()
 	l2 := store.NewRbMemoryStoreWithExpire(time.Minute)
-	r2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
-	defer r2.Shutdown()
+	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2, l2))
+	defer stop2()
 	stm.Register(2, NewTransaction(r2))
 
 	// initial write routed to group 1
