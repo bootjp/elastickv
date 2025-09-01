@@ -125,7 +125,10 @@ func (e *Engine) splitRange(idx int) {
 	}
 left := Route{Start: r.Start, End: mid, GroupID: r.GroupID, Load: r.Load / 2}
 right := Route{Start: mid, End: r.End, GroupID: r.GroupID, Load: r.Load - (r.Load / 2)}
-	e.routes = append(append(e.routes[:idx], left, right), e.routes[idx+1:]...)
+e.routes = append(e.routes, Route{}) // Make room for one more element.
+copy(e.routes[idx+2:], e.routes[idx+1:]) // Shift elements to the right.
+e.routes[idx] = left
+e.routes[idx+1] = right
 }
 
 func cloneBytes(b []byte) []byte {
