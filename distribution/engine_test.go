@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -86,6 +87,42 @@ func TestEngineSplitOnHotspot(t *testing.T) {
 	r, ok := e.GetRoute([]byte("b"))
 	if !ok || (r.End != nil && bytes.Compare([]byte("b"), r.End) >= 0) {
 		t.Fatalf("route does not contain key b")
+	}
+}
+
+func TestEngineHotspotUnboundedResetsLoad(t *testing.T) {
+	e := NewEngineWithThreshold(2)
+	e.UpdateRoute([]byte("a"), nil, 1)
+	e.RecordAccess([]byte("b"))
+	e.RecordAccess([]byte("b"))
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(stats))
+	}
+	if stats[0].Load != 0 {
+		t.Fatalf("expected load reset to 0, got %d", stats[0].Load)
+	}
+}
+
+func TestEngineRecordAccessConcurrent(t *testing.T) {
+	t.Parallel()
+	e := NewEngineWithThreshold(6)
+	e.UpdateRoute([]byte("a"), []byte("c"), 1)
+
+	var wg sync.WaitGroup
+	const workers = 10
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.RecordAccess([]byte("b"))
+		}()
+	}
+	wg.Wait()
+
+	stats := e.Stats()
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 routes after concurrent split, got %d", len(stats))
 	}
 }
 

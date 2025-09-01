@@ -132,16 +132,22 @@ func (e *Engine) routeIndex(key []byte) int {
 func (e *Engine) splitRange(idx int) {
 	r := e.routes[idx]
 	if r.End == nil {
-		// cannot split unbounded range
+		// cannot split unbounded range; reset load to avoid repeated attempts
+		e.routes[idx].Load = 0
 		return
 	}
 	mid := midpoint(r.Start, r.End)
 	if mid == nil {
+		// cannot determine midpoint; reset load to avoid repeated attempts
+		e.routes[idx].Load = 0
 		return
 	}
 	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID}
 	right := Route{Start: mid, End: r.End, GroupID: r.GroupID}
-	e.routes = append(append(e.routes[:idx], left, right), e.routes[idx+1:]...)
+	// replace the range at idx with left and right in an idiomatic manner
+	e.routes = append(e.routes[:idx+1], e.routes[idx:]...)
+	e.routes[idx] = left
+	e.routes[idx+1] = right
 }
 
 func cloneBytes(b []byte) []byte {
