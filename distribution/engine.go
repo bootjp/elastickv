@@ -122,8 +122,7 @@ func (e *Engine) routeIndex(key []byte) int {
 		return -1
 	}
 	i--
-	r := e.routes[i]
-	if r.End != nil && bytes.Compare(key, r.End) >= 0 {
+	if end := e.routes[i].End; end != nil && bytes.Compare(key, end) >= 0 {
 		return -1
 	}
 	return i
