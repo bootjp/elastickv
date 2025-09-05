@@ -2,7 +2,7 @@ module github.com/bootjp/elastickv
 
 go 1.23.0
 
-toolchain go1.25.0
+toolchain go1.25.1
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
