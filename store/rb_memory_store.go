@@ -3,7 +3,9 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/gob"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
@@ -229,21 +231,45 @@ func (s *rbMemoryStore) Snapshot() (io.ReadWriter, error) {
 	s.mtx.RUnlock()
 
 	buf := &bytes.Buffer{}
-	err := gob.NewEncoder(buf).Encode(cl)
-	if err != nil {
+	if err := gob.NewEncoder(buf).Encode(cl); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	sum := crc32.ChecksumIEEE(buf.Bytes())
+	if err := binary.Write(buf, binary.LittleEndian, sum); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
 	return buf, nil
 }
-func (s *rbMemoryStore) Restore(buf io.Reader) error {
+func (s *rbMemoryStore) Restore(r io.Reader) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	s.tree.Clear()
-	err := gob.NewDecoder(buf).Decode(&s.tree)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if len(data) < 4 {
+		return errors.WithStack(ErrInvalidChecksum)
+	}
+	payload := data[:len(data)-4]
+	expected := binary.LittleEndian.Uint32(data[len(data)-4:])
+	if crc32.ChecksumIEEE(payload) != expected {
+		return errors.WithStack(ErrInvalidChecksum)
+	}
+
+	var cl map[*[]byte][]byte
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&cl); err != nil {
+		return errors.WithStack(err)
+	}
+
+	s.tree.Clear()
+	for k, v := range cl {
+		if k == nil {
+			continue
+		}
+		s.tree.Put(*k, v)
 	}
 
 	return nil
