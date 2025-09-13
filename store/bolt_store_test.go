@@ -83,6 +83,45 @@ func TestBoltStore_Scan(t *testing.T) {
 	assert.Equal(t, 100, cnt)
 }
 
+func TestBoltStore_ScanKeys(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	st := mustStore(NewBoltStore(t.TempDir() + "/bolt.db"))
+
+	for i := 0; i < 999; i++ {
+		keyStr := "prefix " + strconv.Itoa(i) + "foo"
+		key := []byte(keyStr)
+		b := make([]byte, 8)
+		binary.PutVarint(b, int64(i))
+		err := st.Put(ctx, key, b)
+		assert.NoError(t, err)
+	}
+
+	res, err := st.ScanKeys(ctx, []byte("prefix"), []byte("z"), 100)
+	assert.NoError(t, err)
+	assert.Equal(t, 100, len(res))
+
+	sortedKeys := make([][]byte, 999)
+
+	for _, k := range res {
+		str := string(k)
+		i, err := strconv.Atoi(str[7 : len(str)-3])
+		assert.NoError(t, err)
+		sortedKeys[i] = k
+	}
+
+	cnt := 0
+	for i, k := range sortedKeys {
+		if k == nil {
+			continue
+		}
+		cnt++
+		assert.Equal(t, []byte("prefix "+strconv.Itoa(i)+"foo"), k)
+	}
+
+	assert.Equal(t, 100, cnt)
+}
+
 func TestBoltStore_Txn(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {

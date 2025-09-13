@@ -126,6 +126,40 @@ func (s *rbMemoryStore) Scan(ctx context.Context, start []byte, end []byte, limi
 	return result, nil
 }
 
+func (s *rbMemoryStore) ScanKeys(ctx context.Context, start []byte, end []byte, limit int) ([][]byte, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	var result [][]byte
+
+	it := s.tree.Iterator()
+
+	var ok bool
+	if start != nil {
+		it.Begin()
+		ok = it.NextTo(func(key, _ interface{}) bool {
+			k, _ := key.([]byte)
+			return bytes.Compare(k, start) >= 0
+		})
+	} else {
+		ok = it.First()
+	}
+
+	for ; ok && len(result) < limit; ok = it.Next() {
+		k, _ := it.Key().([]byte)
+
+		if end != nil && bytes.Compare(k, end) > 0 {
+			break
+		}
+
+		keyCopy := make([]byte, len(k))
+		copy(keyCopy, k)
+		result = append(result, keyCopy)
+	}
+
+	return result, nil
+}
+
 func (s *rbMemoryStore) Put(ctx context.Context, key []byte, value []byte) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
