@@ -8,6 +8,8 @@ concurrency:
 #  cancel-in-progress: true
 
 name: Test
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
