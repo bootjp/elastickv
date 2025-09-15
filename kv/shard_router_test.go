@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -251,5 +252,34 @@ func TestShardRouterCommitFailure(t *testing.T) {
 
 	if ok.abortCalls != 0 {
 		t.Fatalf("unexpected abort on successful group")
+	}
+}
+
+func TestShardRouterCommitMultipleFailures(t *testing.T) {
+	e := distribution.NewEngine()
+	e.UpdateRoute([]byte("a"), []byte("m"), 1)
+	e.UpdateRoute([]byte("m"), nil, 2)
+
+	router := NewShardRouter(e)
+
+	fail1 := &fakeTM{commitErr: true}
+	fail2 := &fakeTM{commitErr: true}
+	router.Register(1, fail1, nil)
+	router.Register(2, fail2, nil)
+
+	reqs := []*pb.Request{
+		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
+		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
+	}
+
+	_, err := router.Commit(reqs)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if c := strings.Count(fmt.Sprintf("%+v", err), "commit fail"); c < 2 {
+		t.Fatalf("expected combined errors, got %d: %+v", c, err)
+	}
+	if fail1.commitCalls == 0 || fail2.commitCalls == 0 {
+		t.Fatalf("expected commits on both groups")
 	}
 }
