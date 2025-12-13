@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -259,7 +260,9 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 	var lc net.ListenConfig
 
 	for i := 0; i < n; i++ {
-		st := store.NewRbMemoryStore()
+
+		st, err := store.NewBoltStore(os.TempDir())
+		require.NoError(t, err)
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
