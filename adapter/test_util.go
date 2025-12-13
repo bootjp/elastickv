@@ -57,7 +57,7 @@ const (
 	redisPort = 63790
 
 	// followers wait longer before starting elections to give the leader time to bootstrap and share config.
-	followerElectionTimeout = 30 * time.Second
+	followerElectionTimeout = 10 * time.Second
 )
 
 var mu sync.Mutex
@@ -125,30 +125,11 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	cfg := buildRaftConfig(n, ports)
 	nodes, grpcAdders, redisAdders := setupNodes(t, ctx, n, ports, cfg)
 
-	bootstrapFollowers(t, cfg, nodes)
 	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
 	waitForConfigReplication(t, cfg, nodes, waitTimeout, waitInterval)
 	waitForRaftReadiness(t, nodes, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
-}
-
-func bootstrapFollowers(t *testing.T, cfg raft.Configuration, nodes []Node) {
-	t.Helper()
-	for i, n := range nodes {
-		if i == 0 {
-			continue
-		}
-
-		future := n.raft.GetConfiguration()
-		assert.NoError(t, future.Error())
-		if len(future.Configuration().Servers) != 0 {
-			continue
-		}
-
-		boot := n.raft.BootstrapCluster(cfg)
-		assert.NoError(t, boot.Error())
-	}
 }
 
 func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitTimeout, waitInterval time.Duration) {
@@ -255,7 +236,7 @@ func buildRaftConfig(n int, ports []portsAdress) raft.Configuration {
 	return cfg
 }
 
-const leaderElectionTimeout = 10 * time.Second
+const leaderElectionTimeout = 0 * time.Second
 
 func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, cfg raft.Configuration) ([]Node, []string, []string) {
 	t.Helper()
