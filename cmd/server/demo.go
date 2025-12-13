@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
@@ -80,7 +81,7 @@ func run(eg *errgroup.Group) error {
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
-		r, tm, err := newRaft(strconv.Itoa(i), grpcAdders[i], fsm, i == 0, cfg)
+		r, tm, err := newRaft(strconv.Itoa(i), grpcAdders[i], fsm, i == 0, cfg, 0)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -119,9 +120,13 @@ func run(eg *errgroup.Group) error {
 	return nil
 }
 
-func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration) (*raft.Raft, *transport.Manager, error) {
+func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration, electionTimeout time.Duration) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
+
+	if electionTimeout > 0 {
+		c.ElectionTimeout = electionTimeout
+	}
 
 	// this config is for development
 	ldb := raft.NewInmemStore()
