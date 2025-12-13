@@ -263,7 +263,9 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 
 	for i := 0; i < n; i++ {
 		rnd := uuid.New()
-		st, err := store.NewBoltStore(filepath.Join(os.TempDir(), rnd.String(), "raft.db"))
+		path := filepath.Join(os.TempDir(), rnd.String())
+		require.NoError(t, os.Mkdir(path, 0755)) //nolint:mnd
+		st, err := store.NewBoltStore(filepath.Join(path, "raft.db"))
 		require.NoError(t, err)
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
