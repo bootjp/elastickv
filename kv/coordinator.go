@@ -198,6 +198,10 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 		return nil, errors.WithStack(err)
 	}
 
+	if !r.Success {
+		return nil, ErrInvalidRequest
+	}
+
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
 	}, nil

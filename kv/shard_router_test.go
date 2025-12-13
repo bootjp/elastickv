@@ -17,6 +17,21 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 	t.Helper()
 
 	const n = 3
+	addrs, trans := setupInmemTransports(id, n)
+	connectInmemTransports(addrs, trans)
+	cfg := buildRaftConfig(id, addrs)
+	rafts := initTestRafts(t, cfg, trans, fsm)
+	waitForLeader(t, id, rafts[0])
+
+	shutdown := func() {
+		for _, r := range rafts {
+			r.Shutdown()
+		}
+	}
+	return rafts[0], shutdown
+}
+
+func setupInmemTransports(id string, n int) ([]raft.ServerAddress, []*raft.InmemTransport) {
 	addrs := make([]raft.ServerAddress, n)
 	trans := make([]*raft.InmemTransport, n)
 	for i := 0; i < n; i++ {
@@ -24,25 +39,36 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 		addrs[i] = addr
 		trans[i] = tr
 	}
+	return addrs, trans
+}
+
+func connectInmemTransports(addrs []raft.ServerAddress, trans []*raft.InmemTransport) {
 	// fully connect transports
-	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
+	for i := 0; i < len(trans); i++ {
+		for j := i + 1; j < len(trans); j++ {
 			trans[i].Connect(addrs[j], trans[j])
 			trans[j].Connect(addrs[i], trans[i])
 		}
 	}
+}
 
+func buildRaftConfig(id string, addrs []raft.ServerAddress) raft.Configuration {
 	// cluster configuration
 	cfg := raft.Configuration{}
-	for i := 0; i < n; i++ {
+	for i := 0; i < len(addrs); i++ {
 		cfg.Servers = append(cfg.Servers, raft.Server{
 			ID:      raft.ServerID(fmt.Sprintf("%s-%d", id, i)),
 			Address: addrs[i],
 		})
 	}
+	return cfg
+}
 
-	rafts := make([]*raft.Raft, n)
-	for i := 0; i < n; i++ {
+func initTestRafts(t *testing.T, cfg raft.Configuration, trans []*raft.InmemTransport, fsm raft.FSM) []*raft.Raft {
+	t.Helper()
+
+	rafts := make([]*raft.Raft, len(trans))
+	for i := 0; i < len(trans); i++ {
 		c := raft.DefaultConfig()
 		c.LocalID = cfg.Servers[i].ID
 		if i == 0 {
@@ -73,23 +99,22 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 		rafts[i] = r
 	}
 
-	// node 0 should become leader
+	return rafts
+}
+
+func waitForLeader(t *testing.T, id string, leader *raft.Raft) {
+	t.Helper()
+
+	// node 0 should become leader quickly during tests
 	for i := 0; i < 100; i++ {
-		if rafts[0].State() == raft.Leader {
+		if leader.State() == raft.Leader {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if rafts[0].State() != raft.Leader {
+	if leader.State() != raft.Leader {
 		t.Fatalf("node %s-0 is not leader", id)
 	}
-
-	shutdown := func() {
-		for _, r := range rafts {
-			r.Shutdown()
-		}
-	}
-	return rafts[0], shutdown
 }
 
 func TestShardRouterCommit(t *testing.T) {

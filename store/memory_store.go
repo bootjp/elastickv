@@ -29,6 +29,7 @@ type memoryStore struct {
 
 const (
 	defaultExpireInterval = 30 * time.Second
+	checksumSize          = 4
 )
 
 func NewMemoryStore() Store {
@@ -230,11 +231,11 @@ func (s *memoryStore) Restore(r io.Reader) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if len(data) < 4 {
+	if len(data) < checksumSize {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-	payload := data[:len(data)-4]
-	expected := binary.LittleEndian.Uint32(data[len(data)-4:])
+	payload := data[:len(data)-checksumSize]
+	expected := binary.LittleEndian.Uint32(data[len(data)-checksumSize:])
 	if crc32.ChecksumIEEE(payload) != expected {
 		return errors.WithStack(ErrInvalidChecksum)
 	}

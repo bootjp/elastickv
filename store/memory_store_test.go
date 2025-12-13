@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"io"
 	"strconv"
 	"sync"
 	"testing"
@@ -217,8 +218,11 @@ func TestMemoryStore_SnapshotChecksum(t *testing.T) {
 		buf, err := st.Snapshot()
 		assert.NoError(t, err)
 
+		snapshotData, err := io.ReadAll(buf)
+		assert.NoError(t, err)
+
 		st2 := NewMemoryStore()
-		err = st2.Restore(bytes.NewReader(buf.(*bytes.Buffer).Bytes()))
+		err = st2.Restore(bytes.NewReader(snapshotData))
 		assert.NoError(t, err)
 
 		v, err := st2.Get(ctx, []byte("foo"))
@@ -234,9 +238,12 @@ func TestMemoryStore_SnapshotChecksum(t *testing.T) {
 
 		buf, err := st.Snapshot()
 		assert.NoError(t, err)
-		data := buf.(*bytes.Buffer).Bytes()
-		corrupted := make([]byte, len(data))
-		copy(corrupted, data)
+
+		snapshotData, err := io.ReadAll(buf)
+		assert.NoError(t, err)
+
+		corrupted := make([]byte, len(snapshotData))
+		copy(corrupted, snapshotData)
 		corrupted[0] ^= 0xff
 
 		st2 := NewMemoryStore()

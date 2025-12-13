@@ -250,11 +250,11 @@ func (s *rbMemoryStore) Restore(r io.Reader) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if len(data) < 4 {
+	if len(data) < checksumSize {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-	payload := data[:len(data)-4]
-	expected := binary.LittleEndian.Uint32(data[len(data)-4:])
+	payload := data[:len(data)-checksumSize]
+	expected := binary.LittleEndian.Uint32(data[len(data)-checksumSize:])
 	if crc32.ChecksumIEEE(payload) != expected {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
