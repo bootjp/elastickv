@@ -95,6 +95,34 @@ func (s *boltStore) Scan(ctx context.Context, start []byte, end []byte, limit in
 	return res, errors.WithStack(err)
 }
 
+func (s *boltStore) ScanKeys(ctx context.Context, start []byte, end []byte, limit int) ([][]byte, error) {
+	s.log.InfoContext(ctx, "ScanKeys",
+		slog.String("start", string(start)),
+		slog.String("end", string(end)),
+		slog.Int("limit", limit),
+	)
+
+	var res [][]byte
+
+	err := s.bbolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultBucket)
+		if b == nil {
+			return nil
+		}
+
+		c := b.Cursor()
+		for k, _ := c.Seek(start); k != nil && (end == nil || bytes.Compare(k, end) < 0); k, _ = c.Next() {
+			res = append(res, k)
+			if len(res) >= limit {
+				break
+			}
+		}
+		return nil
+	})
+
+	return res, errors.WithStack(err)
+}
+
 func (s *boltStore) Put(ctx context.Context, key []byte, value []byte) error {
 	s.log.InfoContext(ctx, "put",
 		slog.String("key", string(key)),
