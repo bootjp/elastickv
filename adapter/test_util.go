@@ -56,11 +56,11 @@ type portsAdress struct {
 
 const (
 	// raft and the grpc requested by the client use grpc and are received on the same port
-	grpcPort = 50000
-	raftPort = 50000
-	redisPort = 63790
+	grpcPort   = 50000
+	raftPort   = 50000
+	redisPort  = 63790
 	dynamoPort = 28000
-  
+
 	// followers wait longer before starting elections to give the leader time to bootstrap and share config.
 	followerElectionTimeout = 10 * time.Second
 )
