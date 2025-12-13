@@ -149,9 +149,6 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 
 func waitForRaftReadiness(t *testing.T, nodes []Node, waitTimeout, waitInterval time.Duration) {
 	t.Helper()
-	assert.Eventually(t, func() bool {
-		return nodes[0].raft.State() == raft.Leader
-	}, waitTimeout, waitInterval)
 
 	expectedLeader := raft.ServerAddress(nodes[0].raftAddress)
 	assert.Eventually(t, func() bool {
