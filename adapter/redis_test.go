@@ -3,7 +3,6 @@ package adapter
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -68,10 +67,9 @@ func TestRedis_follower_redirect_node_set_get_deleted(t *testing.T) {
 	assert.NoError(t, res3.Err())
 	assert.Equal(t, int64(1), res3.Val())
 
-	assert.Eventually(t, func() bool {
-		res4 := rdb.Get(ctx, string(key))
-		return res4.Err() == redis.Nil && res4.Val() == ""
-	}, 2*time.Second, 50*time.Millisecond)
+	res4 := rdb.Get(ctx, string(key))
+	assert.Equal(t, redis.Nil, res4.Err())
+	assert.Equal(t, "", res4.Val())
 }
 
 func TestRedis_leader_keys(t *testing.T) {
