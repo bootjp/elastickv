@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
@@ -260,8 +262,8 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 	var lc net.ListenConfig
 
 	for i := 0; i < n; i++ {
-
-		st, err := store.NewBoltStore(os.TempDir())
+		rnd := uuid.New()
+		st, err := store.NewBoltStore(filepath.Join(os.TempDir(), rnd.String(), "raft.db"))
 		require.NoError(t, err)
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
