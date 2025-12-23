@@ -85,7 +85,7 @@ func (s *rbMemoryStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 	vv, ok := v.([]byte)
 	if !ok {
-		return nil, errors.WithStack(ErrKeyNotFound)
+		return nil, ErrKeyNotFound
 	}
 
 	return vv, nil

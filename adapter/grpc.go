@@ -140,7 +140,12 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 
 	v, err := r.store.Get(ctx, req.Key)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		switch {
+		case errors.Is(err, store.ErrKeyNotFound):
+			return &pb.GetResponse{Value: nil}, nil
+		default:
+			return nil, errors.WithStack(err)
+		}
 	}
 
 	r.log.InfoContext(ctx, "Get",
