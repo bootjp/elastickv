@@ -34,9 +34,8 @@ func TestBoltStore(t *testing.T) {
 		assert.Equal(t, []byte("bar"), res)
 		assert.NoError(t, st.Delete(ctx, key))
 		// bolt store does not support NotFound
-		res, err = st.Get(ctx, []byte("aaaaaa"))
-		assert.NoError(t, err)
-		assert.Nil(t, res)
+		_, err = st.Get(ctx, []byte("aaaaaa"))
+		assert.Equal(t, err, ErrKeyNotFound)
 	}
 }
 
