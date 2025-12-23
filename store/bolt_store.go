@@ -61,7 +61,14 @@ func (s *boltStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil
 	})
 
-	return v, errors.WithStack(err)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if v == nil {
+		return nil, ErrKeyNotFound
+	}
+
+	return v, nil
 }
 
 func (s *boltStore) Scan(ctx context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {

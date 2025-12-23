@@ -28,6 +28,30 @@ type TransactionResponse struct {
 	CommitIndex uint64
 }
 
+// applyAndBarrier submits a log entry, waits for it to be applied, and
+// surfaces both Raft transport errors and errors returned from FSM.Apply.
+// HashiCorp Raft delivers FSM errors via ApplyFuture.Response(), not Error(),
+// so we must inspect the response to avoid silently treating failed writes as
+// successes.
+func applyAndBarrier(r *raft.Raft, b []byte) (uint64, error) {
+	af := r.Apply(b, time.Second)
+	if err := af.Error(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	if resp := af.Response(); resp != nil {
+		if err, ok := resp.(error); ok && err != nil {
+			return 0, errors.WithStack(err)
+		}
+	}
+
+	if f := r.Barrier(time.Second); f.Error() != nil {
+		return 0, errors.WithStack(f.Error())
+	}
+
+	return af.Index(), nil
+}
+
 func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
 	commitIndex, err := func() (uint64, error) {
 		commitIndex := uint64(0)
@@ -37,15 +61,11 @@ func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, e
 				return 0, errors.WithStack(err)
 			}
 
-			af := t.raft.Apply(b, time.Second)
-			if af.Error() != nil {
-				return 0, errors.WithStack(af.Error())
+			idx, err := applyAndBarrier(t.raft, b)
+			if err != nil {
+				return 0, err
 			}
-			f := t.raft.Barrier(time.Second)
-			if f.Error() != nil {
-				return 0, errors.WithStack(f.Error())
-			}
-			commitIndex = af.Index()
+			commitIndex = idx
 		}
 
 		return commitIndex, nil
@@ -83,15 +103,11 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 			return nil, errors.WithStack(err)
 		}
 
-		af := t.raft.Apply(b, time.Second)
-		if af.Error() != nil {
-			return nil, errors.WithStack(af.Error())
+		idx, err := applyAndBarrier(t.raft, b)
+		if err != nil {
+			return nil, err
 		}
-		f := t.raft.Barrier(time.Second)
-		if f.Error() != nil {
-			return nil, errors.WithStack(f.Error())
-		}
-		commitIndex = af.Index()
+		commitIndex = idx
 	}
 
 	return &TransactionResponse{

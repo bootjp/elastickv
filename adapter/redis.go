@@ -8,9 +8,12 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 //nolint:mnd
@@ -113,6 +116,15 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
+	if v, ok := r.tryLeaderGet(cmd.Args[1]); ok {
+		if v == nil {
+			conn.WriteNull()
+		} else {
+			conn.WriteBulk(v)
+		}
+		return
+	}
+
 	v, err := r.store.Get(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteNull()
@@ -189,4 +201,33 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	for _, kvPair := range keys {
 		conn.WriteBulk(kvPair.Key)
 	}
+}
+
+// tryLeaderGet proxies a GET to the current Raft leader, returning the value and
+// whether the proxy succeeded.
+func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, bool) {
+	c, ok := r.coordinator.(*kv.Coordinate)
+	if !ok || r.coordinator.IsLeader() {
+		return nil, false
+	}
+	addr := c.RaftLeader()
+	if addr == "" {
+		return nil, false
+	}
+
+	conn, err := grpc.NewClient(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return nil, false
+	}
+	defer conn.Close()
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+	if err != nil {
+		return nil, false
+	}
+	return resp.Value, true
 }
