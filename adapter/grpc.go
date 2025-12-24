@@ -11,6 +11,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var _ pb.RawKVServer = (*GRPCServer)(nil)
@@ -38,16 +40,33 @@ func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer
 }
 
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
-	v, err := r.store.Get(ctx, req.Key)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrKeyNotFound):
-			return &pb.RawGetResponse{
-				Value: nil,
-			}, nil
-		default:
-			return nil, errors.WithStack(err)
+
+	if r.coordinator.IsLeader() {
+		v, err := r.store.Get(ctx, req.Key)
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrKeyNotFound):
+				return &pb.RawGetResponse{
+					Value: nil,
+				}, nil
+			default:
+				return nil, errors.WithStack(err)
+			}
 		}
+		r.log.InfoContext(ctx, "Get",
+			slog.String("key", string(req.Key)),
+			slog.String("value", string(v)))
+
+		return &pb.RawGetResponse{
+			Value: v,
+		}, nil
+	}
+
+	v, err := r.tryLeaderGet(req.Key)
+	if err != nil {
+		return &pb.RawGetResponse{
+			Value: nil,
+		}, err
 	}
 
 	r.log.InfoContext(ctx, "Get",
@@ -57,6 +76,30 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 	return &pb.RawGetResponse{
 		Value: v,
 	}, nil
+}
+
+func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
+	addr := r.coordinator.RaftLeader()
+	if addr == "" {
+		return nil, ErrLeaderNotFound
+	}
+
+	conn, err := grpc.NewClient(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer conn.Close()
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return resp.Value, nil
 }
 
 func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
