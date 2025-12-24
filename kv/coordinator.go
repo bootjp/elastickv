@@ -2,7 +2,6 @@ package kv
 
 import (
 	"context"
-	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -32,6 +31,7 @@ var _ Coordinator = (*Coordinate)(nil)
 type Coordinator interface {
 	Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
+	RaftLeader() raft.ServerAddress
 }
 
 func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -209,39 +209,9 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 		return nil, ErrInvalidRequest
 	}
 
-	if err := c.waitApplied(r.CommitIndex); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
 	}, nil
-}
-
-// waitApplied blocks until the local raft FSM has applied at least the given
-// log index. This is used on followers after redirecting a write to the leader
-// so that immediately subsequent reads served locally observe the new value.
-func (c *Coordinate) waitApplied(idx uint64) error {
-	// Fast path: already applied.
-	if c.raft.AppliedIndex() >= idx {
-		return nil
-	}
-
-	const (
-		pollInterval = 5 * time.Millisecond
-		// Keep generous but finite to avoid hanging client calls.
-		timeout = 2 * time.Second
-	)
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if c.raft.AppliedIndex() >= idx {
-			return nil
-		}
-		time.Sleep(pollInterval)
-	}
-
-	return errors.Wrapf(ErrInvalidRequest, "timeout waiting for apply: want=%d applied=%d", idx, c.raft.AppliedIndex())
 }
 
 func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {

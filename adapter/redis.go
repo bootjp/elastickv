@@ -116,18 +116,29 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
-	if v, ok := r.tryLeaderGet(cmd.Args[1]); ok {
-		if v == nil {
-			conn.WriteNull()
-		} else {
-			conn.WriteBulk(v)
+	if r.coordinator.IsLeader() {
+		v, err := r.store.Get(context.Background(), cmd.Args[1])
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrKeyNotFound):
+				conn.WriteNull()
+			default:
+				conn.WriteError(err.Error())
+			}
+			return
 		}
+		conn.WriteBulk(v)
 		return
 	}
 
-	v, err := r.store.Get(context.Background(), cmd.Args[1])
+	v, err := r.tryLeaderGet(cmd.Args[1])
 	if err != nil {
-		conn.WriteNull()
+		switch {
+		case errors.Is(err, store.ErrKeyNotFound):
+			conn.WriteNull()
+		default:
+			conn.WriteError(err.Error())
+		}
 		return
 	}
 
@@ -205,14 +216,10 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 
 // tryLeaderGet proxies a GET to the current Raft leader, returning the value and
 // whether the proxy succeeded.
-func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, bool) {
-	c, ok := r.coordinator.(*kv.Coordinate)
-	if !ok || r.coordinator.IsLeader() {
-		return nil, false
-	}
-	addr := c.RaftLeader()
+func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, error) {
+	addr := r.coordinator.RaftLeader()
 	if addr == "" {
-		return nil, false
+		return nil, ErrLeaderNotFound
 	}
 
 	conn, err := grpc.NewClient(string(addr),
@@ -220,14 +227,15 @@ func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, bool) {
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	if err != nil {
-		return nil, false
+		return nil, errors.WithStack(err)
 	}
 	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
 	if err != nil {
-		return nil, false
+		return nil, errors.WithStack(err)
 	}
-	return resp.Value, true
+
+	return resp.Value, nil
 }

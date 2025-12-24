@@ -26,6 +26,7 @@ type Internal struct {
 var _ pb.InternalServer = (*Internal)(nil)
 
 var ErrNotLeader = errors.New("not leader")
+var ErrLeaderNotFound = errors.New("leader not found")
 
 func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
 	if i.raft.State() != raft.Leader {
