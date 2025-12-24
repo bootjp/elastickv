@@ -40,7 +40,6 @@ func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer
 }
 
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
-
 	if r.coordinator.IsLeader() {
 		v, err := r.store.Get(ctx, req.Key)
 		if err != nil {

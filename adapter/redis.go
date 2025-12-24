@@ -128,6 +128,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 			return
 		}
 		conn.WriteBulk(v)
+		return
 	}
 
 	v, err := r.tryLeaderGet(cmd.Args[1])
