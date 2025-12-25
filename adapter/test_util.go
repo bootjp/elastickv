@@ -258,6 +258,11 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 	var nodes []Node
 	var lc net.ListenConfig
 
+	leaderRedis := make(map[raft.ServerAddress]string, n)
+	for i := 0; i < n; i++ {
+		leaderRedis[raft.ServerAddress(ports[i].raftAddress)] = ports[i].redisAddress
+	}
+
 	for i := 0; i < n; i++ {
 		st := store.NewRbMemoryStore()
 		trxSt := store.NewMemoryStoreDefaultTTL()
@@ -297,7 +302,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 
 		l, err := lc.Listen(ctx, "tcp", port.redisAddress)
 		require.NoError(t, err)
-		rd := NewRedisServer(l, st, coordinator)
+		rd := NewRedisServer(l, st, coordinator, leaderRedis)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)

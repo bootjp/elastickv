@@ -196,8 +196,14 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 	cli := pb.NewInternalClient(conn)
 
 	var requests []*pb.Request
-	for _, req := range reqs.Elems {
-		requests = append(requests, c.toRawRequest(req))
+	if reqs.IsTxn {
+		for _, req := range reqs.Elems {
+			requests = append(requests, c.toTxnRequests(req)...)
+		}
+	} else {
+		for _, req := range reqs.Elems {
+			requests = append(requests, c.toRawRequest(req))
+		}
 	}
 
 	r, err := cli.Forward(ctx, c.toForwardRequest(requests))

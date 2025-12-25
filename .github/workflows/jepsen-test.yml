@@ -10,19 +10,43 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      RUN_JEPSEN: 'true'
+      GOCACHE: /tmp/go-build
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Install netcat
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
-      - name: Run Jepsen tests
-        if: env.RUN_JEPSEN == 'true'
+      - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
+      - name: Launch demo cluster
+        run: |
+          mkdir -p "$GOCACHE"
+          nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
+          echo $! > /tmp/elastickv-demo.pid
+          for i in {1..30}; do
+            nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 && break
+            sleep 1
+          done
+      - name: Run Redis Jepsen workload against elastickv
+        working-directory: jepsen
+        run: |
+          ~/lein run -m elastickv.redis-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
+      - name: Stop demo cluster
+        run: |
+          if [ -f /tmp/elastickv-demo.pid ]; then
+            kill "$(cat /tmp/elastickv-demo.pid)" || true
+          fi

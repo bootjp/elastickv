@@ -27,3 +27,5 @@ go.work
 jepsen/target/
 jepsen/.lein-*
 jepsen/.nrepl-port
+.m2/
+jepsen/store/

@@ -1,0 +1,3 @@
+[submodule "jepsen/redis"]
+	path = jepsen/redis
+	url = https://github.com/jepsen-io/redis

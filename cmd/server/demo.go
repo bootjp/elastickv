@@ -75,6 +75,11 @@ func run(eg *errgroup.Group) error {
 		cfg.Servers = append(cfg.Servers, server)
 	}
 
+	leaderRedis := make(map[raft.ServerAddress]string)
+	for i := 0; i < 3; i++ {
+		leaderRedis[raft.ServerAddress(grpcAdders[i])] = redisAdders[i]
+	}
+
 	for i := 0; i < 3; i++ {
 		st := store.NewRbMemoryStore()
 		trxSt := store.NewMemoryStoreDefaultTTL()
@@ -109,7 +114,7 @@ func run(eg *errgroup.Group) error {
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		rd := adapter.NewRedisServer(l, st, coordinator)
+		rd := adapter.NewRedisServer(l, st, coordinator, leaderRedis)
 
 		eg.Go(func() error {
 			return errors.WithStack(rd.Run())
