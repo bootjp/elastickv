@@ -9,6 +9,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/go-build
     steps:
       - uses: actions/checkout@v6
         with:
