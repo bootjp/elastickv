@@ -79,12 +79,16 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
+	leaderRedis := map[raft.ServerAddress]string{
+		raft.ServerAddress(*myAddr): *redisAddr,
+	}
+
 	eg := errgroup.Group{}
 	eg.Go(func() error {
 		return errors.WithStack(gs.Serve(grpcSock))
 	})
 	eg.Go(func() error {
-		return errors.WithStack(adapter.NewRedisServer(redisL, s, coordinate).Run())
+		return errors.WithStack(adapter.NewRedisServer(redisL, s, coordinate, leaderRedis).Run())
 	})
 
 	err = eg.Wait()

@@ -14,6 +14,8 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/raft"
+	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -39,6 +41,8 @@ type RedisServer struct {
 	store           store.ScanStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
+	// TODO manage membership from raft log
+	leaderRedis map[raft.ServerAddress]string
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
@@ -68,12 +72,13 @@ type redisResult struct {
 	err     error
 }
 
-func NewRedisServer(listen net.Listener, store store.ScanStore, coordinate *kv.Coordinate) *RedisServer {
+func NewRedisServer(listen net.Listener, store store.ScanStore, coordinate *kv.Coordinate, leaderRedis map[raft.ServerAddress]string) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
 		coordinator:     coordinate,
 		redisTranscoder: newRedisTranscoder(),
+		leaderRedis:     leaderRedis,
 	}
 
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
@@ -243,42 +248,87 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
+	pattern := cmd.Args[1]
 
-	// If an asterisk (*) is not included, the match will be exact,
-	// so check if the key exists.
-	if !bytes.Contains(cmd.Args[1], []byte("*")) {
-		res, err := r.store.Exists(context.Background(), cmd.Args[1])
+	if r.coordinator.IsLeader() {
+		keys, err := r.localKeys(pattern)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
-		if res {
-			conn.WriteArray(1)
-			conn.WriteBulk(cmd.Args[1])
-			return
+		conn.WriteArray(len(keys))
+		for _, k := range keys {
+			conn.WriteBulk(k)
 		}
-		conn.WriteArray(0)
 		return
 	}
 
-	var start []byte
-	switch {
-	case bytes.Equal(cmd.Args[1], []byte("*")):
-		start = nil
-	default:
-		start = bytes.ReplaceAll(cmd.Args[1], []byte("*"), nil)
-	}
-
-	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
+	keys, err := r.proxyKeys(pattern)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 
 	conn.WriteArray(len(keys))
-	for _, kvPair := range keys {
-		conn.WriteBulk(kvPair.Key)
+	for _, k := range keys {
+		conn.WriteBulkString(k)
 	}
+}
+
+func (r *RedisServer) localKeys(pattern []byte) ([][]byte, error) {
+	// If an asterisk (*) is not included, the match will be exact,
+	// so check if the key exists.
+	if !bytes.Contains(pattern, []byte("*")) {
+		res, err := r.store.Exists(context.Background(), pattern)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if res {
+			return [][]byte{bytes.Clone(pattern)}, nil
+		}
+		return [][]byte{}, nil
+	}
+
+	var start []byte
+	switch {
+	case bytes.Equal(pattern, []byte("*")):
+		start = nil
+	default:
+		start = bytes.ReplaceAll(pattern, []byte("*"), nil)
+	}
+
+	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	out := make([][]byte, 0, len(keys))
+	for _, kvPair := range keys {
+		out = append(out, kvPair.Key)
+	}
+	return out, nil
+}
+
+func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return nil, ErrLeaderNotFound
+	}
+
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{
+		Addr: leaderAddr,
+	})
+	defer func() {
+		_ = cli.Close()
+	}()
+
+	keys, err := cli.Keys(context.Background(), string(pattern)).Result()
+	return keys, errors.WithStack(err)
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -577,34 +627,6 @@ func encodeList(list []string) ([]byte, error) {
 	return b, errors.WithStack(err)
 }
 
-func (r *RedisServer) pushList(key []byte, values [][]byte) (int, error) {
-	current, err := r.getValue(key)
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return 0, errors.WithStack(err)
-	}
-
-	list, err := decodeList(current)
-	if err != nil {
-		return 0, err
-	}
-	for _, v := range values {
-		list = append(list, string(v))
-	}
-	enc, err := encodeList(list)
-	if err != nil {
-		return 0, err
-	}
-
-	req, err := r.redisTranscoder.SetToRequest(key, enc)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := r.coordinator.Dispatch(req); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return len(list), nil
-}
-
 func clampRange(start, end, length int) (int, int) {
 	if start < 0 {
 		start = length + start
@@ -683,12 +705,25 @@ func (r *RedisServer) getValue(key []byte) ([]byte, error) {
 }
 
 func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
-	length, err := r.pushList(cmd.Args[1], cmd.Args[2:])
+	results, err := r.runTransaction([]redcon.Command{cmd})
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	conn.WriteInt(length)
+	if len(results) != 1 {
+		conn.WriteError("ERR internal error: rpush should have one result")
+		return
+	}
+	res := results[0]
+	if res.err != nil {
+		conn.WriteError(res.err.Error())
+		return
+	}
+	if res.typ != resultInt {
+		conn.WriteError("ERR internal error: rpush result should be an integer")
+		return
+	}
+	conn.WriteInt64(res.integer)
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {

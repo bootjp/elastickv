@@ -21,7 +21,7 @@ jobs:
         with:
           go-version-file: 'go.mod'
       - name: Install netcat
-        run: sudo apt-get update && sudo apt-get install -y netcat
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
