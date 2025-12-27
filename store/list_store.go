@@ -3,8 +3,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/errors"
@@ -220,7 +220,32 @@ func ListMetaKey(userKey []byte) []byte {
 
 // ListItemKey builds the item key for a user key and sequence number.
 func ListItemKey(userKey []byte, seq int64) []byte {
-	return []byte(fmt.Sprintf("%s%s|%0*d", ListItemPrefix, userKey, ListSeqWidth, seq))
+	// Offset sign bit (seq ^ minInt64) to preserve order, then big-endian encode and hex.
+	var raw [8]byte
+	encodeSortableInt64(raw[:], seq)
+	hexSeq := make([]byte, hex.EncodedLen(len(raw)))
+	hex.Encode(hexSeq, raw[:])
+
+	buf := make([]byte, 0, len(ListItemPrefix)+len(userKey)+1+len(hexSeq))
+	buf = append(buf, ListItemPrefix...)
+	buf = append(buf, userKey...)
+	buf = append(buf, '|')
+	buf = append(buf, hexSeq...)
+	return buf
+}
+
+// encodeSortableInt64 writes seq with sign bit flipped (seq ^ minInt64) in big-endian order.
+const sortableInt64Bytes = 8
+
+func encodeSortableInt64(dst []byte, seq int64) {
+	if len(dst) < sortableInt64Bytes {
+		return
+	}
+	sortable := seq ^ math.MinInt64
+	for i := sortableInt64Bytes - 1; i >= 0; i-- {
+		dst[i] = byte(sortable)
+		sortable >>= 8
+	}
 }
 
 func clampRange(start, end, length int) (int, int) {
@@ -263,7 +288,7 @@ func ExtractListUserKey(key []byte) []byte {
 		trimmed := bytes.TrimPrefix(key, []byte(ListItemPrefix))
 		idx := bytes.LastIndexByte(trimmed, '|')
 		if idx == -1 {
-			return trimmed
+			return nil
 		}
 		return trimmed[:idx]
 	default:

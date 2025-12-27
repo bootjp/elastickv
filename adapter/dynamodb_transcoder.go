@@ -87,8 +87,8 @@ func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv
 	if len(val.L) > 0 {
 		var elems []*kv.Elem[kv.OP]
 		for i, item := range val.L {
-			if item.S == "" {
-				return nil, errors.New("only string list items are supported")
+			if len(item.L) > 0 {
+				return nil, errors.New("nested lists are not supported")
 			}
 			elems = append(elems, &kv.Elem[kv.OP]{
 				Op:    kv.Put,
@@ -110,8 +110,8 @@ func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv
 		return &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems}, nil
 	}
 
-	// Default: simple string
-	if val.S == "" {
+	// Default: simple string (allow empty string). Reject only when both S and L are absent.
+	if val.S == "" && len(val.L) == 0 {
 		return nil, errors.New("unsupported attribute type (only S or L of S)")
 	}
 	return &kv.OperationGroup[kv.OP]{

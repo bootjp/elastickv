@@ -183,11 +183,8 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	if isList {
-		// delete list metadata so this becomes a plain string key
-		if err := r.deleteList(context.Background(), cmd.Args[1]); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
+		conn.WriteError("WRONGTYPE Operation against a key holding the wrong kind of value")
+		return
 	}
 
 	res, err := r.redisTranscoder.SetToRequest(cmd.Args[1], cmd.Args[2])
@@ -629,15 +626,15 @@ func (t *txnContext) applyLRange(cmd redcon.Command) (redisResult, error) {
 }
 
 func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
-	start, err := strconv.Atoi(string(startRaw))
+	start, err := parseInt(startRaw)
 	if err != nil {
-		return 0, 0, errors.WithStack(err)
+		return 0, 0, err
 	}
-	end, err := strconv.Atoi(string(endRaw))
+	end, err := parseInt(endRaw)
 	if err != nil {
-		return 0, 0, errors.WithStack(err)
+		return 0, 0, err
 	}
-	s, e := clampRange(start, end, total)
+	s, e := clampRange(int(start), int(end), total)
 	return s, e, nil
 }
 
@@ -723,6 +720,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		userKey := []byte(k)
 
 		if st.deleted {
+			// delete all persisted list items
+			for seq := st.meta.Head; seq < st.meta.Tail; seq++ {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(userKey, seq)})
+			}
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
 			continue
 		}
@@ -884,7 +885,7 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 }
 
 func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
-	_, exists, err := r.loadListMeta(ctx, key)
+	meta, exists, err := r.loadListMeta(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -892,9 +893,24 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 		return nil
 	}
 
-	ops := []*kv.Elem[kv.OP]{
-		{Op: kv.Del, Key: listMetaKey(key)},
+	start := listItemKey(key, math.MinInt64)
+	end := listItemKey(key, math.MaxInt64)
+
+	kvs, err := r.store.Scan(ctx, start, end, math.MaxInt)
+	if err != nil {
+		return errors.WithStack(err)
 	}
+
+	ops := make([]*kv.Elem[kv.OP], 0, len(kvs)+1)
+	for _, kvp := range kvs {
+		ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+	}
+	// delete meta last
+	ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+
+	// ensure meta bounds consistent even if scan missed (in case of empty list)
+	_ = meta
+
 	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
 	_, err = r.coordinator.Dispatch(group)
 	return errors.WithStack(err)
@@ -966,7 +982,16 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
 	defer func() { _ = cli.Close() }()
 
-	res, err := cli.LRange(context.Background(), string(key), parseInt(startRaw), parseInt(endRaw)).Result()
+	start, err := parseInt(startRaw)
+	if err != nil {
+		return nil, err
+	}
+	end, err := parseInt(endRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := cli.LRange(context.Background(), string(key), start, end).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -992,9 +1017,9 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 	return res, errors.WithStack(err)
 }
 
-func parseInt(b []byte) int64 {
-	i, _ := strconv.ParseInt(string(b), 10, 64)
-	return i
+func parseInt(b []byte) (int64, error) {
+	i, err := strconv.ParseInt(string(b), 10, 64)
+	return i, errors.WithStack(err)
 }
 
 // tryLeaderGet proxies a GET to the current Raft leader, returning the value and
