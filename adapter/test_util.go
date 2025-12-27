@@ -136,14 +136,54 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	ctx := context.Background()
 
 	ports := assignPorts(n)
-	cfg := buildRaftConfig(n, ports)
-	nodes, grpcAdders, redisAdders := setupNodes(t, ctx, n, ports, cfg)
+	nodes, grpcAdders, redisAdders, cfg := setupNodes(t, ctx, n, ports)
 
 	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
 	waitForConfigReplication(t, cfg, nodes, waitTimeout, waitInterval)
 	waitForRaftReadiness(t, nodes, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
+}
+
+type listeners struct {
+	grpc   net.Listener
+	redis  net.Listener
+	dynamo net.Listener
+}
+
+func bindListeners(ctx context.Context, lc *net.ListenConfig, port portsAdress) (portsAdress, listeners, bool, error) {
+	grpcSock, err := lc.Listen(ctx, "tcp", port.grpcAddress)
+	if err != nil {
+		if errors.Is(err, unix.EADDRINUSE) {
+			return port, listeners{}, true, nil
+		}
+		return port, listeners{}, false, errors.WithStack(err)
+	}
+
+	redisSock, err := lc.Listen(ctx, "tcp", port.redisAddress)
+	if err != nil {
+		_ = grpcSock.Close()
+		if errors.Is(err, unix.EADDRINUSE) {
+			return port, listeners{}, true, nil
+		}
+		return port, listeners{}, false, errors.WithStack(err)
+	}
+
+	dynamoSock, err := lc.Listen(ctx, "tcp", port.dynamoAddress)
+	if err != nil {
+		_ = grpcSock.Close()
+		_ = redisSock.Close()
+		if errors.Is(err, unix.EADDRINUSE) {
+			return port, listeners{}, true, nil
+		}
+		return port, listeners{}, false, errors.WithStack(err)
+	}
+
+	return port, listeners{
+		grpc:   grpcSock,
+		redis:  redisSock,
+		dynamo: dynamoSock,
+	}, false, nil
 }
 
 func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitTimeout, waitInterval time.Duration) {
@@ -252,53 +292,44 @@ func buildRaftConfig(n int, ports []portsAdress) raft.Configuration {
 
 const leaderElectionTimeout = 0 * time.Second
 
-func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, cfg raft.Configuration) ([]Node, []string, []string) {
+func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) ([]Node, []string, []string, raft.Configuration) {
 	t.Helper()
 	var grpcAdders []string
 	var redisAdders []string
 	var nodes []Node
-	var lc net.ListenConfig
+	lc := net.ListenConfig{}
+	lis := make([]listeners, n)
+	for i := 0; i < n; i++ {
+		var (
+			bound portsAdress
+			l     listeners
+			retry bool
+			err   error
+		)
+		for {
+			bound, l, retry, err = bindListeners(ctx, &lc, ports[i])
+			require.NoError(t, err)
+			if retry {
+				ports[i] = portAssigner()
+				continue
+			}
+			ports[i] = bound
+			lis[i] = l
+			break
+		}
+	}
+
+	cfg := buildRaftConfig(n, ports)
 
 	for i := 0; i < n; i++ {
 		st := store.NewRbMemoryStore()
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
-		var port portsAdress
-		var grpcSock, redisSock, dynamoSock net.Listener
-
-		for {
-			port = ports[i]
-			var err error
-
-			grpcSock, err = lc.Listen(ctx, "tcp", port.grpcAddress)
-			if err != nil && errors.Is(err, unix.EADDRINUSE) {
-				ports[i] = portAssigner()
-				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
-				continue
-			}
-			require.NoError(t, err)
-
-			redisSock, err = lc.Listen(ctx, "tcp", port.redisAddress)
-			if err != nil && errors.Is(err, unix.EADDRINUSE) {
-				_ = grpcSock.Close()
-				ports[i] = portAssigner()
-				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
-				continue
-			}
-			require.NoError(t, err)
-
-			dynamoSock, err = lc.Listen(ctx, "tcp", port.dynamoAddress)
-			if err != nil && errors.Is(err, unix.EADDRINUSE) {
-				_ = grpcSock.Close()
-				_ = redisSock.Close()
-				ports[i] = portAssigner()
-				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
-				continue
-			}
-			require.NoError(t, err)
-			break
-		}
+		port := ports[i]
+		grpcSock := lis[i].grpc
+		redisSock := lis[i].redis
+		dynamoSock := lis[i].dynamo
 
 		leaderRedis := map[raft.ServerAddress]string{
 			raft.ServerAddress(ports[i].raftAddress): ports[i].redisAddress,
@@ -354,7 +385,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 		))
 	}
 
-	return nodes, grpcAdders, redisAdders
+	return nodes, grpcAdders, redisAdders, cfg
 }
 
 func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration, electionTimeout time.Duration) (*raft.Raft, *transport.Manager, error) {
