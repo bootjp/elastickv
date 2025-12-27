@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
@@ -258,17 +260,50 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 	var nodes []Node
 	var lc net.ListenConfig
 
-	leaderRedis := make(map[raft.ServerAddress]string, n)
-	for i := 0; i < n; i++ {
-		leaderRedis[raft.ServerAddress(ports[i].raftAddress)] = ports[i].redisAddress
-	}
-
 	for i := 0; i < n; i++ {
 		st := store.NewRbMemoryStore()
 		trxSt := store.NewMemoryStoreDefaultTTL()
 		fsm := kv.NewKvFSM(st, trxSt)
 
-		port := ports[i]
+		var port portsAdress
+		var grpcSock, redisSock, dynamoSock net.Listener
+
+		for {
+			port = ports[i]
+			var err error
+
+			grpcSock, err = lc.Listen(ctx, "tcp", port.grpcAddress)
+			if err != nil && errors.Is(err, unix.EADDRINUSE) {
+				ports[i] = portAssigner()
+				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
+				continue
+			}
+			require.NoError(t, err)
+
+			redisSock, err = lc.Listen(ctx, "tcp", port.redisAddress)
+			if err != nil && errors.Is(err, unix.EADDRINUSE) {
+				_ = grpcSock.Close()
+				ports[i] = portAssigner()
+				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
+				continue
+			}
+			require.NoError(t, err)
+
+			dynamoSock, err = lc.Listen(ctx, "tcp", port.dynamoAddress)
+			if err != nil && errors.Is(err, unix.EADDRINUSE) {
+				_ = grpcSock.Close()
+				_ = redisSock.Close()
+				ports[i] = portAssigner()
+				cfg.Servers[i].Address = raft.ServerAddress(ports[i].raftAddress)
+				continue
+			}
+			require.NoError(t, err)
+			break
+		}
+
+		leaderRedis := map[raft.ServerAddress]string{
+			raft.ServerAddress(ports[i].raftAddress): ports[i].redisAddress,
+		}
 
 		// リーダーが先に投票を開始させる
 		electionTimeout := leaderElectionTimeout
@@ -291,25 +326,18 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress, c
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
 
-		grpcSock, err := lc.Listen(ctx, "tcp", port.grpcAddress)
-		require.NoError(t, err)
-
 		grpcAdders = append(grpcAdders, port.grpcAddress)
 		redisAdders = append(redisAdders, port.redisAddress)
 		go func(srv *grpc.Server, lis net.Listener) {
 			assert.NoError(t, srv.Serve(lis))
 		}(s, grpcSock)
 
-		l, err := lc.Listen(ctx, "tcp", port.redisAddress)
-		require.NoError(t, err)
-		rd := NewRedisServer(l, st, coordinator, leaderRedis)
+		rd := NewRedisServer(redisSock, st, coordinator, leaderRedis)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)
 
-		dl, err := lc.Listen(ctx, "tcp", port.dynamoAddress)
-		assert.NoError(t, err)
-		ds := NewDynamoDBServer(dl, st, coordinator)
+		ds := NewDynamoDBServer(dynamoSock, st, coordinator)
 		go func() {
 			assert.NoError(t, ds.Run())
 		}()
