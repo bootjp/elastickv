@@ -209,6 +209,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 				}
 
 				if !ok {
+					// Lock already gone: treat as conflict and abort.
 					return errors.WithStack(ErrKeyNotLocked)
 				}
 
