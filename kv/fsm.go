@@ -209,13 +209,8 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 				}
 
 				if !ok {
-					// Lock missing (e.g., expired). Try to reacquire to make progress.
-					err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, ttlTxn store.TTLTxn) error {
-						return f.lock(ttlTxn, mut.Key, r.Ts)
-					})
-					if err != nil {
-						return errors.WithStack(err)
-					}
+					// Lock already gone: treat as conflict and abort.
+					return errors.WithStack(ErrKeyNotLocked)
 				}
 
 				err = f.commit(ctx, txn, mut)
