@@ -634,7 +634,7 @@ func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	s, e := clampRange(int(start), int(end), total)
+	s, e := clampRange(start, end, total)
 	return s, e, nil
 }
 
@@ -991,7 +991,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	res, err := cli.LRange(context.Background(), string(key), start, end).Result()
+	res, err := cli.LRange(context.Background(), string(key), int64(start), int64(end)).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -1017,8 +1017,8 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 	return res, errors.WithStack(err)
 }
 
-func parseInt(b []byte) (int64, error) {
-	i, err := strconv.ParseInt(string(b), 10, 64)
+func parseInt(b []byte) (int, error) {
+	i, err := strconv.Atoi(string(b))
 	return i, errors.WithStack(err)
 }
 
