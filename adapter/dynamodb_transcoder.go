@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -14,7 +15,8 @@ func newDynamoDBTranscoder() *dynamodbTranscoder { // create new transcoder
 }
 
 type attributeValue struct {
-	S string `json:"S"`
+	S string           `json:"S,omitempty"`
+	L []attributeValue `json:"L,omitempty"`
 }
 
 type putItemInput struct {
@@ -43,16 +45,8 @@ func (t *dynamodbTranscoder) PutItemToRequest(b []byte) (*kv.OperationGroup[kv.O
 	if !ok {
 		return nil, errors.New("missing value attribute")
 	}
-	return &kv.OperationGroup[kv.OP]{
-		IsTxn: false,
-		Elems: []*kv.Elem[kv.OP]{
-			{
-				Op:    kv.Put,
-				Key:   []byte(keyAttr.S),
-				Value: []byte(valAttr.S),
-			},
-		},
-	}, nil
+
+	return t.valueAttrToOps([]byte(keyAttr.S), valAttr)
 }
 
 func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
@@ -74,15 +68,58 @@ func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.Operatio
 		if !ok {
 			return nil, errors.New("missing value attribute")
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   []byte(keyAttr.S),
-			Value: []byte(valAttr.S),
-		})
+
+		ops, err := t.valueAttrToOps([]byte(keyAttr.S), valAttr)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, ops.Elems...)
 	}
 
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		Elems: elems,
+	}, nil
+}
+
+func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv.OperationGroup[kv.OP], error) {
+	// List handling: only lists of scalar strings are supported.
+	if len(val.L) > 0 {
+		var elems []*kv.Elem[kv.OP]
+		for i, item := range val.L {
+			if item.S == "" {
+				return nil, errors.New("only string list items are supported")
+			}
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ListItemKey(key, int64(i)),
+				Value: []byte(item.S),
+			})
+		}
+		meta := store.ListMeta{
+			Head: 0,
+			Tail: int64(len(val.L)),
+			Len:  int64(len(val.L)),
+		}
+		b, err := json.Marshal(meta)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaKey(key), Value: b})
+
+		return &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems}, nil
+	}
+
+	// Default: simple string
+	if val.S == "" {
+		return nil, errors.New("unsupported attribute type (only S or L of S)")
+	}
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn: false,
+		Elems: []*kv.Elem[kv.OP]{{
+			Op:    kv.Put,
+			Key:   key,
+			Value: []byte(val.S),
+		}},
 	}, nil
 }
