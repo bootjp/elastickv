@@ -209,7 +209,13 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 				}
 
 				if !ok {
-					return errors.WithStack(ErrKeyNotLocked)
+					// Lock missing (e.g., expired). Try to reacquire to make progress.
+					err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, ttlTxn store.TTLTxn) error {
+						return f.lock(ttlTxn, mut.Key, r.Ts)
+					})
+					if err != nil {
+						return errors.WithStack(err)
+					}
 				}
 
 				err = f.commit(ctx, txn, mut)
