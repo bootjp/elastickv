@@ -3,21 +3,23 @@ package store
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
-	"encoding/json"
+	"encoding/binary"
 	"math"
 
 	"github.com/cockroachdb/errors"
 )
 
 // Wide-column style list storage using per-element keys.
-// Item keys: !lst|itm|<userKey>|%020d
-// Meta key : !lst|meta|<userKey> -> {"h":head,"t":tail,"l":len}
+// Item keys: !lst|itm|<userKey><seq(8-byte sortable binary)>
+// Meta key : !lst|meta|<userKey> -> [Head(8)][Tail(8)][Len(8)]
 
 const (
 	ListMetaPrefix = "!lst|meta|"
 	ListItemPrefix = "!lst|itm|"
-	ListSeqWidth   = 20
+	// limit per scan when deleting to avoid OOM.
+	deleteBatchSize    = 1024
+	listMetaBinarySize = 24
+	scanAdvanceByte    = byte(0x00)
 )
 
 type ListMeta struct {
@@ -43,24 +45,28 @@ func (s *ListStore) IsList(ctx context.Context, key []byte) (bool, error) {
 
 // PutList replaces the entire list.
 func (s *ListStore) PutList(ctx context.Context, key []byte, list []string) error {
-	// delete existing meta/items (best-effort)
-	if err := s.deleteList(ctx, key); err != nil {
-		return err
-	}
-
 	meta := ListMeta{Head: 0, Tail: int64(len(list)), Len: int64(len(list))}
-	metaBytes, err := json.Marshal(meta)
+	metaBytes, err := marshalListMeta(meta)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
 	return errors.WithStack(s.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
+		scanTxn, ok := txn.(ScanTxn)
+		if !ok {
+			return errors.WithStack(ErrNotSupported)
+		}
+
+		if err := s.deleteListTxn(ctx, scanTxn, key); err != nil {
+			return err
+		}
+
 		for i, v := range list {
-			if err := txn.Put(ctx, ListItemKey(key, int64(i)), []byte(v)); err != nil {
+			if err := scanTxn.Put(ctx, ListItemKey(key, int64(i)), []byte(v)); err != nil {
 				return errors.WithStack(err)
 			}
 		}
-		if err := txn.Put(ctx, ListMetaKey(key), metaBytes); err != nil {
+		if err := scanTxn.Put(ctx, ListMetaKey(key), metaBytes); err != nil {
 			return errors.WithStack(err)
 		}
 		return nil
@@ -107,7 +113,7 @@ func (s *ListStore) RPush(ctx context.Context, key []byte, values ...string) (in
 		}
 		meta.Len += int64(len(values))
 		meta.Tail = meta.Head + meta.Len
-		metaBytes, err := json.Marshal(meta)
+		metaBytes, err := marshalListMeta(meta)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -168,11 +174,8 @@ func (s *ListStore) LoadMeta(ctx context.Context, key []byte) (ListMeta, bool, e
 	if len(val) == 0 {
 		return ListMeta{}, false, nil
 	}
-	var meta ListMeta
-	if err := json.Unmarshal(val, &meta); err != nil {
-		return ListMeta{}, false, errors.WithStack(err)
-	}
-	return meta, true, nil
+	meta, err := unmarshalListMeta(val)
+	return meta, err == nil, errors.WithStack(err)
 }
 
 func (s *ListStore) loadMetaTxn(ctx context.Context, txn Txn, key []byte) (ListMeta, bool, error) {
@@ -186,31 +189,44 @@ func (s *ListStore) loadMetaTxn(ctx context.Context, txn Txn, key []byte) (ListM
 	if len(val) == 0 {
 		return ListMeta{}, false, nil
 	}
-	var meta ListMeta
-	if err := json.Unmarshal(val, &meta); err != nil {
-		return ListMeta{}, false, errors.WithStack(err)
-	}
-	return meta, true, nil
+	meta, err := unmarshalListMeta(val)
+	return meta, err == nil, errors.WithStack(err)
 }
 
-func (s *ListStore) deleteList(ctx context.Context, key []byte) error {
-	start := ListItemKey(key, mathMinInt64) // use smallest seq
-	end := ListItemKey(key, mathMaxInt64)
+// deleteListTxn deletes list items and metadata within the provided transaction.
+func (s *ListStore) deleteListTxn(ctx context.Context, txn ScanTxn, key []byte) error {
+	start := ListItemKey(key, mathMinInt64) // inclusive
+	end := ListItemKey(key, mathMaxInt64)   // inclusive sentinel
 
-	items, err := s.store.Scan(ctx, start, end, math.MaxInt)
-	if err != nil && !errors.Is(err, ErrKeyNotFound) {
-		return errors.WithStack(err)
-	}
+	for {
+		kvs, err := txn.Scan(ctx, start, end, deleteBatchSize)
+		if err != nil && !errors.Is(err, ErrKeyNotFound) {
+			return errors.WithStack(err)
+		}
+		if len(kvs) == 0 {
+			break
+		}
 
-	return errors.WithStack(s.store.Txn(ctx, func(ctx context.Context, txn Txn) error {
-		for _, kvp := range items {
+		for _, kvp := range kvs {
 			if err := txn.Delete(ctx, kvp.Key); err != nil {
 				return errors.WithStack(err)
 			}
 		}
-		_ = txn.Delete(ctx, ListMetaKey(key))
-		return nil
-	}))
+
+		// advance start just after the last processed key to guarantee forward progress
+		lastKey := kvs[len(kvs)-1].Key
+		start = append(bytes.Clone(lastKey), scanAdvanceByte)
+
+		if len(kvs) < deleteBatchSize {
+			break
+		}
+	}
+
+	// delete meta last (ignore missing)
+	if err := txn.Delete(ctx, ListMetaKey(key)); err != nil && !errors.Is(err, ErrKeyNotFound) {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 // ListMetaKey builds the metadata key for a user key.
@@ -220,18 +236,53 @@ func ListMetaKey(userKey []byte) []byte {
 
 // ListItemKey builds the item key for a user key and sequence number.
 func ListItemKey(userKey []byte, seq int64) []byte {
-	// Offset sign bit (seq ^ minInt64) to preserve order, then big-endian encode and hex.
+	// Offset sign bit (seq ^ minInt64) to preserve order, then big-endian encode (8 bytes).
 	var raw [8]byte
 	encodeSortableInt64(raw[:], seq)
-	hexSeq := make([]byte, hex.EncodedLen(len(raw)))
-	hex.Encode(hexSeq, raw[:])
 
-	buf := make([]byte, 0, len(ListItemPrefix)+len(userKey)+1+len(hexSeq))
+	buf := make([]byte, 0, len(ListItemPrefix)+len(userKey)+len(raw))
 	buf = append(buf, ListItemPrefix...)
 	buf = append(buf, userKey...)
-	buf = append(buf, '|')
-	buf = append(buf, hexSeq...)
+	buf = append(buf, raw[:]...)
 	return buf
+}
+
+// MarshalListMeta encodes ListMeta into a fixed 24-byte binary format.
+func MarshalListMeta(meta ListMeta) ([]byte, error) { return marshalListMeta(meta) }
+
+// UnmarshalListMeta decodes ListMeta from the fixed 24-byte binary format.
+func UnmarshalListMeta(b []byte) (ListMeta, error) { return unmarshalListMeta(b) }
+
+func marshalListMeta(meta ListMeta) ([]byte, error) {
+	if meta.Head < 0 || meta.Tail < 0 || meta.Len < 0 {
+		return nil, errors.WithStack(errors.Newf("list meta contains negative value: head=%d tail=%d len=%d", meta.Head, meta.Tail, meta.Len))
+	}
+
+	buf := make([]byte, listMetaBinarySize)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail))
+	binary.BigEndian.PutUint64(buf[16:24], uint64(meta.Len))
+	return buf, nil
+}
+
+func unmarshalListMeta(b []byte) (ListMeta, error) {
+	if len(b) != listMetaBinarySize {
+		return ListMeta{}, errors.Wrap(errors.Newf("invalid list meta length: %d", len(b)), "unmarshal list meta")
+	}
+
+	head := binary.BigEndian.Uint64(b[0:8])
+	tail := binary.BigEndian.Uint64(b[8:16])
+	length := binary.BigEndian.Uint64(b[16:24])
+
+	if head > math.MaxInt64 || tail > math.MaxInt64 || length > math.MaxInt64 {
+		return ListMeta{}, errors.New("list meta value overflows int64")
+	}
+
+	return ListMeta{
+		Head: int64(head),
+		Tail: int64(tail),
+		Len:  int64(length),
+	}, nil
 }
 
 // encodeSortableInt64 writes seq with sign bit flipped (seq ^ minInt64) in big-endian order.
@@ -286,11 +337,10 @@ func ExtractListUserKey(key []byte) []byte {
 		return bytes.TrimPrefix(key, []byte(ListMetaPrefix))
 	case IsListItemKey(key):
 		trimmed := bytes.TrimPrefix(key, []byte(ListItemPrefix))
-		idx := bytes.LastIndexByte(trimmed, '|')
-		if idx == -1 {
+		if len(trimmed) < sortableInt64Bytes {
 			return nil
 		}
-		return trimmed[:idx]
+		return trimmed[:len(trimmed)-sortableInt64Bytes]
 	default:
 		return nil
 	}

@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"math"
 	"net"
 	"sort"
@@ -742,7 +741,7 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 
 		st.meta.Len += int64(len(st.appends))
 		st.meta.Tail = st.meta.Head + st.meta.Len
-		metaBytes, err := json.Marshal(st.meta)
+		metaBytes, err := store.MarshalListMeta(st.meta)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -854,7 +853,7 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 	meta.Len += int64(len(values))
 	meta.Tail = meta.Head + meta.Len
 
-	b, err := json.Marshal(meta)
+	b, err := store.MarshalListMeta(meta)
 	if err != nil {
 		return nil, meta, errors.WithStack(err)
 	}

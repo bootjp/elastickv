@@ -101,7 +101,7 @@ func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv
 			Tail: int64(len(val.L)),
 			Len:  int64(len(val.L)),
 		}
-		b, err := json.Marshal(meta)
+		b, err := store.MarshalListMeta(meta)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}

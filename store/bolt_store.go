@@ -175,6 +175,22 @@ func (t *boltStoreTxn) Exists(_ context.Context, key []byte) (bool, error) {
 	return t.bucket.Get(key) != nil, nil
 }
 
+func (t *boltStoreTxn) Scan(_ context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	var res []*KVPair
+	c := t.bucket.Cursor()
+	for k, v := c.Seek(start); k != nil && (end == nil || bytes.Compare(k, end) < 0); k, v = c.Next() {
+		res = append(res, &KVPair{Key: k, Value: v})
+		if len(res) >= limit {
+			break
+		}
+	}
+	return res, nil
+}
+
 func (s *boltStore) Txn(ctx context.Context, fn func(ctx context.Context, txn Txn) error) error {
 	btxn, err := s.bbolt.Begin(true)
 	if err != nil {
