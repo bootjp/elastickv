@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -384,8 +385,44 @@ func (t *rbMemoryStoreTxn) Scan(_ context.Context, start []byte, end []byte, lim
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	var result []*KVPair
+	if limit <= 0 {
+		return nil, nil
+	}
 
+	deleted := t.deletedSet()
+	staged := t.stagedMap()
+	included := make(map[string]struct{})
+
+	result := make([]*KVPair, 0, limit)
+	t.addBaseResults(&result, included, start, end, limit, staged, deleted)
+	if len(result) < limit {
+		t.addStagedOnly(&result, included, start, end, limit, staged)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Key, result[j].Key) < 0
+	})
+
+	if len(result) > limit {
+		result = result[:limit]
+	}
+
+	return result, nil
+}
+
+// helper methods below assume t.mu is already RLocked by caller.
+func (t *rbMemoryStoreTxn) deletedSet() map[string]struct{} {
+	deleted := make(map[string]struct{}, len(t.ops))
+	for _, op := range t.ops {
+		if op.opType == OpTypeDelete {
+			deleted[string(op.key)] = struct{}{}
+		}
+	}
+	return deleted
+}
+
+func (t *rbMemoryStoreTxn) stagedMap() map[string][]byte {
+	staged := make(map[string][]byte, t.tree.Size())
 	t.tree.Each(func(key interface{}, value interface{}) {
 		k, ok := key.([]byte)
 		if !ok {
@@ -395,25 +432,66 @@ func (t *rbMemoryStoreTxn) Scan(_ context.Context, start []byte, end []byte, lim
 		if !ok {
 			return
 		}
-
-		if bytes.Compare(k, start) < 0 {
-			return
-		}
-
-		if bytes.Compare(k, end) > 0 {
-			return
-		}
-
-		if len(result) >= limit {
-			return
-		}
-
-		result = append(result, &KVPair{
-			Key:   k,
-			Value: v,
-		})
+		staged[string(k)] = v
 	})
-	return result, nil
+	return staged
+}
+
+func withinBounds(k, start, end []byte) bool {
+	if start != nil && bytes.Compare(k, start) < 0 {
+		return false
+	}
+	if end != nil && bytes.Compare(k, end) > 0 {
+		return false
+	}
+	return true
+}
+
+func (t *rbMemoryStoreTxn) addBaseResults(result *[]*KVPair, included map[string]struct{}, start, end []byte, limit int, staged map[string][]byte, deleted map[string]struct{}) {
+	t.s.tree.Each(func(key interface{}, value interface{}) {
+		if len(*result) >= limit {
+			return
+		}
+
+		k, ok := key.([]byte)
+		if !ok {
+			return
+		}
+		if !withinBounds(k, start, end) {
+			return
+		}
+		if _, deletedHere := deleted[string(k)]; deletedHere {
+			return
+		}
+
+		v, ok := value.([]byte)
+		if !ok {
+			return
+		}
+		if stagedVal, ok := staged[string(k)]; ok {
+			v = stagedVal
+		}
+
+		*result = append(*result, &KVPair{Key: k, Value: v})
+		included[string(k)] = struct{}{}
+	})
+}
+
+func (t *rbMemoryStoreTxn) addStagedOnly(result *[]*KVPair, included map[string]struct{}, start, end []byte, limit int, staged map[string][]byte) {
+	for kStr, v := range staged {
+		if len(*result) >= limit {
+			return
+		}
+		if _, already := included[kStr]; already {
+			continue
+		}
+		kb := []byte(kStr)
+		if !withinBounds(kb, start, end) {
+			continue
+		}
+		*result = append(*result, &KVPair{Key: kb, Value: v})
+		included[kStr] = struct{}{}
+	}
 }
 
 func (t *rbMemoryStoreTxn) Put(_ context.Context, key []byte, value []byte) error {

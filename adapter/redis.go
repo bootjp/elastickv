@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"math"
 	"net"
 	"sort"
@@ -41,6 +40,7 @@ type RedisServer struct {
 	store           store.ScanStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
+	listStore       *store.ListStore
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -72,12 +72,15 @@ type redisResult struct {
 	err     error
 }
 
+func store2list(st store.ScanStore) *store.ListStore { return store.NewListStore(st) }
+
 func NewRedisServer(listen net.Listener, store store.ScanStore, coordinate *kv.Coordinate, leaderRedis map[raft.ServerAddress]string) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
 		coordinator:     coordinate,
 		redisTranscoder: newRedisTranscoder(),
+		listStore:       store2list(store),
 		leaderRedis:     leaderRedis,
 	}
 
@@ -172,6 +175,17 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
+	// Prevent overwriting list keys with string values without cleanup.
+	isList, err := r.isListKey(context.Background(), cmd.Args[1])
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if isList {
+		conn.WriteError("WRONGTYPE Operation against a key holding the wrong kind of value")
+		return
+	}
+
 	res, err := r.redisTranscoder.SetToRequest(cmd.Args[1], cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -188,6 +202,14 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
+	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		conn.WriteError(err.Error())
+		return
+	} else if ok {
+		conn.WriteError("WRONGTYPE Operation against a key holding the wrong kind of value")
+		return
+	}
+
 	if r.coordinator.IsLeader() {
 		v, err := r.store.Get(context.Background(), cmd.Args[1])
 		if err != nil {
@@ -218,6 +240,18 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
+	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		conn.WriteError(err.Error())
+		return
+	} else if ok {
+		if err := r.deleteList(context.Background(), cmd.Args[1]); err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt(1)
+		return
+	}
+
 	res, err := r.redisTranscoder.DeleteToRequest(cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -234,6 +268,14 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
+	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		conn.WriteError(err.Error())
+		return
+	} else if ok {
+		conn.WriteInt(1)
+		return
+	}
+
 	ok, err := r.store.Exists(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -276,37 +318,59 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) localKeys(pattern []byte) ([][]byte, error) {
-	// If an asterisk (*) is not included, the match will be exact,
-	// so check if the key exists.
 	if !bytes.Contains(pattern, []byte("*")) {
-		res, err := r.store.Exists(context.Background(), pattern)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		if res {
-			return [][]byte{bytes.Clone(pattern)}, nil
-		}
-		return [][]byte{}, nil
+		return r.localKeysExact(pattern)
 	}
+	return r.localKeysPattern(pattern)
+}
 
-	var start []byte
-	switch {
-	case bytes.Equal(pattern, []byte("*")):
-		start = nil
-	default:
-		start = bytes.ReplaceAll(pattern, []byte("*"), nil)
+func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
+	res, err := r.store.Exists(context.Background(), pattern)
+	if err != nil {
+		return nil, errors.WithStack(err)
 	}
+	if res {
+		return [][]byte{bytes.Clone(pattern)}, nil
+	}
+	return [][]byte{}, nil
+}
+
+func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
+	start := r.patternStart(pattern)
 
 	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	out := make([][]byte, 0, len(keys))
-	for _, kvPair := range keys {
-		out = append(out, kvPair.Key)
+	keyset := r.collectUserKeys(keys)
+
+	out := make([][]byte, 0, len(keyset))
+	for _, v := range keyset {
+		out = append(out, v)
 	}
 	return out, nil
+}
+
+func (r *RedisServer) patternStart(pattern []byte) []byte {
+	if bytes.Equal(pattern, []byte("*")) {
+		return nil
+	}
+	return bytes.ReplaceAll(pattern, []byte("*"), nil)
+}
+
+func (r *RedisServer) collectUserKeys(kvs []*store.KVPair) map[string][]byte {
+	keyset := map[string][]byte{}
+	for _, kvPair := range kvs {
+		if store.IsListMetaKey(kvPair.Key) || store.IsListItemKey(kvPair.Key) {
+			if userKey := store.ExtractListUserKey(kvPair.Key); userKey != nil {
+				keyset[string(userKey)] = userKey
+			}
+			continue
+		}
+		keyset[string(kvPair.Key)] = kvPair.Key
+	}
+	return keyset
 }
 
 func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
@@ -374,16 +438,22 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 
 type txnValue struct {
 	raw     []byte
-	list    []string
-	isList  bool
 	deleted bool
 	dirty   bool
 	loaded  bool
 }
 
 type txnContext struct {
-	server  *RedisServer
-	working map[string]*txnValue
+	server     *RedisServer
+	working    map[string]*txnValue
+	listStates map[string]*listTxnState
+}
+
+type listTxnState struct {
+	meta       store.ListMeta
+	metaExists bool
+	appends    [][]byte
+	deleted    bool
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
@@ -400,6 +470,30 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 	tv.loaded = true
 	t.working[k] = tv
 	return tv, nil
+}
+
+func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
+	k := string(key)
+	if st, ok := t.listStates[k]; ok {
+		return st, nil
+	}
+
+	meta, exists, err := t.server.loadListMeta(context.Background(), key)
+	if err != nil {
+		return nil, err
+	}
+
+	st := &listTxnState{
+		meta:       meta,
+		metaExists: exists,
+		appends:    [][]byte{},
+	}
+	t.listStates[k] = st
+	return st, nil
+}
+
+func (t *txnContext) listLength(st *listTxnState) int64 {
+	return st.meta.Len + int64(len(st.appends))
 }
 
 func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
@@ -422,18 +516,36 @@ func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
+	if isList, err := t.server.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		return redisResult{}, err
+	} else if isList {
+		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
+	}
+
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
 	tv.raw = cmd.Args[2]
-	tv.isList = false
 	tv.deleted = false
 	tv.dirty = true
 	return redisResult{typ: resultString, str: "OK"}, nil
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
+	// handle list delete separately
+	if isList, err := t.server.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		return redisResult{}, err
+	} else if isList {
+		st, err := t.loadListState(cmd.Args[1])
+		if err != nil {
+			return redisResult{}, err
+		}
+		st.deleted = true
+		st.appends = nil
+		return redisResult{typ: resultInt, integer: 1}, nil
+	}
+
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
@@ -444,6 +556,12 @@ func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
+	if isList, err := t.server.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		return redisResult{}, err
+	} else if isList {
+		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
+	}
+
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
@@ -455,6 +573,12 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
+	if isList, err := t.server.isListKey(context.Background(), cmd.Args[1]); err != nil {
+		return redisResult{}, err
+	} else if isList {
+		return redisResult{typ: resultInt, integer: 1}, nil
+	}
+
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
@@ -465,63 +589,101 @@ func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 
-func (t *txnContext) ensureList(tv *txnValue) error {
-	if tv.isList {
-		return nil
-	}
-	list, err := decodeList(tv.raw)
-	if err != nil {
-		return err
-	}
-	tv.list = list
-	tv.isList = true
-	return nil
-}
-
 func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
-	tv, err := t.load(cmd.Args[1])
+	st, err := t.loadListState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if err := t.ensureList(tv); err != nil {
-		return redisResult{}, err
-	}
+
 	for _, v := range cmd.Args[2:] {
-		tv.list = append(tv.list, string(v))
+		st.appends = append(st.appends, bytes.Clone(v))
 	}
-	tv.dirty = true
-	tv.deleted = false
-	return redisResult{typ: resultInt, integer: int64(len(tv.list))}, nil
+
+	return redisResult{typ: resultInt, integer: t.listLength(st)}, nil
 }
 
 func (t *txnContext) applyLRange(cmd redcon.Command) (redisResult, error) {
-	tv, err := t.load(cmd.Args[1])
+	st, err := t.loadListState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if err := t.ensureList(tv); err != nil {
+
+	s, e, err := parseRangeBounds(cmd.Args[2], cmd.Args[3], int(t.listLength(st)))
+	if err != nil {
 		return redisResult{}, err
 	}
-	start, err := strconv.Atoi(string(cmd.Args[2]))
-	if err != nil {
-		return redisResult{}, errors.WithStack(err)
-	}
-	end, err := strconv.Atoi(string(cmd.Args[3]))
-	if err != nil {
-		return redisResult{}, errors.WithStack(err)
-	}
-	s, e := clampRange(start, end, len(tv.list))
 	if e < s {
 		return redisResult{typ: resultArray, arr: []string{}}, nil
 	}
-	return redisResult{typ: resultArray, arr: tv.list[s : e+1]}, nil
+
+	out, err := t.listRangeValues(cmd.Args[1], st, s, e)
+	if err != nil {
+		return redisResult{}, err
+	}
+
+	return redisResult{typ: resultArray, arr: out}, nil
+}
+
+func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
+	start, err := parseInt(startRaw)
+	if err != nil {
+		return 0, 0, err
+	}
+	end, err := parseInt(endRaw)
+	if err != nil {
+		return 0, 0, err
+	}
+	s, e := clampRange(start, end, total)
+	return s, e, nil
+}
+
+func (t *txnContext) listRangeValues(key []byte, st *listTxnState, s, e int) ([]string, error) {
+	persistedLen := int(st.meta.Len)
+
+	switch {
+	case e < persistedLen:
+		return t.server.fetchListRange(context.Background(), key, st.meta, int64(s), int64(e))
+	case s >= persistedLen:
+		return appendValues(st.appends, s-persistedLen, e-persistedLen), nil
+	default:
+		head, err := t.server.fetchListRange(context.Background(), key, st.meta, int64(s), int64(persistedLen-1))
+		if err != nil {
+			return nil, err
+		}
+		tail := appendValues(st.appends, 0, e-persistedLen)
+		return append(head, tail...), nil
+	}
+}
+
+func appendValues(buf [][]byte, start, end int) []string {
+	out := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		out = append(out, string(buf[i]))
+	}
+	return out
 }
 
 func (t *txnContext) commit() error {
-	if len(t.working) == 0 {
+	elems := t.buildKeyElems()
+
+	listElems, err := t.buildListElems()
+	if err != nil {
+		return err
+	}
+
+	elems = append(elems, listElems...)
+	if len(elems) == 0 {
 		return nil
 	}
 
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems}
+	if _, err := t.server.coordinator.Dispatch(group); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 	keys := make([]string, 0, len(t.working))
 	for k := range t.working {
 		keys = append(keys, k)
@@ -539,34 +701,60 @@ func (t *txnContext) commit() error {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
 			continue
 		}
-		var val []byte
-		if tv.isList {
-			enc, err := encodeList(tv.list)
-			if err != nil {
-				return err
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: tv.raw})
+	}
+	return elems
+}
+
+func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
+	listKeys := make([]string, 0, len(t.listStates))
+	for k := range t.listStates {
+		listKeys = append(listKeys, k)
+	}
+	sort.Strings(listKeys)
+
+	var elems []*kv.Elem[kv.OP]
+	for _, k := range listKeys {
+		st := t.listStates[k]
+		userKey := []byte(k)
+
+		if st.deleted {
+			// delete all persisted list items
+			for seq := st.meta.Head; seq < st.meta.Tail; seq++ {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(userKey, seq)})
 			}
-			val = enc
-		} else {
-			val = tv.raw
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
+			continue
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: val})
-	}
+		if len(st.appends) == 0 {
+			continue
+		}
 
-	if len(elems) == 0 {
-		return nil
-	}
+		startSeq := st.meta.Head + st.meta.Len
+		for i, v := range st.appends {
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   listItemKey(userKey, startSeq+int64(i)),
+				Value: v,
+			})
+		}
 
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems}
-	if _, err := t.server.coordinator.Dispatch(group); err != nil {
-		return errors.WithStack(err)
+		st.meta.Len += int64(len(st.appends))
+		st.meta.Tail = st.meta.Head + st.meta.Len
+		metaBytes, err := store.MarshalListMeta(st.meta)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(userKey), Value: metaBytes})
 	}
-	return nil
+	return elems, nil
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
 	ctx := &txnContext{
-		server:  r,
-		working: map[string]*txnValue{},
+		server:     r,
+		working:    map[string]*txnValue{},
+		listStates: map[string]*listTxnState{},
 	}
 
 	results := make([]redisResult, 0, len(queue))
@@ -610,21 +798,14 @@ func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 	}
 }
 
-// list helpers
-func decodeList(b []byte) ([]string, error) {
-	if b == nil {
-		return []string{}, nil
-	}
-	var out []string
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return out, nil
+// --- list helpers ----------------------------------------------------
+
+func listMetaKey(userKey []byte) []byte {
+	return store.ListMetaKey(userKey)
 }
 
-func encodeList(list []string) ([]byte, error) {
-	b, err := json.Marshal(list)
-	return b, errors.WithStack(err)
+func listItemKey(userKey []byte, seq int64) []byte {
+	return store.ListItemKey(userKey, seq)
 }
 
 func clampRange(start, end, length int) (int, int) {
@@ -646,15 +827,130 @@ func clampRange(start, end, length int) (int, int) {
 	return start, end
 }
 
-func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
-	val, err := r.getValue(key)
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return nil, errors.WithStack(err)
+func (r *RedisServer) loadListMeta(ctx context.Context, key []byte) (store.ListMeta, bool, error) {
+	meta, exists, err := r.listStore.LoadMeta(ctx, key)
+	return meta, exists, errors.WithStack(err)
+}
+
+func (r *RedisServer) isListKey(ctx context.Context, key []byte) (bool, error) {
+	isList, err := r.listStore.IsList(ctx, key)
+	return isList, errors.WithStack(err)
+}
+
+func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+	if len(values) == 0 {
+		return nil, meta, nil
 	}
-	list, err := decodeList(val)
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	seq := meta.Head + meta.Len
+	for _, v := range values {
+		vCopy := bytes.Clone(v)
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listItemKey(key, seq), Value: vCopy})
+		seq++
+	}
+
+	meta.Len += int64(len(values))
+	meta.Tail = meta.Head + meta.Len
+
+	b, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, meta, errors.WithStack(err)
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
+	return elems, meta, nil
+}
+
+func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
+	meta, _, err := r.loadListMeta(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+
+	ops, newMeta, err := r.buildRPushOps(meta, key, values)
+	if err != nil {
+		return 0, err
+	}
+	if len(ops) == 0 {
+		return newMeta.Len, nil
+	}
+
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
+	if _, err := r.coordinator.Dispatch(group); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return newMeta.Len, nil
+}
+
+func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
+	meta, exists, err := r.loadListMeta(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+
+	start := listItemKey(key, math.MinInt64)
+	end := listItemKey(key, math.MaxInt64)
+
+	kvs, err := r.store.Scan(ctx, start, end, math.MaxInt)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	ops := make([]*kv.Elem[kv.OP], 0, len(kvs)+1)
+	for _, kvp := range kvs {
+		ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+	}
+	// delete meta last
+	ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+
+	// ensure meta bounds consistent even if scan missed (in case of empty list)
+	_ = meta
+
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
+	_, err = r.coordinator.Dispatch(group)
+	return errors.WithStack(err)
+}
+
+func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64) ([]string, error) {
+	if endIdx < startIdx {
+		return []string{}, nil
+	}
+
+	startSeq := meta.Head + startIdx
+	endSeq := meta.Head + endIdx
+
+	startKey := listItemKey(key, startSeq)
+	endKey := listItemKey(key, endSeq+1) // exclusive
+
+	kvs, err := r.store.Scan(ctx, startKey, endKey, int(endIdx-startIdx+1))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	out := make([]string, 0, len(kvs))
+	for _, kvp := range kvs {
+		out = append(out, string(kvp.Value))
+	}
+	return out, nil
+}
+
+func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
+	if !r.coordinator.IsLeader() {
+		return r.proxyLRange(key, startRaw, endRaw)
+	}
+
+	meta, exists, err := r.loadListMeta(context.Background(), key)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || meta.Len == 0 {
+		return []string{}, nil
+	}
+
 	start, err := strconv.Atoi(string(startRaw))
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -663,11 +959,66 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	s, e := clampRange(start, end, len(list))
+
+	s, e := clampRange(start, end, int(meta.Len))
 	if e < s {
 		return []string{}, nil
 	}
-	return list[s : e+1], nil
+
+	return r.fetchListRange(context.Background(), key, meta, int64(s), int64(e))
+}
+
+func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return nil, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
+	defer func() { _ = cli.Close() }()
+
+	start, err := parseInt(startRaw)
+	if err != nil {
+		return nil, err
+	}
+	end, err := parseInt(endRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := cli.LRange(context.Background(), string(key), int64(start), int64(end)).Result()
+	return res, errors.WithStack(err)
+}
+
+func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
+	defer func() { _ = cli.Close() }()
+
+	args := make([]interface{}, 0, len(values))
+	for _, v := range values {
+		args = append(args, string(v))
+	}
+
+	res, err := cli.RPush(context.Background(), string(key), args...).Result()
+	return res, errors.WithStack(err)
+}
+
+func parseInt(b []byte) (int, error) {
+	i, err := strconv.Atoi(string(b))
+	return i, errors.WithStack(err)
 }
 
 // tryLeaderGet proxies a GET to the current Raft leader, returning the value and
@@ -705,25 +1056,21 @@ func (r *RedisServer) getValue(key []byte) ([]byte, error) {
 }
 
 func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
-	results, err := r.runTransaction([]redcon.Command{cmd})
+	ctx := context.Background()
+
+	var length int64
+	var err error
+	if r.coordinator.IsLeader() {
+		length, err = r.listRPush(ctx, cmd.Args[1], cmd.Args[2:])
+	} else {
+		length, err = r.proxyRPush(cmd.Args[1], cmd.Args[2:])
+	}
+
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	if len(results) != 1 {
-		conn.WriteError("ERR internal error: rpush should have one result")
-		return
-	}
-	res := results[0]
-	if res.err != nil {
-		conn.WriteError(res.err.Error())
-		return
-	}
-	if res.typ != resultInt {
-		conn.WriteError("ERR internal error: rpush result should be an integer")
-		return
-	}
-	conn.WriteInt64(res.integer)
+	conn.WriteInt64(length)
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {
