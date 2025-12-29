@@ -59,7 +59,7 @@ func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Re
 	}
 
 	var firstErr error
-	var max uint64
+	var maxIndex uint64
 	for gid, rs := range grouped {
 		g, ok := s.getGroup(gid)
 		if !ok {
@@ -72,14 +72,14 @@ func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Re
 			}
 			continue
 		}
-		if r.CommitIndex > max {
-			max = r.CommitIndex
+		if r.CommitIndex > maxIndex {
+			maxIndex = r.CommitIndex
 		}
 	}
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	return &TransactionResponse{CommitIndex: max}, nil
+	return &TransactionResponse{CommitIndex: maxIndex}, nil
 }
 
 func (s *ShardRouter) getGroup(id uint64) (*routerGroup, bool) {
