@@ -121,6 +121,8 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 	panic("unreachable")
 }
 
+const defaultTxnLockTTLSeconds = uint64(30)
+
 func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 	switch req.Op {
 	case Put:
@@ -128,6 +130,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_PREPARE,
+				Ts:    defaultTxnLockTTLSeconds,
 				Mutations: []*pb.Mutation{
 					{
 						Key:   req.Key,
@@ -138,6 +141,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_COMMIT,
+				Ts:    defaultTxnLockTTLSeconds,
 				Mutations: []*pb.Mutation{
 					{
 						Key:   req.Key,
@@ -152,6 +156,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_PREPARE,
+				Ts:    defaultTxnLockTTLSeconds,
 				Mutations: []*pb.Mutation{
 					{
 						Key: req.Key,
@@ -161,6 +166,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_COMMIT,
+				Ts:    defaultTxnLockTTLSeconds,
 				Mutations: []*pb.Mutation{
 					{
 						Key: req.Key,

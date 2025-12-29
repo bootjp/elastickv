@@ -58,7 +58,8 @@ func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Re
 		return nil, errors.WithStack(err)
 	}
 
-	var max uint64
+	var firstErr error
+	var maxIndex uint64
 	for gid, rs := range grouped {
 		g, ok := s.getGroup(gid)
 		if !ok {
@@ -66,13 +67,19 @@ func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Re
 		}
 		r, err := fn(g, rs)
 		if err != nil {
-			return nil, errors.WithStack(err)
+			if firstErr == nil {
+				firstErr = errors.WithStack(err)
+			}
+			continue
 		}
-		if r.CommitIndex > max {
-			max = r.CommitIndex
+		if r.CommitIndex > maxIndex {
+			maxIndex = r.CommitIndex
 		}
 	}
-	return &TransactionResponse{CommitIndex: max}, nil
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return &TransactionResponse{CommitIndex: maxIndex}, nil
 }
 
 func (s *ShardRouter) getGroup(id uint64) (*routerGroup, bool) {
