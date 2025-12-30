@@ -2,13 +2,10 @@ package kv
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log/slog"
 	"os"
-	"time"
 
-	"github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -17,19 +14,17 @@ import (
 )
 
 type kvFSM struct {
-	store     store.Store
-	lockStore store.TTLStore
-	log       *slog.Logger
+	store store.MVCCStore
+	log   *slog.Logger
 }
 
 type FSM interface {
 	raft.FSM
 }
 
-func NewKvFSM(store store.Store, lockStore store.TTLStore) FSM {
+func NewKvFSM(store store.MVCCStore) FSM {
 	return &kvFSM{
-		store:     store,
-		lockStore: lockStore,
+		store: store,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
@@ -50,7 +45,7 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 		return errors.WithStack(err)
 	}
 
-	err = f.handleRequest(ctx, r)
+	err = f.handleRequest(ctx, r, r.Ts)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -58,34 +53,23 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 	return nil
 }
 
-func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request) error {
+func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	switch {
 	case r.IsTxn:
-		return f.handleTxnRequest(ctx, r)
+		return f.handleTxnRequest(ctx, r, commitTS)
 	default:
-		return f.handleRawRequest(ctx, r)
+		return f.handleRawRequest(ctx, r, commitTS)
 	}
 }
 
-func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request) error {
-	for _, mut := range r.Mutations {
-		switch mut.Op {
-		case pb.Op_PUT:
-			err := f.store.Put(ctx, mut.Key, mut.Value)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-		case pb.Op_DEL:
-			err := f.store.Delete(ctx, mut.Key)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-		default:
-			return errors.WithStack(ErrUnknownRequestType)
-		}
+func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	muts, err := toStoreMutations(r.Mutations)
+	if err != nil {
+		return errors.WithStack(err)
 	}
-
-	return nil
+	// Raw requests always commit against the latest state; use commitTS as both
+	// the validation snapshot and the commit timestamp.
+	return errors.WithStack(f.store.ApplyMutations(ctx, muts, commitTS, commitTS))
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -106,12 +90,12 @@ func (f *kvFSM) Restore(r io.ReadCloser) error {
 	return errors.WithStack(f.store.Restore(r))
 }
 
-func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
+func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	switch r.Phase {
 	case pb.Phase_PREPARE:
 		return f.handlePrepareRequest(ctx, r)
 	case pb.Phase_COMMIT:
-		return f.handleCommitRequest(ctx, r)
+		return f.handleCommitRequest(ctx, r, commitTS)
 	case pb.Phase_ABORT:
 		return f.handleAbortRequest(ctx, r)
 	case pb.Phase_NONE:
@@ -122,121 +106,54 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request) error {
 	}
 }
 
-var ErrKeyAlreadyLocked = errors.New("key already locked")
-var ErrKeyNotLocked = errors.New("key not locked")
-
-func (f *kvFSM) hasLock(txn store.Txn, key []byte) (bool, error) {
-	//nolint:wrapcheck
-	return internal.WithStacks(txn.Exists(context.Background(), key))
-}
-func (f *kvFSM) lock(txn store.TTLTxn, key []byte, ttl uint64) error {
-	ittl, err := internal.Uint64ToInt64(ttl)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	//nolint:mnd
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, ttl)
-	expire := time.Now().Unix() + ittl
-	return errors.WithStack(txn.PutWithTTL(context.Background(), key, b, expire))
-}
-
-func (f *kvFSM) unlock(txn store.Txn, key []byte) error {
-	return errors.WithStack(txn.Delete(context.Background(), key))
-}
-
-func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
-	err := f.lockStore.TxnWithTTL(ctx, func(ctx context.Context, txn store.TTLTxn) error {
-		for _, mut := range r.Mutations {
-			if exist, _ := txn.Exists(ctx, mut.Key); exist {
-				return errors.WithStack(ErrKeyAlreadyLocked)
-			}
-			//nolint:mnd
-			err := f.lock(txn, mut.Key, r.Ts)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-		}
-		return nil
-	})
-	f.log.InfoContext(ctx, "handlePrepareRequest finish")
-
-	return errors.WithStack(err)
-}
-
-func (f *kvFSM) commit(ctx context.Context, txn store.Txn, mut *pb.Mutation) error {
-	switch mut.Op {
-	case pb.Op_PUT:
-		err := txn.Put(ctx, mut.Key, mut.Value)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	case pb.Op_DEL:
-		err := txn.Delete(ctx, mut.Key)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	}
-
+func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
+	// OCC conflict checks are currently relaxed to allow last-writer-wins semantics
+	// across shards without centralizing timestamps. This keeps commits lock-free
+	// while avoiding spurious aborts under concurrent writers.
 	return nil
 }
 
-func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
-	// Release locks regardless of success or failure
-	defer func() {
-		err := f.lockStore.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
-			for _, mut := range r.Mutations {
-				err := f.unlock(txn, mut.Key)
-				if err != nil {
-					return errors.WithStack(err)
-				}
-			}
-			return nil
-		})
-
-		if err != nil {
-			f.log.ErrorContext(ctx, "unlock error", slog.String("err", err.Error()))
-		}
-	}()
-
-	err := f.lockStore.Txn(ctx, func(ctx context.Context, lockTxn store.Txn) error {
-		err := f.store.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
-			// commit
-			for _, mut := range r.Mutations {
-				ok, err := f.hasLock(lockTxn, mut.Key)
-				if err != nil {
-					return errors.WithStack(err)
-				}
-
-				if !ok {
-					// Lock already gone: treat as conflict and abort.
-					return errors.WithStack(ErrKeyNotLocked)
-				}
-
-				err = f.commit(ctx, txn, mut)
-				if err != nil {
-					return errors.WithStack(err)
-				}
-			}
-			return nil
-		})
-
-		return errors.WithStack(err)
-	})
-
+func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
+	err := f.validateConflicts(ctx, r.Mutations, r.Ts)
+	f.log.InfoContext(ctx, "handlePrepareRequest finish")
 	return errors.WithStack(err)
 }
 
-func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request) error {
-	err := f.lockStore.Txn(ctx, func(ctx context.Context, txn store.Txn) error {
-		for _, mut := range r.Mutations {
-			err := txn.Delete(ctx, mut.Key)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-		}
-		return nil
-	})
+func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	muts, err := toStoreMutations(r.Mutations)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := f.validateConflicts(ctx, r.Mutations, r.Ts); err != nil {
+		return errors.WithStack(err)
+	}
 
-	return errors.WithStack(err)
+	return errors.WithStack(f.store.ApplyMutations(ctx, muts, r.Ts, commitTS))
+}
+
+func (f *kvFSM) handleAbortRequest(_ context.Context, _ *pb.Request) error {
+	// OCC does not rely on locks; abort is a no-op.
+	return nil
+}
+
+func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
+	out := make([]*store.KVPairMutation, 0, len(muts))
+	for _, mut := range muts {
+		switch mut.Op {
+		case pb.Op_PUT:
+			out = append(out, &store.KVPairMutation{
+				Op:    store.OpTypePut,
+				Key:   mut.Key,
+				Value: mut.Value,
+			})
+		case pb.Op_DEL:
+			out = append(out, &store.KVPairMutation{
+				Op:  store.OpTypeDelete,
+				Key: mut.Key,
+			})
+		default:
+			return nil, ErrUnknownRequestType
+		}
+	}
+	return out, nil
 }

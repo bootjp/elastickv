@@ -322,9 +322,8 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 	cfg := buildRaftConfig(n, ports)
 
 	for i := 0; i < n; i++ {
-		st := store.NewRbMemoryStore()
-		trxSt := store.NewMemoryStoreDefaultTTL()
-		fsm := kv.NewKvFSM(st, trxSt)
+		st := store.NewMVCCStore()
+		fsm := kv.NewKvFSM(st)
 
 		port := ports[i]
 		grpcSock := lis[i].grpc
@@ -351,7 +350,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, NewInternal(trx, r))
+		pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock()))
 
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)

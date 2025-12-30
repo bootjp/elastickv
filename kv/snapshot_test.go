@@ -12,9 +12,8 @@ import (
 )
 
 func TestSnapshot(t *testing.T) {
-	store := store3.NewMemoryStore()
-	txnStore := store3.NewMemoryStoreDefaultTTL()
-	fsm := NewKvFSM(store, txnStore)
+	store := store3.NewMVCCStore()
+	fsm := NewKvFSM(store)
 
 	mutation := pb.Request{
 		IsTxn: false,
@@ -47,9 +46,8 @@ func TestSnapshot(t *testing.T) {
 	snapshot, err := fsm.Snapshot()
 	assert.NoError(t, err)
 
-	store2 := store3.NewMemoryStore()
-	trxnStore2 := store3.NewMemoryStoreDefaultTTL()
-	fsm2 := NewKvFSM(store2, trxnStore2)
+	store2 := store3.NewMVCCStore()
+	fsm2 := NewKvFSM(store2)
 
 	kvFSMSnap, ok := snapshot.(*kvFSMSnapshot)
 	assert.True(t, ok)
