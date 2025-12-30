@@ -14,6 +14,7 @@ func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
 	return &Coordinate{
 		transactionManager: txm,
 		raft:               r,
+		clock:              NewHLC(),
 	}
 }
 
@@ -24,6 +25,7 @@ type CoordinateResponse struct {
 type Coordinate struct {
 	transactionManager Transactional
 	raft               *raft.Raft
+	clock              *HLC
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -39,8 +41,13 @@ func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 		return c.redirect(reqs)
 	}
 
+	if reqs.IsTxn && reqs.StartTS == 0 {
+		// Leader-only timestamp issuance to avoid divergence across shards.
+		reqs.StartTS = c.nextStartTS()
+	}
+
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems)
+		return c.dispatchTxn(reqs.Elems, reqs.StartTS)
 	}
 
 	return c.dispatchRaw(reqs.Elems)
@@ -56,10 +63,18 @@ func (c *Coordinate) RaftLeader() raft.ServerAddress {
 	return addr
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *Coordinate) Clock() *HLC {
+	return c.clock
+}
+
+func (c *Coordinate) nextStartTS() uint64 {
+	return c.clock.Next()
+}
+
+func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateResponse, error) {
 	var logs []*pb.Request
 	for _, req := range reqs {
-		m := c.toTxnRequests(req)
+		m := c.toTxnRequests(req, startTS)
 		logs = append(logs, m...)
 	}
 
@@ -96,6 +111,7 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
+			Ts:    c.clock.Next(),
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -109,6 +125,7 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
+			Ts:    c.clock.Next(),
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
@@ -121,16 +138,14 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 	panic("unreachable")
 }
 
-const defaultTxnLockTTLSeconds = uint64(30)
-
-func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
+func (c *Coordinate) toTxnRequests(req *Elem[OP], startTS uint64) []*pb.Request {
 	switch req.Op {
 	case Put:
 		return []*pb.Request{
 			{
 				IsTxn: true,
 				Phase: pb.Phase_PREPARE,
-				Ts:    defaultTxnLockTTLSeconds,
+				Ts:    startTS,
 				Mutations: []*pb.Mutation{
 					{
 						Key:   req.Key,
@@ -141,7 +156,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_COMMIT,
-				Ts:    defaultTxnLockTTLSeconds,
+				Ts:    startTS,
 				Mutations: []*pb.Mutation{
 					{
 						Key:   req.Key,
@@ -156,7 +171,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_PREPARE,
-				Ts:    defaultTxnLockTTLSeconds,
+				Ts:    startTS,
 				Mutations: []*pb.Mutation{
 					{
 						Key: req.Key,
@@ -166,7 +181,7 @@ func (c *Coordinate) toTxnRequests(req *Elem[OP]) []*pb.Request {
 			{
 				IsTxn: true,
 				Phase: pb.Phase_COMMIT,
-				Ts:    defaultTxnLockTTLSeconds,
+				Ts:    startTS,
 				Mutations: []*pb.Mutation{
 					{
 						Key: req.Key,
@@ -204,7 +219,7 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 	var requests []*pb.Request
 	if reqs.IsTxn {
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toTxnRequests(req)...)
+			requests = append(requests, c.toTxnRequests(req, reqs.StartTS)...)
 		}
 	} else {
 		for _, req := range reqs.Elems {

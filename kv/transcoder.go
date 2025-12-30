@@ -20,4 +20,7 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// StartTS is a logical timestamp captured at transaction begin.
+	// It is ignored for non-transactional groups.
+	StartTS uint64
 }

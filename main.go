@@ -53,9 +53,8 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	s := store.NewRbMemoryStore()
-	lockStore := store.NewMemoryStoreDefaultTTL()
-	kvFSM := kv.NewKvFSM(s, lockStore)
+	s := store.NewMVCCStore()
+	kvFSM := kv.NewKvFSM(s)
 
 	r, tm, err := NewRaft(ctx, *raftId, *myAddr, kvFSM)
 	if err != nil {
@@ -67,7 +66,7 @@ func main() {
 	coordinate := kv.NewCoordinator(trx, r)
 	pb.RegisterRawKVServer(gs, adapter.NewGRPCServer(s, coordinate))
 	pb.RegisterTransactionalKVServer(gs, adapter.NewGRPCServer(s, coordinate))
-	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, r))
+	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, r, coordinate.Clock()))
 	tm.Register(gs)
 
 	leaderhealth.Setup(r, gs, []string{"RawKV", "Example"})

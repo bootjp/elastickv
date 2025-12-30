@@ -81,9 +81,8 @@ func run(eg *errgroup.Group) error {
 	}
 
 	for i := 0; i < 3; i++ {
-		st := store.NewRbMemoryStore()
-		trxSt := store.NewMemoryStoreDefaultTTL()
-		fsm := kv.NewKvFSM(st, trxSt)
+		st := store.NewMVCCStore()
+		fsm := kv.NewKvFSM(st)
 
 		r, tm, err := newRaft(strconv.Itoa(i), grpcAdders[i], fsm, i == 0, cfg)
 		if err != nil {
@@ -97,7 +96,7 @@ func run(eg *errgroup.Group) error {
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, adapter.NewInternal(trx, r))
+		pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
 		leaderhealth.Setup(r, s, []string{"RawKV"})
 		raftadmin.Register(s, r)
 
