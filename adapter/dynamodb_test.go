@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDynamoDB_PutItem_GetItem(t *testing.T) {
@@ -248,7 +249,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 			})
 			assert.NoError(t, err, "Get failed for key1 in goroutine %d", i)
 			value1Attr, ok := out1.Item["value"].(*types.AttributeValueMemberS)
-			assert.True(t, ok, "Type assertion failed for key1 in goroutine %d", i)
+			require.True(t, ok, "Type assertion failed for key1 in goroutine %d", i)
 			assert.Equal(t, value1, value1Attr.Value, "Value mismatch for key1 in goroutine %d", i)
 
 			out2, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
@@ -259,7 +260,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 			})
 			assert.NoError(t, err, "Get failed for key2 in goroutine %d", i)
 			value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
-			assert.True(t, ok, "Type assertion failed for key2 in goroutine %d", i)
+			require.True(t, ok, "Type assertion failed for key2 in goroutine %d", i)
 			assert.Equal(t, value2, value2Attr.Value, "Value mismatch for key2 in goroutine %d", i)
 		}(i)
 	}

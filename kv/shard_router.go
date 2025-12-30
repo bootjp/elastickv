@@ -21,7 +21,7 @@ type ShardRouter struct {
 
 type routerGroup struct {
 	tm    Transactional
-	store store.Store
+	store store.MVCCStore
 }
 
 // NewShardRouter creates a new router.
@@ -33,7 +33,7 @@ func NewShardRouter(e *distribution.Engine) *ShardRouter {
 }
 
 // Register associates a raft group ID with its transactional manager and store.
-func (s *ShardRouter) Register(group uint64, tm Transactional, st store.Store) {
+func (s *ShardRouter) Register(group uint64, tm Transactional, st store.MVCCStore) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.groups[group] = &routerGroup{tm: tm, store: st}
@@ -115,7 +115,7 @@ func (s *ShardRouter) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", route.GroupID)
 	}
-	v, err := g.store.Get(ctx, key)
+	v, err := g.store.GetAt(ctx, key, ^uint64(0))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

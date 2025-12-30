@@ -35,18 +35,7 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 
-	// Ensure leader issues start_ts when followers forward txn groups without it.
-	if req.IsTxn {
-		var startTs uint64
-		for _, r := range req.Requests {
-			if r.Ts == 0 {
-				if startTs == 0 {
-					startTs = i.clock.Next()
-				}
-				r.Ts = startTs
-			}
-		}
-	}
+	i.stampTimestamps(req)
 
 	r, err := i.transactionManager.Commit(req.Requests)
 	if err != nil {
@@ -60,4 +49,28 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 		Success:     true,
 		CommitIndex: r.CommitIndex,
 	}, nil
+}
+
+func (i *Internal) stampTimestamps(req *pb.ForwardRequest) {
+	if req == nil {
+		return
+	}
+	if req.IsTxn {
+		var startTs uint64
+		for _, r := range req.Requests {
+			if r.Ts == 0 {
+				if startTs == 0 {
+					startTs = i.clock.Next()
+				}
+				r.Ts = startTs
+			}
+		}
+		return
+	}
+
+	for _, r := range req.Requests {
+		if r.Ts == 0 {
+			r.Ts = i.clock.Next()
+		}
+	}
 }

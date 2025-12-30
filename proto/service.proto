@@ -31,6 +31,7 @@ message RawPutResponse {
 
 message RawGetRequest {
   bytes key = 1;
+  uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
 }
 
 message RawGetResponse {
