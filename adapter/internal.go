@@ -37,9 +37,13 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 
 	// Ensure leader issues start_ts when followers forward txn groups without it.
 	if req.IsTxn {
+		var startTs uint64
 		for _, r := range req.Requests {
 			if r.Ts == 0 {
-				r.Ts = i.clock.Next()
+				if startTs == 0 {
+					startTs = i.clock.Next()
+				}
+				r.Ts = startTs
 			}
 		}
 	}
