@@ -123,6 +123,49 @@ func cloneKVPair(key, val []byte) *KVPair {
 	}
 }
 
+type iterEntry struct {
+	key      []byte
+	ok       bool
+	versions []VersionedValue
+	stageVal mvccTxnValue
+}
+
+func nextBaseEntry(it *treemap.Iterator, start, end []byte) iterEntry {
+	for it.Next() {
+		k, ok := it.Key().([]byte)
+		if !ok {
+			continue
+		}
+		if !withinBoundsKey(k, start, end) {
+			if end != nil && bytes.Compare(k, end) > 0 {
+				return iterEntry{}
+			}
+			continue
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		return iterEntry{key: k, ok: true, versions: versions}
+	}
+	return iterEntry{}
+}
+
+func nextStageEntry(it *treemap.Iterator, start, end []byte) iterEntry {
+	for it.Next() {
+		k, ok := it.Key().([]byte)
+		if !ok {
+			continue
+		}
+		if !withinBoundsKey(k, start, end) {
+			if end != nil && bytes.Compare(k, end) > 0 {
+				return iterEntry{}
+			}
+			continue
+		}
+		val, _ := it.Value().(mvccTxnValue)
+		return iterEntry{key: k, ok: true, stageVal: val}
+	}
+	return iterEntry{}
+}
+
 func (s *mvccStore) nextCommitTSLocked() uint64 {
 	return s.alignCommitTS(s.clock.Now())
 }
@@ -602,61 +645,6 @@ func (t *mvccTxn) PutWithTTL(_ context.Context, key []byte, value []byte, ttl in
 	return nil
 }
 
-func (t *mvccTxn) appendBaseRange(result []*KVPair, included map[string]struct{}, start []byte, end []byte, limit int, now uint64) []*KVPair {
-	t.s.tree.Each(func(key interface{}, value interface{}) {
-		if len(result) >= limit {
-			return
-		}
-		k, ok := key.([]byte)
-		if !ok || !withinBoundsKey(k, start, end) {
-			return
-		}
-
-		if staged, ok := t.stage.Get(k); ok {
-			sv, _ := staged.(mvccTxnValue)
-			if val, visible := visibleTxnValue(sv, now); visible {
-				result = append(result, cloneKVPair(k, val))
-				included[string(k)] = struct{}{}
-			}
-			return
-		}
-
-		versions, _ := value.([]VersionedValue)
-		val, ok := visibleValue(versions, now)
-		if !ok {
-			return
-		}
-		result = append(result, cloneKVPair(k, val))
-		included[string(k)] = struct{}{}
-	})
-
-	return result
-}
-
-func (t *mvccTxn) appendStageOnly(result []*KVPair, included map[string]struct{}, start []byte, end []byte, limit int, now uint64) []*KVPair {
-	t.stage.Each(func(key interface{}, value interface{}) {
-		if len(result) >= limit {
-			return
-		}
-		k, ok := key.([]byte)
-		if !ok || !withinBoundsKey(k, start, end) {
-			return
-		}
-		if _, ok := included[string(k)]; ok {
-			return
-		}
-		sv, _ := value.(mvccTxnValue)
-		val, visible := visibleTxnValue(sv, now)
-		if !visible {
-			return
-		}
-		result = append(result, cloneKVPair(k, val))
-		included[string(k)] = struct{}{}
-	})
-
-	return result
-}
-
 func (t *mvccTxn) Scan(_ context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
 	if limit <= 0 {
 		return []*KVPair{}, nil
@@ -672,15 +660,54 @@ func (t *mvccTxn) Scan(_ context.Context, start []byte, end []byte, limit int) (
 	}
 
 	result := make([]*KVPair, 0, capHint)
-	included := make(map[string]struct{})
 	now := t.s.clock.Now()
 
-	result = t.appendBaseRange(result, included, start, end, limit, now)
-	if len(result) < limit {
-		result = t.appendStageOnly(result, included, start, end, limit, now)
-	}
+	baseIt := t.s.tree.Iterator()
+	baseIt.Begin()
+	stageIt := t.stage.Iterator()
+	stageIt.Begin()
+
+	result = mergeTxnEntries(result, limit, start, end, now, &baseIt, &stageIt)
 
 	return result, nil
+}
+
+func mergeTxnEntries(result []*KVPair, limit int, start []byte, end []byte, now uint64, baseIt, stageIt *treemap.Iterator) []*KVPair {
+	baseNext := nextBaseEntry(baseIt, start, end)
+	stageNext := nextStageEntry(stageIt, start, end)
+
+	for len(result) < limit && (baseNext.ok || stageNext.ok) {
+		useStage := chooseStage(baseNext, stageNext)
+
+		if useStage {
+			k := stageNext.key
+			if val, visible := visibleTxnValue(stageNext.stageVal, now); visible {
+				result = append(result, cloneKVPair(k, val))
+			}
+			if baseNext.ok && bytes.Equal(baseNext.key, k) {
+				baseNext = nextBaseEntry(baseIt, start, end)
+			}
+			stageNext = nextStageEntry(stageIt, start, end)
+			continue
+		}
+
+		if val, ok := visibleValue(baseNext.versions, now); ok {
+			result = append(result, cloneKVPair(baseNext.key, val))
+		}
+		baseNext = nextBaseEntry(baseIt, start, end)
+	}
+
+	return result
+}
+
+func chooseStage(baseNext, stageNext iterEntry) bool {
+	if !baseNext.ok {
+		return stageNext.ok
+	}
+	if !stageNext.ok {
+		return false
+	}
+	return bytes.Compare(stageNext.key, baseNext.key) <= 0
 }
 
 // mvccSnapshotEntry is used solely for gob snapshot serialization.

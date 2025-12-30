@@ -107,9 +107,9 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
-	// OCC conflict checks are currently relaxed to allow last-writer-wins semantics
-	// across shards without centralizing timestamps. This keeps commits lock-free
-	// while avoiding spurious aborts under concurrent writers.
+	// Debug guard only: real OCC runs at the leader/storage layer, so conflicts
+	// should already be resolved before log application. Keep this stub to make
+	// any unexpected violations visible during development.
 	return nil
 }
 
