@@ -276,6 +276,12 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	for _, mut := range mutations {
+		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
+			return errors.Wrapf(ErrWriteConflict, "key: %s", string(mut.Key))
+		}
+	}
+
 	commitTS = s.alignCommitTS(commitTS)
 
 	for _, mut := range mutations {
