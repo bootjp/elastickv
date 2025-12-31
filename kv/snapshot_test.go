@@ -39,7 +39,7 @@ func TestSnapshot(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	v, err := store.Get(ctx, []byte("hoge"))
+	v, err := store.GetAt(ctx, []byte("hoge"), ^uint64(0))
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("fuga"), v)
 
@@ -56,7 +56,7 @@ func TestSnapshot(t *testing.T) {
 	err = fsm2.Restore(kvFSMSnap)
 	assert.NoError(t, err)
 
-	v, err = store2.Get(ctx, []byte("hoge"))
+	v, err = store2.GetAt(ctx, []byte("hoge"), ^uint64(0))
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("fuga"), v)
 

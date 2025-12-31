@@ -37,10 +37,9 @@ var argsLen = map[string]int{
 
 type RedisServer struct {
 	listen          net.Listener
-	store           store.ScanStore
+	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
-	listStore       *store.ListStore
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -72,15 +71,12 @@ type redisResult struct {
 	err     error
 }
 
-func store2list(st store.ScanStore) *store.ListStore { return store.NewListStore(st) }
-
-func NewRedisServer(listen net.Listener, store store.ScanStore, coordinate *kv.Coordinate, leaderRedis map[raft.ServerAddress]string) *RedisServer {
+func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate *kv.Coordinate, leaderRedis map[raft.ServerAddress]string) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
 		coordinator:     coordinate,
 		redisTranscoder: newRedisTranscoder(),
-		listStore:       store2list(store),
 		leaderRedis:     leaderRedis,
 	}
 
@@ -110,6 +106,10 @@ func getConnState(conn redcon.Conn) *connState {
 	st := &connState{}
 	conn.SetContext(st)
 	return st
+}
+
+func (r *RedisServer) readTS() uint64 {
+	return snapshotTS(r.coordinator.Clock(), r.store)
 }
 
 func (r *RedisServer) Run() error {
@@ -211,7 +211,8 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	if r.coordinator.IsLeader() {
-		v, err := r.store.Get(context.Background(), cmd.Args[1])
+		readTS := r.readTS()
+		v, err := r.store.GetAt(context.Background(), cmd.Args[1], readTS)
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrKeyNotFound):
@@ -276,7 +277,8 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ok, err := r.store.Exists(context.Background(), cmd.Args[1])
+	readTS := r.readTS()
+	ok, err := r.store.ExistsAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -325,7 +327,8 @@ func (r *RedisServer) localKeys(pattern []byte) ([][]byte, error) {
 }
 
 func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
-	res, err := r.store.Exists(context.Background(), pattern)
+	readTS := r.readTS()
+	res, err := r.store.ExistsAt(context.Background(), pattern, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -338,7 +341,8 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 	start := r.patternStart(pattern)
 
-	keys, err := r.store.Scan(context.Background(), start, nil, math.MaxInt)
+	readTS := r.readTS()
+	keys, err := r.store.ScanAt(context.Background(), start, nil, math.MaxInt, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -828,13 +832,24 @@ func clampRange(start, end, length int) (int, int) {
 }
 
 func (r *RedisServer) loadListMeta(ctx context.Context, key []byte) (store.ListMeta, bool, error) {
-	meta, exists, err := r.listStore.LoadMeta(ctx, key)
-	return meta, exists, errors.WithStack(err)
+	readTS := r.readTS()
+	val, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return store.ListMeta{}, false, nil
+		}
+		return store.ListMeta{}, false, errors.WithStack(err)
+	}
+	meta, err := store.UnmarshalListMeta(val)
+	if err != nil {
+		return store.ListMeta{}, false, errors.WithStack(err)
+	}
+	return meta, true, nil
 }
 
 func (r *RedisServer) isListKey(ctx context.Context, key []byte) (bool, error) {
-	isList, err := r.listStore.IsList(ctx, key)
-	return isList, errors.WithStack(err)
+	_, exists, err := r.loadListMeta(ctx, key)
+	return exists, err
 }
 
 func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
@@ -895,7 +910,8 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 	start := listItemKey(key, math.MinInt64)
 	end := listItemKey(key, math.MaxInt64)
 
-	kvs, err := r.store.Scan(ctx, start, end, math.MaxInt)
+	readTS := r.readTS()
+	kvs, err := r.store.ScanAt(ctx, start, end, math.MaxInt, readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -926,7 +942,8 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 	startKey := listItemKey(key, startSeq)
 	endKey := listItemKey(key, endSeq+1) // exclusive
 
-	kvs, err := r.store.Scan(ctx, startKey, endKey, int(endIdx-startIdx+1))
+	readTS := r.readTS()
+	kvs, err := r.store.ScanAt(ctx, startKey, endKey, int(endIdx-startIdx+1), readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1039,7 +1056,8 @@ func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, error) {
 	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+	ts := r.readTS()
+	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1048,8 +1066,9 @@ func (r *RedisServer) tryLeaderGet(key []byte) ([]byte, error) {
 }
 
 func (r *RedisServer) getValue(key []byte) ([]byte, error) {
+	readTS := r.readTS()
 	if r.coordinator.IsLeader() {
-		v, err := r.store.Get(context.Background(), key)
+		v, err := r.store.GetAt(context.Background(), key, readTS)
 		return v, errors.WithStack(err)
 	}
 	return r.tryLeaderGet(key)

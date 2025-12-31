@@ -26,13 +26,13 @@ const updateSplitCount = 2
 
 type DynamoDBServer struct {
 	listen           net.Listener
-	store            store.ScanStore
+	store            store.MVCCStore
 	coordinator      kv.Coordinator
 	dynamoTranscoder *dynamodbTranscoder
 	httpServer       *http.Server
 }
 
-func NewDynamoDBServer(listen net.Listener, st store.ScanStore, coordinate *kv.Coordinate) *DynamoDBServer {
+func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate *kv.Coordinate) *DynamoDBServer {
 	d := &DynamoDBServer{
 		listen:           listen,
 		store:            st,
@@ -114,7 +114,8 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	v, err := d.store.Get(r.Context(), []byte(keyAttr.S))
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	v, err := d.store.GetAt(r.Context(), []byte(keyAttr.S), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -233,7 +234,8 @@ func (d *DynamoDBServer) validateCondition(ctx context.Context, expr string, nam
 	if expr == "" {
 		return nil
 	}
-	exists, err := d.store.Exists(ctx, key)
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	exists, err := d.store.ExistsAt(ctx, key, readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}

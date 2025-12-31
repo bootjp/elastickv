@@ -22,13 +22,13 @@ type GRPCServer struct {
 	log            *slog.Logger
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
-	store          store.ScanStore
+	store          store.MVCCStore
 
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer {
+func NewGRPCServer(store store.MVCCStore, coordinate *kv.Coordinate) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
@@ -40,8 +40,13 @@ func NewGRPCServer(store store.ScanStore, coordinate *kv.Coordinate) *GRPCServer
 }
 
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	readTS := req.GetTs()
+	if readTS == 0 {
+		readTS = snapshotTS(r.coordinator.Clock(), r.store)
+	}
+
 	if r.coordinator.IsLeader() {
-		v, err := r.store.Get(ctx, req.Key)
+		v, err := r.store.GetAt(ctx, req.Key, readTS)
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrKeyNotFound):
@@ -93,7 +98,8 @@ func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
 	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+	ts := snapshotTS(r.coordinator.Clock(), r.store)
+	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -180,7 +186,8 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 		return nil, errors.WithStack(err)
 	}
 
-	v, err := r.store.Get(ctx, req.Key)
+	readTS := snapshotTS(r.coordinator.Clock(), r.store)
+	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrKeyNotFound):
@@ -227,7 +234,8 @@ func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResp
 			Kv: nil,
 		}, errors.WithStack(err)
 	}
-	res, err := r.store.Scan(ctx, req.StartKey, req.EndKey, limit)
+	readTS := snapshotTS(r.coordinator.Clock(), r.store)
+	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return &pb.ScanResponse{
 			Kv: nil,

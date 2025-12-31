@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/emirpasic/gods/maps/treemap"
@@ -25,9 +24,35 @@ type VersionedValue struct {
 }
 
 const (
-	hlcLogicalBits = 16
-	msPerSecond    = 1000
+	checksumSize = 4
 )
+
+// mvccSnapshot is used solely for gob snapshot serialization.
+type mvccSnapshot struct {
+	LastCommitTS uint64
+	Entries      []mvccSnapshotEntry
+}
+
+// mvccSnapshotEntry is used solely for gob snapshot serialization.
+type mvccSnapshotEntry struct {
+	Key      []byte
+	Versions []VersionedValue
+}
+
+func byteSliceComparator(a, b interface{}) int {
+	ab, okA := a.([]byte)
+	bb, okB := b.([]byte)
+	switch {
+	case okA && okB:
+		return bytes.Compare(ab, bb)
+	case okA:
+		return 1
+	case okB:
+		return -1
+	default:
+		return 0
+	}
+}
 
 func withinBoundsKey(k, start, end []byte) bool {
 	if start != nil && bytes.Compare(k, start) < 0 {
@@ -46,42 +71,41 @@ type mvccStore struct {
 	mtx          sync.RWMutex
 	log          *slog.Logger
 	lastCommitTS uint64
-	clock        HybridClock
+}
+
+// LastCommitTS exposes the latest commit timestamp for read snapshot selection.
+// It is intentionally not part of the public MVCCStore interface.
+func (s *mvccStore) LastCommitTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.lastCommitTS
+}
+
+// MVCCStoreOption configures the MVCCStore.
+type MVCCStoreOption func(*mvccStore)
+
+// WithLogger sets a custom logger for the store.
+func WithLogger(l *slog.Logger) MVCCStoreOption {
+	return func(s *mvccStore) {
+		s.log = l
+	}
 }
 
 // NewMVCCStore creates a new MVCC-enabled in-memory store.
-func NewMVCCStore() MVCCStore {
-	return NewMVCCStoreWithClock(defaultHLC{})
-}
-
-// NewMVCCStoreWithClock allows injecting a hybrid clock (for tests or cluster-wide clocks).
-func NewMVCCStoreWithClock(clock HybridClock) MVCCStore {
-	return &mvccStore{
+func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
+	s := &mvccStore{
 		tree: treemap.NewWith(byteSliceComparator),
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		clock: clock,
 	}
-}
-
-type defaultHLC struct{}
-
-func nonNegativeMillis() uint64 {
-	nowMs := time.Now().UnixMilli()
-	if nowMs < 0 {
-		return 0
+	for _, opt := range opts {
+		opt(s)
 	}
-	return uint64(nowMs)
-}
-
-func (defaultHLC) Now() uint64 {
-	return nonNegativeMillis() << hlcLogicalBits
+	return s
 }
 
 var _ MVCCStore = (*mvccStore)(nil)
-var _ ScanStore = (*mvccStore)(nil)
-var _ Store = (*mvccStore)(nil)
 
 // ---- helpers guarded by caller locks ----
 
@@ -104,70 +128,6 @@ func visibleValue(versions []VersionedValue, ts uint64) ([]byte, bool) {
 		return nil, false
 	}
 	return ver.Value, true
-}
-
-func visibleTxnValue(tv mvccTxnValue, now uint64) ([]byte, bool) {
-	if tv.tombstone {
-		return nil, false
-	}
-	if tv.expireAt != 0 && tv.expireAt <= now {
-		return nil, false
-	}
-	return tv.value, true
-}
-
-func cloneKVPair(key, val []byte) *KVPair {
-	return &KVPair{
-		Key:   bytes.Clone(key),
-		Value: bytes.Clone(val),
-	}
-}
-
-type iterEntry struct {
-	key      []byte
-	ok       bool
-	versions []VersionedValue
-	stageVal mvccTxnValue
-}
-
-func nextBaseEntry(it *treemap.Iterator, start, end []byte) iterEntry {
-	for it.Next() {
-		k, ok := it.Key().([]byte)
-		if !ok {
-			continue
-		}
-		if !withinBoundsKey(k, start, end) {
-			if end != nil && bytes.Compare(k, end) > 0 {
-				return iterEntry{}
-			}
-			continue
-		}
-		versions, _ := it.Value().([]VersionedValue)
-		return iterEntry{key: k, ok: true, versions: versions}
-	}
-	return iterEntry{}
-}
-
-func nextStageEntry(it *treemap.Iterator, start, end []byte) iterEntry {
-	for it.Next() {
-		k, ok := it.Key().([]byte)
-		if !ok {
-			continue
-		}
-		if !withinBoundsKey(k, start, end) {
-			if end != nil && bytes.Compare(k, end) > 0 {
-				return iterEntry{}
-			}
-			continue
-		}
-		val, _ := it.Value().(mvccTxnValue)
-		return iterEntry{key: k, ok: true, stageVal: val}
-	}
-	return iterEntry{}
-}
-
-func (s *mvccStore) nextCommitTSLocked() uint64 {
-	return s.alignCommitTS(s.clock.Now())
 }
 
 func (s *mvccStore) putVersionLocked(key, value []byte, commitTS, expireAt uint64) {
@@ -200,30 +160,39 @@ func (s *mvccStore) deleteVersionLocked(key []byte, commitTS uint64) {
 	s.tree.Put(bytes.Clone(key), versions)
 }
 
-func (s *mvccStore) ttlExpireAt(ttl int64) uint64 {
-	now := s.readTS()
-	if ttl <= 0 {
-		return now
-	}
-	// ttl is seconds; convert to milliseconds then shift to HLC layout.
-	deltaMs := uint64(ttl) * msPerSecond
-	return now + (deltaMs << hlcLogicalBits)
+func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	commitTS = s.alignCommitTS(commitTS)
+	s.putVersionLocked(key, value, commitTS, expireAt)
+	s.log.InfoContext(ctx, "put_at",
+		slog.String("key", string(key)),
+		slog.String("value", string(value)),
+		slog.Uint64("commit_ts", commitTS),
+	)
+	return nil
+}
+
+func (s *mvccStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	commitTS = s.alignCommitTS(commitTS)
+	s.deleteVersionLocked(key, commitTS)
+	s.log.InfoContext(ctx, "delete_at",
+		slog.String("key", string(key)),
+		slog.Uint64("commit_ts", commitTS),
+	)
+	return nil
 }
 
 func (s *mvccStore) readTS() uint64 {
-	now := s.clock.Now()
-	if now < s.lastCommitTS {
-		return s.lastCommitTS
-	}
-	return now
+	return s.lastCommitTS
 }
 
 func (s *mvccStore) alignCommitTS(commitTS uint64) uint64 {
 	ts := commitTS
-	read := s.readTS()
-	if ts < read {
-		ts = read
-	}
 	if ts <= s.lastCommitTS {
 		ts = s.lastCommitTS + 1
 	}
@@ -259,6 +228,66 @@ func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, e
 		return nil, ErrKeyNotFound
 	}
 	return bytes.Clone(ver.Value), nil
+}
+
+func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	v, ok := s.tree.Get(key)
+	if !ok {
+		return false, nil
+	}
+	versions, _ := v.([]VersionedValue)
+	if len(versions) == 0 {
+		return false, nil
+	}
+	ver, ok := latestVisible(versions, ts)
+	if !ok || ver.Tombstone {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	if limit <= 0 {
+		return []*KVPair{}, nil
+	}
+
+	capHint := limit
+	if size := s.tree.Size(); size < capHint {
+		capHint = size
+	}
+	if capHint < 0 {
+		capHint = 0
+	}
+
+	result := make([]*KVPair, 0, capHint)
+	s.tree.Each(func(key interface{}, value interface{}) {
+		if len(result) >= limit {
+			return
+		}
+		k, ok := key.([]byte)
+		if !ok || !withinBoundsKey(k, start, end) {
+			return
+		}
+
+		versions, _ := value.([]VersionedValue)
+		val, ok := visibleValue(versions, ts)
+		if !ok {
+			return
+		}
+
+		result = append(result, &KVPair{
+			Key:   bytes.Clone(k),
+			Value: bytes.Clone(val),
+		})
+	})
+
+	return result, nil
 }
 
 func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
@@ -305,85 +334,14 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 
 // ---- Store / ScanStore methods ----
 
-func (s *mvccStore) Get(_ context.Context, key []byte) ([]byte, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	now := s.readTS()
-
-	v, ok := s.tree.Get(key)
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-	versions, _ := v.([]VersionedValue)
-	val, ok := visibleValue(versions, now)
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-	return bytes.Clone(val), nil
+func (s *mvccStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	return s.PutAt(ctx, key, value, commitTS, expireAt)
 }
 
-func (s *mvccStore) Put(ctx context.Context, key []byte, value []byte) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	s.putVersionLocked(key, value, s.nextCommitTSLocked(), 0)
-	s.log.InfoContext(ctx, "put",
-		slog.String("key", string(key)),
-		slog.String("value", string(value)),
-	)
-	return nil
-}
-
-func (s *mvccStore) PutWithTTL(ctx context.Context, key []byte, value []byte, ttl int64) error {
+func (s *mvccStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	exp := s.ttlExpireAt(ttl)
-	s.putVersionLocked(key, value, s.nextCommitTSLocked(), exp)
-	s.log.InfoContext(ctx, "put_ttl",
-		slog.String("key", string(key)),
-		slog.String("value", string(value)),
-		slog.Int64("ttl_sec", ttl),
-	)
-	return nil
-}
-
-func (s *mvccStore) Delete(ctx context.Context, key []byte) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	s.deleteVersionLocked(key, s.nextCommitTSLocked())
-	s.log.InfoContext(ctx, "delete",
-		slog.String("key", string(key)),
-	)
-	return nil
-}
-
-func (s *mvccStore) Exists(_ context.Context, key []byte) (bool, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	now := s.readTS()
-
-	v, ok := s.tree.Get(key)
-	if !ok {
-		return false, nil
-	}
-	versions, _ := v.([]VersionedValue)
-	if len(versions) == 0 {
-		return false, nil
-	}
-	ver, ok := latestVisible(versions, now)
-	if !ok {
-		return false, nil
-	}
-	return !ver.Tombstone, nil
-}
-
-func (s *mvccStore) Expire(ctx context.Context, key []byte, ttl int64) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
-	now := s.clock.Now()
 	v, ok := s.tree.Get(key)
 	if !ok {
 		return ErrKeyNotFound
@@ -393,106 +351,27 @@ func (s *mvccStore) Expire(ctx context.Context, key []byte, ttl int64) error {
 		return ErrKeyNotFound
 	}
 	ver := versions[len(versions)-1]
-	if ver.Tombstone || (ver.ExpireAt != 0 && ver.ExpireAt <= now) {
+	if ver.Tombstone || (ver.ExpireAt != 0 && ver.ExpireAt <= commitTS) {
 		return ErrKeyNotFound
 	}
 
-	exp := s.ttlExpireAt(ttl)
-	s.putVersionLocked(key, ver.Value, s.nextCommitTSLocked(), exp)
+	s.putVersionLocked(key, ver.Value, s.alignCommitTS(commitTS), expireAt)
 	s.log.InfoContext(ctx, "expire",
 		slog.String("key", string(key)),
-		slog.Int64("ttl_sec", ttl),
+		slog.Uint64("expire_at", expireAt),
 	)
 	return nil
 }
 
 func (s *mvccStore) Scan(_ context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	if limit <= 0 {
-		return []*KVPair{}, nil
-	}
-
-	now := s.readTS()
-
-	capHint := limit
-	if size := s.tree.Size(); size < capHint {
-		capHint = size
-	}
-	if capHint < 0 {
-		capHint = 0
-	}
-
-	result := make([]*KVPair, 0, capHint)
-	s.tree.Each(func(key interface{}, value interface{}) {
-		if len(result) >= limit {
-			return
-		}
-		k, ok := key.([]byte)
-		if !ok || !withinBoundsKey(k, start, end) {
-			return
-		}
-
-		versions, _ := value.([]VersionedValue)
-		val, ok := visibleValue(versions, now)
-		if !ok {
-			return
-		}
-
-		result = append(result, &KVPair{
-			Key:   bytes.Clone(k),
-			Value: bytes.Clone(val),
-		})
-	})
-
-	return result, nil
-}
-
-func (s *mvccStore) Txn(ctx context.Context, f func(ctx context.Context, txn Txn) error) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
-	txn := &mvccTxn{
-		stage: treemap.NewWith(byteSliceComparator),
-		ops:   []mvccOp{},
-		s:     s,
-	}
-
-	if err := f(ctx, txn); err != nil {
-		return errors.WithStack(err)
-	}
-
-	commitTS := s.nextCommitTSLocked()
-	for _, op := range txn.ops {
-		switch op.opType {
-		case OpTypePut:
-			s.putVersionLocked(op.key, op.value, commitTS, op.expireAt)
-		case OpTypeDelete:
-			s.deleteVersionLocked(op.key, commitTS)
-		default:
-			return errors.WithStack(ErrUnknownOp)
-		}
-	}
-
-	return nil
-}
-
-func (s *mvccStore) TxnWithTTL(ctx context.Context, f func(ctx context.Context, txn TTLTxn) error) error {
-	return s.Txn(ctx, func(ctx context.Context, txn Txn) error {
-		tt, ok := txn.(*mvccTxn)
-		if !ok {
-			return ErrNotSupported
-		}
-		return f(ctx, tt)
-	})
+	return s.ScanAt(context.Background(), start, end, limit, s.readTS())
 }
 
 func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	state := make([]mvccSnapshotEntry, 0, s.tree.Size())
+	entries := make([]mvccSnapshotEntry, 0, s.tree.Size())
 	s.tree.Each(func(key interface{}, value interface{}) {
 		k, ok := key.([]byte)
 		if !ok {
@@ -502,14 +381,19 @@ func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 		if !ok {
 			return
 		}
-		state = append(state, mvccSnapshotEntry{
+		entries = append(entries, mvccSnapshotEntry{
 			Key:      bytes.Clone(k),
 			Versions: append([]VersionedValue(nil), versions...),
 		})
 	})
 
+	snapshot := mvccSnapshot{
+		LastCommitTS: s.lastCommitTS,
+		Entries:      entries,
+	}
+
 	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(state); err != nil {
+	if err := gob.NewEncoder(buf).Encode(snapshot); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -535,8 +419,8 @@ func (s *mvccStore) Restore(r io.Reader) error {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
 
-	var state []mvccSnapshotEntry
-	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&state); err != nil {
+	var snapshot mvccSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&snapshot); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -544,180 +428,82 @@ func (s *mvccStore) Restore(r io.Reader) error {
 	defer s.mtx.Unlock()
 
 	s.tree.Clear()
-	for _, entry := range state {
+	s.lastCommitTS = snapshot.LastCommitTS
+	for _, entry := range snapshot.Entries {
 		versions := append([]VersionedValue(nil), entry.Versions...)
 		s.tree.Put(bytes.Clone(entry.Key), versions)
-		if len(versions) > 0 {
-			last := versions[len(versions)-1].TS
-			if last > s.lastCommitTS {
-				s.lastCommitTS = last
-			}
+	}
+
+	return nil
+}
+
+func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+	if len(versions) == 0 {
+		return versions, false
+	}
+
+	// Find the latest version that is <= minTS
+	keepIdx := -1
+	for i := len(versions) - 1; i >= 0; i-- {
+		if versions[i].TS <= minTS {
+			keepIdx = i
+			break
 		}
 	}
 
+	// If all versions are newer than minTS, keep everything
+	if keepIdx == -1 {
+		return versions, false
+	}
+
+	// If the oldest version is the one to keep, we can't remove anything before it
+	if keepIdx == 0 {
+		return versions, false
+	}
+
+	// We keep versions starting from keepIdx
+	// The version at keepIdx represents the state at minTS.
+	newVersions := make([]VersionedValue, len(versions)-keepIdx)
+	copy(newVersions, versions[keepIdx:])
+	return newVersions, true
+}
+
+func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	// Estimate size to avoid frequent allocations, though exact count is unknown
+	updates := make(map[string][]VersionedValue)
+
+	it := s.tree.Iterator()
+	for it.Next() {
+		versions, ok := it.Value().([]VersionedValue)
+		if !ok {
+			continue
+		}
+
+		newVersions, changed := compactVersions(versions, minTS)
+		if changed {
+			// tree keys are []byte, need string for map key
+			keyBytes, ok := it.Key().([]byte)
+			if !ok {
+				continue
+			}
+			updates[string(keyBytes)] = newVersions
+		}
+	}
+
+	for k, v := range updates {
+		s.tree.Put([]byte(k), v)
+	}
+
+	s.log.InfoContext(ctx, "compact",
+		slog.Uint64("min_ts", minTS),
+		slog.Int("updated_keys", len(updates)),
+	)
 	return nil
 }
 
 func (s *mvccStore) Close() error {
 	return nil
-}
-
-// ---- transactional staging ----
-
-type mvccOp struct {
-	opType   OpType
-	key      []byte
-	value    []byte
-	expireAt uint64
-}
-
-type mvccTxn struct {
-	stage *treemap.Map // key []byte -> mvccTxnValue
-	ops   []mvccOp
-	s     *mvccStore
-}
-
-type mvccTxnValue struct {
-	value     []byte
-	tombstone bool
-	expireAt  uint64
-}
-
-func (t *mvccTxn) Get(_ context.Context, key []byte) ([]byte, error) {
-	if v, ok := t.stage.Get(key); ok {
-		tv, _ := v.(mvccTxnValue)
-		if tv.tombstone {
-			return nil, ErrKeyNotFound
-		}
-		if tv.expireAt != 0 && tv.expireAt <= t.s.clock.Now() {
-			return nil, ErrKeyNotFound
-		}
-		return bytes.Clone(tv.value), nil
-	}
-
-	return t.s.Get(context.Background(), key)
-}
-
-func (t *mvccTxn) Put(_ context.Context, key []byte, value []byte) error {
-	t.stage.Put(key, mvccTxnValue{value: bytes.Clone(value)})
-	t.ops = append(t.ops, mvccOp{opType: OpTypePut, key: bytes.Clone(key), value: bytes.Clone(value)})
-	return nil
-}
-
-func (t *mvccTxn) Delete(_ context.Context, key []byte) error {
-	t.stage.Put(key, mvccTxnValue{tombstone: true})
-	t.ops = append(t.ops, mvccOp{opType: OpTypeDelete, key: bytes.Clone(key)})
-	return nil
-}
-
-func (t *mvccTxn) Exists(_ context.Context, key []byte) (bool, error) {
-	if v, ok := t.stage.Get(key); ok {
-		tv, _ := v.(mvccTxnValue)
-		if tv.expireAt != 0 && tv.expireAt <= t.s.clock.Now() {
-			return false, nil
-		}
-		return !tv.tombstone, nil
-	}
-	return t.s.Exists(context.Background(), key)
-}
-
-func (t *mvccTxn) Expire(_ context.Context, key []byte, ttl int64) error {
-	exp := t.s.ttlExpireAt(ttl)
-
-	if v, ok := t.stage.Get(key); ok {
-		tv, _ := v.(mvccTxnValue)
-		if tv.tombstone {
-			return ErrKeyNotFound
-		}
-		tv.expireAt = exp
-		t.stage.Put(key, tv)
-		t.ops = append(t.ops, mvccOp{opType: OpTypePut, key: bytes.Clone(key), value: bytes.Clone(tv.value), expireAt: exp})
-		return nil
-	}
-
-	val, err := t.s.Get(context.Background(), key)
-	if err != nil {
-		return err
-	}
-	t.stage.Put(key, mvccTxnValue{value: bytes.Clone(val), expireAt: exp})
-	t.ops = append(t.ops, mvccOp{opType: OpTypePut, key: bytes.Clone(key), value: bytes.Clone(val), expireAt: exp})
-	return nil
-}
-
-func (t *mvccTxn) PutWithTTL(_ context.Context, key []byte, value []byte, ttl int64) error {
-	exp := t.s.ttlExpireAt(ttl)
-	t.stage.Put(key, mvccTxnValue{value: bytes.Clone(value), expireAt: exp})
-	t.ops = append(t.ops, mvccOp{opType: OpTypePut, key: bytes.Clone(key), value: bytes.Clone(value), expireAt: exp})
-	return nil
-}
-
-func (t *mvccTxn) Scan(_ context.Context, start []byte, end []byte, limit int) ([]*KVPair, error) {
-	if limit <= 0 {
-		return []*KVPair{}, nil
-	}
-
-	totalSize := t.s.tree.Size() + t.stage.Size()
-	capHint := limit
-	if totalSize < capHint {
-		capHint = totalSize
-	}
-	if capHint < 0 {
-		capHint = 0
-	}
-
-	result := make([]*KVPair, 0, capHint)
-	now := t.s.clock.Now()
-
-	baseIt := t.s.tree.Iterator()
-	baseIt.Begin()
-	stageIt := t.stage.Iterator()
-	stageIt.Begin()
-
-	result = mergeTxnEntries(result, limit, start, end, now, &baseIt, &stageIt)
-
-	return result, nil
-}
-
-func mergeTxnEntries(result []*KVPair, limit int, start []byte, end []byte, now uint64, baseIt, stageIt *treemap.Iterator) []*KVPair {
-	baseNext := nextBaseEntry(baseIt, start, end)
-	stageNext := nextStageEntry(stageIt, start, end)
-
-	for len(result) < limit && (baseNext.ok || stageNext.ok) {
-		useStage := chooseStage(baseNext, stageNext)
-
-		if useStage {
-			k := stageNext.key
-			if val, visible := visibleTxnValue(stageNext.stageVal, now); visible {
-				result = append(result, cloneKVPair(k, val))
-			}
-			if baseNext.ok && bytes.Equal(baseNext.key, k) {
-				baseNext = nextBaseEntry(baseIt, start, end)
-			}
-			stageNext = nextStageEntry(stageIt, start, end)
-			continue
-		}
-
-		if val, ok := visibleValue(baseNext.versions, now); ok {
-			result = append(result, cloneKVPair(baseNext.key, val))
-		}
-		baseNext = nextBaseEntry(baseIt, start, end)
-	}
-
-	return result
-}
-
-func chooseStage(baseNext, stageNext iterEntry) bool {
-	if !baseNext.ok {
-		return stageNext.ok
-	}
-	if !stageNext.ok {
-		return false
-	}
-	return bytes.Compare(stageNext.key, baseNext.key) <= 0
-}
-
-// mvccSnapshotEntry is used solely for gob snapshot serialization.
-type mvccSnapshotEntry struct {
-	Key      []byte
-	Versions []VersionedValue
 }

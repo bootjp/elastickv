@@ -34,6 +34,7 @@ type Coordinator interface {
 	Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
 	RaftLeader() raft.ServerAddress
+	Clock() *HLC
 }
 
 func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {

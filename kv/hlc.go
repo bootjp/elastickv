@@ -2,7 +2,7 @@ package kv
 
 import (
 	"math"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,9 +21,8 @@ const hlcLogicalMask uint64 = (1 << hlcLogicalBits) - 1
 // synchronized; it avoids dependence on per-raft commit indices that diverge
 // between shards.
 type HLC struct {
-	mu       sync.Mutex
-	lastWall int64
-	logical  uint16
+	// last holds the last issued timestamp in the same layout (ms<<bits | logical).
+	last atomic.Uint64
 }
 
 func nonNegativeUint64(v int64) uint64 {
@@ -54,37 +53,47 @@ func NewHLC() *HLC {
 
 // Next returns the next hybrid logical timestamp.
 func (h *HLC) Next() uint64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	for {
+		prev := h.last.Load()
+		wallPart := prev >> hlcLogicalBits
+		logicalPart := prev & hlcLogicalMask
+		prevWall := clampUint64ToInt64(wallPart)
+		prevLogical := clampUint64ToUint16(logicalPart)
 
-	now := time.Now().UnixMilli()
-	if now > h.lastWall {
-		h.lastWall = now
-		h.logical = 0
-	} else {
-		h.logical++
-		if h.logical == 0 { // overflow; bump wall to keep monotonicity
-			h.lastWall++
+		nowMs := time.Now().UnixMilli()
+		newWall := nowMs
+		newLogical := uint16(0)
+
+		if nowMs <= prevWall {
+			newWall = prevWall
+			newLogical = prevLogical + 1
+			if newLogical == 0 { // overflow
+				newWall++
+			}
+		}
+
+		next := (nonNegativeUint64(newWall) << hlcLogicalBits) | uint64(newLogical)
+		if h.last.CompareAndSwap(prev, next) {
+			return next
 		}
 	}
+}
 
-	wall := nonNegativeUint64(h.lastWall)
-	return (wall << hlcLogicalBits) | uint64(h.logical)
+// Current returns the last issued or observed HLC value without advancing it.
+// If no timestamp has been generated yet, it returns 0.
+func (h *HLC) Current() uint64 {
+	return h.last.Load()
 }
 
 // Observe bumps the local clock if a higher timestamp is seen.
 func (h *HLC) Observe(ts uint64) {
-	wallPart := ts >> hlcLogicalBits
-	logicalPart := ts & hlcLogicalMask
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	wall := clampUint64ToInt64(wallPart)
-	logical := clampUint64ToUint16(logicalPart)
-
-	if wall > h.lastWall || (wall == h.lastWall && logical > h.logical) {
-		h.lastWall = wall
-		h.logical = logical
+	for {
+		prev := h.last.Load()
+		if ts <= prev {
+			return
+		}
+		if h.last.CompareAndSwap(prev, ts) {
+			return
+		}
 	}
 }

@@ -35,18 +35,7 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 
-	// Ensure leader issues start_ts when followers forward txn groups without it.
-	if req.IsTxn {
-		var startTs uint64
-		for _, r := range req.Requests {
-			if r.Ts == 0 {
-				if startTs == 0 {
-					startTs = i.clock.Next()
-				}
-				r.Ts = startTs
-			}
-		}
-	}
+	i.stampTimestamps(req)
 
 	r, err := i.transactionManager.Commit(req.Requests)
 	if err != nil {
@@ -60,4 +49,37 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 		Success:     true,
 		CommitIndex: r.CommitIndex,
 	}, nil
+}
+
+func (i *Internal) stampTimestamps(req *pb.ForwardRequest) {
+	if req == nil {
+		return
+	}
+	if req.IsTxn {
+		var startTs uint64
+		// All requests in a transaction must have the same timestamp.
+		// Find a timestamp from the requests, or generate a new one if none exist.
+		for _, r := range req.Requests {
+			if r.Ts != 0 {
+				startTs = r.Ts
+				break
+			}
+		}
+
+		if startTs == 0 && len(req.Requests) > 0 {
+			startTs = i.clock.Next()
+		}
+
+		// Assign the unified timestamp to all requests in the transaction.
+		for _, r := range req.Requests {
+			r.Ts = startTs
+		}
+		return
+	}
+
+	for _, r := range req.Requests {
+		if r.Ts == 0 {
+			r.Ts = i.clock.Next()
+		}
+	}
 }
