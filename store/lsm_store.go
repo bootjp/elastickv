@@ -176,7 +176,9 @@ func (s *pebbleStore) updateLastCommitTS(ts uint64) {
 	if ts > s.lastCommitTS {
 		s.lastCommitTS = ts
 		// Best effort persist
-		_ = s.saveLastCommitTS(ts)
+		if err := s.saveLastCommitTS(ts); err != nil {
+			s.log.Error("failed to persist last commit timestamp", slog.Any("error", err))
+		}
 	}
 }
 
@@ -262,75 +264,82 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	return val != nil, nil
 }
 
-func (s *pebbleStore) scanProcessKey(iter *pebble.Iterator, ts uint64, lastUserKey *[]byte) (*KVPair, bool) {
+func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
+	if currentVersion <= ts {
+		return true
+	}
+	seekKey := encodeKey(userKey, ts)
+	if !iter.SeekGE(seekKey) {
+		return false
+	}
 	k := iter.Key()
-	userKey, version := decodeKey(k)
-
-	if bytes.Equal(userKey, *lastUserKey) {
-		iter.Next()
-		return nil, true // continue loop
-	}
-
-	if version <= ts {
-		valBytes := iter.Value()
-		sv, err := decodeValue(valBytes)
-		if err != nil {
-			s.log.Error("failed to decode value", slog.Any("error", err), slog.String("key", string(k)))
-			iter.Next()
-			return nil, true // continue loop
-		}
-
-		*lastUserKey = append([]byte(nil), userKey...)
-
-		if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
-			iter.Next()
-			return &KVPair{
-				Key:   userKey,
-				Value: sv.Value,
-			}, false
-		}
-		iter.Next()
-		return nil, false // processed but filtered out
-	}
-
-	return nil, false // Need seek
+	currentUserKey, _ := decodeKey(k)
+	return bytes.Equal(currentUserKey, userKey)
 }
 
-func (s *pebbleStore) seekNextVersion(iter *pebble.Iterator, userKey []byte, ts uint64) bool {
-	target := encodeKey(userKey, ts)
-	return iter.SeekGE(target)
+func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
+	valBytes := iter.Value()
+	sv, err := decodeValue(valBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
+		return &KVPair{
+			Key:   userKey,
+			Value: sv.Value,
+		}, nil
+	}
+	return nil, nil
 }
 
-func (s *pebbleStore) scanLoop(iter *pebble.Iterator, end []byte, limit int, ts uint64) []*KVPair {
+func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
+	if !iter.SeekGE(encodeKey(userKey, 0)) {
+		return false
+	}
+	k := iter.Key()
+	u, _ := decodeKey(k)
+	if bytes.Equal(u, userKey) {
+		return iter.Next()
+	}
+	return true
+}
+
+func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, limit)
-	var lastUserKey []byte
 
-	for iter.Valid() {
+	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid(); {
 		if len(result) >= limit {
 			break
 		}
 
 		k := iter.Key()
-		userKey, _ := decodeKey(k)
+		userKey, version := decodeKey(k)
 
 		if end != nil && bytes.Compare(userKey, end) > 0 {
 			break
 		}
 
-		kv, cont := s.scanProcessKey(iter, ts, &lastUserKey)
-		if kv != nil {
-			result = append(result, kv)
-		}
-		if cont {
+		// Find the correct version for userKey
+		if !s.seekToVisibleVersion(iter, userKey, version, ts) {
 			continue
 		}
 
-		// Seek forward
-		if !s.seekNextVersion(iter, userKey, ts) {
-			break
+		// Now iter is at the latest visible version for userKey.
+		kv, err := s.processFoundValue(iter, userKey, ts)
+		if err != nil {
+			return nil, err
+		}
+		if kv != nil {
+			result = append(result, kv)
+		}
+
+		// Move to the next user key.
+		if !s.skipToNextUserKey(iter, userKey) {
+			break // No more keys
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
@@ -346,10 +355,7 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 	}
 	defer iter.Close()
 
-	// We want to scan keys >= start.
-	iter.SeekGE(encodeKey(start, math.MaxUint64))
-
-	return s.scanLoop(iter, end, limit, ts), nil
+	return s.collectScanResults(iter, start, end, limit, ts)
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
