@@ -481,13 +481,12 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 }
 
 func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
-	// Real Compaction in LSM is hard to trigger precisely for MVCC GC.
-	// We can set a CompactionFilter in Options that drops keys with TS < minTS
-	// IF there is a newer version > minTS.
-	// But Options are set at Open.
-	// Updating options dynamically is not fully supported for CompactionFilter in standard Pebble API simply.
-	// However, we can use DeleteRange for VERY old data if we knew the keys.
-	// For this assignment, we will simply log.
+	// TODO: Implement MVCC garbage collection.
+	// We should iterate through all keys and remove versions older than minTS,
+	// keeping at least one version <= minTS for snapshot consistency.
+	// This is a heavy operation and should be done in the background or using
+	// a Pebble CompactionFilter if possible.
+	// For now, we simply log the request.
 	s.log.Info("Compact requested", slog.Uint64("minTS", minTS))
 	return nil
 }
@@ -514,7 +513,7 @@ func (s *pebbleStore) Snapshot() (io.ReadWriter, error) {
 
 	buf := &bytes.Buffer{}
 
-	// Format: [LastCommitTS] [Count] [KeyLen] [Key] [ValLen] [Val] ...
+	// Format: [LastCommitTS] [KeyLen] [Key] [ValLen] [Val] ...
 
 	// We need to persist s.lastCommitTS too.
 
