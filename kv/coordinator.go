@@ -33,6 +33,7 @@ var _ Coordinator = (*Coordinate)(nil)
 type Coordinator interface {
 	Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
+	VerifyLeader() error
 	RaftLeader() raft.ServerAddress
 	Clock() *HLC
 }
@@ -56,6 +57,10 @@ func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 
 func (c *Coordinate) IsLeader() bool {
 	return c.raft.State() == raft.Leader
+}
+
+func (c *Coordinate) VerifyLeader() error {
+	return errors.WithStack(c.raft.VerifyLeader().Error())
 }
 
 // RaftLeader returns the current leader's address as known by this node.
