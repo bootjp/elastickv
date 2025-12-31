@@ -273,7 +273,12 @@ func (s *pebbleStore) scanProcessKey(iter *pebble.Iterator, ts uint64, lastUserK
 
 	if version <= ts {
 		valBytes := iter.Value()
-		sv, _ := decodeValue(valBytes)
+		sv, err := decodeValue(valBytes)
+		if err != nil {
+			s.log.Error("failed to decode value", slog.Any("error", err), slog.String("key", string(k)))
+			iter.Next()
+			return nil, true // continue loop
+		}
 
 		*lastUserKey = append([]byte(nil), userKey...)
 
