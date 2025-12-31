@@ -61,6 +61,8 @@ type MVCCStore interface {
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
+	// Compact removes versions older than minTS that are no longer needed.
+	Compact(ctx context.Context, minTS uint64) error
 	Snapshot() (io.ReadWriter, error)
 	Restore(buf io.Reader) error
 	Close() error
