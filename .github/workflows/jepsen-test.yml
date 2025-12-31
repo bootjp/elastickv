@@ -29,20 +29,25 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
+      - name: Pre-fetch Go modules
+        run: |
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          GOPATH=$(go env GOPATH)
+          export GOCACHE GOTMPDIR=/tmp/go-tmp
+          go mod download
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
       - name: Launch demo cluster
-        env:
-          GOTMPDIR: /tmp/go-tmp
         run: |
           set -euo pipefail
-          mkdir -p "$GOCACHE" "$GOTMPDIR"
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          export GOTMPDIR=/tmp/go-tmp
           nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
 
           echo "Waiting for redis listeners on 63791-63793..."
-          for i in {1..45}; do
+          for i in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793; then
               echo "Cluster is up"
               exit 0
