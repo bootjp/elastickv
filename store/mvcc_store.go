@@ -27,6 +27,18 @@ const (
 	checksumSize = 4
 )
 
+// mvccSnapshot is used solely for gob snapshot serialization.
+type mvccSnapshot struct {
+	LastCommitTS uint64
+	Entries      []mvccSnapshotEntry
+}
+
+// mvccSnapshotEntry is used solely for gob snapshot serialization.
+type mvccSnapshotEntry struct {
+	Key      []byte
+	Versions []VersionedValue
+}
+
 func byteSliceComparator(a, b interface{}) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
@@ -69,14 +81,28 @@ func (s *mvccStore) LastCommitTS() uint64 {
 	return s.lastCommitTS
 }
 
+// MVCCStoreOption configures the MVCCStore.
+type MVCCStoreOption func(*mvccStore)
+
+// WithLogger sets a custom logger for the store.
+func WithLogger(l *slog.Logger) MVCCStoreOption {
+	return func(s *mvccStore) {
+		s.log = l
+	}
+}
+
 // NewMVCCStore creates a new MVCC-enabled in-memory store.
-func NewMVCCStore() MVCCStore {
-	return &mvccStore{
+func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
+	s := &mvccStore{
 		tree: treemap.NewWith(byteSliceComparator),
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 var _ MVCCStore = (*mvccStore)(nil)
@@ -345,7 +371,7 @@ func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	state := make([]mvccSnapshotEntry, 0, s.tree.Size())
+	entries := make([]mvccSnapshotEntry, 0, s.tree.Size())
 	s.tree.Each(func(key interface{}, value interface{}) {
 		k, ok := key.([]byte)
 		if !ok {
@@ -355,14 +381,19 @@ func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 		if !ok {
 			return
 		}
-		state = append(state, mvccSnapshotEntry{
+		entries = append(entries, mvccSnapshotEntry{
 			Key:      bytes.Clone(k),
 			Versions: append([]VersionedValue(nil), versions...),
 		})
 	})
 
+	snapshot := mvccSnapshot{
+		LastCommitTS: s.lastCommitTS,
+		Entries:      entries,
+	}
+
 	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(state); err != nil {
+	if err := gob.NewEncoder(buf).Encode(snapshot); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -388,8 +419,8 @@ func (s *mvccStore) Restore(r io.Reader) error {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
 
-	var state []mvccSnapshotEntry
-	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&state); err != nil {
+	var snapshot mvccSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&snapshot); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -397,26 +428,82 @@ func (s *mvccStore) Restore(r io.Reader) error {
 	defer s.mtx.Unlock()
 
 	s.tree.Clear()
-	for _, entry := range state {
+	s.lastCommitTS = snapshot.LastCommitTS
+	for _, entry := range snapshot.Entries {
 		versions := append([]VersionedValue(nil), entry.Versions...)
 		s.tree.Put(bytes.Clone(entry.Key), versions)
-		if len(versions) > 0 {
-			last := versions[len(versions)-1].TS
-			if last > s.lastCommitTS {
-				s.lastCommitTS = last
-			}
-		}
 	}
 
 	return nil
 }
 
-func (s *mvccStore) Close() error {
+func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+	if len(versions) == 0 {
+		return versions, false
+	}
+
+	// Find the latest version that is <= minTS
+	keepIdx := -1
+	for i := len(versions) - 1; i >= 0; i-- {
+		if versions[i].TS <= minTS {
+			keepIdx = i
+			break
+		}
+	}
+
+	// If all versions are newer than minTS, keep everything
+	if keepIdx == -1 {
+		return versions, false
+	}
+
+	// If the oldest version is the one to keep, we can't remove anything before it
+	if keepIdx == 0 {
+		return versions, false
+	}
+
+	// We keep versions starting from keepIdx
+	// The version at keepIdx represents the state at minTS.
+	newVersions := make([]VersionedValue, len(versions)-keepIdx)
+	copy(newVersions, versions[keepIdx:])
+	return newVersions, true
+}
+
+func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	// Estimate size to avoid frequent allocations, though exact count is unknown
+	updates := make(map[string][]VersionedValue)
+
+	it := s.tree.Iterator()
+	for it.Next() {
+		versions, ok := it.Value().([]VersionedValue)
+		if !ok {
+			continue
+		}
+
+		newVersions, changed := compactVersions(versions, minTS)
+		if changed {
+			// tree keys are []byte, need string for map key
+			keyBytes, ok := it.Key().([]byte)
+			if !ok {
+				continue
+			}
+			updates[string(keyBytes)] = newVersions
+		}
+	}
+
+	for k, v := range updates {
+		s.tree.Put([]byte(k), v)
+	}
+
+	s.log.InfoContext(ctx, "compact",
+		slog.Uint64("min_ts", minTS),
+		slog.Int("updated_keys", len(updates)),
+	)
 	return nil
 }
 
-// mvccSnapshotEntry is used solely for gob snapshot serialization.
-type mvccSnapshotEntry struct {
-	Key      []byte
-	Versions []VersionedValue
+func (s *mvccStore) Close() error {
+	return nil
 }
