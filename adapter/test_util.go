@@ -320,6 +320,10 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 	}
 
 	cfg := buildRaftConfig(n, ports)
+	leaderRedisMap := make(map[raft.ServerAddress]string, len(ports))
+	for _, p := range ports {
+		leaderRedisMap[raft.ServerAddress(p.raftAddress)] = p.redisAddress
+	}
 
 	for i := 0; i < n; i++ {
 		st := store.NewMVCCStore()
@@ -329,10 +333,6 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		grpcSock := lis[i].grpc
 		redisSock := lis[i].redis
 		dynamoSock := lis[i].dynamo
-
-		leaderRedis := map[raft.ServerAddress]string{
-			raft.ServerAddress(ports[i].raftAddress): ports[i].redisAddress,
-		}
 
 		// リーダーが先に投票を開始させる
 		electionTimeout := leaderElectionTimeout
@@ -361,7 +361,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, srv.Serve(lis))
 		}(s, grpcSock)
 
-		rd := NewRedisServer(redisSock, st, coordinator, leaderRedis)
+		rd := NewRedisServer(redisSock, st, coordinator, leaderRedisMap)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)

@@ -29,18 +29,35 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
+      - name: Pre-fetch Go modules
+        run: |
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          GOPATH=$(go env GOPATH)
+          export GOCACHE GOTMPDIR=/tmp/go-tmp
+          go mod download
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
       - name: Launch demo cluster
         run: |
-          mkdir -p "$GOCACHE"
+          set -euo pipefail
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          export GOTMPDIR=/tmp/go-tmp
           nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
-          for i in {1..30}; do
-            nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 && break
+
+          echo "Waiting for redis listeners on 63791-63793..."
+          for i in {1..90}; do
+            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793; then
+              echo "Cluster is up"
+              exit 0
+            fi
             sleep 1
           done
+
+          echo "Demo cluster failed to start; dumping log:"
+          tail -n 200 /tmp/elastickv-demo.log || true
+          exit 1
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
         run: |
@@ -48,5 +65,7 @@ jobs:
       - name: Stop demo cluster
         run: |
           if [ -f /tmp/elastickv-demo.pid ]; then
-            kill "$(cat /tmp/elastickv-demo.pid)" || true
+            pid=$(cat /tmp/elastickv-demo.pid)
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
           fi

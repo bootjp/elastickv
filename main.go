@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
@@ -23,6 +24,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
+)
+
+const (
+	heartbeatTimeout = 200 * time.Millisecond
+	electionTimeout  = 2000 * time.Millisecond
+	leaderLease      = 100 * time.Millisecond
 )
 
 var (
@@ -101,6 +108,9 @@ const snapshotRetainCount = 3
 func NewRaft(_ context.Context, myID, myAddress string, fsm raft.FSM) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
+	c.HeartbeatTimeout = heartbeatTimeout
+	c.ElectionTimeout = electionTimeout
+	c.LeaderLeaseTimeout = leaderLease
 
 	baseDir := filepath.Join(*raftDir, myID)
 
