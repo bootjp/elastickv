@@ -57,13 +57,22 @@ func (i *Internal) stampTimestamps(req *pb.ForwardRequest) {
 	}
 	if req.IsTxn {
 		var startTs uint64
+		// All requests in a transaction must have the same timestamp.
+		// Find a timestamp from the requests, or generate a new one if none exist.
 		for _, r := range req.Requests {
-			if r.Ts == 0 {
-				if startTs == 0 {
-					startTs = i.clock.Next()
-				}
-				r.Ts = startTs
+			if r.Ts != 0 {
+				startTs = r.Ts
+				break
 			}
+		}
+
+		if startTs == 0 && len(req.Requests) > 0 {
+			startTs = i.clock.Next()
+		}
+
+		// Assign the unified timestamp to all requests in the transaction.
+		for _, r := range req.Requests {
+			r.Ts = startTs
 		}
 		return
 	}
