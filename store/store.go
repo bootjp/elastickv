@@ -59,6 +59,8 @@ type MVCCStore interface {
 	// It must return ErrWriteConflict if any key has a newer commit timestamp
 	// than startTS.
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
+	// LastCommitTS returns the highest commit timestamp applied on this node.
+	LastCommitTS() uint64
 	Snapshot() (io.ReadWriter, error)
 	Restore(buf io.Reader) error
 	Close() error

@@ -42,7 +42,7 @@ func NewGRPCServer(store store.MVCCStore, coordinate *kv.Coordinate) *GRPCServer
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = snapshotTS(r.coordinator.Clock())
+		readTS = snapshotTS(r.coordinator.Clock(), r.store)
 	}
 
 	if r.coordinator.IsLeader() {
@@ -98,7 +98,7 @@ func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
 	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
-	ts := snapshotTS(r.coordinator.Clock())
+	ts := snapshotTS(r.coordinator.Clock(), r.store)
 	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -186,7 +186,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 		return nil, errors.WithStack(err)
 	}
 
-	readTS := snapshotTS(r.coordinator.Clock())
+	readTS := snapshotTS(r.coordinator.Clock(), r.store)
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	if err != nil {
 		switch {
@@ -234,7 +234,7 @@ func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResp
 			Kv: nil,
 		}, errors.WithStack(err)
 	}
-	readTS := snapshotTS(r.coordinator.Clock())
+	readTS := snapshotTS(r.coordinator.Clock(), r.store)
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return &pb.ScanResponse{

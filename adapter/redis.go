@@ -109,7 +109,7 @@ func getConnState(conn redcon.Conn) *connState {
 }
 
 func (r *RedisServer) readTS() uint64 {
-	return snapshotTS(r.coordinator.Clock())
+	return snapshotTS(r.coordinator.Clock(), r.store)
 }
 
 func (r *RedisServer) Run() error {

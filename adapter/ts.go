@@ -1,17 +1,26 @@
 package adapter
 
-import "github.com/bootjp/elastickv/kv"
+import (
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
+)
 
-// snapshotTS returns a timestamp suitable for snapshot reads without
-// unnecessarily advancing the logical clock. It relies solely on the shared
-// HLC; if none has been issued yet, fall back to MaxUint64 to see latest
-// committed versions irrespective of local clock lag.
-func snapshotTS(clock *kv.HLC) uint64 {
-	if clock == nil {
-		return ^uint64(0)
+// snapshotTS picks a safe snapshot timestamp:
+// - uses the store's last commit watermark if available,
+// - otherwise the coordinator's HLC current value,
+// - and falls back to MaxUint64 if neither is set.
+func snapshotTS(clock *kv.HLC, st store.MVCCStore) uint64 {
+	ts := uint64(0)
+	if st != nil {
+		ts = st.LastCommitTS()
 	}
-	if cur := clock.Current(); cur != 0 {
-		return cur
+	if clock != nil {
+		if cur := clock.Current(); cur > ts {
+			ts = cur
+		}
 	}
-	return ^uint64(0)
+	if ts == 0 {
+		ts = ^uint64(0)
+	}
+	return ts
 }

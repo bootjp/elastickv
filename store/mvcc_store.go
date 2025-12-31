@@ -61,6 +61,14 @@ type mvccStore struct {
 	lastCommitTS uint64
 }
 
+// LastCommitTS exposes the latest commit timestamp for read snapshot selection.
+// It is intentionally not part of the public MVCCStore interface.
+func (s *mvccStore) LastCommitTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.lastCommitTS
+}
+
 // NewMVCCStore creates a new MVCC-enabled in-memory store.
 func NewMVCCStore() MVCCStore {
 	return &mvccStore{

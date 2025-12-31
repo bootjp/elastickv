@@ -114,7 +114,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	readTS := snapshotTS(d.coordinator.Clock())
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
 	v, err := d.store.GetAt(r.Context(), []byte(keyAttr.S), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -234,7 +234,7 @@ func (d *DynamoDBServer) validateCondition(ctx context.Context, expr string, nam
 	if expr == "" {
 		return nil
 	}
-	readTS := snapshotTS(d.coordinator.Clock())
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
 	exists, err := d.store.ExistsAt(ctx, key, readTS)
 	if err != nil {
 		return errors.WithStack(err)
