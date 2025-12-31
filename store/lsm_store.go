@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/gob"
 	"io"
 	"log/slog"
 	"math"
@@ -18,6 +17,7 @@ import (
 
 const (
 	timestampSize     = 8
+	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchSize = 1000
 	dirPerms          = 0755
 )
@@ -119,25 +119,31 @@ type storedValue struct {
 	ExpireAt  uint64
 }
 
-func encodeValue(val []byte, tombstone bool, expireAt uint64) ([]byte, error) {
-	sv := storedValue{
-		Value:     val,
-		Tombstone: tombstone,
-		ExpireAt:  expireAt,
+func encodeValue(val []byte, tombstone bool, expireAt uint64) []byte {
+	// Format: [Tombstone(1)] [ExpireAt(8)] [Value(...)]
+	buf := make([]byte, valueHeaderSize+len(val))
+	if tombstone {
+		buf[0] = 1
 	}
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(sv); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return buf.Bytes(), nil
+	binary.LittleEndian.PutUint64(buf[1:], expireAt)
+	copy(buf[valueHeaderSize:], val)
+	return buf
 }
 
 func decodeValue(data []byte) (storedValue, error) {
-	var sv storedValue
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&sv); err != nil {
-		return sv, errors.WithStack(err)
+	if len(data) < valueHeaderSize {
+		return storedValue{}, errors.New("invalid value length")
 	}
-	return sv, nil
+	tombstone := data[0] != 0
+	expireAt := binary.LittleEndian.Uint64(data[1:])
+	val := make([]byte, len(data)-valueHeaderSize)
+	copy(val, data[valueHeaderSize:])
+
+	return storedValue{
+		Value:     val,
+		Tombstone: tombstone,
+		ExpireAt:  expireAt,
+	}, nil
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
@@ -362,10 +368,7 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v, err := encodeValue(value, false, expireAt)
-	if err != nil {
-		return err
-	}
+	v := encodeValue(value, false, expireAt)
 
 	if err := s.db.Set(k, v, pebble.Sync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
@@ -378,10 +381,7 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v, err := encodeValue(nil, true, 0)
-	if err != nil {
-		return err
-	}
+	v := encodeValue(nil, true, 0)
 
 	if err := s.db.Set(k, v, pebble.Sync); err != nil {
 		return errors.WithStack(err)
@@ -403,10 +403,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
-	v, err := encodeValue(val, false, expireAt)
-	if err != nil {
-		return err
-	}
+	v := encodeValue(val, false, expireAt)
 	if err := s.db.Set(k, v, pebble.Sync); err != nil {
 		return errors.WithStack(err)
 	}
@@ -449,18 +446,14 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 	for _, mut := range mutations {
 		k := encodeKey(mut.Key, commitTS)
 		var v []byte
-		var err error
 
 		switch mut.Op {
 		case OpTypePut:
-			v, err = encodeValue(mut.Value, false, mut.ExpireAt)
+			v = encodeValue(mut.Value, false, mut.ExpireAt)
 		case OpTypeDelete:
-			v, err = encodeValue(nil, true, 0)
+			v = encodeValue(nil, true, 0)
 		default:
 			return ErrUnknownOp
-		}
-		if err != nil {
-			return err
 		}
 		if err := b.Set(k, v, nil); err != nil {
 			return errors.WithStack(err)
