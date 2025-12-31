@@ -98,7 +98,7 @@ func TestPebbleStore_Scan(t *testing.T) {
 	assert.Len(t, pairs, 2)
 	assert.Equal(t, []byte("k1"), pairs[0].Key)
 	assert.Equal(t, []byte("v10"), pairs[0].Value)
-	
+
 	// Scan at TS 5
 	// Expect: empty
 	pairs, err = s.ScanAt(ctx, []byte("k"), nil, 10, 5)
@@ -113,31 +113,31 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	
+
 	ctx := context.Background()
 	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 100, 0))
-	
+
 	// Snapshot
 	buf, err := s.Snapshot()
 	require.NoError(t, err)
-	
+
 	s.Close()
-	
+
 	// Restore to new dir
 	dir2, err := os.MkdirTemp("", "pebble-restore-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir2)
-	
+
 	s2, err := NewPebbleStore(dir2)
 	require.NoError(t, err)
 	defer s2.Close()
-	
+
 	err = s2.Restore(buf)
 	require.NoError(t, err)
-	
+
 	val, err := s2.GetAt(ctx, []byte("k1"), 100)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v1"), val)
-	
+
 	assert.Equal(t, uint64(100), s2.LastCommitTS()) // aligned 100 -> 100 (if started from 0)
 }
