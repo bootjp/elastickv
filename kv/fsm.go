@@ -107,9 +107,22 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
-	// Debug guard only: real OCC runs at the leader/storage layer, so conflicts
-	// should already be resolved before log application. Keep this stub to make
-	// any unexpected violations visible during development.
+	seen := make(map[string]struct{}, len(muts))
+	for _, mut := range muts {
+		keyStr := string(mut.Key)
+		if _, ok := seen[keyStr]; ok {
+			continue
+		}
+		seen[keyStr] = struct{}{}
+
+		latest, exists, err := f.store.LatestCommitTS(ctx, mut.Key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if exists && latest > startTS {
+			return errors.Wrapf(store.ErrWriteConflict, "key: %s", string(mut.Key))
+		}
+	}
 	return nil
 }
 
