@@ -72,4 +72,3 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), v)
 }
-
