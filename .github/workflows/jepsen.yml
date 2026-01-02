@@ -1,5 +1,8 @@
 name: Jepsen VM Run
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
