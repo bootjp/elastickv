@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net"
 	"os"
-	"strconv"
+	"path/filepath"
+	"strings"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
@@ -16,6 +18,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -23,16 +26,18 @@ import (
 )
 
 var (
-	grpcAdders = []string{
-		"localhost:50051",
-		"localhost:50052",
-		"localhost:50053",
-	}
-	redisAdders = []string{
-		"localhost:63791",
-		"localhost:63792",
-		"localhost:63793",
-	}
+	address       = flag.String("address", ":50051", "gRPC/Raft address")
+	redisAddress  = flag.String("redis_address", ":6379", "Redis address")
+	raftID        = flag.String("raft_id", "", "Raft ID")
+	raftDataDir   = flag.String("raft_data_dir", "/var/lib/elastickv", "Raft data directory")
+	raftBootstrap = flag.Bool("raft_bootstrap", false, "Bootstrap cluster")
+	raftRedisMap  = flag.String("raft_redis_map", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+)
+
+const (
+	raftSnapshotsRetain = 2
+	kvParts             = 2
+	defaultFileMode     = 0755
 )
 
 func init() {
@@ -42,117 +47,150 @@ func init() {
 }
 
 func main() {
+	flag.Parse()
+	if *raftID == "" {
+		slog.Error("raft_id is required")
+		os.Exit(1)
+	}
+
 	eg := &errgroup.Group{}
 	if err := run(eg); err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
 	}
-	err := eg.Wait()
-	if err != nil {
+	if err := eg.Wait(); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(eg *errgroup.Group) error {
+func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
+	if dir == "" {
+		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
+	}
+	if err := os.MkdirAll(dir, defaultFileMode); err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	ldb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
+	if err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	sdb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
+	if err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
+	if err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	return ldb, sdb, fss, nil
+}
 
-	cfg := raft.Configuration{}
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate) *grpc.Server {
+	s := grpc.NewServer()
+	trx := kv.NewTransaction(r)
+	gs := adapter.NewGRPCServer(st, coordinator)
+	tm.Register(s)
+	pb.RegisterRawKVServer(s, gs)
+	pb.RegisterTransactionalKVServer(s, gs)
+	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
+	leaderhealth.Setup(r, s, []string{"RawKV"})
+	raftadmin.Register(s, r)
+	return s
+}
+
+func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr string) (*adapter.RedisServer, error) {
+	leaderRedis := make(map[raft.ServerAddress]string)
+	if *raftRedisMap != "" {
+		parts := strings.Split(*raftRedisMap, ",")
+		for _, part := range parts {
+			kv := strings.Split(part, "=")
+			if len(kv) == kvParts {
+				leaderRedis[raft.ServerAddress(kv[0])] = kv[1]
+			}
+		}
+	}
+	// Ensure self is in map (override if present)
+	leaderRedis[raft.ServerAddress(addr)] = *redisAddress
+
+	l, err := lc.Listen(ctx, "tcp", *redisAddress)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
+}
+
+func run(eg *errgroup.Group) error {
 	ctx := context.Background()
 	var lc net.ListenConfig
 
-	for i := 0; i < 3; i++ {
-		var suffrage raft.ServerSuffrage
-		if i == 0 {
-			suffrage = raft.Voter
-		} else {
-			suffrage = raft.Nonvoter
-		}
-
-		server := raft.Server{
-			Suffrage: suffrage,
-			ID:       raft.ServerID(strconv.Itoa(i)),
-			Address:  raft.ServerAddress(grpcAdders[i]),
-		}
-		cfg.Servers = append(cfg.Servers, server)
+	ldb, sdb, fss, err := setupStorage(*raftDataDir)
+	if err != nil {
+		return err
 	}
 
-	leaderRedis := make(map[raft.ServerAddress]string)
-	for i := 0; i < 3; i++ {
-		leaderRedis[raft.ServerAddress(grpcAdders[i])] = redisAdders[i]
-	}
+	st := store.NewMVCCStore()
+	fsm := kv.NewKvFSM(st)
 
-	for i := 0; i < 3; i++ {
-		st := store.NewMVCCStore()
-		fsm := kv.NewKvFSM(st)
-
-		r, tm, err := newRaft(strconv.Itoa(i), grpcAdders[i], fsm, i == 0, cfg)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		s := grpc.NewServer()
-		trx := kv.NewTransaction(r)
-		coordinator := kv.NewCoordinator(trx, r)
-		gs := adapter.NewGRPCServer(st, coordinator)
-		tm.Register(s)
-		pb.RegisterRawKVServer(s, gs)
-		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
-		leaderhealth.Setup(r, s, []string{"RawKV"})
-		raftadmin.Register(s, r)
-
-		grpcSock, err := lc.Listen(ctx, "tcp", grpcAdders[i])
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		eg.Go(func() error {
-			return errors.WithStack(s.Serve(grpcSock))
-		})
-
-		l, err := lc.Listen(ctx, "tcp", redisAdders[i])
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		rd := adapter.NewRedisServer(l, st, coordinator, leaderRedis)
-
-		eg.Go(func() error {
-			return errors.WithStack(rd.Run())
-		})
-	}
-
-	return nil
-}
-
-func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration) (*raft.Raft, *transport.Manager, error) {
+	// Config
 	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(myID)
-
-	// this config is for development
-	ldb := raft.NewInmemStore()
-	sdb := raft.NewInmemStore()
-	fss := raft.NewInmemSnapshotStore()
-
+	c.LocalID = raft.ServerID(*raftID)
 	c.Logger = hclog.New(&hclog.LoggerOptions{
-		Name:       "raft-" + myID,
+		Name:       "raft-" + *raftID,
 		JSONFormat: true,
-		Level:      hclog.NoLevel,
+		Level:      hclog.Info,
 	})
 
-	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
+	// Transport
+	tm := transport.New(raft.ServerAddress(*address), []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	})
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return errors.WithStack(err)
 	}
 
-	if bootstrap {
+	if *raftBootstrap {
+		cfg := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					Suffrage: raft.Voter,
+					ID:       raft.ServerID(*raftID),
+					Address:  raft.ServerAddress(*address),
+				},
+			},
+		}
 		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil {
-			return nil, nil, errors.WithStack(err)
+		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+			return errors.WithStack(err)
 		}
 	}
 
-	return r, tm, nil
+	trx := kv.NewTransaction(r)
+	coordinator := kv.NewCoordinator(trx, r)
+
+	s := setupGRPC(r, st, tm, coordinator)
+
+	grpcSock, err := lc.Listen(ctx, "tcp", *address)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	eg.Go(func() error {
+		slog.Info("Starting gRPC server", "address", *address)
+		return errors.WithStack(s.Serve(grpcSock))
+	})
+
+	rd, err := setupRedis(ctx, lc, st, coordinator, *address)
+	if err != nil {
+		return err
+	}
+
+	eg.Go(func() error {
+		slog.Info("Starting Redis server", "address", *redisAddress)
+		return errors.WithStack(rd.Run())
+	})
+
+	return nil
 }

@@ -2,50 +2,25 @@
   (:gen-class)
   (:require [clojure.string :as str]
             [clojure.tools.cli :as tools.cli]
+            [elastickv.db :as ekdb]
             [jepsen [client :as client]
                     [core :as jepsen]
-                    [db :as db]
-                    [generator :as gen]]
-            [jepsen.os :as os]
-            [jepsen.control.core :as control]
-            [jepsen.nemesis :as nemesis]
+                    [generator :as gen]
+                    [net :as net]]
+            [jepsen.control :as control]
+            [jepsen.nemesis.combined :as combined]
+            [jepsen.os.debian :as debian]
             [jepsen.redis.client :as rc]
             [jepsen.redis.append :as redis-append]
             [jepsen.tests.cycle.append :as append]))
 
-(def default-node->port
-  {:n1 63791
-   :n2 63792
-   :n3 63793})
+(def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
-(defn parse-ports
-  "Turns a comma separated ports string into a vector of ints."
-  [s]
-  (->> (str/split s #",")
-       (remove str/blank?)
-       (map #(Integer/parseInt %))
-       vec))
-
-(defrecord DummyRemote []
-  control/Remote
-  (connect [this conn-spec] this)
-  (disconnect! [this])
-  (execute! [this ctx action]
-    (assoc action :exit 0 :out "" :err ""))
-  (upload! [this ctx local-paths remote-path opts] {:exit 0})
-  (download! [this ctx remote-paths local-path opts] {:exit 0}))
-
-(defrecord NoopNemesis []
-  nemesis/Nemesis
-  (setup! [this test] this)
-  (invoke! [this test op] (assoc op :type :info, :value :noop))
-  (teardown! [this test] this))
-
-(defrecord ElastickvRedisClient [host node->port conn]
+(defrecord ElastickvRedisClient [node->port conn]
   client/Client
   (open! [this test node]
     (let [p (get node->port node 6379)
-          h (or (:redis-host test) host)
+          h (or (:redis-host test) (name node))
           c (rc/open h {:port p :timeout-ms 10000})]
       (assoc this :conn c)))
 
@@ -81,47 +56,76 @@
                                :max-txn-length (or (:max-txn-length opts) 4)
                                :max-writes-per-key (or (:max-writes-per-key opts) 128)
                                :consistency-models [:strict-serializable]})
-        client (->ElastickvRedisClient (or (:redis-host opts) "127.0.0.1")
-                                       (or (:node->port opts) default-node->port)
+        client (->ElastickvRedisClient (or (:node->port opts)
+                                           (zipmap default-nodes (repeat 6379)))
                                        nil)]
     (assoc workload :client client)))
 
 (defn ports->node-map
-  [ports]
+  [ports nodes]
   (into {}
-        (map-indexed (fn [idx port]
-                       [(keyword (str "n" (inc idx))) port])
-                     ports)))
+        (map (fn [n p] [n p]) nodes ports)))
+
+(defn- normalize-faults [faults]
+  (->> faults
+       (map (fn [f]
+              (case f
+                :reboot :kill
+                f)))
+       vec))
 
 (defn elastickv-redis-test
   "Builds a Jepsen test map that drives elastickv's Redis protocol with the
    jepsen-io/redis append workload."
   ([] (elastickv-redis-test {}))
   ([opts]
-   (let [ports      (or (:redis-ports opts) (vals default-node->port))
-         node->port (or (:node->port opts) (ports->node-map ports))
-         nodes      (vec (keys node->port))
+   (let [nodes      (or (:nodes opts) default-nodes)
+         redis-ports (or (:redis-ports opts) (repeat (count nodes) (or (:redis-port opts) 6379)))
+         node->port (or (:node->port opts) (ports->node-map redis-ports nodes))
+         db         (ekdb/db {:grpc-port (or (:grpc-port opts) 50051)
+                              :redis-port node->port})
          rate       (double (or (:rate opts) 5))
          time-limit (or (:time-limit opts) 30)
+         faults     (normalize-faults (or (:faults opts) [:partition :kill]))
+         nemesis-p  (combined/nemesis-package {:db db
+                                               :faults faults
+                                               :interval (or (:fault-interval opts) 40)})
          workload   (elastickv-append-workload (assoc opts :node->port node->port))]
      (merge workload
-            {:name         (or (:name opts) "elastickv-redis-append")
-             :nodes        nodes
-             :db           db/noop
-             :os           os/noop
-             :ssh          {:dummy? true}
-             :remote       (->DummyRemote)
-             :nemesis      (->NoopNemesis)
-             :concurrency  (or (:concurrency opts) 5)
-             :generator    (->> (:generator workload)
-                                (gen/stagger (/ rate))
-                                (gen/time-limit time-limit))}))))
+            {:name            (or (:name opts) "elastickv-redis-append")
+             :nodes           nodes
+             :db              db
+             :os              debian/os
+             :net             net/iptables
+             :ssh             (merge {:username "vagrant"
+                                      :private-key-path "/home/vagrant/.ssh/id_rsa"
+                                      :strict-host-key-checking false}
+                                     (:ssh opts))
+             :remote          control/ssh
+             :nemesis         (:nemesis nemesis-p)
+             ; Jepsen 0.3.x can't fressian-serialize some combined final gens; skip.
+             :final-generator nil
+             :concurrency     (or (:concurrency opts) 5)
+             :generator       (->> (:generator workload)
+                                   (gen/nemesis (:generator nemesis-p))
+                                   (gen/stagger (/ rate))
+                                   (gen/time-limit time-limit))}))))
 
 (def cli-opts
-  [[nil "--ports PORTS" "Comma separated Redis ports (leader first)."
-    :default "63791,63792,63793"]
-   [nil "--host HOST" "Hostname elastickv is listening on."
-    :default "127.0.0.1"]
+  [[nil "--nodes NODES" "Comma separated node names."
+    :default "n1,n2,n3,n4,n5"]
+   [nil "--redis-port PORT" "Redis port (applied to all nodes)."
+    :default 6379
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--grpc-port PORT" "gRPC/Raft port."
+    :default 50051
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--faults LIST" "Comma separated faults (partition,kill,clock)."
+    :default "partition,kill,clock"]
+   [nil "--ssh-key PATH" "SSH private key path."
+    :default "/home/vagrant/.ssh/id_rsa"]
+   [nil "--ssh-user USER" "SSH username."
+    :default "vagrant"]
    [nil "--time-limit SECONDS" "How long to run the workload."
     :default 30
     :parse-fn #(Integer/parseInt %)]
@@ -136,10 +140,23 @@
 (defn -main
   [& args]
   (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
-        parsed  (update options :ports parse-ports)
-        options (assoc parsed
-                  :redis-ports (:ports parsed)
-                  :redis-host  (:host parsed))]
+        node-list (-> (:nodes options)
+                      (str/split #",")
+                      (->> (remove str/blank?)
+                           vec))
+        faults    (-> (:faults options)
+                      (str/split #",")
+                      (->> (remove str/blank?)
+                           (map (comp keyword str/lower-case))
+                           vec))
+        options   (assoc options
+                    :nodes node-list
+                    :faults faults
+                    :redis-port (:redis-port options)
+                    :grpc-port (:grpc-port options)
+                    :ssh {:username (:ssh-user options)
+                          :private-key-path (:ssh-key options)
+                          :strict-host-key-checking false})]
     (cond
       (:help options) (println summary)
       (seq errors) (binding [*out* *err*]
