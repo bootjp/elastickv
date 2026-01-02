@@ -1,0 +1,43 @@
+NODES = {
+  ctrl: "192.168.56.10",
+  n1:   "192.168.56.11",
+  n2:   "192.168.56.12",
+  n3:   "192.168.56.13",
+  n4:   "192.168.56.14",
+  n5:   "192.168.56.15"
+}.freeze
+
+Vagrant.configure("2") do |config|
+  config.ssh.insert_key = false
+  #config.vm.box = "debian/bookworm64"
+  config.vm.box = "bento/debian-12"
+
+  NODES.each do |name, ip|
+    config.vm.define name do |node|
+      node.vm.hostname = name.to_s
+      node.vm.network "private_network", ip: ip
+
+      # VirtualBox (Intel) defaults
+      node.vm.provider "virtualbox" do |vb|
+        vb.memory = name == :ctrl ? 4096 : 2048
+        vb.cpus   = 2
+      end
+
+      # UTM (Apple Silicon) defaults
+      node.vm.provider "utm" do |utm|
+        utm.memory = name == :ctrl ? 4096 : 2048
+        utm.cpus   = 2
+      end
+
+      if name == :ctrl
+        node.vm.synced_folder "..", "/home/vagrant/elastickv",
+                              type: "rsync",
+                              rsync__exclude: [".git", "target", "build", ".cache", "tmp-home", "jepsen/target", "jepsen/tmp-home"]
+      else
+        node.vm.synced_folder ".", "/vagrant", disabled: true
+      end
+
+      node.vm.provision "shell", path: "provision/base.sh", args: name.to_s
+    end
+  end
+end
