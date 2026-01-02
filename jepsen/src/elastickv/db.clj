@@ -87,11 +87,11 @@
         bootstrap? (= node bootstrap-node)
         args (cond-> [server-bin
                       "--address" grpc
-                      "--redis_address" redis
-                      "--raft_id" (name node)
-                      "--raft_data_dir" data-dir
-                      "--raft_redis_map" raft-redis-map]
-               bootstrap? (conj "--raft_bootstrap"))]
+                      "--redisAddress" redis
+                      "--raftId" (name node)
+                      "--raftDataDir" data-dir
+                      "--raftRedisMap" raft-redis-map]
+               bootstrap? (conj "--raftBootstrap"))]
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
