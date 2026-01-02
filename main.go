@@ -34,17 +34,17 @@ const (
 
 var (
 	myAddr        = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	redisAddr     = flag.String("redis_address", "localhost:6379", "TCP host+port for redis")
-	raftId        = flag.String("raft_id", "", "Node id used by Raft")
-	raftDir       = flag.String("raft_data_dir", "data/", "Raft data dir")
-	raftBootstrap = flag.Bool("raft_bootstrap", false, "Whether to bootstrap the Raft cluster")
+	redisAddr     = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
+	raftId        = flag.String("raftId", "", "Node id used by Raft")
+	raftDir       = flag.String("raftDataDir", "data/", "Raft data dir")
+	raftBootstrap = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 )
 
 func main() {
 	flag.Parse()
 
 	if *raftId == "" {
-		log.Fatalf("flag --raft_id is required")
+		log.Fatalf("flag --raftId is required")
 	}
 
 	ctx := context.Background()
