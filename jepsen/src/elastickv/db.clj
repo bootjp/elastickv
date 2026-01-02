@@ -113,8 +113,8 @@
   [node grpc-port]
   (c/on node
     (c/exec :bash "-c"
-            (format "for i in $(seq 1 60); do nc -z %s %s && exit 0; sleep 1; done; exit 1"
-                    (name node) grpc-port))))
+            (format "for i in $(seq 1 60); do if nc -z -w 1 %s %s; then exit 0; fi; sleep 1; done; echo 'Timed out waiting for %s:%s'; exit 1"
+                    (name node) grpc-port (name node) grpc-port))))
 
 (defn- join-node!
   "Join peer into cluster via raftadmin, executed on bootstrap node."

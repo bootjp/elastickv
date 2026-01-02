@@ -1,0 +1,7 @@
+/target
+/tmp-home
+/.lein
+/.vagrant
+/.vagrant.d
+/store
+/results.tgz
