@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.53.5
 	github.com/cockroachdb/errors v1.12.0
-	github.com/cockroachdb/pebble v1.1.5
+	github.com/cockroachdb/pebble/v2 v2.1.3
 	github.com/cockroachdb/pebble/v2 v2.1.3
 	github.com/emirpasic/gods v1.18.1
 	github.com/hashicorp/go-hclog v1.6.3
