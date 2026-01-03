@@ -1,0 +1,49 @@
+services:
+  n1:
+    build: .
+    hostname: n1
+    privileged: true # Required for iptables/clock skew
+    ports:
+      - "2221:22"
+    networks:
+      - jepsen-net
+
+  n2:
+    build: .
+    hostname: n2
+    privileged: true
+    ports:
+      - "2222:22"
+    networks:
+      - jepsen-net
+
+  n3:
+    build: .
+    hostname: n3
+    privileged: true
+    ports:
+      - "2223:22"
+    networks:
+      - jepsen-net
+
+  n4:
+    build: .
+    hostname: n4
+    privileged: true
+    ports:
+      - "2224:22"
+    networks:
+      - jepsen-net
+
+  n5:
+    build: .
+    hostname: n5
+    privileged: true
+    ports:
+      - "2225:22"
+    networks:
+      - jepsen-net
+
+networks:
+  jepsen-net:
+    driver: bridge

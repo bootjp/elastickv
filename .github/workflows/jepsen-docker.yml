@@ -1,0 +1,92 @@
+name: Jepsen Docker Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      time-limit:
+        description: "Workload runtime seconds"
+        required: false
+        default: "60"
+      rate:
+        description: "Ops/sec per worker"
+        required: false
+        default: "10"
+      faults:
+        description: "Comma-separated faults (partition,kill,clock)"
+        required: false
+        default: "partition,kill,clock"
+
+jobs:
+  jepsen-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Leiningen
+        run: |
+          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > lein
+          chmod +x lein
+          sudo mv lein /usr/local/bin/
+
+      - name: Start Jepsen Docker Cluster
+        working-directory: jepsen/docker
+        run: bash up.sh
+
+      - name: Run Jepsen workload
+        working-directory: jepsen
+        env:
+          LEIN_JVM_OPTS: -Duser.home=${{ github.workspace }}/jepsen/tmp-home
+        run: |
+          mkdir -p tmp-home
+          # Use generated ssh config
+          export SSH_CONFIG="${{ github.workspace }}/jepsen/docker/ssh_config"
+          
+          # Jepsen needs to use the custom ssh config.
+          # Since we can't easily pass -F to Jepsen's internal SSH calls without modifying clj-ssh or using ~/.ssh/config,
+          # we will append our config to ~/.ssh/config.
+          mkdir -p ~/.ssh
+          cat $SSH_CONFIG >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          lein run -m elastickv.redis-workload \
+            --nodes n1,n2,n3,n4,n5 \
+            --time-limit ${{ github.event.inputs['time-limit'] || '60' }} \
+            --rate ${{ github.event.inputs['rate'] || '10' }} \
+            --faults ${{ github.event.inputs['faults'] || 'partition,kill,clock' }} \
+            --concurrency 10 \
+            --ssh-user vagrant \
+            --ssh-key ${{ github.workspace }}/jepsen/docker/id_rsa
+
+      - name: Collect Jepsen artifacts
+        if: always()
+        working-directory: jepsen
+        run: |
+          mkdir -p ../artifacts
+          tar czf ../artifacts/results.tgz store/ || true
+
+      - name: Stop Docker Cluster
+        if: always()
+        working-directory: jepsen/docker
+        run: docker compose down -v
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-results
+          path: artifacts/results.tgz
