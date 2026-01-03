@@ -29,7 +29,8 @@ Vagrant.configure("2") do |config|
         utm.cpus   = 2
       end
 
-      node.vm.provider "libvirt" do |kvm|
+      node.vm.provider "libvirt" do |kvm, override|
+        override.vm.box = "generic/debian12"
         kvm.memory = name == :ctrl ? 4096 : 2048
         kvm.cpus = 2
         # 必要に応じてドライバを指定
