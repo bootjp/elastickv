@@ -21,8 +21,7 @@ on:
 
 jobs:
   jepsen:
-    # Requires a self-hosted runner with VirtualBox + Vagrant and at least 12GB RAM free.
-    runs-on: [self-hosted, virtualbox]
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -35,9 +34,28 @@ jobs:
         with:
           go-version: "1.25.5"
 
+      - name: Setup Vagrant and Libvirt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils libvirt-dev
+          
+          # Install Vagrant from HashiCorp
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update && sudo apt-get install -y vagrant
+          
+          # Install plugins
+          vagrant plugin install vagrant-libvirt
+          vagrant plugin install vagrant-scp
+          
+          # Configure permissions
+          sudo usermod -aG libvirt $USER
+          sudo usermod -aG kvm $USER
+          sudo chmod 666 /var/run/libvirt/libvirt-sock
+
       - name: Bring up Jepsen VMs
         working-directory: jepsen
-        run: vagrant up
+        run: vagrant up --provider=libvirt
 
       - name: Run Jepsen workload
         working-directory: jepsen
