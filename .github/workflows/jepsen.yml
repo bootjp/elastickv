@@ -23,7 +23,9 @@ jobs:
   jepsen:
     # Requires a runner with KVM support (e.g. larger GitHub runners or metal) for decent performance.
     # Standard ubuntu-latest might fall back to QEMU TCG (very slow) or fail if kvm driver is forced.
-    runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest
+    runs-on: [self-hosted]
+    
     timeout-minutes: 120
     steps:
       - name: Checkout
