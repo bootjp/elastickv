@@ -62,7 +62,15 @@ jobs:
 
       - name: Bring up Jepsen VMs
         working-directory: jepsen
-        run: vagrant up --provider=libvirt
+        run: |
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM is available. Using kvm driver."
+            export LIBVIRT_DRIVER=kvm
+          else
+            echo "KVM is NOT available or not writable. Falling back to qemu driver (slow)."
+            export LIBVIRT_DRIVER=qemu
+          fi
+          vagrant up --provider=libvirt
 
       - name: Run Jepsen workload
         working-directory: jepsen

@@ -34,7 +34,7 @@ Vagrant.configure("2") do |config|
         kvm.memory = name == :ctrl ? 4096 : 2048
         kvm.cpus = 2
         # 必要に応じてドライバを指定
-        kvm.driver = 'kvm' 
+        kvm.driver = ENV['LIBVIRT_DRIVER'] || 'kvm'
       end
 
       if name == :ctrl
