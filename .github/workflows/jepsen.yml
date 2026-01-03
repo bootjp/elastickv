@@ -21,8 +21,9 @@ on:
 
 jobs:
   jepsen:
-    # Requires a self-hosted runner with VirtualBox + Vagrant and at least 12GB RAM free.
-    runs-on: [self-hosted, virtualbox]
+    # Requires a runner with KVM support (e.g. larger GitHub runners or metal) for decent performance.
+    # Standard ubuntu-latest might fall back to QEMU TCG (very slow) or fail if kvm driver is forced.
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -35,9 +36,31 @@ jobs:
         with:
           go-version: "1.25.5"
 
+      - name: Install Vagrant and Libvirt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vagrant ruby-libvirt qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils libvirt-dev gcc make
+          
+          # Check KVM support
+          echo "Checking KVM support..."
+          if [ -r /dev/kvm ]; then
+            echo "KVM is available."
+          else
+            echo "WARNING: KVM is NOT available. VMs may run very slowly or fail."
+          fi
+
+          # Setup Libvirt permissions
+          sudo usermod -aG libvirt $USER
+          # Allow current session to access libvirt socket
+          sudo chmod 666 /var/run/libvirt/libvirt-sock
+          
+          # Install Vagrant plugins
+          vagrant plugin install vagrant-libvirt
+          vagrant plugin install vagrant-scp
+
       - name: Bring up Jepsen VMs
         working-directory: jepsen
-        run: vagrant up
+        run: vagrant up --provider=libvirt
 
       - name: Run Jepsen workload
         working-directory: jepsen
