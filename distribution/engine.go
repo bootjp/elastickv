@@ -30,9 +30,19 @@ type Engine struct {
 	hotspotThreshold uint64
 }
 
+const defaultGroupID uint64 = 1
+
 // NewEngine creates an Engine with no hotspot splitting.
 func NewEngine() *Engine {
 	return NewEngineWithThreshold(0)
+}
+
+// NewEngineWithDefaultRoute creates an Engine and registers a default route
+// covering the full keyspace with a default group ID.
+func NewEngineWithDefaultRoute() *Engine {
+	engine := NewEngine()
+	engine.UpdateRoute([]byte(""), nil, defaultGroupID)
+	return engine
 }
 
 // NewEngineWithThreshold creates an Engine and sets a threshold for hotspot

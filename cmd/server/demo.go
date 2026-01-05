@@ -16,6 +16,7 @@ import (
 	"github.com/Jille/raftadmin"
 	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -224,7 +225,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	return ldb, sdb, fss, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate) *grpc.Server {
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) *grpc.Server {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	gs := adapter.NewGRPCServer(st, coordinator)
@@ -232,6 +233,7 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
 	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
+	pb.RegisterDistributionServer(s, distServer)
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
 	return s
@@ -307,8 +309,10 @@ func run(eg *errgroup.Group, cfg config) error {
 
 	trx := kv.NewTransaction(r)
 	coordinator := kv.NewCoordinator(trx, r)
+	distEngine := distribution.NewEngineWithDefaultRoute()
+	distServer := adapter.NewDistributionServer(distEngine)
 
-	s := setupGRPC(r, st, tm, coordinator)
+	s := setupGRPC(r, st, tm, coordinator, distServer)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
