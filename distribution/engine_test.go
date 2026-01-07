@@ -126,6 +126,34 @@ func TestEngineRecordAccessConcurrent(t *testing.T) {
 	}
 }
 
+func TestNewEngineWithDefaultRoute(t *testing.T) {
+	e := NewEngineWithDefaultRoute()
+	stats := e.Stats()
+
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(stats))
+	}
+
+	r := stats[0]
+	if r.GroupID != defaultGroupID {
+		t.Fatalf("expected group ID %d, got %d", defaultGroupID, r.GroupID)
+	}
+	if !bytes.Equal(r.Start, []byte("")) {
+		t.Fatalf("expected start of keyspace (empty slice), got %q", r.Start)
+	}
+	if r.End != nil {
+		t.Fatalf("expected end of keyspace (nil), got %q", r.End)
+	}
+
+	route, ok := e.GetRoute([]byte("any-key"))
+	if !ok {
+		t.Fatal("GetRoute should find the default route")
+	}
+	if route.GroupID != defaultGroupID {
+		t.Fatalf("GetRoute: expected group ID %d, got %d", defaultGroupID, route.GroupID)
+	}
+}
+
 func assertRange(t *testing.T, r Route, start, end []byte) {
 	t.Helper()
 	if !bytes.Equal(r.Start, start) || !bytes.Equal(r.End, end) {
