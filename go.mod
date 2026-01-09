@@ -15,7 +15,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.53.5
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/cockroachdb/pebble/v2 v2.1.3
 	github.com/emirpasic/gods v1.18.1
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
@@ -26,7 +25,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/redcon v1.6.2
 	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.40.0
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.11
 )
@@ -49,6 +48,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5 // indirect
 	github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
@@ -66,7 +66,6 @@ require (
 	github.com/hashicorp/go-msgpack/v2 v2.1.2 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/iancoleman/strcase v0.3.0 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
