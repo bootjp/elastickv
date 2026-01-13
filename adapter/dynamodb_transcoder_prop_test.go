@@ -57,6 +57,7 @@ func TestDynamoDBTranscoder_Property_TransactWrite(t *testing.T) {
 		gotTx, err := tr.TransactWriteItemsToRequest(bTx)
 		require.NoError(t, err)
 		require.True(t, gotTx.IsTxn)
+		require.Equal(t, uint64(0), gotTx.StartTS)
 		require.Len(t, gotTx.Elems, 2)
 
 		require.Equal(t, kv.Put, gotTx.Elems[0].Op)
