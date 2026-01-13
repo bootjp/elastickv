@@ -1,10 +1,10 @@
 package adapter
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -15,15 +15,12 @@ func TestRedisTranscoder_Property_Set(t *testing.T) {
 		tr := newRedisTranscoder()
 
 		req, err := tr.SetToRequest(key, value)
-		if err != nil {
-			t.Fatalf("SetToRequest failed: %v", err)
-		}
-		if req.IsTxn {
-			t.Error("SetToRequest should not be a transaction")
-		}
-		if len(req.Elems) != 1 || req.Elems[0].Op != kv.Put || !bytes.Equal(req.Elems[0].Key, key) || !bytes.Equal(req.Elems[0].Value, value) {
-			t.Errorf("SetToRequest mapping incorrect")
-		}
+		require.NoError(t, err)
+		require.False(t, req.IsTxn)
+		require.Len(t, req.Elems, 1)
+		require.Equal(t, kv.Put, req.Elems[0].Op)
+		require.Equal(t, key, req.Elems[0].Key)
+		require.Equal(t, value, req.Elems[0].Value)
 	})
 }
 
@@ -33,14 +30,10 @@ func TestRedisTranscoder_Property_Delete(t *testing.T) {
 		tr := newRedisTranscoder()
 
 		reqDel, err := tr.DeleteToRequest(key)
-		if err != nil {
-			t.Fatalf("DeleteToRequest failed: %v", err)
-		}
-		if reqDel.IsTxn {
-			t.Error("DeleteToRequest should not be a transaction")
-		}
-		if len(reqDel.Elems) != 1 || reqDel.Elems[0].Op != kv.Del || !bytes.Equal(reqDel.Elems[0].Key, key) {
-			t.Errorf("DeleteToRequest mapping incorrect")
-		}
+		require.NoError(t, err)
+		require.False(t, reqDel.IsTxn)
+		require.Len(t, reqDel.Elems, 1)
+		require.Equal(t, kv.Del, reqDel.Elems[0].Op)
+		require.Equal(t, key, reqDel.Elems[0].Key)
 	})
 }

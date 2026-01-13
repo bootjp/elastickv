@@ -1,11 +1,11 @@
 package adapter
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -17,13 +17,12 @@ func TestGrpcTranscoder_Property_RawPut(t *testing.T) {
 
 		putReq := &pb.RawPutRequest{Key: key, Value: value}
 		gotPut, err := tr.RawPutToRequest(putReq)
-		if err != nil {
-			t.Fatalf("RawPutToRequest failed: %v", err)
-		}
-		if gotPut.IsTxn || len(gotPut.Elems) != 1 || gotPut.Elems[0].Op != kv.Put ||
-			!bytes.Equal(gotPut.Elems[0].Key, key) || !bytes.Equal(gotPut.Elems[0].Value, value) {
-			t.Error("RawPutToRequest mapping incorrect")
-		}
+		require.NoError(t, err)
+		require.False(t, gotPut.IsTxn)
+		require.Len(t, gotPut.Elems, 1)
+		require.Equal(t, kv.Put, gotPut.Elems[0].Op)
+		require.Equal(t, key, gotPut.Elems[0].Key)
+		require.Equal(t, value, gotPut.Elems[0].Value)
 	})
 }
 
@@ -34,13 +33,11 @@ func TestGrpcTranscoder_Property_RawDelete(t *testing.T) {
 
 		delReq := &pb.RawDeleteRequest{Key: key}
 		gotDel, err := tr.RawDeleteToRequest(delReq)
-		if err != nil {
-			t.Fatalf("RawDeleteToRequest failed: %v", err)
-		}
-		if gotDel.IsTxn || len(gotDel.Elems) != 1 || gotDel.Elems[0].Op != kv.Del ||
-			!bytes.Equal(gotDel.Elems[0].Key, key) {
-			t.Error("RawDeleteToRequest mapping incorrect")
-		}
+		require.NoError(t, err)
+		require.False(t, gotDel.IsTxn)
+		require.Len(t, gotDel.Elems, 1)
+		require.Equal(t, kv.Del, gotDel.Elems[0].Op)
+		require.Equal(t, key, gotDel.Elems[0].Key)
 	})
 }
 
@@ -53,21 +50,20 @@ func TestGrpcTranscoder_Property_TxnOps(t *testing.T) {
 		// TransactionalPut
 		txPutReq := &pb.PutRequest{Key: key, Value: value}
 		gotTxPut, err := tr.TransactionalPutToRequests(txPutReq)
-		if err != nil {
-			t.Fatalf("TransactionalPutToRequests failed: %v", err)
-		}
-		if !gotTxPut.IsTxn || len(gotTxPut.Elems) != 1 {
-			t.Error("TransactionalPutToRequests should be a transaction")
-		}
+		require.NoError(t, err)
+		require.True(t, gotTxPut.IsTxn)
+		require.Len(t, gotTxPut.Elems, 1)
+		require.Equal(t, kv.Put, gotTxPut.Elems[0].Op)
+		require.Equal(t, key, gotTxPut.Elems[0].Key)
+		require.Equal(t, value, gotTxPut.Elems[0].Value)
 
 		// TransactionalDelete
 		txDelReq := &pb.DeleteRequest{Key: key}
 		gotTxDel, err := tr.TransactionalDeleteToRequests(txDelReq)
-		if err != nil {
-			t.Fatalf("TransactionalDeleteToRequests failed: %v", err)
-		}
-		if !gotTxDel.IsTxn || len(gotTxDel.Elems) != 1 {
-			t.Error("TransactionalDeleteToRequests should be a transaction")
-		}
+		require.NoError(t, err)
+		require.True(t, gotTxDel.IsTxn)
+		require.Len(t, gotTxDel.Elems, 1)
+		require.Equal(t, kv.Del, gotTxDel.Elems[0].Op)
+		require.Equal(t, key, gotTxDel.Elems[0].Key)
 	})
 }

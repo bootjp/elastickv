@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -22,15 +24,15 @@ func TestDynamoDBTranscoder_Property_PutItem(t *testing.T) {
 			},
 		}
 
-		b, _ := json.Marshal(input)
-		got, err := tr.PutItemToRequest(b)
-		if err != nil {
-			t.Fatalf("PutItemToRequest failed: %v", err)
-		}
+		b, err := json.Marshal(input)
+		require.NoError(t, err)
 
-		if len(got.Elems) != 1 || string(got.Elems[0].Key) != key || string(got.Elems[0].Value) != value {
-			t.Errorf("PutItemToRequest mapping incorrect")
-		}
+		got, err := tr.PutItemToRequest(b)
+		require.NoError(t, err)
+		require.Len(t, got.Elems, 1)
+		require.Equal(t, kv.Put, got.Elems[0].Op)
+		require.Equal(t, key, string(got.Elems[0].Key))
+		require.Equal(t, value, string(got.Elems[0].Value))
 	})
 }
 
@@ -49,17 +51,19 @@ func TestDynamoDBTranscoder_Property_TransactWrite(t *testing.T) {
 			},
 		}
 
-		bTx, _ := json.Marshal(txInput)
-		gotTx, err := tr.TransactWriteItemsToRequest(bTx)
-		if err != nil {
-			t.Fatalf("TransactWriteItemsToRequest failed: %v", err)
-		}
+		bTx, err := json.Marshal(txInput)
+		require.NoError(t, err)
 
-		if !gotTx.IsTxn || len(gotTx.Elems) != 2 {
-			t.Errorf("TransactWriteItemsToRequest should be a transaction with 2 elements")
-		}
-		if string(gotTx.Elems[0].Key) != k1 || string(gotTx.Elems[1].Key) != k2 {
-			t.Errorf("TransactWriteItemsToRequest elements mapping incorrect")
-		}
+		gotTx, err := tr.TransactWriteItemsToRequest(bTx)
+		require.NoError(t, err)
+		require.True(t, gotTx.IsTxn)
+		require.Len(t, gotTx.Elems, 2)
+
+		require.Equal(t, kv.Put, gotTx.Elems[0].Op)
+		require.Equal(t, k1, string(gotTx.Elems[0].Key))
+		require.Equal(t, v1, string(gotTx.Elems[0].Value))
+		require.Equal(t, kv.Put, gotTx.Elems[1].Op)
+		require.Equal(t, k2, string(gotTx.Elems[1].Key))
+		require.Equal(t, v2, string(gotTx.Elems[1].Value))
 	})
 }

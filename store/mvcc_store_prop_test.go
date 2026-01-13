@@ -1,11 +1,10 @@
 package store
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -19,30 +18,27 @@ func TestMVCCStore_Property_PutGet(t *testing.T) {
 		ctx := context.Background()
 
 		err := s.PutAt(ctx, key, value, ts, 0)
-		if err != nil {
-			t.Fatalf("PutAt failed: %v", err)
-		}
+		require.NoError(t, err)
 
 		actualTS, ok, err := s.LatestCommitTS(ctx, key)
-		if err != nil || !ok {
-			t.Fatalf("LatestCommitTS failed: %v, ok=%v", err, ok)
-		}
+		require.NoError(t, err)
+		require.True(t, ok)
 
+		// 1. Get at the actual commit timestamp
 		got, err := s.GetAt(ctx, key, actualTS)
-		if err != nil {
-			t.Fatalf("GetAt(%d) failed: %v", actualTS, err)
-		}
-		if !bytes.Equal(got, value) {
-			t.Errorf("GetAt(%d) = %q, want %q", actualTS, got, value)
-		}
+		require.NoError(t, err)
+		require.Equal(t, value, got)
 
+		// 2. Get at a later timestamp
 		laterTS := rapid.Uint64Range(actualTS, ^uint64(0)).Draw(t, "laterTS")
 		gotLater, err := s.GetAt(ctx, key, laterTS)
-		if err != nil {
-			t.Fatalf("GetAt(%d) failed: %v", laterTS, err)
-		}
-		if !bytes.Equal(gotLater, value) {
-			t.Errorf("GetAt(%d) = %q, want %q", laterTS, gotLater, value)
+		require.NoError(t, err)
+		require.Equal(t, value, gotLater)
+
+		// 3. Get at an earlier timestamp should fail
+		if actualTS > 0 {
+			_, err := s.GetAt(ctx, key, actualTS-1)
+			require.ErrorIs(t, err, ErrKeyNotFound)
 		}
 	})
 }
@@ -56,23 +52,24 @@ func TestMVCCStore_Property_Delete(t *testing.T) {
 		s := NewMVCCStore()
 		ctx := context.Background()
 
-		_ = s.PutAt(ctx, key, value, ts, 0)
-		actualTS, _, _ := s.LatestCommitTS(ctx, key)
+		// 1. Put
+		err := s.PutAt(ctx, key, value, ts, 0)
+		require.NoError(t, err)
+		actualPutTS := s.LastCommitTS()
 
-		delTS := rapid.Uint64Range(actualTS+1, ^uint64(0)-1).Draw(t, "delTS")
-		err := s.DeleteAt(ctx, key, delTS)
-		if err != nil {
-			t.Fatalf("DeleteAt failed: %v", err)
-		}
+		// 2. Delete
+		delTS := rapid.Uint64Range(actualPutTS, ^uint64(0)-1).Draw(t, "delTS")
+		err = s.DeleteAt(ctx, key, delTS)
+		require.NoError(t, err)
+		actualDelTS := s.LastCommitTS()
 
-		actualDelTS, ok, err := s.LatestCommitTS(ctx, key)
-		if err != nil || !ok {
-			t.Fatalf("LatestCommitTS failed: %v, ok=%v", err, ok)
-		}
+		// 3. GetAt(actualPutTS) should still see value (Snapshot Isolation)
+		got, err := s.GetAt(ctx, key, actualPutTS)
+		require.NoError(t, err)
+		require.Equal(t, value, got)
 
+		// 4. GetAt(actualDelTS) should see nothing
 		_, err = s.GetAt(ctx, key, actualDelTS)
-		if err == nil || !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("GetAt(%d) expected ErrKeyNotFound, got %v", actualDelTS, err)
-		}
+		require.ErrorIs(t, err, ErrKeyNotFound)
 	})
 }
