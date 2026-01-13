@@ -88,7 +88,7 @@ func TestGrpcTranscoder_Property_TxnOps(t *testing.T) {
 	})
 }
 
-func applyOps(t interface{
+func applyOps(t interface {
 	Helper()
 	Errorf(string, ...interface{})
 	FailNow()
