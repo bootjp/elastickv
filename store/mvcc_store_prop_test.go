@@ -8,9 +8,11 @@ import (
 	"pgregory.net/rapid"
 )
 
+var nonEmptyBytes = rapid.SliceOf(rapid.Byte()).Filter(func(b []byte) bool { return len(b) > 0 })
+
 func TestMVCCStore_Property_PutGet(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		key := rapid.SliceOf(rapid.Byte()).Filter(func(b []byte) bool { return len(b) > 0 }).Draw(t, "key")
+		key := nonEmptyBytes.Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")
 		ts := rapid.Uint64Range(0, ^uint64(0)-100).Draw(t, "ts")
 
@@ -45,7 +47,7 @@ func TestMVCCStore_Property_PutGet(t *testing.T) {
 
 func TestMVCCStore_Property_Delete(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		key := rapid.SliceOf(rapid.Byte()).Filter(func(b []byte) bool { return len(b) > 0 }).Draw(t, "key")
+		key := nonEmptyBytes.Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")
 		ts := rapid.Uint64Range(0, ^uint64(0)-100).Draw(t, "ts")
 

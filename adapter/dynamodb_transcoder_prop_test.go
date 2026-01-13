@@ -9,11 +9,13 @@ import (
 	"pgregory.net/rapid"
 )
 
+var nonEmptyString = rapid.String().Filter(func(s string) bool { return s != "" })
+
 func TestDynamoDBTranscoder_Property_PutItem(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		tableName := rapid.String().Draw(t, "tableName")
-		key := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "key")
-		value := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "value")
+		key := nonEmptyString.Draw(t, "key")
+		value := nonEmptyString.Draw(t, "value")
 		tr := newDynamoDBTranscoder()
 
 		input := putItemInput{
@@ -39,10 +41,10 @@ func TestDynamoDBTranscoder_Property_PutItem(t *testing.T) {
 func TestDynamoDBTranscoder_Property_TransactWrite(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		tr := newDynamoDBTranscoder()
-		k1 := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "k1")
-		v1 := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "v1")
-		k2 := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "k2")
-		v2 := rapid.String().Filter(func(s string) bool { return s != "" }).Draw(t, "v2")
+		k1 := nonEmptyString.Draw(t, "k1")
+		v1 := nonEmptyString.Draw(t, "v1")
+		k2 := nonEmptyString.Draw(t, "k2")
+		v2 := nonEmptyString.Draw(t, "v2")
 
 		txInput := transactWriteItemsInput{
 			TransactItems: []transactWriteItem{
