@@ -95,7 +95,7 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 		if len(r.Mutations) == 0 {
 			return nil, ErrInvalidRequest
 		}
-		key := r.Mutations[0].Key
+		key := routeKey(r.Mutations[0].Key)
 		route, ok := s.engine.GetRoute(key)
 		if !ok {
 			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
@@ -107,7 +107,7 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 
 // Get retrieves a key routed to the correct shard.
 func (s *ShardRouter) Get(ctx context.Context, key []byte) ([]byte, error) {
-	route, ok := s.engine.GetRoute(key)
+	route, ok := s.engine.GetRoute(routeKey(key))
 	if !ok {
 		return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
 	}

@@ -32,7 +32,7 @@ type DynamoDBServer struct {
 	httpServer       *http.Server
 }
 
-func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate *kv.Coordinate) *DynamoDBServer {
+func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator) *DynamoDBServer {
 	d := &DynamoDBServer{
 		listen:           listen,
 		store:            st,

@@ -21,19 +21,34 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	cmdGet       = "GET"
+	cmdSet       = "SET"
+	cmdDel       = "DEL"
+	cmdExists    = "EXISTS"
+	cmdPing      = "PING"
+	cmdKeys      = "KEYS"
+	cmdMulti     = "MULTI"
+	cmdExec      = "EXEC"
+	cmdDiscard   = "DISCARD"
+	cmdLRange    = "LRANGE"
+	cmdRPush     = "RPUSH"
+	minKeyedArgs = 2
+)
+
 //nolint:mnd
 var argsLen = map[string]int{
-	"GET":     2,
-	"SET":     3,
-	"DEL":     2,
-	"EXISTS":  2,
-	"PING":    1,
-	"KEYS":    2,
-	"MULTI":   1,
-	"EXEC":    1,
-	"DISCARD": 1,
-	"LRANGE":  4,
-	"RPUSH":   -3, // negative means minimum number of args
+	cmdGet:     2,
+	cmdSet:     3,
+	cmdDel:     2,
+	cmdExists:  2,
+	cmdPing:    1,
+	cmdKeys:    2,
+	cmdMulti:   1,
+	cmdExec:    1,
+	cmdDiscard: 1,
+	cmdLRange:  4,
+	cmdRPush:   -3, // negative means minimum number of args
 }
 
 type RedisServer struct {
@@ -72,7 +87,7 @@ type redisResult struct {
 	err     error
 }
 
-func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate *kv.Coordinate, leaderRedis map[raft.ServerAddress]string) *RedisServer {
+func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string) *RedisServer {
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
@@ -82,17 +97,17 @@ func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate *kv.C
 	}
 
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		"PING":    r.ping,
-		"SET":     r.set,
-		"GET":     r.get,
-		"DEL":     r.del,
-		"EXISTS":  r.exists,
-		"KEYS":    r.keys,
-		"MULTI":   r.multi,
-		"EXEC":    r.exec,
-		"DISCARD": r.discard,
-		"RPUSH":   r.rpush,
-		"LRANGE":  r.lrange,
+		cmdPing:    r.ping,
+		cmdSet:     r.set,
+		cmdGet:     r.get,
+		cmdDel:     r.del,
+		cmdExists:  r.exists,
+		cmdKeys:    r.keys,
+		cmdMulti:   r.multi,
+		cmdExec:    r.exec,
+		cmdDiscard: r.discard,
+		cmdRPush:   r.rpush,
+		cmdLRange:  r.lrange,
 	}
 
 	return r
@@ -129,7 +144,7 @@ func (r *RedisServer) Run() error {
 			}
 
 			name := strings.ToUpper(string(cmd.Args[0]))
-			if state.inTxn && name != "EXEC" && name != "DISCARD" && name != "MULTI" {
+			if state.inTxn && name != cmdExec && name != cmdDiscard && name != cmdMulti {
 				state.queue = append(state.queue, cmd)
 				conn.WriteString("QUEUED")
 				return
@@ -255,7 +270,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
-	if !r.coordinator.IsLeader() {
+	if !r.coordinator.IsLeaderForKey(cmd.Args[1]) {
 		res, err := r.proxyExists(cmd.Args[1])
 		if err != nil {
 			conn.WriteError(err.Error())
@@ -265,7 +280,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	if err := r.coordinator.VerifyLeader(); err != nil {
+	if err := r.coordinator.VerifyLeaderForKey(cmd.Args[1]); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -517,17 +532,17 @@ func (t *txnContext) listLength(st *listTxnState) int64 {
 
 func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
 	switch strings.ToUpper(string(cmd.Args[0])) {
-	case "SET":
+	case cmdSet:
 		return t.applySet(cmd)
-	case "DEL":
+	case cmdDel:
 		return t.applyDel(cmd)
-	case "GET":
+	case cmdGet:
 		return t.applyGet(cmd)
-	case "EXISTS":
+	case cmdExists:
 		return t.applyExists(cmd)
-	case "RPUSH":
+	case cmdRPush:
 		return t.applyRPush(cmd)
-	case "LRANGE":
+	case cmdLRange:
 		return t.applyLRange(cmd)
 	default:
 		return redisResult{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", cmd.Args[0]))
@@ -770,14 +785,7 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
-	if err := r.coordinator.VerifyLeader(); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	startTS := r.coordinator.Clock().Next()
-	if last := r.store.LastCommitTS(); last > startTS {
-		startTS = last
-	}
+	startTS := r.txnStartTS(queue)
 
 	ctx := &txnContext{
 		server:     r,
@@ -800,6 +808,57 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	}
 
 	return results, nil
+}
+
+func (r *RedisServer) txnStartTS(queue []redcon.Command) uint64 {
+	maxTS := r.maxLatestCommitTS(queue)
+	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
+		r.coordinator.Clock().Observe(maxTS)
+	}
+	if r.coordinator == nil || r.coordinator.Clock() == nil {
+		return maxTS
+	}
+	return r.coordinator.Clock().Next()
+}
+
+func (r *RedisServer) maxLatestCommitTS(queue []redcon.Command) uint64 {
+	var maxTS uint64
+	if r.store == nil {
+		return maxTS
+	}
+	seen := make(map[string]struct{})
+	for _, cmd := range queue {
+		if len(cmd.Args) < minKeyedArgs {
+			continue
+		}
+		name := strings.ToUpper(string(cmd.Args[0]))
+		switch name {
+		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange:
+			key := cmd.Args[1]
+			r.bumpLatestCommitTS(&maxTS, key, seen)
+			// Also account for list metadata keys to avoid stale typing decisions.
+			r.bumpLatestCommitTS(&maxTS, listMetaKey(key), seen)
+		}
+	}
+	return maxTS
+}
+
+func (r *RedisServer) bumpLatestCommitTS(maxTS *uint64, key []byte, seen map[string]struct{}) {
+	if len(key) == 0 {
+		return
+	}
+	k := string(key)
+	if _, ok := seen[k]; ok {
+		return
+	}
+	seen[k] = struct{}{}
+	latest, exists, err := r.store.LatestCommitTS(context.Background(), key)
+	if err != nil || !exists {
+		return
+	}
+	if latest > *maxTS {
+		*maxTS = latest
+	}
 }
 
 func (r *RedisServer) proxyExec(conn redcon.Conn, queue []redcon.Command) error {
@@ -909,13 +968,13 @@ func newProxyCmd(name string, args []string, ctx context.Context) redis.Cmder {
 	}
 
 	switch name {
-	case "SET":
+	case cmdSet:
 		return redis.NewStatusCmd(ctx, argv...)
-	case "DEL", "EXISTS", "RPUSH":
+	case cmdDel, cmdExists, cmdRPush:
 		return redis.NewIntCmd(ctx, argv...)
-	case "GET":
+	case cmdGet:
 		return redis.NewStringCmd(ctx, argv...)
-	case "LRANGE":
+	case cmdLRange:
 		return redis.NewStringSliceCmd(ctx, argv...)
 	default:
 		return redis.NewCmd(ctx, argv...)
@@ -1082,11 +1141,11 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
 	readTS := r.readTS()
-	if !r.coordinator.IsLeader() {
+	if !r.coordinator.IsLeaderForKey(key) {
 		return r.proxyLRange(key, startRaw, endRaw)
 	}
 
-	if err := r.coordinator.VerifyLeader(); err != nil {
+	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -1116,7 +1175,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 }
 
 func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
-	leader := r.coordinator.RaftLeader()
+	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
 		return nil, ErrLeaderNotFound
 	}
@@ -1142,7 +1201,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 }
 
 func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
-	leader := r.coordinator.RaftLeader()
+	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
 		return 0, ErrLeaderNotFound
 	}
@@ -1171,7 +1230,7 @@ func parseInt(b []byte) (int, error) {
 // tryLeaderGet proxies a GET to the current Raft leader, returning the value and
 // whether the proxy succeeded.
 func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
-	addr := r.coordinator.RaftLeader()
+	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return nil, ErrLeaderNotFound
 	}
@@ -1195,8 +1254,8 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
-	if r.coordinator.IsLeader() {
-		if err := r.coordinator.VerifyLeader(); err != nil {
+	if r.coordinator.IsLeaderForKey(key) {
+		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
 			return nil, errors.WithStack(err)
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)
@@ -1210,7 +1269,7 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 
 	var length int64
 	var err error
-	if r.coordinator.IsLeader() {
+	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
 		length, err = r.listRPush(ctx, cmd.Args[1], cmd.Args[2:])
 	} else {
 		length, err = r.proxyRPush(cmd.Args[1], cmd.Args[2:])

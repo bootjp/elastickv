@@ -35,6 +35,9 @@ type Coordinator interface {
 	IsLeader() bool
 	VerifyLeader() error
 	RaftLeader() raft.ServerAddress
+	IsLeaderForKey(key []byte) bool
+	VerifyLeaderForKey(key []byte) error
+	RaftLeaderForKey(key []byte) raft.ServerAddress
 	Clock() *HLC
 }
 
@@ -73,15 +76,40 @@ func (c *Coordinate) Clock() *HLC {
 	return c.clock
 }
 
+func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
+	return c.IsLeader()
+}
+
+func (c *Coordinate) VerifyLeaderForKey(_ []byte) error {
+	return c.VerifyLeader()
+}
+
+func (c *Coordinate) RaftLeaderForKey(_ []byte) raft.ServerAddress {
+	return c.RaftLeader()
+}
+
 func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
 func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateResponse, error) {
-	var logs []*pb.Request
+	muts := make([]*pb.Mutation, 0, len(reqs))
 	for _, req := range reqs {
-		m := c.toTxnRequests(req, startTS)
-		logs = append(logs, m...)
+		muts = append(muts, elemToMutation(req))
+	}
+	logs := []*pb.Request{
+		{
+			IsTxn:     true,
+			Phase:     pb.Phase_PREPARE,
+			Ts:        startTS,
+			Mutations: muts,
+		},
+		{
+			IsTxn:     true,
+			Phase:     pb.Phase_COMMIT,
+			Ts:        startTS,
+			Mutations: muts,
+		},
 	}
 
 	r, err := c.transactionManager.Commit(logs)
@@ -144,63 +172,8 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 	panic("unreachable")
 }
 
-func (c *Coordinate) toTxnRequests(req *Elem[OP], startTS uint64) []*pb.Request {
-	switch req.Op {
-	case Put:
-		return []*pb.Request{
-			{
-				IsTxn: true,
-				Phase: pb.Phase_PREPARE,
-				Ts:    startTS,
-				Mutations: []*pb.Mutation{
-					{
-						Key:   req.Key,
-						Value: req.Value,
-					},
-				},
-			},
-			{
-				IsTxn: true,
-				Phase: pb.Phase_COMMIT,
-				Ts:    startTS,
-				Mutations: []*pb.Mutation{
-					{
-						Key:   req.Key,
-						Value: req.Value,
-					},
-				},
-			},
-		}
-
-	case Del:
-		return []*pb.Request{
-			{
-				IsTxn: true,
-				Phase: pb.Phase_PREPARE,
-				Ts:    startTS,
-				Mutations: []*pb.Mutation{
-					{
-						Key: req.Key,
-					},
-				},
-			},
-			{
-				IsTxn: true,
-				Phase: pb.Phase_COMMIT,
-				Ts:    startTS,
-				Mutations: []*pb.Mutation{
-					{
-						Key: req.Key,
-					},
-				},
-			},
-		}
-	}
-
-	panic("unreachable")
-}
-
 var ErrInvalidRequest = errors.New("invalid request")
+var ErrLeaderNotFound = errors.New("leader not found")
 
 func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	ctx := context.Background()
@@ -224,9 +197,14 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 
 	var requests []*pb.Request
 	if reqs.IsTxn {
+		muts := make([]*pb.Mutation, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toTxnRequests(req, reqs.StartTS)...)
+			muts = append(muts, elemToMutation(req))
 		}
+		requests = append(requests,
+			&pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: reqs.StartTS, Mutations: muts},
+			&pb.Request{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: reqs.StartTS, Mutations: muts},
+		)
 	} else {
 		for _, req := range reqs.Elems {
 			requests = append(requests, c.toRawRequest(req))
@@ -259,4 +237,21 @@ func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {
 	out.Requests = reqs
 
 	return out
+}
+
+func elemToMutation(req *Elem[OP]) *pb.Mutation {
+	switch req.Op {
+	case Put:
+		return &pb.Mutation{
+			Op:    pb.Op_PUT,
+			Key:   req.Key,
+			Value: req.Value,
+		}
+	case Del:
+		return &pb.Mutation{
+			Op:  pb.Op_DEL,
+			Key: req.Key,
+		}
+	}
+	panic("unreachable")
 }

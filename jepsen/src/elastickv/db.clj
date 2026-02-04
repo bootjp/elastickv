@@ -71,19 +71,42 @@
     (get port-spec node)
     port-spec))
 
-(defn- build-raft-redis-map [nodes grpc-port redis-port]
-  (->> nodes
-       (map (fn [n]
-              (let [g (node-addr n (port-for grpc-port n))
-                    r (node-addr n (port-for redis-port n))]
-                (str g "=" r))))
+(defn- group-ids [raft-groups]
+  (->> (keys raft-groups)
+       (sort)))
+
+(defn- group-addr [node raft-groups group-id]
+  (node-addr node (port-for (get raft-groups group-id) node)))
+
+(defn- build-raft-groups-arg [node raft-groups]
+  (->> (group-ids raft-groups)
+       (map (fn [gid]
+              (str gid "=" (group-addr node raft-groups gid))))
        (clojure.string/join ",")))
 
+(defn- build-raft-redis-map [nodes grpc-port redis-port raft-groups]
+  (let [groups (when (seq raft-groups) (group-ids raft-groups))]
+    (->> nodes
+         (mapcat (fn [n]
+                   (let [redis (node-addr n (port-for redis-port n))]
+                     (if (seq groups)
+                       (map (fn [gid]
+                              (str (group-addr n raft-groups gid) "=" redis))
+                            groups)
+                       [(str (node-addr n (port-for grpc-port n)) "=" redis)]))))
+         (clojure.string/join ","))))
+
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port data-dir]}]
-  (let [grpc (node-addr node (port-for grpc-port node))
+  [test node {:keys [bootstrap-node grpc-port redis-port data-dir raft-groups shard-ranges]}]
+  (when (and (seq raft-groups)
+             (> (count raft-groups) 1)
+             (nil? shard-ranges))
+    (throw (ex-info "shard-ranges is required when raft-groups has multiple entries" {})))
+  (let [grpc (if (seq raft-groups)
+               (group-addr node raft-groups (first (group-ids raft-groups)))
+               (node-addr node (port-for grpc-port node)))
         redis (node-addr node (port-for redis-port node))
-        raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port)
+        raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         bootstrap? (= node bootstrap-node)
         args (cond-> [server-bin
                       "--address" grpc
@@ -91,6 +114,8 @@
                       "--raftId" (name node)
                       "--raftDataDir" data-dir
                       "--raftRedisMap" raft-redis-map]
+               (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
+               (seq shard-ranges) (conj "--shardRanges" shard-ranges)
                bootstrap? (conj "--raftBootstrap"))]
     (c/on node
       (c/su
@@ -111,10 +136,12 @@
 (defn- wait-for-grpc!
   "Wait until the given node listens on grpc port."
   [node grpc-port]
-  (c/on node
-    (c/exec :bash "-c"
-            (format "for i in $(seq 1 60); do if nc -z -w 1 %s %s; then exit 0; fi; sleep 1; done; echo 'Timed out waiting for %s:%s'; exit 1"
-                    (name node) grpc-port (name node) grpc-port))))
+  (let [ports (if (sequential? grpc-port) grpc-port [grpc-port])]
+    (doseq [p ports]
+      (c/on node
+        (c/exec :bash "-c"
+                (format "for i in $(seq 1 60); do if nc -z -w 1 %s %s; then exit 0; fi; sleep 1; done; echo 'Timed out waiting for %s:%s'; exit 1"
+                        (name node) p (name node) p))))))
 
 (defn- join-node!
   "Join peer into cluster via raftadmin, executed on bootstrap node."
@@ -138,14 +165,26 @@
                                    :bootstrap-node (first (:nodes test))}
                                   opts))
     (when (= node (first (:nodes test)))
-      (let [leader (node-addr node (or (:grpc-port opts) 50051))]
+      (let [raft-groups (:raft-groups opts)
+            grpc-port (or (:grpc-port opts) 50051)
+            group-ids (when (seq raft-groups) (group-ids raft-groups))]
         (doseq [peer (rest (:nodes test))]
           (util/await-fn
             (fn []
               (try
-                (wait-for-grpc! peer (or (:grpc-port opts) 50051))
-                (join-node! node leader (name peer)
-                            (node-addr peer (or (:grpc-port opts) 50051)))
+                (if (seq raft-groups)
+                  (doseq [gid group-ids]
+                    (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
+                    (join-node! node
+                                (group-addr node raft-groups gid)
+                                (name peer)
+                                (group-addr peer raft-groups gid)))
+                  (do
+                    (wait-for-grpc! peer grpc-port)
+                    (join-node! node
+                                (node-addr node grpc-port)
+                                (name peer)
+                                (node-addr peer grpc-port))))
                 true
                 (catch Throwable t
                   (warn t "retrying join for" peer)
@@ -171,7 +210,10 @@
                                    :redis-port (or (:redis-port opts) 6379)
                                    :bootstrap-node (first (:nodes test))}
                                   opts))
-    (wait-for-grpc! node (or (:grpc-port opts) 50051))
+    (if-let [raft-groups (:raft-groups opts)]
+      (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
+                                (group-ids raft-groups)))
+      (wait-for-grpc! node (or (:grpc-port opts) 50051)))
     (info "node started" node)
     this)
   (kill! [this _test node]
@@ -194,6 +236,8 @@
 
 (defn db
   "Constructs an ElastickvDB with optional opts.
-   opts: {:grpc-port 50051 :redis-port 6379}"
+   opts: {:grpc-port 50051 :redis-port 6379
+          :raft-groups {1 50051 2 50052}
+          :shard-ranges \":m=1,m:=2\"}"
   ([] (->ElastickvDB {}))
   ([opts] (->ElastickvDB opts)))

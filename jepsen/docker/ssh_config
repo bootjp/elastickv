@@ -1,0 +1,44 @@
+Host n1
+  HostName 127.0.0.1
+  User vagrant
+  Port 2221
+  IdentityFile /Users/bootjp/src/elastickv/jepsen/docker/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+
+Host n2
+  HostName 127.0.0.1
+  User vagrant
+  Port 2222
+  IdentityFile /Users/bootjp/src/elastickv/jepsen/docker/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+
+Host n3
+  HostName 127.0.0.1
+  User vagrant
+  Port 2223
+  IdentityFile /Users/bootjp/src/elastickv/jepsen/docker/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+
+Host n4
+  HostName 127.0.0.1
+  User vagrant
+  Port 2224
+  IdentityFile /Users/bootjp/src/elastickv/jepsen/docker/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+
+Host n5
+  HostName 127.0.0.1
+  User vagrant
+  Port 2225
+  IdentityFile /Users/bootjp/src/elastickv/jepsen/docker/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR

@@ -28,7 +28,7 @@ type GRPCServer struct {
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store store.MVCCStore, coordinate *kv.Coordinate) *GRPCServer {
+func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer {
 	return &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
@@ -45,7 +45,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 		readTS = snapshotTS(r.coordinator.Clock(), r.store)
 	}
 
-	if r.coordinator.IsLeader() {
+	if r.coordinator.IsLeaderForKey(req.Key) {
 		v, err := r.store.GetAt(ctx, req.Key, readTS)
 		if err != nil {
 			switch {
@@ -83,7 +83,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 }
 
 func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
-	addr := r.coordinator.RaftLeader()
+	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return nil, ErrLeaderNotFound
 	}
