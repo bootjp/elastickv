@@ -23,9 +23,9 @@ type rangeSpec struct {
 const splitParts = 2
 
 var (
-	ErrAddressRequired          = errors.New("address is required")
-	ErrNoRaftGroupsConfigured   = errors.New("no raft groups configured")
-	ErrNoShardRangesConfigured  = errors.New("no shard ranges configured")
+	ErrAddressRequired         = errors.New("address is required")
+	ErrNoRaftGroupsConfigured  = errors.New("no raft groups configured")
+	ErrNoShardRangesConfigured = errors.New("no shard ranges configured")
 )
 
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
