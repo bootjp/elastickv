@@ -140,8 +140,8 @@
     (doseq [p ports]
       (c/on node
         (c/exec :bash "-c"
-                (format "for i in $(seq 1 60); do if nc -z -w 1 %s %s; then exit 0; fi; sleep 1; done; echo 'Timed out waiting for %s:%s'; exit 1"
-                        (name node) p (name node) p))))))
+                "for i in $(seq 1 60); do if nc -z -w 1 $1 $2; then exit 0; fi; sleep 1; done; echo \\\"Timed out waiting for $1:$2\\\"; exit 1"
+                "--" (name node) (str p))))))
 
 (defn- join-node!
   "Join peer into cluster via raftadmin, executed on bootstrap node."
