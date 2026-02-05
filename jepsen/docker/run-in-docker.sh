@@ -24,10 +24,23 @@ if ! command -v lein >/dev/null 2>&1; then
     chmod +x /usr/local/bin/lein
 fi
 
-# Generate SSH key for control node to connect to others
+# Generate or install SSH key for control node to connect to others
 if [ ! -f /root/.ssh/id_rsa ]; then
     mkdir -p /root/.ssh
-    cp /jepsen-ro/jepsen/docker/id_rsa /root/.ssh/id_rsa
+    if [ -n "${JEPSEN_SSH_PRIVATE_KEY:-}" ]; then
+        printf "%s" "${JEPSEN_SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+    elif [ -n "${JEPSEN_SSH_PRIVATE_KEY_PATH:-}" ] && [ -f "${JEPSEN_SSH_PRIVATE_KEY_PATH}" ]; then
+        cp "${JEPSEN_SSH_PRIVATE_KEY_PATH}" /root/.ssh/id_rsa
+    elif [ -f /jepsen-ro/jepsen/docker/id_rsa ]; then
+        # Backward-compatible path (local, uncommitted key file)
+        cp /jepsen-ro/jepsen/docker/id_rsa /root/.ssh/id_rsa
+    else
+        if ! command -v ssh-keygen >/dev/null 2>&1; then
+            apt-get update -y
+            apt-get install -y --no-install-recommends openssh-client
+        fi
+        ssh-keygen -t rsa -b 2048 -N "" -f /root/.ssh/id_rsa
+    fi
     chmod 600 /root/.ssh/id_rsa
     # Disable strict host checking
     echo "Host *" > /root/.ssh/config
