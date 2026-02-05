@@ -59,9 +59,14 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
+
+	// Get only the routes whose ranges intersect with [start, end)
+	intersectingRoutes := s.engine.GetIntersectingRoutes(start, end)
+
 	var out []*store.KVPair
-	for _, g := range s.groups {
-		if g == nil || g.Store == nil {
+	for _, route := range intersectingRoutes {
+		g, ok := s.groups[route.GroupID]
+		if !ok || g == nil || g.Store == nil {
 			continue
 		}
 		kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)

@@ -1,0 +1,19 @@
+# test log
+getenv TMPDIR
+stat /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772/LOCK
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772/CURRENT
+open /tmp/pebble-scan-test1263864772/MANIFEST-000001
+open /tmp/pebble-scan-test1263864772/temporary.000001.dbtmp
+stat /tmp/pebble-scan-test1263864772/CURRENT
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772
+open /tmp/pebble-scan-test1263864772/000002.log
+open /tmp/pebble-scan-test1263864772/temporary.000003.dbtmp
+stat /tmp/pebble-scan-test1263864772/OPTIONS-000003
+open /tmp

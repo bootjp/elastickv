@@ -160,3 +160,74 @@ func assertRange(t *testing.T, r Route, start, end []byte) {
 		t.Errorf("expected range [%q, %q), got [%q, %q]", start, end, r.Start, r.End)
 	}
 }
+
+func TestEngineGetIntersectingRoutes(t *testing.T) {
+	e := NewEngine()
+	e.UpdateRoute([]byte("a"), []byte("m"), 1)
+	e.UpdateRoute([]byte("m"), []byte("z"), 2)
+	e.UpdateRoute([]byte("z"), nil, 3)
+
+	cases := []struct {
+		name   string
+		start  []byte
+		end    []byte
+		groups []uint64
+	}{
+		{
+			name:   "scan in first range",
+			start:  []byte("b"),
+			end:    []byte("d"),
+			groups: []uint64{1},
+		},
+		{
+			name:   "scan across first two ranges",
+			start:  []byte("k"),
+			end:    []byte("p"),
+			groups: []uint64{1, 2},
+		},
+		{
+			name:   "scan across all ranges",
+			start:  []byte("a"),
+			end:    nil,
+			groups: []uint64{1, 2, 3},
+		},
+		{
+			name:   "scan in last unbounded range",
+			start:  []byte("za"),
+			end:    nil,
+			groups: []uint64{3},
+		},
+		{
+			name:   "scan before first range",
+			start:  []byte("0"),
+			end:    []byte("9"),
+			groups: []uint64{},
+		},
+		{
+			name:   "scan at boundary",
+			start:  []byte("m"),
+			end:    []byte("n"),
+			groups: []uint64{2},
+		},
+		{
+			name:   "scan ending at boundary",
+			start:  []byte("k"),
+			end:    []byte("m"),
+			groups: []uint64{1},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			routes := e.GetIntersectingRoutes(c.start, c.end)
+			if len(routes) != len(c.groups) {
+				t.Fatalf("expected %d routes, got %d", len(c.groups), len(routes))
+			}
+			for i, expectedGroup := range c.groups {
+				if routes[i].GroupID != expectedGroup {
+					t.Errorf("route %d: expected group %d, got %d", i, expectedGroup, routes[i].GroupID)
+				}
+			}
+		})
+	}
+}

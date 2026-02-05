@@ -1,0 +1,36 @@
+=== RUN   TestEngineRouteLookup
+--- PASS: TestEngineRouteLookup (0.00s)
+=== RUN   TestEngineRouteUnmatchedAfterEnd
+--- PASS: TestEngineRouteUnmatchedAfterEnd (0.00s)
+=== RUN   TestEngineTimestampMonotonic
+--- PASS: TestEngineTimestampMonotonic (0.00s)
+=== RUN   TestEngineRecordAccessAndStats
+--- PASS: TestEngineRecordAccessAndStats (0.00s)
+=== RUN   TestEngineSplitOnHotspot
+--- PASS: TestEngineSplitOnHotspot (0.00s)
+=== RUN   TestEngineHotspotUnboundedResetsLoad
+--- PASS: TestEngineHotspotUnboundedResetsLoad (0.00s)
+=== RUN   TestEngineRecordAccessConcurrent
+=== PAUSE TestEngineRecordAccessConcurrent
+=== RUN   TestNewEngineWithDefaultRoute
+--- PASS: TestNewEngineWithDefaultRoute (0.00s)
+=== RUN   TestEngineGetIntersectingRoutes
+=== RUN   TestEngineGetIntersectingRoutes/scan_in_first_range
+=== RUN   TestEngineGetIntersectingRoutes/scan_across_first_two_ranges
+=== RUN   TestEngineGetIntersectingRoutes/scan_across_all_ranges
+=== RUN   TestEngineGetIntersectingRoutes/scan_in_last_unbounded_range
+=== RUN   TestEngineGetIntersectingRoutes/scan_before_first_range
+=== RUN   TestEngineGetIntersectingRoutes/scan_at_boundary
+=== RUN   TestEngineGetIntersectingRoutes/scan_ending_at_boundary
+--- PASS: TestEngineGetIntersectingRoutes (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_in_first_range (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_across_first_two_ranges (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_across_all_ranges (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_in_last_unbounded_range (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_before_first_range (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_at_boundary (0.00s)
+    --- PASS: TestEngineGetIntersectingRoutes/scan_ending_at_boundary (0.00s)
+=== CONT  TestEngineRecordAccessConcurrent
+--- PASS: TestEngineRecordAccessConcurrent (0.00s)
+PASS
+ok  	github.com/bootjp/elastickv/distribution	0.002s
