@@ -93,6 +93,7 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
 			_ = r.Shutdown().Error()
+			cleanup()
 			return nil, nil, errors.WithStack(err)
 		}
 	}
