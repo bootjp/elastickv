@@ -156,8 +156,10 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		if err != nil {
 			return errors.Wrapf(err, "failed to listen on %s", rt.spec.address)
 		}
+		srv := gs
+		lis := grpcSock
 		eg.Go(func() error {
-			return errors.WithStack(gs.Serve(grpcSock))
+			return errors.WithStack(srv.Serve(lis))
 		})
 	}
 	return nil
