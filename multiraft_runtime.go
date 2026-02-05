@@ -44,16 +44,33 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 
 	ldb, err := boltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
 	if err != nil {
+		// No cleanup needed here - ldb creation failed, so no resource was allocated
 		return nil, nil, errors.WithStack(err)
 	}
 
-	sdb, err := boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
+	// Define cleanup function immediately after ldb is created to ensure
+	// proper cleanup in all error paths. If we return before this point,
+	// no cleanup is needed since ldb creation failed.
+	var sdb *boltdb.BoltStore
+	var r *raft.Raft
+	cleanup := func() {
+		if ldb != nil {
+			_ = ldb.Close()
+		}
+		if sdb != nil {
+			_ = sdb.Close()
+		}
+	}
+
+	sdb, err = boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
 	if err != nil {
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
 	fss, err := raft.NewFileSnapshotStore(dir, snapshotRetainCount, os.Stderr)
 	if err != nil {
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
@@ -61,8 +78,9 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	})
 
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
+	r, err = raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
@@ -78,6 +96,8 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		}
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
+			_ = r.Shutdown().Error()
+			cleanup()
 			return nil, nil, errors.WithStack(err)
 		}
 	}
