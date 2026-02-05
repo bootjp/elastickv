@@ -47,16 +47,26 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		return nil, nil, errors.WithStack(err)
 	}
 
-	sdb, err := boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
+	var sdb *boltdb.BoltStore
+	var r *raft.Raft
+	cleanup := func() {
+		if ldb != nil {
+			_ = ldb.Close()
+		}
+		if sdb != nil {
+			_ = sdb.Close()
+		}
+	}
+
+	sdb, err = boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
 	if err != nil {
-		_ = ldb.Close()
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
 	fss, err := raft.NewFileSnapshotStore(dir, snapshotRetainCount, os.Stderr)
 	if err != nil {
-		_ = ldb.Close()
-		_ = sdb.Close()
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
@@ -64,10 +74,9 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	})
 
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
+	r, err = raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		_ = ldb.Close()
-		_ = sdb.Close()
+		cleanup()
 		return nil, nil, errors.WithStack(err)
 	}
 
