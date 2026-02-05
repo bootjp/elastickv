@@ -121,6 +121,36 @@ func (e *Engine) Stats() []Route {
 	return stats
 }
 
+// GetIntersectingRoutes returns all routes whose key ranges intersect with [start, end).
+// A route [rStart, rEnd) intersects with [start, end) if:
+// - rStart < end (or end is nil, meaning unbounded scan)
+// - start < rEnd (or rEnd is nil, meaning unbounded route)
+func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var result []Route
+	for _, r := range e.routes {
+		// Check if route intersects with [start, end)
+		// Route ends before scan starts: rEnd != nil && rEnd <= start
+		if r.End != nil && bytes.Compare(r.End, start) <= 0 {
+			continue
+		}
+		// Route starts at or after scan ends: end != nil && rStart >= end
+		if end != nil && bytes.Compare(r.Start, end) >= 0 {
+			continue
+		}
+		// Route intersects with scan range
+		result = append(result, Route{
+			Start:   cloneBytes(r.Start),
+			End:     cloneBytes(r.End),
+			GroupID: r.GroupID,
+			Load:    atomic.LoadUint64(&r.Load),
+		})
+	}
+	return result
+}
+
 func (e *Engine) routeIndex(key []byte) int {
 	if len(e.routes) == 0 {
 		return -1
