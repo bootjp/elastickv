@@ -132,11 +132,23 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 	if len(mutations) == 0 {
 		return nil
 	}
-	g, ok := s.groupForKey(mutations[0].Key)
-	if !ok || g.Store == nil {
+	// Determine the shard group for the first mutation.
+	firstGroup, ok := s.groupForKey(mutations[0].Key)
+	if !ok || firstGroup == nil || firstGroup.Store == nil {
 		return store.ErrNotSupported
 	}
-	return errors.WithStack(g.Store.ApplyMutations(ctx, mutations, startTS, commitTS))
+	// Ensure that all mutations in the batch belong to the same shard.
+	for i := 1; i < len(mutations); i++ {
+		g, ok := s.groupForKey(mutations[i].Key)
+		if !ok || g == nil || g.Store == nil {
+			return store.ErrNotSupported
+		}
+		if g != firstGroup {
+			// Mixed-shard mutation batches are not supported.
+			return store.ErrNotSupported
+		}
+	}
+	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, startTS, commitTS))
 }
 
 func (s *ShardStore) LastCommitTS() uint64 {
