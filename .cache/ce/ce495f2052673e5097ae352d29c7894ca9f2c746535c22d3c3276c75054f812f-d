@@ -1,0 +1,9 @@
+./list_helpers.go
+./lsm_store.go
+./mvcc_store.go
+./store.go
+./lsm_store_test.go
+./mvcc_store_at_test.go
+./mvcc_store_compact_test.go
+./mvcc_store_prop_test.go
+./mvcc_store_test.go

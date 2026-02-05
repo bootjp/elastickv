@@ -49,11 +49,14 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 
 	sdb, err := boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
 	if err != nil {
+		_ = ldb.Close()
 		return nil, nil, errors.WithStack(err)
 	}
 
 	fss, err := raft.NewFileSnapshotStore(dir, snapshotRetainCount, os.Stderr)
 	if err != nil {
+		_ = ldb.Close()
+		_ = sdb.Close()
 		return nil, nil, errors.WithStack(err)
 	}
 
@@ -63,6 +66,8 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
+		_ = ldb.Close()
+		_ = sdb.Close()
 		return nil, nil, errors.WithStack(err)
 	}
 
@@ -78,6 +83,7 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		}
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
+			_ = r.Shutdown().Error()
 			return nil, nil, errors.WithStack(err)
 		}
 	}

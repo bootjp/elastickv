@@ -1,0 +1,11 @@
+./decode.go
+./doc.go
+./encode.go
+./fast-path.not.go
+./gen-helper.generated.go
+./gen-internal.go
+./helper.go
+./helper_internal.go
+./json.go
+./msgpack.go
+./rpc.go
