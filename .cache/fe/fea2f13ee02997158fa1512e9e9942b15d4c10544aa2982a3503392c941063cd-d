@@ -1,6 +1,0 @@
-./distribution.pb.go
-./distribution_grpc.pb.go
-./internal.pb.go
-./internal_grpc.pb.go
-./service.pb.go
-./service_grpc.pb.go

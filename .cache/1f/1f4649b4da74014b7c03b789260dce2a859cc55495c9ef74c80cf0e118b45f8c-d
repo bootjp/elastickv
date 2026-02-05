@@ -1,6 +1,0 @@
-=== RUN   TestPebbleStore_Scan
---- PASS: TestPebbleStore_Scan (0.01s)
-=== RUN   TestMVCCStore_ScanAtSortedAndSnapshot
---- PASS: TestMVCCStore_ScanAtSortedAndSnapshot (0.00s)
-PASS
-ok  	github.com/bootjp/elastickv/store	0.016s

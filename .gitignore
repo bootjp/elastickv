@@ -33,3 +33,6 @@ jepsen/store/
 # Jepsen local SSH keys (generated locally; never commit)
 jepsen/docker/id_rsa
 jepsen/.ssh/
+
+# Go build cache
+.cache/
