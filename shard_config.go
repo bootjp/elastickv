@@ -22,10 +22,16 @@ type rangeSpec struct {
 
 const splitParts = 2
 
+var (
+	ErrAddressRequired          = errors.New("address is required")
+	ErrNoRaftGroupsConfigured   = errors.New("no raft groups configured")
+	ErrNoShardRangesConfigured  = errors.New("no shard ranges configured")
+)
+
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 	if raw == "" {
 		if defaultAddr == "" {
-			return nil, errors.New("address is required")
+			return nil, ErrAddressRequired
 		}
 		return []groupSpec{{id: 1, address: defaultAddr}}, nil
 	}
@@ -56,7 +62,7 @@ func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 		groups = append(groups, groupSpec{id: id, address: addr})
 	}
 	if len(groups) == 0 {
-		return nil, errors.New("no raft groups configured")
+		return nil, ErrNoRaftGroupsConfigured
 	}
 	return groups, nil
 }
@@ -93,7 +99,7 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 		ranges = append(ranges, rangeSpec{start: start, end: end, groupID: groupID})
 	}
 	if len(ranges) == 0 {
-		return nil, errors.New("no shard ranges configured")
+		return nil, ErrNoShardRangesConfigured
 	}
 	return ranges, nil
 }
