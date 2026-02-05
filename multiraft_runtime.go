@@ -44,9 +44,13 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 
 	ldb, err := boltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
 	if err != nil {
+		// No cleanup needed here - ldb creation failed, so no resource was allocated
 		return nil, nil, errors.WithStack(err)
 	}
 
+	// Define cleanup function immediately after ldb is created to ensure
+	// proper cleanup in all error paths. If we return before this point,
+	// no cleanup is needed since ldb creation failed.
 	var sdb *boltdb.BoltStore
 	var r *raft.Raft
 	cleanup := func() {
