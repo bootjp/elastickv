@@ -21,6 +21,8 @@ type ShardStore struct {
 	connCache GRPCConnCache
 }
 
+var ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+
 // NewShardStore creates a sharded MVCC store wrapper.
 func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *ShardStore {
 	return &ShardStore{
@@ -238,6 +240,10 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 	return resp.Ts, resp.Exists, nil
 }
 
+// ApplyMutations applies a batch of mutations to the correct shard store.
+//
+// All mutations must belong to the same shard. Cross-shard mutation batches are
+// not supported.
 func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, startTS, commitTS uint64) error {
 	if len(mutations) == 0 {
 		return nil
@@ -254,8 +260,10 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 			return store.ErrNotSupported
 		}
 		if g != firstGroup {
-			// Mixed-shard mutation batches are not supported.
-			return store.ErrNotSupported
+			return errors.WithStack(errors.Mark(
+				errors.Wrap(store.ErrNotSupported, ErrCrossShardMutationBatchNotSupported.Error()),
+				ErrCrossShardMutationBatchNotSupported,
+			))
 		}
 	}
 	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, startTS, commitTS))

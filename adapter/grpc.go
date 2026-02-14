@@ -49,7 +49,7 @@ func (r *GRPCServer) Close() error {
 	return nil
 }
 
-func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {
 		readTS = snapshotTS(r.coordinator.Clock(), r.store)
@@ -92,7 +92,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 	}, nil
 }
 
-func (r GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	key := req.GetKey()
 	if len(key) == 0 {
 		return nil, errors.WithStack(kv.ErrInvalidRequest)
@@ -127,7 +127,7 @@ func (r GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestComm
 	}, nil
 }
 
-func (r GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
 	limit64 := req.GetLimit()
 	if limit64 < 0 {
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(kv.ErrInvalidRequest)
@@ -170,7 +170,7 @@ func (r GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*p
 	return &pb.RawScanAtResponse{Kv: out}, nil
 }
 
-func (r GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+func (r *GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return nil, ErrLeaderNotFound
@@ -190,7 +190,7 @@ func (r GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]
 	return resp.Value, nil
 }
 
-func (r GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+func (r *GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return 0, false, ErrLeaderNotFound
@@ -209,7 +209,7 @@ func (r GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (ui
 	return resp.Ts, resp.Exists, nil
 }
 
-func (r GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKey []byte, limit int64, ts uint64) (*pb.RawScanAtResponse, error) {
+func (r *GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKey []byte, limit int64, ts uint64) (*pb.RawScanAtResponse, error) {
 	addr := r.coordinator.RaftLeaderForKey(startKey)
 	if addr == "" {
 		return &pb.RawScanAtResponse{Kv: nil}, ErrLeaderNotFound
@@ -233,7 +233,7 @@ func (r GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKey
 	return resp, nil
 }
 
-func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
+func (r *GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
 	m, err := r.grpcTranscoder.RawPutToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -253,7 +253,7 @@ func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPut
 	}, nil
 }
 
-func (r GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
+func (r *GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
 	m, err := r.grpcTranscoder.RawDeleteToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -273,19 +273,19 @@ func (r GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*p
 	}, nil
 }
 
-func (r GRPCServer) PreWrite(ctx context.Context, req *pb.PreWriteRequest) (*pb.PreCommitResponse, error) {
+func (r *GRPCServer) PreWrite(ctx context.Context, req *pb.PreWriteRequest) (*pb.PreCommitResponse, error) {
 	return nil, kv.ErrNotImplemented
 }
 
-func (r GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
+func (r *GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
 	return nil, kv.ErrNotImplemented
 }
 
-func (r GRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
+func (r *GRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
 	return nil, kv.ErrNotImplemented
 }
 
-func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	reqs, err := r.grpcTranscoder.TransactionalPutToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -306,7 +306,7 @@ func (r GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 	}, nil
 }
 
-func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	h := murmur3.New64()
 	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
@@ -332,7 +332,7 @@ func (r GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	}, nil
 }
 
-func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	reqs, err := r.grpcTranscoder.TransactionalDeleteToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -353,7 +353,7 @@ func (r GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Dele
 	}, nil
 }
 
-func (r GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
 	limit, err := internal.Uint64ToInt(req.Limit)
 	if err != nil {
 		return &pb.ScanResponse{

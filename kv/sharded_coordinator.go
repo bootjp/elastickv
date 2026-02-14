@@ -218,6 +218,13 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if err != nil {
 		return nil, err
 	}
+	if len(gids) > 1 {
+		return nil, errors.WithStack(errors.Wrapf(
+			ErrCrossShardTransactionNotSupported,
+			"involved_shards=%v",
+			gids,
+		))
+	}
 	return buildTxnLogs(reqs.StartTS, grouped, gids), nil
 }
 

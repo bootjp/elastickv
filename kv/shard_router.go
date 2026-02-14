@@ -11,13 +11,18 @@ import (
 )
 
 // ShardRouter routes requests to multiple raft groups based on key ranges.
-// It does not provide transactional guarantees across shards; commits are executed
-// per shard and failures may leave partial results.
+//
+// Cross-shard transactions are not supported. They require distributed
+// coordination (for example, 2PC) to ensure atomicity.
+//
+// Non-transactional request batches may still partially succeed across shards.
 type ShardRouter struct {
 	engine *distribution.Engine
 	mu     sync.RWMutex
 	groups map[uint64]*routerGroup
 }
+
+var ErrCrossShardTransactionNotSupported = errors.New("cross-shard transactions are not supported")
 
 type routerGroup struct {
 	tm    Transactional
@@ -53,11 +58,31 @@ func (s *ShardRouter) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 }
 
 func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Request) (*TransactionResponse, error)) (*TransactionResponse, error) {
+	if len(reqs) == 0 {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+
 	grouped, err := s.groupRequests(reqs)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
+	if err := validateShardBatch(reqs[0], grouped); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return s.processGrouped(grouped, fn)
+}
+
+func validateShardBatch(first *pb.Request, grouped map[uint64][]*pb.Request) error {
+	// Avoid partial commits for transactional batches spanning shards.
+	if first.IsTxn && len(grouped) > 1 {
+		return ErrCrossShardTransactionNotSupported
+	}
+	return nil
+}
+
+func (s *ShardRouter) processGrouped(grouped map[uint64][]*pb.Request, fn func(*routerGroup, []*pb.Request) (*TransactionResponse, error)) (*TransactionResponse, error) {
 	var firstErr error
 	var maxIndex uint64
 	for gid, rs := range grouped {
