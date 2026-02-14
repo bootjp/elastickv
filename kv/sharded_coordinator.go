@@ -47,13 +47,17 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	}
 }
 
-func (c *ShardedCoordinator) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if err := validateOperationGroup(reqs); err != nil {
 		return nil, err
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
-		reqs.StartTS = c.nextStartTS(reqs.Elems)
+		reqs.StartTS = c.nextStartTS(ctx, reqs.Elems)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -68,8 +72,8 @@ func (c *ShardedCoordinator) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResp
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
 }
 
-func (c *ShardedCoordinator) nextStartTS(elems []*Elem[OP]) uint64 {
-	maxTS := c.maxLatestCommitTS(elems)
+func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP]) uint64 {
+	maxTS := c.maxLatestCommitTS(ctx, elems)
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
@@ -79,7 +83,7 @@ func (c *ShardedCoordinator) nextStartTS(elems []*Elem[OP]) uint64 {
 	return c.clock.Next()
 }
 
-func (c *ShardedCoordinator) maxLatestCommitTS(elems []*Elem[OP]) uint64 {
+func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Elem[OP]) uint64 {
 	if c.store == nil {
 		return 0
 	}
@@ -94,7 +98,7 @@ func (c *ShardedCoordinator) maxLatestCommitTS(elems []*Elem[OP]) uint64 {
 		keys = append(keys, e.Key)
 	}
 
-	return MaxLatestCommitTS(context.Background(), c.store, keys)
+	return MaxLatestCommitTS(ctx, c.store, keys)
 }
 
 func (c *ShardedCoordinator) IsLeader() bool {

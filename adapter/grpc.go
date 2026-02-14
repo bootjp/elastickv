@@ -98,6 +98,18 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		return nil, errors.WithStack(kv.ErrInvalidRequest)
 	}
 
+	// ShardStore already proxies to the correct shard leader.
+	if _, ok := r.store.(*kv.ShardStore); ok {
+		ts, exists, err := r.store.LatestCommitTS(ctx, key)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &pb.RawLatestCommitTSResponse{
+			Ts:     ts,
+			Exists: exists,
+		}, nil
+	}
+
 	if r.coordinator.IsLeaderForKey(key) {
 		// Ensure we are still leader before serving from local state.
 		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
@@ -129,21 +141,19 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 
 func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
 	limit64 := req.GetLimit()
-	if limit64 < 0 {
-		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(kv.ErrInvalidRequest)
+	limit, err := rawScanLimit(limit64)
+	if err != nil {
+		return &pb.RawScanAtResponse{Kv: nil}, err
 	}
-	maxInt64 := int64(^uint(0) >> 1)
-	if limit64 > maxInt64 {
-		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(internal.ErrIntOverflow)
-	}
-	limit := int(limit64)
 
 	readTS := req.GetTs()
 	if readTS == 0 {
 		readTS = snapshotTS(r.coordinator.Clock(), r.store)
 	}
 
-	if r.coordinator != nil && !r.coordinator.IsLeaderForKey(req.StartKey) {
+	// ShardStore already proxies per shard, so avoid forwarding the entire scan
+	// to a single leader address.
+	if r.shouldProxyRawScanAt(req.StartKey) {
 		resp, err := r.tryLeaderScanAt(ctx, req.StartKey, req.EndKey, limit64, readTS)
 		if err != nil {
 			return &pb.RawScanAtResponse{Kv: nil}, err
@@ -156,6 +166,28 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
 	}
 
+	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
+}
+
+func rawScanLimit(limit64 int64) (int, error) {
+	if limit64 < 0 {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	maxInt64 := int64(^uint(0) >> 1)
+	if limit64 > maxInt64 {
+		return 0, errors.WithStack(internal.ErrIntOverflow)
+	}
+	return int(limit64), nil
+}
+
+func (r *GRPCServer) shouldProxyRawScanAt(startKey []byte) bool {
+	if _, ok := r.store.(*kv.ShardStore); ok {
+		return false
+	}
+	return r.coordinator != nil && !r.coordinator.IsLeaderForKey(startKey)
+}
+
+func rawKvPairs(res []*store.KVPair) []*pb.RawKvPair {
 	out := make([]*pb.RawKvPair, 0, len(res))
 	for _, kvp := range res {
 		if kvp == nil {
@@ -166,8 +198,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 			Value: kvp.Value,
 		})
 	}
-
-	return &pb.RawScanAtResponse{Kv: out}, nil
+	return out
 }
 
 func (r *GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -233,13 +264,13 @@ func (r *GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKe
 	return resp, nil
 }
 
-func (r *GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
+func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
 	m, err := r.grpcTranscoder.RawPutToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	res, err := r.coordinator.Dispatch(m)
+	res, err := r.coordinator.Dispatch(ctx, m)
 	if err != nil {
 		return &pb.RawPutResponse{
 			CommitIndex: uint64(0),
@@ -259,7 +290,7 @@ func (r *GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*
 		return nil, errors.WithStack(err)
 	}
 
-	res, err := r.coordinator.Dispatch(m)
+	res, err := r.coordinator.Dispatch(ctx, m)
 	if err != nil {
 		return &pb.RawDeleteResponse{
 			CommitIndex: uint64(0),
@@ -293,7 +324,7 @@ func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespon
 
 	r.log.InfoContext(ctx, "Put", slog.Any("reqs", reqs))
 
-	res, err := r.coordinator.Dispatch(reqs)
+	res, err := r.coordinator.Dispatch(ctx, reqs)
 	if err != nil {
 		return &pb.PutResponse{
 			CommitIndex: uint64(0),
@@ -340,7 +371,7 @@ func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Del
 
 	r.log.InfoContext(ctx, "Delete", slog.Any("reqs", reqs))
 
-	res, err := r.coordinator.Dispatch(reqs)
+	res, err := r.coordinator.Dispatch(ctx, reqs)
 	if err != nil {
 		return &pb.DeleteResponse{
 			CommitIndex: uint64(0),

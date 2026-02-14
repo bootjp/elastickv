@@ -31,7 +31,7 @@ type Coordinate struct {
 var _ Coordinator = (*Coordinate)(nil)
 
 type Coordinator interface {
-	Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error)
+	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
 	VerifyLeader() error
 	RaftLeader() raft.ServerAddress
@@ -41,9 +41,13 @@ type Coordinator interface {
 	Clock() *HLC
 }
 
-func (c *Coordinate) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if !c.IsLeader() {
-		return c.redirect(reqs)
+		return c.redirect(ctx, reqs)
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
@@ -93,24 +97,7 @@ func (c *Coordinate) nextStartTS() uint64 {
 }
 
 func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateResponse, error) {
-	muts := make([]*pb.Mutation, 0, len(reqs))
-	for _, req := range reqs {
-		muts = append(muts, elemToMutation(req))
-	}
-	logs := []*pb.Request{
-		{
-			IsTxn:     true,
-			Phase:     pb.Phase_PREPARE,
-			Ts:        startTS,
-			Mutations: muts,
-		},
-		{
-			IsTxn:     true,
-			Phase:     pb.Phase_COMMIT,
-			Ts:        startTS,
-			Mutations: muts,
-		},
-	}
+	logs := txnRequests(startTS, reqs)
 
 	r, err := c.transactionManager.Commit(logs)
 	if err != nil {
@@ -175,9 +162,7 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 var ErrInvalidRequest = errors.New("invalid request")
 var ErrLeaderNotFound = errors.New("leader not found")
 
-func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
-	ctx := context.Background()
-
+func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if len(reqs.Elems) == 0 {
 		return nil, ErrInvalidRequest
 	}
@@ -197,14 +182,7 @@ func (c *Coordinate) redirect(reqs *OperationGroup[OP]) (*CoordinateResponse, er
 
 	var requests []*pb.Request
 	if reqs.IsTxn {
-		muts := make([]*pb.Mutation, 0, len(reqs.Elems))
-		for _, req := range reqs.Elems {
-			muts = append(muts, elemToMutation(req))
-		}
-		requests = append(requests,
-			&pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: reqs.StartTS, Mutations: muts},
-			&pb.Request{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: reqs.StartTS, Mutations: muts},
-		)
+		requests = txnRequests(reqs.StartTS, reqs.Elems)
 	} else {
 		for _, req := range reqs.Elems {
 			requests = append(requests, c.toRawRequest(req))
@@ -254,4 +232,15 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 		}
 	}
 	panic("unreachable")
+}
+
+func txnRequests(startTS uint64, reqs []*Elem[OP]) []*pb.Request {
+	muts := make([]*pb.Mutation, 0, len(reqs))
+	for _, req := range reqs {
+		muts = append(muts, elemToMutation(req))
+	}
+	return []*pb.Request{
+		{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: muts},
+		{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: muts},
+	}
 }

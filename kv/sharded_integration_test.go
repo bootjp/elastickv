@@ -84,7 +84,7 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
 		},
 	}
-	if _, err := coord.Dispatch(ops); err != nil {
+	if _, err := coord.Dispatch(ctx, ops); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 

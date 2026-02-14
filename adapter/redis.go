@@ -210,7 +210,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	_, err = r.coordinator.Dispatch(res)
+	_, err = r.coordinator.Dispatch(context.Background(), res)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -262,7 +262,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	_, err = r.coordinator.Dispatch(res)
+	_, err = r.coordinator.Dispatch(context.Background(), res)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -704,7 +704,7 @@ func (t *txnContext) commit() error {
 	}
 
 	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS}
-	if _, err := t.server.coordinator.Dispatch(group); err != nil {
+	if _, err := t.server.coordinator.Dispatch(context.Background(), group); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -965,7 +965,7 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 	}
 
 	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
-	if _, err := r.coordinator.Dispatch(group); err != nil {
+	if _, err := r.coordinator.Dispatch(ctx, group); err != nil {
 		return 0, errors.WithStack(err)
 	}
 	return newMeta.Len, nil
@@ -1000,7 +1000,7 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 	_ = meta
 
 	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
-	_, err = r.coordinator.Dispatch(group)
+	_, err = r.coordinator.Dispatch(ctx, group)
 	return errors.WithStack(err)
 }
 
