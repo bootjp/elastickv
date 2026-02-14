@@ -28,6 +28,15 @@ func TestParseRaftGroups(t *testing.T) {
 		}, groups)
 	})
 
+	t.Run("trims whitespace around id", func(t *testing.T) {
+		groups, err := parseRaftGroups("1 = 127.0.0.1:50051, 2=127.0.0.1:50052", "")
+		require.NoError(t, err)
+		require.Equal(t, []groupSpec{
+			{id: 1, address: "127.0.0.1:50051"},
+			{id: 2, address: "127.0.0.1:50052"},
+		}, groups)
+	})
+
 	t.Run("invalid entry", func(t *testing.T) {
 		_, err := parseRaftGroups("nope", "127.0.0.1:50051")
 		require.ErrorIs(t, err, ErrInvalidRaftGroupsEntry)

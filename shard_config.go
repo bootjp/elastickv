@@ -51,9 +51,10 @@ func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 		if len(kv) != splitParts {
 			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "%q", part)
 		}
-		id, err := strconv.ParseUint(kv[0], 10, 64)
+		idRaw := strings.TrimSpace(kv[0])
+		id, err := strconv.ParseUint(idRaw, 10, 64)
 		if err != nil {
-			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "invalid group id %q: %v", kv[0], err)
+			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "invalid group id %q: %v", idRaw, err)
 		}
 		addr := strings.TrimSpace(kv[1])
 		if addr == "" {
