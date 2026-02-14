@@ -36,12 +36,26 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 	if !ok || g.Store == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	if g.Raft != nil && g.Raft.State() == raft.Leader {
+
+	// Some tests use ShardStore without raft; in that case serve reads locally.
+	if g.Raft == nil {
 		val, err := g.Store.GetAt(ctx, key, ts)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 		return val, nil
+	}
+
+	// Verify leadership with a quorum before serving reads from local state to
+	// avoid stale results from a deposed leader.
+	if g.Raft.State() == raft.Leader {
+		if err := g.Raft.VerifyLeader().Error(); err == nil {
+			val, err := g.Store.GetAt(ctx, key, ts)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			return val, nil
+		}
 	}
 	return s.proxyRawGet(ctx, g, key, ts)
 }

@@ -52,44 +52,52 @@ func (r *GRPCServer) Close() error {
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = snapshotTS(r.coordinator.Clock(), r.store)
-	}
-
-	if r.coordinator.IsLeaderForKey(req.Key) {
-		v, err := r.store.GetAt(ctx, req.Key, readTS)
-		if err != nil {
-			switch {
-			case errors.Is(err, store.ErrKeyNotFound):
-				return &pb.RawGetResponse{
-					Value: nil,
-				}, nil
-			default:
-				return nil, errors.WithStack(err)
-			}
+		var clock *kv.HLC
+		if r.coordinator != nil {
+			clock = r.coordinator.Clock()
 		}
-		r.log.InfoContext(ctx, "Get",
-			slog.String("key", string(req.Key)),
-			slog.String("value", string(v)))
-
-		return &pb.RawGetResponse{
-			Value: v,
-		}, nil
+		readTS = snapshotTS(clock, r.store)
 	}
 
-	v, err := r.tryLeaderGet(ctx, req.Key, readTS)
+	v, err := r.rawGetAt(ctx, req.Key, readTS)
 	if err != nil {
-		return &pb.RawGetResponse{
-			Value: nil,
-		}, err
+		switch {
+		case errors.Is(err, store.ErrKeyNotFound):
+			return &pb.RawGetResponse{Value: nil}, nil
+		default:
+			return nil, err
+		}
 	}
 
 	r.log.InfoContext(ctx, "Get",
 		slog.String("key", string(req.Key)),
 		slog.String("value", string(v)))
 
-	return &pb.RawGetResponse{
-		Value: v,
-	}, nil
+	return &pb.RawGetResponse{Value: v}, nil
+}
+
+func (r *GRPCServer) rawGetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	// ShardStore already proxies to the correct shard leader and verifies
+	// leadership before serving reads from local state.
+	if _, ok := r.store.(*kv.ShardStore); ok {
+		v, err := r.store.GetAt(ctx, key, ts)
+		return v, errors.WithStack(err)
+	}
+
+	if r.coordinator == nil {
+		v, err := r.store.GetAt(ctx, key, ts)
+		return v, errors.WithStack(err)
+	}
+
+	if r.coordinator.IsLeaderForKey(key) {
+		// Ensure we are still leader before serving from local state.
+		if err := r.coordinator.VerifyLeaderForKey(key); err == nil {
+			v, err := r.store.GetAt(ctx, key, ts)
+			return v, errors.WithStack(err)
+		}
+	}
+
+	return r.tryLeaderGet(ctx, key, ts)
 }
 
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
@@ -184,7 +192,13 @@ func (r *GRPCServer) shouldProxyRawScanAt(startKey []byte) bool {
 	if _, ok := r.store.(*kv.ShardStore); ok {
 		return false
 	}
-	return r.coordinator != nil && !r.coordinator.IsLeaderForKey(startKey)
+	if r.coordinator == nil {
+		return false
+	}
+	if !r.coordinator.IsLeaderForKey(startKey) {
+		return true
+	}
+	return r.coordinator.VerifyLeaderForKey(startKey) != nil
 }
 
 func rawKvPairs(res []*store.KVPair) []*pb.RawKvPair {
