@@ -19,6 +19,14 @@ type ShardGroup struct {
 
 const txnPhaseCount = 2
 
+// ShardAwareStore is an MVCCStore that can serve reads in a sharded deployment.
+//
+// Implementations must route per-key operations (e.g. LatestCommitTS) to the
+// correct shard leader when needed to avoid returning stale results.
+type ShardAwareStore interface {
+	store.MVCCStore
+}
+
 // ShardedCoordinator routes operations to shard-specific raft groups.
 // It issues timestamps via a shared HLC and uses ShardRouter to dispatch.
 type ShardedCoordinator struct {
@@ -27,12 +35,12 @@ type ShardedCoordinator struct {
 	groups       map[uint64]*ShardGroup
 	defaultGroup uint64
 	clock        *HLC
-	store        store.MVCCStore
+	store        ShardAwareStore
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
-func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
+func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st ShardAwareStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
 	for gid, g := range groups {
 		router.Register(gid, g.Txn, g.Store)
@@ -88,8 +96,6 @@ func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Ele
 		return 0
 	}
 
-	// NOTE: c.store is expected to be shard-aware (e.g. *ShardStore) so that
-	// LatestCommitTS can route keys to the correct shard leader when needed.
 	keys := make([][]byte, 0, len(elems))
 	for _, e := range elems {
 		if e == nil || len(e.Key) == 0 {
