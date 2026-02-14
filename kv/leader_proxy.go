@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"sync"
+	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -10,6 +11,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+const leaderForwardTimeout = 5 * time.Second
 
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
@@ -66,7 +69,10 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 	}
 
 	cli := pb.NewInternalClient(conn)
-	resp, err := cli.Forward(context.Background(), &pb.ForwardRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), leaderForwardTimeout)
+	defer cancel()
+
+	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
 		IsTxn:    reqs[0].IsTxn,
 		Requests: reqs,
 	})

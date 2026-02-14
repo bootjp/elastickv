@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -35,6 +36,8 @@ const (
 	cmdRPush     = "RPUSH"
 	minKeyedArgs = 2
 )
+
+const redisLatestCommitTimeout = 5 * time.Second
 
 //nolint:mnd
 var argsLen = map[string]int{
@@ -811,7 +814,10 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 }
 
 func (r *RedisServer) txnStartTS(queue []redcon.Command) uint64 {
-	maxTS := r.maxLatestCommitTS(queue)
+	ctx, cancel := context.WithTimeout(context.Background(), redisLatestCommitTimeout)
+	defer cancel()
+
+	maxTS := r.maxLatestCommitTS(ctx, queue)
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
@@ -821,7 +827,7 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) uint64 {
 	return r.coordinator.Clock().Next()
 }
 
-func (r *RedisServer) maxLatestCommitTS(queue []redcon.Command) uint64 {
+func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) uint64 {
 	var maxTS uint64
 	if r.store == nil {
 		return maxTS
@@ -835,15 +841,15 @@ func (r *RedisServer) maxLatestCommitTS(queue []redcon.Command) uint64 {
 		switch name {
 		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange:
 			key := cmd.Args[1]
-			r.bumpLatestCommitTS(&maxTS, key, seen)
+			r.bumpLatestCommitTS(ctx, &maxTS, key, seen)
 			// Also account for list metadata keys to avoid stale typing decisions.
-			r.bumpLatestCommitTS(&maxTS, listMetaKey(key), seen)
+			r.bumpLatestCommitTS(ctx, &maxTS, listMetaKey(key), seen)
 		}
 	}
 	return maxTS
 }
 
-func (r *RedisServer) bumpLatestCommitTS(maxTS *uint64, key []byte, seen map[string]struct{}) {
+func (r *RedisServer) bumpLatestCommitTS(ctx context.Context, maxTS *uint64, key []byte, seen map[string]struct{}) {
 	if len(key) == 0 {
 		return
 	}
@@ -852,7 +858,7 @@ func (r *RedisServer) bumpLatestCommitTS(maxTS *uint64, key []byte, seen map[str
 		return
 	}
 	seen[k] = struct{}{}
-	latest, exists, err := r.store.LatestCommitTS(context.Background(), key)
+	latest, exists, err := r.store.LatestCommitTS(ctx, key)
 	if err != nil || !exists {
 		return
 	}

@@ -7,6 +7,7 @@ service RawKV {
   rpc RawGet(RawGetRequest) returns (RawGetResponse) {}
   rpc RawDelete(RawDeleteRequest) returns (RawDeleteResponse) {}
   rpc RawLatestCommitTS(RawLatestCommitTSRequest) returns (RawLatestCommitTSResponse) {}
+  rpc RawScanAt(RawScanAtRequest) returns (RawScanAtResponse) {}
 }
 
 service TransactionalKV {
@@ -56,6 +57,22 @@ message RawLatestCommitTSRequest {
 message RawLatestCommitTSResponse {
   uint64 ts = 1;
   bool exists = 2;
+}
+
+message RawScanAtRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  int64 limit = 3;
+  uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
+}
+
+message RawKvPair {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message RawScanAtResponse {
+  repeated RawKvPair kv = 1;
 }
 
 message PutRequest {

@@ -23,6 +23,7 @@ const (
 	RawKV_RawGet_FullMethodName            = "/RawKV/RawGet"
 	RawKV_RawDelete_FullMethodName         = "/RawKV/RawDelete"
 	RawKV_RawLatestCommitTS_FullMethodName = "/RawKV/RawLatestCommitTS"
+	RawKV_RawScanAt_FullMethodName         = "/RawKV/RawScanAt"
 )
 
 // RawKVClient is the client API for RawKV service.
@@ -33,6 +34,7 @@ type RawKVClient interface {
 	RawGet(ctx context.Context, in *RawGetRequest, opts ...grpc.CallOption) (*RawGetResponse, error)
 	RawDelete(ctx context.Context, in *RawDeleteRequest, opts ...grpc.CallOption) (*RawDeleteResponse, error)
 	RawLatestCommitTS(ctx context.Context, in *RawLatestCommitTSRequest, opts ...grpc.CallOption) (*RawLatestCommitTSResponse, error)
+	RawScanAt(ctx context.Context, in *RawScanAtRequest, opts ...grpc.CallOption) (*RawScanAtResponse, error)
 }
 
 type rawKVClient struct {
@@ -83,6 +85,16 @@ func (c *rawKVClient) RawLatestCommitTS(ctx context.Context, in *RawLatestCommit
 	return out, nil
 }
 
+func (c *rawKVClient) RawScanAt(ctx context.Context, in *RawScanAtRequest, opts ...grpc.CallOption) (*RawScanAtResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RawScanAtResponse)
+	err := c.cc.Invoke(ctx, RawKV_RawScanAt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RawKVServer is the server API for RawKV service.
 // All implementations must embed UnimplementedRawKVServer
 // for forward compatibility
@@ -91,6 +103,7 @@ type RawKVServer interface {
 	RawGet(context.Context, *RawGetRequest) (*RawGetResponse, error)
 	RawDelete(context.Context, *RawDeleteRequest) (*RawDeleteResponse, error)
 	RawLatestCommitTS(context.Context, *RawLatestCommitTSRequest) (*RawLatestCommitTSResponse, error)
+	RawScanAt(context.Context, *RawScanAtRequest) (*RawScanAtResponse, error)
 	mustEmbedUnimplementedRawKVServer()
 }
 
@@ -109,6 +122,9 @@ func (UnimplementedRawKVServer) RawDelete(context.Context, *RawDeleteRequest) (*
 }
 func (UnimplementedRawKVServer) RawLatestCommitTS(context.Context, *RawLatestCommitTSRequest) (*RawLatestCommitTSResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RawLatestCommitTS not implemented")
+}
+func (UnimplementedRawKVServer) RawScanAt(context.Context, *RawScanAtRequest) (*RawScanAtResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RawScanAt not implemented")
 }
 func (UnimplementedRawKVServer) mustEmbedUnimplementedRawKVServer() {}
 
@@ -195,6 +211,24 @@ func _RawKV_RawLatestCommitTS_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RawKV_RawScanAt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RawScanAtRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RawKVServer).RawScanAt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RawKV_RawScanAt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RawKVServer).RawScanAt(ctx, req.(*RawScanAtRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RawKV_ServiceDesc is the grpc.ServiceDesc for RawKV service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -217,6 +251,10 @@ var RawKV_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RawLatestCommitTS",
 			Handler:    _RawKV_RawLatestCommitTS_Handler,
+		},
+		{
+			MethodName: "RawScanAt",
+			Handler:    _RawKV_RawScanAt_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

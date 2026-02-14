@@ -63,6 +63,15 @@ func TestParseShardRanges(t *testing.T) {
 		}, ranges)
 	})
 
+	t.Run("trims whitespace", func(t *testing.T) {
+		ranges, err := parseShardRanges(" a : m = 1 , m :  = 2 ", 1)
+		require.NoError(t, err)
+		require.Equal(t, []rangeSpec{
+			{start: []byte("a"), end: []byte("m"), groupID: 1},
+			{start: []byte("m"), end: nil, groupID: 2},
+		}, ranges)
+	})
+
 	t.Run("invalid entry", func(t *testing.T) {
 		_, err := parseShardRanges("a=1", 1)
 		require.Error(t, err)
@@ -75,11 +84,26 @@ func TestParseShardRanges(t *testing.T) {
 }
 
 func TestParseRaftRedisMap(t *testing.T) {
-	m := parseRaftRedisMap("a=b, c=d")
+	m, err := parseRaftRedisMap("a=b, c=d")
+	require.NoError(t, err)
 	require.Equal(t, map[raft.ServerAddress]string{
 		"a": "b",
 		"c": "d",
 	}, m)
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		m, err := parseRaftRedisMap(" a = b , c = d ")
+		require.NoError(t, err)
+		require.Equal(t, map[raft.ServerAddress]string{
+			"a": "b",
+			"c": "d",
+		}, m)
+	})
+
+	t.Run("invalid entry errors", func(t *testing.T) {
+		_, err := parseRaftRedisMap("a=b, nope")
+		require.Error(t, err)
+	})
 }
 
 func TestDefaultGroupID(t *testing.T) {

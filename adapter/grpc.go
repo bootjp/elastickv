@@ -66,7 +66,7 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 		}, nil
 	}
 
-	v, err := r.tryLeaderGet(req.Key)
+	v, err := r.tryLeaderGet(ctx, req.Key, readTS)
 	if err != nil {
 		return &pb.RawGetResponse{
 			Value: nil,
@@ -117,7 +117,42 @@ func (r GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestComm
 	}, nil
 }
 
-func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
+func (r GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	limit64 := req.GetLimit()
+	if limit64 < 0 {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	maxInt64 := int64(^uint(0) >> 1)
+	if limit64 > maxInt64 {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(internal.ErrIntOverflow)
+	}
+	limit := int(limit64)
+
+	readTS := req.GetTs()
+	if readTS == 0 {
+		readTS = snapshotTS(r.coordinator.Clock(), r.store)
+	}
+
+	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	if err != nil {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
+	}
+
+	out := make([]*pb.RawKvPair, 0, len(res))
+	for _, kvp := range res {
+		if kvp == nil {
+			continue
+		}
+		out = append(out, &pb.RawKvPair{
+			Key:   kvp.Key,
+			Value: kvp.Value,
+		})
+	}
+
+	return &pb.RawScanAtResponse{Kv: out}, nil
+}
+
+func (r GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return nil, ErrLeaderNotFound
@@ -133,8 +168,7 @@ func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
 	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
-	ts := snapshotTS(r.coordinator.Clock(), r.store)
-	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
+	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -54,38 +54,26 @@ func run() error {
 	ctx := context.Background()
 	var lc net.ListenConfig
 
-	groups, err := parseRaftGroups(*raftGroups, *myAddr)
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *raftGroups, *shardRanges, *raftRedisMap)
 	if err != nil {
-		return errors.Wrapf(err, "failed to parse raft groups")
-	}
-	defaultGroup := defaultGroupID(groups)
-	ranges, err := parseShardRanges(*shardRanges, defaultGroup)
-	if err != nil {
-		return errors.Wrapf(err, "failed to parse shard ranges")
-	}
-	if err := validateShardRanges(ranges, groups); err != nil {
-		return errors.Wrapf(err, "invalid shard ranges")
+		return err
 	}
 
-	engine := buildEngine(ranges)
-	leaderRedis := buildLeaderRedis(groups, *redisAddr, *raftRedisMap)
-
-	multi := len(groups) > 1 || *raftGroups != ""
-	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, groups, multi, *raftBootstrap)
+	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, *raftBootstrap)
 	if err != nil {
 		return err
 	}
 
 	clock := kv.NewHLC()
-	shardStore := kv.NewShardStore(engine, shardGroups)
-	coordinate := kv.NewShardedCoordinator(engine, shardGroups, defaultGroup, clock, shardStore)
-	distServer := adapter.NewDistributionServer(engine)
+	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
+	distServer := adapter.NewDistributionServer(cfg.engine)
 
 	eg := errgroup.Group{}
 	if err := startRaftServers(ctx, &lc, &eg, runtimes, shardStore, coordinate, distServer); err != nil {
 		return err
 	}
-	if err := startRedisServer(ctx, &lc, &eg, *redisAddr, shardStore, coordinate, leaderRedis); err != nil {
+	if err := startRedisServer(ctx, &lc, &eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
 		return err
 	}
 
@@ -97,6 +85,43 @@ func run() error {
 
 const snapshotRetainCount = 3
 
+type runtimeConfig struct {
+	groups       []groupSpec
+	defaultGroup uint64
+	engine       *distribution.Engine
+	leaderRedis  map[raft.ServerAddress]string
+	multi        bool
+}
+
+func parseRuntimeConfig(myAddr, redisAddr, raftGroups, shardRanges, raftRedisMap string) (runtimeConfig, error) {
+	groups, err := parseRaftGroups(raftGroups, myAddr)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft groups")
+	}
+	defaultGroup := defaultGroupID(groups)
+	ranges, err := parseShardRanges(shardRanges, defaultGroup)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse shard ranges")
+	}
+	if err := validateShardRanges(ranges, groups); err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "invalid shard ranges")
+	}
+
+	engine := buildEngine(ranges)
+	leaderRedis, err := buildLeaderRedis(groups, redisAddr, raftRedisMap)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft redis map")
+	}
+
+	return runtimeConfig{
+		groups:       groups,
+		defaultGroup: defaultGroup,
+		engine:       engine,
+		leaderRedis:  leaderRedis,
+		multi:        len(groups) > 1 || raftGroups != "",
+	}, nil
+}
+
 func buildEngine(ranges []rangeSpec) *distribution.Engine {
 	engine := distribution.NewEngine()
 	for _, r := range ranges {
@@ -105,12 +130,15 @@ func buildEngine(ranges []rangeSpec) *distribution.Engine {
 	return engine
 }
 
-func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) map[raft.ServerAddress]string {
-	leaderRedis := parseRaftRedisMap(raftRedisMap)
+func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) (map[raft.ServerAddress]string, error) {
+	leaderRedis, err := parseRaftRedisMap(raftRedisMap)
+	if err != nil {
+		return nil, err
+	}
 	for _, g := range groups {
 		leaderRedis[raft.ServerAddress(g.address)] = redisAddr
 	}
-	return leaderRedis
+	return leaderRedis, nil
 }
 
 func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi bool, bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {

@@ -92,30 +92,44 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 }
 
 func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	st := s.groupStore(route.GroupID)
-	if st == nil {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil {
 		return nil, nil
 	}
 
 	routeStart := clampScanStart(start, route.Start)
 	routeEnd := clampScanEnd(end, route.End)
 
-	kvs, err := st.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+	if g.Raft == nil {
+		kvs, err := g.Store.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return kvs, nil
+	}
+
+	// Reads should come from the shard's leader to avoid returning stale or
+	// incomplete results when this node is a follower for a given shard.
+	if g.Raft.State() == raft.Leader {
+		if err := g.Raft.VerifyLeader().Error(); err == nil {
+			kvs, err := g.Store.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			return kvs, nil
+		}
+	}
+
+	kvs, err := s.proxyRawScanAt(ctx, g, routeStart, routeEnd, limit, ts)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	return kvs, nil
 }
 
-func (s *ShardStore) groupStore(groupID uint64) store.MVCCStore {
+func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
 	g, ok := s.groups[groupID]
-	if !ok {
-		return nil
-	}
-	if g == nil {
-		return nil
-	}
-	return g.Store
+	return g, ok
 }
 
 func clampScanStart(start []byte, routeStart []byte) []byte {
@@ -339,6 +353,42 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil
+}
+
+func (s *ShardStore) proxyRawScanAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if g == nil || g.Raft == nil {
+		return nil, store.ErrNotSupported
+	}
+	addr, _ := g.Raft.LeaderWithID()
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	conn, err := s.connFor(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: start,
+		EndKey:   end,
+		Limit:    int64(limit),
+		Ts:       ts,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	out := make([]*store.KVPair, 0, len(resp.Kv))
+	for _, kvp := range resp.Kv {
+		out = append(out, &store.KVPair{
+			Key:   bytes.Clone(kvp.Key),
+			Value: bytes.Clone(kvp.Value),
+		})
+	}
+
+	return out, nil
 }
 
 func (s *ShardStore) connFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {

@@ -9,7 +9,12 @@ cd /root/elastickv/jepsen
 
 # Install Go
 if ! command -v go >/dev/null 2>&1; then
-    GO_VERSION=1.25.5
+    TOOLCHAIN="$(awk '$1 == "toolchain" { print $2 }' ../go.mod 2>/dev/null | head -n1 || true)"
+    if [ -n "${TOOLCHAIN}" ]; then
+        GO_VERSION="${TOOLCHAIN#go}"
+    else
+        GO_VERSION=1.26.0
+    fi
     ARCH="amd64" # Assuming amd64 for now, or detect
     if [ "$(uname -m)" = "aarch64" ]; then ARCH="arm64"; fi
 

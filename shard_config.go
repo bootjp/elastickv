@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 
@@ -81,19 +82,22 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 		if len(kv) != splitParts {
 			return nil, errors.WithStack(errors.Newf("invalid shardRanges entry: %q", part))
 		}
-		groupID, err := strconv.ParseUint(kv[1], 10, 64)
+		groupID, err := strconv.ParseUint(strings.TrimSpace(kv[1]), 10, 64)
 		if err != nil {
 			return nil, errors.Wrapf(err, "invalid group id in %q", part)
 		}
-		rangePart := kv[0]
+		rangePart := strings.TrimSpace(kv[0])
 		bounds := strings.SplitN(rangePart, ":", splitParts)
 		if len(bounds) != splitParts {
 			return nil, errors.WithStack(errors.Newf("invalid range %q (expected start:end)", rangePart))
 		}
-		start := []byte(bounds[0])
+		start := []byte(strings.TrimSpace(bounds[0]))
 		var end []byte
-		if bounds[1] != "" {
-			end = []byte(bounds[1])
+		if endStr := strings.TrimSpace(bounds[1]); endStr != "" {
+			end = []byte(endStr)
+			if bytes.Compare(start, end) >= 0 {
+				return nil, errors.WithStack(errors.Newf("invalid range %q (start must be < end)", rangePart))
+			}
 		}
 		ranges = append(ranges, rangeSpec{start: start, end: end, groupID: groupID})
 	}
@@ -103,10 +107,10 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 	return ranges, nil
 }
 
-func parseRaftRedisMap(raw string) map[raft.ServerAddress]string {
+func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 	out := make(map[raft.ServerAddress]string)
 	if raw == "" {
-		return out
+		return out, nil
 	}
 	parts := strings.Split(raw, ",")
 	for _, part := range parts {
@@ -116,11 +120,16 @@ func parseRaftRedisMap(raw string) map[raft.ServerAddress]string {
 		}
 		kv := strings.SplitN(part, "=", splitParts)
 		if len(kv) != splitParts {
-			continue
+			return nil, errors.WithStack(errors.Newf("invalid raftRedisMap entry: %q", part))
 		}
-		out[raft.ServerAddress(kv[0])] = kv[1]
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == "" || v == "" {
+			return nil, errors.WithStack(errors.Newf("invalid raftRedisMap entry: %q", part))
+		}
+		out[raft.ServerAddress(k)] = v
 	}
-	return out
+	return out, nil
 }
 
 func defaultGroupID(groups []groupSpec) uint64 {

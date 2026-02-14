@@ -130,7 +130,8 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 	defer e.mu.RUnlock()
 
 	var result []Route
-	for _, r := range e.routes {
+	for i := range e.routes {
+		r := &e.routes[i]
 		// Check if route intersects with [start, end)
 		// Route ends before scan starts: rEnd != nil && rEnd <= start
 		if r.End != nil && bytes.Compare(r.End, start) <= 0 {
