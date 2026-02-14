@@ -76,7 +76,31 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 		return []*store.KVPair{}, nil
 	}
 
-	routes := s.engine.GetIntersectingRoutes(start, end)
+	// Determine routing bounds. For internal list keys, routing must be based on
+	// the logical user key rather than the raw internal key prefix, otherwise
+	// sharded scans over list meta/item keys may miss the correct shard.
+	routeStart := start
+	routeEnd := end
+
+	if userKeyStart := store.ExtractListUserKey(start); userKeyStart != nil {
+		// If the end bound is also a list key for the same user key, route over
+		// that user-key range; otherwise, route based on the single user key
+		// implied by the start bound.
+		if end != nil {
+			if userKeyEnd := store.ExtractListUserKey(end); userKeyEnd != nil && bytes.Equal(userKeyStart, userKeyEnd) {
+				routeStart = userKeyStart
+				routeEnd = userKeyEnd
+			} else {
+				routeStart = userKeyStart
+				routeEnd = userKeyStart
+			}
+		} else {
+			routeStart = userKeyStart
+			routeEnd = userKeyStart
+		}
+	}
+
+	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
 	out, err := s.scanRoutesAt(ctx, routes, start, end, limit, ts)
 	if err != nil {
 		return nil, err
