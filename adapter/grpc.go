@@ -147,13 +147,13 @@ func rawScanLimit(limit64 int64) (int, error) {
 	return int(limit64), nil
 }
 
-func rawKvPairs(res []*store.KVPair) []*pb.RawKvPair {
-	out := make([]*pb.RawKvPair, 0, len(res))
+func rawKvPairs(res []*store.KVPair) []*pb.RawKVPair {
+	out := make([]*pb.RawKVPair, 0, len(res))
 	for _, kvp := range res {
 		if kvp == nil {
 			continue
 		}
-		out = append(out, &pb.RawKvPair{
+		out = append(out, &pb.RawKVPair{
 			Key:   kvp.Key,
 			Value: kvp.Value,
 		})

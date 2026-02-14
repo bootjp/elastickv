@@ -66,13 +66,13 @@ message RawScanAtRequest {
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
 }
 
-message RawKvPair {
+message RawKVPair {
   bytes key = 1;
   bytes value = 2;
 }
 
 message RawScanAtResponse {
-  repeated RawKvPair kv = 1;
+  repeated RawKVPair kv = 1;
 }
 
 message PutRequest {
