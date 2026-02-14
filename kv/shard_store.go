@@ -305,16 +305,34 @@ func (s *ShardStore) Restore(_ io.Reader) error {
 func (s *ShardStore) Close() error {
 	var first error
 	for _, g := range s.groups {
-		if g == nil || g.Store == nil {
-			continue
-		}
-		if err := g.Store.Close(); err != nil && first == nil {
-			first = errors.WithStack(err)
+		if err := s.closeGroup(g); err != nil && first == nil {
+			first = err
 		}
 	}
 
 	if err := s.connCache.Close(); err != nil && first == nil {
 		first = err
+	}
+
+	return first
+}
+
+func (s *ShardStore) closeGroup(g *ShardGroup) error {
+	if g == nil {
+		return nil
+	}
+
+	var first error
+	if g.Store != nil {
+		if err := g.Store.Close(); err != nil && first == nil {
+			first = errors.WithStack(err)
+		}
+	}
+
+	if closer, ok := g.Txn.(io.Closer); ok {
+		if err := closer.Close(); err != nil && first == nil {
+			first = errors.WithStack(err)
+		}
 	}
 
 	return first

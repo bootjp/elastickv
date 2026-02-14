@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"io"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -82,3 +83,11 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 }
 
 var _ Transactional = (*LeaderProxy)(nil)
+var _ io.Closer = (*LeaderProxy)(nil)
+
+func (p *LeaderProxy) Close() error {
+	if p == nil {
+		return nil
+	}
+	return p.connCache.Close()
+}
