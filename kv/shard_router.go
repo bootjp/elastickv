@@ -117,10 +117,16 @@ func (s *ShardRouter) getGroup(id uint64) (*routerGroup, bool) {
 func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Request, error) {
 	batches := make(map[uint64][]*pb.Request)
 	for _, r := range reqs {
-		if len(r.Mutations) == 0 {
+		if r == nil {
+			return nil, ErrInvalidRequest
+		}
+		if len(r.Mutations) == 0 || r.Mutations[0] == nil {
 			return nil, ErrInvalidRequest
 		}
 		key := routeKey(r.Mutations[0].Key)
+		if len(key) == 0 {
+			return nil, ErrInvalidRequest
+		}
 		route, ok := s.engine.GetRoute(key)
 		if !ok {
 			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)

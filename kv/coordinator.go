@@ -45,6 +45,11 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		ctx = context.Background()
 	}
 
+	// Validate the request before any use to avoid panics on malformed input.
+	if err := validateOperationGroup(reqs); err != nil {
+		return nil, err
+	}
+
 	if !c.IsLeader() {
 		return c.redirect(ctx, reqs)
 	}

@@ -238,16 +238,12 @@ func (s *LeaderRoutedStore) Restore(buf io.Reader) error {
 }
 
 func (s *LeaderRoutedStore) Close() error {
-	var first error
-	if err := s.connCache.Close(); err != nil && first == nil {
-		first = err
+	if s == nil {
+		return nil
 	}
-	if s.local != nil {
-		if err := s.local.Close(); err != nil && first == nil {
-			first = errors.WithStack(err)
-		}
-	}
-	return first
+	// LeaderRoutedStore is a routing wrapper; it does not own the underlying
+	// store's lifecycle. Close only releases resources owned by the wrapper.
+	return s.connCache.Close()
 }
 
 var _ store.MVCCStore = (*LeaderRoutedStore)(nil)

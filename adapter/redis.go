@@ -36,7 +36,10 @@ const (
 	minKeyedArgs = 2
 )
 
-const redisLatestCommitTimeout = 5 * time.Second
+const (
+	redisLatestCommitTimeout = 5 * time.Second
+	redisDispatchTimeout     = 10 * time.Second
+)
 
 //nolint:mnd
 var argsLen = map[string]int{
@@ -210,7 +213,9 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	_, err = r.coordinator.Dispatch(context.Background(), res)
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	_, err = r.coordinator.Dispatch(ctx, res)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -262,7 +267,9 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	_, err = r.coordinator.Dispatch(context.Background(), res)
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	_, err = r.coordinator.Dispatch(ctx, res)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -704,7 +711,9 @@ func (t *txnContext) commit() error {
 	}
 
 	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS}
-	if _, err := t.server.coordinator.Dispatch(context.Background(), group); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -818,7 +827,7 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 		r.coordinator.Clock().Observe(maxTS)
 	}
 	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return maxTS, nil
+		return maxTS + 1, nil
 	}
 	return r.coordinator.Clock().Next(), nil
 }

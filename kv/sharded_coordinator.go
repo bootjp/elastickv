@@ -85,7 +85,7 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 		c.clock.Observe(maxTS)
 	}
 	if c.clock == nil {
-		return maxTS, nil
+		return maxTS + 1, nil
 	}
 	return c.clock.Next(), nil
 }

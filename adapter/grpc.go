@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
@@ -22,12 +23,24 @@ type GRPCServer struct {
 	coordinator    kv.Coordinator
 	store          store.MVCCStore
 
+	closeStore bool
+	closeOnce  sync.Once
+	closeErr   error
+
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
 }
 
-func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer {
-	return &GRPCServer{
+type GRPCServerOption func(*GRPCServer)
+
+func WithCloseStore() GRPCServerOption {
+	return func(s *GRPCServer) {
+		s.closeStore = true
+	}
+}
+
+func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator, opts ...GRPCServerOption) *GRPCServer {
+	s := &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
@@ -35,10 +48,28 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer
 		coordinator:    coordinate,
 		store:          store,
 	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(s)
+	}
+	return s
 }
 
 func (r *GRPCServer) Close() error {
-	return nil
+	if r == nil {
+		return nil
+	}
+	r.closeOnce.Do(func() {
+		if !r.closeStore || r.store == nil {
+			return
+		}
+		if err := r.store.Close(); err != nil {
+			r.closeErr = errors.WithStack(err)
+		}
+	})
+	return r.closeErr
 }
 
 func (r *GRPCServer) clock() *kv.HLC {
