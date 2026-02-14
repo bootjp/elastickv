@@ -80,30 +80,19 @@ func (c *ShardedCoordinator) nextStartTS(elems []*Elem[OP]) uint64 {
 }
 
 func (c *ShardedCoordinator) maxLatestCommitTS(elems []*Elem[OP]) uint64 {
-	var maxTS uint64
 	if c.store == nil {
-		return maxTS
+		return 0
 	}
-	seen := make(map[string]struct{})
+
+	keys := make([][]byte, 0, len(elems))
 	for _, e := range elems {
 		if e == nil || len(e.Key) == 0 {
 			continue
 		}
-		k := string(e.Key)
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
-
-		latest, exists, err := c.store.LatestCommitTS(context.Background(), e.Key)
-		if err != nil || !exists {
-			continue
-		}
-		if latest > maxTS {
-			maxTS = latest
-		}
+		keys = append(keys, e.Key)
 	}
-	return maxTS
+
+	return MaxLatestCommitTS(context.Background(), c.store, keys)
 }
 
 func (c *ShardedCoordinator) IsLeader() bool {

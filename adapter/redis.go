@@ -818,11 +818,12 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) uint64 {
 }
 
 func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) uint64 {
-	var maxTS uint64
 	if r.store == nil {
-		return maxTS
+		return 0
 	}
-	seen := make(map[string]struct{})
+
+	const txnLatestCommitKeysPerCmd = 2
+	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
 	for _, cmd := range queue {
 		if len(cmd.Args) < minKeyedArgs {
 			continue
@@ -831,30 +832,12 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 		switch name {
 		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange:
 			key := cmd.Args[1]
-			r.bumpLatestCommitTS(ctx, &maxTS, key, seen)
+			keys = append(keys, key)
 			// Also account for list metadata keys to avoid stale typing decisions.
-			r.bumpLatestCommitTS(ctx, &maxTS, listMetaKey(key), seen)
+			keys = append(keys, listMetaKey(key))
 		}
 	}
-	return maxTS
-}
-
-func (r *RedisServer) bumpLatestCommitTS(ctx context.Context, maxTS *uint64, key []byte, seen map[string]struct{}) {
-	if len(key) == 0 {
-		return
-	}
-	k := string(key)
-	if _, ok := seen[k]; ok {
-		return
-	}
-	seen[k] = struct{}{}
-	latest, exists, err := r.store.LatestCommitTS(ctx, key)
-	if err != nil || !exists {
-		return
-	}
-	if latest > *maxTS {
-		*maxTS = latest
-	}
+	return kv.MaxLatestCommitTS(ctx, r.store, keys)
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
