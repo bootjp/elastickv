@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -26,11 +27,12 @@ type ShardedCoordinator struct {
 	groups       map[uint64]*ShardGroup
 	defaultGroup uint64
 	clock        *HLC
+	store        store.MVCCStore
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
-func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC) *ShardedCoordinator {
+func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
 	for gid, g := range groups {
 		router.Register(gid, g.Txn, g.Store)
@@ -41,6 +43,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		groups:       groups,
 		defaultGroup: defaultGroup,
 		clock:        clock,
+		store:        st,
 	}
 }
 
@@ -50,7 +53,7 @@ func (c *ShardedCoordinator) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResp
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
-		reqs.StartTS = c.clock.Next()
+		reqs.StartTS = c.nextStartTS(reqs.Elems)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -63,6 +66,44 @@ func (c *ShardedCoordinator) Dispatch(reqs *OperationGroup[OP]) (*CoordinateResp
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+}
+
+func (c *ShardedCoordinator) nextStartTS(elems []*Elem[OP]) uint64 {
+	maxTS := c.maxLatestCommitTS(elems)
+	if c.clock != nil && maxTS > 0 {
+		c.clock.Observe(maxTS)
+	}
+	if c.clock == nil {
+		return maxTS
+	}
+	return c.clock.Next()
+}
+
+func (c *ShardedCoordinator) maxLatestCommitTS(elems []*Elem[OP]) uint64 {
+	var maxTS uint64
+	if c.store == nil {
+		return maxTS
+	}
+	seen := make(map[string]struct{})
+	for _, e := range elems {
+		if e == nil || len(e.Key) == 0 {
+			continue
+		}
+		k := string(e.Key)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+
+		latest, exists, err := c.store.LatestCommitTS(context.Background(), e.Key)
+		if err != nil || !exists {
+			continue
+		}
+		if latest > maxTS {
+			maxTS = latest
+		}
+	}
+	return maxTS
 }
 
 func (c *ShardedCoordinator) IsLeader() bool {

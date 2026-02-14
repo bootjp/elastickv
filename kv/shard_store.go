@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"sort"
+	"sync"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -19,6 +20,9 @@ import (
 type ShardStore struct {
 	engine *distribution.Engine
 	groups map[uint64]*ShardGroup
+
+	connMu sync.Mutex
+	conns  map[raft.ServerAddress]*grpc.ClientConn
 }
 
 // NewShardStore creates a sharded MVCC store wrapper.
@@ -60,21 +64,12 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 		return []*store.KVPair{}, nil
 	}
 
-	// Get only the routes whose ranges intersect with [start, end)
-	intersectingRoutes := s.engine.GetIntersectingRoutes(start, end)
-
-	var out []*store.KVPair
-	for _, route := range intersectingRoutes {
-		g, ok := s.groups[route.GroupID]
-		if !ok || g == nil || g.Store == nil {
-			continue
-		}
-		kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		out = append(out, kvs...)
+	routes := s.engine.GetIntersectingRoutes(start, end)
+	out, err := s.scanRoutesAt(ctx, routes, start, end, limit, ts)
+	if err != nil {
+		return nil, err
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
@@ -82,6 +77,68 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0)
+	for _, route := range routes {
+		kvs, err := s.scanRouteAt(ctx, route, start, end, limit, ts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, kvs...)
+	}
+	return out, nil
+}
+
+func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	st := s.groupStore(route.GroupID)
+	if st == nil {
+		return nil, nil
+	}
+
+	routeStart := clampScanStart(start, route.Start)
+	routeEnd := clampScanEnd(end, route.End)
+
+	kvs, err := st.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return kvs, nil
+}
+
+func (s *ShardStore) groupStore(groupID uint64) store.MVCCStore {
+	g, ok := s.groups[groupID]
+	if !ok {
+		return nil
+	}
+	if g == nil {
+		return nil
+	}
+	return g.Store
+}
+
+func clampScanStart(start []byte, routeStart []byte) []byte {
+	if start == nil {
+		return routeStart
+	}
+	if bytes.Compare(start, routeStart) < 0 {
+		return routeStart
+	}
+	return start
+}
+
+func clampScanEnd(end []byte, routeEnd []byte) []byte {
+	if routeEnd == nil {
+		return end
+	}
+	if end == nil {
+		return routeEnd
+	}
+	if bytes.Compare(end, routeEnd) > 0 {
+		return routeEnd
+	}
+	return end
 }
 
 func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
@@ -121,11 +178,50 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 	if !ok || g.Store == nil {
 		return 0, false, nil
 	}
-	ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+
+	if g.Raft == nil {
+		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		if err != nil {
+			return 0, false, errors.WithStack(err)
+		}
+		return ts, exists, nil
+	}
+
+	// Avoid returning a stale watermark when our local raft instance is a
+	// deposed leader.
+	if g.Raft.State() == raft.Leader {
+		if err := g.Raft.VerifyLeader().Error(); err == nil {
+			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+			if err != nil {
+				return 0, false, errors.WithStack(err)
+			}
+			return ts, exists, nil
+		}
+	}
+
+	return s.proxyLatestCommitTS(ctx, g, key)
+}
+
+func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key []byte) (uint64, bool, error) {
+	if g == nil || g.Raft == nil {
+		return 0, false, nil
+	}
+	addr, _ := g.Raft.LeaderWithID()
+	if addr == "" {
+		return 0, false, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	conn, err := s.connFor(addr)
+	if err != nil {
+		return 0, false, err
+	}
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	return ts, exists, nil
+	return resp.Ts, resp.Exists, nil
 }
 
 func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, startTS, commitTS uint64) error {
@@ -194,6 +290,20 @@ func (s *ShardStore) Close() error {
 			first = errors.WithStack(err)
 		}
 	}
+
+	s.connMu.Lock()
+	conns := s.conns
+	s.conns = nil
+	s.connMu.Unlock()
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		if err := conn.Close(); err != nil && first == nil {
+			first = errors.WithStack(err)
+		}
+	}
+
 	return first
 }
 
@@ -215,14 +325,10 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := s.connFor(addr)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
-	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
@@ -233,6 +339,32 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil
+}
+
+func (s *ShardStore) connFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	if s.conns == nil {
+		s.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
+	}
+	if conn, ok := s.conns[addr]; ok && conn != nil {
+		return conn, nil
+	}
+
+	conn, err := grpc.NewClient(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	s.conns[addr] = conn
+	return conn, nil
 }
 
 var _ store.MVCCStore = (*ShardStore)(nil)

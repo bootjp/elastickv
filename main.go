@@ -77,8 +77,8 @@ func run() error {
 	}
 
 	clock := kv.NewHLC()
-	coordinate := kv.NewShardedCoordinator(engine, shardGroups, defaultGroup, clock)
 	shardStore := kv.NewShardStore(engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(engine, shardGroups, defaultGroup, clock, shardStore)
 	distServer := adapter.NewDistributionServer(engine)
 
 	eg := errgroup.Group{}

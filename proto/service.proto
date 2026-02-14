@@ -6,6 +6,7 @@ service RawKV {
   rpc RawPut(RawPutRequest) returns (RawPutResponse) {}
   rpc RawGet(RawGetRequest) returns (RawGetResponse) {}
   rpc RawDelete(RawDeleteRequest) returns (RawDeleteResponse) {}
+  rpc RawLatestCommitTS(RawLatestCommitTSRequest) returns (RawLatestCommitTSResponse) {}
 }
 
 service TransactionalKV {
@@ -46,6 +47,15 @@ message RawDeleteRequest {
 message RawDeleteResponse {
   uint64 commit_index = 1;
   bool success = 2;
+}
+
+message RawLatestCommitTSRequest {
+  bytes key = 1;
+}
+
+message RawLatestCommitTSResponse {
+  uint64 ts = 1;
+  bool exists = 2;
 }
 
 message PutRequest {

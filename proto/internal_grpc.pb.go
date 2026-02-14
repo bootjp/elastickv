@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.4.0
 // - protoc             v5.29.3
-// source: proto/internal.proto
+// source: internal.proto
 
 package proto
 
@@ -108,5 +108,5 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/internal.proto",
+	Metadata: "internal.proto",
 }

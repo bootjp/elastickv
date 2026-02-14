@@ -74,8 +74,8 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 		2: {Raft: r2, Store: s2, Txn: NewLeaderProxy(r2)},
 	}
 
-	coord := NewShardedCoordinator(engine, groups, 1, NewHLC())
 	shardStore := NewShardStore(engine, groups)
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)
 
 	ops := &OperationGroup[OP]{
 		IsTxn: false,

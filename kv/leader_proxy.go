@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"sync"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -15,6 +16,9 @@ import (
 type LeaderProxy struct {
 	raft *raft.Raft
 	tm   *TransactionManager
+
+	connMu sync.Mutex
+	conns  map[raft.ServerAddress]*grpc.ClientConn
 }
 
 // NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
@@ -26,17 +30,25 @@ func NewLeaderProxy(r *raft.Raft) *LeaderProxy {
 }
 
 func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	if p.raft.State() == raft.Leader {
-		return p.tm.Commit(reqs)
+	if p.raft.State() != raft.Leader {
+		return p.forward(reqs)
 	}
-	return p.forward(reqs)
+	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
+	if err := p.raft.VerifyLeader().Error(); err != nil {
+		return p.forward(reqs)
+	}
+	return p.tm.Commit(reqs)
 }
 
 func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
-	if p.raft.State() == raft.Leader {
-		return p.tm.Abort(reqs)
+	if p.raft.State() != raft.Leader {
+		return p.forward(reqs)
 	}
-	return p.forward(reqs)
+	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
+	if err := p.raft.VerifyLeader().Error(); err != nil {
+		return p.forward(reqs)
+	}
+	return p.tm.Abort(reqs)
 }
 
 func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
@@ -48,14 +60,10 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := p.connFor(addr)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
-	defer conn.Close()
 
 	cli := pb.NewInternalClient(conn)
 	resp, err := cli.Forward(context.Background(), &pb.ForwardRequest{
@@ -69,6 +77,32 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 		return nil, ErrInvalidRequest
 	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+}
+
+func (p *LeaderProxy) connFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+
+	if p.conns == nil {
+		p.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
+	}
+	if conn, ok := p.conns[addr]; ok && conn != nil {
+		return conn, nil
+	}
+
+	conn, err := grpc.NewClient(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	p.conns[addr] = conn
+	return conn, nil
 }
 
 var _ Transactional = (*LeaderProxy)(nil)

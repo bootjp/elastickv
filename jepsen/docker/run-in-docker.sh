@@ -12,16 +12,27 @@ if ! command -v go >/dev/null 2>&1; then
     GO_VERSION=1.25.5
     ARCH="amd64" # Assuming amd64 for now, or detect
     if [ "$(uname -m)" = "aarch64" ]; then ARCH="arm64"; fi
-    
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o go.tar.gz
-    tar -C /usr/local -xzf go.tar.gz
+
+    TARBALL="go${GO_VERSION}.linux-${ARCH}.tar.gz"
+    curl -fsSL "https://go.dev/dl/${TARBALL}" -o "${TARBALL}"
+    curl -fsSL "https://go.dev/dl/${TARBALL}.sha256" -o "${TARBALL}.sha256"
+
+    expected_sha256="$(awk '{print $1}' < "${TARBALL}.sha256")"
+    actual_sha256="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+    if [ "${expected_sha256}" != "${actual_sha256}" ]; then
+        echo "Go toolchain checksum mismatch for ${TARBALL}" >&2
+        exit 1
+    fi
+
+    tar -C /usr/local -xzf "${TARBALL}"
+    rm -f "${TARBALL}" "${TARBALL}.sha256"
     export PATH=$PATH:/usr/local/go/bin
 fi
 
 # Install Leiningen
 if ! command -v lein >/dev/null 2>&1; then
-    curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > /usr/local/bin/lein
-    chmod +x /usr/local/bin/lein
+    apt-get update -y
+    apt-get install -y --no-install-recommends leiningen
 fi
 
 # Generate or install SSH key for control node to connect to others

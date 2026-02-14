@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.4.0
 // - protoc             v5.29.3
-// source: proto/service.proto
+// source: service.proto
 
 package proto
 
@@ -19,9 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion8
 
 const (
-	RawKV_RawPut_FullMethodName    = "/RawKV/RawPut"
-	RawKV_RawGet_FullMethodName    = "/RawKV/RawGet"
-	RawKV_RawDelete_FullMethodName = "/RawKV/RawDelete"
+	RawKV_RawPut_FullMethodName            = "/RawKV/RawPut"
+	RawKV_RawGet_FullMethodName            = "/RawKV/RawGet"
+	RawKV_RawDelete_FullMethodName         = "/RawKV/RawDelete"
+	RawKV_RawLatestCommitTS_FullMethodName = "/RawKV/RawLatestCommitTS"
 )
 
 // RawKVClient is the client API for RawKV service.
@@ -31,6 +32,7 @@ type RawKVClient interface {
 	RawPut(ctx context.Context, in *RawPutRequest, opts ...grpc.CallOption) (*RawPutResponse, error)
 	RawGet(ctx context.Context, in *RawGetRequest, opts ...grpc.CallOption) (*RawGetResponse, error)
 	RawDelete(ctx context.Context, in *RawDeleteRequest, opts ...grpc.CallOption) (*RawDeleteResponse, error)
+	RawLatestCommitTS(ctx context.Context, in *RawLatestCommitTSRequest, opts ...grpc.CallOption) (*RawLatestCommitTSResponse, error)
 }
 
 type rawKVClient struct {
@@ -71,6 +73,16 @@ func (c *rawKVClient) RawDelete(ctx context.Context, in *RawDeleteRequest, opts 
 	return out, nil
 }
 
+func (c *rawKVClient) RawLatestCommitTS(ctx context.Context, in *RawLatestCommitTSRequest, opts ...grpc.CallOption) (*RawLatestCommitTSResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RawLatestCommitTSResponse)
+	err := c.cc.Invoke(ctx, RawKV_RawLatestCommitTS_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RawKVServer is the server API for RawKV service.
 // All implementations must embed UnimplementedRawKVServer
 // for forward compatibility
@@ -78,6 +90,7 @@ type RawKVServer interface {
 	RawPut(context.Context, *RawPutRequest) (*RawPutResponse, error)
 	RawGet(context.Context, *RawGetRequest) (*RawGetResponse, error)
 	RawDelete(context.Context, *RawDeleteRequest) (*RawDeleteResponse, error)
+	RawLatestCommitTS(context.Context, *RawLatestCommitTSRequest) (*RawLatestCommitTSResponse, error)
 	mustEmbedUnimplementedRawKVServer()
 }
 
@@ -93,6 +106,9 @@ func (UnimplementedRawKVServer) RawGet(context.Context, *RawGetRequest) (*RawGet
 }
 func (UnimplementedRawKVServer) RawDelete(context.Context, *RawDeleteRequest) (*RawDeleteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RawDelete not implemented")
+}
+func (UnimplementedRawKVServer) RawLatestCommitTS(context.Context, *RawLatestCommitTSRequest) (*RawLatestCommitTSResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RawLatestCommitTS not implemented")
 }
 func (UnimplementedRawKVServer) mustEmbedUnimplementedRawKVServer() {}
 
@@ -161,6 +177,24 @@ func _RawKV_RawDelete_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RawKV_RawLatestCommitTS_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RawLatestCommitTSRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RawKVServer).RawLatestCommitTS(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RawKV_RawLatestCommitTS_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RawKVServer).RawLatestCommitTS(ctx, req.(*RawLatestCommitTSRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RawKV_ServiceDesc is the grpc.ServiceDesc for RawKV service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -180,9 +214,13 @@ var RawKV_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "RawDelete",
 			Handler:    _RawKV_RawDelete_Handler,
 		},
+		{
+			MethodName: "RawLatestCommitTS",
+			Handler:    _RawKV_RawLatestCommitTS_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/service.proto",
+	Metadata: "service.proto",
 }
 
 const (
@@ -501,5 +539,5 @@ var TransactionalKV_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/service.proto",
+	Metadata: "service.proto",
 }

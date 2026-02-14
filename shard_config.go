@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -31,7 +30,7 @@ var (
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 	if raw == "" {
 		if defaultAddr == "" {
-			return nil, ErrAddressRequired
+			return nil, errors.WithStack(ErrAddressRequired)
 		}
 		return []groupSpec{{id: 1, address: defaultAddr}}, nil
 	}
@@ -62,7 +61,7 @@ func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 		groups = append(groups, groupSpec{id: id, address: addr})
 	}
 	if len(groups) == 0 {
-		return nil, ErrNoRaftGroupsConfigured
+		return nil, errors.WithStack(ErrNoRaftGroupsConfigured)
 	}
 	return groups, nil
 }
@@ -99,7 +98,7 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 		ranges = append(ranges, rangeSpec{start: start, end: end, groupID: groupID})
 	}
 	if len(ranges) == 0 {
-		return nil, ErrNoShardRangesConfigured
+		return nil, errors.WithStack(ErrNoShardRangesConfigured)
 	}
 	return ranges, nil
 }
@@ -144,7 +143,7 @@ func validateShardRanges(ranges []rangeSpec, groups []groupSpec) error {
 	}
 	for _, r := range ranges {
 		if _, ok := ids[r.groupID]; !ok {
-			return fmt.Errorf("shard range references unknown group %d", r.groupID)
+			return errors.WithStack(errors.Newf("shard range references unknown group %d", r.groupID))
 		}
 	}
 	return nil

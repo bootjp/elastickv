@@ -82,6 +82,41 @@ func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawG
 	}, nil
 }
 
+func (r GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	key := req.GetKey()
+	if len(key) == 0 {
+		return nil, errors.WithStack(kv.ErrInvalidRequest)
+	}
+
+	if r.coordinator.IsLeaderForKey(key) {
+		// Ensure we are still leader before serving from local state.
+		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		ts, exists, err := r.store.LatestCommitTS(ctx, key)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &pb.RawLatestCommitTSResponse{
+			Ts:     ts,
+			Exists: exists,
+		}, nil
+	}
+
+	ts, exists, err := r.tryLeaderLatestCommitTS(ctx, key)
+	if err != nil {
+		return &pb.RawLatestCommitTSResponse{
+			Ts:     0,
+			Exists: false,
+		}, err
+	}
+
+	return &pb.RawLatestCommitTSResponse{
+		Ts:     ts,
+		Exists: exists,
+	}, nil
+}
+
 func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
 	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
@@ -105,6 +140,29 @@ func (r GRPCServer) tryLeaderGet(key []byte) ([]byte, error) {
 	}
 
 	return resp.Value, nil
+}
+
+func (r GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	addr := r.coordinator.RaftLeaderForKey(key)
+	if addr == "" {
+		return 0, false, ErrLeaderNotFound
+	}
+
+	conn, err := grpc.NewClient(string(addr),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	defer conn.Close()
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return resp.Ts, resp.Exists, nil
 }
 
 func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
