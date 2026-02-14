@@ -778,7 +778,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
-	startTS := r.txnStartTS(queue)
+	startTS, err := r.txnStartTS(queue)
+	if err != nil {
+		return nil, err
+	}
 
 	ctx := &txnContext{
 		server:     r,
@@ -803,23 +806,26 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return results, nil
 }
 
-func (r *RedisServer) txnStartTS(queue []redcon.Command) uint64 {
+func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisLatestCommitTimeout)
 	defer cancel()
 
-	maxTS := r.maxLatestCommitTS(ctx, queue)
+	maxTS, err := r.maxLatestCommitTS(ctx, queue)
+	if err != nil {
+		return 0, err
+	}
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
 	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return maxTS
+		return maxTS, nil
 	}
-	return r.coordinator.Clock().Next()
+	return r.coordinator.Clock().Next(), nil
 }
 
-func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) uint64 {
+func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) (uint64, error) {
 	if r.store == nil {
-		return 0
+		return 0, nil
 	}
 
 	// NOTE: This currently calls LatestCommitTS for each (unique) key involved in
@@ -841,7 +847,11 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 			keys = append(keys, listMetaKey(key))
 		}
 	}
-	return kv.MaxLatestCommitTS(ctx, r.store, keys)
+	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return ts, nil
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {

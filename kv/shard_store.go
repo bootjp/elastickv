@@ -298,10 +298,7 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 			return store.ErrNotSupported
 		}
 		if g != firstGroup {
-			return errors.WithStack(errors.Mark(
-				errors.Wrap(store.ErrNotSupported, ErrCrossShardMutationBatchNotSupported.Error()),
-				ErrCrossShardMutationBatchNotSupported,
-			))
+			return errors.WithStack(ErrCrossShardMutationBatchNotSupported)
 		}
 	}
 	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, startTS, commitTS))

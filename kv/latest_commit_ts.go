@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -12,16 +13,16 @@ const maxLatestCommitTSConcurrency = 16
 
 // MaxLatestCommitTS returns the maximum commit timestamp for the provided keys.
 //
-// This is best-effort: missing keys and lookup errors are ignored, matching the
-// behavior of existing callers.
-func MaxLatestCommitTS(ctx context.Context, st store.MVCCStore, keys [][]byte) uint64 {
+// Missing keys are ignored. If any LatestCommitTS lookup returns an error, the
+// error is returned to the caller.
+func MaxLatestCommitTS(ctx context.Context, st store.MVCCStore, keys [][]byte) (uint64, error) {
 	if st == nil || len(keys) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	uniq := uniqueKeys(keys)
 	if len(uniq) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	// Avoid goroutine overhead for tiny inputs.
@@ -57,10 +58,13 @@ func uniqueKeys(keys [][]byte) [][]byte {
 	return uniq
 }
 
-func maxLatestCommitTSSequential(ctx context.Context, st store.MVCCStore, keys [][]byte) uint64 {
+func maxLatestCommitTSSequential(ctx context.Context, st store.MVCCStore, keys [][]byte) (uint64, error) {
 	var maxTS uint64
 	for _, key := range keys {
-		ts, exists, _ := st.LatestCommitTS(ctx, key)
+		ts, exists, err := st.LatestCommitTS(ctx, key)
+		if err != nil {
+			return 0, errors.WithStack(err)
+		}
 		if !exists {
 			continue
 		}
@@ -68,10 +72,10 @@ func maxLatestCommitTSSequential(ctx context.Context, st store.MVCCStore, keys [
 			maxTS = ts
 		}
 	}
-	return maxTS
+	return maxTS, nil
 }
 
-func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][]byte, limit int) uint64 {
+func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][]byte, limit int) (uint64, error) {
 	eg, egctx := errgroup.WithContext(ctx)
 	eg.SetLimit(limit)
 
@@ -80,7 +84,10 @@ func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][
 	for i := range keys {
 		key := keys[i]
 		eg.Go(func() error {
-			ts, exists, _ := st.LatestCommitTS(egctx, key)
+			ts, exists, err := st.LatestCommitTS(egctx, key)
+			if err != nil {
+				return errors.WithStack(err)
+			}
 			if !exists {
 				return nil
 			}
@@ -92,6 +99,8 @@ func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][
 			return nil
 		})
 	}
-	_ = eg.Wait()
-	return maxTS
+	if err := eg.Wait(); err != nil {
+		return 0, err
+	}
+	return maxTS, nil
 }

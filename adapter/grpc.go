@@ -41,14 +41,17 @@ func (r *GRPCServer) Close() error {
 	return nil
 }
 
+func (r *GRPCServer) clock() *kv.HLC {
+	if r == nil || r.coordinator == nil {
+		return nil
+	}
+	return r.coordinator.Clock()
+}
+
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {
-		var clock *kv.HLC
-		if r.coordinator != nil {
-			clock = r.coordinator.Clock()
-		}
-		readTS = snapshotTS(clock, r.store)
+		readTS = snapshotTS(r.clock(), r.store)
 	}
 
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
@@ -91,7 +94,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = snapshotTS(r.coordinator.Clock(), r.store)
+		readTS = snapshotTS(r.clock(), r.store)
 	}
 
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
@@ -206,7 +209,7 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 		return nil, errors.WithStack(err)
 	}
 
-	readTS := snapshotTS(r.coordinator.Clock(), r.store)
+	readTS := snapshotTS(r.clock(), r.store)
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	if err != nil {
 		switch {
@@ -254,7 +257,7 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, errors.WithStack(err)
 	}
-	readTS := snapshotTS(r.coordinator.Clock(), r.store)
+	readTS := snapshotTS(r.clock(), r.store)
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return &pb.ScanResponse{

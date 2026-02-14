@@ -28,11 +28,18 @@ func TestMaxLatestCommitTS_Empty(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	require.Equal(t, uint64(0), MaxLatestCommitTS(ctx, nil, nil))
+	ts, err := MaxLatestCommitTS(ctx, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), ts)
 
 	st := store.NewMVCCStore()
-	require.Equal(t, uint64(0), MaxLatestCommitTS(ctx, st, nil))
-	require.Equal(t, uint64(0), MaxLatestCommitTS(ctx, st, [][]byte{nil, {}}))
+	ts, err = MaxLatestCommitTS(ctx, st, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), ts)
+
+	ts, err = MaxLatestCommitTS(ctx, st, [][]byte{nil, {}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), ts)
 }
 
 func TestMaxLatestCommitTS_SingleKey(t *testing.T) {
@@ -42,7 +49,9 @@ func TestMaxLatestCommitTS_SingleKey(t *testing.T) {
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
 
-	require.Equal(t, uint64(10), MaxLatestCommitTS(ctx, st, [][]byte{[]byte("k1")}))
+	ts, err := MaxLatestCommitTS(ctx, st, [][]byte{[]byte("k1")})
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), ts)
 }
 
 func TestMaxLatestCommitTS_DeduplicatesKeys(t *testing.T) {
@@ -59,10 +68,12 @@ func TestMaxLatestCommitTS_DeduplicatesKeys(t *testing.T) {
 		[]byte("a"),
 		[]byte("b"),
 	}
-	require.Equal(t, uint64(20), MaxLatestCommitTS(ctx, st, keys))
+	ts, err := MaxLatestCommitTS(ctx, st, keys)
+	require.NoError(t, err)
+	require.Equal(t, uint64(20), ts)
 }
 
-func TestMaxLatestCommitTS_IgnoresErrors(t *testing.T) {
+func TestMaxLatestCommitTS_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -73,5 +84,8 @@ func TestMaxLatestCommitTS_IgnoresErrors(t *testing.T) {
 		MVCCStore: st,
 		key:       []byte("b"),
 	}
-	require.Equal(t, uint64(10), MaxLatestCommitTS(ctx, wrapped, [][]byte{[]byte("a"), []byte("b")}))
+	ts, err := MaxLatestCommitTS(ctx, wrapped, [][]byte{[]byte("a"), []byte("b")})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTestLatestCommitTS))
+	require.Equal(t, uint64(0), ts)
 }

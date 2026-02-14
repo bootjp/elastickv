@@ -57,7 +57,11 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
-		reqs.StartTS = c.nextStartTS(ctx, reqs.Elems)
+		startTS, err := c.nextStartTS(ctx, reqs.Elems)
+		if err != nil {
+			return nil, err
+		}
+		reqs.StartTS = startTS
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -72,20 +76,23 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
 }
 
-func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP]) uint64 {
-	maxTS := c.maxLatestCommitTS(ctx, elems)
+func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP]) (uint64, error) {
+	maxTS, err := c.maxLatestCommitTS(ctx, elems)
+	if err != nil {
+		return 0, err
+	}
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
 	if c.clock == nil {
-		return maxTS
+		return maxTS, nil
 	}
-	return c.clock.Next()
+	return c.clock.Next(), nil
 }
 
-func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Elem[OP]) uint64 {
+func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Elem[OP]) (uint64, error) {
 	if c.store == nil {
-		return 0
+		return 0, nil
 	}
 
 	keys := make([][]byte, 0, len(elems))
@@ -199,6 +206,11 @@ func validateOperationGroup(reqs *OperationGroup[OP]) error {
 	if reqs == nil || len(reqs.Elems) == 0 {
 		return ErrInvalidRequest
 	}
+	for _, e := range reqs.Elems {
+		if e == nil {
+			return ErrInvalidRequest
+		}
+	}
 	return nil
 }
 
@@ -223,11 +235,11 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 		return nil, err
 	}
 	if len(gids) > 1 {
-		return nil, errors.WithStack(errors.Wrapf(
+		return nil, errors.Wrapf(
 			ErrCrossShardTransactionNotSupported,
 			"involved_shards=%v",
 			gids,
-		))
+		)
 	}
 	return buildTxnLogs(reqs.StartTS, grouped, gids), nil
 }
@@ -235,6 +247,9 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
 	grouped := make(map[uint64][]*pb.Mutation)
 	for _, req := range reqs {
+		if req == nil {
+			return nil, nil, ErrInvalidRequest
+		}
 		mut := elemToMutation(req)
 		route, ok := c.engine.GetRoute(routeKey(mut.Key))
 		if !ok {

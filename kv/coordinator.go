@@ -6,8 +6,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
@@ -26,6 +24,7 @@ type Coordinate struct {
 	transactionManager Transactional
 	raft               *raft.Raft
 	clock              *HLC
+	connCache          GRPCConnCache
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -168,15 +167,14 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	addr, _ := c.raft.LeaderWithID()
-
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
-	defer conn.Close()
+
+	conn, err := c.connCache.ConnFor(addr)
+	if err != nil {
+		return nil, err
+	}
 
 	cli := pb.NewInternalClient(conn)
 
@@ -239,8 +237,12 @@ func txnRequests(startTS uint64, reqs []*Elem[OP]) []*pb.Request {
 	for _, req := range reqs {
 		muts = append(muts, elemToMutation(req))
 	}
+
+	// Use separate slices for PREPARE and COMMIT to avoid sharing slice header/state.
+	prepareMuts := append([]*pb.Mutation(nil), muts...)
+	commitMuts := append([]*pb.Mutation(nil), muts...)
 	return []*pb.Request{
-		{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: muts},
-		{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: muts},
+		{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: prepareMuts},
+		{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: commitMuts},
 	}
 }
