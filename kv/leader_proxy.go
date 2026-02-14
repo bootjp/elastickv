@@ -17,7 +17,7 @@ type LeaderProxy struct {
 	raft *raft.Raft
 	tm   *TransactionManager
 
-	connCache grpcConnCache
+	connCache GRPCConnCache
 }
 
 // NewLeaderProxy creates a leader-aware transactional proxy for a raft group.

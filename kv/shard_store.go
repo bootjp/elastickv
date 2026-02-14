@@ -18,7 +18,7 @@ type ShardStore struct {
 	engine *distribution.Engine
 	groups map[uint64]*ShardGroup
 
-	connCache grpcConnCache
+	connCache GRPCConnCache
 }
 
 // NewShardStore creates a sharded MVCC store wrapper.
@@ -78,7 +78,11 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	for _, route := range routes {
-		kvs, err := s.scanRouteAt(ctx, route, start, end, limit, ts)
+		remaining := limit - len(out)
+		if remaining <= 0 {
+			break
+		}
+		kvs, err := s.scanRouteAt(ctx, route, start, end, remaining, ts)
 		if err != nil {
 			return nil, err
 		}

@@ -10,15 +10,15 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// grpcConnCache reuses gRPC connections per address. gRPC itself handles
+// GRPCConnCache reuses gRPC connections per address. gRPC itself handles
 // reconnection on transient failures; we only force a re-dial if the conn has
 // already been closed (Shutdown).
-type grpcConnCache struct {
+type GRPCConnCache struct {
 	mu    sync.Mutex
 	conns map[raft.ServerAddress]*grpc.ClientConn
 }
 
-func (c *grpcConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
+func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
@@ -51,7 +51,7 @@ func (c *grpcConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, erro
 	return conn, nil
 }
 
-func (c *grpcConnCache) Close() error {
+func (c *GRPCConnCache) Close() error {
 	c.mu.Lock()
 	conns := c.conns
 	c.conns = nil
