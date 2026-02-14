@@ -18,26 +18,61 @@ type GRPCConnCache struct {
 	conns map[raft.ServerAddress]*grpc.ClientConn
 }
 
-func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
-	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
-	}
-
+func (c *GRPCConnCache) cachedConn(addr raft.ServerAddress) *grpc.ClientConn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conns == nil {
 		c.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
 	}
-	if conn, ok := c.conns[addr]; ok && conn != nil {
-		if st := conn.GetState(); st == connectivity.Shutdown {
-			delete(c.conns, addr)
-		} else {
+
+	conn, ok := c.conns[addr]
+	if !ok || conn == nil {
+		return nil
+	}
+
+	st := conn.GetState()
+	if st == connectivity.Shutdown {
+		delete(c.conns, addr)
+		return nil
+	}
+	if st == connectivity.TransientFailure {
+		conn.ResetConnectBackoff()
+	}
+	return conn
+}
+
+func (c *GRPCConnCache) storeConn(addr raft.ServerAddress, conn *grpc.ClientConn) *grpc.ClientConn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conns == nil {
+		c.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
+	}
+
+	existing, ok := c.conns[addr]
+	if ok && existing != nil {
+		st := existing.GetState()
+		if st != connectivity.Shutdown {
 			if st == connectivity.TransientFailure {
-				conn.ResetConnectBackoff()
+				existing.ResetConnectBackoff()
 			}
-			return conn, nil
+			return existing
 		}
+		delete(c.conns, addr)
+	}
+
+	c.conns[addr] = conn
+	return conn
+}
+
+func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	if conn := c.cachedConn(addr); conn != nil {
+		return conn, nil
 	}
 
 	conn, err := grpc.NewClient(string(addr),
@@ -47,8 +82,12 @@ func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, erro
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	c.conns[addr] = conn
-	return conn, nil
+
+	stored := c.storeConn(addr, conn)
+	if stored != conn {
+		_ = conn.Close()
+	}
+	return stored, nil
 }
 
 func (c *GRPCConnCache) Close() error {
