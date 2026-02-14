@@ -77,9 +77,9 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 }
 
 func (r *GRPCServer) rawGetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	// ShardStore already proxies to the correct shard leader and verifies
+	// Shard-aware stores already proxy to the correct shard leader and verify
 	// leadership before serving reads from local state.
-	if _, ok := r.store.(*kv.ShardStore); ok {
+	if _, ok := r.store.(kv.ShardAwareStore); ok {
 		v, err := r.store.GetAt(ctx, key, ts)
 		return v, errors.WithStack(err)
 	}
@@ -107,7 +107,7 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	}
 
 	// ShardStore already proxies to the correct shard leader.
-	if _, ok := r.store.(*kv.ShardStore); ok {
+	if _, ok := r.store.(kv.ShardAwareStore); ok {
 		ts, exists, err := r.store.LatestCommitTS(ctx, key)
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -189,7 +189,7 @@ func rawScanLimit(limit64 int64) (int, error) {
 }
 
 func (r *GRPCServer) shouldProxyRawScanAt(startKey []byte) bool {
-	if _, ok := r.store.(*kv.ShardStore); ok {
+	if _, ok := r.store.(kv.ShardAwareStore); ok {
 		return false
 	}
 	if r.coordinator == nil {

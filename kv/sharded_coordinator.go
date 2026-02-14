@@ -21,10 +21,12 @@ const txnPhaseCount = 2
 
 // ShardAwareStore is an MVCCStore that can serve reads in a sharded deployment.
 //
-// Implementations must route per-key operations (e.g. LatestCommitTS) to the
-// correct shard leader when needed to avoid returning stale results.
+// Implementations must route per-key operations (e.g. GetAt/LatestCommitTS/ScanAt)
+// to the correct shard leader when needed to avoid returning stale or partial
+// results.
 type ShardAwareStore interface {
 	store.MVCCStore
+	ShardAware()
 }
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
