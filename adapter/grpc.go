@@ -11,8 +11,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 var _ pb.RawKVServer = (*GRPCServer)(nil)
@@ -23,6 +21,7 @@ type GRPCServer struct {
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
 	store          store.MVCCStore
+	connCache      *kv.GRPCConnCache
 
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
@@ -36,6 +35,7 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer
 		grpcTranscoder: newGrpcGrpcTranscoder(),
 		coordinator:    coordinate,
 		store:          store,
+		connCache:      &kv.GRPCConnCache{},
 	}
 }
 
@@ -133,6 +133,14 @@ func (r GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*p
 		readTS = snapshotTS(r.coordinator.Clock(), r.store)
 	}
 
+	if r.coordinator != nil && !r.coordinator.IsLeaderForKey(req.StartKey) {
+		resp, err := r.tryLeaderScanAt(ctx, req.StartKey, req.EndKey, limit64, readTS)
+		if err != nil {
+			return &pb.RawScanAtResponse{Kv: nil}, err
+		}
+		return resp, nil
+	}
+
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
@@ -158,14 +166,10 @@ func (r GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]
 		return nil, ErrLeaderNotFound
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := r.connCache.ConnFor(addr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
@@ -182,14 +186,10 @@ func (r GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (ui
 		return 0, false, ErrLeaderNotFound
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := r.connCache.ConnFor(addr)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	defer conn.Close()
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
@@ -197,6 +197,30 @@ func (r GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (ui
 		return 0, false, errors.WithStack(err)
 	}
 	return resp.Ts, resp.Exists, nil
+}
+
+func (r GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKey []byte, limit int64, ts uint64) (*pb.RawScanAtResponse, error) {
+	addr := r.coordinator.RaftLeaderForKey(startKey)
+	if addr == "" {
+		return &pb.RawScanAtResponse{Kv: nil}, ErrLeaderNotFound
+	}
+
+	conn, err := r.connCache.ConnFor(addr)
+	if err != nil {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
+	}
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: startKey,
+		EndKey:   endKey,
+		Limit:    limit,
+		Ts:       ts,
+	})
+	if err != nil {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
+	}
+	return resp, nil
 }
 
 func (r GRPCServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {

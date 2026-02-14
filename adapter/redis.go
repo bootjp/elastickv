@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"math"
 	"net"
 	"sort"
@@ -452,15 +451,6 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	if !r.coordinator.IsLeader() {
-		if err := r.proxyExec(conn, state.queue); err != nil {
-			conn.WriteError(err.Error())
-		}
-		state.inTxn = false
-		state.queue = nil
-		return
-	}
-
 	results, err := r.runTransaction(state.queue)
 	state.inTxn = false
 	state.queue = nil
@@ -867,54 +857,6 @@ func (r *RedisServer) bumpLatestCommitTS(ctx context.Context, maxTS *uint64, key
 	}
 }
 
-func (r *RedisServer) proxyExec(conn redcon.Conn, queue []redcon.Command) error {
-	leader := r.coordinator.RaftLeader()
-	if leader == "" {
-		return ErrLeaderNotFound
-	}
-	leaderAddr, ok := r.leaderRedis[leader]
-	if !ok || leaderAddr == "" {
-		return errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
-	}
-
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
-
-	ctx := context.Background()
-	cmds := make([]redis.Cmder, len(queue))
-	names := make([]string, len(queue))
-	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		for i, c := range queue {
-			name := strings.ToUpper(string(c.Args[0]))
-			names[i] = name
-			args := make([]string, 0, len(c.Args)-1)
-			for _, a := range c.Args[1:] {
-				args = append(args, string(a))
-			}
-			cmd := newProxyCmd(name, args, ctx)
-			_ = pipe.Process(ctx, cmd)
-			cmds[i] = cmd
-		}
-		return nil
-	})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	results := make([]redisResult, 0, len(cmds))
-	for i, cmd := range cmds {
-		res, err := buildProxyResult(names[i], cmd)
-		if err != nil {
-			results = append(results, redisResult{typ: resultError, err: err})
-			continue
-		}
-		results = append(results, res)
-	}
-
-	r.writeResults(conn, results)
-	return nil
-}
-
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 	conn.WriteArray(len(results))
 	for _, res := range results {
@@ -937,53 +879,6 @@ func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 		default:
 			conn.WriteNull()
 		}
-	}
-}
-
-// --- list helpers ----------------------------------------------------
-func buildProxyResult(_ string, cmd redis.Cmder) (redisResult, error) {
-	switch c := cmd.(type) {
-	case *redis.StatusCmd:
-		s, err := c.Result()
-		return redisResult{typ: resultString, str: s}, errors.WithStack(err)
-	case *redis.IntCmd:
-		i, err := c.Result()
-		return redisResult{typ: resultInt, integer: i}, errors.WithStack(err)
-	case *redis.StringCmd:
-		b, err := c.Bytes()
-		if errors.Is(err, redis.Nil) {
-			return redisResult{typ: resultNil}, nil
-		}
-		return redisResult{typ: resultBulk, bulk: b}, errors.WithStack(err)
-	case *redis.StringSliceCmd:
-		arr, err := c.Result()
-		return redisResult{typ: resultArray, arr: arr}, errors.WithStack(err)
-	case *redis.Cmd:
-		v, err := c.Result()
-		return redisResult{typ: resultString, str: fmt.Sprint(v)}, errors.WithStack(err)
-	default:
-		return redisResult{typ: resultError, err: errors.Newf("unsupported command result type %T", cmd)}, nil
-	}
-}
-
-func newProxyCmd(name string, args []string, ctx context.Context) redis.Cmder {
-	argv := make([]any, 0, len(args)+1)
-	argv = append(argv, name)
-	for _, a := range args {
-		argv = append(argv, a)
-	}
-
-	switch name {
-	case cmdSet:
-		return redis.NewStatusCmd(ctx, argv...)
-	case cmdDel, cmdExists, cmdRPush:
-		return redis.NewIntCmd(ctx, argv...)
-	case cmdGet:
-		return redis.NewStringCmd(ctx, argv...)
-	case cmdLRange:
-		return redis.NewStringSliceCmd(ctx, argv...)
-	default:
-		return redis.NewCmd(ctx, argv...)
 	}
 }
 
