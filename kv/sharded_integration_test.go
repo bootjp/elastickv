@@ -105,3 +105,47 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 		t.Fatalf("expected key b missing in group2, got %v", err)
 	}
 }
+
+func TestShardedCoordinatorDispatch_RejectsCrossShardTxn(t *testing.T) {
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	s1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(s1))
+	defer stop1()
+
+	s2 := store.NewMVCCStore()
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(s2))
+	defer stop2()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
+		2: {Raft: r2, Store: s2, Txn: NewLeaderProxy(r2)},
+	}
+
+	shardStore := NewShardStore(engine, groups)
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)
+
+	ops := &OperationGroup[OP]{
+		IsTxn: true,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+		},
+	}
+	if _, err := coord.Dispatch(ctx, ops); err == nil || !errors.Is(err, ErrCrossShardTransactionNotSupported) {
+		t.Fatalf("expected ErrCrossShardTransactionNotSupported, got %v", err)
+	}
+
+	// Ensure the rejected transaction didn't write anything.
+	readTS := ^uint64(0)
+	if _, err := shardStore.GetAt(ctx, []byte("b"), readTS); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Fatalf("expected key b missing, got %v", err)
+	}
+	if _, err := shardStore.GetAt(ctx, []byte("x"), readTS); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Fatalf("expected key x missing, got %v", err)
+	}
+}

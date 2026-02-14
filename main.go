@@ -161,6 +161,12 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 			for _, rt := range runtimes {
 				rt.Close()
 			}
+			if r != nil {
+				_ = r.Shutdown().Error()
+			}
+			if tm != nil {
+				_ = tm.Close()
+			}
 			_ = st.Close()
 			if closeStores != nil {
 				closeStores()
