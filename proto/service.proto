@@ -62,7 +62,7 @@ message RawLatestCommitTSResponse {
 message RawScanAtRequest {
   bytes start_key = 1;
   bytes end_key = 2;
-  int64 limit = 3;
+  int64 limit = 3; // validated against host int size; large values may be rejected
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
 }
 

@@ -96,6 +96,7 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 		if len(bounds) != splitParts {
 			return nil, errors.Wrapf(ErrInvalidShardRangesEntry, "invalid range %q (expected start:end)", rangePart)
 		}
+		// An empty start key represents the minimum key boundary.
 		start := []byte(strings.TrimSpace(bounds[0]))
 		var end []byte
 		if endStr := strings.TrimSpace(bounds[1]); endStr != "" {

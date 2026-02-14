@@ -150,15 +150,23 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 	for _, g := range groups {
 		st := store.NewMVCCStore()
 		fsm := kv.NewKvFSM(st)
-		r, tm, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, fsm)
+		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, fsm)
 		if err != nil {
+			for _, rt := range runtimes {
+				rt.Close()
+			}
+			_ = st.Close()
+			if closeStores != nil {
+				closeStores()
+			}
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
 		runtimes = append(runtimes, &raftGroupRuntime{
-			spec:  g,
-			raft:  r,
-			tm:    tm,
-			store: st,
+			spec:        g,
+			raft:        r,
+			tm:          tm,
+			store:       st,
+			closeStores: closeStores,
 		})
 		shardGroups[g.id] = &kv.ShardGroup{
 			Raft:  r,

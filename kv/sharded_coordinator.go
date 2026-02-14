@@ -84,6 +84,8 @@ func (c *ShardedCoordinator) maxLatestCommitTS(elems []*Elem[OP]) uint64 {
 		return 0
 	}
 
+	// NOTE: c.store is expected to be shard-aware (e.g. *ShardStore) so that
+	// LatestCommitTS can route keys to the correct shard leader when needed.
 	keys := make([][]byte, 0, len(elems))
 	for _, e := range elems {
 		if e == nil || len(e.Key) == 0 {

@@ -822,6 +822,10 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 		return 0
 	}
 
+	// NOTE: This currently calls LatestCommitTS for each (unique) key involved in
+	// the transaction. kv.MaxLatestCommitTS deduplicates keys and performs the
+	// lookups in parallel, but very large transactions can still make this a
+	// latency hot path. If needed, add batching/caching at the storage layer.
 	const txnLatestCommitKeysPerCmd = 2
 	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
 	for _, cmd := range queue {

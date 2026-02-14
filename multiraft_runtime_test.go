@@ -31,7 +31,7 @@ func TestNewRaftGroupBootstrap(t *testing.T) {
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSM(st)
 
-	r, tm, err := newRaftGroup(
+	r, tm, closeStores, err := newRaftGroup(
 		"n1",
 		groupSpec{id: 1, address: "127.0.0.1:0"},
 		baseDir,
@@ -44,6 +44,10 @@ func TestNewRaftGroupBootstrap(t *testing.T) {
 	require.NotNil(t, tm)
 	t.Cleanup(func() {
 		_ = r.Shutdown().Error()
+		_ = tm.Close()
+		if closeStores != nil {
+			closeStores()
+		}
 	})
 
 	dir := groupDataDir(baseDir, "n1", 1, true)
