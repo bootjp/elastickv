@@ -118,7 +118,7 @@ func parseRuntimeConfig(myAddr, redisAddr, raftGroups, shardRanges, raftRedisMap
 		defaultGroup: defaultGroup,
 		engine:       engine,
 		leaderRedis:  leaderRedis,
-		multi:        len(groups) > 1 || raftGroups != "",
+		multi:        len(groups) > 1,
 	}, nil
 }
 
