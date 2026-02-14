@@ -353,7 +353,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		s := grpc.NewServer()
 		trx := kv.NewTransaction(r)
 		coordinator := kv.NewCoordinator(trx, r)
-		gs := NewGRPCServer(st, coordinator)
+		gs := NewGRPCServer(kv.NewLeaderRoutedStore(st, coordinator), coordinator)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)

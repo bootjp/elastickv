@@ -228,7 +228,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) *grpc.Server {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
-	gs := adapter.NewGRPCServer(st, coordinator)
+	gs := adapter.NewGRPCServer(kv.NewLeaderRoutedStore(st, coordinator), coordinator)
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)

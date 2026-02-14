@@ -21,8 +21,6 @@ type ShardStore struct {
 	connCache GRPCConnCache
 }
 
-func (*ShardStore) ShardAware() {}
-
 var ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
 
 // NewShardStore creates a sharded MVCC store wrapper.

@@ -21,7 +21,6 @@ type GRPCServer struct {
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
 	store          store.MVCCStore
-	connCache      *kv.GRPCConnCache
 
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
@@ -35,17 +34,10 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer
 		grpcTranscoder: newGrpcGrpcTranscoder(),
 		coordinator:    coordinate,
 		store:          store,
-		connCache:      &kv.GRPCConnCache{},
 	}
 }
 
 func (r *GRPCServer) Close() error {
-	if r == nil || r.connCache == nil {
-		return nil
-	}
-	if err := r.connCache.Close(); err != nil {
-		return errors.WithStack(err)
-	}
 	return nil
 }
 
@@ -59,14 +51,12 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		readTS = snapshotTS(clock, r.store)
 	}
 
-	v, err := r.rawGetAt(ctx, req.Key, readTS)
+	v, err := r.store.GetAt(ctx, req.Key, readTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return &pb.RawGetResponse{Value: nil}, nil
+	}
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrKeyNotFound):
-			return &pb.RawGetResponse{Value: nil}, nil
-		default:
-			return nil, err
-		}
+		return nil, errors.WithStack(err)
 	}
 
 	r.log.InfoContext(ctx, "Get",
@@ -76,71 +66,16 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	return &pb.RawGetResponse{Value: v}, nil
 }
 
-func (r *GRPCServer) rawGetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	// Shard-aware stores already proxy to the correct shard leader and verify
-	// leadership before serving reads from local state.
-	if _, ok := r.store.(kv.ShardAwareStore); ok {
-		v, err := r.store.GetAt(ctx, key, ts)
-		return v, errors.WithStack(err)
-	}
-
-	if r.coordinator == nil {
-		v, err := r.store.GetAt(ctx, key, ts)
-		return v, errors.WithStack(err)
-	}
-
-	if r.coordinator.IsLeaderForKey(key) {
-		// Ensure we are still leader before serving from local state.
-		if err := r.coordinator.VerifyLeaderForKey(key); err == nil {
-			v, err := r.store.GetAt(ctx, key, ts)
-			return v, errors.WithStack(err)
-		}
-	}
-
-	return r.tryLeaderGet(ctx, key, ts)
-}
-
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	key := req.GetKey()
 	if len(key) == 0 {
 		return nil, errors.WithStack(kv.ErrInvalidRequest)
 	}
 
-	// ShardStore already proxies to the correct shard leader.
-	if _, ok := r.store.(kv.ShardAwareStore); ok {
-		ts, exists, err := r.store.LatestCommitTS(ctx, key)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return &pb.RawLatestCommitTSResponse{
-			Ts:     ts,
-			Exists: exists,
-		}, nil
-	}
-
-	if r.coordinator.IsLeaderForKey(key) {
-		// Ensure we are still leader before serving from local state.
-		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		ts, exists, err := r.store.LatestCommitTS(ctx, key)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return &pb.RawLatestCommitTSResponse{
-			Ts:     ts,
-			Exists: exists,
-		}, nil
-	}
-
-	ts, exists, err := r.tryLeaderLatestCommitTS(ctx, key)
+	ts, exists, err := r.store.LatestCommitTS(ctx, key)
 	if err != nil {
-		return &pb.RawLatestCommitTSResponse{
-			Ts:     0,
-			Exists: false,
-		}, err
+		return nil, errors.WithStack(err)
 	}
-
 	return &pb.RawLatestCommitTSResponse{
 		Ts:     ts,
 		Exists: exists,
@@ -157,16 +92,6 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	readTS := req.GetTs()
 	if readTS == 0 {
 		readTS = snapshotTS(r.coordinator.Clock(), r.store)
-	}
-
-	// ShardStore already proxies per shard, so avoid forwarding the entire scan
-	// to a single leader address.
-	if r.shouldProxyRawScanAt(req.StartKey) {
-		resp, err := r.tryLeaderScanAt(ctx, req.StartKey, req.EndKey, limit64, readTS)
-		if err != nil {
-			return &pb.RawScanAtResponse{Kv: nil}, err
-		}
-		return resp, nil
 	}
 
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
@@ -188,19 +113,6 @@ func rawScanLimit(limit64 int64) (int, error) {
 	return int(limit64), nil
 }
 
-func (r *GRPCServer) shouldProxyRawScanAt(startKey []byte) bool {
-	if _, ok := r.store.(kv.ShardAwareStore); ok {
-		return false
-	}
-	if r.coordinator == nil {
-		return false
-	}
-	if !r.coordinator.IsLeaderForKey(startKey) {
-		return true
-	}
-	return r.coordinator.VerifyLeaderForKey(startKey) != nil
-}
-
 func rawKvPairs(res []*store.KVPair) []*pb.RawKvPair {
 	out := make([]*pb.RawKvPair, 0, len(res))
 	for _, kvp := range res {
@@ -213,69 +125,6 @@ func rawKvPairs(res []*store.KVPair) []*pb.RawKvPair {
 		})
 	}
 	return out
-}
-
-func (r *GRPCServer) tryLeaderGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	addr := r.coordinator.RaftLeaderForKey(key)
-	if addr == "" {
-		return nil, ErrLeaderNotFound
-	}
-
-	conn, err := r.connCache.ConnFor(addr)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	return resp.Value, nil
-}
-
-func (r *GRPCServer) tryLeaderLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
-	addr := r.coordinator.RaftLeaderForKey(key)
-	if addr == "" {
-		return 0, false, ErrLeaderNotFound
-	}
-
-	conn, err := r.connCache.ConnFor(addr)
-	if err != nil {
-		return 0, false, errors.WithStack(err)
-	}
-
-	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
-	if err != nil {
-		return 0, false, errors.WithStack(err)
-	}
-	return resp.Ts, resp.Exists, nil
-}
-
-func (r *GRPCServer) tryLeaderScanAt(ctx context.Context, startKey []byte, endKey []byte, limit int64, ts uint64) (*pb.RawScanAtResponse, error) {
-	addr := r.coordinator.RaftLeaderForKey(startKey)
-	if addr == "" {
-		return &pb.RawScanAtResponse{Kv: nil}, ErrLeaderNotFound
-	}
-
-	conn, err := r.connCache.ConnFor(addr)
-	if err != nil {
-		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
-	}
-
-	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey: startKey,
-		EndKey:   endKey,
-		Limit:    limit,
-		Ts:       ts,
-	})
-	if err != nil {
-		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
-	}
-	return resp, nil
 }
 
 func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
