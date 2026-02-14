@@ -2,14 +2,11 @@ package kv
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -20,8 +17,7 @@ type LeaderProxy struct {
 	raft *raft.Raft
 	tm   *TransactionManager
 
-	connMu sync.Mutex
-	conns  map[raft.ServerAddress]*grpc.ClientConn
+	connCache grpcConnCache
 }
 
 // NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
@@ -63,7 +59,7 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := p.connFor(addr)
+	conn, err := p.connCache.ConnFor(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -83,32 +79,6 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 		return nil, ErrInvalidRequest
 	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
-}
-
-func (p *LeaderProxy) connFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
-	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
-	}
-
-	p.connMu.Lock()
-	defer p.connMu.Unlock()
-
-	if p.conns == nil {
-		p.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
-	}
-	if conn, ok := p.conns[addr]; ok && conn != nil {
-		return conn, nil
-	}
-
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	p.conns[addr] = conn
-	return conn, nil
 }
 
 var _ Transactional = (*LeaderProxy)(nil)

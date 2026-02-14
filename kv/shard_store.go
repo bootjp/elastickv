@@ -5,15 +5,12 @@ import (
 	"context"
 	"io"
 	"sort"
-	"sync"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
@@ -21,8 +18,7 @@ type ShardStore struct {
 	engine *distribution.Engine
 	groups map[uint64]*ShardGroup
 
-	connMu sync.Mutex
-	conns  map[raft.ServerAddress]*grpc.ClientConn
+	connCache grpcConnCache
 }
 
 // NewShardStore creates a sharded MVCC store wrapper.
@@ -225,7 +221,7 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 		return 0, false, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := s.connFor(addr)
+	conn, err := s.connCache.ConnFor(addr)
 	if err != nil {
 		return 0, false, err
 	}
@@ -305,17 +301,8 @@ func (s *ShardStore) Close() error {
 		}
 	}
 
-	s.connMu.Lock()
-	conns := s.conns
-	s.conns = nil
-	s.connMu.Unlock()
-	for _, conn := range conns {
-		if conn == nil {
-			continue
-		}
-		if err := conn.Close(); err != nil && first == nil {
-			first = errors.WithStack(err)
-		}
+	if err := s.connCache.Close(); err != nil && first == nil {
+		first = err
 	}
 
 	return first
@@ -339,7 +326,7 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := s.connFor(addr)
+	conn, err := s.connCache.ConnFor(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +351,7 @@ func (s *ShardStore) proxyRawScanAt(ctx context.Context, g *ShardGroup, start []
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	conn, err := s.connFor(addr)
+	conn, err := s.connCache.ConnFor(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -389,32 +376,6 @@ func (s *ShardStore) proxyRawScanAt(ctx context.Context, g *ShardGroup, start []
 	}
 
 	return out, nil
-}
-
-func (s *ShardStore) connFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
-	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
-	}
-
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
-
-	if s.conns == nil {
-		s.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
-	}
-	if conn, ok := s.conns[addr]; ok && conn != nil {
-		return conn, nil
-	}
-
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	s.conns[addr] = conn
-	return conn, nil
 }
 
 var _ store.MVCCStore = (*ShardStore)(nil)
