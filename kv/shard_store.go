@@ -76,32 +76,8 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 		return []*store.KVPair{}, nil
 	}
 
-	// Determine routing bounds. For internal list keys, routing must be based on
-	// the logical user key rather than the raw internal key prefix, otherwise
-	// sharded scans over list meta/item keys may miss the correct shard.
-	routeStart := start
-	routeEnd := end
-
-	if userKeyStart := store.ExtractListUserKey(start); userKeyStart != nil {
-		// If the end bound is also a list key for the same user key, route over
-		// that user-key range; otherwise, route based on the single user key
-		// implied by the start bound.
-		if end != nil {
-			if userKeyEnd := store.ExtractListUserKey(end); userKeyEnd != nil && bytes.Equal(userKeyStart, userKeyEnd) {
-				routeStart = userKeyStart
-				routeEnd = userKeyEnd
-			} else {
-				routeStart = userKeyStart
-				routeEnd = userKeyStart
-			}
-		} else {
-			routeStart = userKeyStart
-			routeEnd = userKeyStart
-		}
-	}
-
-	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
-	out, err := s.scanRoutesAt(ctx, routes, start, end, limit, ts)
+	routes, clampToRoutes := s.routesForScan(start, end)
+	out, err := s.scanRoutesAt(ctx, routes, start, end, limit, ts, clampToRoutes)
 	if err != nil {
 		return nil, err
 	}
@@ -115,14 +91,41 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	return out, nil
 }
 
-func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	// For internal list keys, shard routing is based on the logical user key
+	// rather than the raw key prefix.
+	if userKey := store.ExtractListUserKey(start); userKey != nil {
+		route, ok := s.engine.GetRoute(userKey)
+		if !ok {
+			return []distribution.Route{}, false
+		}
+		return []distribution.Route{route}, false
+	}
+
+	routes := s.engine.GetIntersectingRoutes(start, end)
+	// If the scan can include internal list keys (which use a fixed prefix),
+	// avoid clamping to shard range bounds because those keys may be ordered
+	// before the shard range start in raw keyspace.
+	if len(start) == 0 {
+		return routes, false
+	}
+
+	return routes, true
+}
+
+func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	for _, route := range routes {
-		remaining := limit - len(out)
-		if remaining <= 0 {
-			break
+		scanStart := start
+		scanEnd := end
+		if clampToRoutes {
+			scanStart = clampScanStart(start, route.Start)
+			scanEnd = clampScanEnd(end, route.End)
 		}
-		kvs, err := s.scanRouteAt(ctx, route, start, end, remaining, ts)
+
+		// Fetch up to 'limit' items from each shard. The final result will be
+		// sorted and truncated by ScanAt.
+		kvs, err := s.scanRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
 		if err != nil {
 			return nil, err
 		}
@@ -137,11 +140,8 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 		return nil, nil
 	}
 
-	routeStart := clampScanStart(start, route.Start)
-	routeEnd := clampScanEnd(end, route.End)
-
 	if g.Raft == nil {
-		kvs, err := g.Store.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+		kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -152,7 +152,7 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 	// incomplete results when this node is a follower for a given shard.
 	if g.Raft.State() == raft.Leader {
 		if err := g.Raft.VerifyLeader().Error(); err == nil {
-			kvs, err := g.Store.ScanAt(ctx, routeStart, routeEnd, limit, ts)
+			kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
 			if err != nil {
 				return nil, errors.WithStack(err)
 			}
@@ -160,7 +160,7 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 		}
 	}
 
-	kvs, err := s.proxyRawScanAt(ctx, g, routeStart, routeEnd, limit, ts)
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts)
 	if err != nil {
 		return nil, err
 	}
