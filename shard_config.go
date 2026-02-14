@@ -26,6 +26,10 @@ var (
 	ErrAddressRequired         = errors.New("address is required")
 	ErrNoRaftGroupsConfigured  = errors.New("no raft groups configured")
 	ErrNoShardRangesConfigured = errors.New("no shard ranges configured")
+
+	ErrInvalidRaftGroupsEntry   = errors.New("invalid raftGroups entry")
+	ErrInvalidShardRangesEntry  = errors.New("invalid shardRanges entry")
+	ErrInvalidRaftRedisMapEntry = errors.New("invalid raftRedisMap entry")
 )
 
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
@@ -45,18 +49,18 @@ func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 		}
 		kv := strings.SplitN(part, "=", splitParts)
 		if len(kv) != splitParts {
-			return nil, errors.WithStack(errors.Newf("invalid raftGroups entry: %q", part))
+			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "%q", part)
 		}
 		id, err := strconv.ParseUint(kv[0], 10, 64)
 		if err != nil {
-			return nil, errors.Wrapf(err, "invalid group id %q", kv[0])
+			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "invalid group id %q: %v", kv[0], err)
 		}
 		addr := strings.TrimSpace(kv[1])
 		if addr == "" {
-			return nil, errors.WithStack(errors.Newf("empty address for group %d", id))
+			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "empty address for group %d", id)
 		}
 		if _, ok := seen[id]; ok {
-			return nil, errors.WithStack(errors.Newf("duplicate group id %d", id))
+			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "duplicate group id %d", id)
 		}
 		seen[id] = struct{}{}
 		groups = append(groups, groupSpec{id: id, address: addr})
@@ -80,23 +84,23 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 		}
 		kv := strings.SplitN(part, "=", splitParts)
 		if len(kv) != splitParts {
-			return nil, errors.WithStack(errors.Newf("invalid shardRanges entry: %q", part))
+			return nil, errors.Wrapf(ErrInvalidShardRangesEntry, "%q", part)
 		}
 		groupID, err := strconv.ParseUint(strings.TrimSpace(kv[1]), 10, 64)
 		if err != nil {
-			return nil, errors.Wrapf(err, "invalid group id in %q", part)
+			return nil, errors.Wrapf(ErrInvalidShardRangesEntry, "invalid group id in %q: %v", part, err)
 		}
 		rangePart := strings.TrimSpace(kv[0])
 		bounds := strings.SplitN(rangePart, ":", splitParts)
 		if len(bounds) != splitParts {
-			return nil, errors.WithStack(errors.Newf("invalid range %q (expected start:end)", rangePart))
+			return nil, errors.Wrapf(ErrInvalidShardRangesEntry, "invalid range %q (expected start:end)", rangePart)
 		}
 		start := []byte(strings.TrimSpace(bounds[0]))
 		var end []byte
 		if endStr := strings.TrimSpace(bounds[1]); endStr != "" {
 			end = []byte(endStr)
 			if bytes.Compare(start, end) >= 0 {
-				return nil, errors.WithStack(errors.Newf("invalid range %q (start must be < end)", rangePart))
+				return nil, errors.Wrapf(ErrInvalidShardRangesEntry, "invalid range %q (start must be < end)", rangePart)
 			}
 		}
 		ranges = append(ranges, rangeSpec{start: start, end: end, groupID: groupID})
@@ -120,12 +124,12 @@ func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 		}
 		kv := strings.SplitN(part, "=", splitParts)
 		if len(kv) != splitParts {
-			return nil, errors.WithStack(errors.Newf("invalid raftRedisMap entry: %q", part))
+			return nil, errors.Wrapf(ErrInvalidRaftRedisMapEntry, "%q", part)
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
 		if k == "" || v == "" {
-			return nil, errors.WithStack(errors.Newf("invalid raftRedisMap entry: %q", part))
+			return nil, errors.Wrapf(ErrInvalidRaftRedisMapEntry, "%q", part)
 		}
 		out[raft.ServerAddress(k)] = v
 	}

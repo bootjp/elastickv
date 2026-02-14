@@ -30,7 +30,7 @@ func TestParseRaftGroups(t *testing.T) {
 
 	t.Run("invalid entry", func(t *testing.T) {
 		_, err := parseRaftGroups("nope", "127.0.0.1:50051")
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrInvalidRaftGroupsEntry)
 	})
 
 	t.Run("duplicate ids", func(t *testing.T) {
@@ -74,7 +74,7 @@ func TestParseShardRanges(t *testing.T) {
 
 	t.Run("invalid entry", func(t *testing.T) {
 		_, err := parseShardRanges("a=1", 1)
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrInvalidShardRangesEntry)
 	})
 
 	t.Run("empty after trimming", func(t *testing.T) {
@@ -102,7 +102,7 @@ func TestParseRaftRedisMap(t *testing.T) {
 
 	t.Run("invalid entry errors", func(t *testing.T) {
 		_, err := parseRaftRedisMap("a=b, nope")
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrInvalidRaftRedisMapEntry)
 	})
 }
 
