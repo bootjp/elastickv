@@ -136,7 +136,10 @@ func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string)
 		return nil, err
 	}
 	for _, g := range groups {
-		leaderRedis[raft.ServerAddress(g.address)] = redisAddr
+		addr := raft.ServerAddress(g.address)
+		if _, ok := leaderRedis[addr]; !ok {
+			leaderRedis[addr] = redisAddr
+		}
 	}
 	return leaderRedis, nil
 }
@@ -170,9 +173,9 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	for _, rt := range runtimes {
 		gs := grpc.NewServer()
 		trx := kv.NewTransaction(rt.raft)
-		grpcServer := adapter.NewGRPCServer(shardStore, coordinate)
-		pb.RegisterRawKVServer(gs, grpcServer)
-		pb.RegisterTransactionalKVServer(gs, grpcServer)
+		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
+		pb.RegisterRawKVServer(gs, grpcSvc)
+		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock()))
 		pb.RegisterDistributionServer(gs, distServer)
 		rt.tm.Register(gs)
@@ -186,7 +189,9 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		}
 		srv := gs
 		lis := grpcSock
+		grpcService := grpcSvc
 		eg.Go(func() error {
+			defer func() { _ = grpcService.Close() }()
 			return errors.WithStack(srv.Serve(lis))
 		})
 	}

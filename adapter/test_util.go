@@ -29,6 +29,11 @@ import (
 func shutdown(nodes []Node) {
 	for _, n := range nodes {
 		n.grpcServer.Stop()
+		if n.grpcService != nil {
+			if err := n.grpcService.Close(); err != nil {
+				log.Printf("grpc service close: %v", err)
+			}
+		}
 		n.redisServer.Stop()
 		if n.dynamoServer != nil {
 			n.dynamoServer.Stop()
@@ -104,19 +109,21 @@ type Node struct {
 	redisAddress  string
 	dynamoAddress string
 	grpcServer    *grpc.Server
+	grpcService   *GRPCServer
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
 	raft          *raft.Raft
 	tm            *transport.Manager
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, rd *RedisServer, ds *DynamoDBServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
 		redisAddress:  redisAddress,
 		dynamoAddress: dynamoAddress,
 		grpcServer:    grpcs,
+		grpcService:   grpcService,
 		redisServer:   rd,
 		dynamoServer:  ds,
 		raft:          r,
@@ -379,6 +386,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			r,
 			tm,
 			s,
+			gs,
 			rd,
 			ds,
 		))

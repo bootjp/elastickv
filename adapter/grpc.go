@@ -39,6 +39,16 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator) *GRPCServer
 	}
 }
 
+func (r *GRPCServer) Close() error {
+	if r == nil || r.connCache == nil {
+		return nil
+	}
+	if err := r.connCache.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
 func (r GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {

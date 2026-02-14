@@ -77,7 +77,8 @@ func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][
 
 	var mu sync.Mutex
 	var maxTS uint64
-	for _, key := range keys {
+	for i := range keys {
+		key := keys[i]
 		eg.Go(func() error {
 			ts, exists, _ := st.LatestCommitTS(egctx, key)
 			if !exists {
