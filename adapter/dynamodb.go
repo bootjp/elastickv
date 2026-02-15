@@ -32,7 +32,7 @@ type DynamoDBServer struct {
 	httpServer       *http.Server
 }
 
-func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate *kv.Coordinate) *DynamoDBServer {
+func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator) *DynamoDBServer {
 	d := &DynamoDBServer{
 		listen:           listen,
 		store:            st,
@@ -85,7 +85,7 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err = d.coordinator.Dispatch(reqs); err != nil {
+	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -195,7 +195,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		IsTxn: false,
 		Elems: []*kv.Elem[kv.OP]{elem},
 	}
-	if _, err = d.coordinator.Dispatch(req); err != nil {
+	if _, err = d.coordinator.Dispatch(r.Context(), req); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -214,7 +214,7 @@ func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err = d.coordinator.Dispatch(reqs); err != nil {
+	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

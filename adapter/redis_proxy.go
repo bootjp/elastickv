@@ -8,7 +8,7 @@ import (
 )
 
 func (r *RedisServer) proxyExists(key []byte) (int, error) {
-	leader := r.coordinator.RaftLeader()
+	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
 		return 0, ErrLeaderNotFound
 	}

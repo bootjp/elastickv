@@ -1,3 +1,5 @@
+require "fileutils"
+
 NODES = {
   ctrl: "192.168.56.10",
   n1:   "192.168.56.11",
@@ -6,6 +8,19 @@ NODES = {
   n4:   "192.168.56.14",
   n5:   "192.168.56.15"
 }.freeze
+
+KEY_DIR = File.join(__dir__, ".ssh")
+CTRL_KEY = File.join(KEY_DIR, "ctrl_id_rsa")
+CTRL_PUB = "#{CTRL_KEY}.pub"
+
+unless File.exist?(CTRL_KEY)
+  FileUtils.mkdir_p(KEY_DIR)
+  unless system("ssh-keygen", "-t", "rsa", "-b", "2048", "-N", "", "-f", CTRL_KEY)
+    raise "failed to generate Jepsen SSH key at #{CTRL_KEY}"
+  end
+end
+
+CTRL_PUB_KEY = File.read(CTRL_PUB).strip
 
 Vagrant.configure("2") do |config|
   config.ssh.insert_key = false
@@ -37,7 +52,7 @@ Vagrant.configure("2") do |config|
         node.vm.synced_folder ".", "/vagrant", disabled: true
       end
 
-      node.vm.provision "shell", path: "provision/base.sh", args: name.to_s
+      node.vm.provision "shell", path: "provision/base.sh", args: [name.to_s, CTRL_PUB_KEY]
     end
   end
 end
