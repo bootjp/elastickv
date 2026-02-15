@@ -60,7 +60,9 @@ func TestMVCCStore_Property_Delete(t *testing.T) {
 		actualPutTS := s.LastCommitTS()
 
 		// 2. Delete
-		delTS := rapid.Uint64Range(actualPutTS, ^uint64(0)-1).Draw(t, "delTS")
+		// Delete must be strictly after the put. If timestamps are equal, the
+		// later write wins and the value is not visible at that timestamp.
+		delTS := rapid.Uint64Range(actualPutTS+1, ^uint64(0)-1).Draw(t, "delTS")
 		err = s.DeleteAt(ctx, key, delTS)
 		require.NoError(t, err)
 		actualDelTS := s.LastCommitTS()

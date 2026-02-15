@@ -191,9 +191,6 @@ func (s *pebbleStore) updateLastCommitTS(ts uint64) {
 func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if commitTS <= s.lastCommitTS {
-		commitTS = s.lastCommitTS + 1
-	}
 	s.updateLastCommitTS(commitTS)
 	return commitTS
 }

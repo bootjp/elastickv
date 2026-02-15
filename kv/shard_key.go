@@ -8,6 +8,13 @@ func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil
 	}
+	if embedded, ok := txnRouteKey(key); ok {
+		// Transaction internal keys embed the logical key after the prefix.
+		if user := store.ExtractListUserKey(embedded); user != nil {
+			return user
+		}
+		return embedded
+	}
 	if user := store.ExtractListUserKey(key); user != nil {
 		return user
 	}

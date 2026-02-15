@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/bootjp/elastickv/kv"
@@ -56,30 +57,109 @@ func (i *Internal) stampTimestamps(req *pb.ForwardRequest) {
 		return
 	}
 	if req.IsTxn {
-		var startTs uint64
-		// All requests in a transaction must have the same timestamp.
-		// Find a timestamp from the requests, or generate a new one if none exist.
-		for _, r := range req.Requests {
-			if r.Ts != 0 {
-				startTs = r.Ts
-				break
-			}
-		}
-
-		if startTs == 0 && len(req.Requests) > 0 {
-			startTs = i.clock.Next()
-		}
-
-		// Assign the unified timestamp to all requests in the transaction.
-		for _, r := range req.Requests {
-			r.Ts = startTs
-		}
+		i.stampTxnTimestamps(req.Requests)
 		return
 	}
 
-	for _, r := range req.Requests {
-		if r.Ts == 0 {
-			r.Ts = i.clock.Next()
+	i.stampRawTimestamps(req.Requests)
+}
+
+func (i *Internal) stampRawTimestamps(reqs []*pb.Request) {
+	for _, r := range reqs {
+		if r == nil {
+			continue
 		}
+		if r.Ts != 0 {
+			continue
+		}
+		if i.clock == nil {
+			r.Ts = 1
+			continue
+		}
+		r.Ts = i.clock.Next()
+	}
+}
+
+func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) {
+	startTS := forwardedTxnStartTS(reqs)
+	if startTS == 0 {
+		if i.clock == nil {
+			startTS = 1
+		} else {
+			startTS = i.clock.Next()
+		}
+	}
+
+	// Assign the unified timestamp to all requests in the transaction.
+	for _, r := range reqs {
+		if r != nil {
+			r.Ts = startTS
+		}
+	}
+
+	i.fillForwardedTxnCommitTS(reqs, startTS)
+}
+
+func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
+	for _, r := range reqs {
+		if r != nil && r.Ts != 0 {
+			return r.Ts
+		}
+	}
+	return 0
+}
+
+func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, bool) {
+	if r == nil {
+		return nil, false
+	}
+	if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_ABORT {
+		return nil, false
+	}
+	if len(r.Mutations) == 0 || r.Mutations[0] == nil {
+		return nil, false
+	}
+	if !bytes.HasPrefix(r.Mutations[0].Key, metaPrefix) {
+		return nil, false
+	}
+	return r.Mutations[0], true
+}
+
+func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) {
+	const metaPrefix = "!txn|meta|"
+
+	metaMutations := make([]*pb.Mutation, 0, len(reqs))
+	prefix := []byte(metaPrefix)
+	for _, r := range reqs {
+		m, ok := forwardedTxnMetaMutation(r, prefix)
+		if !ok {
+			continue
+		}
+		meta, err := kv.DecodeTxnMeta(m.Value)
+		if err != nil {
+			continue
+		}
+		if meta.CommitTS != 0 {
+			continue
+		}
+		metaMutations = append(metaMutations, m)
+	}
+	if len(metaMutations) == 0 {
+		return
+	}
+
+	commitTS := startTS + 1
+	if i.clock != nil {
+		i.clock.Observe(startTS)
+		commitTS = i.clock.Next()
+	}
+
+	for _, m := range metaMutations {
+		meta, err := kv.DecodeTxnMeta(m.Value)
+		if err != nil {
+			continue
+		}
+		meta.CommitTS = commitTS
+		m.Value = kv.EncodeTxnMeta(meta)
 	}
 }

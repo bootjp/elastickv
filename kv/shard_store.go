@@ -39,25 +39,39 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 
 	// Some tests use ShardStore without raft; in that case serve reads locally.
 	if g.Raft == nil {
-		val, err := g.Store.GetAt(ctx, key, ts)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return val, nil
+		return s.localGetAt(ctx, g, key, ts)
 	}
 
 	// Verify leadership with a quorum before serving reads from local state to
 	// avoid stale results from a deposed leader.
-	if g.Raft.State() == raft.Leader {
-		if err := g.Raft.VerifyLeader().Error(); err == nil {
-			val, err := g.Store.GetAt(ctx, key, ts)
-			if err != nil {
-				return nil, errors.WithStack(err)
-			}
-			return val, nil
-		}
+	if isVerifiedRaftLeader(g.Raft) {
+		return s.leaderGetAt(ctx, g, key, ts)
 	}
 	return s.proxyRawGet(ctx, g, key, ts)
+}
+
+func isVerifiedRaftLeader(r *raft.Raft) bool {
+	if r == nil || r.State() != raft.Leader {
+		return false
+	}
+	return r.VerifyLeader().Error() == nil
+}
+
+func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
+	if !isTxnInternalKey(key) {
+		if err := s.maybeResolveTxnLock(ctx, g, key, ts); err != nil {
+			return nil, err
+		}
+	}
+	return s.localGetAt(ctx, g, key, ts)
+}
+
+func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
+	val, err := g.Store.GetAt(ctx, key, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return val, nil
 }
 
 func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -156,7 +170,7 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 			if err != nil {
 				return nil, errors.WithStack(err)
 			}
-			return kvs, nil
+			return s.resolveScanLocks(ctx, kvs, ts)
 		}
 	}
 
@@ -164,7 +178,7 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 	if err != nil {
 		return nil, err
 	}
-	return kvs, nil
+	return s.resolveScanLocks(ctx, kvs, ts)
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
@@ -276,6 +290,178 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 		return 0, false, errors.WithStack(err)
 	}
 	return resp.Ts, resp.Exists, nil
+}
+
+func (s *ShardStore) maybeResolveTxnLock(ctx context.Context, g *ShardGroup, key []byte, readTS uint64) error {
+	// Only consider locks visible at the read timestamp.
+	lockBytes, err := g.Store.GetAt(ctx, txnLockKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	lock, err := decodeTxnLock(lockBytes)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	// Check primary transaction status to decide commit/rollback.
+	status, commitTS, err := s.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case txnStatusCommitted:
+		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
+	case txnStatusRolledBack:
+		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, cleanupTS(lock.StartTS), lock.PrimaryKey, [][]byte{key})
+	case txnStatusPending:
+		return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+	default:
+		return errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
+	}
+}
+
+func (s *ShardStore) resolveScanLocks(ctx context.Context, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
+	if len(kvs) == 0 {
+		return kvs, nil
+	}
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		// Filter txn-internal keys from user-facing scans.
+		if isTxnInternalKey(kvp.Key) {
+			continue
+		}
+		v, err := s.GetAt(ctx, kvp.Key, ts)
+		if err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, &store.KVPair{Key: kvp.Key, Value: v})
+	}
+	return out, nil
+}
+
+type txnStatus int
+
+const (
+	txnStatusPending txnStatus = iota
+	txnStatusCommitted
+	txnStatusRolledBack
+)
+
+func (s *ShardStore) primaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
+	commitTS, committed, err := s.txnCommitTS(ctx, primaryKey, startTS)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if committed {
+		return txnStatusCommitted, commitTS, nil
+	}
+
+	rolledBack, err := s.hasTxnRollback(ctx, primaryKey, startTS)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if rolledBack {
+		return txnStatusRolledBack, 0, nil
+	}
+
+	lock, ok, err := s.loadTxnLock(ctx, primaryKey)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if !ok || lock.StartTS != startTS {
+		return txnStatusRolledBack, 0, nil
+	}
+
+	if lock.TTLExpireAt != 0 && hlcWallNow() > lock.TTLExpireAt {
+		s.bestEffortAbortPrimary(primaryKey, startTS)
+		return txnStatusRolledBack, 0, nil
+	}
+
+	return txnStatusPending, 0, nil
+}
+
+func (s *ShardStore) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint64) (uint64, bool, error) {
+	b, err := s.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	cts, derr := decodeTxnCommitRecord(b)
+	if derr != nil {
+		return 0, false, errors.WithStack(derr)
+	}
+	return cts, true, nil
+}
+
+func (s *ShardStore) hasTxnRollback(ctx context.Context, primaryKey []byte, startTS uint64) (bool, error) {
+	_, err := s.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *ShardStore) loadTxnLock(ctx context.Context, primaryKey []byte) (txnLock, bool, error) {
+	lockBytes, err := s.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return txnLock{}, false, nil
+		}
+		return txnLock{}, false, err
+	}
+	lock, derr := decodeTxnLock(lockBytes)
+	if derr != nil {
+		return txnLock{}, false, errors.WithStack(derr)
+	}
+	return lock, true, nil
+}
+
+func (s *ShardStore) bestEffortAbortPrimary(primaryKey []byte, startTS uint64) {
+	pg, ok := s.groupForKey(primaryKey)
+	if !ok || pg == nil || pg.Txn == nil {
+		return
+	}
+	_ = applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey})
+}
+
+func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64, primaryKey []byte, keys [][]byte) error {
+	if g == nil || g.Txn == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	meta := &pb.Mutation{
+		Op:    pb.Op_PUT,
+		Key:   []byte(txnMetaPrefix),
+		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS}),
+	}
+	muts := make([]*pb.Mutation, 0, len(keys)+1)
+	muts = append(muts, meta)
+	for _, k := range keys {
+		muts = append(muts, &pb.Mutation{Op: pb.Op_PUT, Key: k})
+	}
+	_, err := g.Txn.Commit([]*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
+	return errors.WithStack(err)
+}
+
+func cleanupTS(startTS uint64) uint64 {
+	now := hlcWallNow()
+	next := startTS + 1
+	if now > next {
+		return now
+	}
+	return next
 }
 
 // ApplyMutations applies a batch of mutations to the correct shard store.
