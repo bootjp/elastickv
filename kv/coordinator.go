@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"sort"
 
@@ -297,30 +298,6 @@ func primaryKeyForElems(reqs []*Elem[OP]) []byte {
 	if len(keys) == 0 {
 		return nil
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytesCompare(keys[i], keys[j]) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
 	return keys[0]
-}
-
-func bytesCompare(a, b []byte) int {
-	min := len(a)
-	if len(b) < min {
-		min = len(b)
-	}
-	for i := 0; i < min; i++ {
-		if a[i] == b[i] {
-			continue
-		}
-		if a[i] < b[i] {
-			return -1
-		}
-		return 1
-	}
-	switch {
-	case len(a) < len(b):
-		return -1
-	case len(a) > len(b):
-		return 1
-	default:
-		return 0
-	}
 }

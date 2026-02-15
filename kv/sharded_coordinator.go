@@ -418,7 +418,11 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	return buildTxnLogs(reqs.StartTS, grouped, gids), nil
+	commitTS := c.nextTxnTSAfter(reqs.StartTS)
+	if commitTS == 0 || commitTS <= reqs.StartTS {
+		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -442,17 +446,21 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 	return grouped, gids, nil
 }
 
-func buildTxnLogs(startTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64) []*pb.Request {
+func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]*pb.Request, error) {
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
+		primaryKey := primaryKeyFromMutations(muts)
+		if len(primaryKey) == 0 {
+			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
+		}
 		logs = append(logs,
 			&pb.Request{
 				IsTxn: true,
 				Phase: pb.Phase_PREPARE,
 				Ts:    startTS,
 				Mutations: append([]*pb.Mutation{
-					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKeyFromMutations(muts), LockTTLms: defaultTxnLockTTLms})},
+					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
 				}, muts...),
 			},
 			&pb.Request{
@@ -460,24 +468,27 @@ func buildTxnLogs(startTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint
 				Phase: pb.Phase_COMMIT,
 				Ts:    startTS,
 				Mutations: append([]*pb.Mutation{
-					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKeyFromMutations(muts)})},
+					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
 				}, keyMutations(muts)...),
 			},
 		)
 	}
-	return logs
+	return logs, nil
 }
 
 func primaryKeyFromMutations(muts []*pb.Mutation) []byte {
-	if len(muts) == 0 {
-		return nil
-	}
-	primary := muts[0].Key
-	for _, m := range muts[1:] {
+	seen := map[string]struct{}{}
+	var primary []byte
+	for _, m := range muts {
 		if m == nil || len(m.Key) == 0 {
 			continue
 		}
-		if bytes.Compare(m.Key, primary) < 0 {
+		k := string(m.Key)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		if primary == nil || bytes.Compare(m.Key, primary) < 0 {
 			primary = m.Key
 		}
 	}

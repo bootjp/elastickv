@@ -101,6 +101,10 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 		}
 		startTS := req.Ts
 		abortTS := startTS + 1
+		if abortTS == 0 {
+			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			continue
+		}
 		meta.CommitTS = abortTS
 
 		abortReqs = append(abortReqs, &pb.Request{
@@ -142,7 +146,7 @@ func extractTxnMeta(muts []*pb.Mutation) (TxnMeta, []*pb.Mutation, error) {
 	}
 	meta, err := DecodeTxnMeta(muts[0].Value)
 	if err != nil {
-		return TxnMeta{}, nil, errors.WithStack(err)
+		return TxnMeta{}, nil, errors.WithStack(errors.Wrap(err, "decode txn meta"))
 	}
 	return meta, muts[1:], nil
 }

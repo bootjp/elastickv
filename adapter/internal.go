@@ -128,7 +128,12 @@ func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, b
 func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) {
 	const metaPrefix = "!txn|meta|"
 
-	metaMutations := make([]*pb.Mutation, 0, len(reqs))
+	type metaToUpdate struct {
+		m    *pb.Mutation
+		meta kv.TxnMeta
+	}
+
+	metaMutations := make([]metaToUpdate, 0, len(reqs))
 	prefix := []byte(metaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -142,24 +147,28 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 		if meta.CommitTS != 0 {
 			continue
 		}
-		metaMutations = append(metaMutations, m)
+		metaMutations = append(metaMutations, metaToUpdate{m: m, meta: meta})
 	}
 	if len(metaMutations) == 0 {
 		return
 	}
 
 	commitTS := startTS + 1
+	if commitTS == 0 {
+		// Overflow: can't choose a commit timestamp strictly greater than startTS.
+		return
+	}
 	if i.clock != nil {
 		i.clock.Observe(startTS)
 		commitTS = i.clock.Next()
 	}
+	if commitTS <= startTS {
+		// Defensive: avoid writing an invalid CommitTS.
+		return
+	}
 
-	for _, m := range metaMutations {
-		meta, err := kv.DecodeTxnMeta(m.Value)
-		if err != nil {
-			continue
-		}
-		meta.CommitTS = commitTS
-		m.Value = kv.EncodeTxnMeta(meta)
+	for _, item := range metaMutations {
+		item.meta.CommitTS = commitTS
+		item.m.Value = kv.EncodeTxnMeta(item.meta)
 	}
 }

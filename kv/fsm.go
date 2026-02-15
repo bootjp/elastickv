@@ -48,7 +48,7 @@ func (f *kvFSM) Apply(l *raft.Log) interface{} {
 
 	commitTS := r.Ts
 	if r.IsTxn && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT) {
-		meta, _, err := splitTxnMeta(r.Mutations)
+		meta, _, err := extractTxnMeta(r.Mutations)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -173,7 +173,7 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 }
 
 func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
-	meta, muts, err := splitTxnMeta(r.Mutations)
+	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
 		return err
 	}
@@ -212,7 +212,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
-	meta, muts, err := splitTxnMeta(r.Mutations)
+	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
 		return err
 	}
@@ -241,7 +241,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS uint64) error {
-	meta, muts, err := splitTxnMeta(r.Mutations)
+	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
 		return err
 	}
@@ -484,20 +484,6 @@ func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key []byte, startTS uin
 		return false, nil
 	}
 	return true, nil
-}
-
-func splitTxnMeta(muts []*pb.Mutation) (TxnMeta, []*pb.Mutation, error) {
-	if len(muts) == 0 || muts[0] == nil || len(muts[0].Key) == 0 {
-		return TxnMeta{}, nil, errors.WithStack(ErrTxnMetaMissing)
-	}
-	if !isTxnMetaKey(muts[0].Key) {
-		return TxnMeta{}, nil, errors.WithStack(ErrTxnMetaMissing)
-	}
-	meta, err := DecodeTxnMeta(muts[0].Value)
-	if err != nil {
-		return TxnMeta{}, nil, errors.WithStack(errors.Wrap(err, "decode txn meta"))
-	}
-	return meta, muts[1:], nil
 }
 
 func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key []byte, startTS uint64) error {

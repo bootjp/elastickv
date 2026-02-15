@@ -159,7 +159,8 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return kvs, nil
+		// Keep ScanAt behavior consistent even when running without raft.
+		return filterTxnInternalKVs(kvs), nil
 	}
 
 	// Reads should come from the shard's leader to avoid returning stale or
@@ -170,7 +171,7 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 			if err != nil {
 				return nil, errors.WithStack(err)
 			}
-			return s.resolveScanLocks(ctx, kvs, ts)
+			return s.resolveScanLocks(ctx, g, kvs, ts)
 		}
 	}
 
@@ -178,7 +179,9 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 	if err != nil {
 		return nil, err
 	}
-	return s.resolveScanLocks(ctx, kvs, ts)
+	// The leader's RawScanAt is expected to perform lock resolution and filtering
+	// via ShardStore.ScanAt, so avoid N+1 proxy gets here.
+	return filterTxnInternalKVs(kvs), nil
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
@@ -322,29 +325,85 @@ func (s *ShardStore) maybeResolveTxnLock(ctx context.Context, g *ShardGroup, key
 	}
 }
 
-func (s *ShardStore) resolveScanLocks(ctx context.Context, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
 	if len(kvs) == 0 {
 		return kvs, nil
+	}
+	if g == nil || g.Store == nil {
+		return []*store.KVPair{}, nil
+	}
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		resolved, skip, err := s.resolveScanKVP(ctx, g, kvp, ts)
+		if err != nil {
+			return nil, err
+		}
+		if skip {
+			continue
+		}
+		out = append(out, resolved)
+	}
+	return out, nil
+}
+
+func (s *ShardStore) resolveScanKVP(ctx context.Context, g *ShardGroup, kvp *store.KVPair, ts uint64) (*store.KVPair, bool, error) {
+	if kvp == nil {
+		return nil, true, nil
+	}
+	// Filter txn-internal keys from user-facing scans.
+	if isTxnInternalKey(kvp.Key) {
+		return nil, true, nil
+	}
+
+	// Fast-path: if there's no lock visible at this read timestamp, use the scan
+	// value directly instead of re-reading it.
+	locked, err := scanKeyLockedAt(ctx, g, kvp.Key, ts)
+	if err != nil {
+		return nil, false, err
+	}
+	if !locked {
+		return kvp, false, nil
+	}
+
+	v, err := s.leaderGetAt(ctx, g, kvp.Key, ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, true, nil
+		}
+		return nil, false, err
+	}
+	return &store.KVPair{Key: kvp.Key, Value: v}, false, nil
+}
+
+func scanKeyLockedAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) (bool, error) {
+	if g == nil || g.Store == nil {
+		return false, nil
+	}
+	_, err := g.Store.GetAt(ctx, txnLockKey(key), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	return true, nil
+}
+
+func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
+	if len(kvs) == 0 {
+		return kvs
 	}
 	out := make([]*store.KVPair, 0, len(kvs))
 	for _, kvp := range kvs {
 		if kvp == nil {
 			continue
 		}
-		// Filter txn-internal keys from user-facing scans.
 		if isTxnInternalKey(kvp.Key) {
 			continue
 		}
-		v, err := s.GetAt(ctx, kvp.Key, ts)
-		if err != nil {
-			if errors.Is(err, store.ErrKeyNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		out = append(out, &store.KVPair{Key: kvp.Key, Value: v})
+		out = append(out, kvp)
 	}
-	return out, nil
+	return out
 }
 
 type txnStatus int

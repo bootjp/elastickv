@@ -106,7 +106,7 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 	}
 }
 
-func TestShardedCoordinatorDispatch_RejectsCrossShardTxn(t *testing.T) {
+func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
