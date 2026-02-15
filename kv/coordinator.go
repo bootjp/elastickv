@@ -3,7 +3,6 @@ package kv
 import (
 	"bytes"
 	"context"
-	"sort"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -282,8 +281,8 @@ func txnRequests(startTS, commitTS, lockTTLms uint64, primaryKey []byte, reqs []
 }
 
 func primaryKeyForElems(reqs []*Elem[OP]) []byte {
-	keys := make([][]byte, 0, len(reqs))
-	seen := map[string]struct{}{}
+	var primary []byte
+	seen := make(map[string]struct{}, len(reqs))
 	for _, e := range reqs {
 		if e == nil || len(e.Key) == 0 {
 			continue
@@ -293,11 +292,9 @@ func primaryKeyForElems(reqs []*Elem[OP]) []byte {
 			continue
 		}
 		seen[k] = struct{}{}
-		keys = append(keys, e.Key)
+		if primary == nil || bytes.Compare(e.Key, primary) < 0 {
+			primary = e.Key
+		}
 	}
-	if len(keys) == 0 {
-		return nil
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
-	return keys[0]
+	return primary
 }

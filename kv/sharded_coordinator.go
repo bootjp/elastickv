@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -168,6 +169,9 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 }
 
 func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
+	// Secondary commits are best-effort. If a shard is unavailable after the
+	// primary commits, read-time lock resolution will commit the remaining
+	// secondaries based on the primary commit record.
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -183,7 +187,18 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
 		}
-		if r, err := g.Txn.Commit([]*pb.Request{req}); err == nil && r != nil && r.CommitIndex > maxIndex {
+		r, err := g.Txn.Commit([]*pb.Request{req})
+		if err != nil {
+			slog.Warn("txn secondary commit failed",
+				slog.Uint64("gid", gid),
+				slog.String("primary_key", string(primaryKey)),
+				slog.Uint64("start_ts", startTS),
+				slog.Uint64("commit_ts", commitTS),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		if r != nil && r.CommitIndex > maxIndex {
 			maxIndex = r.CommitIndex
 		}
 	}
@@ -221,7 +236,11 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 
 func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
 	if c.clock == nil {
-		return startTS + 1
+		nextTS := startTS + 1
+		if nextTS == 0 {
+			return startTS
+		}
+		return nextTS
 	}
 	ts := c.clock.Next()
 	if ts <= startTS {

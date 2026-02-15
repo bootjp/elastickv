@@ -13,6 +13,9 @@ const (
 	txnMetaPrefix     = "!txn|meta|"
 )
 
+// TxnMetaPrefix is the key prefix used for transaction metadata mutations.
+const TxnMetaPrefix = txnMetaPrefix
+
 const txnStartTSSuffixLen = 8
 
 func txnLockKey(userKey []byte) []byte {

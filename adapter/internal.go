@@ -126,15 +126,13 @@ func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, b
 }
 
 func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) {
-	const metaPrefix = "!txn|meta|"
-
 	type metaToUpdate struct {
 		m    *pb.Mutation
 		meta kv.TxnMeta
 	}
 
 	metaMutations := make([]metaToUpdate, 0, len(reqs))
-	prefix := []byte(metaPrefix)
+	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
 		if !ok {
