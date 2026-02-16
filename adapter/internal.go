@@ -30,13 +30,19 @@ var _ pb.InternalServer = (*Internal)(nil)
 
 var ErrNotLeader = errors.New("not leader")
 var ErrLeaderNotFound = errors.New("leader not found")
+var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
 func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
 	if i.raft.State() != raft.Leader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 
-	i.stampTimestamps(req)
+	if err := i.stampTimestamps(req); err != nil {
+		return &pb.ForwardResponse{
+			Success:     false,
+			CommitIndex: 0,
+		}, errors.WithStack(err)
+	}
 
 	r, err := i.transactionManager.Commit(req.Requests)
 	if err != nil {
@@ -52,16 +58,16 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 	}, nil
 }
 
-func (i *Internal) stampTimestamps(req *pb.ForwardRequest) {
+func (i *Internal) stampTimestamps(req *pb.ForwardRequest) error {
 	if req == nil {
-		return
+		return nil
 	}
 	if req.IsTxn {
-		i.stampTxnTimestamps(req.Requests)
-		return
+		return i.stampTxnTimestamps(req.Requests)
 	}
 
 	i.stampRawTimestamps(req.Requests)
+	return nil
 }
 
 func (i *Internal) stampRawTimestamps(reqs []*pb.Request) {
@@ -80,7 +86,7 @@ func (i *Internal) stampRawTimestamps(reqs []*pb.Request) {
 	}
 }
 
-func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) {
+func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) error {
 	startTS := forwardedTxnStartTS(reqs)
 	if startTS == 0 {
 		if i.clock == nil {
@@ -88,6 +94,9 @@ func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) {
 		} else {
 			startTS = i.clock.Next()
 		}
+	}
+	if startTS == ^uint64(0) {
+		return errors.WithStack(ErrTxnTimestampOverflow)
 	}
 
 	// Assign the unified timestamp to all requests in the transaction.
@@ -97,7 +106,7 @@ func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) {
 		}
 	}
 
-	i.fillForwardedTxnCommitTS(reqs, startTS)
+	return i.fillForwardedTxnCommitTS(reqs, startTS)
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -125,7 +134,7 @@ func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, b
 	return r.Mutations[0], true
 }
 
-func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) {
+func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) error {
 	type metaToUpdate struct {
 		m    *pb.Mutation
 		meta kv.TxnMeta
@@ -148,13 +157,13 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 		metaMutations = append(metaMutations, metaToUpdate{m: m, meta: meta})
 	}
 	if len(metaMutations) == 0 {
-		return
+		return nil
 	}
 
 	commitTS := startTS + 1
 	if commitTS == 0 {
 		// Overflow: can't choose a commit timestamp strictly greater than startTS.
-		return
+		return errors.WithStack(ErrTxnTimestampOverflow)
 	}
 	if i.clock != nil {
 		i.clock.Observe(startTS)
@@ -162,11 +171,12 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 	}
 	if commitTS <= startTS {
 		// Defensive: avoid writing an invalid CommitTS.
-		return
+		return errors.WithStack(ErrTxnTimestampOverflow)
 	}
 
 	for _, item := range metaMutations {
 		item.meta.CommitTS = commitTS
 		item.m.Value = kv.EncodeTxnMeta(item.meta)
 	}
+	return nil
 }

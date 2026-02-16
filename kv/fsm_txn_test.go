@@ -110,3 +110,36 @@ func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 	_, err = st.GetAt(ctx, txnLockKey(key), ^uint64(0))
 	require.NoError(t, err)
 }
+
+func TestPrepareClampsHugeLockTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(12)
+	key := []byte("k")
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: ^uint64(0)})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+
+	lockBytes, err := st.GetAt(ctx, txnLockKey(key), ^uint64(0))
+	require.NoError(t, err)
+	lock, err := decodeTxnLock(lockBytes)
+	require.NoError(t, err)
+	require.NotEqual(t, ^uint64(0), lock.TTLExpireAt)
+
+	now := hlcWallNow()
+	require.Greater(t, lock.TTLExpireAt, now)
+	maxDelta := maxTxnLockTTLms << hlcLogicalBits
+	require.LessOrEqual(t, lock.TTLExpireAt-now, maxDelta)
+}

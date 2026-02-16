@@ -100,8 +100,8 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 			continue
 		}
 		startTS := req.Ts
-		abortTS := startTS + 1
-		if abortTS == 0 {
+		abortTS := abortTSFrom(startTS, startTS)
+		if abortTS <= startTS {
 			// Overflow: can't choose an abort timestamp strictly greater than startTS.
 			continue
 		}

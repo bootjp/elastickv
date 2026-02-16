@@ -261,15 +261,23 @@ func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {
-	abortTS := commitTS + 1
-	if abortTS > startTS {
-		return abortTS
+	const maxUint64 = ^uint64(0)
+
+	// Prefer commitTS+1 when representable and strictly greater than startTS.
+	if commitTS < maxUint64 {
+		abortTS := commitTS + 1
+		if abortTS > startTS {
+			return abortTS
+		}
 	}
-	fallback := startTS + 1
-	if fallback == 0 {
-		return 0
+
+	// Fallback to startTS+1 when representable.
+	if startTS < maxUint64 {
+		return startTS + 1
 	}
-	return fallback
+
+	// No representable timestamp exists that is strictly greater than startTS.
+	return 0
 }
 
 func txnMetaMutation(primaryKey []byte, lockTTLms uint64, commitTS uint64) *pb.Mutation {

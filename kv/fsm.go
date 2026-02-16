@@ -201,12 +201,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return errors.WithStack(err)
 	}
 
-	ttlMs := meta.LockTTLms
-	if ttlMs == 0 {
-		// Default when callers don't specify TTL (for example, Redis MULTI/EXEC).
-		ttlMs = defaultTxnLockTTLms
-	}
-	expireAt := hlcWallFromNowMs(ttlMs)
+	expireAt := txnLockExpireAt(meta.LockTTLms)
 
 	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt)
 	if err != nil {

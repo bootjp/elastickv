@@ -26,3 +26,13 @@ func hlcWallFromNowMs(deltaMs uint64) uint64 {
 	}
 	return now + delta
 }
+
+func txnLockExpireAt(ttlMs uint64) uint64 {
+	if ttlMs == 0 {
+		ttlMs = defaultTxnLockTTLms
+	}
+	if ttlMs > maxTxnLockTTLms {
+		ttlMs = maxTxnLockTTLms
+	}
+	return hlcWallFromNowMs(ttlMs)
+}
