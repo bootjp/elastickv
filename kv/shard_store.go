@@ -343,6 +343,47 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	}
 }
 
+type scanItem struct {
+	kvp    *store.KVPair
+	skip   bool
+	locked bool
+}
+
+type lockTxnKey struct {
+	startTS uint64
+	primary string
+}
+
+type lockTxnStatus struct {
+	status   txnStatus
+	commitTS uint64
+}
+
+type lockResolutionBatch struct {
+	phase      pb.Phase
+	startTS    uint64
+	resolveTS  uint64
+	primaryKey []byte
+	keys       [][]byte
+	seen       map[string]struct{}
+}
+
+type scanLockPlan struct {
+	items             []scanItem
+	statusCache       map[lockTxnKey]lockTxnStatus
+	resolutionBatches map[lockTxnKey]*lockResolutionBatch
+	batchOrder        []lockTxnKey
+}
+
+func newScanLockPlan(size int) *scanLockPlan {
+	return &scanLockPlan{
+		items:             make([]scanItem, 0, size),
+		statusCache:       make(map[lockTxnKey]lockTxnStatus),
+		resolutionBatches: make(map[lockTxnKey]*lockResolutionBatch),
+		batchOrder:        make([]lockTxnKey, 0),
+	}
+}
+
 func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
 	if len(kvs) == 0 {
 		return kvs, nil
@@ -350,51 +391,137 @@ func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []
 	if g == nil || g.Store == nil {
 		return []*store.KVPair{}, nil
 	}
-	out := make([]*store.KVPair, 0, len(kvs))
-	for _, kvp := range kvs {
-		resolved, skip, err := s.resolveScanKVP(ctx, g, kvp, ts)
-		if err != nil {
-			return nil, err
-		}
-		if skip {
-			continue
-		}
-		out = append(out, resolved)
+
+	plan, err := s.planScanLockResolutions(ctx, g, kvs, ts)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	if err := applyScanLockResolutions(g, plan); err != nil {
+		return nil, err
+	}
+	return s.materializeScanLockResults(ctx, g, ts, plan.items)
 }
 
-func (s *ShardStore) resolveScanKVP(ctx context.Context, g *ShardGroup, kvp *store.KVPair, ts uint64) (*store.KVPair, bool, error) {
-	if kvp == nil {
-		return nil, true, nil
+func (s *ShardStore) planScanLockResolutions(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
+	plan := newScanLockPlan(len(kvs))
+	for _, kvp := range kvs {
+		if err := s.planScanLockItem(ctx, g, ts, plan, kvp); err != nil {
+			return nil, err
+		}
 	}
-	// Filter txn-internal keys from user-facing scans.
-	if isTxnInternalKey(kvp.Key) {
-		return nil, true, nil
+	return plan, nil
+}
+
+func (s *ShardStore) planScanLockItem(ctx context.Context, g *ShardGroup, ts uint64, plan *scanLockPlan, kvp *store.KVPair) error {
+	if kvp == nil || isTxnInternalKey(kvp.Key) {
+		plan.items = append(plan.items, scanItem{skip: true})
+		return nil
 	}
 
-	// Fast-path: if there's no lock visible at this read timestamp, use the scan
-	// value directly instead of re-reading it.
 	lock, locked, err := loadTxnLockAt(ctx, g, kvp.Key, ts)
 	if err != nil {
-		return nil, false, err
+		return err
 	}
 	if !locked {
-		return kvp, false, nil
+		plan.items = append(plan.items, scanItem{kvp: kvp})
+		return nil
+	}
+	if len(lock.PrimaryKey) == 0 {
+		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(kvp.Key))
 	}
 
-	if err := s.resolveTxnLockForKey(ctx, g, kvp.Key, lock); err != nil {
-		return nil, false, err
-	}
-
-	v, err := s.localGetAt(ctx, g, kvp.Key, ts)
+	txnKey := lockTxnKey{startTS: lock.StartTS, primary: string(lock.PrimaryKey)}
+	state, err := s.cachedLockTxnStatus(ctx, plan, lock, txnKey)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, true, nil
-		}
-		return nil, false, err
+		return err
 	}
-	return &store.KVPair{Key: kvp.Key, Value: v}, false, nil
+	phase, resolveTS, err := lockResolutionForStatus(state, lock, kvp.Key)
+	if err != nil {
+		return err
+	}
+	appendScanLockResolutionBatch(plan, txnKey, phase, resolveTS, lock, kvp.Key)
+	plan.items = append(plan.items, scanItem{kvp: kvp, locked: true})
+	return nil
+}
+
+func (s *ShardStore) cachedLockTxnStatus(ctx context.Context, plan *scanLockPlan, lock txnLock, txnKey lockTxnKey) (lockTxnStatus, error) {
+	if state, ok := plan.statusCache[txnKey]; ok {
+		return state, nil
+	}
+	status, commitTS, err := s.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil {
+		return lockTxnStatus{}, err
+	}
+	state := lockTxnStatus{status: status, commitTS: commitTS}
+	plan.statusCache[txnKey] = state
+	return state, nil
+}
+
+func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.Phase, uint64, error) {
+	switch state.status {
+	case txnStatusPending:
+		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+	case txnStatusCommitted:
+		return pb.Phase_COMMIT, state.commitTS, nil
+	case txnStatusRolledBack:
+		return pb.Phase_ABORT, cleanupTS(lock.StartTS), nil
+	default:
+		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
+	}
+}
+
+func appendScanLockResolutionBatch(plan *scanLockPlan, txnKey lockTxnKey, phase pb.Phase, resolveTS uint64, lock txnLock, key []byte) {
+	batch, exists := plan.resolutionBatches[txnKey]
+	if !exists {
+		batch = &lockResolutionBatch{
+			phase:      phase,
+			startTS:    lock.StartTS,
+			resolveTS:  resolveTS,
+			primaryKey: lock.PrimaryKey,
+			keys:       make([][]byte, 0, 1),
+			seen:       map[string]struct{}{},
+		}
+		plan.resolutionBatches[txnKey] = batch
+		plan.batchOrder = append(plan.batchOrder, txnKey)
+	}
+	keyID := string(key)
+	if _, duplicated := batch.seen[keyID]; duplicated {
+		return
+	}
+	batch.seen[keyID] = struct{}{}
+	batch.keys = append(batch.keys, key)
+}
+
+func applyScanLockResolutions(g *ShardGroup, plan *scanLockPlan) error {
+	for _, txnKey := range plan.batchOrder {
+		batch := plan.resolutionBatches[txnKey]
+		if err := applyTxnResolution(g, batch.phase, batch.startTS, batch.resolveTS, batch.primaryKey, batch.keys); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ShardStore) materializeScanLockResults(ctx context.Context, g *ShardGroup, ts uint64, items []scanItem) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, len(items))
+	for _, item := range items {
+		if item.skip {
+			continue
+		}
+		if !item.locked {
+			out = append(out, item.kvp)
+			continue
+		}
+		v, err := s.localGetAt(ctx, g, item.kvp.Key, ts)
+		if err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, &store.KVPair{Key: item.kvp.Key, Value: v})
+	}
+	return out, nil
 }
 
 func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
