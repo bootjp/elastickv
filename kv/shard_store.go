@@ -183,11 +183,35 @@ func (s *ShardStore) scanRouteAtLeader(ctx context.Context, g *ShardGroup, start
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	lockKVs, err := scanTxnLockRangeAt(ctx, g, start, end, limit, ts)
+	lockEnd := scanLockUpperBoundForKVs(kvs, end)
+	lockKVs, err := scanTxnLockRangeAt(ctx, g, start, lockEnd, ts)
 	if err != nil {
 		return nil, err
 	}
 	return s.resolveScanLocks(ctx, g, kvs, lockKVs, ts)
+}
+
+func scanLockUpperBoundForKVs(kvs []*store.KVPair, scanEnd []byte) []byte {
+	lastUserKey := lastNonInternalScanKey(kvs)
+	if len(lastUserKey) == 0 {
+		return scanEnd
+	}
+	bound := nextScanCursor(lastUserKey)
+	if scanEnd == nil || bytes.Compare(bound, scanEnd) < 0 {
+		return bound
+	}
+	return scanEnd
+}
+
+func lastNonInternalScanKey(kvs []*store.KVPair) []byte {
+	for i := len(kvs) - 1; i >= 0; i-- {
+		kvp := kvs[i]
+		if kvp == nil || isTxnInternalKey(kvp.Key) {
+			continue
+		}
+		return kvp.Key
+	}
+	return nil
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
@@ -555,16 +579,59 @@ func txnUserKeyFromLockKey(lockKey []byte) ([]byte, bool) {
 	return bytes.Clone(lockKey[len(txnLockPrefix):]), true
 }
 
-func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	if g == nil || g.Store == nil || limit <= 0 {
+func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, ts uint64) ([]*store.KVPair, error) {
+	if g == nil || g.Store == nil {
 		return []*store.KVPair{}, nil
 	}
+
 	lockStart, lockEnd := txnLockScanBounds(start, end)
-	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, limit, ts)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	return scanTxnLockPagesAt(ctx, g.Store, lockStart, lockEnd, ts)
+}
+
+func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0)
+	cursor := start
+	for {
+		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lockKVs...)
+		if done {
+			return out, nil
+		}
+		cursor = nextCursor
 	}
-	return lockKVs, nil
+}
+
+func scanTxnLockPageAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64) ([]*store.KVPair, []byte, bool, error) {
+	const lockPageLimit = 256
+
+	lockKVs, err := st.ScanAt(ctx, start, end, lockPageLimit, ts)
+	if err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+	if len(lockKVs) == 0 || len(lockKVs) < lockPageLimit {
+		return lockKVs, nil, true, nil
+	}
+
+	last := lockKVs[len(lockKVs)-1]
+	if last == nil || len(last.Key) == 0 {
+		return lockKVs, nil, true, nil
+	}
+
+	nextCursor := nextScanCursor(last.Key)
+	if end != nil && bytes.Compare(nextCursor, end) >= 0 {
+		return lockKVs, nil, true, nil
+	}
+
+	return lockKVs, nextCursor, false, nil
+}
+
+func nextScanCursor(lastKey []byte) []byte {
+	next := make([]byte, len(lastKey)+1)
+	copy(next, lastKey)
+	return next
 }
 
 func txnLockScanBounds(start []byte, end []byte) ([]byte, []byte) {
@@ -648,35 +715,77 @@ const (
 )
 
 func (s *ShardStore) primaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
-	commitTS, committed, err := s.txnCommitTS(ctx, primaryKey, startTS)
+	status, commitTS, done, err := s.primaryTxnRecordedStatus(ctx, primaryKey, startTS)
+	if err != nil || done {
+		return status, commitTS, err
+	}
+
+	lock, locked, err := s.primaryTxnLock(ctx, primaryKey, startTS)
 	if err != nil {
 		return txnStatusPending, 0, err
 	}
+	if !locked {
+		return txnStatusRolledBack, 0, nil
+	}
+	if !txnLockExpired(lock) {
+		return txnStatusPending, 0, nil
+	}
+	return s.expiredPrimaryTxnStatus(ctx, primaryKey, startTS)
+}
+
+func (s *ShardStore) primaryTxnRecordedStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, bool, error) {
+	commitTS, committed, err := s.txnCommitTS(ctx, primaryKey, startTS)
+	if err != nil {
+		return txnStatusPending, 0, false, err
+	}
 	if committed {
-		return txnStatusCommitted, commitTS, nil
+		return txnStatusCommitted, commitTS, true, nil
 	}
 
 	rolledBack, err := s.hasTxnRollback(ctx, primaryKey, startTS)
 	if err != nil {
-		return txnStatusPending, 0, err
+		return txnStatusPending, 0, false, err
 	}
 	if rolledBack {
-		return txnStatusRolledBack, 0, nil
+		return txnStatusRolledBack, 0, true, nil
 	}
+	return txnStatusPending, 0, false, nil
+}
 
+func (s *ShardStore) primaryTxnLock(ctx context.Context, primaryKey []byte, startTS uint64) (txnLock, bool, error) {
 	lock, ok, err := s.loadTxnLock(ctx, primaryKey)
 	if err != nil {
-		return txnStatusPending, 0, err
+		return txnLock{}, false, err
 	}
 	if !ok || lock.StartTS != startTS {
+		return txnLock{}, false, nil
+	}
+	return lock, true, nil
+}
+
+func txnLockExpired(lock txnLock) bool {
+	return lock.TTLExpireAt != 0 && hlcWallNow() > lock.TTLExpireAt
+}
+
+func (s *ShardStore) expiredPrimaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
+	aborted, err := s.tryAbortExpiredPrimary(primaryKey, startTS)
+	if err != nil {
+		return s.statusAfterAbortFailure(ctx, primaryKey, startTS)
+	}
+	if aborted {
 		return txnStatusRolledBack, 0, nil
 	}
+	return txnStatusPending, 0, nil
+}
 
-	if lock.TTLExpireAt != 0 && hlcWallNow() > lock.TTLExpireAt {
-		s.bestEffortAbortPrimary(primaryKey, startTS)
+func (s *ShardStore) statusAfterAbortFailure(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
+	if commitTS, committed, err := s.txnCommitTS(ctx, primaryKey, startTS); err == nil && committed {
+		return txnStatusCommitted, commitTS, nil
+	}
+	if rolledBack, err := s.hasTxnRollback(ctx, primaryKey, startTS); err == nil && rolledBack {
 		return txnStatusRolledBack, 0, nil
 	}
-
+	// Keep reads conservative when timeout cleanup cannot be confirmed.
 	return txnStatusPending, 0, nil
 }
 
@@ -721,12 +830,15 @@ func (s *ShardStore) loadTxnLock(ctx context.Context, primaryKey []byte) (txnLoc
 	return lock, true, nil
 }
 
-func (s *ShardStore) bestEffortAbortPrimary(primaryKey []byte, startTS uint64) {
+func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (bool, error) {
 	pg, ok := s.groupForKey(primaryKey)
 	if !ok || pg == nil || pg.Txn == nil {
-		return
+		return false, nil
 	}
-	_ = applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey})
+	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64, primaryKey []byte, keys [][]byte) error {
@@ -880,8 +992,8 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, errors.WithStack(err)
 	}
 	// Compatibility with older nodes that don't set RawGetResponse.exists:
-	// treat non-empty value as found even when exists=false.
-	if !resp.GetExists() && len(resp.GetValue()) == 0 {
+	// treat any non-nil payload as found even when exists=false.
+	if !resp.GetExists() && resp.GetValue() == nil {
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil

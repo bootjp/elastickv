@@ -203,6 +203,75 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t 
 	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
 }
 
+func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	st1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	defer stop1()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+	}
+	shardStore := NewShardStore(engine, groups)
+
+	// A normal committed user key so ScanAt can return data if lock checks miss.
+	require.NoError(t, st1.PutAt(ctx, []byte("c"), []byte("visible"), 1, 0))
+
+	committedPrimary := []byte("p")
+	committedSecondary := []byte("a")
+	committedStartTS := uint64(2)
+	committedCommitTS := uint64(3)
+	prepareCommitted := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    committedStartTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: committedPrimary, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
+			{Op: pb.Op_PUT, Key: committedPrimary, Value: []byte("vp")},
+			{Op: pb.Op_PUT, Key: committedSecondary, Value: []byte("va")},
+		},
+	}
+	_, err := groups[1].Txn.Commit([]*pb.Request{prepareCommitted})
+	require.NoError(t, err)
+	commitCommittedPrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    committedStartTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: committedPrimary, CommitTS: committedCommitTS})},
+			{Op: pb.Op_PUT, Key: committedPrimary},
+		},
+	}
+	_, err = groups[1].Txn.Commit([]*pb.Request{commitCommittedPrimary})
+	require.NoError(t, err)
+
+	// Create a later pending lock-only write that must block the scan.
+	pendingPrimary := []byte("b")
+	pendingStartTS := uint64(4)
+	preparePending := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    pendingStartTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: pendingPrimary, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
+			{Op: pb.Op_PUT, Key: pendingPrimary, Value: []byte("vb")},
+		},
+	}
+	_, err = groups[1].Txn.Commit([]*pb.Request{preparePending})
+	require.NoError(t, err)
+
+	// limit=1 should not hide pending locks after one resolved lock.
+	_, err = shardStore.ScanAt(ctx, []byte("a"), []byte("z"), 1, ^uint64(0))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
+}
+
 func TestShardStoreScanAt_ResolvesCommittedSecondaryLocks(t *testing.T) {
 	t.Parallel()
 

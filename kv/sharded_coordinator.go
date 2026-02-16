@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -19,7 +20,12 @@ type ShardGroup struct {
 	Txn   Transactional
 }
 
-const txnPhaseCount = 2
+const (
+	txnPhaseCount = 2
+
+	txnSecondaryCommitRetryAttempts = 3
+	txnSecondaryCommitRetryBackoff  = 20 * time.Millisecond
+)
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
 // It issues timestamps via a shared HLC and uses ShardRouter to dispatch.
@@ -175,7 +181,8 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
 	// Secondary commits are best-effort. If a shard is unavailable after the
 	// primary commits, read-time lock resolution will commit the remaining
-	// secondaries based on the primary commit record.
+	// secondaries based on the primary commit record. Retry a few times to
+	// absorb short leader-election windows and reduce lock lag.
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -191,7 +198,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
 		}
-		r, err := g.Txn.Commit([]*pb.Request{req})
+		r, err := commitSecondaryWithRetry(g, req)
 		if err != nil {
 			slog.Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
@@ -207,6 +214,24 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 		}
 	}
 	return maxIndex
+}
+
+func commitSecondaryWithRetry(g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
+	if g == nil || g.Txn == nil || req == nil {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+	var lastErr error
+	for attempt := 0; attempt < txnSecondaryCommitRetryAttempts; attempt++ {
+		resp, err := g.Txn.Commit([]*pb.Request{req})
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if attempt+1 < txnSecondaryCommitRetryAttempts {
+			time.Sleep(txnSecondaryCommitRetryBackoff * time.Duration(attempt+1))
+		}
+	}
+	return nil, errors.WithStack(lastErr)
 }
 
 func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
