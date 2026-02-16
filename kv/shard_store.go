@@ -877,8 +877,6 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	return errors.WithStack(err)
 }
 
-
-
 // ApplyMutations applies a batch of mutations to the correct shard store.
 //
 // All mutations must belong to the same shard. Cross-shard mutation batches are
