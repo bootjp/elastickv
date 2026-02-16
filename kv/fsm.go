@@ -157,8 +157,11 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 		return []*pb.Mutation{}, nil
 	}
 	seen := make(map[string]struct{}, len(muts))
-	out := make([]*pb.Mutation, 0, len(muts))
-	for _, mut := range muts {
+	reversed := make([]*pb.Mutation, 0, len(muts))
+	// Keep the last mutation per key to avoid dropping final operations like
+	// PUT followed by DEL in the same transactional batch.
+	for i := len(muts) - 1; i >= 0; i-- {
+		mut := muts[i]
 		if mut == nil || len(mut.Key) == 0 {
 			return nil, errors.WithStack(ErrInvalidRequest)
 		}
@@ -167,7 +170,12 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 			continue
 		}
 		seen[keyStr] = struct{}{}
-		out = append(out, mut)
+		reversed = append(reversed, mut)
+	}
+
+	out := make([]*pb.Mutation, 0, len(reversed))
+	for i := len(reversed) - 1; i >= 0; i-- {
+		out = append(out, reversed[i])
 	}
 	return out, nil
 }
@@ -298,7 +306,7 @@ func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutati
 			committingPrimary = true
 		}
 
-		keyMuts, err := f.commitTxnKeyMutations(ctx, key, startTS)
+		keyMuts, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS)
 		if err != nil {
 			return nil, err
 		}
@@ -325,7 +333,7 @@ func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.
 			abortingPrimary = true
 		}
 
-		shouldClear, err := f.shouldClearAbortKey(ctx, key, startTS)
+		shouldClear, err := f.shouldClearAbortKey(ctx, key, primaryKey, startTS)
 		if err != nil {
 			return nil, false, err
 		}
@@ -435,7 +443,7 @@ func storeMutationForIntent(key []byte, intent txnIntent) (*store.KVPairMutation
 	}
 }
 
-func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key []byte, startTS uint64) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64) ([]*store.KVPairMutation, error) {
 	lock, ok, err := f.txnLockForCommit(ctx, key)
 	if err != nil {
 		return nil, err
@@ -446,6 +454,9 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key []byte, startTS u
 	}
 	if lock.StartTS != startTS {
 		return nil, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+	}
+	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
+		return nil, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
 	}
 
 	intent, ok, err := f.txnIntentForCommit(ctx, key)
@@ -468,7 +479,7 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key []byte, startTS u
 	return out, nil
 }
 
-func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key []byte, startTS uint64) (bool, error) {
+func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key, primaryKey []byte, startTS uint64) (bool, error) {
 	lockBytes, err := f.store.GetAt(ctx, txnLockKey(key), ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -482,6 +493,9 @@ func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key []byte, startTS uin
 	}
 	if lock.StartTS != startTS {
 		return false, nil
+	}
+	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
+		return false, errors.Wrapf(ErrTxnInvalidMeta, "abort primary_key mismatch for key %s", string(key))
 	}
 	return true, nil
 }
