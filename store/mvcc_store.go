@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -136,7 +137,7 @@ func (s *mvccStore) putVersionLocked(key, value []byte, commitTS, expireAt uint6
 	if existing != nil {
 		versions, _ = existing.([]VersionedValue)
 	}
-	versions = append(versions, VersionedValue{
+	versions = insertVersionSorted(versions, VersionedValue{
 		TS:        commitTS,
 		Value:     bytes.Clone(value),
 		Tombstone: false,
@@ -151,13 +152,30 @@ func (s *mvccStore) deleteVersionLocked(key []byte, commitTS uint64) {
 	if existing != nil {
 		versions, _ = existing.([]VersionedValue)
 	}
-	versions = append(versions, VersionedValue{
+	versions = insertVersionSorted(versions, VersionedValue{
 		TS:        commitTS,
 		Value:     nil,
 		Tombstone: true,
 		ExpireAt:  0,
 	})
 	s.tree.Put(bytes.Clone(key), versions)
+}
+
+func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []VersionedValue {
+	// Keep versions sorted by TS ascending so lookups can assume max TS is last.
+	if n := len(versions); n == 0 || versions[n-1].TS < vv.TS {
+		return append(versions, vv)
+	}
+	i := sort.Search(len(versions), func(i int) bool { return versions[i].TS >= vv.TS })
+	if i < len(versions) && versions[i].TS == vv.TS {
+		// Idempotence: overwrite same timestamp.
+		versions[i] = vv
+		return versions
+	}
+	versions = append(versions, VersionedValue{})
+	copy(versions[i+1:], versions[i:])
+	versions[i] = vv
+	return versions
 }
 
 func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
@@ -192,12 +210,10 @@ func (s *mvccStore) readTS() uint64 {
 }
 
 func (s *mvccStore) alignCommitTS(commitTS uint64) uint64 {
-	ts := commitTS
-	if ts <= s.lastCommitTS {
-		ts = s.lastCommitTS + 1
+	if commitTS > s.lastCommitTS {
+		s.lastCommitTS = commitTS
 	}
-	s.lastCommitTS = ts
-	return ts
+	return commitTS
 }
 
 func (s *mvccStore) latestVersionLocked(key []byte) (VersionedValue, bool) {

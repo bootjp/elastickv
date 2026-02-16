@@ -72,11 +72,14 @@ func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	}()
 
 	if err != nil {
-		_, _err := t.Abort(reqs)
-		if _err != nil {
-			return nil, errors.WithStack(errors.CombineErrors(err, _err))
+		// Only attempt transactional cleanup for transactional batches. Raw request
+		// batches may partially succeed across shards by design.
+		if len(reqs) > 0 && reqs[0] != nil && reqs[0].IsTxn {
+			_, _err := t.Abort(reqs)
+			if _err != nil {
+				return nil, errors.WithStack(errors.CombineErrors(err, _err))
+			}
 		}
-
 		return nil, errors.WithStack(err)
 	}
 
@@ -88,11 +91,33 @@ func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, e
 func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 	var abortReqs []*pb.Request
 	for _, req := range reqs {
+		if req == nil || !req.IsTxn {
+			continue
+		}
+		meta, muts, err := extractTxnMeta(req.Mutations)
+		if err != nil {
+			// Best-effort cleanup; skip requests we can't interpret.
+			continue
+		}
+		startTS := req.Ts
+		abortTS := abortTSFrom(startTS, startTS)
+		if abortTS <= startTS {
+			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			continue
+		}
+		meta.CommitTS = abortTS
+
 		abortReqs = append(abortReqs, &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_ABORT,
-			Ts:        req.Ts,
-			Mutations: req.Mutations,
+			IsTxn: true,
+			Phase: pb.Phase_ABORT,
+			Ts:    startTS,
+			Mutations: append([]*pb.Mutation{
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte(txnMetaPrefix),
+					Value: EncodeTxnMeta(meta),
+				},
+			}, muts...),
 		})
 	}
 
@@ -113,4 +138,15 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 	return &TransactionResponse{
 		CommitIndex: commitIndex,
 	}, nil
+}
+
+func extractTxnMeta(muts []*pb.Mutation) (TxnMeta, []*pb.Mutation, error) {
+	if len(muts) == 0 || muts[0] == nil || !isTxnMetaKey(muts[0].Key) {
+		return TxnMeta{}, nil, errors.WithStack(ErrTxnMetaMissing)
+	}
+	meta, err := DecodeTxnMeta(muts[0].Value)
+	if err != nil {
+		return TxnMeta{}, nil, errors.WithStack(errors.Wrap(err, "decode txn meta"))
+	}
+	return meta, muts[1:], nil
 }

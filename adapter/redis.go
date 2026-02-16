@@ -150,7 +150,9 @@ func (r *RedisServer) Run() error {
 
 			name := strings.ToUpper(string(cmd.Args[0]))
 			if state.inTxn && name != cmdExec && name != cmdDiscard && name != cmdMulti {
-				state.queue = append(state.queue, cmd)
+				// redcon reuses the underlying argument buffers; copy queued commands
+				// so MULTI/EXEC works reliably under concurrency and with -race.
+				state.queue = append(state.queue, cloneCommand(cmd))
 				conn.WriteString("QUEUED")
 				return
 			}
@@ -168,6 +170,17 @@ func (r *RedisServer) Run() error {
 		})
 
 	return errors.WithStack(err)
+}
+
+func cloneCommand(cmd redcon.Command) redcon.Command {
+	out := redcon.Command{
+		Raw:  bytes.Clone(cmd.Raw),
+		Args: make([][]byte, len(cmd.Args)),
+	}
+	for i := range cmd.Args {
+		out.Args[i] = bytes.Clone(cmd.Args[i])
+	}
+	return out
 }
 
 func (r *RedisServer) Stop() {
@@ -233,8 +246,14 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	key := cmd.Args[1]
 	readTS := r.readTS()
-	v, err := r.readValueAt(cmd.Args[1], readTS)
+	// When proxying reads to the leader, let the leader choose a safe snapshot.
+	// Our local store watermark may lag behind a just-committed transaction.
+	if !r.coordinator.IsLeaderForKey(key) {
+		readTS = 0
+	}
+	v, err := r.readValueAt(key, readTS)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrKeyNotFound):
@@ -1156,7 +1175,11 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-
+	// Compatibility with older nodes that don't set RawGetResponse.exists:
+	// treat any non-nil payload as found even when exists=false.
+	if !resp.GetExists() && resp.GetValue() == nil {
+		return nil, errors.WithStack(store.ErrKeyNotFound)
+	}
 	return resp.Value, nil
 }
 

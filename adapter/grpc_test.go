@@ -36,13 +36,33 @@ func Test_value_can_be_deleted(t *testing.T) {
 	resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 	assert.NoError(t, err, "Get RPC failed")
 	assert.Nil(t, err)
+	assert.True(t, resp.Exists)
 	assert.Equal(t, want, resp.Value)
 
 	_, err = c.RawDelete(context.TODO(), &pb.RawDeleteRequest{Key: key})
 	assert.NoError(t, err, "Delete RPC failed")
 
-	_, err = c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+	resp, err = c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
 	assert.NoError(t, err, "Get RPC failed")
+	assert.False(t, resp.Exists)
+}
+
+func Test_grpc_raw_get_empty_value(t *testing.T) {
+	t.Parallel()
+	nodes, adders, _ := createNode(t, 3)
+	c := rawKVClient(t, adders)
+	defer shutdown(nodes)
+
+	key := []byte("empty-key")
+	empty := []byte{}
+
+	_, err := c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: empty})
+	assert.NoError(t, err, "Put RPC failed")
+
+	resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+	assert.NoError(t, err, "Get RPC failed")
+	assert.True(t, resp.Exists)
+	assert.Equal(t, 0, len(resp.Value))
 }
 
 func Test_grpc_scan(t *testing.T) {

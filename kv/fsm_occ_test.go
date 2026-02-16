@@ -47,16 +47,15 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
 	require.Nil(t, resp)
 
-	// Stale transaction attempts to commit with startTS=90.
+	// Stale transaction attempts to prewrite with startTS=90.
 	conflict := &pb.Request{
 		IsTxn: true,
-		Phase: pb.Phase_COMMIT,
+		Phase: pb.Phase_PREPARE,
 		Ts:    90,
-		Mutations: []*pb.Mutation{{
-			Op:    pb.Op_PUT,
-			Key:   []byte("k"),
-			Value: []byte("v2"),
-		}},
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("!txn|meta|"), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("k"), LockTTLms: 1000})},
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v2")},
+		},
 	}
 	data, err = proto.Marshal(conflict)
 	require.NoError(t, err)
