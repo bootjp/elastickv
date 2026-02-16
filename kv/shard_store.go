@@ -365,7 +365,7 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	case txnStatusCommitted:
 		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusRolledBack:
-		abortTS := abortTSFrom(lock.StartTS, lock.StartTS)
+		abortTS := abortTSFrom(lock.StartTS, commitTS)
 		if abortTS <= lock.StartTS {
 			// Overflow: can't choose an abort timestamp strictly greater than startTS.
 			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
@@ -533,7 +533,7 @@ func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		abortTS := abortTSFrom(lock.StartTS, lock.StartTS)
+		abortTS := abortTSFrom(lock.StartTS, state.commitTS)
 		if abortTS <= lock.StartTS {
 			// Overflow: can't choose an abort timestamp strictly greater than startTS.
 			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
