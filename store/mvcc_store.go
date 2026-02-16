@@ -163,6 +163,9 @@ func (s *mvccStore) deleteVersionLocked(key []byte, commitTS uint64) {
 
 func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []VersionedValue {
 	// Keep versions sorted by TS ascending so lookups can assume max TS is last.
+	if n := len(versions); n == 0 || versions[n-1].TS < vv.TS {
+		return append(versions, vv)
+	}
 	i := sort.Search(len(versions), func(i int) bool { return versions[i].TS >= vv.TS })
 	if i < len(versions) && versions[i].TS == vv.TS {
 		// Idempotence: overwrite same timestamp.

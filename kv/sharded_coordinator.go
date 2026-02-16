@@ -92,15 +92,19 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, elems []*Elem[OP]) (*Co
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	prepared, err := c.prewriteTxn(startTS, primaryKey, grouped, gids)
+	commitTS := c.nextTxnTSAfter(startTS)
+	if commitTS == 0 || commitTS <= startTS {
+		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+
+	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
 	if err != nil {
 		return nil, err
 	}
 
-	commitTS := c.nextTxnTSAfter(startTS)
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(startTS, primaryKey, grouped, commitTS)
 	if err != nil {
-		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(commitTS))
+		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 		return nil, errors.WithStack(err)
 	}
 
@@ -113,7 +117,7 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
@@ -129,7 +133,7 @@ func (c *ShardedCoordinator) prewriteTxn(startTS uint64, primaryKey []byte, grou
 			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
 		}
 		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
-			c.abortPreparedTxn(startTS, primaryKey, prepared, c.nextTxnTSAfter(startTS))
+			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 			return nil, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
@@ -209,6 +213,9 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 	if len(prepared) == 0 {
 		return
 	}
+	if abortTS == 0 || abortTS <= startTS {
+		return
+	}
 
 	meta := txnMetaMutation(primaryKey, 0, abortTS)
 	for _, pg := range prepared {
@@ -238,7 +245,7 @@ func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
 	if c.clock == nil {
 		nextTS := startTS + 1
 		if nextTS == 0 {
-			return startTS
+			return 0
 		}
 		return nextTS
 	}
@@ -247,15 +254,22 @@ func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
 		c.clock.Observe(startTS)
 		ts = c.clock.Next()
 	}
+	if ts <= startTS {
+		return 0
+	}
 	return ts
 }
 
-func abortTSFrom(commitTS uint64) uint64 {
+func abortTSFrom(startTS, commitTS uint64) uint64 {
 	abortTS := commitTS + 1
-	if abortTS == 0 {
-		return commitTS
+	if abortTS > startTS {
+		return abortTS
 	}
-	return abortTS
+	fallback := startTS + 1
+	if fallback == 0 {
+		return 0
+	}
+	return fallback
 }
 
 func txnMetaMutation(primaryKey []byte, lockTTLms uint64, commitTS uint64) *pb.Mutation {

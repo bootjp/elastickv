@@ -198,6 +198,9 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	var requests []*pb.Request
 	if reqs.IsTxn {
 		primary := primaryKeyForElems(reqs.Elems)
+		if len(primary) == 0 {
+			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
+		}
 		requests = txnRequests(reqs.StartTS, 0, defaultTxnLockTTLms, primary, reqs.Elems)
 	} else {
 		for _, req := range reqs.Elems {
