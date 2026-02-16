@@ -845,6 +845,8 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}
+	// No commitTS available here; we're aborting an expired lock with no commit record.
+	// abortTSFrom will use startTS+1 if representable.
 	abortTS := abortTSFrom(startTS, startTS)
 	if abortTS <= startTS {
 		// Overflow: can't choose an abort timestamp strictly greater than startTS.
