@@ -365,7 +365,12 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	case txnStatusCommitted:
 		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusRolledBack:
-		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, cleanupTS(lock.StartTS), lock.PrimaryKey, [][]byte{key})
+		abortTS := abortTSFrom(lock.StartTS, lock.StartTS)
+		if abortTS <= lock.StartTS {
+			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusPending:
 		return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
 	default:
@@ -528,7 +533,12 @@ func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		return pb.Phase_ABORT, cleanupTS(lock.StartTS), nil
+		abortTS := abortTSFrom(lock.StartTS, lock.StartTS)
+		if abortTS <= lock.StartTS {
+			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return pb.Phase_ABORT, abortTS, nil
 	default:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
 	}
@@ -835,7 +845,12 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}
-	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey}); err != nil {
+	abortTS := abortTSFrom(startTS, startTS)
+	if abortTS <= startTS {
+		// Overflow: can't choose an abort timestamp strictly greater than startTS.
+		return false, nil
+	}
+	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -859,14 +874,7 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	return errors.WithStack(err)
 }
 
-func cleanupTS(startTS uint64) uint64 {
-	now := hlcWallNow()
-	next := startTS + 1
-	if now > next {
-		return now
-	}
-	return next
-}
+
 
 // ApplyMutations applies a batch of mutations to the correct shard store.
 //
