@@ -365,7 +365,14 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	case txnStatusCommitted:
 		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusRolledBack:
-		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, cleanupTS(lock.StartTS), lock.PrimaryKey, [][]byte{key})
+		abortTS := abortTSFrom(lock.StartTS, commitTS)
+		if abortTS <= lock.StartTS {
+			// Defensive check: While uint64 overflow is not expected in normal operation,
+			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
+			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusPending:
 		return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
 	default:
@@ -528,7 +535,14 @@ func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		return pb.Phase_ABORT, cleanupTS(lock.StartTS), nil
+		abortTS := abortTSFrom(lock.StartTS, state.commitTS)
+		if abortTS <= lock.StartTS {
+			// Defensive check: While uint64 overflow is not expected in normal operation,
+			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
+			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return pb.Phase_ABORT, abortTS, nil
 	default:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
 	}
@@ -835,7 +849,17 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}
-	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey}); err != nil {
+	// No commitTS available here; we're aborting an expired lock with no commit record.
+	// Pass 0 for commitTS to explicitly indicate it's not available; abortTSFrom will
+	// use startTS+1 if representable.
+	abortTS := abortTSFrom(startTS, 0)
+	if abortTS <= startTS {
+		// Defensive check: While uint64 overflow is not expected in normal operation,
+		// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+		// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
+		return false, nil
+	}
+	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -857,15 +881,6 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	}
 	_, err := g.Txn.Commit([]*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
 	return errors.WithStack(err)
-}
-
-func cleanupTS(startTS uint64) uint64 {
-	now := hlcWallNow()
-	next := startTS + 1
-	if now > next {
-		return now
-	}
-	return next
 }
 
 // ApplyMutations applies a batch of mutations to the correct shard store.
