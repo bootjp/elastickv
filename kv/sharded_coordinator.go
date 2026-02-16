@@ -483,7 +483,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
-		primaryKey := primaryKeyFromMutations(muts)
+		primaryKey, keys := primaryKeyAndKeyMutations(muts)
 		if len(primaryKey) == 0 {
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 		}
@@ -502,16 +502,17 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 				Ts:    startTS,
 				Mutations: append([]*pb.Mutation{
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
-				}, keyMutations(muts)...),
+				}, keys...),
 			},
 		)
 	}
 	return logs, nil
 }
 
-func primaryKeyFromMutations(muts []*pb.Mutation) []byte {
+func primaryKeyAndKeyMutations(muts []*pb.Mutation) ([]byte, []*pb.Mutation) {
 	seen := map[string]struct{}{}
 	var primary []byte
+	keys := make([]*pb.Mutation, 0, len(muts))
 	for _, m := range muts {
 		if m == nil || len(m.Key) == 0 {
 			continue
@@ -524,8 +525,9 @@ func primaryKeyFromMutations(muts []*pb.Mutation) []byte {
 		if primary == nil || bytes.Compare(m.Key, primary) < 0 {
 			primary = m.Key
 		}
+		keys = append(keys, &pb.Mutation{Op: pb.Op_PUT, Key: m.Key})
 	}
-	return primary
+	return primary, keys
 }
 
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {

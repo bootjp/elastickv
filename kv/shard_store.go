@@ -296,18 +296,36 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 }
 
 func (s *ShardStore) maybeResolveTxnLock(ctx context.Context, g *ShardGroup, key []byte, readTS uint64) error {
-	// Only consider locks visible at the read timestamp.
-	lockBytes, err := g.Store.GetAt(ctx, txnLockKey(key), readTS)
+	lock, ok, err := loadTxnLockAt(ctx, g, key, readTS)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	return s.resolveTxnLockForKey(ctx, g, key, lock)
+}
+
+func loadTxnLockAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) (txnLock, bool, error) {
+	if g == nil || g.Store == nil {
+		return txnLock{}, false, nil
+	}
+	// Only consider locks visible at the provided read timestamp.
+	lockBytes, err := g.Store.GetAt(ctx, txnLockKey(key), ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil
+			return txnLock{}, false, nil
 		}
-		return errors.WithStack(err)
+		return txnLock{}, false, errors.WithStack(err)
 	}
 	lock, err := decodeTxnLock(lockBytes)
 	if err != nil {
-		return errors.WithStack(err)
+		return txnLock{}, false, errors.WithStack(err)
 	}
+	return lock, true, nil
+}
+
+func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, key []byte, lock txnLock) error {
 	// Check primary transaction status to decide commit/rollback.
 	status, commitTS, err := s.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
 	if err != nil {
@@ -357,7 +375,7 @@ func (s *ShardStore) resolveScanKVP(ctx context.Context, g *ShardGroup, kvp *sto
 
 	// Fast-path: if there's no lock visible at this read timestamp, use the scan
 	// value directly instead of re-reading it.
-	locked, err := scanKeyLockedAt(ctx, g, kvp.Key, ts)
+	lock, locked, err := loadTxnLockAt(ctx, g, kvp.Key, ts)
 	if err != nil {
 		return nil, false, err
 	}
@@ -365,7 +383,11 @@ func (s *ShardStore) resolveScanKVP(ctx context.Context, g *ShardGroup, kvp *sto
 		return kvp, false, nil
 	}
 
-	v, err := s.leaderGetAt(ctx, g, kvp.Key, ts)
+	if err := s.resolveTxnLockForKey(ctx, g, kvp.Key, lock); err != nil {
+		return nil, false, err
+	}
+
+	v, err := s.localGetAt(ctx, g, kvp.Key, ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, true, nil
@@ -373,20 +395,6 @@ func (s *ShardStore) resolveScanKVP(ctx context.Context, g *ShardGroup, kvp *sto
 		return nil, false, err
 	}
 	return &store.KVPair{Key: kvp.Key, Value: v}, false, nil
-}
-
-func scanKeyLockedAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) (bool, error) {
-	if g == nil || g.Store == nil {
-		return false, nil
-	}
-	_, err := g.Store.GetAt(ctx, txnLockKey(key), ts)
-	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return false, nil
-		}
-		return false, errors.WithStack(err)
-	}
-	return true, nil
 }
 
 func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
