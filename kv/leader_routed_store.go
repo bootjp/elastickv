@@ -66,7 +66,9 @@ func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if !resp.GetExists() {
+	// Compatibility with older nodes that don't set RawGetResponse.exists:
+	// treat non-empty value as found even when exists=false.
+	if !resp.GetExists() && len(resp.GetValue()) == 0 {
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil

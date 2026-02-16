@@ -1175,7 +1175,9 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if !resp.GetExists() {
+	// Compatibility with older nodes that don't set RawGetResponse.exists:
+	// treat non-empty value as found even when exists=false.
+	if !resp.GetExists() && len(resp.GetValue()) == 0 {
 		return nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 	return resp.Value, nil
