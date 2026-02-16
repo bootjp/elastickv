@@ -367,7 +367,9 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	case txnStatusRolledBack:
 		abortTS := abortTSFrom(lock.StartTS, commitTS)
 		if abortTS <= lock.StartTS {
-			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			// Defensive check: While uint64 overflow is not expected in normal operation,
+			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
 		}
 		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
@@ -535,7 +537,9 @@ func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.
 	case txnStatusRolledBack:
 		abortTS := abortTSFrom(lock.StartTS, state.commitTS)
 		if abortTS <= lock.StartTS {
-			// Overflow: can't choose an abort timestamp strictly greater than startTS.
+			// Defensive check: While uint64 overflow is not expected in normal operation,
+			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
 		}
 		return pb.Phase_ABORT, abortTS, nil
@@ -850,7 +854,9 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 	// use startTS+1 if representable.
 	abortTS := abortTSFrom(startTS, 0)
 	if abortTS <= startTS {
-		// Overflow: can't choose an abort timestamp strictly greater than startTS.
+		// Defensive check: While uint64 overflow is not expected in normal operation,
+		// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+		// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 		return false, nil
 	}
 	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
