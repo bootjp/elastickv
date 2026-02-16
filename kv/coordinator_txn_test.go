@@ -38,3 +38,19 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 	require.Equal(t, 0, tx.commits)
 }
+
+func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
+	t.Parallel()
+
+	tx := &stubTransactional{}
+	c := &Coordinate{
+		transactionManager: tx,
+		clock:              NewHLC(),
+	}
+
+	_, err := c.dispatchTxn([]*Elem[OP]{
+		{Op: Put, Key: nil, Value: []byte("v")},
+	}, 1)
+	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
+	require.Equal(t, 0, tx.commits)
+}
