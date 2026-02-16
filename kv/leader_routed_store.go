@@ -66,7 +66,7 @@ func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if resp.Value == nil {
+	if !resp.GetExists() {
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil

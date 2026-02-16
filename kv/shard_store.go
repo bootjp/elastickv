@@ -165,14 +165,8 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 
 	// Reads should come from the shard's leader to avoid returning stale or
 	// incomplete results when this node is a follower for a given shard.
-	if g.Raft.State() == raft.Leader {
-		if err := g.Raft.VerifyLeader().Error(); err == nil {
-			kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
-			if err != nil {
-				return nil, errors.WithStack(err)
-			}
-			return s.resolveScanLocks(ctx, g, kvs, ts)
-		}
+	if isVerifiedRaftLeader(g.Raft) {
+		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts)
 	}
 
 	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts)
@@ -182,6 +176,18 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 	// The leader's RawScanAt is expected to perform lock resolution and filtering
 	// via ShardStore.ScanAt, so avoid N+1 proxy gets here.
 	return filterTxnInternalKVs(kvs), nil
+}
+
+func (s *ShardStore) scanRouteAtLeader(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	lockKVs, err := scanTxnLockRangeAt(ctx, g, start, end, limit, ts)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveScanLocks(ctx, g, kvs, lockKVs, ts)
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
@@ -370,6 +376,7 @@ type lockResolutionBatch struct {
 
 type scanLockPlan struct {
 	items             []scanItem
+	itemIndex         map[string]int
 	statusCache       map[lockTxnKey]lockTxnStatus
 	resolutionBatches map[lockTxnKey]*lockResolutionBatch
 	batchOrder        []lockTxnKey
@@ -378,21 +385,22 @@ type scanLockPlan struct {
 func newScanLockPlan(size int) *scanLockPlan {
 	return &scanLockPlan{
 		items:             make([]scanItem, 0, size),
+		itemIndex:         make(map[string]int, size),
 		statusCache:       make(map[lockTxnKey]lockTxnStatus),
 		resolutionBatches: make(map[lockTxnKey]*lockResolutionBatch),
 		batchOrder:        make([]lockTxnKey, 0),
 	}
 }
 
-func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
-	if len(kvs) == 0 {
+func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, lockKVs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
+	if len(kvs) == 0 && len(lockKVs) == 0 {
 		return kvs, nil
 	}
 	if g == nil || g.Store == nil {
 		return []*store.KVPair{}, nil
 	}
 
-	plan, err := s.planScanLockResolutions(ctx, g, kvs, ts)
+	plan, err := s.planScanLockResolutions(ctx, g, kvs, lockKVs, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -402,8 +410,13 @@ func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []
 	return s.materializeScanLockResults(ctx, g, ts, plan.items)
 }
 
-func (s *ShardStore) planScanLockResolutions(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
-	plan := newScanLockPlan(len(kvs))
+func (s *ShardStore) planScanLockResolutions(ctx context.Context, g *ShardGroup, kvs []*store.KVPair, lockKVs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
+	plan := newScanLockPlan(len(kvs) + len(lockKVs))
+	for _, kvp := range lockKVs {
+		if err := s.planScanLockFromLockKVP(ctx, plan, kvp); err != nil {
+			return nil, err
+		}
+	}
 	for _, kvp := range kvs {
 		if err := s.planScanLockItem(ctx, g, ts, plan, kvp); err != nil {
 			return nil, err
@@ -412,9 +425,32 @@ func (s *ShardStore) planScanLockResolutions(ctx context.Context, g *ShardGroup,
 	return plan, nil
 }
 
+func (s *ShardStore) planScanLockFromLockKVP(ctx context.Context, plan *scanLockPlan, kvp *store.KVPair) error {
+	if kvp == nil {
+		return nil
+	}
+	userKey, ok := txnUserKeyFromLockKey(kvp.Key)
+	if !ok {
+		return nil
+	}
+
+	lock, err := decodeTxnLock(kvp.Value)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(lock.PrimaryKey) == 0 {
+		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(userKey))
+	}
+
+	return s.planLockedUserKey(ctx, plan, userKey, lock)
+}
+
 func (s *ShardStore) planScanLockItem(ctx context.Context, g *ShardGroup, ts uint64, plan *scanLockPlan, kvp *store.KVPair) error {
 	if kvp == nil || isTxnInternalKey(kvp.Key) {
 		plan.items = append(plan.items, scanItem{skip: true})
+		return nil
+	}
+	if _, exists := plan.itemIndex[string(kvp.Key)]; exists {
 		return nil
 	}
 
@@ -423,11 +459,15 @@ func (s *ShardStore) planScanLockItem(ctx context.Context, g *ShardGroup, ts uin
 		return err
 	}
 	if !locked {
-		plan.items = append(plan.items, scanItem{kvp: kvp})
+		appendScanItem(plan, kvp, false)
 		return nil
 	}
+	return s.planLockedUserKey(ctx, plan, kvp.Key, lock)
+}
+
+func (s *ShardStore) planLockedUserKey(ctx context.Context, plan *scanLockPlan, userKey []byte, lock txnLock) error {
 	if len(lock.PrimaryKey) == 0 {
-		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(kvp.Key))
+		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(userKey))
 	}
 
 	txnKey := lockTxnKey{startTS: lock.StartTS, primary: string(lock.PrimaryKey)}
@@ -435,12 +475,12 @@ func (s *ShardStore) planScanLockItem(ctx context.Context, g *ShardGroup, ts uin
 	if err != nil {
 		return err
 	}
-	phase, resolveTS, err := lockResolutionForStatus(state, lock, kvp.Key)
+	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey)
 	if err != nil {
 		return err
 	}
-	appendScanLockResolutionBatch(plan, txnKey, phase, resolveTS, lock, kvp.Key)
-	plan.items = append(plan.items, scanItem{kvp: kvp, locked: true})
+	appendScanLockResolutionBatch(plan, txnKey, phase, resolveTS, lock, userKey)
+	appendScanItem(plan, &store.KVPair{Key: userKey}, true)
 	return nil
 }
 
@@ -490,6 +530,64 @@ func appendScanLockResolutionBatch(plan *scanLockPlan, txnKey lockTxnKey, phase 
 	}
 	batch.seen[keyID] = struct{}{}
 	batch.keys = append(batch.keys, key)
+}
+
+func appendScanItem(plan *scanLockPlan, kvp *store.KVPair, locked bool) {
+	if kvp == nil || len(kvp.Key) == 0 {
+		return
+	}
+	keyID := string(kvp.Key)
+	if idx, exists := plan.itemIndex[keyID]; exists {
+		if locked {
+			plan.items[idx].locked = true
+		}
+		return
+	}
+
+	plan.itemIndex[keyID] = len(plan.items)
+	plan.items = append(plan.items, scanItem{kvp: kvp, locked: locked})
+}
+
+func txnUserKeyFromLockKey(lockKey []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(lockKey, []byte(txnLockPrefix)) {
+		return nil, false
+	}
+	return bytes.Clone(lockKey[len(txnLockPrefix):]), true
+}
+
+func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if g == nil || g.Store == nil || limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	lockStart, lockEnd := txnLockScanBounds(start, end)
+	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, limit, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return lockKVs, nil
+}
+
+func txnLockScanBounds(start []byte, end []byte) ([]byte, []byte) {
+	lockStart := txnLockKey(start)
+	if end != nil {
+		return lockStart, txnLockKey(end)
+	}
+	return lockStart, prefixScanEnd([]byte(txnLockPrefix))
+}
+
+func prefixScanEnd(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+	out := bytes.Clone(prefix)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] == ^byte(0) {
+			continue
+		}
+		out[i]++
+		return out[:i+1]
+	}
+	return nil
 }
 
 func applyScanLockResolutions(g *ShardGroup, plan *scanLockPlan) error {
@@ -781,7 +879,7 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if resp.Value == nil {
+	if !resp.GetExists() {
 		return nil, store.ErrKeyNotFound
 	}
 	return resp.Value, nil

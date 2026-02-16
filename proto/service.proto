@@ -39,6 +39,7 @@ message RawGetRequest {
 message RawGetResponse {
   uint64 read_at_index = 1;
   bytes value = 2;
+  bool exists = 3;
 }
 
 message RawDeleteRequest {

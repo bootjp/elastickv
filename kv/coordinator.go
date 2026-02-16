@@ -112,6 +112,9 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateR
 		c.clock.Observe(startTS)
 		commitTS = c.clock.Next()
 	}
+	if commitTS <= startTS {
+		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	}
 
 	logs := txnRequests(startTS, commitTS, defaultTxnLockTTLms, primary, reqs)
 

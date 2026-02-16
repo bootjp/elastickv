@@ -1175,7 +1175,7 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if resp.Value == nil {
+	if !resp.GetExists() {
 		return nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 	return resp.Value, nil

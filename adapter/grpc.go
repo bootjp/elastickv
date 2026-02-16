@@ -87,7 +87,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
-		return &pb.RawGetResponse{Value: nil}, nil
+		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
 	}
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -97,7 +97,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		slog.String("key", string(req.Key)),
 		slog.String("value", string(v)))
 
-	return &pb.RawGetResponse{Value: v}, nil
+	return &pb.RawGetResponse{Value: v, Exists: true}, nil
 }
 
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
