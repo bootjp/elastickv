@@ -283,75 +283,65 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	return nil, nil
 }
 
-func decodeIterKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
-	key, version := decodeKey(iter.Key())
-	if key == nil {
-		return nil, 0, false
+func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
+	if currentVersion <= ts {
+		return true
 	}
-	return key, version, true
+	seekKey := encodeKey(userKey, ts)
+	if !iter.SeekGE(seekKey) {
+		return false
+	}
+	k := iter.Key()
+	currentUserKey, _ := decodeKey(k)
+	return bytes.Equal(currentUserKey, userKey)
 }
 
-func (s *pebbleStore) scanCurrentUserKey(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
-	var out *KVPair
-	evaluatedVisible := false
-
-	for iter.Valid() {
-		curKey, version, ok := decodeIterKey(iter)
-		if !ok {
-			if !iter.Next() {
-				return out, nil
-			}
-			continue
-		}
-		if !bytes.Equal(curKey, userKey) {
-			return out, nil
-		}
-
-		// Only the newest version visible at ts should determine scan visibility.
-		// If that version is tombstoned/expired, older versions must stay masked.
-		if !evaluatedVisible && version <= ts {
-			kv, err := s.processFoundValue(iter, userKey, ts)
-			if err != nil {
-				return nil, err
-			}
-			out = kv
-			evaluatedVisible = true
-		}
-
-		if !iter.Next() {
-			return out, nil
-		}
+func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
+	if !iter.SeekGE(encodeKey(userKey, 0)) {
+		return false
 	}
+	k := iter.Key()
+	u, _ := decodeKey(k)
+	if bytes.Equal(u, userKey) {
+		return iter.Next()
+	}
+	return true
+}
 
-	return out, nil
+func pastScanEnd(userKey, end []byte) bool {
+	return end != nil && bytes.Compare(userKey, end) > 0
 }
 
 func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, limit)
 
-	if !iter.SeekGE(encodeKey(start, math.MaxUint64)) {
-		return result, nil
-	}
-
-	for iter.Valid() && len(result) < limit {
-		userKey, _, ok := decodeIterKey(iter)
-		if !ok {
+	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
+		userKey, version := decodeKey(iter.Key())
+		if userKey == nil {
 			if !iter.Next() {
 				break
 			}
 			continue
 		}
 
-		if end != nil && bytes.Compare(userKey, end) > 0 {
+		if pastScanEnd(userKey, end) {
 			break
 		}
 
-		kv, err := s.scanCurrentUserKey(iter, userKey, ts)
+		if !s.seekToVisibleVersion(iter, userKey, version, ts) {
+			continue
+		}
+
+		kv, err := s.processFoundValue(iter, userKey, ts)
 		if err != nil {
 			return nil, err
 		}
 		if kv != nil {
 			result = append(result, kv)
+		}
+
+		if !s.skipToNextUserKey(iter, userKey) {
+			break
 		}
 	}
 

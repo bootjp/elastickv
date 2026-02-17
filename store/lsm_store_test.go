@@ -124,6 +124,27 @@ func TestPebbleStore_Scan_TombstoneMasksOlderVersions(t *testing.T) {
 	assert.Len(t, pairs, 0)
 }
 
+func TestPebbleStore_Scan_SkipsKeyWithOnlyFutureVersions(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-scan-future-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v100"), 100, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v110"), 110, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v80"), 80, 0))
+
+	pairs, err := s.ScanAt(ctx, []byte("k"), nil, 10, 85)
+	require.NoError(t, err)
+	require.Len(t, pairs, 1)
+	assert.Equal(t, []byte("k2"), pairs[0].Key)
+	assert.Equal(t, []byte("v80"), pairs[0].Value)
+}
+
 func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-snap-test")
 	require.NoError(t, err)

@@ -27,6 +27,20 @@ func TestLockResolutionForStatus_RolledBackTimestampOverflow(t *testing.T) {
 	require.Zero(t, ts)
 }
 
+func TestLockResolutionForStatus_RolledBackUsesCleanupNowWhenAhead(t *testing.T) {
+	t.Parallel()
+
+	phase, ts, err := lockResolutionForStatus(
+		lockTxnStatus{status: txnStatusRolledBack},
+		txnLock{StartTS: 10},
+		[]byte("k"),
+		200,
+	)
+	require.NoError(t, err)
+	require.Equal(t, pb.Phase_ABORT, phase)
+	require.Equal(t, uint64(200), ts)
+}
+
 func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	t.Parallel()
 
