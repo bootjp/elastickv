@@ -261,6 +261,44 @@ func TestCatalogStoreSaveRejectsCommitTSOverflow(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreApplySaveMutations_UsesMonotonicCommitTS(t *testing.T) {
+	st := store.NewMVCCStore()
+	ctx := context.Background()
+	cs := NewCatalogStore(st)
+
+	plan, err := cs.prepareSave(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+	})
+	if err != nil {
+		t.Fatalf("prepareSave: %v", err)
+	}
+
+	// Simulate unrelated writes advancing the global LastCommitTS after planning.
+	advancedTS := plan.minCommitTS + 50
+	if err := st.PutAt(ctx, []byte("unrelated"), []byte("v"), advancedTS, 0); err != nil {
+		t.Fatalf("advance LastCommitTS: %v", err)
+	}
+
+	mutations, err := cs.buildSaveMutations(ctx, plan)
+	if err != nil {
+		t.Fatalf("buildSaveMutations: %v", err)
+	}
+	if err := cs.applySaveMutations(ctx, plan, mutations); err != nil {
+		t.Fatalf("applySaveMutations: %v", err)
+	}
+
+	ts, exists, err := st.LatestCommitTS(ctx, CatalogVersionKey())
+	if err != nil {
+		t.Fatalf("LatestCommitTS(version key): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected catalog version key to exist")
+	}
+	if ts <= advancedTS {
+		t.Fatalf("expected catalog commit TS to be > %d, got %d", advancedTS, ts)
+	}
+}
+
 func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	t.Helper()
 	if want.RouteID != got.RouteID {
