@@ -39,6 +39,8 @@ const (
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
+	listDeleteBatchSize      = 1024
+	maxByteValue             = 0xFF
 )
 
 //nolint:mnd
@@ -387,15 +389,38 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 }
 
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
-	start := r.patternStart(pattern)
+	start, end := patternScanBounds(pattern)
+	keyset := map[string][]byte{}
 
-	readTS := r.readTS()
-	keys, err := r.store.ScanAt(context.Background(), start, nil, math.MaxInt, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	mergeScannedKeys := func(scanStart, scanEnd []byte) error {
+		readTS := r.readTS()
+		keys, err := r.store.ScanAt(context.Background(), scanStart, scanEnd, math.MaxInt, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		for k, v := range r.collectUserKeys(keys, pattern) {
+			keyset[k] = v
+		}
+		return nil
 	}
 
-	keyset := r.collectUserKeys(keys)
+	if err := mergeScannedKeys(start, end); err != nil {
+		return nil, err
+	}
+
+	// User-key bounded scans like "foo*" do not naturally include internal list
+	// keys ("!lst|..."), so scan list namespaces separately with mapped bounds.
+	if start != nil || end != nil {
+		metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
+		if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
+			return nil, err
+		}
+
+		itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
+		if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
+			return nil, err
+		}
+	}
 
 	out := make([][]byte, 0, len(keyset))
 	for _, v := range keyset {
@@ -404,20 +429,100 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func (r *RedisServer) patternStart(pattern []byte) []byte {
+func patternScanBounds(pattern []byte) ([]byte, []byte) {
 	if bytes.Equal(pattern, []byte("*")) {
-		return nil
+		return nil, nil
 	}
-	return bytes.ReplaceAll(pattern, []byte("*"), nil)
+
+	i := bytes.IndexByte(pattern, '*')
+	if i <= 0 {
+		return nil, nil
+	}
+
+	start := bytes.Clone(pattern[:i])
+	return start, prefixScanEnd(start)
 }
 
-func (r *RedisServer) collectUserKeys(kvs []*store.KVPair) map[string][]byte {
+func listPatternScanBounds(prefix string, pattern []byte) ([]byte, []byte) {
+	userStart, userEnd := patternScanBounds(pattern)
+	prefixBytes := []byte(prefix)
+
+	if userStart == nil && userEnd == nil {
+		return prefixBytes, prefixScanEnd(prefixBytes)
+	}
+
+	start := append(bytes.Clone(prefixBytes), userStart...)
+	if userEnd == nil {
+		return start, prefixScanEnd(prefixBytes)
+	}
+	end := append(bytes.Clone(prefixBytes), userEnd...)
+	return start, end
+}
+
+func prefixScanEnd(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+
+	end := bytes.Clone(prefix)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] == maxByteValue {
+			continue
+		}
+		end[i]++
+		return end[:i+1]
+	}
+
+	return nil
+}
+
+func matchesAsteriskPattern(pattern, key []byte) bool {
+	parts := bytes.Split(pattern, []byte("*"))
+	if len(parts) == 1 {
+		return bytes.Equal(pattern, key)
+	}
+
+	pos := 0
+	if len(parts[0]) > 0 {
+		if !bytes.HasPrefix(key, parts[0]) {
+			return false
+		}
+		pos = len(parts[0])
+	}
+
+	for i := 1; i < len(parts)-1; i++ {
+		part := parts[i]
+		if len(part) == 0 {
+			continue
+		}
+		idx := bytes.Index(key[pos:], part)
+		if idx < 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+
+	last := parts[len(parts)-1]
+	if len(last) > 0 && !bytes.HasSuffix(key, last) {
+		return false
+	}
+
+	return true
+}
+
+func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[string][]byte {
 	keyset := map[string][]byte{}
 	for _, kvPair := range kvs {
 		if store.IsListMetaKey(kvPair.Key) || store.IsListItemKey(kvPair.Key) {
 			if userKey := store.ExtractListUserKey(kvPair.Key); userKey != nil {
+				if !matchesAsteriskPattern(pattern, userKey) {
+					continue
+				}
 				keyset[string(userKey)] = userKey
 			}
+			continue
+		}
+		if !matchesAsteriskPattern(pattern, kvPair.Key) {
 			continue
 		}
 		keyset[string(kvPair.Key)] = kvPair.Key
@@ -1010,7 +1115,7 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 }
 
 func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
-	meta, exists, err := r.loadListMeta(ctx, key)
+	_, exists, err := r.loadListMeta(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -1021,23 +1126,36 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 	start := listItemKey(key, math.MinInt64)
 	end := listItemKey(key, math.MaxInt64)
 
-	readTS := r.readTS()
-	kvs, err := r.store.ScanAt(ctx, start, end, math.MaxInt, readTS)
-	if err != nil {
-		return errors.WithStack(err)
+	for {
+		readTS := r.readTS()
+		kvs, scanErr := r.store.ScanAt(ctx, start, end, listDeleteBatchSize, readTS)
+		if scanErr != nil {
+			return errors.WithStack(scanErr)
+		}
+		if len(kvs) == 0 {
+			break
+		}
+
+		ops := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		for _, kvp := range kvs {
+			ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+		}
+
+		group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
+		if _, dispatchErr := r.coordinator.Dispatch(ctx, group); dispatchErr != nil {
+			return errors.WithStack(dispatchErr)
+		}
+		if len(kvs) < listDeleteBatchSize {
+			break
+		}
 	}
 
-	ops := make([]*kv.Elem[kv.OP], 0, len(kvs)+1)
-	for _, kvp := range kvs {
-		ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+	group := &kv.OperationGroup[kv.OP]{
+		IsTxn: true,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: listMetaKey(key)},
+		},
 	}
-	// delete meta last
-	ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-
-	// ensure meta bounds consistent even if scan missed (in case of empty list)
-	_ = meta
-
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
 	_, err = r.coordinator.Dispatch(ctx, group)
 	return errors.WithStack(err)
 }

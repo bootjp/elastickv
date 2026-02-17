@@ -353,10 +353,10 @@ func (c *ShardedCoordinator) IsLeader() bool {
 
 func (c *ShardedCoordinator) VerifyLeader() error {
 	g, ok := c.groups[c.defaultGroup]
-	if !ok || g.Raft == nil {
+	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return errors.WithStack(g.Raft.VerifyLeader().Error())
+	return verifyRaftLeader(g.Raft)
 }
 
 func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
@@ -378,10 +378,10 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 
 func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
 	g, ok := c.groupForKey(key)
-	if !ok || g.Raft == nil {
+	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return errors.WithStack(g.Raft.VerifyLeader().Error())
+	return verifyRaftLeader(g.Raft)
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {

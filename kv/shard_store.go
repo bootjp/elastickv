@@ -54,7 +54,7 @@ func isVerifiedRaftLeader(r *raft.Raft) bool {
 	if r == nil || r.State() != raft.Leader {
 		return false
 	}
-	return r.VerifyLeader().Error() == nil
+	return verifyRaftLeader(r) == nil
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
@@ -291,7 +291,7 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 	// Avoid returning a stale watermark when our local raft instance is a
 	// deposed leader.
 	if g.Raft.State() == raft.Leader {
-		if err := g.Raft.VerifyLeader().Error(); err == nil {
+		if err := verifyRaftLeader(g.Raft); err == nil {
 			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 			if err != nil {
 				return 0, false, errors.WithStack(err)

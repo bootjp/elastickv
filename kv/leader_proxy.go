@@ -34,7 +34,7 @@ func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
 		return p.forward(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
-	if err := p.raft.VerifyLeader().Error(); err != nil {
+	if err := verifyRaftLeader(p.raft); err != nil {
 		return p.forward(reqs)
 	}
 	return p.tm.Commit(reqs)
@@ -45,7 +45,7 @@ func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 		return p.forward(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
-	if err := p.raft.VerifyLeader().Error(); err != nil {
+	if err := verifyRaftLeader(p.raft); err != nil {
 		return p.forward(reqs)
 	}
 	return p.tm.Abort(reqs)
