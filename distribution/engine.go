@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/cockroachdb/errors"
 )
 
 // Route represents a mapping from a key range to a raft group.
@@ -12,12 +14,17 @@ import (
 // End is exclusive. A nil End denotes an unbounded interval extending to
 // positive infinity.
 type Route struct {
+	// RouteID is the durable identifier assigned by route catalog.
+	// Zero means ephemeral/non-catalog routes.
+	RouteID uint64
 	// Start marks the inclusive beginning of the range.
 	Start []byte
 	// End marks the exclusive end of the range. nil means unbounded.
 	End []byte
 	// GroupID identifies the raft group for the range starting at Start.
 	GroupID uint64
+	// State tracks control-plane state for this route.
+	State RouteState
 	// Load tracks the number of accesses served by this range.
 	Load uint64
 }
@@ -26,11 +33,20 @@ type Route struct {
 type Engine struct {
 	mu               sync.RWMutex
 	routes           []Route
+	catalogVersion   uint64
 	ts               uint64
 	hotspotThreshold uint64
 }
 
 const defaultGroupID uint64 = 1
+const minRouteCountForOrderValidation = 2
+
+var (
+	ErrEngineSnapshotVersionStale = errors.New("engine snapshot version is stale")
+	ErrEngineSnapshotDuplicateID  = errors.New("engine snapshot has duplicate route id")
+	ErrEngineSnapshotRouteOverlap = errors.New("engine snapshot has overlapping routes")
+	ErrEngineSnapshotRouteOrder   = errors.New("engine snapshot has invalid route order")
+)
 
 // NewEngine creates an Engine with no hotspot splitting.
 func NewEngine() *Engine {
@@ -52,12 +68,47 @@ func NewEngineWithThreshold(threshold uint64) *Engine {
 	return &Engine{routes: make([]Route, 0), hotspotThreshold: threshold}
 }
 
+// Version returns current route catalog version applied to the engine.
+func (e *Engine) Version() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.catalogVersion
+}
+
+// ApplySnapshot atomically replaces all in-memory routes with the provided
+// catalog snapshot when the snapshot version is newer.
+func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if snapshot.Version < e.catalogVersion {
+		return errors.WithStack(ErrEngineSnapshotVersionStale)
+	}
+	if snapshot.Version == e.catalogVersion {
+		return nil
+	}
+
+	routes, err := routesFromCatalog(snapshot.Routes)
+	if err != nil {
+		return err
+	}
+
+	e.routes = routes
+	e.catalogVersion = snapshot.Version
+	return nil
+}
+
 // UpdateRoute registers or updates a route for the given key range.
 // Routes are stored sorted by Start.
 func (e *Engine) UpdateRoute(start, end []byte, group uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.routes = append(e.routes, Route{Start: start, End: end, GroupID: group})
+	e.routes = append(e.routes, Route{
+		Start:   start,
+		End:     end,
+		GroupID: group,
+		State:   RouteStateActive,
+	})
 	sort.Slice(e.routes, func(i, j int) bool {
 		return bytes.Compare(e.routes[i].Start, e.routes[j].Start) < 0
 	})
@@ -116,7 +167,14 @@ func (e *Engine) Stats() []Route {
 	defer e.mu.RUnlock()
 	stats := make([]Route, len(e.routes))
 	for i, r := range e.routes {
-		stats[i] = Route{Start: cloneBytes(r.Start), End: cloneBytes(r.End), GroupID: r.GroupID, Load: atomic.LoadUint64(&e.routes[i].Load)}
+		stats[i] = Route{
+			RouteID: r.RouteID,
+			Start:   cloneBytes(r.Start),
+			End:     cloneBytes(r.End),
+			GroupID: r.GroupID,
+			State:   r.State,
+			Load:    atomic.LoadUint64(&e.routes[i].Load),
+		}
 	}
 	return stats
 }
@@ -143,9 +201,11 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		}
 		// Route intersects with scan range
 		result = append(result, Route{
+			RouteID: r.RouteID,
 			Start:   cloneBytes(r.Start),
 			End:     cloneBytes(r.End),
 			GroupID: r.GroupID,
+			State:   r.State,
 			Load:    atomic.LoadUint64(&r.Load),
 		})
 	}
@@ -182,12 +242,66 @@ func (e *Engine) splitRange(idx int) {
 		e.routes[idx].Load = 0
 		return
 	}
-	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID}
-	right := Route{Start: mid, End: r.End, GroupID: r.GroupID}
+	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
+	right := Route{Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
 	// replace the range at idx with left and right in an idiomatic manner
 	e.routes = append(e.routes[:idx+1], e.routes[idx:]...)
 	e.routes[idx] = left
 	e.routes[idx+1] = right
+}
+
+func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
+	if len(routes) == 0 {
+		return []Route{}, nil
+	}
+
+	out := make([]Route, 0, len(routes))
+	seen := make(map[uint64]struct{}, len(routes))
+	for _, rd := range routes {
+		if err := validateRouteDescriptor(rd); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[rd.RouteID]; exists {
+			return nil, errors.WithStack(ErrEngineSnapshotDuplicateID)
+		}
+		seen[rd.RouteID] = struct{}{}
+		out = append(out, Route{
+			RouteID: rd.RouteID,
+			Start:   cloneBytes(rd.Start),
+			End:     cloneBytes(rd.End),
+			GroupID: rd.GroupID,
+			State:   rd.State,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Start, out[j].Start) < 0
+	})
+	if err := validateRouteOrder(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func validateRouteOrder(routes []Route) error {
+	if len(routes) < minRouteCountForOrderValidation {
+		return nil
+	}
+	for i := 1; i < len(routes); i++ {
+		prev := routes[i-1]
+		curr := routes[i]
+
+		if bytes.Compare(prev.Start, curr.Start) >= 0 {
+			return errors.WithStack(ErrEngineSnapshotRouteOrder)
+		}
+		if prev.End == nil {
+			return errors.WithStack(ErrEngineSnapshotRouteOrder)
+		}
+		if bytes.Compare(prev.End, curr.Start) > 0 {
+			return errors.WithStack(ErrEngineSnapshotRouteOverlap)
+		}
+	}
+	return nil
 }
 
 func cloneBytes(b []byte) []byte {
