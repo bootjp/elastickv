@@ -623,6 +623,18 @@ type listTxnState struct {
 	purgeMeta  store.ListMeta
 }
 
+func stageListDelete(st *listTxnState) {
+	if st == nil {
+		return
+	}
+	if st.metaExists {
+		st.purge = true
+		st.purgeMeta = st.meta
+	}
+	st.deleted = true
+	st.appends = nil
+}
+
 func (t *txnContext) load(key []byte) (*txnValue, error) {
 	k := string(key)
 	if tv, ok := t.working[k]; ok {
@@ -703,12 +715,7 @@ func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
 	// Handle list delete through txn-local list state so subsequent commands in
 	// the same MULTI observe the staged delete consistently.
 	if st, ok := t.listStates[string(cmd.Args[1])]; ok {
-		if st.metaExists {
-			st.purge = true
-			st.purgeMeta = st.meta
-		}
-		st.deleted = true
-		st.appends = nil
+		stageListDelete(st)
 		return redisResult{typ: resultInt, integer: 1}, nil
 	}
 	isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS)
@@ -720,12 +727,7 @@ func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
 		if err != nil {
 			return redisResult{}, err
 		}
-		if st.metaExists {
-			st.purge = true
-			st.purgeMeta = st.meta
-		}
-		st.deleted = true
-		st.appends = nil
+		stageListDelete(st)
 		return redisResult{typ: resultInt, integer: 1}, nil
 	}
 
