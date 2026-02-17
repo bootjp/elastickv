@@ -206,6 +206,8 @@ func (s *mvccStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) e
 }
 
 func (s *mvccStore) readTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
 	return s.lastCommitTS
 }
 

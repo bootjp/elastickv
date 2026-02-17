@@ -72,7 +72,7 @@ func (c *Coordinate) IsLeader() bool {
 }
 
 func (c *Coordinate) VerifyLeader() error {
-	return errors.WithStack(c.raft.VerifyLeader().Error())
+	return verifyRaftLeader(c.raft)
 }
 
 // RaftLeader returns the current leader's address as known by this node.

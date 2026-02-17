@@ -54,7 +54,7 @@ func isVerifiedRaftLeader(r *raft.Raft) bool {
 	if r == nil || r.State() != raft.Leader {
 		return false
 	}
-	return r.VerifyLeader().Error() == nil
+	return verifyRaftLeader(r) == nil
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
@@ -291,7 +291,7 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 	// Avoid returning a stale watermark when our local raft instance is a
 	// deposed leader.
 	if g.Raft.State() == raft.Leader {
-		if err := g.Raft.VerifyLeader().Error(); err == nil {
+		if err := verifyRaftLeader(g.Raft); err == nil {
 			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 			if err != nil {
 				return 0, false, errors.WithStack(err)
@@ -411,6 +411,7 @@ type scanLockPlan struct {
 	statusCache       map[lockTxnKey]lockTxnStatus
 	resolutionBatches map[lockTxnKey]*lockResolutionBatch
 	batchOrder        []lockTxnKey
+	cleanupNow        uint64
 }
 
 func newScanLockPlan(size int) *scanLockPlan {
@@ -420,6 +421,7 @@ func newScanLockPlan(size int) *scanLockPlan {
 		statusCache:       make(map[lockTxnKey]lockTxnStatus),
 		resolutionBatches: make(map[lockTxnKey]*lockResolutionBatch),
 		batchOrder:        make([]lockTxnKey, 0),
+		cleanupNow:        hlcWallNow(),
 	}
 }
 
@@ -506,7 +508,7 @@ func (s *ShardStore) planLockedUserKey(ctx context.Context, plan *scanLockPlan, 
 	if err != nil {
 		return err
 	}
-	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey)
+	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey, plan.cleanupNow)
 	if err != nil {
 		return err
 	}
@@ -528,18 +530,15 @@ func (s *ShardStore) cachedLockTxnStatus(ctx context.Context, plan *scanLockPlan
 	return state, nil
 }
 
-func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.Phase, uint64, error) {
+func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte, cleanupNow uint64) (pb.Phase, uint64, error) {
 	switch state.status {
 	case txnStatusPending:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		abortTS := abortTSFrom(lock.StartTS, state.commitTS)
+		abortTS := cleanupTSWithNow(lock.StartTS, cleanupNow)
 		if abortTS <= lock.StartTS {
-			// Defensive check: While uint64 overflow is not expected in normal operation,
-			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
-			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
 		}
 		return pb.Phase_ABORT, abortTS, nil
@@ -881,6 +880,14 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	}
 	_, err := g.Txn.Commit([]*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
 	return errors.WithStack(err)
+}
+
+func cleanupTSWithNow(startTS, now uint64) uint64 {
+	next := startTS + 1
+	if now > next {
+		return now
+	}
+	return next
 }
 
 // ApplyMutations applies a batch of mutations to the correct shard store.

@@ -20,7 +20,10 @@ const (
 	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchSize = 1000
 	dirPerms          = 0755
+	metaLastCommitTS  = "_meta_last_commit_ts"
 )
+
+var metaLastCommitTSBytes = []byte(metaLastCommitTS)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 type pebbleStore struct {
@@ -152,7 +155,7 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	// For this task, we will persist LastCommitTS in a special meta key "_meta_last_commit_ts"
 	// whenever we update it (or periodically).
 	// For now, let's look for that key.
-	val, closer, err := s.db.Get([]byte("_meta_last_commit_ts"))
+	val, closer, err := s.db.Get(metaLastCommitTSBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return 0, nil
@@ -169,7 +172,7 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 	buf := make([]byte, timestampSize)
 	binary.LittleEndian.PutUint64(buf, ts)
-	return errors.WithStack(s.db.Set([]byte("_meta_last_commit_ts"), buf, pebble.NoSync))
+	return errors.WithStack(s.db.Set(metaLastCommitTSBytes, buf, pebble.NoSync))
 }
 
 func (s *pebbleStore) LastCommitTS() uint64 {
@@ -267,19 +270,6 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	return val != nil, nil
 }
 
-func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
-	if currentVersion <= ts {
-		return true
-	}
-	seekKey := encodeKey(userKey, ts)
-	if !iter.SeekGE(seekKey) {
-		return false
-	}
-	k := iter.Key()
-	currentUserKey, _ := decodeKey(k)
-	return bytes.Equal(currentUserKey, userKey)
-}
-
 func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
 	valBytes := iter.Value()
 	sv, err := decodeValue(valBytes)
@@ -296,6 +286,19 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	return nil, nil
 }
 
+func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
+	if currentVersion <= ts {
+		return true
+	}
+	seekKey := encodeKey(userKey, ts)
+	if !iter.SeekGE(seekKey) {
+		return false
+	}
+	k := iter.Key()
+	currentUserKey, _ := decodeKey(k)
+	return bytes.Equal(currentUserKey, userKey)
+}
+
 func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
 	if !iter.SeekGE(encodeKey(userKey, 0)) {
 		return false
@@ -308,27 +311,48 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 	return true
 }
 
+func pastScanEnd(userKey, end []byte) bool {
+	return end != nil && bytes.Compare(userKey, end) > 0
+}
+
+func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
+	for iter.Valid() {
+		rawKey := iter.Key()
+		if bytes.Equal(rawKey, metaLastCommitTSBytes) {
+			if !iter.Next() {
+				return nil, 0, false
+			}
+			continue
+		}
+		userKey, version := decodeKey(rawKey)
+		if userKey == nil {
+			if !iter.Next() {
+				return nil, 0, false
+			}
+			continue
+		}
+		return userKey, version, true
+	}
+	return nil, 0, false
+}
+
 func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, limit)
 
-	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid(); {
-		if len(result) >= limit {
+	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
+		userKey, version, ok := nextScannableUserKey(iter)
+		if !ok {
 			break
 		}
 
-		k := iter.Key()
-		userKey, version := decodeKey(k)
-
-		if end != nil && bytes.Compare(userKey, end) > 0 {
+		if pastScanEnd(userKey, end) {
 			break
 		}
 
-		// Find the correct version for userKey
 		if !s.seekToVisibleVersion(iter, userKey, version, ts) {
 			continue
 		}
 
-		// Now iter is at the latest visible version for userKey.
 		kv, err := s.processFoundValue(iter, userKey, ts)
 		if err != nil {
 			return nil, err
@@ -337,11 +361,11 @@ func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byt
 			result = append(result, kv)
 		}
 
-		// Move to the next user key.
 		if !s.skipToNextUserKey(iter, userKey) {
-			break // No more keys
+			break
 		}
 	}
+
 	return result, nil
 }
 
