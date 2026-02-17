@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -10,6 +11,21 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLockResolutionForStatus_RolledBackTimestampOverflow(t *testing.T) {
+	t.Parallel()
+
+	phase, ts, err := lockResolutionForStatus(
+		lockTxnStatus{status: txnStatusRolledBack},
+		txnLock{StartTS: math.MaxUint64},
+		[]byte("k"),
+		0,
+	)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTxnLocked))
+	require.Equal(t, pb.Phase_NONE, phase)
+	require.Zero(t, ts)
+}
 
 func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	t.Parallel()

@@ -611,6 +611,8 @@ type listTxnState struct {
 	metaExists bool
 	appends    [][]byte
 	deleted    bool
+	purge      bool
+	purgeMeta  store.ListMeta
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
@@ -690,13 +692,29 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
-	// handle list delete separately
-	if isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS); err != nil {
+	// Handle list delete through txn-local list state so subsequent commands in
+	// the same MULTI observe the staged delete consistently.
+	if st, ok := t.listStates[string(cmd.Args[1])]; ok {
+		if st.metaExists {
+			st.purge = true
+			st.purgeMeta = st.meta
+		}
+		st.deleted = true
+		st.appends = nil
+		return redisResult{typ: resultInt, integer: 1}, nil
+	}
+	isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS)
+	if err != nil {
 		return redisResult{}, err
-	} else if isList {
+	}
+	if isList {
 		st, err := t.loadListState(cmd.Args[1])
 		if err != nil {
 			return redisResult{}, err
+		}
+		if st.metaExists {
+			st.purge = true
+			st.purgeMeta = st.meta
 		}
 		st.deleted = true
 		st.appends = nil
@@ -752,6 +770,10 @@ func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
 		return redisResult{}, err
 	}
 	if st.deleted {
+		if st.metaExists {
+			st.purge = true
+			st.purgeMeta = st.meta
+		}
 		// DEL followed by RPUSH in the same transaction recreates the list.
 		st.deleted = false
 		st.metaExists = false
@@ -872,6 +894,24 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 	return elems
 }
 
+func listDeleteMeta(st *listTxnState) (store.ListMeta, bool) {
+	switch {
+	case st.metaExists:
+		return st.meta, true
+	case st.purge:
+		return st.purgeMeta, true
+	default:
+		return store.ListMeta{}, false
+	}
+}
+
+func appendListDeleteOps(elems []*kv.Elem[kv.OP], userKey []byte, meta store.ListMeta) []*kv.Elem[kv.OP] {
+	for seq := meta.Head; seq < meta.Tail; seq++ {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(userKey, seq)})
+	}
+	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
+}
+
 func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 	listKeys := make([]string, 0, len(t.listStates))
 	for k := range t.listStates {
@@ -885,15 +925,16 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		userKey := []byte(k)
 
 		if st.deleted {
-			// delete all persisted list items
-			for seq := st.meta.Head; seq < st.meta.Tail; seq++ {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(userKey, seq)})
+			if meta, ok := listDeleteMeta(st); ok {
+				elems = appendListDeleteOps(elems, userKey, meta)
 			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
 			continue
 		}
 		if len(st.appends) == 0 {
 			continue
+		}
+		if st.purge {
+			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
 		}
 
 		startSeq := st.meta.Head + st.meta.Len

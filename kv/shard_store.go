@@ -537,7 +537,11 @@ func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte, clea
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		return pb.Phase_ABORT, cleanupTSWithNow(lock.StartTS, cleanupNow), nil
+		abortTS := cleanupTSWithNow(lock.StartTS, cleanupNow)
+		if abortTS <= lock.StartTS {
+			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return pb.Phase_ABORT, abortTS, nil
 	default:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
 	}
@@ -876,10 +880,6 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	}
 	_, err := g.Txn.Commit([]*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
 	return errors.WithStack(err)
-}
-
-func cleanupTS(startTS uint64) uint64 {
-	return cleanupTSWithNow(startTS, hlcWallNow())
 }
 
 func cleanupTSWithNow(startTS, now uint64) uint64 {

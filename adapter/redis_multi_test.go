@@ -193,4 +193,27 @@ func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
 	rangeRes, err := rdb.Do(ctx, "LRANGE", "list-del-rpush", 0, -1).Result()
 	require.NoError(t, err)
 	require.Equal(t, []interface{}{"new1", "new2"}, rangeRes)
+
+	readTS := nodes[1].redisServer.readTS()
+	metaRaw, err := nodes[1].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-del-rpush")), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalListMeta(metaRaw)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), meta.Len)
+
+	kvs, err := nodes[1].redisServer.store.ScanAt(
+		ctx,
+		store.ListItemKey([]byte("list-del-rpush"), math.MinInt64),
+		store.ListItemKey([]byte("list-del-rpush"), math.MaxInt64),
+		10,
+		readTS,
+	)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+
+	got := make([]string, 0, len(kvs))
+	for _, kvp := range kvs {
+		got = append(got, string(kvp.Value))
+	}
+	require.Equal(t, []string{"new1", "new2"}, got)
 }
