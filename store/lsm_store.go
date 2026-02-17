@@ -20,7 +20,10 @@ const (
 	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchSize = 1000
 	dirPerms          = 0755
+	metaLastCommitTS  = "_meta_last_commit_ts"
 )
+
+var metaLastCommitTSBytes = []byte(metaLastCommitTS)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 type pebbleStore struct {
@@ -152,7 +155,7 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	// For this task, we will persist LastCommitTS in a special meta key "_meta_last_commit_ts"
 	// whenever we update it (or periodically).
 	// For now, let's look for that key.
-	val, closer, err := s.db.Get([]byte("_meta_last_commit_ts"))
+	val, closer, err := s.db.Get(metaLastCommitTSBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return 0, nil
@@ -169,7 +172,7 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 	buf := make([]byte, timestampSize)
 	binary.LittleEndian.PutUint64(buf, ts)
-	return errors.WithStack(s.db.Set([]byte("_meta_last_commit_ts"), buf, pebble.NoSync))
+	return errors.WithStack(s.db.Set(metaLastCommitTSBytes, buf, pebble.NoSync))
 }
 
 func (s *pebbleStore) LastCommitTS() uint64 {
@@ -312,16 +315,34 @@ func pastScanEnd(userKey, end []byte) bool {
 	return end != nil && bytes.Compare(userKey, end) > 0
 }
 
+func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
+	for iter.Valid() {
+		rawKey := iter.Key()
+		if bytes.Equal(rawKey, metaLastCommitTSBytes) {
+			if !iter.Next() {
+				return nil, 0, false
+			}
+			continue
+		}
+		userKey, version := decodeKey(rawKey)
+		if userKey == nil {
+			if !iter.Next() {
+				return nil, 0, false
+			}
+			continue
+		}
+		return userKey, version, true
+	}
+	return nil, 0, false
+}
+
 func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, limit)
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version := decodeKey(iter.Key())
-		if userKey == nil {
-			if !iter.Next() {
-				break
-			}
-			continue
+		userKey, version, ok := nextScannableUserKey(iter)
+		if !ok {
+			break
 		}
 
 		if pastScanEnd(userKey, end) {

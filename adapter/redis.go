@@ -384,6 +384,14 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 	if res {
 		return [][]byte{bytes.Clone(pattern)}, nil
 	}
+
+	isList, err := r.isListKeyAt(context.Background(), pattern, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if isList {
+		return [][]byte{bytes.Clone(pattern)}, nil
+	}
 	return [][]byte{}, nil
 }
 

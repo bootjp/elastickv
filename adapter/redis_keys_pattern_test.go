@@ -169,3 +169,24 @@ func TestLocalKeysPattern_UsesSingleSnapshotTSAcrossScans(t *testing.T) {
 		require.Equal(t, tracking.scanTS[0], ts)
 	}
 }
+
+func TestLocalKeysExact_FindsListByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 1, Tail: 2, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey([]byte("exact:list")), meta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ListItemKey([]byte("exact:list"), 1), []byte("v"), 2, 0))
+
+	r := &RedisServer{
+		store:       st,
+		coordinator: &stubAdapterCoordinator{clock: kv.NewHLC()},
+	}
+
+	keys, err := r.localKeysExact([]byte("exact:list"))
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.Equal(t, []byte("exact:list"), keys[0])
+}
