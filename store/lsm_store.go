@@ -293,6 +293,7 @@ func decodeIterKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 
 func (s *pebbleStore) scanCurrentUserKey(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
 	var out *KVPair
+	evaluatedVisible := false
 
 	for iter.Valid() {
 		curKey, version, ok := decodeIterKey(iter)
@@ -306,12 +307,15 @@ func (s *pebbleStore) scanCurrentUserKey(iter *pebble.Iterator, userKey []byte, 
 			return out, nil
 		}
 
-		if out == nil && version <= ts {
+		// Only the newest version visible at ts should determine scan visibility.
+		// If that version is tombstoned/expired, older versions must stay masked.
+		if !evaluatedVisible && version <= ts {
 			kv, err := s.processFoundValue(iter, userKey, ts)
 			if err != nil {
 				return nil, err
 			}
 			out = kv
+			evaluatedVisible = true
 		}
 
 		if !iter.Next() {

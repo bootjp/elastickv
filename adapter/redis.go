@@ -39,7 +39,6 @@ const (
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
-	listDeleteBatchSize      = 1024
 	maxByteValue             = 0xFF
 )
 
@@ -752,6 +751,13 @@ func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
+	if st.deleted {
+		// DEL followed by RPUSH in the same transaction recreates the list.
+		st.deleted = false
+		st.metaExists = false
+		st.meta = store.ListMeta{}
+		st.appends = nil
+	}
 
 	for _, v := range cmd.Args[2:] {
 		st.appends = append(st.appends, bytes.Clone(v))
@@ -1126,36 +1132,24 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 	start := listItemKey(key, math.MinInt64)
 	end := listItemKey(key, math.MaxInt64)
 
-	for {
-		readTS := r.readTS()
-		kvs, scanErr := r.store.ScanAt(ctx, start, end, listDeleteBatchSize, readTS)
-		if scanErr != nil {
-			return errors.WithStack(scanErr)
-		}
-		if len(kvs) == 0 {
-			break
-		}
-
-		ops := make([]*kv.Elem[kv.OP], 0, len(kvs))
-		for _, kvp := range kvs {
-			ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
-		}
-
-		group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
-		if _, dispatchErr := r.coordinator.Dispatch(ctx, group); dispatchErr != nil {
-			return errors.WithStack(dispatchErr)
-		}
-		if len(kvs) < listDeleteBatchSize {
-			break
-		}
+	startTS := r.readTS()
+	if startTS == ^uint64(0) && r.coordinator != nil && r.coordinator.Clock() != nil {
+		startTS = r.coordinator.Clock().Next()
 	}
 
-	group := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: listMetaKey(key)},
-		},
+	kvs, err := r.store.ScanAt(ctx, start, end, math.MaxInt, startTS)
+	if err != nil {
+		return errors.WithStack(err)
 	}
+
+	ops := make([]*kv.Elem[kv.OP], 0, len(kvs)+1)
+	for _, kvp := range kvs {
+		ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+	}
+	// delete meta last
+	ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: startTS, Elems: ops}
 	_, err = r.coordinator.Dispatch(ctx, group)
 	return errors.WithStack(err)
 }

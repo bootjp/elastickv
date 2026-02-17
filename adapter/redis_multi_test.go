@@ -2,9 +2,13 @@ package adapter
 
 import (
 	"context"
+	"math"
+	"strconv"
 	"testing"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -89,4 +93,104 @@ func TestRedis_DiscardClearsTxn(t *testing.T) {
 	got, err := rdb.Get(ctx, "dc-key").Result()
 	require.NoError(t, err)
 	require.Equal(t, "before", got)
+}
+
+func TestRedis_DelList_RemovesLargeListAndInternalKeys(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	args := make([]interface{}, 0, 1302)
+	args = append(args, "RPUSH", "list-big-del")
+	for i := 0; i < 1300; i++ {
+		args = append(args, "v"+strconv.Itoa(i))
+	}
+	_, err := rdb.Do(ctx, args...).Result()
+	require.NoError(t, err)
+
+	delCount, err := rdb.Del(ctx, "list-big-del").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), delCount)
+
+	rangeRes, err := rdb.Do(ctx, "LRANGE", "list-big-del", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []interface{}{}, rangeRes)
+
+	readTS := nodes[0].redisServer.readTS()
+	_, err = nodes[0].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-big-del")), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err := nodes[0].redisServer.store.ScanAt(
+		ctx,
+		store.ListItemKey([]byte("list-big-del"), math.MinInt64),
+		store.ListItemKey([]byte("list-big-del"), math.MaxInt64),
+		1,
+		readTS,
+	)
+	require.NoError(t, err)
+	assert.Len(t, kvs, 0)
+}
+
+func TestRedis_DelList_EmptyAfterDeleteHasNoResidualInternalKeys(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	_, err := rdb.Do(ctx, "RPUSH", "list-empty-del", "a").Result()
+	require.NoError(t, err)
+
+	_, err = rdb.Del(ctx, "list-empty-del").Result()
+	require.NoError(t, err)
+
+	// Second DEL should be a no-op for list internals.
+	_, err = rdb.Del(ctx, "list-empty-del").Result()
+	require.NoError(t, err)
+
+	readTS := nodes[0].redisServer.readTS()
+	_, err = nodes[0].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-empty-del")), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err := nodes[0].redisServer.store.ScanAt(
+		ctx,
+		store.ListItemKey([]byte("list-empty-del"), math.MinInt64),
+		store.ListItemKey([]byte("list-empty-del"), math.MaxInt64),
+		1,
+		readTS,
+	)
+	require.NoError(t, err)
+	assert.Len(t, kvs, 0)
+}
+
+func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[1].redisAddress})
+	ctx := context.Background()
+
+	_, err := rdb.Do(ctx, "RPUSH", "list-del-rpush", "old1", "old2").Result()
+	require.NoError(t, err)
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", "list-del-rpush").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", "list-del-rpush", "new1", "new2").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]interface{})
+	require.True(t, ok)
+	require.Len(t, vals, 2)
+	require.Equal(t, int64(1), vals[0])
+	require.Equal(t, int64(2), vals[1])
+
+	rangeRes, err := rdb.Do(ctx, "LRANGE", "list-del-rpush", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []interface{}{"new1", "new2"}, rangeRes)
 }
