@@ -1,87 +1,87 @@
 # Hotspot Shard Split Design for Elastickv
 
-## 1. 背景
+## 1. Background
 
-Elastickv には既にシャード境界の概念がありますが、ホットスポットに対して安全に自動分割するための制御面が不足しています。
+Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-現状（2026-02-17 時点）の実装状況:
+Current implementation status (as of February 17, 2026):
 
-- `distribution/engine.go` にアクセスカウントと閾値超過時の `splitRange` はある。
-- ただし `RecordAccess` は実リクエスト経路から呼ばれていない。
-- ルートテーブルはメモリ常駐で、ノード再起動で消える。
-- ルート更新は `UpdateRoute` の append ベースで、重複/競合検出やバージョン管理がない。
-- 分割後に別 Raft Group へデータ移送する仕組みがない。
+- `distribution/engine.go` has per-range access counters and threshold-based `splitRange`.
+- However, `RecordAccess` is not wired into real request paths.
+- The route table is in-memory only and is lost on restart.
+- Route updates are append-based via `UpdateRoute`, with no conflict detection, deduplication, or versioning.
+- There is no data movement workflow to relocate part of a split range to another Raft group.
 
-結果として、実際の「ホットスポット分割」は未接続状態です。
+So practical “hotspot splitting” is currently not connected end-to-end.
 
-## 2. 目的と非目的
+## 2. Goals and Non-goals
 
-### 2.1 目的
+### 2.1 Goals
 
-1. ホットレンジを自動検知し、範囲分割を実行できるようにする。
-2. 分割片を別 Raft Group に移送し、負荷を分散できるようにする。
-3. 分割中も整合性（書き込み喪失なし、MVCC/Txn 破壊なし）を維持する。
-4. 失敗時に再開可能なジョブ方式で運用できるようにする。
+1. Detect hot ranges automatically and execute range splits.
+2. Move split children to other Raft groups to distribute load.
+3. Preserve consistency during split (no lost writes, no MVCC/Txn breakage).
+4. Support resumable job-based operations after failures.
 
-### 2.2 非目的
+### 2.2 Non-goals
 
-1. Raft Group の自動生成・自動メンバー変更（既存 `--raftGroups` 内で完結）。
-2. 自動マージ（split の逆操作）は本設計の対象外。
-3. LSM/Pebble の最適化実装は後段（まず in-memory MVCC を基準）。
+1. Automatic Raft group creation or membership orchestration (operate within existing `--raftGroups`).
+2. Automatic merge (inverse of split) in this design.
+3. Deep LSM/Pebble optimization in the first phase (in-memory MVCC is the baseline first).
 
-## 3. 要件
+## 3. Requirements
 
-### 3.1 機能要件
+### 3.1 Functional requirements
 
-1. Read/Write 負荷をレンジ単位で収集できる。
-2. 閾値・ヒステリシスに基づいて分割候補を決定できる。
-3. 分割キーをアクセス分布から決定できる（単純 midpoint 依存を脱却）。
-4. バックフィルとカットオーバーを段階的に実行できる。
-5. 分割後のルーティングを全ノードに反映できる。
+1. Collect read/write load by range.
+2. Select split candidates with thresholds and hysteresis.
+3. Choose split keys from observed key distribution (not midpoint-only).
+4. Execute phased backfill and cutover.
+5. Propagate post-split routing to all nodes.
 
-### 3.2 整合性要件
+### 3.2 Consistency requirements
 
-1. カットオーバー境界で書き込みを取りこぼさない。
-2. `!txn|...` と `!lst|...` を含む内部キーを正しく移送する。
-3. stale route で旧グループに届いた書き込みを reject できる。
+1. No write loss at cutover boundaries.
+2. Correct migration of internal keys including `!txn|...` and `!lst|...`.
+3. Ability to reject writes delivered to the old group using stale routes.
 
-### 3.3 運用要件
+### 3.3 Operational requirements
 
-1. 自動 split を ON/OFF できる。
-2. 手動 split API を提供する。
-3. ジョブ状態、失敗理由、処理速度を観測可能にする。
+1. Toggle auto-split ON/OFF.
+2. Provide manual split API.
+3. Expose job status, failure reason, and migration throughput.
 
-## 4. 全体アーキテクチャ
+## 4. High-level Architecture
 
-追加コンポーネント:
+New components:
 
 1. `Split Controller`
 2. `Hotspot Detector`
-3. `Route Catalog`（永続化 + バージョン管理）
+3. `Route Catalog` (durable + versioned)
 4. `Range Migrator`
 5. `Route Watcher`
 
-責務分担:
+Responsibilities:
 
-| コンポーネント | 主責務 | 配置 |
+| Component | Responsibility | Placement |
 |---|---|---|
-| Hotspot Detector | 負荷集計と split 候補抽出 | 各ノード + リーダー集約 |
-| Split Controller | split ジョブ状態機械、再試行 | 既定グループの leader |
-| Route Catalog | ルート表と split ジョブの永続化 | 既定グループの内部メタデータ |
-| Range Migrator | バックフィル/差分コピー | source/target leader 間 |
-| Route Watcher | ルート表更新の配布とローカル反映 | 全ノード |
+| Hotspot Detector | Load aggregation and split candidate extraction | Every node + leader aggregation |
+| Split Controller | Split state machine and retries | Default-group leader |
+| Route Catalog | Durable route table and split jobs | Internal metadata in default group |
+| Range Migrator | Backfill and delta copy | Between source/target leaders |
+| Route Watcher | Route update distribution and local refresh | All nodes |
 
-## 5. データモデル
+## 5. Data Model
 
 `RouteDescriptor`:
 
 - `route_id uint64`
-- `start []byte`（inclusive）
-- `end []byte`（exclusive, nil=+inf）
+- `start []byte` (inclusive)
+- `end []byte` (exclusive, nil=+inf)
 - `group_id uint64`
-- `version uint64`（catalog 全体世代）
+- `version uint64` (catalog generation)
 - `state` (`ACTIVE`, `WRITE_FENCED`, `MIGRATING_SOURCE`, `MIGRATING_TARGET`)
-- `parent_route_id uint64`（split 由来のトレース）
+- `parent_route_id uint64` (lineage)
 
 `SplitJob`:
 
@@ -92,7 +92,7 @@ Elastickv には既にシャード境界の概念がありますが、ホット�
 - `snapshot_ts uint64`
 - `fence_ts uint64`
 - `phase` (`PLANNED`, `BACKFILL`, `FENCE`, `DELTA_COPY`, `CUTOVER`, `CLEANUP`, `DONE`, `ABORTED`)
-- `cursor []byte`（再開用）
+- `cursor []byte` (resume cursor)
 - `retry_count uint32`
 - `last_error string`
 
@@ -102,42 +102,42 @@ Elastickv には既にシャード境界の概念がありますが、ホット�
 - `window_start_unix_ms uint64`
 - `read_ops uint64`
 - `write_ops uint64`
-- `p95_latency_us uint64`（将来）
-- `top_keys_sample`（分割キー選定用）
+- `p95_latency_us uint64` (future)
+- `top_keys_sample` (for split-key selection)
 
-## 6. ホットスポット検知設計
+## 6. Hotspot Detection
 
-### 6.1 計測点
+### 6.1 Instrumentation points
 
-Read:
+Read path:
 
 - `kv/ShardStore.GetAt`
 - `kv/ShardStore.ScanAt`
 
-Write:
+Write path:
 
-- `kv/ShardedCoordinator.groupMutations`（キー単位で加算）
+- `kv/ShardedCoordinator.groupMutations` (increment per key)
 
-### 6.2 判定式
+### 6.2 Scoring
 
-レンジ score:
+Range score:
 
 `score = write_ops * Ww + read_ops * Wr`
 
-初期値:
+Initial parameters:
 
 - `Ww=4`, `Wr=1`
 - `threshold=50_000 ops/min`
-- 3 ウィンドウ連続超過で候補化
-- split 実行後 cooldown 10 分
+- Candidate after 3 consecutive windows over threshold
+- Cooldown 10 minutes after split
 
-### 6.3 分割キー決定
+### 6.3 Split-key selection
 
-1. サンプルキー分布から p50 を基本 split key とする。
-2. 単一キー偏り (`top_key_share >= 0.8`) の場合は hot key 分離を優先。
-3. `end=nil`（無限上限）でも観測キーに基づいて split key を算出可能にする。
+1. Default to p50 of sampled key distribution.
+2. If single-key skew is high (`top_key_share >= 0.8`), isolate the hot key.
+3. For `end=nil` ranges, derive split key from observed keys.
 
-## 7. Split 実行フロー
+## 7. Split Execution Flow
 
 ```mermaid
 flowchart LR
@@ -152,72 +152,72 @@ flowchart LR
 
 ### 7.1 BACKFILL
 
-1. `snapshot_ts = source.LastCommitTS()` を記録。
-2. source から moving range の MVCC バージョンをエクスポート。
-3. target へ idempotent import。
-4. `cursor` をジョブに保存しながら進める。
+1. Record `snapshot_ts = source.LastCommitTS()`.
+2. Export MVCC versions for the moving range from source.
+3. Import into target idempotently.
+4. Persist `cursor` continuously for resumability.
 
 ### 7.2 FENCE
 
-1. moving range を `WRITE_FENCED` に更新。
-2. `ShardedCoordinator.Dispatch` で対象キー書き込みを `retryable` エラーで拒否。
-3. `raft.Barrier` で fence 反映点を確定。
+1. Mark moving range as `WRITE_FENCED`.
+2. In `ShardedCoordinator.Dispatch`, reject writes in fenced range with retryable errors.
+3. Use `raft.Barrier` to confirm fence visibility.
 
 ### 7.3 DELTA_COPY
 
-1. `fence_ts = source.LastCommitTS()` を取得。
-2. `(snapshot_ts, fence_ts]` の差分バージョンをコピー。
-3. 反映完了後に cutover 可能。
+1. Acquire `fence_ts = source.LastCommitTS()`.
+2. Copy delta versions in `(snapshot_ts, fence_ts]`.
+3. Mark cutover-ready when complete.
 
 ### 7.4 CUTOVER
 
-1. 親レンジを削除し、子レンジ 2 本を `ACTIVE` で公開。
-2. moving child の `group_id` を target に切替。
-3. route catalog `version` をインクリメント。
+1. Replace parent range with two active child ranges.
+2. Switch moving child `group_id` to target.
+3. Increment route catalog `version`.
 
 ### 7.5 CLEANUP
 
-1. 一定 grace 期間は source に旧データを残す（読み取り保険）。
-2. 期間後に source 側の moving child データを GC。
+1. Keep old copies on source for a grace period (read safety).
+2. Garbage-collect moved data after grace period.
 
-## 8. ルーティング整合性
+## 8. Routing Consistency
 
-### 8.1 Route Version 付与
+### 8.1 Route version in requests
 
-- `pb.Request`（`proto/internal.proto`）に `route_version` を追加。
-- Coordinator は現在の route version を request に埋める。
+- Add `route_version` to `pb.Request` (`proto/internal.proto`).
+- Coordinator stamps current route version into each request.
 
-### 8.2 所有権検証
+### 8.2 Ownership validation
 
-- `kvFSM` に `groupID` と route resolver を注入。
-- Apply 前に mutation key の `routeKey` 所有グループを検証。
-- 不一致時は `ErrWrongShard` を返す。
+- Inject `groupID` + route resolver into `kvFSM`.
+- Validate ownership for each mutation key (via `routeKey`) before apply.
+- Return `ErrWrongShard` on mismatch.
 
-### 8.3 stale route 対策
+### 8.3 Stale-route handling
 
-- stale ノードが旧ルートで送信しても、旧グループ leader が reject する。
-- クライアントは再試行時に最新ルートを取得する。
+- Old-group leader rejects stale-route writes.
+- Client retries after refreshing routes.
 
-## 9. 移送対象キーの定義
+## 9. Key Coverage for Migration
 
-moving range 判定は raw key ではなく logical route key で行う。
+Range membership must be based on logical route key, not raw storage key.
 
-対象:
+Keys to include:
 
-1. user key 本体
-2. list key（`!lst|meta|...`, `!lst|itm|...`）
-3. txn key（`!txn|lock|...`, `!txn|int|...`, `!txn|cmt|...`, `!txn|rb|...`）
+1. User keys
+2. List keys (`!lst|meta|...`, `!lst|itm|...`)
+3. Txn keys (`!txn|lock|...`, `!txn|int|...`, `!txn|cmt|...`, `!txn|rb|...`)
 
-必要変更:
+Required changes:
 
-- `kv/txn_keys.go` の route key 抽出をエクスポートし、migrator から再利用可能にする。
-- `store` 側に MVCC バージョン export/import API を追加する。
+- Export route-key extraction from `kv/txn_keys.go` for migrator reuse.
+- Add MVCC version export/import APIs in `store`.
 
-## 10. API 変更案
+## 10. API Changes
 
 ### 10.1 `proto/distribution.proto`
 
-追加 RPC:
+Add RPCs:
 
 1. `ReportAccess(ReportAccessRequest) returns (ReportAccessResponse)`
 2. `ListRoutes(ListRoutesRequest) returns (ListRoutesResponse)`
@@ -227,101 +227,101 @@ moving range 判定は raw key ではなく logical route key で行う。
 
 ### 10.2 `proto/internal.proto`
 
-追加 RPC:
+Add RPCs:
 
 1. `ExportRangeVersions(ExportRangeVersionsRequest) returns (stream ExportRangeVersionsResponse)`
 2. `ImportRangeVersions(ImportRangeVersionsRequest) returns (ImportRangeVersionsResponse)`
 
-## 11. 変更対象（実装単位）
+## 11. Implementation Touchpoints
 
 1. `distribution/engine.go`
-- route version/route state を持つ構造へ拡張
-- append 更新ではなく CAS 更新 API 追加
+- Extend route data with state/version.
+- Replace append-only updates with CAS update APIs.
 
 2. `kv/shard_store.go`
-- read path の access 記録追加
-- moving/fenced レンジ時の挙動整理
+- Add read-path access recording.
+- Define behavior for moving/fenced ranges.
 
 3. `kv/sharded_coordinator.go`
-- write path の access 記録追加
-- `WRITE_FENCED` への retryable error 返却
+- Add write-path access recording.
+- Return retryable errors for `WRITE_FENCED` writes.
 
 4. `kv/fsm.go`
-- route ownership 検証追加
-- `ErrWrongShard` を返す分岐追加
+- Add route-ownership checks.
+- Return `ErrWrongShard` when ownership mismatches.
 
 5. `adapter/distribution_server.go`
-- split/job/watch/report RPC 実装
+- Implement split/job/watch/report APIs.
 
-6. `store/mvcc_store.go`（+ `store/lsm_store.go`）
-- range export/import API 実装
+6. `store/mvcc_store.go` and `store/lsm_store.go`
+- Implement range version export/import.
 
-## 12. 段階導入計画
+## 12. Phased Rollout
 
-### Milestone 1: 制御面
+### Milestone 1: Control plane
 
-1. Route catalog の永続化
-2. route version + watcher
-3. 手動 split API（データ移送なし・同一 group 内分割）
+1. Durable route catalog
+2. Route version + watcher
+3. Manual split API (same-group split, no migration)
 
-### Milestone 2: データ移送
+### Milestone 2: Migration plane
 
 1. MVCC range export/import
-2. BACKFILL/FENCE/DELTA/CUTOVER のジョブ化
-3. 手動 split with target group
+2. Job phases: BACKFILL/FENCE/DELTA/CUTOVER
+3. Manual split with target-group relocation
 
-### Milestone 3: 自動化
+### Milestone 3: Automation
 
-1. access 集計
-2. hotspot detector
-3. auto split scheduler（cooldown/hysteresis）
+1. Access aggregation
+2. Hotspot detector
+3. Auto-split scheduler (cooldown/hysteresis)
 
-### Milestone 4: 堅牢化
+### Milestone 4: Hardening
 
-1. stale route reject
-2. cleanup GC
-3. Jepsen workload 追加
+1. Stale-route reject path
+2. Cleanup GC
+3. Jepsen hotspot workloads
 
-## 13. テスト戦略
+## 13. Test Strategy
 
-### 13.1 Unit
+### 13.1 Unit tests
 
-1. hotspot 判定と split key 選定
-2. route catalog CAS/バージョン遷移
-3. split state machine の phase 遷移
-4. ownership 検証
+1. Hotspot scoring and split-key selection
+2. Route catalog CAS/version transitions
+3. Split state-machine phase transitions
+4. Ownership validation
 
-### 13.2 Integration
+### 13.2 Integration tests
 
-1. split 中の並行 write/read の整合性
-2. FENCE 中の retryable エラー確認
-3. リーダー交代・ノード再起動後のジョブ再開
-4. cross-shard txn と split 併用
+1. Consistency under concurrent read/write during split
+2. Retryable behavior during FENCE
+3. Job resume after leader change/restart
+4. Split with cross-shard transactions
 
 ### 13.3 Jepsen
 
-1. hotspot 負荷 + partition nemesis
-2. hotspot 負荷 + kill nemesis
-3. split 実行中の linearizability 検証
+1. Hotspot load + partition nemesis
+2. Hotspot load + kill nemesis
+3. Linearizability checks during split
 
-## 14. リスクと緩和策
+## 14. Risks and Mitigations
 
-1. リスク: split 中の write 停止時間が長い。
-- 緩和: chunked delta copy、fence 範囲を moving child のみに限定。
+1. Risk: Long write pause during split.
+- Mitigation: Chunked delta copy, narrow fence to moving child only.
 
-2. リスク: stale route による誤配送。
-- 緩和: leader 側 ownership 検証 + route version。
+2. Risk: Misrouting via stale route cache.
+- Mitigation: Leader-side ownership validation + route version checks.
 
-3. リスク: 内部キー取りこぼしで txn 解決不能。
-- 緩和: logical route key ベースで export 対象を決定し、txn/list の専用テストを追加。
+3. Risk: Internal key omission causing unresolved transactions.
+- Mitigation: Logical route-key based filtering + dedicated txn/list migration tests.
 
-4. リスク: cleanup が早すぎると古い reader に影響。
-- 緩和: grace 期間 + route version 監視 + 段階 GC。
+4. Risk: Cleanup too early impacting old readers.
+- Mitigation: Grace period + route-version observability + staged GC.
 
-## 15. 受け入れ基準
+## 15. Acceptance Criteria
 
-1. 手動 split で range が 2 分割され、片側を別 group へ移送できる。
-2. split 中に write ロスが発生しない。
-3. split 後に stale route write が reject される。
-4. 障害復旧後に split job が再開され最終的に `DONE` になる。
-5. 既存テスト + 新規 split テスト + Jepsen 拡張シナリオが通る。
+1. Manual split divides one range into two and moves one child to another group.
+2. No write loss during split.
+3. Stale-route writes are rejected after cutover.
+4. Split jobs resume after failure and eventually reach `DONE`.
+5. Existing tests + new split tests + extended Jepsen scenarios pass.
