@@ -239,6 +239,28 @@ func TestCatalogStoreSaveRejectsVersionOverflow(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreSaveRejectsCommitTSOverflow(t *testing.T) {
+	st := store.NewMVCCStore()
+	ctx := context.Background()
+
+	// Set catalog version at a high commit TS.
+	if err := st.PutAt(ctx, CatalogVersionKey(), EncodeCatalogVersion(10), ^uint64(0)-1, 0); err != nil {
+		t.Fatalf("prepare version key: %v", err)
+	}
+	// Push LastCommitTS to max uint64 so prepareSave overflows readTS+1.
+	if err := st.PutAt(ctx, []byte("!dist|meta|sentinel"), []byte("x"), ^uint64(0), 0); err != nil {
+		t.Fatalf("prepare sentinel key: %v", err)
+	}
+
+	cs := NewCatalogStore(st)
+	_, err := cs.Save(ctx, 10, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+	})
+	if !errors.Is(err, ErrCatalogVersionOverflow) {
+		t.Fatalf("expected ErrCatalogVersionOverflow, got %v", err)
+	}
+}
+
 func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	t.Helper()
 	if want.RouteID != got.RouteID {

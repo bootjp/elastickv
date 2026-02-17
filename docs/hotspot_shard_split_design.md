@@ -79,9 +79,19 @@ Responsibilities:
 - `start []byte` (inclusive)
 - `end []byte` (exclusive, nil=+inf)
 - `group_id uint64`
-- `version uint64` (catalog generation)
 - `state` (`ACTIVE`, `WRITE_FENCED`, `MIGRATING_SOURCE`, `MIGRATING_TARGET`)
 - `parent_route_id uint64` (lineage)
+
+`CatalogSnapshot`:
+
+- `version uint64` (global catalog generation)
+- `routes []RouteDescriptor`
+
+Versioning model note:
+
+- The current implementation uses a single global catalog version.
+- Per-route version fields are not used.
+- Store-level OCC with per-record version checks is not the mechanism here; consistency is coordinated by leader-side sequencing and catalog-level compare-and-swap.
 
 `SplitJob`:
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"sort"
-	"strconv"
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -322,10 +321,8 @@ func readU64LenBytes(r *bytes.Reader, rawLen uint64) ([]byte, error) {
 }
 
 func u64ToInt(v uint64) (int, error) {
-	if strconv.IntSize == 32 && v > uint64(^uint32(0)>>1) {
-		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
-	}
-	if strconv.IntSize == 64 && v > (^uint64(0)>>1) {
+	const maxInt = int(^uint(0) >> 1)
+	if v > uint64(maxInt) {
 		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	return int(v), nil
