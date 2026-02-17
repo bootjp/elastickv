@@ -404,6 +404,7 @@ type scanLockPlan struct {
 	statusCache       map[lockTxnKey]lockTxnStatus
 	resolutionBatches map[lockTxnKey]*lockResolutionBatch
 	batchOrder        []lockTxnKey
+	cleanupNow        uint64
 }
 
 func newScanLockPlan(size int) *scanLockPlan {
@@ -413,6 +414,7 @@ func newScanLockPlan(size int) *scanLockPlan {
 		statusCache:       make(map[lockTxnKey]lockTxnStatus),
 		resolutionBatches: make(map[lockTxnKey]*lockResolutionBatch),
 		batchOrder:        make([]lockTxnKey, 0),
+		cleanupNow:        hlcWallNow(),
 	}
 }
 
@@ -499,7 +501,7 @@ func (s *ShardStore) planLockedUserKey(ctx context.Context, plan *scanLockPlan, 
 	if err != nil {
 		return err
 	}
-	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey)
+	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey, plan.cleanupNow)
 	if err != nil {
 		return err
 	}
@@ -521,14 +523,14 @@ func (s *ShardStore) cachedLockTxnStatus(ctx context.Context, plan *scanLockPlan
 	return state, nil
 }
 
-func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte) (pb.Phase, uint64, error) {
+func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte, cleanupNow uint64) (pb.Phase, uint64, error) {
 	switch state.status {
 	case txnStatusPending:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
-		return pb.Phase_ABORT, cleanupTS(lock.StartTS), nil
+		return pb.Phase_ABORT, cleanupTSWithNow(lock.StartTS, cleanupNow), nil
 	default:
 		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
 	}
@@ -860,7 +862,10 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 }
 
 func cleanupTS(startTS uint64) uint64 {
-	now := hlcWallNow()
+	return cleanupTSWithNow(startTS, hlcWallNow())
+}
+
+func cleanupTSWithNow(startTS, now uint64) uint64 {
 	next := startTS + 1
 	if now > next {
 		return now
