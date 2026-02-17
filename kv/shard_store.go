@@ -365,7 +365,14 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	case txnStatusCommitted:
 		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusRolledBack:
-		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, cleanupTS(lock.StartTS), lock.PrimaryKey, [][]byte{key})
+		abortTS := abortTSFrom(lock.StartTS, commitTS)
+		if abortTS <= lock.StartTS {
+			// Defensive check: While uint64 overflow is not expected in normal operation,
+			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
+			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+		}
+		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusPending:
 		return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
 	default:
@@ -837,7 +844,17 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}
-	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, cleanupTS(startTS), primaryKey, [][]byte{primaryKey}); err != nil {
+	// No commitTS available here; we're aborting an expired lock with no commit record.
+	// Pass 0 for commitTS to explicitly indicate it's not available; abortTSFrom will
+	// use startTS+1 if representable.
+	abortTS := abortTSFrom(startTS, 0)
+	if abortTS <= startTS {
+		// Defensive check: While uint64 overflow is not expected in normal operation,
+		// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
+		// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
+		return false, nil
+	}
+	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
 		return false, err
 	}
 	return true, nil
