@@ -1137,6 +1137,10 @@ func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
 		startTS = r.coordinator.Clock().Next()
 	}
 
+	// Keep DEL atomic by deleting all persisted list entries and metadata in one
+	// transaction at a single snapshot timestamp. This can allocate large slices
+	// for very large lists; if the storage layer grows range-delete support, this
+	// path should move to a streaming/range tombstone strategy.
 	kvs, err := r.store.ScanAt(ctx, start, end, math.MaxInt, startTS)
 	if err != nil {
 		return errors.WithStack(err)
