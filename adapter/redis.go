@@ -390,9 +390,9 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 	start, end := patternScanBounds(pattern)
 	keyset := map[string][]byte{}
+	readTS := r.readTS()
 
 	mergeScannedKeys := func(scanStart, scanEnd []byte) error {
-		readTS := r.readTS()
 		keys, err := r.store.ScanAt(context.Background(), scanStart, scanEnd, math.MaxInt, readTS)
 		if err != nil {
 			return errors.WithStack(err)

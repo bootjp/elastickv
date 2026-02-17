@@ -49,6 +49,16 @@ func (s *stubAdapterCoordinator) Clock() *kv.HLC {
 	return s.clock
 }
 
+type tsTrackingStore struct {
+	store.MVCCStore
+	scanTS []uint64
+}
+
+func (s *tsTrackingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scanTS = append(s.scanTS, ts)
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
 func TestPatternScanBounds(t *testing.T) {
 	t.Parallel()
 
@@ -135,4 +145,27 @@ func TestLocalKeysPattern_FindsListKeysForUserPrefix(t *testing.T) {
 	require.Len(t, keys, 2)
 	require.Contains(t, keys, []byte("test:key"))
 	require.Contains(t, keys, []byte("test:list"))
+}
+
+func TestLocalKeysPattern_UsesSingleSnapshotTSAcrossScans(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := store.NewMVCCStore()
+	require.NoError(t, base.PutAt(ctx, []byte("test:key"), []byte("v"), 1, 0))
+	require.NoError(t, base.PutAt(ctx, store.ListMetaKey([]byte("test:list")), []byte("m"), 2, 0))
+	require.NoError(t, base.PutAt(ctx, store.ListItemKey([]byte("test:list"), 1), []byte("i"), 3, 0))
+
+	tracking := &tsTrackingStore{MVCCStore: base}
+	r := &RedisServer{
+		store:       tracking,
+		coordinator: &stubAdapterCoordinator{clock: kv.NewHLC()},
+	}
+
+	_, err := r.localKeysPattern([]byte("test*"))
+	require.NoError(t, err)
+	require.Len(t, tracking.scanTS, 3)
+	for _, ts := range tracking.scanTS {
+		require.Equal(t, tracking.scanTS[0], ts)
+	}
 }
