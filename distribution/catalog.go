@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"sort"
-	"strconv"
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -322,10 +321,8 @@ func readU64LenBytes(r *bytes.Reader, rawLen uint64) ([]byte, error) {
 }
 
 func u64ToInt(v uint64) (int, error) {
-	if strconv.IntSize == 32 && v > uint64(^uint32(0)>>1) {
-		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
-	}
-	if strconv.IntSize == 64 && v > (^uint64(0)>>1) {
+	const maxInt = int(^uint(0) >> 1)
+	if v > uint64(maxInt) {
 		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	return int(v), nil
@@ -426,7 +423,7 @@ func (s *CatalogStore) scanRouteEntriesAt(ctx context.Context, ts uint64) ([]*st
 
 type savePlan struct {
 	readTS      uint64
-	commitTS    uint64
+	minCommitTS uint64
 	nextVersion uint64
 	routes      []RouteDescriptor
 }
@@ -450,14 +447,14 @@ func (s *CatalogStore) prepareSave(ctx context.Context, expectedVersion uint64, 
 	if nextVersion == 0 {
 		return savePlan{}, errors.WithStack(ErrCatalogVersionOverflow)
 	}
-	commitTS := readTS + 1
-	if commitTS == 0 {
+	minCommitTS := readTS + 1
+	if minCommitTS == 0 {
 		return savePlan{}, errors.WithStack(ErrCatalogVersionOverflow)
 	}
 
 	return savePlan{
 		readTS:      readTS,
-		commitTS:    commitTS,
+		minCommitTS: minCommitTS,
 		nextVersion: nextVersion,
 		routes:      normalized,
 	}, nil
@@ -484,13 +481,30 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 }
 
 func (s *CatalogStore) applySaveMutations(ctx context.Context, plan savePlan, mutations []*store.KVPairMutation) error {
-	if err := s.store.ApplyMutations(ctx, mutations, plan.readTS, plan.commitTS); err != nil {
+	commitTS, err := s.commitTSForApply(plan.minCommitTS)
+	if err != nil {
+		return err
+	}
+	if err := s.store.ApplyMutations(ctx, mutations, plan.readTS, commitTS); err != nil {
 		if errors.Is(err, store.ErrWriteConflict) {
 			return errors.WithStack(ErrCatalogVersionMismatch)
 		}
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func (s *CatalogStore) commitTSForApply(minCommitTS uint64) (uint64, error) {
+	currentLast := s.store.LastCommitTS()
+	candidateFromStore := currentLast + 1
+	if candidateFromStore == 0 {
+		return 0, errors.WithStack(ErrCatalogVersionOverflow)
+	}
+
+	if candidateFromStore > minCommitTS {
+		return candidateFromStore, nil
+	}
+	return minCommitTS, nil
 }
 
 func appendDeleteMutations(out []*store.KVPairMutation, keys [][]byte) []*store.KVPairMutation {
