@@ -261,9 +261,7 @@ func normalizeRoutes(routes []RouteDescriptor) ([]RouteDescriptor, error) {
 		seen[route.RouteID] = struct{}{}
 		out = append(out, cloneRouteDescriptor(route))
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].RouteID < out[j].RouteID
-	})
+	sortRouteDescriptors(out)
 	return out, nil
 }
 
@@ -300,6 +298,32 @@ func cloneRouteDescriptors(routes []RouteDescriptor) []RouteDescriptor {
 		out[i] = cloneRouteDescriptor(routes[i])
 	}
 	return out
+}
+
+func sortRouteDescriptors(routes []RouteDescriptor) {
+	sort.Slice(routes, func(i, j int) bool {
+		return routeDescriptorLess(routes[i], routes[j])
+	})
+}
+
+func routeDescriptorLess(left, right RouteDescriptor) bool {
+	if c := bytes.Compare(left.Start, right.Start); c != 0 {
+		return c < 0
+	}
+
+	if left.End == nil && right.End != nil {
+		return false
+	}
+	if left.End != nil && right.End == nil {
+		return true
+	}
+	if left.End != nil && right.End != nil {
+		if c := bytes.Compare(left.End, right.End); c != 0 {
+			return c < 0
+		}
+	}
+
+	return left.RouteID < right.RouteID
 }
 
 func readU64LenBytes(r *bytes.Reader, rawLen uint64) ([]byte, error) {
@@ -368,9 +392,7 @@ func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescript
 		seen[route.RouteID] = struct{}{}
 		out = append(out, route)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].RouteID < out[j].RouteID
-	})
+	sortRouteDescriptors(out)
 	return out, nil
 }
 

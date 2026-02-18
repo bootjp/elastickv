@@ -131,8 +131,8 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	if len(saved.Routes) != 2 {
 		t.Fatalf("expected 2 routes, got %d", len(saved.Routes))
 	}
-	if saved.Routes[0].RouteID != 1 || saved.Routes[1].RouteID != 2 {
-		t.Fatalf("expected sorted route ids [1,2], got [%d,%d]", saved.Routes[0].RouteID, saved.Routes[1].RouteID)
+	if !bytes.Equal(saved.Routes[0].Start, []byte("")) || !bytes.Equal(saved.Routes[1].Start, []byte("m")) {
+		t.Fatalf("expected routes sorted by start key, got starts [%q,%q]", saved.Routes[0].Start, saved.Routes[1].Start)
 	}
 
 	snapshot, err := cs.Snapshot(ctx)
@@ -147,6 +147,50 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	}
 	assertRouteEqual(t, saved.Routes[0], snapshot.Routes[0])
 	assertRouteEqual(t, saved.Routes[1], snapshot.Routes[1])
+}
+
+func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+
+	saved, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{
+			RouteID:       10,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       20,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if len(saved.Routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(saved.Routes))
+	}
+	if saved.Routes[0].RouteID != 20 || saved.Routes[1].RouteID != 10 {
+		t.Fatalf("expected route order by start key [20,10], got [%d,%d]", saved.Routes[0].RouteID, saved.Routes[1].RouteID)
+	}
+
+	snapshot, err := cs.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot.Routes) != 2 {
+		t.Fatalf("expected 2 routes in snapshot, got %d", len(snapshot.Routes))
+	}
+	if snapshot.Routes[0].RouteID != 20 || snapshot.Routes[1].RouteID != 10 {
+		t.Fatalf("expected snapshot route order by start key [20,10], got [%d,%d]", snapshot.Routes[0].RouteID, snapshot.Routes[1].RouteID)
+	}
 }
 
 func TestCatalogStoreSaveRejectsVersionMismatch(t *testing.T) {
