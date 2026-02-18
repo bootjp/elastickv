@@ -69,6 +69,27 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 	assertRouteEqual(t, route, got)
 }
 
+func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw = append(raw, 0xff)
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
 func TestCatalogRouteKeyHelpers(t *testing.T) {
 	key := CatalogRouteKey(11)
 	if !IsCatalogRouteKey(key) {
@@ -264,6 +285,45 @@ func TestCatalogStoreSaveDeletesRemovedRoutes(t *testing.T) {
 	}
 	if snapshot.Routes[0].RouteID != 2 {
 		t.Fatalf("expected remaining route id 2, got %d", snapshot.Routes[0].RouteID)
+	}
+}
+
+func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	routes := []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+	}
+	_, err := cs.Save(ctx, 0, routes)
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	route1FirstTS, exists, err := st.LatestCommitTS(ctx, CatalogRouteKey(1))
+	if err != nil {
+		t.Fatalf("route 1 latest ts (first): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected route 1 key to exist")
+	}
+
+	_, err = cs.Save(ctx, 1, routes)
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	route1SecondTS, exists, err := st.LatestCommitTS(ctx, CatalogRouteKey(1))
+	if err != nil {
+		t.Fatalf("route 1 latest ts (second): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected route 1 key to exist after second save")
+	}
+	if route1SecondTS != route1FirstTS {
+		t.Fatalf("expected unchanged route key commit ts to remain %d, got %d", route1FirstTS, route1SecondTS)
 	}
 }
 
