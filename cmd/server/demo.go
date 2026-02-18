@@ -311,7 +311,8 @@ func run(eg *errgroup.Group, cfg config) error {
 	trx := kv.NewTransaction(r)
 	coordinator := kv.NewCoordinator(trx, r)
 	distEngine := distribution.NewEngineWithDefaultRoute()
-	distServer := adapter.NewDistributionServer(distEngine)
+	distCatalog := distribution.NewCatalogStore(st)
+	distServer := adapter.NewDistributionServer(distEngine, distCatalog)
 
 	s := setupGRPC(r, st, tm, coordinator, distServer)
 

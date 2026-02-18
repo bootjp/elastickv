@@ -73,7 +73,8 @@ func run() error {
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() { _ = shardStore.Close() }()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
-	distServer := adapter.NewDistributionServer(cfg.engine)
+	distCatalog := distributionCatalogStoreForGroup(runtimes, cfg.defaultGroup)
+	distServer := adapter.NewDistributionServer(cfg.engine, distCatalog)
 
 	eg := errgroup.Group{}
 	if err := startRaftServers(ctx, &lc, &eg, runtimes, shardStore, coordinate, distServer); err != nil {
@@ -226,5 +227,17 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	eg.Go(func() error {
 		return errors.WithStack(adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis).Run())
 	})
+	return nil
+}
+
+func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint64) *distribution.CatalogStore {
+	for _, rt := range runtimes {
+		if rt == nil || rt.store == nil {
+			continue
+		}
+		if rt.spec.id == groupID {
+			return distribution.NewCatalogStore(rt.store)
+		}
+	}
 	return nil
 }
