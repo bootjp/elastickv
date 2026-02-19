@@ -349,6 +349,51 @@ func TestEngineApplySnapshot_RejectsInvalidRouteOrder(t *testing.T) {
 	}
 }
 
+func TestEngineApplySnapshot_RejectsDuplicateRouteStarts(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("a"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOrder) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOrder, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_EmptyRoutesClearsState(t *testing.T) {
+	e := NewEngine()
+
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply initial snapshot: %v", err)
+	}
+
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 2,
+		Routes:  []RouteDescriptor{},
+	}); err != nil {
+		t.Fatalf("apply empty snapshot: %v", err)
+	}
+
+	if got := e.Version(); got != 2 {
+		t.Fatalf("expected version 2, got %d", got)
+	}
+	if got := len(e.Stats()); got != 0 {
+		t.Fatalf("expected 0 routes after empty snapshot, got %d", got)
+	}
+	if _, ok := e.GetRoute([]byte("a")); ok {
+		t.Fatal("expected no route after empty snapshot")
+	}
+}
+
 func TestEngineApplySnapshot_LookupBehavior(t *testing.T) {
 	e := NewEngine()
 	err := e.ApplySnapshot(CatalogSnapshot{

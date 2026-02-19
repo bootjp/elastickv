@@ -294,16 +294,37 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 			End:     cloneBytes(rd.End),
 			GroupID: rd.GroupID,
 			State:   rd.State,
+			Load:    0,
 		})
 	}
 
+	// Keep deterministic ordering consistent with catalog route ordering.
+	// Duplicate Start keys are still rejected by validateRouteOrder.
 	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(out[i].Start, out[j].Start) < 0
+		return engineRouteLess(out[i], out[j])
 	})
 	if err := validateRouteOrder(out); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func engineRouteLess(left, right Route) bool {
+	if c := bytes.Compare(left.Start, right.Start); c != 0 {
+		return c < 0
+	}
+	if left.End == nil && right.End != nil {
+		return false
+	}
+	if left.End != nil && right.End == nil {
+		return true
+	}
+	if left.End != nil && right.End != nil {
+		if c := bytes.Compare(left.End, right.End); c != 0 {
+			return c < 0
+		}
+	}
+	return left.RouteID < right.RouteID
 }
 
 func validateRouteOrder(routes []Route) error {
@@ -320,6 +341,8 @@ func validateRouteOrder(routes []Route) error {
 		if prev.End == nil {
 			return errors.WithStack(ErrEngineSnapshotRouteOrder)
 		}
+		// Adjacent routes where prev.End == curr.Start are valid in [Start, End).
+		// Only prev.End > curr.Start indicates an overlap.
 		if bytes.Compare(prev.End, curr.Start) > 0 {
 			return errors.WithStack(ErrEngineSnapshotRouteOverlap)
 		}
