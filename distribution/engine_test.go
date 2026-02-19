@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"strings"
 	"sync"
 	"testing"
 
@@ -290,6 +291,9 @@ func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
 	if !errors.Is(err, ErrEngineSnapshotVersionStale) {
 		t.Fatalf("expected ErrEngineSnapshotVersionStale, got %v", err)
 	}
+	if !strings.Contains(err.Error(), "snapshot version 1") || !strings.Contains(err.Error(), "engine catalog version 2") {
+		t.Fatalf("expected stale error to include version context, got %v", err)
+	}
 
 	route, ok := e.GetRoute([]byte("k"))
 	if !ok {
@@ -297,6 +301,51 @@ func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
 	}
 	if route.GroupID != 1 || route.RouteID != 1 {
 		t.Fatalf("expected route to remain unchanged, got %+v", route)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsDuplicateRouteIDs(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 10, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotDuplicateID) {
+		t.Fatalf("expected ErrEngineSnapshotDuplicateID, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsOverlappingRoutes(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("n"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOverlap) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOverlap, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsInvalidRouteOrder(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOrder) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOrder, got %v", err)
 	}
 }
 

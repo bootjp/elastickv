@@ -78,13 +78,13 @@ func (e *Engine) Version() uint64 {
 // ApplySnapshot atomically replaces all in-memory routes with the provided
 // catalog snapshot when the snapshot version is newer.
 func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if snapshot.Version < e.catalogVersion {
-		return errors.WithStack(ErrEngineSnapshotVersionStale)
+	e.mu.RLock()
+	currentVersion := e.catalogVersion
+	e.mu.RUnlock()
+	if snapshot.Version < currentVersion {
+		return staleSnapshotVersionErr(snapshot.Version, currentVersion)
 	}
-	if snapshot.Version == e.catalogVersion {
+	if snapshot.Version == currentVersion {
 		return nil
 	}
 
@@ -93,9 +93,28 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 		return err
 	}
 
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if snapshot.Version < e.catalogVersion {
+		return staleSnapshotVersionErr(snapshot.Version, e.catalogVersion)
+	}
+	if snapshot.Version == e.catalogVersion {
+		return nil
+	}
+
 	e.routes = routes
 	e.catalogVersion = snapshot.Version
 	return nil
+}
+
+func staleSnapshotVersionErr(snapshotVersion, currentVersion uint64) error {
+	return errors.Wrapf(
+		ErrEngineSnapshotVersionStale,
+		"snapshot version %d is older than engine catalog version %d",
+		snapshotVersion,
+		currentVersion,
+	)
 }
 
 // UpdateRoute registers or updates a route for the given key range.
