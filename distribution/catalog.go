@@ -145,11 +145,19 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 
 	var buf bytes.Buffer
 	buf.WriteByte(catalogRouteCodecVersion)
-	_ = binary.Write(&buf, binary.BigEndian, route.RouteID)
-	_ = binary.Write(&buf, binary.BigEndian, route.GroupID)
+	if err := binary.Write(&buf, binary.BigEndian, route.RouteID); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, route.GroupID); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	buf.WriteByte(byte(route.State))
-	_ = binary.Write(&buf, binary.BigEndian, route.ParentRouteID)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(len(route.Start)))
+	if err := binary.Write(&buf, binary.BigEndian, route.ParentRouteID); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint64(len(route.Start))); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	if len(route.Start) > 0 {
 		buf.Write(route.Start)
 	}
@@ -159,7 +167,9 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 	}
 
 	buf.WriteByte(1)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(len(route.End)))
+	if err := binary.Write(&buf, binary.BigEndian, uint64(len(route.End))); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	buf.Write(route.End)
 	return buf.Bytes(), nil
 }

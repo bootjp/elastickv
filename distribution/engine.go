@@ -242,8 +242,10 @@ func (e *Engine) splitRange(idx int) {
 		e.routes[idx].Load = 0
 		return
 	}
-	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
-	right := Route{Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
+	// Auto-split routes are ephemeral in-memory entries until persisted through
+	// catalog operations, so keep RouteID zero here.
+	left := Route{RouteID: 0, Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
+	right := Route{RouteID: 0, Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
 	// replace the range at idx with left and right in an idiomatic manner
 	e.routes = append(e.routes[:idx+1], e.routes[idx:]...)
 	e.routes[idx] = left
