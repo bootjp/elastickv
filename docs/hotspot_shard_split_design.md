@@ -216,7 +216,7 @@ Keys to include:
 
 1. User keys
 2. List keys (`!lst|meta|...`, `!lst|itm|...`)
-3. Txn keys (`!txn|lock|...`, `!txn|int|...`, `!txn|cmt|...`, `!txn|rb|...`)
+3. Txn keys (`!txn|lock|...`, `!txn|int|...`, `!txn|meta|...`, `!txn|cmt|...`, `!txn|rb|...`)
 
 Required changes:
 
