@@ -4,7 +4,7 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (at proposal time):
+Current implementation status (as of February 17, 2026):
 
 - `distribution/engine.go` has per-range access counters and threshold-based `splitRange`.
 - However, `RecordAccess` is not wired into real request paths.
