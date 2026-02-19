@@ -383,3 +383,56 @@ func TestEngineApplySnapshot_LookupBehavior(t *testing.T) {
 		}
 	}
 }
+
+func TestEngineApplySnapshot_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	const maxVersion uint64 = 20
+
+	var wg sync.WaitGroup
+	errs := make(chan error, maxVersion)
+
+	for version := uint64(1); version <= maxVersion; version++ {
+		v := version
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			err := e.ApplySnapshot(CatalogSnapshot{
+				Version: v,
+				Routes: []RouteDescriptor{
+					{
+						RouteID: 1,
+						Start:   []byte("a"),
+						End:     nil,
+						GroupID: v,
+						State:   RouteStateActive,
+					},
+				},
+			})
+			if err != nil && !errors.Is(err, ErrEngineSnapshotVersionStale) {
+				errs <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("unexpected apply snapshot error: %v", err)
+	}
+
+	if got := e.Version(); got != maxVersion {
+		t.Fatalf("expected final version %d, got %d", maxVersion, got)
+	}
+
+	route, ok := e.GetRoute([]byte("a"))
+	if !ok {
+		t.Fatal("expected route after concurrent snapshots")
+	}
+	if route.GroupID != maxVersion {
+		t.Fatalf("expected route group %d, got %d", maxVersion, route.GroupID)
+	}
+}
