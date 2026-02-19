@@ -80,12 +80,11 @@ func (e *Engine) Version() uint64 {
 func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 	e.mu.RLock()
 	currentVersion := e.catalogVersion
-	if snapshot.Version < currentVersion {
+	if snapshot.Version <= currentVersion {
 		e.mu.RUnlock()
-		return staleSnapshotVersionErr(snapshot.Version, currentVersion)
-	}
-	if snapshot.Version == currentVersion {
-		e.mu.RUnlock()
+		if snapshot.Version < currentVersion {
+			return staleSnapshotVersionErr(snapshot.Version, currentVersion)
+		}
 		return nil
 	}
 	e.mu.RUnlock()
@@ -98,10 +97,10 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if snapshot.Version < e.catalogVersion {
-		return staleSnapshotVersionErr(snapshot.Version, e.catalogVersion)
-	}
-	if snapshot.Version == e.catalogVersion {
+	if snapshot.Version <= e.catalogVersion {
+		if snapshot.Version < e.catalogVersion {
+			return staleSnapshotVersionErr(snapshot.Version, e.catalogVersion)
+		}
 		return nil
 	}
 
