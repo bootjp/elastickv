@@ -80,13 +80,15 @@ func (e *Engine) Version() uint64 {
 func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 	e.mu.RLock()
 	currentVersion := e.catalogVersion
-	e.mu.RUnlock()
 	if snapshot.Version < currentVersion {
+		e.mu.RUnlock()
 		return staleSnapshotVersionErr(snapshot.Version, currentVersion)
 	}
 	if snapshot.Version == currentVersion {
+		e.mu.RUnlock()
 		return nil
 	}
+	e.mu.RUnlock()
 
 	routes, err := routesFromCatalog(snapshot.Routes)
 	if err != nil {
