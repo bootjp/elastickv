@@ -277,9 +277,9 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		return []Route{}, nil
 	}
 
-	out := make([]Route, 0, len(routes))
+	out := make([]Route, len(routes))
 	seen := make(map[uint64]struct{}, len(routes))
-	for _, rd := range routes {
+	for i, rd := range routes {
 		if err := validateRouteDescriptor(rd); err != nil {
 			return nil, err
 		}
@@ -287,43 +287,27 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 			return nil, errors.WithStack(ErrEngineSnapshotDuplicateID)
 		}
 		seen[rd.RouteID] = struct{}{}
-		out = append(out, Route{
+		out[i] = Route{
 			RouteID: rd.RouteID,
 			Start:   cloneBytes(rd.Start),
 			End:     cloneBytes(rd.End),
 			GroupID: rd.GroupID,
 			State:   rd.State,
 			Load:    0,
-		})
+		}
 	}
 
-	// Keep deterministic ordering consistent with catalog route ordering.
-	// Duplicate Start keys are still rejected by validateRouteOrder.
+	// Engine assumes valid snapshots have unique Start keys.
+	// Therefore, unlike routeDescriptorLess in catalog, sort by Start only.
+	// If an invalid snapshot is supplied (duplicate Start or bad order),
+	// validateRouteOrder rejects it after sorting.
 	sort.Slice(out, func(i, j int) bool {
-		return engineRouteLess(out[i], out[j])
+		return bytes.Compare(out[i].Start, out[j].Start) < 0
 	})
 	if err := validateRouteOrder(out); err != nil {
 		return nil, err
 	}
 	return out, nil
-}
-
-func engineRouteLess(left, right Route) bool {
-	if c := bytes.Compare(left.Start, right.Start); c != 0 {
-		return c < 0
-	}
-	if left.End == nil && right.End != nil {
-		return false
-	}
-	if left.End != nil && right.End == nil {
-		return true
-	}
-	if left.End != nil && right.End != nil {
-		if c := bytes.Compare(left.End, right.End); c != 0 {
-			return c < 0
-		}
-	}
-	return left.RouteID < right.RouteID
 }
 
 func validateRouteOrder(routes []Route) error {
