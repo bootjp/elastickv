@@ -69,6 +69,27 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 	assertRouteEqual(t, route, got)
 }
 
+func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw = append(raw, 0xff)
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
 func TestCatalogRouteKeyHelpers(t *testing.T) {
 	key := CatalogRouteKey(11)
 	if !IsCatalogRouteKey(key) {
@@ -131,8 +152,8 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	if len(saved.Routes) != 2 {
 		t.Fatalf("expected 2 routes, got %d", len(saved.Routes))
 	}
-	if saved.Routes[0].RouteID != 1 || saved.Routes[1].RouteID != 2 {
-		t.Fatalf("expected sorted route ids [1,2], got [%d,%d]", saved.Routes[0].RouteID, saved.Routes[1].RouteID)
+	if !bytes.Equal(saved.Routes[0].Start, []byte("")) || !bytes.Equal(saved.Routes[1].Start, []byte("m")) {
+		t.Fatalf("expected routes sorted by start key, got starts [%q,%q]", saved.Routes[0].Start, saved.Routes[1].Start)
 	}
 
 	snapshot, err := cs.Snapshot(ctx)
@@ -147,6 +168,50 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	}
 	assertRouteEqual(t, saved.Routes[0], snapshot.Routes[0])
 	assertRouteEqual(t, saved.Routes[1], snapshot.Routes[1])
+}
+
+func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+
+	saved, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{
+			RouteID:       10,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       20,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if len(saved.Routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(saved.Routes))
+	}
+	if saved.Routes[0].RouteID != 20 || saved.Routes[1].RouteID != 10 {
+		t.Fatalf("expected route order by start key [20,10], got [%d,%d]", saved.Routes[0].RouteID, saved.Routes[1].RouteID)
+	}
+
+	snapshot, err := cs.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot.Routes) != 2 {
+		t.Fatalf("expected 2 routes in snapshot, got %d", len(snapshot.Routes))
+	}
+	if snapshot.Routes[0].RouteID != 20 || snapshot.Routes[1].RouteID != 10 {
+		t.Fatalf("expected snapshot route order by start key [20,10], got [%d,%d]", snapshot.Routes[0].RouteID, snapshot.Routes[1].RouteID)
+	}
 }
 
 func TestCatalogStoreSaveRejectsVersionMismatch(t *testing.T) {
@@ -220,6 +285,45 @@ func TestCatalogStoreSaveDeletesRemovedRoutes(t *testing.T) {
 	}
 	if snapshot.Routes[0].RouteID != 2 {
 		t.Fatalf("expected remaining route id 2, got %d", snapshot.Routes[0].RouteID)
+	}
+}
+
+func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	routes := []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+	}
+	_, err := cs.Save(ctx, 0, routes)
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	route1FirstTS, exists, err := st.LatestCommitTS(ctx, CatalogRouteKey(1))
+	if err != nil {
+		t.Fatalf("route 1 latest ts (first): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected route 1 key to exist")
+	}
+
+	_, err = cs.Save(ctx, 1, routes)
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	route1SecondTS, exists, err := st.LatestCommitTS(ctx, CatalogRouteKey(1))
+	if err != nil {
+		t.Fatalf("route 1 latest ts (second): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected route 1 key to exist after second save")
+	}
+	if route1SecondTS != route1FirstTS {
+		t.Fatalf("expected unchanged route key commit ts to remain %d, got %d", route1FirstTS, route1SecondTS)
 	}
 }
 
