@@ -152,6 +152,7 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 	out = appendU64(out, route.ParentRouteID)
 	out = appendU64(out, uint64(len(route.Start)))
 	out = append(out, route.Start...)
+
 	if route.End == nil {
 		out = append(out, 0)
 		return out, nil
@@ -160,6 +161,7 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 	out = append(out, 1)
 	out = appendU64(out, uint64(len(route.End)))
 	out = append(out, route.End...)
+
 	return out, nil
 }
 
