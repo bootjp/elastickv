@@ -78,24 +78,44 @@ func (e *Engine) Version() uint64 {
 // ApplySnapshot atomically replaces all in-memory routes with the provided
 // catalog snapshot when the snapshot version is newer.
 func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if snapshot.Version < e.catalogVersion {
-		return errors.WithStack(ErrEngineSnapshotVersionStale)
-	}
-	if snapshot.Version == e.catalogVersion {
+	e.mu.RLock()
+	currentVersion := e.catalogVersion
+	if snapshot.Version <= currentVersion {
+		e.mu.RUnlock()
+		if snapshot.Version < currentVersion {
+			return staleSnapshotVersionErr(snapshot.Version, currentVersion)
+		}
 		return nil
 	}
+	e.mu.RUnlock()
 
 	routes, err := routesFromCatalog(snapshot.Routes)
 	if err != nil {
 		return err
 	}
 
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if snapshot.Version <= e.catalogVersion {
+		if snapshot.Version < e.catalogVersion {
+			return staleSnapshotVersionErr(snapshot.Version, e.catalogVersion)
+		}
+		return nil
+	}
+
 	e.routes = routes
 	e.catalogVersion = snapshot.Version
 	return nil
+}
+
+func staleSnapshotVersionErr(snapshotVersion, currentVersion uint64) error {
+	return errors.Wrapf(
+		ErrEngineSnapshotVersionStale,
+		"snapshot version %d is older than engine catalog version %d",
+		snapshotVersion,
+		currentVersion,
+	)
 }
 
 // UpdateRoute registers or updates a route for the given key range.
@@ -242,8 +262,10 @@ func (e *Engine) splitRange(idx int) {
 		e.routes[idx].Load = 0
 		return
 	}
-	left := Route{Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
-	right := Route{Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
+	// Auto-split routes are ephemeral in-memory entries until persisted through
+	// catalog operations, so keep RouteID zero here.
+	left := Route{RouteID: 0, Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
+	right := Route{RouteID: 0, Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
 	// replace the range at idx with left and right in an idiomatic manner
 	e.routes = append(e.routes[:idx+1], e.routes[idx:]...)
 	e.routes[idx] = left
@@ -255,9 +277,9 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		return []Route{}, nil
 	}
 
-	out := make([]Route, 0, len(routes))
+	out := make([]Route, len(routes))
 	seen := make(map[uint64]struct{}, len(routes))
-	for _, rd := range routes {
+	for i, rd := range routes {
 		if err := validateRouteDescriptor(rd); err != nil {
 			return nil, err
 		}
@@ -265,15 +287,20 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 			return nil, errors.WithStack(ErrEngineSnapshotDuplicateID)
 		}
 		seen[rd.RouteID] = struct{}{}
-		out = append(out, Route{
+		out[i] = Route{
 			RouteID: rd.RouteID,
 			Start:   cloneBytes(rd.Start),
 			End:     cloneBytes(rd.End),
 			GroupID: rd.GroupID,
 			State:   rd.State,
-		})
+			Load:    0,
+		}
 	}
 
+	// Engine assumes valid snapshots have unique Start keys.
+	// Therefore, unlike routeDescriptorLess in catalog, sort by Start only.
+	// If an invalid snapshot is supplied (duplicate Start or bad order),
+	// validateRouteOrder rejects it after sorting.
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Start, out[j].Start) < 0
 	})
@@ -297,6 +324,8 @@ func validateRouteOrder(routes []Route) error {
 		if prev.End == nil {
 			return errors.WithStack(ErrEngineSnapshotRouteOrder)
 		}
+		// Adjacent routes where prev.End == curr.Start are valid in [Start, End).
+		// Only prev.End > curr.Start indicates an overlap.
 		if bytes.Compare(prev.End, curr.Start) > 0 {
 			return errors.WithStack(ErrEngineSnapshotRouteOverlap)
 		}

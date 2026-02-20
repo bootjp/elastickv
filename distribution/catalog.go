@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"sort"
 
 	"github.com/bootjp/elastickv/store"
@@ -143,25 +144,25 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 		return nil, err
 	}
 
-	var buf bytes.Buffer
-	buf.WriteByte(catalogRouteCodecVersion)
-	_ = binary.Write(&buf, binary.BigEndian, route.RouteID)
-	_ = binary.Write(&buf, binary.BigEndian, route.GroupID)
-	buf.WriteByte(byte(route.State))
-	_ = binary.Write(&buf, binary.BigEndian, route.ParentRouteID)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(len(route.Start)))
-	if len(route.Start) > 0 {
-		buf.Write(route.Start)
-	}
+	out := make([]byte, 0, routeDescriptorEncodedSize(route))
+	out = append(out, catalogRouteCodecVersion)
+	out = appendU64(out, route.RouteID)
+	out = appendU64(out, route.GroupID)
+	out = append(out, byte(route.State))
+	out = appendU64(out, route.ParentRouteID)
+	out = appendU64(out, uint64(len(route.Start)))
+	out = append(out, route.Start...)
+
 	if route.End == nil {
-		buf.WriteByte(0)
-		return buf.Bytes(), nil
+		out = append(out, 0)
+		return out, nil
 	}
 
-	buf.WriteByte(1)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(len(route.End)))
-	buf.Write(route.End)
-	return buf.Bytes(), nil
+	out = append(out, 1)
+	out = appendU64(out, uint64(len(route.End)))
+	out = append(out, route.End...)
+
+	return out, nil
 }
 
 // DecodeRouteDescriptor deserializes a route descriptor record.
@@ -181,6 +182,9 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	route.End, err = decodeRouteDescriptorEnd(r)
 	if err != nil {
 		return RouteDescriptor{}, err
+	}
+	if r.Len() != 0 {
+		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	if err := validateRouteDescriptor(route); err != nil {
 		return RouteDescriptor{}, err
@@ -261,9 +265,7 @@ func normalizeRoutes(routes []RouteDescriptor) ([]RouteDescriptor, error) {
 		seen[route.RouteID] = struct{}{}
 		out = append(out, cloneRouteDescriptor(route))
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].RouteID < out[j].RouteID
-	})
+	sortRouteDescriptors(out)
 	return out, nil
 }
 
@@ -302,6 +304,32 @@ func cloneRouteDescriptors(routes []RouteDescriptor) []RouteDescriptor {
 	return out
 }
 
+func sortRouteDescriptors(routes []RouteDescriptor) {
+	sort.Slice(routes, func(i, j int) bool {
+		return routeDescriptorLess(routes[i], routes[j])
+	})
+}
+
+func routeDescriptorLess(left, right RouteDescriptor) bool {
+	if c := bytes.Compare(left.Start, right.Start); c != 0 {
+		return c < 0
+	}
+
+	if left.End == nil && right.End != nil {
+		return false
+	}
+	if left.End != nil && right.End == nil {
+		return true
+	}
+	if left.End != nil && right.End != nil {
+		if c := bytes.Compare(left.End, right.End); c != 0 {
+			return c < 0
+		}
+	}
+
+	return left.RouteID < right.RouteID
+}
+
 func readU64LenBytes(r *bytes.Reader, rawLen uint64) ([]byte, error) {
 	n, err := u64ToInt(rawLen)
 	if err != nil {
@@ -321,8 +349,7 @@ func readU64LenBytes(r *bytes.Reader, rawLen uint64) ([]byte, error) {
 }
 
 func u64ToInt(v uint64) (int, error) {
-	const maxInt = int(^uint(0) >> 1)
-	if v > uint64(maxInt) {
+	if v > uint64(math.MaxInt) {
 		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	return int(v), nil
@@ -368,21 +395,7 @@ func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescript
 		seen[route.RouteID] = struct{}{}
 		out = append(out, route)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].RouteID < out[j].RouteID
-	})
-	return out, nil
-}
-
-func (s *CatalogStore) routeKeysAt(ctx context.Context, ts uint64) ([][]byte, error) {
-	entries, err := s.scanRouteEntriesAt(ctx, ts)
-	if err != nil {
-		return nil, err
-	}
-	out := make([][]byte, 0, len(entries))
-	for _, kvp := range entries {
-		out = append(out, cloneBytes(kvp.Key))
-	}
+	sortRouteDescriptors(out)
 	return out, nil
 }
 
@@ -461,14 +474,14 @@ func (s *CatalogStore) prepareSave(ctx context.Context, expectedVersion uint64, 
 }
 
 func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([]*store.KVPairMutation, error) {
-	existingKeys, err := s.routeKeysAt(ctx, plan.readTS)
+	existingRoutes, err := s.routesAt(ctx, plan.readTS)
 	if err != nil {
 		return nil, err
 	}
 
-	mutations := make([]*store.KVPairMutation, 0, len(existingKeys)+len(plan.routes)+1)
-	mutations = appendDeleteMutations(mutations, existingKeys)
-	mutations, err = appendRouteMutations(mutations, plan.routes)
+	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+1)
+	mutations = appendDeleteRouteMutations(mutations, existingRoutes, plan.routes)
+	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes)
 	if err != nil {
 		return nil, err
 	}
@@ -507,18 +520,34 @@ func (s *CatalogStore) commitTSForApply(minCommitTS uint64) (uint64, error) {
 	return minCommitTS, nil
 }
 
-func appendDeleteMutations(out []*store.KVPairMutation, keys [][]byte) []*store.KVPairMutation {
-	for _, key := range keys {
+func appendDeleteRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor) []*store.KVPairMutation {
+	desiredByID := make(map[uint64]struct{}, len(desired))
+	for _, route := range desired {
+		desiredByID[route.RouteID] = struct{}{}
+	}
+
+	for _, route := range existing {
+		if _, ok := desiredByID[route.RouteID]; ok {
+			continue
+		}
 		out = append(out, &store.KVPairMutation{
 			Op:  store.OpTypeDelete,
-			Key: key,
+			Key: CatalogRouteKey(route.RouteID),
 		})
 	}
 	return out
 }
 
-func appendRouteMutations(out []*store.KVPairMutation, routes []RouteDescriptor) ([]*store.KVPairMutation, error) {
-	for _, route := range routes {
+func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor) ([]*store.KVPairMutation, error) {
+	existingByID := make(map[uint64]RouteDescriptor, len(existing))
+	for _, route := range existing {
+		existingByID[route.RouteID] = route
+	}
+
+	for _, route := range desired {
+		if existingRoute, ok := existingByID[route.RouteID]; ok && routeDescriptorEqual(existingRoute, route) {
+			continue
+		}
 		encoded, err := EncodeRouteDescriptor(route)
 		if err != nil {
 			return nil, err
@@ -530,6 +559,29 @@ func appendRouteMutations(out []*store.KVPairMutation, routes []RouteDescriptor)
 		})
 	}
 	return out, nil
+}
+
+func routeDescriptorEqual(left, right RouteDescriptor) bool {
+	return left.RouteID == right.RouteID &&
+		bytes.Equal(left.Start, right.Start) &&
+		bytes.Equal(left.End, right.End) &&
+		left.GroupID == right.GroupID &&
+		left.State == right.State &&
+		left.ParentRouteID == right.ParentRouteID
+}
+
+func appendU64(dst []byte, v uint64) []byte {
+	var encoded [catalogUint64Bytes]byte
+	binary.BigEndian.PutUint64(encoded[:], v)
+	return append(dst, encoded[:]...)
+}
+
+func routeDescriptorEncodedSize(route RouteDescriptor) int {
+	size := 1 + catalogUint64Bytes + catalogUint64Bytes + 1 + catalogUint64Bytes + catalogUint64Bytes + len(route.Start) + 1
+	if route.End != nil {
+		size += catalogUint64Bytes + len(route.End)
+	}
+	return size
 }
 
 func decodeRouteDescriptorHeader(r *bytes.Reader) (RouteDescriptor, error) {

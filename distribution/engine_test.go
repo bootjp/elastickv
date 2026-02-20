@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"strings"
 	"sync"
 	"testing"
 
@@ -290,6 +291,9 @@ func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
 	if !errors.Is(err, ErrEngineSnapshotVersionStale) {
 		t.Fatalf("expected ErrEngineSnapshotVersionStale, got %v", err)
 	}
+	if !strings.Contains(err.Error(), "snapshot version 1") || !strings.Contains(err.Error(), "engine catalog version 2") {
+		t.Fatalf("expected stale error to include version context, got %v", err)
+	}
 
 	route, ok := e.GetRoute([]byte("k"))
 	if !ok {
@@ -297,6 +301,96 @@ func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
 	}
 	if route.GroupID != 1 || route.RouteID != 1 {
 		t.Fatalf("expected route to remain unchanged, got %+v", route)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsDuplicateRouteIDs(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 10, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotDuplicateID) {
+		t.Fatalf("expected ErrEngineSnapshotDuplicateID, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsOverlappingRoutes(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("n"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOverlap) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOverlap, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsInvalidRouteOrder(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOrder) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOrder, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_RejectsDuplicateRouteStarts(t *testing.T) {
+	e := NewEngine()
+
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("a"), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	})
+	if !errors.Is(err, ErrEngineSnapshotRouteOrder) {
+		t.Fatalf("expected ErrEngineSnapshotRouteOrder, got %v", err)
+	}
+}
+
+func TestEngineApplySnapshot_EmptyRoutesClearsState(t *testing.T) {
+	e := NewEngine()
+
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply initial snapshot: %v", err)
+	}
+
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 2,
+		Routes:  []RouteDescriptor{},
+	}); err != nil {
+		t.Fatalf("apply empty snapshot: %v", err)
+	}
+
+	if got := e.Version(); got != 2 {
+		t.Fatalf("expected version 2, got %d", got)
+	}
+	if got := len(e.Stats()); got != 0 {
+		t.Fatalf("expected 0 routes after empty snapshot, got %d", got)
+	}
+	if _, ok := e.GetRoute([]byte("a")); ok {
+		t.Fatal("expected no route after empty snapshot")
 	}
 }
 
@@ -332,5 +426,58 @@ func TestEngineApplySnapshot_LookupBehavior(t *testing.T) {
 		if ok && r.GroupID != c.group {
 			t.Fatalf("key %q expected group %d, got %d", c.key, c.group, r.GroupID)
 		}
+	}
+}
+
+func TestEngineApplySnapshot_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	const maxVersion uint64 = 20
+
+	var wg sync.WaitGroup
+	errs := make(chan error, maxVersion)
+
+	for version := uint64(1); version <= maxVersion; version++ {
+		v := version
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			err := e.ApplySnapshot(CatalogSnapshot{
+				Version: v,
+				Routes: []RouteDescriptor{
+					{
+						RouteID: 1,
+						Start:   []byte("a"),
+						End:     nil,
+						GroupID: v,
+						State:   RouteStateActive,
+					},
+				},
+			})
+			if err != nil && !errors.Is(err, ErrEngineSnapshotVersionStale) {
+				errs <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("unexpected apply snapshot error: %v", err)
+	}
+
+	if got := e.Version(); got != maxVersion {
+		t.Fatalf("expected final version %d, got %d", maxVersion, got)
+	}
+
+	route, ok := e.GetRoute([]byte("a"))
+	if !ok {
+		t.Fatal("expected route after concurrent snapshots")
+	}
+	if route.GroupID != maxVersion {
+		t.Fatalf("expected route group %d, got %d", maxVersion, route.GroupID)
 	}
 }

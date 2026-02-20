@@ -712,24 +712,13 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
-	// Handle list delete through txn-local list state so subsequent commands in
-	// the same MULTI observe the staged delete consistently.
-	if st, ok := t.listStates[string(cmd.Args[1])]; ok {
-		stageListDelete(st)
-		return redisResult{typ: resultInt, integer: 1}, nil
-	}
-	isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS)
+	// Always stage list deletion so DEL followed by RPUSH in the same MULTI
+	// reliably recreates the list from an empty state.
+	st, err := t.loadListState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if isList {
-		st, err := t.loadListState(cmd.Args[1])
-		if err != nil {
-			return redisResult{}, err
-		}
-		stageListDelete(st)
-		return redisResult{typ: resultInt, integer: 1}, nil
-	}
+	stageListDelete(st)
 
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
