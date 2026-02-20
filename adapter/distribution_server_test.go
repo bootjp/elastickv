@@ -5,8 +5,10 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -222,6 +224,79 @@ func TestDistributionServerSplitRange_VersionConflict(t *testing.T) {
 	require.ErrorContains(t, err, errDistributionCatalogConflict.Error())
 }
 
+func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	engine := distribution.NewEngine()
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(engine, catalog, WithDistributionCoordinator(coordinator))
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfigured(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte(""),
+			End:           nil,
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, false)),
+	)
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionNotLeader.Error())
+}
+
 func seededDistributionServer(t *testing.T) (*DistributionServer, uint64) {
 	t.Helper()
 
@@ -240,4 +315,109 @@ func seededDistributionServer(t *testing.T) (*DistributionServer, uint64) {
 	require.NoError(t, err)
 
 	return NewDistributionServer(distribution.NewEngine(), catalog), saved.Version
+}
+
+type distributionCoordinatorStub struct {
+	store         store.MVCCStore
+	leader        bool
+	nextTS        uint64
+	dispatchCalls int
+}
+
+func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
+	return &distributionCoordinatorStub{
+		store:  st,
+		leader: leader,
+	}
+}
+
+func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if !s.leader {
+		return nil, kv.ErrLeaderNotFound
+	}
+	if reqs == nil || len(reqs.Elems) == 0 {
+		return nil, kv.ErrInvalidRequest
+	}
+	s.dispatchCalls++
+	if s.nextTS == 0 {
+		s.nextTS = s.store.LastCommitTS() + 1
+	}
+	commitTS := s.nextTS
+	s.nextTS++
+
+	mutations, err := coordinatorStubMutations(reqs.Elems)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.ApplyMutations(ctx, mutations, commitTS, commitTS); err != nil {
+		return nil, err
+	}
+	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+}
+
+func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
+	mutations := make([]*store.KVPairMutation, 0, len(elems))
+	for _, elem := range elems {
+		mutation, err := coordinatorStubMutation(elem)
+		if err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, mutation)
+	}
+	return mutations, nil
+}
+
+func coordinatorStubMutation(elem *kv.Elem[kv.OP]) (*store.KVPairMutation, error) {
+	if elem == nil {
+		return nil, kv.ErrInvalidRequest
+	}
+	switch elem.Op {
+	case kv.Put:
+		return &store.KVPairMutation{
+			Op:    store.OpTypePut,
+			Key:   cloneBytes(elem.Key),
+			Value: cloneBytes(elem.Value),
+		}, nil
+	case kv.Del:
+		return &store.KVPairMutation{
+			Op:  store.OpTypeDelete,
+			Key: cloneBytes(elem.Key),
+		}, nil
+	default:
+		return nil, kv.ErrInvalidRequest
+	}
+}
+
+func (s *distributionCoordinatorStub) IsLeader() bool {
+	return s.leader
+}
+
+func (s *distributionCoordinatorStub) VerifyLeader() error {
+	if !s.leader {
+		return kv.ErrLeaderNotFound
+	}
+	return nil
+}
+
+func (s *distributionCoordinatorStub) RaftLeader() raft.ServerAddress {
+	return ""
+}
+
+func (s *distributionCoordinatorStub) IsLeaderForKey(_ []byte) bool {
+	return s.leader
+}
+
+func (s *distributionCoordinatorStub) VerifyLeaderForKey(_ []byte) error {
+	if !s.leader {
+		return kv.ErrLeaderNotFound
+	}
+	return nil
+}
+
+func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) raft.ServerAddress {
+	return ""
+}
+
+func (s *distributionCoordinatorStub) Clock() *kv.HLC {
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
@@ -14,10 +15,22 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
-	mu      sync.Mutex
-	engine  *distribution.Engine
-	catalog *distribution.CatalogStore
+	mu          sync.Mutex
+	engine      *distribution.Engine
+	catalog     *distribution.CatalogStore
+	coordinator kv.Coordinator
 	pb.UnimplementedDistributionServer
+}
+
+// DistributionServerOption configures DistributionServer behavior.
+type DistributionServerOption func(*DistributionServer)
+
+// WithDistributionCoordinator configures the coordinator used for Raft-backed
+// catalog mutations in SplitRange.
+func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.coordinator = coordinator
+	}
 }
 
 const (
@@ -33,11 +46,21 @@ var (
 	errDistributionSplitKeyAtBoundary   = errors.New("split key at route boundary")
 	errDistributionCatalogConflict      = errors.New("catalog version conflict")
 	errDistributionRouteIDOverflow      = errors.New("route id overflow")
+	errDistributionNotLeader            = errors.New("not leader for distribution catalog")
 )
 
 // NewDistributionServer creates a new server.
-func NewDistributionServer(e *distribution.Engine, catalog *distribution.CatalogStore) *DistributionServer {
-	return &DistributionServer{engine: e, catalog: catalog}
+func NewDistributionServer(e *distribution.Engine, catalog *distribution.CatalogStore, opts ...DistributionServerOption) *DistributionServer {
+	s := &DistributionServer{
+		engine:  e,
+		catalog: catalog,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
 // UpdateRoute allows updating route information.
@@ -84,6 +107,10 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.verifyCatalogLeader(); err != nil {
+		return nil, err
+	}
+
 	snapshot, err := s.loadCatalogSnapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -107,9 +134,9 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, grpcStatusError(codes.Internal, err.Error())
 	}
 
-	saved, err := s.catalog.Save(ctx, req.GetExpectedCatalogVersion(), nextRoutes)
+	saved, err := s.saveSplitResult(ctx, req.GetExpectedCatalogVersion(), snapshot.Routes, nextRoutes)
 	if err != nil {
-		return nil, mapSplitSaveError(err)
+		return nil, err
 	}
 	if err := s.applyEngineSnapshot(saved); err != nil {
 		return nil, err
@@ -120,6 +147,104 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		Left:           toProtoRouteDescriptor(left),
 		Right:          toProtoRouteDescriptor(right),
 	}, nil
+}
+
+func (s *DistributionServer) verifyCatalogLeader() error {
+	if s.coordinator == nil {
+		return nil
+	}
+	key := distribution.CatalogVersionKey()
+	if !s.coordinator.IsLeaderForKey(key) {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionNotLeader.Error())
+	}
+	if err := s.coordinator.VerifyLeaderForKey(key); err != nil {
+		return grpcStatusErrorf(codes.FailedPrecondition, "verify catalog leader: %v", err)
+	}
+	return nil
+}
+
+func (s *DistributionServer) saveSplitResult(
+	ctx context.Context,
+	expectedVersion uint64,
+	existingRoutes []distribution.RouteDescriptor,
+	nextRoutes []distribution.RouteDescriptor,
+) (distribution.CatalogSnapshot, error) {
+	if s.coordinator == nil {
+		saved, err := s.catalog.Save(ctx, expectedVersion, nextRoutes)
+		if err != nil {
+			return distribution.CatalogSnapshot{}, mapSplitSaveError(err)
+		}
+		return saved, nil
+	}
+	return s.saveSplitResultViaCoordinator(ctx, expectedVersion, existingRoutes, nextRoutes)
+}
+
+func (s *DistributionServer) saveSplitResultViaCoordinator(
+	ctx context.Context,
+	expectedVersion uint64,
+	existingRoutes []distribution.RouteDescriptor,
+	nextRoutes []distribution.RouteDescriptor,
+) (distribution.CatalogSnapshot, error) {
+	nextVersion := expectedVersion + 1
+	if nextVersion == 0 {
+		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "catalog version overflow")
+	}
+
+	ops, err := buildCatalogReplaceOps(existingRoutes, nextRoutes, nextVersion)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
+	}
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems: ops,
+		IsTxn: false,
+	}); err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
+	}
+
+	saved, err := s.catalog.Snapshot(ctx)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
+	}
+	if saved.Version != nextVersion {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(
+			codes.Internal,
+			"unexpected catalog version after split: got %d, want %d",
+			saved.Version,
+			nextVersion,
+		)
+	}
+	return saved, nil
+}
+
+func buildCatalogReplaceOps(
+	existingRoutes []distribution.RouteDescriptor,
+	nextRoutes []distribution.RouteDescriptor,
+	nextVersion uint64,
+) ([]*kv.Elem[kv.OP], error) {
+	ops := make([]*kv.Elem[kv.OP], 0, len(existingRoutes)+len(nextRoutes)+1)
+	for _, route := range existingRoutes {
+		ops = append(ops, &kv.Elem[kv.OP]{
+			Op:  kv.Del,
+			Key: distribution.CatalogRouteKey(route.RouteID),
+		})
+	}
+	for _, route := range nextRoutes {
+		encoded, err := distribution.EncodeRouteDescriptor(route)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		ops = append(ops, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   distribution.CatalogRouteKey(route.RouteID),
+			Value: encoded,
+		})
+	}
+	ops = append(ops, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   distribution.CatalogVersionKey(),
+		Value: distribution.EncodeCatalogVersion(nextVersion),
+	})
+	return ops, nil
 }
 
 func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribution.CatalogSnapshot, error) {

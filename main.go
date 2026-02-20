@@ -74,7 +74,16 @@ func run() error {
 	defer func() { _ = shardStore.Close() }()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog := distributionCatalogStoreForGroup(runtimes, cfg.defaultGroup)
-	distServer := adapter.NewDistributionServer(cfg.engine, distCatalog)
+	if distCatalog != nil {
+		if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, cfg.engine); err != nil {
+			return errors.Wrapf(err, "initialize distribution catalog")
+		}
+	}
+	distServer := adapter.NewDistributionServer(
+		cfg.engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(coordinate),
+	)
 
 	eg := errgroup.Group{}
 	if err := startRaftServers(ctx, &lc, &eg, runtimes, shardStore, coordinate, distServer); err != nil {
