@@ -312,8 +312,10 @@ func run(eg *errgroup.Group, cfg config) error {
 	coordinator := kv.NewCoordinator(trx, r)
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
-		return errors.WithStack(err)
+	if distCatalog != nil {
+		if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	distServer := adapter.NewDistributionServer(
 		distEngine,

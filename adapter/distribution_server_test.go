@@ -107,7 +107,8 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
 			RouteID:       1,
@@ -129,7 +130,11 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
-	s := NewDistributionServer(engine, catalog)
+	s := NewDistributionServer(
+		engine,
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
 
 	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
 		ExpectedCatalogVersion: saved.Version,
@@ -166,6 +171,20 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	rightRoute, ok := engine.GetRoute([]byte("h"))
 	require.True(t, ok)
 	require.Equal(t, uint64(4), rightRoute.RouteID)
+}
+
+func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
+	t.Parallel()
+
+	s, version := seededDistributionServerWithoutCoordinator(t)
+	_, err := s.SplitRange(context.Background(), &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCoordinatorRequired.Error())
 }
 
 func TestDistributionServerSplitRange_UnknownRoute(t *testing.T) {
@@ -339,6 +358,31 @@ func TestBuildCatalogReplaceOps_RejectsNonSplitShape(t *testing.T) {
 }
 
 func seededDistributionServer(t *testing.T) (*DistributionServer, uint64) {
+	t.Helper()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte("a"),
+			End:           []byte("m"),
+			GroupID:       7,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	return NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	), saved.Version
+}
+
+func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServer, uint64) {
 	t.Helper()
 
 	ctx := context.Background()

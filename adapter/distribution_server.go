@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"math"
 	"sync"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -48,6 +49,14 @@ var (
 	errDistributionCatalogConflict      = errors.New("catalog version conflict")
 	errDistributionRouteIDOverflow      = errors.New("route id overflow")
 	errDistributionNotLeader            = errors.New("not leader for distribution catalog")
+	errDistributionCoordinatorRequired  = errors.New("distribution coordinator is not configured")
+	errDistributionEngineNotConfigured  = errors.New("distribution engine is not configured")
+
+	errDistributionSplitMutationRouteCount     = errors.New("split mutation requires next routes to contain exactly one more route")
+	errDistributionSplitMutationChildCount     = errors.New("split mutation requires exactly two child routes")
+	errDistributionSplitMutationParentRequired = errors.New("split mutation child route must include parent route id")
+	errDistributionSplitMutationParentMismatch = errors.New("split mutation child routes must share the same parent route id")
+	errDistributionSplitMutationParentNotFound = errors.New("split mutation parent route is missing from existing routes")
 )
 
 // NewDistributionServer creates a new server.
@@ -132,7 +141,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 
 	left, right, nextRoutes, err := splitCatalogRoutes(snapshot.Routes, parentIdx, parent, splitKey)
 	if err != nil {
-		return nil, grpcStatusError(codes.Internal, err.Error())
+		return nil, grpcStatusErrorf(codes.Internal, "split catalog routes: %v", err)
 	}
 
 	saved, err := s.saveSplitResult(ctx, req.GetExpectedCatalogVersion(), snapshot.Routes, nextRoutes)
@@ -152,7 +161,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 
 func (s *DistributionServer) verifyCatalogLeader() error {
 	if s.coordinator == nil {
-		return nil
+		return grpcStatusError(codes.FailedPrecondition, errDistributionCoordinatorRequired.Error())
 	}
 	key := distribution.CatalogVersionKey()
 	if !s.coordinator.IsLeaderForKey(key) {
@@ -170,13 +179,6 @@ func (s *DistributionServer) saveSplitResult(
 	existingRoutes []distribution.RouteDescriptor,
 	nextRoutes []distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, error) {
-	if s.coordinator == nil {
-		saved, err := s.catalog.Save(ctx, expectedVersion, nextRoutes)
-		if err != nil {
-			return distribution.CatalogSnapshot{}, mapSplitSaveError(err)
-		}
-		return saved, nil
-	}
 	return s.saveSplitResultViaCoordinator(ctx, expectedVersion, existingRoutes, nextRoutes)
 }
 
@@ -186,10 +188,10 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	existingRoutes []distribution.RouteDescriptor,
 	nextRoutes []distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, error) {
-	nextVersion := expectedVersion + 1
-	if nextVersion == 0 {
+	if expectedVersion == math.MaxUint64 {
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "catalog version overflow")
 	}
+	nextVersion := expectedVersion + 1
 
 	ops, err := buildCatalogReplaceOps(existingRoutes, nextRoutes, nextVersion)
 	if err != nil {
@@ -257,7 +259,7 @@ func splitMutationRoutes(
 	nextRoutes []distribution.RouteDescriptor,
 ) (uint64, distribution.RouteDescriptor, distribution.RouteDescriptor, error) {
 	if len(nextRoutes) != len(existingRoutes)+1 {
-		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(errDistributionSplitMutationRouteCount)
 	}
 
 	existingByID := make(map[uint64]distribution.RouteDescriptor, len(existingRoutes))
@@ -274,19 +276,19 @@ func splitMutationRoutes(
 	}
 
 	if len(children) != childRouteCount {
-		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(errDistributionSplitMutationChildCount)
 	}
 	parentID := children[0].ParentRouteID
 	if parentID == 0 {
-		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(errDistributionSplitMutationParentRequired)
 	}
 	for _, child := range children[1:] {
 		if child.ParentRouteID != parentID {
-			return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+			return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(errDistributionSplitMutationParentMismatch)
 		}
 	}
 	if _, exists := existingByID[parentID]; !exists {
-		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(errDistributionSplitMutationParentNotFound)
 	}
 	return parentID, children[0], children[1], nil
 }
@@ -304,7 +306,7 @@ func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribut
 
 func (s *DistributionServer) applyEngineSnapshot(snapshot distribution.CatalogSnapshot) error {
 	if s.engine == nil {
-		return nil
+		return grpcStatusError(codes.FailedPrecondition, errDistributionEngineNotConfigured.Error())
 	}
 	if err := s.engine.ApplySnapshot(snapshot); err != nil {
 		return grpcStatusErrorf(codes.Internal, "apply engine snapshot: %v", err)
@@ -400,13 +402,6 @@ func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distr
 		}
 	}
 	return distribution.RouteDescriptor{}, -1, false
-}
-
-func mapSplitSaveError(err error) error {
-	if errors.Is(err, distribution.ErrCatalogVersionMismatch) {
-		return grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
-	}
-	return grpcStatusErrorf(codes.Internal, "save split result: %v", err)
 }
 
 func toProtoRouteDescriptors(routes []distribution.RouteDescriptor) []*pb.RouteDescriptor {
