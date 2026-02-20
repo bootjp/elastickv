@@ -297,6 +297,47 @@ func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfig
 	require.ErrorContains(t, err, errDistributionNotLeader.Error())
 }
 
+func TestBuildCatalogReplaceOps_UsesSurgicalSplitMutations(t *testing.T) {
+	t.Parallel()
+
+	existing := []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	}
+	next := []distribution.RouteDescriptor{
+		{RouteID: 3, Start: []byte(""), End: []byte("g"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
+		{RouteID: 4, Start: []byte("g"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	}
+
+	ops, err := buildCatalogReplaceOps(existing, next, 2)
+	require.NoError(t, err)
+	require.Len(t, ops, 4)
+	require.Equal(t, kv.Del, ops[0].Op)
+	require.Equal(t, distribution.CatalogRouteKey(1), ops[0].Key)
+	require.Equal(t, kv.Put, ops[1].Op)
+	require.Equal(t, distribution.CatalogRouteKey(3), ops[1].Key)
+	require.Equal(t, kv.Put, ops[2].Op)
+	require.Equal(t, distribution.CatalogRouteKey(4), ops[2].Key)
+	require.Equal(t, kv.Put, ops[3].Op)
+	require.Equal(t, distribution.CatalogVersionKey(), ops[3].Key)
+}
+
+func TestBuildCatalogReplaceOps_RejectsNonSplitShape(t *testing.T) {
+	t.Parallel()
+
+	existing := []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	}
+	next := []distribution.RouteDescriptor{
+		{RouteID: 2, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
+		{RouteID: 3, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 2},
+	}
+
+	_, err := buildCatalogReplaceOps(existing, next, 2)
+	require.Error(t, err)
+}
+
 func seededDistributionServer(t *testing.T) (*DistributionServer, uint64) {
 	t.Helper()
 
@@ -336,6 +377,9 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, kv.ErrLeaderNotFound
 	}
 	if reqs == nil || len(reqs.Elems) == 0 {
+		return nil, kv.ErrInvalidRequest
+	}
+	if !reqs.IsTxn {
 		return nil, kv.ErrInvalidRequest
 	}
 	s.dispatchCalls++

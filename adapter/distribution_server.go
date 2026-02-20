@@ -37,6 +37,7 @@ const (
 	childRouteFirstOffset  = 1
 	childRouteSecondOffset = 2
 	childRouteCount        = 2
+	splitMutationOpCount   = childRouteCount + 2
 )
 
 var (
@@ -196,7 +197,7 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		Elems: ops,
-		IsTxn: false,
+		IsTxn: true,
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
@@ -221,14 +222,18 @@ func buildCatalogReplaceOps(
 	nextRoutes []distribution.RouteDescriptor,
 	nextVersion uint64,
 ) ([]*kv.Elem[kv.OP], error) {
-	ops := make([]*kv.Elem[kv.OP], 0, len(existingRoutes)+len(nextRoutes)+1)
-	for _, route := range existingRoutes {
-		ops = append(ops, &kv.Elem[kv.OP]{
-			Op:  kv.Del,
-			Key: distribution.CatalogRouteKey(route.RouteID),
-		})
+	// SplitRange mutates the catalog surgically: delete one parent route and add
+	// two children, then bump the version.
+	parentID, left, right, err := splitMutationRoutes(existingRoutes, nextRoutes)
+	if err != nil {
+		return nil, err
 	}
-	for _, route := range nextRoutes {
+	ops := make([]*kv.Elem[kv.OP], 0, splitMutationOpCount)
+	ops = append(ops, &kv.Elem[kv.OP]{
+		Op:  kv.Del,
+		Key: distribution.CatalogRouteKey(parentID),
+	})
+	for _, route := range []distribution.RouteDescriptor{left, right} {
 		encoded, err := distribution.EncodeRouteDescriptor(route)
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -245,6 +250,45 @@ func buildCatalogReplaceOps(
 		Value: distribution.EncodeCatalogVersion(nextVersion),
 	})
 	return ops, nil
+}
+
+func splitMutationRoutes(
+	existingRoutes []distribution.RouteDescriptor,
+	nextRoutes []distribution.RouteDescriptor,
+) (uint64, distribution.RouteDescriptor, distribution.RouteDescriptor, error) {
+	if len(nextRoutes) != len(existingRoutes)+1 {
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+	}
+
+	existingByID := make(map[uint64]distribution.RouteDescriptor, len(existingRoutes))
+	for _, route := range existingRoutes {
+		existingByID[route.RouteID] = route
+	}
+
+	children := make([]distribution.RouteDescriptor, 0, childRouteCount)
+	for _, route := range nextRoutes {
+		if _, exists := existingByID[route.RouteID]; exists {
+			continue
+		}
+		children = append(children, route)
+	}
+
+	if len(children) != childRouteCount {
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	parentID := children[0].ParentRouteID
+	if parentID == 0 {
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	for _, child := range children[1:] {
+		if child.ParentRouteID != parentID {
+			return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+		}
+	}
+	if _, exists := existingByID[parentID]; !exists {
+		return 0, distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	return parentID, children[0], children[1], nil
 }
 
 func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribution.CatalogSnapshot, error) {

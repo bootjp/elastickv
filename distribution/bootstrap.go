@@ -20,9 +20,6 @@ func EnsureCatalogSnapshot(ctx context.Context, catalog *CatalogStore, engine *E
 	if engine == nil {
 		return CatalogSnapshot{}, errors.WithStack(ErrEngineRequired)
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
 
 	snapshot, err := catalog.Snapshot(ctx)
 	if err != nil {
