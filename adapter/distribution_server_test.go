@@ -152,9 +152,10 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), snapshot.Version)
 	require.Len(t, snapshot.Routes, 3)
-	require.Equal(t, uint64(2), snapshot.Routes[0].RouteID)
-	require.Equal(t, uint64(3), snapshot.Routes[1].RouteID)
-	require.Equal(t, uint64(4), snapshot.Routes[2].RouteID)
+	// Catalog snapshots are sorted by range start key.
+	require.Equal(t, uint64(3), snapshot.Routes[0].RouteID)
+	require.Equal(t, uint64(4), snapshot.Routes[1].RouteID)
+	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))

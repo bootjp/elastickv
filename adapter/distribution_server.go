@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"sync"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -13,6 +14,7 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
+	mu      sync.Mutex
 	engine  *distribution.Engine
 	catalog *distribution.CatalogStore
 	pb.UnimplementedDistributionServer
@@ -77,6 +79,11 @@ func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesR
 
 // SplitRange splits a route into two child routes in the same raft group.
 func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeRequest) (*pb.SplitRangeResponse, error) {
+	// SplitRange performs a read-modify-write cycle across catalog and engine.
+	// Serialize it per server instance to keep these updates consistent.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	snapshot, err := s.loadCatalogSnapshot(ctx)
 	if err != nil {
 		return nil, err
