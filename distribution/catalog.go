@@ -15,6 +15,7 @@ const (
 	catalogMetaPrefix        = "!dist|meta|"
 	catalogRoutePrefix       = "!dist|route|"
 	catalogVersionStorageKey = catalogMetaPrefix + "version"
+	catalogNextRouteIDKey    = catalogMetaPrefix + "next_route_id"
 
 	catalogUint64Bytes       = 8
 	catalogVersionRecordSize = 1 + catalogUint64Bytes
@@ -22,18 +23,21 @@ const (
 	catalogVersionCodecVersion byte = 1
 	catalogRouteCodecVersion   byte = 1
 
-	catalogScanPageSize = 256
+	catalogScanPageSize          = 256
+	catalogSaveMetaMutationCount = 2
 )
 
 var (
 	ErrCatalogStoreRequired        = errors.New("catalog store is required")
 	ErrCatalogVersionMismatch      = errors.New("catalog version mismatch")
 	ErrCatalogVersionOverflow      = errors.New("catalog version overflow")
+	ErrCatalogRouteIDOverflow      = errors.New("catalog route id overflow")
 	ErrCatalogRouteIDRequired      = errors.New("catalog route id is required")
 	ErrCatalogGroupIDRequired      = errors.New("catalog group id is required")
 	ErrCatalogDuplicateRouteID     = errors.New("catalog route id must be unique")
 	ErrCatalogInvalidRouteRange    = errors.New("catalog route range is invalid")
 	ErrCatalogInvalidVersionRecord = errors.New("catalog version record is invalid")
+	ErrCatalogInvalidNextRouteID   = errors.New("catalog next route id record is invalid")
 	ErrCatalogInvalidRouteRecord   = errors.New("catalog route record is invalid")
 	ErrCatalogInvalidRouteState    = errors.New("catalog route state is invalid")
 	ErrCatalogInvalidRouteKey      = errors.New("catalog route key is invalid")
@@ -94,6 +98,11 @@ func CatalogVersionKey() []byte {
 	return []byte(catalogVersionStorageKey)
 }
 
+// CatalogNextRouteIDKey returns the reserved key used for next route id storage.
+func CatalogNextRouteIDKey() []byte {
+	return []byte(catalogNextRouteIDKey)
+}
+
 // CatalogRouteKey returns the reserved key used for a route descriptor.
 func CatalogRouteKey(routeID uint64) []byte {
 	key := make([]byte, len(catalogRoutePrefix)+catalogUint64Bytes)
@@ -127,6 +136,11 @@ func EncodeCatalogVersion(version uint64) []byte {
 	return out
 }
 
+// EncodeCatalogNextRouteID serializes a next route id record.
+func EncodeCatalogNextRouteID(nextRouteID uint64) []byte {
+	return EncodeCatalogVersion(nextRouteID)
+}
+
 // DecodeCatalogVersion deserializes a catalog version record.
 func DecodeCatalogVersion(raw []byte) (uint64, error) {
 	if len(raw) != catalogVersionRecordSize {
@@ -136,6 +150,18 @@ func DecodeCatalogVersion(raw []byte) (uint64, error) {
 		return 0, errors.Wrapf(ErrCatalogInvalidVersionRecord, "unsupported version %d", raw[0])
 	}
 	return binary.BigEndian.Uint64(raw[1:]), nil
+}
+
+// DecodeCatalogNextRouteID deserializes a next route id record.
+func DecodeCatalogNextRouteID(raw []byte) (uint64, error) {
+	nextRouteID, err := DecodeCatalogVersion(raw)
+	if err != nil {
+		return 0, errors.WithStack(ErrCatalogInvalidNextRouteID)
+	}
+	if nextRouteID == 0 {
+		return 0, errors.WithStack(ErrCatalogInvalidNextRouteID)
+	}
+	return nextRouteID, nil
 }
 
 // EncodeRouteDescriptor serializes a route descriptor record.
@@ -212,6 +238,26 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 		return CatalogSnapshot{}, err
 	}
 	return CatalogSnapshot{Version: version, Routes: routes}, nil
+}
+
+// NextRouteID reads the next route id counter from catalog metadata.
+func (s *CatalogStore) NextRouteID(ctx context.Context) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	readTS := s.store.LastCommitTS()
+	nextRouteID, err := s.nextRouteIDAt(ctx, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if nextRouteID == 0 {
+		return 1, nil
+	}
+	return nextRouteID, nil
 }
 
 // Save updates the route catalog using optimistic version checks and bumps the
@@ -370,6 +416,45 @@ func (s *CatalogStore) versionAt(ctx context.Context, ts uint64) (uint64, error)
 	return v, nil
 }
 
+func (s *CatalogStore) nextRouteIDAt(ctx context.Context, ts uint64) (uint64, error) {
+	raw, err := s.store.GetAt(ctx, CatalogNextRouteIDKey(), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, nil
+		}
+		return 0, errors.WithStack(err)
+	}
+	nextRouteID, err := DecodeCatalogNextRouteID(raw)
+	if err != nil {
+		return 0, err
+	}
+	return nextRouteID, nil
+}
+
+func ensureNextRouteIDFloor(current uint64, routes []RouteDescriptor) (uint64, error) {
+	floor, err := nextRouteIDFloor(routes)
+	if err != nil {
+		return 0, err
+	}
+	if current < floor {
+		return floor, nil
+	}
+	return current, nil
+}
+
+func nextRouteIDFloor(routes []RouteDescriptor) (uint64, error) {
+	maxRouteID := uint64(0)
+	for _, route := range routes {
+		if route.RouteID > maxRouteID {
+			maxRouteID = route.RouteID
+		}
+	}
+	if maxRouteID == math.MaxUint64 {
+		return 0, errors.WithStack(ErrCatalogRouteIDOverflow)
+	}
+	return maxRouteID + 1, nil
+}
+
 func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescriptor, error) {
 	entries, err := s.scanRouteEntriesAt(ctx, ts)
 	if err != nil {
@@ -478,8 +563,20 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 	if err != nil {
 		return nil, err
 	}
+	nextRouteID, err := s.nextRouteIDAt(ctx, plan.readTS)
+	if err != nil {
+		return nil, err
+	}
+	nextRouteID, err = ensureNextRouteIDFloor(nextRouteID, existingRoutes)
+	if err != nil {
+		return nil, err
+	}
+	nextRouteID, err = ensureNextRouteIDFloor(nextRouteID, plan.routes)
+	if err != nil {
+		return nil, err
+	}
 
-	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+1)
+	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+catalogSaveMetaMutationCount)
 	mutations = appendDeleteRouteMutations(mutations, existingRoutes, plan.routes)
 	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes)
 	if err != nil {
@@ -489,6 +586,11 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 		Op:    store.OpTypePut,
 		Key:   CatalogVersionKey(),
 		Value: EncodeCatalogVersion(plan.nextVersion),
+	})
+	mutations = append(mutations, &store.KVPairMutation{
+		Op:    store.OpTypePut,
+		Key:   CatalogNextRouteIDKey(),
+		Value: EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return mutations, nil
 }

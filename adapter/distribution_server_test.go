@@ -283,6 +283,80 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, 1, coordinator.dispatchCalls)
 }
 
+func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	engine := distribution.NewEngine()
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(engine, catalog, WithDistributionCoordinator(coordinator))
+
+	first, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), first.Left.RouteId)
+	require.Equal(t, uint64(4), first.Right.RouteId)
+
+	nextRouteID, err := catalog.NextRouteID(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), nextRouteID)
+
+	afterDelete, err := catalog.Save(ctx, first.CatalogVersion, []distribution.RouteDescriptor{
+		{
+			RouteID:       3,
+			Start:         []byte(""),
+			End:           []byte("g"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 1,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), afterDelete.Version)
+
+	second, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: afterDelete.Version,
+		RouteId:                3,
+		SplitKey:               []byte("c"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), second.Left.RouteId)
+	require.Equal(t, uint64(6), second.Right.RouteId)
+}
+
 func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -316,22 +390,29 @@ func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfig
 	require.ErrorContains(t, err, errDistributionNotLeader.Error())
 }
 
-func TestBuildCatalogReplaceOps_UsesSurgicalSplitMutations(t *testing.T) {
+func TestBuildCatalogSplitOps_UsesSurgicalSplitMutations(t *testing.T) {
 	t.Parallel()
 
-	existing := []distribution.RouteDescriptor{
-		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
-		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	left := distribution.RouteDescriptor{
+		RouteID:       3,
+		Start:         []byte(""),
+		End:           []byte("g"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 1,
 	}
-	next := []distribution.RouteDescriptor{
-		{RouteID: 3, Start: []byte(""), End: []byte("g"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
-		{RouteID: 4, Start: []byte("g"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
-		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	right := distribution.RouteDescriptor{
+		RouteID:       4,
+		Start:         []byte("g"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 1,
 	}
 
-	ops, err := buildCatalogReplaceOps(existing, next, 2)
+	ops, err := buildCatalogSplitOps(1, left, right, 2, 5)
 	require.NoError(t, err)
-	require.Len(t, ops, 4)
+	require.Len(t, ops, 5)
 	require.Equal(t, kv.Del, ops[0].Op)
 	require.Equal(t, distribution.CatalogRouteKey(1), ops[0].Key)
 	require.Equal(t, kv.Put, ops[1].Op)
@@ -340,21 +421,11 @@ func TestBuildCatalogReplaceOps_UsesSurgicalSplitMutations(t *testing.T) {
 	require.Equal(t, distribution.CatalogRouteKey(4), ops[2].Key)
 	require.Equal(t, kv.Put, ops[3].Op)
 	require.Equal(t, distribution.CatalogVersionKey(), ops[3].Key)
-}
-
-func TestBuildCatalogReplaceOps_RejectsNonSplitShape(t *testing.T) {
-	t.Parallel()
-
-	existing := []distribution.RouteDescriptor{
-		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
-	}
-	next := []distribution.RouteDescriptor{
-		{RouteID: 2, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
-		{RouteID: 3, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 2},
-	}
-
-	_, err := buildCatalogReplaceOps(existing, next, 2)
-	require.Error(t, err)
+	require.Equal(t, kv.Put, ops[4].Op)
+	require.Equal(t, distribution.CatalogNextRouteIDKey(), ops[4].Key)
+	nextRouteID, err := distribution.DecodeCatalogNextRouteID(ops[4].Value)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), nextRouteID)
 }
 
 func seededDistributionServer(t *testing.T) (*DistributionServer, uint64) {
