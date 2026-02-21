@@ -360,6 +360,49 @@ func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
 	require.Equal(t, uint64(6), second.Right.RouteId)
 }
 
+func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	engine := distribution.NewEngine()
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	coordinator.afterDispatch = func(ctx context.Context, st store.MVCCStore, commitTS uint64) error {
+		return st.PutAt(ctx, distribution.CatalogVersionKey(), distribution.EncodeCatalogVersion(3), commitTS+1, 0)
+	}
+	s := NewDistributionServer(engine, catalog, WithDistributionCoordinator(coordinator))
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), resp.CatalogVersion)
+	require.Equal(t, uint64(3), engine.Version())
+}
+
 func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -481,6 +524,7 @@ type distributionCoordinatorStub struct {
 	leader        bool
 	nextTS        uint64
 	lastStartTS   uint64
+	afterDispatch func(context.Context, store.MVCCStore, uint64) error
 	dispatchCalls int
 }
 
@@ -492,17 +536,34 @@ func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributi
 }
 
 func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if !s.leader {
-		return nil, kv.ErrLeaderNotFound
-	}
-	if reqs == nil || len(reqs.Elems) == 0 {
-		return nil, kv.ErrInvalidRequest
-	}
-	if !reqs.IsTxn {
-		return nil, kv.ErrInvalidRequest
+	if err := s.validateDispatch(reqs); err != nil {
+		return nil, err
 	}
 	s.dispatchCalls++
-	startTS := reqs.StartTS
+	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
+	s.lastStartTS = startTS
+
+	mutations, err := coordinatorStubMutations(reqs.Elems)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applyDispatch(ctx, mutations, startTS, commitTS); err != nil {
+		return nil, err
+	}
+	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+}
+
+func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[kv.OP]) error {
+	if !s.leader {
+		return kv.ErrLeaderNotFound
+	}
+	if reqs == nil || len(reqs.Elems) == 0 || !reqs.IsTxn {
+		return kv.ErrInvalidRequest
+	}
+	return nil
+}
+
+func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64) (uint64, uint64) {
 	if s.nextTS == 0 {
 		s.nextTS = s.store.LastCommitTS() + 1
 	}
@@ -510,17 +571,25 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	if startTS > 0 && commitTS <= startTS {
 		commitTS = startTS + 1
 	}
-	s.nextTS++
-	s.lastStartTS = startTS
+	s.nextTS = commitTS + 1
+	return startTS, commitTS
+}
 
-	mutations, err := coordinatorStubMutations(reqs.Elems)
-	if err != nil {
-		return nil, err
-	}
+func (s *distributionCoordinatorStub) applyDispatch(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	startTS uint64,
+	commitTS uint64,
+) error {
 	if err := s.store.ApplyMutations(ctx, mutations, startTS, commitTS); err != nil {
-		return nil, err
+		return err
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+	if s.afterDispatch != nil {
+		if err := s.afterDispatch(ctx, s.store, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {

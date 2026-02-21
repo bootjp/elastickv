@@ -323,6 +323,49 @@ func TestCatalogStoreNextRouteID_TracksHigherRouteID(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreNextRouteIDAt_FallsBackWhenMetaMissing(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	route := RouteDescriptor{
+		RouteID:       10,
+		Start:         []byte(""),
+		End:           nil,
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	encoded, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+
+	const ts = uint64(7)
+	if err := st.PutAt(ctx, CatalogVersionKey(), EncodeCatalogVersion(1), ts, 0); err != nil {
+		t.Fatalf("put version: %v", err)
+	}
+	if err := st.PutAt(ctx, CatalogRouteKey(route.RouteID), encoded, ts, 0); err != nil {
+		t.Fatalf("put route: %v", err)
+	}
+
+	nextAt, err := cs.NextRouteIDAt(ctx, ts)
+	if err != nil {
+		t.Fatalf("next route id at ts: %v", err)
+	}
+	if nextAt != 11 {
+		t.Fatalf("expected next route id 11, got %d", nextAt)
+	}
+
+	next, err := cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id latest: %v", err)
+	}
+	if next != 11 {
+		t.Fatalf("expected latest next route id 11, got %d", next)
+	}
+}
+
 func TestNextRouteIDFloor_RejectsOverflow(t *testing.T) {
 	_, err := NextRouteIDFloor([]RouteDescriptor{
 		{RouteID: math.MaxUint64},

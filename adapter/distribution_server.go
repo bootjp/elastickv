@@ -210,10 +210,10 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
 	}
-	if saved.Version != nextVersion {
+	if saved.Version < nextVersion {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(
 			codes.Internal,
-			"unexpected catalog version after split: got %d, want %d",
+			"unexpected catalog version after split: got %d, want at least %d",
 			saved.Version,
 			nextVersion,
 		)

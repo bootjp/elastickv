@@ -270,10 +270,16 @@ func (s *CatalogStore) NextRouteIDAt(ctx context.Context, ts uint64) (uint64, er
 	if err != nil {
 		return 0, err
 	}
-	if nextRouteID == 0 {
-		return 1, nil
+	if nextRouteID != 0 {
+		return nextRouteID, nil
 	}
-	return nextRouteID, nil
+
+	// Fallback for catalogs created before next_route_id metadata existed.
+	routes, err := s.routesAt(ctx, ts)
+	if err != nil {
+		return 0, err
+	}
+	return NextRouteIDFloor(routes)
 }
 
 // Save updates the route catalog using optimistic version checks and bumps the
