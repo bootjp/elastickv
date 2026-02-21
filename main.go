@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"log"
-	"log/slog"
 	"net"
 	"time"
 
@@ -79,18 +78,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	startDistributionCatalogWatcher(ctx, distCatalog, cfg.engine)
+	eg, runCtx := errgroup.WithContext(ctx)
+	distribution.StartCatalogWatcher(runCtx, distCatalog, cfg.engine, nil)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 	)
 
-	eg := errgroup.Group{}
-	if err := startRaftServers(ctx, &lc, &eg, runtimes, shardStore, coordinate, distServer); err != nil {
+	if err := startRaftServers(runCtx, &lc, eg, runtimes, shardStore, coordinate, distServer); err != nil {
 		return err
 	}
-	if err := startRedisServer(ctx, &lc, &eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
+	if err := startRedisServer(runCtx, &lc, eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
 		return err
 	}
 
@@ -223,7 +222,21 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		grpcService := grpcSvc
 		eg.Go(func() error {
 			defer func() { _ = grpcService.Close() }()
-			return errors.WithStack(srv.Serve(lis))
+			stop := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					srv.GracefulStop()
+					_ = lis.Close()
+				case <-stop:
+				}
+			}()
+			err := srv.Serve(lis)
+			close(stop)
+			if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return errors.WithStack(err)
 		})
 	}
 	return nil
@@ -234,8 +247,22 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
+	redisServer := adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis)
 	eg.Go(func() error {
-		return errors.WithStack(adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis).Run())
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				redisServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := redisServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
 	})
 	return nil
 }
@@ -269,15 +296,6 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
-}
-
-func startDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
-	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
-	go func() {
-		if err := routeWatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error("catalog watcher failed", "error", err)
-		}
-	}()
 }
 
 func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {

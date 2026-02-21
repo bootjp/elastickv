@@ -58,6 +58,25 @@ func NewCatalogWatcher(catalog *CatalogStore, engine *Engine, opts ...CatalogWat
 	return w
 }
 
+// StartCatalogWatcher starts CatalogWatcher in a background goroutine and logs
+// retry/startup errors. Cancellation is controlled by ctx.
+func StartCatalogWatcher(ctx context.Context, catalog *CatalogStore, engine *Engine, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if ctx == nil {
+		logger.Error("catalog watcher context is required")
+		return
+	}
+
+	routeWatcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherLogger(logger))
+	go func() {
+		if err := routeWatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.ErrorContext(ctx, "catalog watcher failed", "error", err)
+		}
+	}()
+}
+
 // Run starts polling and only returns when ctx is canceled or initialization
 // requirements are not met. Snapshot read/apply failures are retried.
 func (w *CatalogWatcher) Run(ctx context.Context) error {
@@ -93,12 +112,11 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
-	engineVersion := w.engine.Version()
 	catalogVersion, err := w.catalog.Version(ctx)
 	if err != nil {
 		return err
 	}
-	if catalogVersion <= engineVersion {
+	if catalogVersion <= w.engine.Version() {
 		return nil
 	}
 
@@ -106,7 +124,7 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if snapshot.Version <= engineVersion {
+	if snapshot.Version <= w.engine.Version() {
 		return nil
 	}
 

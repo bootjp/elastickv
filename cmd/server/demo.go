@@ -276,15 +276,6 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
 }
 
-func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
-	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
-	go func() {
-		if err := routeWatcher.Run(ctx); err != nil && !stderrors.Is(err, context.Canceled) {
-			slog.Error("Catalog watcher failed", "error", err)
-		}
-	}()
-}
-
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 
@@ -326,7 +317,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 			},
 		}
 		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+		if err := f.Error(); err != nil && !stderrors.Is(err, raft.ErrCantBootstrap) {
 			return errors.WithStack(err)
 		}
 	}
@@ -356,7 +347,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	startCatalogWatcher(ctx, distCatalog, distEngine)
+	distribution.StartCatalogWatcher(ctx, distCatalog, distEngine, slog.Default())
 
 	eg.Go(func() error {
 		slog.Info("Starting gRPC server", "address", cfg.address)
