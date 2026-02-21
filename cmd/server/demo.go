@@ -66,7 +66,7 @@ type config struct {
 func main() {
 	flag.Parse()
 
-	eg := &errgroup.Group{}
+	eg, runCtx := errgroup.WithContext(context.Background())
 
 	if *raftID != "" {
 		// Single node mode
@@ -78,7 +78,7 @@ func main() {
 			raftBootstrap: *raftBootstrap,
 			raftRedisMap:  *raftRedisMap,
 		}
-		if err := run(eg, cfg); err != nil {
+		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
 			os.Exit(1)
 		}
@@ -119,7 +119,7 @@ func main() {
 		for _, n := range nodes {
 			n.raftRedisMap = raftRedisMapStr
 			cfg := n // capture loop variable
-			if err := run(eg, cfg); err != nil {
+			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
 				os.Exit(1)
 			}
@@ -156,7 +156,7 @@ func main() {
 			// BUT, looking at the previous demo.go (if I could), it probably did the joins.
 
 			// Let's add a joiner goroutine.
-			return joinCluster(nodes)
+			return joinCluster(runCtx, nodes)
 		})
 	}
 
@@ -166,10 +166,12 @@ func main() {
 	}
 }
 
-func joinCluster(nodes []config) error {
+func joinCluster(ctx context.Context, nodes []config) error {
 	leader := nodes[0]
 	// Give servers some time to start
-	time.Sleep(joinWait)
+	if err := waitForJoinRetry(ctx, joinWait); err != nil {
+		return err
+	}
 
 	// Connect to leader
 	conn, err := grpc.NewClient(leader.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -179,7 +181,6 @@ func joinCluster(nodes []config) error {
 	defer conn.Close()
 	client := raftadminpb.NewRaftAdminClient(conn)
 
-	ctx := context.Background()
 	for _, n := range nodes[1:] {
 		var joined bool
 		for i := 0; i < joinRetries; i++ {
@@ -195,13 +196,26 @@ func joinCluster(nodes []config) error {
 				break
 			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
-			time.Sleep(joinRetryInterval)
+			if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
+				return err
+			}
 		}
 		if !joined {
 			return fmt.Errorf("failed to join node %s after retries", n.raftID)
 		}
 	}
 	return nil
+}
+
+func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
+	}
 }
 
 func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
@@ -262,8 +276,16 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
 }
 
-func run(eg *errgroup.Group, cfg config) error {
-	ctx := context.Background()
+func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
+	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
+	go func() {
+		if err := routeWatcher.Run(ctx); err != nil && !stderrors.Is(err, context.Canceled) {
+			slog.Error("Catalog watcher failed", "error", err)
+		}
+	}()
+}
+
+func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 
 	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
@@ -347,13 +369,4 @@ func run(eg *errgroup.Group, cfg config) error {
 	})
 
 	return nil
-}
-
-func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
-	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
-	go func() {
-		if err := routeWatcher.Run(ctx); err != nil && !stderrors.Is(err, context.Canceled) {
-			slog.Error("Catalog watcher failed", "error", err)
-		}
-	}()
 }

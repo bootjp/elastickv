@@ -52,8 +52,6 @@ func run() error {
 		return errors.New("flag --raftId is required")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var lc net.ListenConfig
 
 	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *raftGroups, *shardRanges, *raftRedisMap)
@@ -66,6 +64,7 @@ func run() error {
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	clock := kv.NewHLC()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() {
