@@ -3,6 +3,7 @@ package distribution
 import (
 	"bytes"
 	"context"
+	"math"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -26,6 +27,26 @@ func TestCatalogVersionCodecRejectsInvalidPayload(t *testing.T) {
 	}
 	if _, err := DecodeCatalogVersion([]byte{99, 0, 0, 0, 0, 0, 0, 0, 1}); !errors.Is(err, ErrCatalogInvalidVersionRecord) {
 		t.Fatalf("expected ErrCatalogInvalidVersionRecord, got %v", err)
+	}
+}
+
+func TestCatalogNextRouteIDCodecRoundTrip(t *testing.T) {
+	raw := EncodeCatalogNextRouteID(77)
+	got, err := DecodeCatalogNextRouteID(raw)
+	if err != nil {
+		t.Fatalf("decode next route id: %v", err)
+	}
+	if got != 77 {
+		t.Fatalf("expected 77, got %d", got)
+	}
+}
+
+func TestCatalogNextRouteIDCodecRejectsInvalidPayload(t *testing.T) {
+	if _, err := DecodeCatalogNextRouteID(nil); !errors.Is(err, ErrCatalogInvalidNextRouteID) {
+		t.Fatalf("expected ErrCatalogInvalidNextRouteID, got %v", err)
+	}
+	if _, err := DecodeCatalogNextRouteID(EncodeCatalogVersion(0)); !errors.Is(err, ErrCatalogInvalidNextRouteID) {
+		t.Fatalf("expected ErrCatalogInvalidNextRouteID, got %v", err)
 	}
 }
 
@@ -119,6 +140,9 @@ func TestCatalogStoreSnapshotEmpty(t *testing.T) {
 	if len(snapshot.Routes) != 0 {
 		t.Fatalf("expected no routes, got %d", len(snapshot.Routes))
 	}
+	if snapshot.ReadTS != 0 {
+		t.Fatalf("expected empty read ts 0, got %d", snapshot.ReadTS)
+	}
 }
 
 func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
@@ -162,6 +186,9 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	}
 	if snapshot.Version != 1 {
 		t.Fatalf("expected version 1, got %d", snapshot.Version)
+	}
+	if snapshot.ReadTS == 0 {
+		t.Fatal("expected snapshot read ts to be set")
 	}
 	if len(snapshot.Routes) != 2 {
 		t.Fatalf("expected 2 routes, got %d", len(snapshot.Routes))
@@ -211,6 +238,140 @@ func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
 	}
 	if snapshot.Routes[0].RouteID != 20 || snapshot.Routes[1].RouteID != 10 {
 		t.Fatalf("expected snapshot route order by start key [20,10], got [%d,%d]", snapshot.Routes[0].RouteID, snapshot.Routes[1].RouteID)
+	}
+}
+
+func TestCatalogStoreNextRouteID_DefaultsToOne(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+
+	next, err := cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id (empty): %v", err)
+	}
+	if next != 1 {
+		t.Fatalf("expected empty next route id 1, got %d", next)
+	}
+}
+
+func TestCatalogStoreNextRouteID_RemainsAfterDelete(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+
+	first, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateActive},
+	})
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	if first.Version != 1 {
+		t.Fatalf("expected version 1, got %d", first.Version)
+	}
+
+	next, err := cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id after first save: %v", err)
+	}
+	if next != 3 {
+		t.Fatalf("expected next route id 3, got %d", next)
+	}
+
+	_, err = cs.Save(ctx, first.Version, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+	})
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	next, err = cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id after delete: %v", err)
+	}
+	if next != 3 {
+		t.Fatalf("expected next route id to remain 3 after delete, got %d", next)
+	}
+}
+
+func TestCatalogStoreNextRouteID_TracksHigherRouteID(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+
+	first, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+	})
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	second, err := cs.Save(ctx, first.Version, []RouteDescriptor{
+		{RouteID: 10, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+	})
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if second.Version != 2 {
+		t.Fatalf("expected version 2, got %d", second.Version)
+	}
+
+	next, err := cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id after high id save: %v", err)
+	}
+	if next != 11 {
+		t.Fatalf("expected next route id 11, got %d", next)
+	}
+}
+
+func TestCatalogStoreNextRouteIDAt_FallsBackWhenMetaMissing(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	route := RouteDescriptor{
+		RouteID:       10,
+		Start:         []byte(""),
+		End:           nil,
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	encoded, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+
+	const ts = uint64(7)
+	if err := st.PutAt(ctx, CatalogVersionKey(), EncodeCatalogVersion(1), ts, 0); err != nil {
+		t.Fatalf("put version: %v", err)
+	}
+	if err := st.PutAt(ctx, CatalogRouteKey(route.RouteID), encoded, ts, 0); err != nil {
+		t.Fatalf("put route: %v", err)
+	}
+
+	nextAt, err := cs.NextRouteIDAt(ctx, ts)
+	if err != nil {
+		t.Fatalf("next route id at ts: %v", err)
+	}
+	if nextAt != 11 {
+		t.Fatalf("expected next route id 11, got %d", nextAt)
+	}
+
+	next, err := cs.NextRouteID(ctx)
+	if err != nil {
+		t.Fatalf("next route id latest: %v", err)
+	}
+	if next != 11 {
+		t.Fatalf("expected latest next route id 11, got %d", next)
+	}
+}
+
+func TestNextRouteIDFloor_RejectsOverflow(t *testing.T) {
+	_, err := NextRouteIDFloor([]RouteDescriptor{
+		{RouteID: math.MaxUint64},
+	})
+	if !errors.Is(err, ErrCatalogRouteIDOverflow) {
+		t.Fatalf("expected ErrCatalogRouteIDOverflow, got %v", err)
 	}
 }
 

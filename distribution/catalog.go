@@ -15,6 +15,7 @@ const (
 	catalogMetaPrefix        = "!dist|meta|"
 	catalogRoutePrefix       = "!dist|route|"
 	catalogVersionStorageKey = catalogMetaPrefix + "version"
+	catalogNextRouteIDKey    = catalogMetaPrefix + "next_route_id"
 
 	catalogUint64Bytes       = 8
 	catalogVersionRecordSize = 1 + catalogUint64Bytes
@@ -22,18 +23,21 @@ const (
 	catalogVersionCodecVersion byte = 1
 	catalogRouteCodecVersion   byte = 1
 
-	catalogScanPageSize = 256
+	catalogScanPageSize          = 256
+	catalogSaveMetaMutationCount = 2
 )
 
 var (
 	ErrCatalogStoreRequired        = errors.New("catalog store is required")
 	ErrCatalogVersionMismatch      = errors.New("catalog version mismatch")
 	ErrCatalogVersionOverflow      = errors.New("catalog version overflow")
+	ErrCatalogRouteIDOverflow      = errors.New("catalog route id overflow")
 	ErrCatalogRouteIDRequired      = errors.New("catalog route id is required")
 	ErrCatalogGroupIDRequired      = errors.New("catalog group id is required")
 	ErrCatalogDuplicateRouteID     = errors.New("catalog route id must be unique")
 	ErrCatalogInvalidRouteRange    = errors.New("catalog route range is invalid")
 	ErrCatalogInvalidVersionRecord = errors.New("catalog version record is invalid")
+	ErrCatalogInvalidNextRouteID   = errors.New("catalog next route id record is invalid")
 	ErrCatalogInvalidRouteRecord   = errors.New("catalog route record is invalid")
 	ErrCatalogInvalidRouteState    = errors.New("catalog route state is invalid")
 	ErrCatalogInvalidRouteKey      = errors.New("catalog route key is invalid")
@@ -77,6 +81,7 @@ type RouteDescriptor struct {
 type CatalogSnapshot struct {
 	Version uint64
 	Routes  []RouteDescriptor
+	ReadTS  uint64
 }
 
 // CatalogStore provides persistence helpers for route catalog state.
@@ -92,6 +97,11 @@ func NewCatalogStore(st store.MVCCStore) *CatalogStore {
 // CatalogVersionKey returns the reserved key used for catalog version storage.
 func CatalogVersionKey() []byte {
 	return []byte(catalogVersionStorageKey)
+}
+
+// CatalogNextRouteIDKey returns the reserved key used for next route id storage.
+func CatalogNextRouteIDKey() []byte {
+	return []byte(catalogNextRouteIDKey)
 }
 
 // CatalogRouteKey returns the reserved key used for a route descriptor.
@@ -127,6 +137,11 @@ func EncodeCatalogVersion(version uint64) []byte {
 	return out
 }
 
+// EncodeCatalogNextRouteID serializes a next route id record.
+func EncodeCatalogNextRouteID(nextRouteID uint64) []byte {
+	return EncodeCatalogVersion(nextRouteID)
+}
+
 // DecodeCatalogVersion deserializes a catalog version record.
 func DecodeCatalogVersion(raw []byte) (uint64, error) {
 	if len(raw) != catalogVersionRecordSize {
@@ -136,6 +151,18 @@ func DecodeCatalogVersion(raw []byte) (uint64, error) {
 		return 0, errors.Wrapf(ErrCatalogInvalidVersionRecord, "unsupported version %d", raw[0])
 	}
 	return binary.BigEndian.Uint64(raw[1:]), nil
+}
+
+// DecodeCatalogNextRouteID deserializes a next route id record.
+func DecodeCatalogNextRouteID(raw []byte) (uint64, error) {
+	nextRouteID, err := DecodeCatalogVersion(raw)
+	if err != nil {
+		return 0, errors.Wrapf(ErrCatalogInvalidNextRouteID, "decode next route id: %v", err)
+	}
+	if nextRouteID == 0 {
+		return 0, errors.WithStack(ErrCatalogInvalidNextRouteID)
+	}
+	return nextRouteID, nil
 }
 
 // EncodeRouteDescriptor serializes a route descriptor record.
@@ -211,7 +238,48 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	return CatalogSnapshot{Version: version, Routes: routes}, nil
+	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: readTS}, nil
+}
+
+// NextRouteID reads the next route id counter from catalog metadata.
+func (s *CatalogStore) NextRouteID(ctx context.Context) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	readTS := s.store.LastCommitTS()
+	nextRouteID, err := s.NextRouteIDAt(ctx, readTS)
+	if err != nil {
+		return 0, err
+	}
+	return nextRouteID, nil
+}
+
+// NextRouteIDAt reads the next route id counter at a given snapshot timestamp.
+func (s *CatalogStore) NextRouteIDAt(ctx context.Context, ts uint64) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	nextRouteID, err := s.nextRouteIDAt(ctx, ts)
+	if err != nil {
+		return 0, err
+	}
+	if nextRouteID != 0 {
+		return nextRouteID, nil
+	}
+
+	// Fallback for catalogs created before next_route_id metadata existed.
+	routes, err := s.routesAt(ctx, ts)
+	if err != nil {
+		return 0, err
+	}
+	return NextRouteIDFloor(routes)
 }
 
 // Save updates the route catalog using optimistic version checks and bumps the
@@ -263,7 +331,7 @@ func normalizeRoutes(routes []RouteDescriptor) ([]RouteDescriptor, error) {
 			return nil, errors.WithStack(ErrCatalogDuplicateRouteID)
 		}
 		seen[route.RouteID] = struct{}{}
-		out = append(out, cloneRouteDescriptor(route))
+		out = append(out, CloneRouteDescriptor(route))
 	}
 	sortRouteDescriptors(out)
 	return out, nil
@@ -285,11 +353,12 @@ func validateRouteDescriptor(route RouteDescriptor) error {
 	return nil
 }
 
-func cloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
+// CloneRouteDescriptor returns a deep copy of route.
+func CloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 	return RouteDescriptor{
 		RouteID:       route.RouteID,
-		Start:         cloneBytes(route.Start),
-		End:           cloneBytes(route.End),
+		Start:         CloneBytes(route.Start),
+		End:           CloneBytes(route.End),
 		GroupID:       route.GroupID,
 		State:         route.State,
 		ParentRouteID: route.ParentRouteID,
@@ -299,7 +368,7 @@ func cloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 func cloneRouteDescriptors(routes []RouteDescriptor) []RouteDescriptor {
 	out := make([]RouteDescriptor, len(routes))
 	for i := range routes {
-		out[i] = cloneRouteDescriptor(routes[i])
+		out[i] = CloneRouteDescriptor(routes[i])
 	}
 	return out
 }
@@ -370,6 +439,37 @@ func (s *CatalogStore) versionAt(ctx context.Context, ts uint64) (uint64, error)
 	return v, nil
 }
 
+func (s *CatalogStore) nextRouteIDAt(ctx context.Context, ts uint64) (uint64, error) {
+	raw, err := s.store.GetAt(ctx, CatalogNextRouteIDKey(), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, nil
+		}
+		return 0, errors.WithStack(err)
+	}
+	nextRouteID, err := DecodeCatalogNextRouteID(raw)
+	if err != nil {
+		return 0, err
+	}
+	return nextRouteID, nil
+}
+
+// NextRouteIDFloor returns the minimum valid next route ID for routes.
+// It is shared by catalog persistence and split planning to keep route-ID
+// allocation rules consistent.
+func NextRouteIDFloor(routes []RouteDescriptor) (uint64, error) {
+	maxRouteID := uint64(0)
+	for _, route := range routes {
+		if route.RouteID > maxRouteID {
+			maxRouteID = route.RouteID
+		}
+	}
+	if maxRouteID == math.MaxUint64 {
+		return 0, errors.WithStack(ErrCatalogRouteIDOverflow)
+	}
+	return maxRouteID + 1, nil
+}
+
 func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescriptor, error) {
 	entries, err := s.scanRouteEntriesAt(ctx, ts)
 	if err != nil {
@@ -402,7 +502,7 @@ func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescript
 func (s *CatalogStore) scanRouteEntriesAt(ctx context.Context, ts uint64) ([]*store.KVPair, error) {
 	prefix := []byte(catalogRoutePrefix)
 	upper := prefixScanEnd(prefix)
-	cursor := cloneBytes(prefix)
+	cursor := CloneBytes(prefix)
 	out := make([]*store.KVPair, 0)
 
 	for {
@@ -478,8 +578,21 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 	if err != nil {
 		return nil, err
 	}
+	nextRouteID, err := s.nextRouteIDAt(ctx, plan.readTS)
+	if err != nil {
+		return nil, err
+	}
+	for _, routes := range [][]RouteDescriptor{existingRoutes, plan.routes} {
+		floor, err := NextRouteIDFloor(routes)
+		if err != nil {
+			return nil, err
+		}
+		if nextRouteID < floor {
+			nextRouteID = floor
+		}
+	}
 
-	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+1)
+	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+catalogSaveMetaMutationCount)
 	mutations = appendDeleteRouteMutations(mutations, existingRoutes, plan.routes)
 	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes)
 	if err != nil {
@@ -489,6 +602,11 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 		Op:    store.OpTypePut,
 		Key:   CatalogVersionKey(),
 		Value: EncodeCatalogVersion(plan.nextVersion),
+	})
+	mutations = append(mutations, &store.KVPairMutation{
+		Op:    store.OpTypePut,
+		Key:   CatalogNextRouteIDKey(),
+		Value: EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return mutations, nil
 }
@@ -649,8 +767,8 @@ func appendRoutePage(out []*store.KVPair, page []*store.KVPair, prefix []byte) (
 			return out, lastKey, true
 		}
 		out = append(out, &store.KVPair{
-			Key:   cloneBytes(kvp.Key),
-			Value: cloneBytes(kvp.Value),
+			Key:   CloneBytes(kvp.Key),
+			Value: CloneBytes(kvp.Value),
 		})
 		lastKey = kvp.Key
 	}
@@ -672,7 +790,7 @@ func prefixScanEnd(prefix []byte) []byte {
 	if len(prefix) == 0 {
 		return nil
 	}
-	out := cloneBytes(prefix)
+	out := CloneBytes(prefix)
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i] == ^byte(0) {
 			continue

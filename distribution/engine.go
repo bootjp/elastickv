@@ -189,8 +189,8 @@ func (e *Engine) Stats() []Route {
 	for i, r := range e.routes {
 		stats[i] = Route{
 			RouteID: r.RouteID,
-			Start:   cloneBytes(r.Start),
-			End:     cloneBytes(r.End),
+			Start:   CloneBytes(r.Start),
+			End:     CloneBytes(r.End),
 			GroupID: r.GroupID,
 			State:   r.State,
 			Load:    atomic.LoadUint64(&e.routes[i].Load),
@@ -222,8 +222,8 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		// Route intersects with scan range
 		result = append(result, Route{
 			RouteID: r.RouteID,
-			Start:   cloneBytes(r.Start),
-			End:     cloneBytes(r.End),
+			Start:   CloneBytes(r.Start),
+			End:     CloneBytes(r.End),
 			GroupID: r.GroupID,
 			State:   r.State,
 			Load:    atomic.LoadUint64(&r.Load),
@@ -289,8 +289,8 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		seen[rd.RouteID] = struct{}{}
 		out[i] = Route{
 			RouteID: rd.RouteID,
-			Start:   cloneBytes(rd.Start),
-			End:     cloneBytes(rd.End),
+			Start:   CloneBytes(rd.Start),
+			End:     CloneBytes(rd.End),
 			GroupID: rd.GroupID,
 			State:   rd.State,
 			Load:    0,
@@ -333,7 +333,8 @@ func validateRouteOrder(routes []Route) error {
 	return nil
 }
 
-func cloneBytes(b []byte) []byte {
+// CloneBytes returns a copied byte slice.
+func CloneBytes(b []byte) []byte {
 	if b == nil {
 		return nil
 	}
@@ -345,7 +346,7 @@ func cloneBytes(b []byte) []byte {
 // midpoint returns a key that is lexicographically between a and b. It returns
 // nil if such a key cannot be determined (e.g. a and b are too close).
 func midpoint(a, b []byte) []byte {
-	m := append(cloneBytes(a), 0)
+	m := append(CloneBytes(a), 0)
 	if bytes.Compare(m, b) >= 0 {
 		return nil
 	}

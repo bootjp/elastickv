@@ -5,6 +5,8 @@ option go_package = "github.com/bootjp/elastickv/proto";
 service Distribution {
   rpc GetRoute (GetRouteRequest) returns (GetRouteResponse) {}
   rpc GetTimestamp (GetTimestampRequest) returns (GetTimestampResponse) {}
+  rpc ListRoutes (ListRoutesRequest) returns (ListRoutesResponse) {}
+  rpc SplitRange (SplitRangeRequest) returns (SplitRangeResponse) {}
 }
 
 message GetRouteRequest {
@@ -25,3 +27,38 @@ message GetTimestampResponse {
   uint64 timestamp = 1;
 }
 
+enum RouteState {
+  ROUTE_STATE_UNSPECIFIED = 0;
+  ROUTE_STATE_ACTIVE = 1;
+  ROUTE_STATE_WRITE_FENCED = 2;
+  ROUTE_STATE_MIGRATING_SOURCE = 3;
+  ROUTE_STATE_MIGRATING_TARGET = 4;
+}
+
+message RouteDescriptor {
+  uint64 route_id = 1;
+  bytes start = 2;
+  bytes end = 3;
+  uint64 raft_group_id = 4;
+  RouteState state = 5;
+  uint64 parent_route_id = 6;
+}
+
+message ListRoutesRequest {}
+
+message ListRoutesResponse {
+  uint64 catalog_version = 1;
+  repeated RouteDescriptor routes = 2;
+}
+
+message SplitRangeRequest {
+  uint64 expected_catalog_version = 1;
+  uint64 route_id = 2;
+  bytes split_key = 3;
+}
+
+message SplitRangeResponse {
+  uint64 catalog_version = 1;
+  RouteDescriptor left = 2;
+  RouteDescriptor right = 3;
+}
