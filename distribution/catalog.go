@@ -443,6 +443,8 @@ func ensureNextRouteIDFloor(current uint64, routes []RouteDescriptor) (uint64, e
 }
 
 // NextRouteIDFloor returns the minimum valid next route ID for routes.
+// It is shared by catalog persistence and split planning to keep route-ID
+// allocation rules consistent.
 func NextRouteIDFloor(routes []RouteDescriptor) (uint64, error) {
 	maxRouteID := uint64(0)
 	for _, route := range routes {

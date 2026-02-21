@@ -339,6 +339,7 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, routes [
 		return 0, 0, grpcStatusErrorf(codes.Internal, "load next route id: %v", err)
 	}
 
+	// Keep floor computation shared with catalog persistence logic.
 	minNextRouteID, err := distribution.NextRouteIDFloor(routes)
 	if err != nil {
 		if errors.Is(err, distribution.ErrCatalogRouteIDOverflow) {
