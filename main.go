@@ -65,15 +65,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	clock := kv.NewHLC()
+	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() {
+		cancel()
+		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()
 		}
 	}()
-
-	clock := kv.NewHLC()
-	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	defer func() { _ = shardStore.Close() }()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {

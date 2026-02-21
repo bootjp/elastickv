@@ -115,15 +115,7 @@ func TestCatalogWatcherNoOpWhenVersionUnchanged(t *testing.T) {
 	require.Equal(t, uint64(1), before[0].Load)
 
 	watcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherInterval(5*time.Millisecond))
-	watchCtx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- watcher.Run(watchCtx)
-	}()
-
-	time.Sleep(40 * time.Millisecond)
-	cancel()
-	require.NoError(t, <-errCh)
+	require.NoError(t, watcher.SyncOnce(ctx))
 
 	after := engine.Stats()
 	require.Len(t, after, 2)

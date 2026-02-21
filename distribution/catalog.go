@@ -241,6 +241,20 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: readTS}, nil
 }
 
+// Version reads only the durable catalog version at the latest commit
+// timestamp.
+func (s *CatalogStore) Version(ctx context.Context) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	readTS := s.store.LastCommitTS()
+	return s.versionAt(ctx, readTS)
+}
+
 // NextRouteID reads the next route id counter from catalog metadata.
 func (s *CatalogStore) NextRouteID(ctx context.Context) (uint64, error) {
 	if err := ensureCatalogStore(s); err != nil {

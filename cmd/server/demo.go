@@ -334,16 +334,14 @@ func run(eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	stopWatch := startCatalogWatcher(ctx, distCatalog, distEngine)
+	startCatalogWatcher(ctx, distCatalog, distEngine)
 
 	eg.Go(func() error {
-		defer stopWatch()
 		slog.Info("Starting gRPC server", "address", cfg.address)
 		return errors.WithStack(s.Serve(grpcSock))
 	})
 
 	eg.Go(func() error {
-		defer stopWatch()
 		slog.Info("Starting Redis server", "address", cfg.redisAddress)
 		return errors.WithStack(rd.Run())
 	})
@@ -351,13 +349,11 @@ func run(eg *errgroup.Group, cfg config) error {
 	return nil
 }
 
-func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) context.CancelFunc {
-	watchCtx, stop := context.WithCancel(ctx)
+func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
 	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
 	go func() {
-		if err := routeWatcher.Run(watchCtx); err != nil && !stderrors.Is(err, context.Canceled) {
+		if err := routeWatcher.Run(ctx); err != nil && !stderrors.Is(err, context.Canceled) {
 			slog.Error("Catalog watcher failed", "error", err)
 		}
 	}()
-	return stop
 }

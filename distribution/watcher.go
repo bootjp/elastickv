@@ -71,10 +71,6 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -97,13 +93,23 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
+	engineVersion := w.engine.Version()
+	catalogVersion, err := w.catalog.Version(ctx)
+	if err != nil {
+		return err
+	}
+	if catalogVersion <= engineVersion {
+		return nil
+	}
+
 	snapshot, err := w.catalog.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if snapshot.Version == w.engine.Version() {
+	if snapshot.Version <= engineVersion {
 		return nil
 	}
+
 	if err := w.engine.ApplySnapshot(snapshot); err != nil {
 		if errors.Is(err, ErrEngineSnapshotVersionStale) {
 			return nil
