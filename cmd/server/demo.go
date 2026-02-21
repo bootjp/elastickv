@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -333,11 +334,7 @@ func run(eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	watchCtx, stopWatch := context.WithCancel(ctx)
-	routeWatcher := distribution.NewCatalogWatcher(distCatalog, distEngine)
-	go func() {
-		_ = routeWatcher.Run(watchCtx)
-	}()
+	stopWatch := startCatalogWatcher(ctx, distCatalog, distEngine)
 
 	eg.Go(func() error {
 		defer stopWatch()
@@ -352,4 +349,15 @@ func run(eg *errgroup.Group, cfg config) error {
 	})
 
 	return nil
+}
+
+func startCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) context.CancelFunc {
+	watchCtx, stop := context.WithCancel(ctx)
+	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
+	go func() {
+		if err := routeWatcher.Run(watchCtx); err != nil && !stderrors.Is(err, context.Canceled) {
+			slog.Error("Catalog watcher failed", "error", err)
+		}
+	}()
+	return stop
 }

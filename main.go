@@ -78,10 +78,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	routeWatcher := distribution.NewCatalogWatcher(distCatalog, cfg.engine)
-	go func() {
-		_ = routeWatcher.Run(ctx)
-	}()
+	startDistributionCatalogWatcher(ctx, distCatalog, cfg.engine)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
@@ -271,6 +268,15 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
+}
+
+func startDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) {
+	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
+	go func() {
+		if err := routeWatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("catalog watcher failed: %v", err)
+		}
+	}()
 }
 
 func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {

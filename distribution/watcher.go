@@ -2,12 +2,15 @@ package distribution
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/cockroachdb/errors"
 )
 
 const defaultCatalogWatcherInterval = 100 * time.Millisecond
+
+var errCatalogWatcherContextRequired = errors.New("catalog watcher context is required")
 
 // CatalogWatcherOption customizes CatalogWatcher behavior.
 type CatalogWatcherOption func(*CatalogWatcher)
@@ -21,11 +24,21 @@ func WithCatalogWatcherInterval(interval time.Duration) CatalogWatcherOption {
 	}
 }
 
+// WithCatalogWatcherLogger sets the logger for watcher background retries.
+func WithCatalogWatcherLogger(logger *slog.Logger) CatalogWatcherOption {
+	return func(w *CatalogWatcher) {
+		if logger != nil {
+			w.logger = logger
+		}
+	}
+}
+
 // CatalogWatcher periodically refreshes Engine from durable catalog snapshots.
 type CatalogWatcher struct {
 	catalog  *CatalogStore
 	engine   *Engine
 	interval time.Duration
+	logger   *slog.Logger
 }
 
 // NewCatalogWatcher creates a watcher that polls the durable route catalog and
@@ -35,6 +48,7 @@ func NewCatalogWatcher(catalog *CatalogStore, engine *Engine, opts ...CatalogWat
 		catalog:  catalog,
 		engine:   engine,
 		interval: defaultCatalogWatcherInterval,
+		logger:   slog.Default(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -51,14 +65,16 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 		return err
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
 	for {
-		_ = w.SyncOnce(ctx)
+		if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -74,7 +90,7 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return err
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
 	snapshot, err := w.catalog.Snapshot(ctx)
@@ -102,6 +118,9 @@ func (w *CatalogWatcher) validate() error {
 	}
 	if w.interval <= 0 {
 		return errors.WithStack(errors.New("catalog watcher interval must be positive"))
+	}
+	if w.logger == nil {
+		return errors.WithStack(errors.New("catalog watcher logger is required"))
 	}
 	return nil
 }
