@@ -22,7 +22,13 @@ const (
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
-const updateSplitCount = 2
+const (
+	updateSplitCount            = 2
+	transactRetryMaxAttempts    = 256
+	transactRetryInitialBackoff = 1 * time.Millisecond
+	transactRetryMaxBackoff     = 10 * time.Millisecond
+	transactRetryBackoffFactor  = 2
+)
 
 type DynamoDBServer struct {
 	listen           net.Listener
@@ -206,20 +212,86 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	reqs, err := d.dynamoTranscoder.TransactWriteItemsToRequest(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
-	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if _, err = d.dispatchTransactWriteItemsWithRetry(r.Context(), reqs); err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	_, _ = w.Write([]byte("{}"))
+}
+
+func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	backoff := transactRetryInitialBackoff
+	var lastErr error
+
+	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
+		resp, err := d.coordinator.Dispatch(ctx, reqs)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = errors.WithStack(err)
+		if !isRetryableTransactWriteError(err) {
+			return nil, lastErr
+		}
+		if err := waitTransactRetryBackoff(ctx, backoff); err != nil {
+			return nil, err
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+
+	return nil, lastErr
+}
+
+func isRetryableTransactWriteError(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+}
+
+func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+func nextTransactRetryBackoff(current time.Duration) time.Duration {
+	if current >= transactRetryMaxBackoff {
+		return transactRetryMaxBackoff
+	}
+	next := current * transactRetryBackoffFactor
+	if next > transactRetryMaxBackoff {
+		return transactRetryMaxBackoff
+	}
+	return next
+}
+
+func writeDynamoError(w http.ResponseWriter, status int, errorType string, message string) {
+	if message == "" {
+		message = http.StatusText(status)
+	}
+
+	resp := map[string]string{
+		"message": message,
+	}
+	if errorType != "" {
+		resp["__type"] = errorType
+		w.Header().Set("x-amzn-ErrorType", errorType)
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func replaceNames(expr string, names map[string]string) string {

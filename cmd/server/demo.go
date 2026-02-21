@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	stderrors "errors"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -24,7 +24,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -212,7 +212,7 @@ func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return errors.WithStack(ctx.Err())
+		return pkgerrors.WithStack(ctx.Err())
 	case <-timer.C:
 		return nil
 	}
@@ -223,19 +223,19 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
 	}
 	if err := os.MkdirAll(dir, defaultFileMode); err != nil {
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, pkgerrors.WithStack(err)
 	}
 	ldb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
 	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, pkgerrors.WithStack(err)
 	}
 	sdb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
 	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, pkgerrors.WithStack(err)
 	}
 	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
 	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, pkgerrors.WithStack(err)
 	}
 	return ldb, sdb, fss, nil
 }
@@ -271,7 +271,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 
 	l, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, pkgerrors.WithStack(err)
 	}
 	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
 }
@@ -303,7 +303,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return errors.WithStack(err)
+		return pkgerrors.WithStack(err)
 	}
 
 	if cfg.raftBootstrap {
@@ -317,8 +317,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 			},
 		}
 		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil && !stderrors.Is(err, raft.ErrCantBootstrap) {
-			return errors.WithStack(err)
+		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+			return pkgerrors.WithStack(err)
 		}
 	}
 
@@ -327,7 +327,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
-		return errors.WithStack(err)
+		return pkgerrors.WithStack(err)
 	}
 	distServer := adapter.NewDistributionServer(
 		distEngine,
@@ -339,7 +339,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
-		return errors.WithStack(err)
+		return pkgerrors.WithStack(err)
 	}
 
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
@@ -359,7 +359,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
 	return func() error {
 		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default()); err != nil {
-			return errors.Wrapf(err, "catalog watcher failed")
+			return pkgerrors.Wrapf(err, "catalog watcher failed")
 		}
 		return nil
 	}
@@ -370,7 +370,7 @@ func grpcShutdownTask(ctx context.Context, server *grpc.Server, listener net.Lis
 		<-ctx.Done()
 		slog.Info("Shutting down gRPC server", "address", address, "reason", ctx.Err())
 		server.GracefulStop()
-		if err := listener.Close(); err != nil && !stderrors.Is(err, net.ErrClosed) {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			slog.Error("Failed to close gRPC listener", "address", address, "err", err)
 		}
 		return nil
@@ -381,10 +381,10 @@ func grpcServeTask(server *grpc.Server, listener net.Listener, address string) f
 	return func() error {
 		slog.Info("Starting gRPC server", "address", address)
 		err := server.Serve(listener)
-		if err == nil || stderrors.Is(err, grpc.ErrServerStopped) || stderrors.Is(err, net.ErrClosed) {
+		if err == nil || errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
-		return errors.WithStack(err)
+		return pkgerrors.WithStack(err)
 	}
 }
 
@@ -401,9 +401,9 @@ func redisServeTask(redisServer *adapter.RedisServer, address string) func() err
 	return func() error {
 		slog.Info("Starting Redis server", "address", address)
 		err := redisServer.Run()
-		if err == nil || stderrors.Is(err, net.ErrClosed) {
+		if err == nil || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
-		return errors.WithStack(err)
+		return pkgerrors.WithStack(err)
 	}
 }
