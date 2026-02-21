@@ -454,17 +454,6 @@ func (s *CatalogStore) nextRouteIDAt(ctx context.Context, ts uint64) (uint64, er
 	return nextRouteID, nil
 }
 
-func ensureNextRouteIDFloor(current uint64, routes []RouteDescriptor) (uint64, error) {
-	floor, err := NextRouteIDFloor(routes)
-	if err != nil {
-		return 0, err
-	}
-	if current < floor {
-		return floor, nil
-	}
-	return current, nil
-}
-
 // NextRouteIDFloor returns the minimum valid next route ID for routes.
 // It is shared by catalog persistence and split planning to keep route-ID
 // allocation rules consistent.
@@ -593,13 +582,14 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 	if err != nil {
 		return nil, err
 	}
-	nextRouteID, err = ensureNextRouteIDFloor(nextRouteID, existingRoutes)
-	if err != nil {
-		return nil, err
-	}
-	nextRouteID, err = ensureNextRouteIDFloor(nextRouteID, plan.routes)
-	if err != nil {
-		return nil, err
+	for _, routes := range [][]RouteDescriptor{existingRoutes, plan.routes} {
+		floor, err := NextRouteIDFloor(routes)
+		if err != nil {
+			return nil, err
+		}
+		if nextRouteID < floor {
+			nextRouteID = floor
+		}
 	}
 
 	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+catalogSaveMetaMutationCount)

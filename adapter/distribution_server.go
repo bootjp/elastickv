@@ -304,18 +304,19 @@ func splitCatalogRoutes(
 	leftID uint64,
 	rightID uint64,
 ) (distribution.RouteDescriptor, distribution.RouteDescriptor) {
+	// parent and splitKey are already cloned before this point and are immutable here.
 	left := distribution.RouteDescriptor{
 		RouteID:       leftID,
-		Start:         distribution.CloneBytes(parent.Start),
-		End:           distribution.CloneBytes(splitKey),
+		Start:         parent.Start,
+		End:           splitKey,
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
 	}
 	right := distribution.RouteDescriptor{
 		RouteID:       rightID,
-		Start:         distribution.CloneBytes(splitKey),
-		End:           distribution.CloneBytes(parent.End),
+		Start:         splitKey,
+		End:           parent.End,
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
