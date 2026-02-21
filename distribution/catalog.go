@@ -331,7 +331,7 @@ func normalizeRoutes(routes []RouteDescriptor) ([]RouteDescriptor, error) {
 			return nil, errors.WithStack(ErrCatalogDuplicateRouteID)
 		}
 		seen[route.RouteID] = struct{}{}
-		out = append(out, cloneRouteDescriptor(route))
+		out = append(out, CloneRouteDescriptor(route))
 	}
 	sortRouteDescriptors(out)
 	return out, nil
@@ -353,7 +353,8 @@ func validateRouteDescriptor(route RouteDescriptor) error {
 	return nil
 }
 
-func cloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
+// CloneRouteDescriptor returns a deep copy of route.
+func CloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 	return RouteDescriptor{
 		RouteID:       route.RouteID,
 		Start:         CloneBytes(route.Start),
@@ -367,7 +368,7 @@ func cloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 func cloneRouteDescriptors(routes []RouteDescriptor) []RouteDescriptor {
 	out := make([]RouteDescriptor, len(routes))
 	for i := range routes {
-		out[i] = cloneRouteDescriptor(routes[i])
+		out[i] = CloneRouteDescriptor(routes[i])
 	}
 	return out
 }

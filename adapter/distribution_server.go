@@ -137,7 +137,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	}
 	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID)
 
-	saved, err := s.saveSplitResult(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -164,17 +164,6 @@ func (s *DistributionServer) verifyCatalogLeader() error {
 		return grpcStatusErrorf(codes.FailedPrecondition, "verify catalog leader: %v", err)
 	}
 	return nil
-}
-
-func (s *DistributionServer) saveSplitResult(
-	ctx context.Context,
-	readTS uint64,
-	expectedVersion uint64,
-	parentID uint64,
-	left distribution.RouteDescriptor,
-	right distribution.RouteDescriptor,
-) (distribution.CatalogSnapshot, error) {
-	return s.saveSplitResultViaCoordinator(ctx, readTS, expectedVersion, parentID, left, right)
 }
 
 func (s *DistributionServer) saveSplitResultViaCoordinator(
@@ -363,7 +352,7 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, readTS u
 func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, int, bool) {
 	for i, route := range routes {
 		if route.RouteID == routeID {
-			return cloneRouteDescriptor(route), i, true
+			return distribution.CloneRouteDescriptor(route), i, true
 		}
 	}
 	return distribution.RouteDescriptor{}, -1, false
@@ -400,17 +389,6 @@ func toProtoRouteState(state distribution.RouteState) pb.RouteState {
 		return pb.RouteState_ROUTE_STATE_MIGRATING_TARGET
 	default:
 		return pb.RouteState_ROUTE_STATE_UNSPECIFIED
-	}
-}
-
-func cloneRouteDescriptor(route distribution.RouteDescriptor) distribution.RouteDescriptor {
-	return distribution.RouteDescriptor{
-		RouteID:       route.RouteID,
-		Start:         distribution.CloneBytes(route.Start),
-		End:           distribution.CloneBytes(route.End),
-		GroupID:       route.GroupID,
-		State:         route.State,
-		ParentRouteID: route.ParentRouteID,
 	}
 }
 
