@@ -58,23 +58,13 @@ func NewCatalogWatcher(catalog *CatalogStore, engine *Engine, opts ...CatalogWat
 	return w
 }
 
-// StartCatalogWatcher starts CatalogWatcher in a background goroutine and logs
-// retry/startup errors. Cancellation is controlled by ctx.
-func StartCatalogWatcher(ctx context.Context, catalog *CatalogStore, engine *Engine, logger *slog.Logger) {
+// RunCatalogWatcher runs CatalogWatcher with optional logger override.
+func RunCatalogWatcher(ctx context.Context, catalog *CatalogStore, engine *Engine, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if ctx == nil {
-		logger.Error("catalog watcher context is required")
-		return
-	}
-
-	routeWatcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherLogger(logger))
-	go func() {
-		if err := routeWatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			logger.ErrorContext(ctx, "catalog watcher failed", "error", err)
-		}
-	}()
+	catalogWatcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherLogger(logger))
+	return catalogWatcher.Run(ctx)
 }
 
 // Run starts polling and only returns when ctx is canceled or initialization
@@ -87,17 +77,18 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(w.interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
 			if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
 			}
+			timer.Reset(w.interval)
 		}
 	}
 }
@@ -112,7 +103,8 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
-	catalogVersion, err := w.catalog.Version(ctx)
+	readTS := w.catalog.store.LastCommitTS()
+	catalogVersion, err := w.catalog.versionAt(ctx, readTS)
 	if err != nil {
 		return err
 	}
@@ -120,9 +112,14 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return nil
 	}
 
-	snapshot, err := w.catalog.Snapshot(ctx)
+	routes, err := w.catalog.routesAt(ctx, readTS)
 	if err != nil {
 		return err
+	}
+	snapshot := CatalogSnapshot{
+		Version: catalogVersion,
+		Routes:  routes,
+		ReadTS:  readTS,
 	}
 	if snapshot.Version <= w.engine.Version() {
 		return nil

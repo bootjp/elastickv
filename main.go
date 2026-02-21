@@ -70,6 +70,8 @@ func run() error {
 		cancel()
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
+			// shardStore already closed group stores.
+			clearRuntimeStore(rt)
 			rt.Close()
 		}
 	}()
@@ -79,7 +81,9 @@ func run() error {
 		return err
 	}
 	eg, runCtx := errgroup.WithContext(ctx)
-	distribution.StartCatalogWatcher(runCtx, distCatalog, cfg.engine, nil)
+	eg.Go(func() error {
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+	})
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
@@ -310,4 +314,18 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 		return 0, errors.New("invalid shard route for distribution catalog key")
 	}
 	return route.GroupID, nil
+}
+
+func clearRuntimeStore(rt *raftGroupRuntime) {
+	if rt == nil {
+		return
+	}
+	rt.store = nil
+}
+
+func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
+	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
+		return errors.Wrapf(err, "catalog watcher failed")
+	}
+	return nil
 }

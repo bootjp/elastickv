@@ -347,17 +347,63 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	distribution.StartCatalogWatcher(ctx, distCatalog, distEngine, slog.Default())
-
-	eg.Go(func() error {
-		slog.Info("Starting gRPC server", "address", cfg.address)
-		return errors.WithStack(s.Serve(grpcSock))
-	})
-
-	eg.Go(func() error {
-		slog.Info("Starting Redis server", "address", cfg.redisAddress)
-		return errors.WithStack(rd.Run())
-	})
+	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
+	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address))
+	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
+	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))
+	eg.Go(redisServeTask(rd, cfg.redisAddress))
 
 	return nil
+}
+
+func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
+	return func() error {
+		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default()); err != nil {
+			return errors.Wrapf(err, "catalog watcher failed")
+		}
+		return nil
+	}
+}
+
+func grpcShutdownTask(ctx context.Context, server *grpc.Server, listener net.Listener, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down gRPC server", "address", address, "reason", ctx.Err())
+		server.GracefulStop()
+		if err := listener.Close(); err != nil && !stderrors.Is(err, net.ErrClosed) {
+			slog.Error("Failed to close gRPC listener", "address", address, "err", err)
+		}
+		return nil
+	}
+}
+
+func grpcServeTask(server *grpc.Server, listener net.Listener, address string) func() error {
+	return func() error {
+		slog.Info("Starting gRPC server", "address", address)
+		err := server.Serve(listener)
+		if err == nil || stderrors.Is(err, grpc.ErrServerStopped) || stderrors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+func redisShutdownTask(ctx context.Context, redisServer *adapter.RedisServer, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down Redis server", "address", address, "reason", ctx.Err())
+		redisServer.Stop()
+		return nil
+	}
+}
+
+func redisServeTask(redisServer *adapter.RedisServer, address string) func() error {
+	return func() error {
+		slog.Info("Starting Redis server", "address", address)
+		err := redisServer.Run()
+		if err == nil || stderrors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
 }
