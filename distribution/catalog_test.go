@@ -3,6 +3,7 @@ package distribution
 import (
 	"bytes"
 	"context"
+	"math"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -313,6 +314,15 @@ func TestCatalogStoreNextRouteID_TracksHigherRouteID(t *testing.T) {
 	}
 	if next != 11 {
 		t.Fatalf("expected next route id 11, got %d", next)
+	}
+}
+
+func TestNextRouteIDFloor_RejectsOverflow(t *testing.T) {
+	_, err := NextRouteIDFloor([]RouteDescriptor{
+		{RouteID: math.MaxUint64},
+	})
+	if !errors.Is(err, ErrCatalogRouteIDOverflow) {
+		t.Fatalf("expected ErrCatalogRouteIDOverflow, got %v", err)
 	}
 }
 

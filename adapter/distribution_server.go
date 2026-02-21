@@ -128,7 +128,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
 
-	splitKey := cloneBytes(req.GetSplitKey())
+	splitKey := distribution.CloneBytes(req.GetSplitKey())
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return nil, err
 	}
@@ -316,16 +316,16 @@ func splitCatalogRoutes(
 ) (distribution.RouteDescriptor, distribution.RouteDescriptor) {
 	left := distribution.RouteDescriptor{
 		RouteID:       leftID,
-		Start:         cloneBytes(parent.Start),
-		End:           cloneBytes(splitKey),
+		Start:         distribution.CloneBytes(parent.Start),
+		End:           distribution.CloneBytes(splitKey),
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
 	}
 	right := distribution.RouteDescriptor{
 		RouteID:       rightID,
-		Start:         cloneBytes(splitKey),
-		End:           cloneBytes(parent.End),
+		Start:         distribution.CloneBytes(splitKey),
+		End:           distribution.CloneBytes(parent.End),
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
@@ -339,9 +339,12 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, routes [
 		return 0, 0, grpcStatusErrorf(codes.Internal, "load next route id: %v", err)
 	}
 
-	minNextRouteID, err := nextRouteIDFloor(routes)
+	minNextRouteID, err := distribution.NextRouteIDFloor(routes)
 	if err != nil {
-		return 0, 0, grpcStatusError(codes.Internal, errDistributionRouteIDOverflow.Error())
+		if errors.Is(err, distribution.ErrCatalogRouteIDOverflow) {
+			return 0, 0, grpcStatusError(codes.Internal, errDistributionRouteIDOverflow.Error())
+		}
+		return 0, 0, grpcStatusErrorf(codes.Internal, "compute next route id floor: %v", err)
 	}
 	if nextRouteID < minNextRouteID {
 		nextRouteID = minNextRouteID
@@ -353,19 +356,6 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, routes [
 	leftID := nextRouteID
 	rightID := nextRouteID + (childRouteSecondOffset - childRouteFirstOffset)
 	return leftID, rightID, nil
-}
-
-func nextRouteIDFloor(routes []distribution.RouteDescriptor) (uint64, error) {
-	maxRouteID := uint64(0)
-	for _, route := range routes {
-		if route.RouteID > maxRouteID {
-			maxRouteID = route.RouteID
-		}
-	}
-	if maxRouteID == math.MaxUint64 {
-		return 0, errors.WithStack(errDistributionRouteIDOverflow)
-	}
-	return maxRouteID + 1, nil
 }
 
 func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, int, bool) {
@@ -388,8 +378,8 @@ func toProtoRouteDescriptors(routes []distribution.RouteDescriptor) []*pb.RouteD
 func toProtoRouteDescriptor(route distribution.RouteDescriptor) *pb.RouteDescriptor {
 	return &pb.RouteDescriptor{
 		RouteId:       route.RouteID,
-		Start:         cloneBytes(route.Start),
-		End:           cloneBytes(route.End),
+		Start:         distribution.CloneBytes(route.Start),
+		End:           distribution.CloneBytes(route.End),
 		RaftGroupId:   route.GroupID,
 		State:         toProtoRouteState(route.State),
 		ParentRouteId: route.ParentRouteID,
@@ -414,21 +404,12 @@ func toProtoRouteState(state distribution.RouteState) pb.RouteState {
 func cloneRouteDescriptor(route distribution.RouteDescriptor) distribution.RouteDescriptor {
 	return distribution.RouteDescriptor{
 		RouteID:       route.RouteID,
-		Start:         cloneBytes(route.Start),
-		End:           cloneBytes(route.End),
+		Start:         distribution.CloneBytes(route.Start),
+		End:           distribution.CloneBytes(route.End),
 		GroupID:       route.GroupID,
 		State:         route.State,
 		ParentRouteID: route.ParentRouteID,
 	}
-}
-
-func cloneBytes(src []byte) []byte {
-	if src == nil {
-		return nil
-	}
-	out := make([]byte, len(src))
-	copy(out, src)
-	return out
 }
 
 func grpcStatusError(code codes.Code, msg string) error {

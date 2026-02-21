@@ -534,13 +534,13 @@ func coordinatorStubMutation(elem *kv.Elem[kv.OP]) (*store.KVPairMutation, error
 	case kv.Put:
 		return &store.KVPairMutation{
 			Op:    store.OpTypePut,
-			Key:   cloneBytes(elem.Key),
-			Value: cloneBytes(elem.Value),
+			Key:   distribution.CloneBytes(elem.Key),
+			Value: distribution.CloneBytes(elem.Value),
 		}, nil
 	case kv.Del:
 		return &store.KVPairMutation{
 			Op:  store.OpTypeDelete,
-			Key: cloneBytes(elem.Key),
+			Key: distribution.CloneBytes(elem.Key),
 		}, nil
 	default:
 		return nil, kv.ErrInvalidRequest

@@ -432,7 +432,7 @@ func (s *CatalogStore) nextRouteIDAt(ctx context.Context, ts uint64) (uint64, er
 }
 
 func ensureNextRouteIDFloor(current uint64, routes []RouteDescriptor) (uint64, error) {
-	floor, err := nextRouteIDFloor(routes)
+	floor, err := NextRouteIDFloor(routes)
 	if err != nil {
 		return 0, err
 	}
@@ -442,7 +442,8 @@ func ensureNextRouteIDFloor(current uint64, routes []RouteDescriptor) (uint64, e
 	return current, nil
 }
 
-func nextRouteIDFloor(routes []RouteDescriptor) (uint64, error) {
+// NextRouteIDFloor returns the minimum valid next route ID for routes.
+func NextRouteIDFloor(routes []RouteDescriptor) (uint64, error) {
 	maxRouteID := uint64(0)
 	for _, route := range routes {
 		if route.RouteID > maxRouteID {

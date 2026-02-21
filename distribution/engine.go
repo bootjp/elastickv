@@ -333,13 +333,18 @@ func validateRouteOrder(routes []Route) error {
 	return nil
 }
 
-func cloneBytes(b []byte) []byte {
+// CloneBytes returns a copied byte slice.
+func CloneBytes(b []byte) []byte {
 	if b == nil {
 		return nil
 	}
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
+}
+
+func cloneBytes(b []byte) []byte {
+	return CloneBytes(b)
 }
 
 // midpoint returns a key that is lexicographically between a and b. It returns
