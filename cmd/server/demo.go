@@ -328,17 +328,25 @@ func run(eg *errgroup.Group, cfg config) error {
 		return errors.WithStack(err)
 	}
 
-	eg.Go(func() error {
-		slog.Info("Starting gRPC server", "address", cfg.address)
-		return errors.WithStack(s.Serve(grpcSock))
-	})
-
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
 	if err != nil {
 		return err
 	}
 
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	routeWatcher := distribution.NewCatalogWatcher(distCatalog, distEngine)
+	go func() {
+		_ = routeWatcher.Run(watchCtx)
+	}()
+
 	eg.Go(func() error {
+		defer stopWatch()
+		slog.Info("Starting gRPC server", "address", cfg.address)
+		return errors.WithStack(s.Serve(grpcSock))
+	})
+
+	eg.Go(func() error {
+		defer stopWatch()
 		slog.Info("Starting Redis server", "address", cfg.redisAddress)
 		return errors.WithStack(rd.Run())
 	})

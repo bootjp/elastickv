@@ -51,7 +51,8 @@ func run() error {
 		return errors.New("flag --raftId is required")
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var lc net.ListenConfig
 
 	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *raftGroups, *shardRanges, *raftRedisMap)
@@ -78,6 +79,10 @@ func run() error {
 		if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, cfg.engine); err != nil {
 			return errors.Wrapf(err, "initialize distribution catalog")
 		}
+		routeWatcher := distribution.NewCatalogWatcher(distCatalog, cfg.engine)
+		go func() {
+			_ = routeWatcher.Run(ctx)
+		}()
 	}
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
