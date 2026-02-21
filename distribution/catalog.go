@@ -350,8 +350,8 @@ func validateRouteDescriptor(route RouteDescriptor) error {
 func cloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 	return RouteDescriptor{
 		RouteID:       route.RouteID,
-		Start:         cloneBytes(route.Start),
-		End:           cloneBytes(route.End),
+		Start:         CloneBytes(route.Start),
+		End:           CloneBytes(route.End),
 		GroupID:       route.GroupID,
 		State:         route.State,
 		ParentRouteID: route.ParentRouteID,
@@ -506,7 +506,7 @@ func (s *CatalogStore) routesAt(ctx context.Context, ts uint64) ([]RouteDescript
 func (s *CatalogStore) scanRouteEntriesAt(ctx context.Context, ts uint64) ([]*store.KVPair, error) {
 	prefix := []byte(catalogRoutePrefix)
 	upper := prefixScanEnd(prefix)
-	cursor := cloneBytes(prefix)
+	cursor := CloneBytes(prefix)
 	out := make([]*store.KVPair, 0)
 
 	for {
@@ -770,8 +770,8 @@ func appendRoutePage(out []*store.KVPair, page []*store.KVPair, prefix []byte) (
 			return out, lastKey, true
 		}
 		out = append(out, &store.KVPair{
-			Key:   cloneBytes(kvp.Key),
-			Value: cloneBytes(kvp.Value),
+			Key:   CloneBytes(kvp.Key),
+			Value: CloneBytes(kvp.Value),
 		})
 		lastKey = kvp.Key
 	}
@@ -793,7 +793,7 @@ func prefixScanEnd(prefix []byte) []byte {
 	if len(prefix) == 0 {
 		return nil
 	}
-	out := cloneBytes(prefix)
+	out := CloneBytes(prefix)
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i] == ^byte(0) {
 			continue

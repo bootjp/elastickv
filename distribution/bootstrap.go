@@ -44,8 +44,8 @@ func routeDescriptorsFromEngine(routes []Route) []RouteDescriptor {
 	for i, route := range routes {
 		out[i] = RouteDescriptor{
 			RouteID:       routeID,
-			Start:         cloneBytes(route.Start),
-			End:           cloneBytes(route.End),
+			Start:         CloneBytes(route.Start),
+			End:           CloneBytes(route.End),
 			GroupID:       route.GroupID,
 			State:         route.State,
 			ParentRouteID: 0,
