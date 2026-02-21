@@ -35,10 +35,8 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 }
 
 const (
-	childRouteFirstOffset  = 1
-	childRouteSecondOffset = 2
-	childRouteCount        = 2
-	splitMutationOpCount   = childRouteCount + 3
+	childRouteCount      = 2
+	splitMutationOpCount = childRouteCount + 3
 )
 
 var (
@@ -133,13 +131,13 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.Routes)
+	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
 	if err != nil {
 		return nil, err
 	}
 	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID)
 
-	saved, err := s.saveSplitResult(ctx, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResult(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -170,16 +168,18 @@ func (s *DistributionServer) verifyCatalogLeader() error {
 
 func (s *DistributionServer) saveSplitResult(
 	ctx context.Context,
+	readTS uint64,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
 	right distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, error) {
-	return s.saveSplitResultViaCoordinator(ctx, expectedVersion, parentID, left, right)
+	return s.saveSplitResultViaCoordinator(ctx, readTS, expectedVersion, parentID, left, right)
 }
 
 func (s *DistributionServer) saveSplitResultViaCoordinator(
 	ctx context.Context,
+	readTS uint64,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
@@ -199,8 +199,9 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems: ops,
-		IsTxn: true,
+		Elems:   ops,
+		IsTxn:   true,
+		StartTS: readTS,
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
@@ -333,8 +334,8 @@ func splitCatalogRoutes(
 	return left, right
 }
 
-func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, routes []distribution.RouteDescriptor) (uint64, uint64, error) {
-	nextRouteID, err := s.catalog.NextRouteID(ctx)
+func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, readTS uint64, routes []distribution.RouteDescriptor) (uint64, uint64, error) {
+	nextRouteID, err := s.catalog.NextRouteIDAt(ctx, readTS)
 	if err != nil {
 		return 0, 0, grpcStatusErrorf(codes.Internal, "load next route id: %v", err)
 	}
@@ -355,7 +356,7 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, routes [
 		return 0, 0, grpcStatusError(codes.Internal, errDistributionRouteIDOverflow.Error())
 	}
 	leftID := nextRouteID
-	rightID := nextRouteID + (childRouteSecondOffset - childRouteFirstOffset)
+	rightID := nextRouteID + 1
 	return leftID, rightID, nil
 }
 

@@ -272,6 +272,8 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	engine := distribution.NewEngine()
 	coordinator := newDistributionCoordinatorStub(baseStore, true)
 	s := NewDistributionServer(engine, catalog, WithDistributionCoordinator(coordinator))
+	readSnapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
 
 	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
 		ExpectedCatalogVersion: saved.Version,
@@ -281,6 +283,7 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
+	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -477,6 +480,7 @@ type distributionCoordinatorStub struct {
 	store         store.MVCCStore
 	leader        bool
 	nextTS        uint64
+	lastStartTS   uint64
 	dispatchCalls int
 }
 
@@ -498,17 +502,22 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, kv.ErrInvalidRequest
 	}
 	s.dispatchCalls++
+	startTS := reqs.StartTS
 	if s.nextTS == 0 {
 		s.nextTS = s.store.LastCommitTS() + 1
 	}
 	commitTS := s.nextTS
+	if startTS > 0 && commitTS <= startTS {
+		commitTS = startTS + 1
+	}
 	s.nextTS++
+	s.lastStartTS = startTS
 
 	mutations, err := coordinatorStubMutations(reqs.Elems)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.ApplyMutations(ctx, mutations, commitTS, commitTS); err != nil {
+	if err := s.store.ApplyMutations(ctx, mutations, startTS, commitTS); err != nil {
 		return nil, err
 	}
 	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil

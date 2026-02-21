@@ -81,6 +81,7 @@ type RouteDescriptor struct {
 type CatalogSnapshot struct {
 	Version uint64
 	Routes  []RouteDescriptor
+	ReadTS  uint64
 }
 
 // CatalogStore provides persistence helpers for route catalog state.
@@ -237,7 +238,7 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	return CatalogSnapshot{Version: version, Routes: routes}, nil
+	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: readTS}, nil
 }
 
 // NextRouteID reads the next route id counter from catalog metadata.
@@ -250,7 +251,22 @@ func (s *CatalogStore) NextRouteID(ctx context.Context) (uint64, error) {
 	}
 
 	readTS := s.store.LastCommitTS()
-	nextRouteID, err := s.nextRouteIDAt(ctx, readTS)
+	nextRouteID, err := s.NextRouteIDAt(ctx, readTS)
+	if err != nil {
+		return 0, err
+	}
+	return nextRouteID, nil
+}
+
+// NextRouteIDAt reads the next route id counter at a given snapshot timestamp.
+func (s *CatalogStore) NextRouteIDAt(ctx context.Context, ts uint64) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	nextRouteID, err := s.nextRouteIDAt(ctx, ts)
 	if err != nil {
 		return 0, err
 	}

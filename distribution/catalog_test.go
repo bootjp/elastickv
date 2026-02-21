@@ -140,6 +140,9 @@ func TestCatalogStoreSnapshotEmpty(t *testing.T) {
 	if len(snapshot.Routes) != 0 {
 		t.Fatalf("expected no routes, got %d", len(snapshot.Routes))
 	}
+	if snapshot.ReadTS != 0 {
+		t.Fatalf("expected empty read ts 0, got %d", snapshot.ReadTS)
+	}
 }
 
 func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
@@ -183,6 +186,9 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	}
 	if snapshot.Version != 1 {
 		t.Fatalf("expected version 1, got %d", snapshot.Version)
+	}
+	if snapshot.ReadTS == 0 {
+		t.Fatal("expected snapshot read ts to be set")
 	}
 	if len(snapshot.Routes) != 2 {
 		t.Fatalf("expected 2 routes, got %d", len(snapshot.Routes))
