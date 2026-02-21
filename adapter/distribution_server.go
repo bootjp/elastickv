@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
@@ -35,8 +36,10 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 }
 
 const (
-	childRouteCount      = 2
-	splitMutationOpCount = childRouteCount + 3
+	childRouteCount            = 2
+	splitMutationOpCount       = childRouteCount + 3
+	catalogReloadRetryAttempts = 20
+	catalogReloadRetryInterval = 10 * time.Millisecond
 )
 
 var (
@@ -194,20 +197,7 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
-
-	saved, err := s.catalog.Snapshot(ctx)
-	if err != nil {
-		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
-	}
-	if saved.Version < nextVersion {
-		return distribution.CatalogSnapshot{}, grpcStatusErrorf(
-			codes.Internal,
-			"unexpected catalog version after split: got %d, want at least %d",
-			saved.Version,
-			nextVersion,
-		)
-	}
-	return saved, nil
+	return s.loadCatalogSnapshotAtLeastVersion(ctx, nextVersion)
 }
 
 func buildCatalogSplitOps(
@@ -257,6 +247,49 @@ func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribut
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "load route catalog: %v", err)
 	}
 	return snapshot, nil
+}
+
+func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
+	ctx context.Context,
+	minVersion uint64,
+) (distribution.CatalogSnapshot, error) {
+	var last distribution.CatalogSnapshot
+	for attempt := 0; attempt < catalogReloadRetryAttempts; attempt++ {
+		snapshot, err := s.catalog.Snapshot(ctx)
+		if err != nil {
+			return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
+		}
+		if snapshot.Version >= minVersion {
+			return snapshot, nil
+		}
+		last = snapshot
+		if attempt == catalogReloadRetryAttempts-1 {
+			break
+		}
+		if err := waitWithContext(ctx, catalogReloadRetryInterval); err != nil {
+			return distribution.CatalogSnapshot{}, err
+		}
+	}
+	return distribution.CatalogSnapshot{}, grpcStatusErrorf(
+		codes.Internal,
+		"catalog split committed but local snapshot is stale: got %d, want at least %d",
+		last.Version,
+		minVersion,
+	)
+}
+
+func waitWithContext(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(status.FromContextError(ctx.Err()).Err())
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *DistributionServer) applyEngineSnapshot(snapshot distribution.CatalogSnapshot) error {

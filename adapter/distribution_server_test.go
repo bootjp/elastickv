@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
@@ -403,6 +404,54 @@ func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing
 	require.Equal(t, uint64(3), engine.Version())
 }
 
+func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+
+	engine := distribution.NewEngine()
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	coordinator.asyncApplyDelay = 15 * time.Millisecond
+	coordinator.asyncApplyDone = make(chan error, 1)
+	s := NewDistributionServer(engine, catalog, WithDistributionCoordinator(coordinator))
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+
+	select {
+	case applyErr := <-coordinator.asyncApplyDone:
+		require.NoError(t, applyErr)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async split apply")
+	}
+}
+
 func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -520,12 +569,14 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 }
 
 type distributionCoordinatorStub struct {
-	store         store.MVCCStore
-	leader        bool
-	nextTS        uint64
-	lastStartTS   uint64
-	afterDispatch func(context.Context, store.MVCCStore, uint64) error
-	dispatchCalls int
+	store           store.MVCCStore
+	leader          bool
+	nextTS          uint64
+	lastStartTS     uint64
+	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
+	asyncApplyDone  chan error
+	asyncApplyDelay time.Duration
+	dispatchCalls   int
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
@@ -546,6 +597,18 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	mutations, err := coordinatorStubMutations(reqs.Elems)
 	if err != nil {
 		return nil, err
+	}
+	if s.asyncApplyDelay > 0 {
+		done := s.asyncApplyDone
+		delay := s.asyncApplyDelay
+		go func() {
+			time.Sleep(delay)
+			err := s.applyDispatch(ctx, mutations, startTS, commitTS)
+			if done != nil {
+				done <- err
+			}
+		}()
+		return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
 	}
 	if err := s.applyDispatch(ctx, mutations, startTS, commitTS); err != nil {
 		return nil, err
