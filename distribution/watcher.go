@@ -71,14 +71,18 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
+	if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
+	}
+
 	for {
-		if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
-		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				w.logger.ErrorContext(ctx, "catalog watcher sync failed", "error", err)
+			}
 		}
 	}
 }

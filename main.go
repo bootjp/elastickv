@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net"
 	"time"
 
@@ -274,7 +275,7 @@ func startDistributionCatalogWatcher(ctx context.Context, catalog *distribution.
 	routeWatcher := distribution.NewCatalogWatcher(catalog, engine)
 	go func() {
 		if err := routeWatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("catalog watcher failed: %v", err)
+			slog.Error("catalog watcher failed", "error", err)
 		}
 	}()
 }
