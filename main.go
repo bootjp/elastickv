@@ -74,16 +74,14 @@ func run() error {
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() { _ = shardStore.Close() }()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
-	distCatalog := distributionCatalogStoreForGroup(runtimes, cfg.defaultGroup)
-	if distCatalog != nil {
-		if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, cfg.engine); err != nil {
-			return errors.Wrapf(err, "initialize distribution catalog")
-		}
-		routeWatcher := distribution.NewCatalogWatcher(distCatalog, cfg.engine)
-		go func() {
-			_ = routeWatcher.Run(ctx)
-		}()
+	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
+	if err != nil {
+		return err
 	}
+	routeWatcher := distribution.NewCatalogWatcher(distCatalog, cfg.engine)
+	go func() {
+		_ = routeWatcher.Run(ctx)
+	}()
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
@@ -254,4 +252,37 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 		}
 	}
 	return nil
+}
+
+func setupDistributionCatalog(
+	ctx context.Context,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+) (*distribution.CatalogStore, error) {
+	catalogGroupID, err := distributionCatalogGroupID(engine)
+	if err != nil {
+		return nil, errors.Wrapf(err, "resolve distribution catalog group")
+	}
+	distCatalog := distributionCatalogStoreForGroup(runtimes, catalogGroupID)
+	if distCatalog == nil {
+		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
+	}
+	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+		return nil, errors.Wrapf(err, "initialize distribution catalog")
+	}
+	return distCatalog, nil
+}
+
+func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
+	if engine == nil {
+		return 0, errors.New("distribution engine is required")
+	}
+	route, ok := engine.GetRoute(distribution.CatalogVersionKey())
+	if !ok {
+		return 0, errors.New("no shard route for distribution catalog key")
+	}
+	if route.GroupID == 0 {
+		return 0, errors.New("invalid shard route for distribution catalog key")
+	}
+	return route.GroupID, nil
 }
