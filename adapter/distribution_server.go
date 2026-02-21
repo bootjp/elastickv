@@ -21,6 +21,10 @@ type DistributionServer struct {
 	engine      *distribution.Engine
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
+	reloadRetry struct {
+		attempts int
+		interval time.Duration
+	}
 	pb.UnimplementedDistributionServer
 }
 
@@ -35,14 +39,28 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 	}
 }
 
+// WithCatalogReloadRetryPolicy configures the retry policy used after split
+// commit when waiting for the local catalog snapshot to become visible.
+func WithCatalogReloadRetryPolicy(attempts int, interval time.Duration) DistributionServerOption {
+	return func(s *DistributionServer) {
+		if attempts > 0 {
+			s.reloadRetry.attempts = attempts
+		}
+		if interval > 0 {
+			s.reloadRetry.interval = interval
+		}
+	}
+}
+
 const (
-	childRouteCount            = 2
-	splitMutationOpCount       = childRouteCount + 3
-	catalogReloadRetryAttempts = 20
-	catalogReloadRetryInterval = 10 * time.Millisecond
+	childRouteCount      = 2
+	splitMutationOpCount = childRouteCount + 3
 )
 
 var (
+	defaultCatalogReloadRetryAttempts = 20
+	defaultCatalogReloadRetryInterval = 10 * time.Millisecond
+
 	errDistributionCatalogNotConfigured = errors.New("route catalog is not configured")
 	errDistributionUnknownRoute         = errors.New("unknown route")
 	errDistributionInvalidSplitKey      = errors.New("invalid split key")
@@ -60,6 +78,8 @@ func NewDistributionServer(e *distribution.Engine, catalog *distribution.Catalog
 		engine:  e,
 		catalog: catalog,
 	}
+	s.reloadRetry.attempts = defaultCatalogReloadRetryAttempts
+	s.reloadRetry.interval = defaultCatalogReloadRetryInterval
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
@@ -253,8 +273,17 @@ func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
 	ctx context.Context,
 	minVersion uint64,
 ) (distribution.CatalogSnapshot, error) {
+	attempts := s.reloadRetry.attempts
+	if attempts <= 0 {
+		attempts = defaultCatalogReloadRetryAttempts
+	}
+	interval := s.reloadRetry.interval
+	if interval <= 0 {
+		interval = defaultCatalogReloadRetryInterval
+	}
+
 	var last distribution.CatalogSnapshot
-	for attempt := 0; attempt < catalogReloadRetryAttempts; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		snapshot, err := s.catalog.Snapshot(ctx)
 		if err != nil {
 			return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
@@ -263,10 +292,10 @@ func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
 			return snapshot, nil
 		}
 		last = snapshot
-		if attempt == catalogReloadRetryAttempts-1 {
+		if attempt == attempts-1 {
 			break
 		}
-		if err := waitWithContext(ctx, catalogReloadRetryInterval); err != nil {
+		if err := waitWithContext(ctx, interval); err != nil {
 			return distribution.CatalogSnapshot{}, err
 		}
 	}

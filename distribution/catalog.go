@@ -157,7 +157,7 @@ func DecodeCatalogVersion(raw []byte) (uint64, error) {
 func DecodeCatalogNextRouteID(raw []byte) (uint64, error) {
 	nextRouteID, err := DecodeCatalogVersion(raw)
 	if err != nil {
-		return 0, errors.WithStack(ErrCatalogInvalidNextRouteID)
+		return 0, errors.Wrapf(ErrCatalogInvalidNextRouteID, "decode next route id: %v", err)
 	}
 	if nextRouteID == 0 {
 		return 0, errors.WithStack(ErrCatalogInvalidNextRouteID)
