@@ -24,7 +24,8 @@ const (
 
 const (
 	updateSplitCount            = 2
-	transactRetryMaxAttempts    = 256
+	transactRetryMaxAttempts    = 128
+	transactRetryMaxDuration    = 2 * time.Second
 	transactRetryInitialBackoff = 1 * time.Millisecond
 	transactRetryMaxBackoff     = 10 * time.Millisecond
 	transactRetryBackoffFactor  = 2
@@ -212,7 +213,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	reqs, err := d.dynamoTranscoder.TransactWriteItemsToRequest(body)
@@ -231,6 +232,7 @@ func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Reque
 func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	backoff := transactRetryInitialBackoff
 	var lastErr error
+	startedAt := time.Now()
 
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
 		resp, err := d.coordinator.Dispatch(ctx, reqs)
@@ -241,8 +243,14 @@ func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context
 		if !isRetryableTransactWriteError(err) {
 			return nil, lastErr
 		}
+		if time.Since(startedAt) >= transactRetryMaxDuration {
+			return nil, errors.Wrapf(lastErr, "transact write retry timeout after %s", transactRetryMaxDuration)
+		}
 		if err := waitTransactRetryBackoff(ctx, backoff); err != nil {
-			return nil, err
+			if lastErr == nil {
+				return nil, err
+			}
+			return nil, errors.Wrapf(err, "transact write retry canceled after previous error: %v", lastErr)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}

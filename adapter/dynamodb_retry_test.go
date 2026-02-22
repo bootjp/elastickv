@@ -41,6 +41,25 @@ func TestDispatchTransactWriteItemsWithRetry_NonRetryableError(t *testing.T) {
 	require.Equal(t, uint64(1), coord.DispatchCalls())
 }
 
+func TestDispatchTransactWriteItemsWithRetry_ContextCanceledIncludesLastError(t *testing.T) {
+	t.Parallel()
+
+	coord := &retryCoordinator{
+		failures: 1_000,
+		err:      errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+	}
+	server := &DynamoDBServer{coordinator: coord}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resp, err := server.dispatchTransactWriteItemsWithRetry(ctx, &kv.OperationGroup[kv.OP]{IsTxn: true})
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.True(t, errors.Is(err, context.Canceled), "expected context cancellation in error chain")
+	require.Contains(t, err.Error(), kv.ErrTxnLocked.Error())
+}
+
 type retryCoordinator struct {
 	mu       sync.Mutex
 	failures uint64
