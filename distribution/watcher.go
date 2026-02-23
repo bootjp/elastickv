@@ -121,10 +121,6 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		Routes:  routes,
 		ReadTS:  readTS,
 	}
-	if snapshot.Version <= w.engine.Version() {
-		return nil
-	}
-
 	if err := w.engine.ApplySnapshot(snapshot); err != nil {
 		if errors.Is(err, ErrEngineSnapshotVersionStale) {
 			return nil

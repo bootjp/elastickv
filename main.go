@@ -70,8 +70,6 @@ func run() error {
 		cancel()
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
-			// shardStore already closed group stores.
-			clearRuntimeStore(rt)
 			rt.Close()
 		}
 	}()
@@ -91,10 +89,10 @@ func run() error {
 	)
 
 	if err := startRaftServers(runCtx, &lc, eg, runtimes, shardStore, coordinate, distServer); err != nil {
-		return err
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startRedisServer(runCtx, &lc, eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
-		return err
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -316,16 +314,17 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 	return route.GroupID, nil
 }
 
-func clearRuntimeStore(rt *raftGroupRuntime) {
-	if rt == nil {
-		return
-	}
-	rt.store = nil
-}
-
 func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
 	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
 		return errors.Wrapf(err, "catalog watcher failed")
 	}
 	return nil
+}
+
+func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
+	cancel()
+	if err := eg.Wait(); err != nil {
+		return errors.Wrapf(startupErr, "startup failed and shutdown returned error: %v", err)
+	}
+	return startupErr
 }
