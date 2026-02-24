@@ -13,6 +13,12 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 ## Development Status
 Elastickv is in the experimental and developmental phase, aspiring to bring to life features that resonate with industry standards like DynamoDB, tailored for cloud infrastructures. We welcome contributions, ideas, and feedback as we navigate through the intricacies of developing a scalable and efficient cloud-optimized distributed key-value store.
 
+## Architecture
+
+Architecture diagrams are available in:
+
+- `docs/architecture_overview.md`
+
 
 ## Example Usage
 
@@ -68,6 +74,57 @@ get bbbb
 quit
 ```
 
+### Manual Route Split API (Milestone 1)
+
+Milestone 1 includes manual control-plane APIs on `proto.Distribution`:
+
+1. `ListRoutes`
+2. `SplitRange` (same-group split only)
+
+Use `grpcurl` against a running node:
+
+```bash
+# 1) Read current durable route catalog
+grpcurl -plaintext -d '{}' localhost:50051 proto.Distribution/ListRoutes
+
+# 2) Split route 1 at user key "g" (bytes are base64 in grpcurl JSON: "g" -> "Zw==")
+grpcurl -plaintext -d '{
+  "expectedCatalogVersion": 1,
+  "routeId": 1,
+  "splitKey": "Zw=="
+}' localhost:50051 proto.Distribution/SplitRange
+```
+
+Example `SplitRange` response:
+
+```json
+{
+  "catalogVersion": "2",
+  "left": {
+    "routeId": "3",
+    "start": "",
+    "end": "Zw==",
+    "raftGroupId": "1",
+    "state": "ROUTE_STATE_ACTIVE",
+    "parentRouteId": "1"
+  },
+  "right": {
+    "routeId": "4",
+    "start": "Zw==",
+    "end": "bQ==",
+    "raftGroupId": "1",
+    "state": "ROUTE_STATE_ACTIVE",
+    "parentRouteId": "1"
+  }
+}
+```
+
+Notes:
+
+1. `expectedCatalogVersion` must match the latest `ListRoutes.catalogVersion`.
+2. `splitKey` must be strictly inside the parent range (not equal to range start/end).
+3. Milestone 1 split keeps both children in the same Raft group as the parent.
+
 
 ### Development
 
@@ -91,4 +148,3 @@ history.
 ```bash
 git config --local core.hooksPath .githooks
 ```
-
