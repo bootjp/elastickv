@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -21,10 +20,10 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	pkgerrors "github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -184,6 +183,9 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	for _, n := range nodes[1:] {
 		var joined bool
 		for i := 0; i < joinRetries; i++ {
+			if ctx.Err() != nil {
+				return nil
+			}
 			slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
 			_, err := client.AddVoter(ctx, &raftadminpb.AddVoterRequest{
 				Id:            n.raftID,
@@ -212,7 +214,9 @@ func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return pkgerrors.WithStack(ctx.Err())
+		// In errgroup.WithContext setups, keep the original goroutine error as the
+		// returned cause from eg.Wait() instead of surfacing cancellation here.
+		return nil
 	case <-timer.C:
 		return nil
 	}
@@ -223,19 +227,19 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
 	}
 	if err := os.MkdirAll(dir, defaultFileMode); err != nil {
-		return nil, nil, nil, pkgerrors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(err)
 	}
 	ldb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
 	if err != nil {
-		return nil, nil, nil, pkgerrors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(err)
 	}
 	sdb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
 	if err != nil {
-		return nil, nil, nil, pkgerrors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(err)
 	}
 	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
 	if err != nil {
-		return nil, nil, nil, pkgerrors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(err)
 	}
 	return ldb, sdb, fss, nil
 }
@@ -271,7 +275,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 
 	l, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
-		return nil, pkgerrors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
 }
@@ -303,7 +307,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
-		return pkgerrors.WithStack(err)
+		return errors.WithStack(err)
 	}
 
 	if cfg.raftBootstrap {
@@ -318,7 +322,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		}
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
-			return pkgerrors.WithStack(err)
+			return errors.WithStack(err)
 		}
 	}
 
@@ -327,7 +331,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
-		return pkgerrors.WithStack(err)
+		return errors.WithStack(err)
 	}
 	distServer := adapter.NewDistributionServer(
 		distEngine,
@@ -339,7 +343,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
-		return pkgerrors.WithStack(err)
+		return errors.WithStack(err)
 	}
 
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
@@ -359,7 +363,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
 	return func() error {
 		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default()); err != nil {
-			return pkgerrors.Wrapf(err, "catalog watcher failed")
+			return errors.Wrapf(err, "catalog watcher failed")
 		}
 		return nil
 	}
@@ -384,7 +388,7 @@ func grpcServeTask(server *grpc.Server, listener net.Listener, address string) f
 		if err == nil || errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
-		return pkgerrors.WithStack(err)
+		return errors.WithStack(err)
 	}
 }
 
@@ -404,6 +408,6 @@ func redisServeTask(redisServer *adapter.RedisServer, address string) func() err
 		if err == nil || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
-		return pkgerrors.WithStack(err)
+		return errors.WithStack(err)
 	}
 }

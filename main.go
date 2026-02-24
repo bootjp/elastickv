@@ -324,7 +324,11 @@ func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.Ca
 func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
 	cancel()
 	if err := eg.Wait(); err != nil {
-		return errors.Wrapf(startupErr, "startup failed and shutdown returned error: %v", err)
+		joined := errors.Join(
+			startupErr,
+			errors.Wrap(err, "shutdown failed after startup error"),
+		)
+		return errors.Wrap(joined, "startup failed")
 	}
 	return startupErr
 }

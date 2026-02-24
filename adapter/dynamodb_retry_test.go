@@ -57,7 +57,7 @@ func TestDispatchTransactWriteItemsWithRetry_ContextCanceledIncludesLastError(t 
 	require.Error(t, err)
 	require.Nil(t, resp)
 	require.True(t, errors.Is(err, context.Canceled), "expected context cancellation in error chain")
-	require.Contains(t, err.Error(), kv.ErrTxnLocked.Error())
+	require.True(t, errors.Is(err, kv.ErrTxnLocked), "expected last dispatch error in error chain")
 }
 
 type retryCoordinator struct {

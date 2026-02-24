@@ -247,15 +247,13 @@ func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context
 			return nil, errors.Wrapf(lastErr, "transact write retry timeout after %s (attempts: %d)", transactRetryMaxDuration, attempt+1)
 		}
 		if err := waitTransactRetryBackoff(ctx, backoff); err != nil {
-			if lastErr == nil {
-				return nil, err
-			}
-			return nil, errors.Wrapf(err, "transact write retry canceled: %v", lastErr)
+			combined := errors.Join(err, lastErr)
+			return nil, errors.Wrap(combined, "transact write retry canceled")
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 
-	return nil, lastErr
+	return nil, errors.Wrapf(lastErr, "transact write retry attempts exhausted after %s (attempts: %d)", time.Since(startedAt), transactRetryMaxAttempts)
 }
 
 func isRetryableTransactWriteError(err error) bool {
@@ -275,9 +273,6 @@ func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {
 }
 
 func nextTransactRetryBackoff(current time.Duration) time.Duration {
-	if current >= transactRetryMaxBackoff {
-		return transactRetryMaxBackoff
-	}
 	next := current * transactRetryBackoffFactor
 	if next > transactRetryMaxBackoff {
 		return transactRetryMaxBackoff
