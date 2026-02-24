@@ -11,9 +11,9 @@ import (
 const defaultCatalogWatcherInterval = 100 * time.Millisecond
 
 var (
-	errCatalogWatcherContextRequired  = errors.New("catalog watcher context is required")
-	errCatalogWatcherInvalidInterval  = errors.New("catalog watcher interval must be positive")
-	errCatalogWatcherLoggerIsRequired = errors.New("catalog watcher logger is required")
+	errCatalogWatcherContextRequired = errors.New("catalog watcher context is required")
+	errCatalogWatcherInvalidInterval = errors.New("catalog watcher interval must be positive")
+	errCatalogWatcherLoggerRequired  = errors.New("catalog watcher logger is required")
 )
 
 // CatalogWatcherOption customizes CatalogWatcher behavior.
@@ -145,7 +145,7 @@ func (w *CatalogWatcher) validate() error {
 		return errors.WithStack(errCatalogWatcherInvalidInterval)
 	}
 	if w.logger == nil {
-		return errors.WithStack(errCatalogWatcherLoggerIsRequired)
+		return errors.WithStack(errCatalogWatcherLoggerRequired)
 	}
 	return nil
 }

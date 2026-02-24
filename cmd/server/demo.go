@@ -170,7 +170,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	leader := nodes[0]
 	// Give servers some time to start
 	if err := waitForJoinRetry(ctx, joinWait); err != nil {
-		return err
+		return joinClusterWaitError(err)
 	}
 
 	// Connect to leader
@@ -184,9 +184,6 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	for _, n := range nodes[1:] {
 		var joined bool
 		for i := 0; i < joinRetries; i++ {
-			if ctx.Err() != nil {
-				return nil
-			}
 			slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
 			_, err := client.AddVoter(ctx, &raftadminpb.AddVoterRequest{
 				Id:            n.raftID,
@@ -198,9 +195,12 @@ func joinCluster(ctx context.Context, nodes []config) error {
 				joined = true
 				break
 			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
 			if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
-				return err
+				return joinClusterWaitError(err)
 			}
 		}
 		if !joined {
@@ -215,12 +215,18 @@ func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		// In errgroup.WithContext setups, keep the original goroutine error as the
-		// returned cause from eg.Wait() instead of surfacing cancellation here.
-		return nil
+		return errors.WithStack(ctx.Err())
 	case <-timer.C:
 		return nil
 	}
+}
+
+func joinClusterWaitError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Do not override the original errgroup cause with cancellation.
+		return nil
+	}
+	return err
 }
 
 func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
