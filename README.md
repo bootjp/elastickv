@@ -5,10 +5,16 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 
 **THIS PROJECT IS CURRENTLY UNDER DEVELOPMENT AND IS NOT READY FOR PRODUCTION USE.**
 
+## Implemented Features (Verified)
+- **Raft-based Data Replication**: KV state replication is implemented on Raft, with leader-based commit and follower forwarding paths.
+- **Shard-aware Data Plane**: Static shard ranges across multiple Raft groups with shard routing/coordinator are implemented.
+- **Durable Route Control Plane (Milestone 1)**: Durable route catalog, versioned route snapshot apply, watcher-based route refresh, and manual `ListRoutes`/`SplitRange` (same-group split) are implemented.
+- **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis (core commands + `MULTI/EXEC` and list operations), and DynamoDB-compatible API (`PutItem`/`GetItem`/`UpdateItem`/`TransactWriteItems`) implementations are available (runtime exposure depends on the selected server entrypoint/configuration).
+- **Basic Consistency Behaviors**: Write-after-read checks, leader redirection/forwarding paths, and OCC conflict detection for transactional writes are covered by tests.
+
 ## Planned Features
-- **Raft-based Data Replication**: Intends to implement data consistency and fault tolerance using the Raft consensus algorithm for distributed systems.
-- **Dynamic Node Scaling**: Aims to dynamically adjust nodes and partition keys in response to variable loads, inspired by DynamoDB's cloud scalability.
-- **Automatic Hot Spot Re-allocation**: Plans to incorporate the capability to identify and reallocate hot spots in real-time, to improve system performance and efficiency in cloud settings.
+- **Dynamic Node Scaling**: Automatic node/range scaling based on load is not yet implemented (current sharding operations are configuration/manual driven).
+- **Automatic Hot Spot Re-allocation**: Automatic hotspot detection/scheduling and cross-group relocation are not yet implemented (Milestone 1 currently provides manual same-group split).
 
 ## Development Status
 Elastickv is in the experimental and developmental phase, aspiring to bring to life features that resonate with industry standards like DynamoDB, tailored for cloud infrastructures. We welcome contributions, ideas, and feedback as we navigate through the intricacies of developing a scalable and efficient cloud-optimized distributed key-value store.

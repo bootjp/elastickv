@@ -243,43 +243,7 @@ Milestone 1 implementation status (current):
 2. `SplitRange` currently supports same-group split only (no cross-group migration).
 3. Not implemented yet: `ReportAccess`, `WatchRoutes`, `GetSplitJob`.
 
-Operator examples (Milestone 1):
-
-```bash
-# Read durable catalog version and route descriptors
-grpcurl -plaintext -d '{}' localhost:50051 proto.Distribution/ListRoutes
-
-# Split route 1 at key "g" (bytes in grpcurl JSON are base64: "g" -> "Zw==")
-grpcurl -plaintext -d '{
-  "expectedCatalogVersion": 1,
-  "routeId": 1,
-  "splitKey": "Zw=="
-}' localhost:50051 proto.Distribution/SplitRange
-```
-
-Example split response:
-
-```json
-{
-  "catalogVersion": "2",
-  "left": {
-    "routeId": "3",
-    "start": "",
-    "end": "Zw==",
-    "raftGroupId": "1",
-    "state": "ROUTE_STATE_ACTIVE",
-    "parentRouteId": "1"
-  },
-  "right": {
-    "routeId": "4",
-    "start": "Zw==",
-    "end": "bQ==",
-    "raftGroupId": "1",
-    "state": "ROUTE_STATE_ACTIVE",
-    "parentRouteId": "1"
-  }
-}
-```
+For operator examples, see the [Manual Route Split API section in the README](../README.md#manual-route-split-api-milestone-1).
 
 ### 10.2 `proto/internal.proto`
 
