@@ -190,9 +190,9 @@ func TestMilestone1SplitRange_RestartReloadsCatalog(t *testing.T) {
 
 	reopenedStore, err := store.NewPebbleStore(catalogDir)
 	require.NoError(t, err)
-	defer func() {
+	t.Cleanup(func() {
 		require.NoError(t, reopenedStore.Close())
-	}()
+	})
 
 	reopenedCatalog := distribution.NewCatalogStore(reopenedStore)
 	restartedEngine := distribution.NewEngine()
