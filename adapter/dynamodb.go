@@ -22,7 +22,14 @@ const (
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
-const updateSplitCount = 2
+const (
+	updateSplitCount            = 2
+	transactRetryMaxAttempts    = 128
+	transactRetryMaxDuration    = 2 * time.Second
+	transactRetryInitialBackoff = 1 * time.Millisecond
+	transactRetryMaxBackoff     = 10 * time.Millisecond
+	transactRetryBackoffFactor  = 2
+)
 
 type DynamoDBServer struct {
 	listen           net.Listener
@@ -70,23 +77,23 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	case transactWriteItemsTarget:
 		d.transactWriteItems(w, r)
 	default:
-		http.Error(w, "unsupported operation", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "unsupported operation")
 	}
 }
 
 func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	reqs, err := d.dynamoTranscoder.PutItemToRequest(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -101,17 +108,17 @@ type getItemInput struct {
 func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	var in getItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	keyAttr, ok := in.Key["key"]
 	if !ok {
-		http.Error(w, "missing key", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing key")
 		return
 	}
 	readTS := snapshotTS(d.coordinator.Clock(), d.store)
@@ -122,7 +129,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte("{}"))
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	resp := map[string]map[string]attributeValue{
@@ -133,7 +140,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := json.Marshal(resp)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -152,37 +159,36 @@ type updateItemInput struct {
 func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	var in updateItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	keyAttr, ok := in.Key["key"]
 	if !ok {
-		http.Error(w, "missing key", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing key")
 		return
 	}
 	key := []byte(keyAttr.S)
 
 	if err := d.validateCondition(r.Context(), in.ConditionExpression, in.ExpressionAttributeNames, key); err != nil {
-		w.Header().Set("x-amzn-ErrorType", "ConditionalCheckFailedException")
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ConditionalCheckFailedException", err.Error())
 		return
 	}
 
 	updExpr := replaceNames(in.UpdateExpression, in.ExpressionAttributeNames)
 	parts := strings.SplitN(updExpr, "=", updateSplitCount)
 	if len(parts) != updateSplitCount {
-		http.Error(w, "invalid update expression", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "invalid update expression")
 		return
 	}
 	valPlaceholder := strings.TrimSpace(parts[1])
 	valAttr, ok := in.ExpressionAttributeValues[valPlaceholder]
 	if !ok {
-		http.Error(w, "missing value attribute", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing value attribute")
 		return
 	}
 
@@ -196,7 +202,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		Elems: []*kv.Elem[kv.OP]{elem},
 	}
 	if _, err = d.coordinator.Dispatch(r.Context(), req); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -206,20 +212,96 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	reqs, err := d.dynamoTranscoder.TransactWriteItemsToRequest(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
-	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if _, err = d.dispatchTransactWriteItemsWithRetry(r.Context(), reqs); err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	_, _ = w.Write([]byte("{}"))
+}
+
+func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	backoff := transactRetryInitialBackoff
+	var lastErr error
+	startedAt := time.Now()
+	deadline := startedAt.Add(transactRetryMaxDuration)
+
+	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
+		// Retry with a fresh transaction start timestamp.
+		reqs.StartTS = 0
+		resp, err := d.coordinator.Dispatch(ctx, reqs)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = errors.WithStack(err)
+		if !isRetryableTransactWriteError(err) {
+			return nil, lastErr
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, errors.Wrapf(lastErr, "transact write retry timeout after %s (attempts: %d)", transactRetryMaxDuration, attempt+1)
+		}
+		retryDelay := backoff
+		if retryDelay > remaining {
+			retryDelay = remaining
+		}
+		if err := waitTransactRetryBackoff(ctx, retryDelay); err != nil {
+			combined := errors.Join(err, lastErr)
+			return nil, errors.Wrap(combined, "transact write retry canceled")
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+
+	return nil, errors.Wrapf(lastErr, "transact write retry attempts exhausted after %s (attempts: %d)", time.Since(startedAt), transactRetryMaxAttempts)
+}
+
+func isRetryableTransactWriteError(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+}
+
+func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+func nextTransactRetryBackoff(current time.Duration) time.Duration {
+	next := current * transactRetryBackoffFactor
+	if next > transactRetryMaxBackoff {
+		return transactRetryMaxBackoff
+	}
+	return next
+}
+
+func writeDynamoError(w http.ResponseWriter, status int, errorType string, message string) {
+	if message == "" {
+		message = http.StatusText(status)
+	}
+
+	resp := map[string]string{
+		"message": message,
+	}
+	if errorType != "" {
+		resp["__type"] = errorType
+		w.Header().Set("x-amzn-ErrorType", errorType)
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func replaceNames(expr string, names map[string]string) string {

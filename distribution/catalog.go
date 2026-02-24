@@ -225,9 +225,7 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	if err := ensureCatalogStore(s); err != nil {
 		return CatalogSnapshot{}, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = contextOrBackground(ctx)
 
 	readTS := s.store.LastCommitTS()
 	version, err := s.versionAt(ctx, readTS)
@@ -241,14 +239,24 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: readTS}, nil
 }
 
+// Version reads only the durable catalog version at the latest commit
+// timestamp.
+func (s *CatalogStore) Version(ctx context.Context) (uint64, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return 0, err
+	}
+	ctx = contextOrBackground(ctx)
+
+	readTS := s.store.LastCommitTS()
+	return s.versionAt(ctx, readTS)
+}
+
 // NextRouteID reads the next route id counter from catalog metadata.
 func (s *CatalogStore) NextRouteID(ctx context.Context) (uint64, error) {
 	if err := ensureCatalogStore(s); err != nil {
 		return 0, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = contextOrBackground(ctx)
 
 	readTS := s.store.LastCommitTS()
 	nextRouteID, err := s.NextRouteIDAt(ctx, readTS)
@@ -263,9 +271,7 @@ func (s *CatalogStore) NextRouteIDAt(ctx context.Context, ts uint64) (uint64, er
 	if err := ensureCatalogStore(s); err != nil {
 		return 0, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = contextOrBackground(ctx)
 	nextRouteID, err := s.nextRouteIDAt(ctx, ts)
 	if err != nil {
 		return 0, err
@@ -288,9 +294,7 @@ func (s *CatalogStore) Save(ctx context.Context, expectedVersion uint64, routes 
 	if err := ensureCatalogStore(s); err != nil {
 		return CatalogSnapshot{}, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = contextOrBackground(ctx)
 
 	plan, err := s.prepareSave(ctx, expectedVersion, routes)
 	if err != nil {
@@ -315,6 +319,13 @@ func ensureCatalogStore(s *CatalogStore) error {
 		return errors.WithStack(ErrCatalogStoreRequired)
 	}
 	return nil
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func normalizeRoutes(routes []RouteDescriptor) ([]RouteDescriptor, error) {

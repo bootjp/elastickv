@@ -970,12 +970,8 @@ func (s *ShardStore) closeGroup(g *ShardGroup) error {
 	}
 
 	var first error
-	if g.Store != nil {
-		if err := g.Store.Close(); err != nil && first == nil {
-			first = errors.WithStack(err)
-		}
-	}
-
+	// MVCC store lifecycle is owned by raft group runtimes; avoid closing it
+	// here to prevent double-close during process shutdown.
 	if closer, ok := g.Txn.(io.Closer); ok {
 		if err := closer.Close(); err != nil && first == nil {
 			first = errors.WithStack(err)

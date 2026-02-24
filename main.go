@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
@@ -51,7 +52,6 @@ func run() error {
 		return errors.New("flag --raftId is required")
 	}
 
-	ctx := context.Background()
 	var lc net.ListenConfig
 
 	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *raftGroups, *shardRanges, *raftRedisMap)
@@ -63,34 +63,37 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	clock := kv.NewHLC()
+	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() {
+		cancel()
+		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()
 		}
 	}()
-
-	clock := kv.NewHLC()
-	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	defer func() { _ = shardStore.Close() }()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
-	distCatalog := distributionCatalogStoreForGroup(runtimes, cfg.defaultGroup)
-	if distCatalog != nil {
-		if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, cfg.engine); err != nil {
-			return errors.Wrapf(err, "initialize distribution catalog")
-		}
+	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
+	if err != nil {
+		return err
 	}
+	eg, runCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+	})
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 	)
 
-	eg := errgroup.Group{}
-	if err := startRaftServers(ctx, &lc, &eg, runtimes, shardStore, coordinate, distServer); err != nil {
-		return err
+	if err := startRaftServers(runCtx, &lc, eg, runtimes, shardStore, coordinate, distServer); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startRedisServer(ctx, &lc, &eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
-		return err
+	if err := startRedisServer(runCtx, &lc, eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -221,8 +224,27 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		lis := grpcSock
 		grpcService := grpcSvc
 		eg.Go(func() error {
-			defer func() { _ = grpcService.Close() }()
-			return errors.WithStack(srv.Serve(lis))
+			var closeOnce sync.Once
+			closeService := func() {
+				closeOnce.Do(func() { _ = grpcService.Close() })
+			}
+			stop := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					srv.GracefulStop()
+					_ = lis.Close()
+					closeService()
+				case <-stop:
+				}
+			}()
+			err := srv.Serve(lis)
+			close(stop)
+			closeService()
+			if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return errors.WithStack(err)
 		})
 	}
 	return nil
@@ -233,8 +255,23 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
+	redisServer := adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis)
 	eg.Go(func() error {
-		return errors.WithStack(adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis).Run())
+		defer redisServer.Stop()
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				redisServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := redisServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
 	})
 	return nil
 }
@@ -249,4 +286,56 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 		}
 	}
 	return nil
+}
+
+func setupDistributionCatalog(
+	ctx context.Context,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+) (*distribution.CatalogStore, error) {
+	catalogGroupID, err := distributionCatalogGroupID(engine)
+	if err != nil {
+		return nil, errors.Wrapf(err, "resolve distribution catalog group")
+	}
+	distCatalog := distributionCatalogStoreForGroup(runtimes, catalogGroupID)
+	if distCatalog == nil {
+		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
+	}
+	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+		return nil, errors.Wrapf(err, "initialize distribution catalog")
+	}
+	return distCatalog, nil
+}
+
+func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
+	if engine == nil {
+		return 0, errors.New("distribution engine is required")
+	}
+	route, ok := engine.GetRoute(distribution.CatalogVersionKey())
+	if !ok {
+		return 0, errors.New("no shard route for distribution catalog key")
+	}
+	if route.GroupID == 0 {
+		return 0, errors.New("invalid shard route for distribution catalog key")
+	}
+	return route.GroupID, nil
+}
+
+func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
+	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
+		return errors.Wrapf(err, "catalog watcher failed")
+	}
+	return nil
+}
+
+func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
+	cancel()
+	if err := eg.Wait(); err != nil {
+		joined := errors.Join(
+			startupErr,
+			errors.Wrap(err, "shutdown failed after startup error"),
+		)
+		return errors.Wrap(joined, "startup failed")
+	}
+	return startupErr
 }
