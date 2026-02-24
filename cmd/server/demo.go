@@ -196,7 +196,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 				break
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
+				return joinClusterWaitError(errors.WithStack(err))
 			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
 			if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {

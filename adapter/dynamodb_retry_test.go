@@ -15,8 +15,9 @@ func TestDispatchTransactWriteItemsWithRetry_RetryableError(t *testing.T) {
 	t.Parallel()
 
 	coord := &retryCoordinator{
-		failures: 3,
-		err:      errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+		failures:      3,
+		err:           errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+		assignStartTS: true,
 	}
 	server := &DynamoDBServer{coordinator: coord}
 
@@ -45,8 +46,9 @@ func TestDispatchTransactWriteItemsWithRetry_ContextCanceledIncludesLastError(t 
 	t.Parallel()
 
 	coord := &retryCoordinator{
-		failures: 1_000,
-		err:      errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+		failures:      1_000,
+		err:           errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+		assignStartTS: true,
 	}
 	server := &DynamoDBServer{coordinator: coord}
 
@@ -60,17 +62,40 @@ func TestDispatchTransactWriteItemsWithRetry_ContextCanceledIncludesLastError(t 
 	require.True(t, errors.Is(err, kv.ErrTxnLocked), "expected last dispatch error in error chain")
 }
 
-type retryCoordinator struct {
-	mu       sync.Mutex
-	failures uint64
-	calls    uint64
-	err      error
+func TestDispatchTransactWriteItemsWithRetry_ResetsStartTSOnRetry(t *testing.T) {
+	t.Parallel()
+
+	coord := &retryCoordinator{
+		failures:      2,
+		err:           errors.Wrapf(kv.ErrTxnLocked, "key: k"),
+		assignStartTS: true,
+	}
+	server := &DynamoDBServer{coordinator: coord}
+
+	resp, err := server.dispatchTransactWriteItemsWithRetry(context.Background(), &kv.OperationGroup[kv.OP]{IsTxn: true})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(3), coord.DispatchCalls())
+	require.Equal(t, []uint64{0, 0, 0}, coord.StartTSes())
 }
 
-func (c *retryCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+type retryCoordinator struct {
+	mu            sync.Mutex
+	failures      uint64
+	calls         uint64
+	err           error
+	assignStartTS bool
+	startTSes     []uint64
+}
+
+func (c *retryCoordinator) Dispatch(_ context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.startTSes = append(c.startTSes, reqs.StartTS)
 	c.calls++
+	if c.assignStartTS && reqs.StartTS == 0 {
+		reqs.StartTS = c.calls
+	}
 	if c.calls <= c.failures {
 		return nil, c.err
 	}
@@ -81,6 +106,14 @@ func (c *retryCoordinator) DispatchCalls() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
+}
+
+func (c *retryCoordinator) StartTSes() []uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]uint64, len(c.startTSes))
+	copy(out, c.startTSes)
+	return out
 }
 
 func (c *retryCoordinator) IsLeader() bool { return true }

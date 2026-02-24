@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	stderrors "errors"
 	"flag"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
@@ -224,18 +224,23 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		lis := grpcSock
 		grpcService := grpcSvc
 		eg.Go(func() error {
-			defer func() { _ = grpcService.Close() }()
+			var closeOnce sync.Once
+			closeService := func() {
+				closeOnce.Do(func() { _ = grpcService.Close() })
+			}
 			stop := make(chan struct{})
 			go func() {
 				select {
 				case <-ctx.Done():
 					srv.GracefulStop()
 					_ = lis.Close()
+					closeService()
 				case <-stop:
 				}
 			}()
 			err := srv.Serve(lis)
 			close(stop)
+			closeService()
 			if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
@@ -252,6 +257,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	}
 	redisServer := adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis)
 	eg.Go(func() error {
+		defer redisServer.Stop()
 		stop := make(chan struct{})
 		go func() {
 			select {
@@ -325,7 +331,7 @@ func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.Ca
 func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
 	cancel()
 	if err := eg.Wait(); err != nil {
-		joined := stderrors.Join(
+		joined := errors.Join(
 			startupErr,
 			errors.Wrap(err, "shutdown failed after startup error"),
 		)

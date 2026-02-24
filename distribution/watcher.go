@@ -80,6 +80,9 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
+	if err := w.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		w.logger.ErrorContext(ctx, "catalog watcher initial sync failed", "error", err)
+	}
 
 	timer := time.NewTimer(w.interval)
 	defer timer.Stop()
