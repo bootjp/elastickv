@@ -78,23 +78,23 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	case transactWriteItemsTarget:
 		d.transactWriteItems(w, r)
 	default:
-		http.Error(w, "unsupported operation", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "unsupported operation")
 	}
 }
 
 func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	reqs, err := d.dynamoTranscoder.PutItemToRequest(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	if _, err = d.coordinator.Dispatch(r.Context(), reqs); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -109,17 +109,17 @@ type getItemInput struct {
 func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	var in getItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	keyAttr, ok := in.Key["key"]
 	if !ok {
-		http.Error(w, "missing key", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing key")
 		return
 	}
 	readTS := snapshotTS(d.coordinator.Clock(), d.store)
@@ -130,7 +130,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte("{}"))
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	resp := map[string]map[string]attributeValue{
@@ -141,7 +141,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := json.Marshal(resp)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -160,37 +160,36 @@ type updateItemInput struct {
 func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	var in updateItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	keyAttr, ok := in.Key["key"]
 	if !ok {
-		http.Error(w, "missing key", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing key")
 		return
 	}
 	key := []byte(keyAttr.S)
 
 	if err := d.validateCondition(r.Context(), in.ConditionExpression, in.ExpressionAttributeNames, key); err != nil {
-		w.Header().Set("x-amzn-ErrorType", "ConditionalCheckFailedException")
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ConditionalCheckFailedException", err.Error())
 		return
 	}
 
 	updExpr := replaceNames(in.UpdateExpression, in.ExpressionAttributeNames)
 	parts := strings.SplitN(updExpr, "=", updateSplitCount)
 	if len(parts) != updateSplitCount {
-		http.Error(w, "invalid update expression", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "invalid update expression")
 		return
 	}
 	valPlaceholder := strings.TrimSpace(parts[1])
 	valAttr, ok := in.ExpressionAttributeValues[valPlaceholder]
 	if !ok {
-		http.Error(w, "missing value attribute", http.StatusBadRequest)
+		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "missing value attribute")
 		return
 	}
 
@@ -204,7 +203,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		Elems: []*kv.Elem[kv.OP]{elem},
 	}
 	if _, err = d.coordinator.Dispatch(r.Context(), req); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
