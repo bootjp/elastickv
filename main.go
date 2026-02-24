@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"flag"
 	"log"
 	"net"
@@ -324,7 +325,7 @@ func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.Ca
 func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
 	cancel()
 	if err := eg.Wait(); err != nil {
-		joined := errors.Join(
+		joined := stderrors.Join(
 			startupErr,
 			errors.Wrap(err, "shutdown failed after startup error"),
 		)

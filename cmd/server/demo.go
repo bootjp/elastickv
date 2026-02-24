@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -244,7 +245,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	return ldb, sdb, fss, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) *grpc.Server {
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
@@ -256,7 +257,7 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 	pb.RegisterDistributionServer(s, distServer)
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
-	return s
+	return s, gs
 }
 
 func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string) (*adapter.RedisServer, error) {
@@ -339,7 +340,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		adapter.WithDistributionCoordinator(coordinator),
 	)
 
-	s := setupGRPC(r, st, tm, coordinator, distServer)
+	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
@@ -352,7 +353,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
-	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address))
+	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
 	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
 	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))
 	eg.Go(redisServeTask(rd, cfg.redisAddress))
@@ -369,13 +370,18 @@ func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogSt
 	}
 }
 
-func grpcShutdownTask(ctx context.Context, server *grpc.Server, listener net.Listener, address string) func() error {
+func grpcShutdownTask(ctx context.Context, server *grpc.Server, listener net.Listener, address string, closer io.Closer) func() error {
 	return func() error {
 		<-ctx.Done()
 		slog.Info("Shutting down gRPC server", "address", address, "reason", ctx.Err())
 		server.GracefulStop()
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			slog.Error("Failed to close gRPC listener", "address", address, "err", err)
+		}
+		if closer != nil {
+			if err := closer.Close(); err != nil {
+				slog.Error("Failed to close gRPC service", "address", address, "err", err)
+			}
 		}
 		return nil
 	}

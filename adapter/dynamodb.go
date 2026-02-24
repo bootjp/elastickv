@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"io"
 	"net"
 	"net/http"
@@ -233,6 +234,7 @@ func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context
 	backoff := transactRetryInitialBackoff
 	var lastErr error
 	startedAt := time.Now()
+	deadline := startedAt.Add(transactRetryMaxDuration)
 
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
 		resp, err := d.coordinator.Dispatch(ctx, reqs)
@@ -243,11 +245,16 @@ func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context
 		if !isRetryableTransactWriteError(err) {
 			return nil, lastErr
 		}
-		if time.Since(startedAt) >= transactRetryMaxDuration {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return nil, errors.Wrapf(lastErr, "transact write retry timeout after %s (attempts: %d)", transactRetryMaxDuration, attempt+1)
 		}
-		if err := waitTransactRetryBackoff(ctx, backoff); err != nil {
-			combined := errors.Join(err, lastErr)
+		retryDelay := backoff
+		if retryDelay > remaining {
+			retryDelay = remaining
+		}
+		if err := waitTransactRetryBackoff(ctx, retryDelay); err != nil {
+			combined := stderrors.Join(err, lastErr)
 			return nil, errors.Wrap(combined, "transact write retry canceled")
 		}
 		backoff = nextTransactRetryBackoff(backoff)
