@@ -38,6 +38,7 @@ const (
 	updateSplitCount            = 2
 	splitPartsInitialCapacity   = 2
 	replacerArgPairSize         = 2
+	gsiQueryReadWorkerCount     = 16
 	transactRetryMaxAttempts    = 128
 	transactRetryMaxDuration    = 2 * time.Second
 	transactRetryInitialBackoff = 1 * time.Millisecond
@@ -1125,22 +1126,207 @@ func (d *DynamoDBServer) queryItemsByGSI(
 		return nil, 0, errors.WithStack(err)
 	}
 	readTS := snapshotTS(d.coordinator.Clock(), d.store)
-	items := make([]map[string]attributeValue, 0, len(kvs))
-	for _, kvp := range kvs {
-		item, found, err := d.readItemAtKeyAt(ctx, kvp.Value, readTS)
-		if err != nil {
-			return nil, 0, err
-		}
-		if !found {
-			continue
-		}
-		attr, ok := item[attrName]
-		if !ok || !attributeValueEqual(attr, expected) {
-			continue
-		}
-		items = append(items, item)
+	itemKeys := uniqueGSIItemKeys(kvs)
+	items, err := d.readItemsForGSIQuery(ctx, itemKeys, readTS, attrName, expected)
+	if err != nil {
+		return nil, 0, err
 	}
 	return items, len(kvs), nil
+}
+
+func uniqueGSIItemKeys(kvs []*store.KVPair) [][]byte {
+	if len(kvs) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(kvs))
+	seen := make(map[string]struct{}, len(kvs))
+	for _, kvp := range kvs {
+		key := string(kvp.Value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, bytes.Clone(kvp.Value))
+	}
+	return out
+}
+
+type gsiReadJob struct {
+	index int
+	key   []byte
+}
+
+type gsiReadResult struct {
+	index int
+	item  map[string]attributeValue
+	err   error
+}
+
+func resolveGSIReadWorkerCount(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n < gsiQueryReadWorkerCount {
+		return n
+	}
+	return gsiQueryReadWorkerCount
+}
+
+func (d *DynamoDBServer) readItemsForGSIQuery(
+	ctx context.Context,
+	itemKeys [][]byte,
+	readTS uint64,
+	attrName string,
+	expected attributeValue,
+) ([]map[string]attributeValue, error) {
+	if len(itemKeys) == 0 {
+		return nil, nil
+	}
+	workerCount := resolveGSIReadWorkerCount(len(itemKeys))
+	jobs := make(chan gsiReadJob)
+	results := make(chan gsiReadResult, len(itemKeys))
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	d.startGSIReadWorkers(&wg, workerCount, workerCtx, readTS, attrName, expected, jobs, results, cancel)
+	enqueueGSIReadJobs(workerCtx, jobs, itemKeys)
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	return collectOrderedGSIReadResults(itemKeys, results)
+}
+
+func (d *DynamoDBServer) startGSIReadWorkers(
+	wg *sync.WaitGroup,
+	workerCount int,
+	ctx context.Context,
+	readTS uint64,
+	attrName string,
+	expected attributeValue,
+	jobs <-chan gsiReadJob,
+	results chan<- gsiReadResult,
+	cancel context.CancelFunc,
+) {
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.gsiReadWorker(ctx, readTS, attrName, expected, jobs, results, cancel)
+		}()
+	}
+}
+
+func enqueueGSIReadJobs(ctx context.Context, jobs chan<- gsiReadJob, itemKeys [][]byte) {
+enqueueLoop:
+	for i, key := range itemKeys {
+		select {
+		case <-ctx.Done():
+			break enqueueLoop
+		case jobs <- gsiReadJob{index: i, key: key}:
+		}
+	}
+}
+
+func collectOrderedGSIReadResults(
+	itemKeys [][]byte,
+	results <-chan gsiReadResult,
+) ([]map[string]attributeValue, error) {
+	indexed := make(map[int]map[string]attributeValue, len(itemKeys))
+	for res := range results {
+		if res.err != nil {
+			return nil, res.err
+		}
+		if res.item != nil {
+			indexed[res.index] = res.item
+		}
+	}
+	items := make([]map[string]attributeValue, 0, len(indexed))
+	for i := 0; i < len(itemKeys); i++ {
+		if item := indexed[i]; item != nil {
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func (d *DynamoDBServer) gsiReadWorker(
+	ctx context.Context,
+	readTS uint64,
+	attrName string,
+	expected attributeValue,
+	jobs <-chan gsiReadJob,
+	results chan<- gsiReadResult,
+	cancel context.CancelFunc,
+) {
+	for {
+		job, ok := nextGSIReadJob(ctx, jobs)
+		if !ok {
+			return
+		}
+		item, emit, err := d.executeGSIReadJob(ctx, readTS, attrName, expected, job.key)
+		if err != nil {
+			sendGSIReadError(results, err)
+			cancel()
+			return
+		}
+		if !emit {
+			continue
+		}
+		if !sendGSIReadResult(ctx, results, gsiReadResult{index: job.index, item: item}) {
+			return
+		}
+	}
+}
+
+func nextGSIReadJob(ctx context.Context, jobs <-chan gsiReadJob) (gsiReadJob, bool) {
+	select {
+	case <-ctx.Done():
+		return gsiReadJob{}, false
+	case job, ok := <-jobs:
+		if !ok {
+			return gsiReadJob{}, false
+		}
+		return job, true
+	}
+}
+
+func (d *DynamoDBServer) executeGSIReadJob(
+	ctx context.Context,
+	readTS uint64,
+	attrName string,
+	expected attributeValue,
+	key []byte,
+) (map[string]attributeValue, bool, error) {
+	item, found, err := d.readItemAtKeyAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return nil, false, nil
+	}
+	attr, ok := item[attrName]
+	if !ok || !attributeValueEqual(attr, expected) {
+		return nil, false, nil
+	}
+	return item, true, nil
+}
+
+func sendGSIReadError(results chan<- gsiReadResult, err error) {
+	select {
+	case results <- gsiReadResult{err: err}:
+	default:
+	}
+}
+
+func sendGSIReadResult(ctx context.Context, results chan<- gsiReadResult, result gsiReadResult) bool {
+	select {
+	case results <- result:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoKeySchema, hashValue attributeValue) ([]byte, error) {
@@ -1770,6 +1956,8 @@ func isLogicalKeywordBoundary(s string, pos int) bool {
 		return true
 	}
 	ch := s[pos]
+	// Keep ASCII letters/digits/underscore as identifier token characters so
+	// expressions like "MY_AND_VAR" are not split at the "AND" substring.
 	if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
 		return false
 	}
