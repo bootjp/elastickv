@@ -46,11 +46,12 @@ const (
 	tableLockStripeCount        = 128
 	queryDefaultLimit           = 100
 	maxReplaceNameDepth         = 32
-	tableCleanupMaxRounds       = 8
+	tableCleanupDeleteBatchSize = 256
 
 	dynamoTableMetaPrefix       = "!ddb|meta|table|"
 	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
 	dynamoItemPrefix            = "!ddb|item|"
+	dynamoGSIPrefix             = "!ddb|gsi|"
 	dynamoScanPageLimit         = 1024
 )
 
@@ -418,25 +419,81 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 }
 
 func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tableName string, generation uint64) error {
-	prefix := dynamoItemPrefixForTable(tableName, generation)
-	for round := 0; round < tableCleanupMaxRounds; round++ {
-		kvs, err := d.scanAllByPrefix(ctx, prefix)
+	prefixes := [][]byte{
+		dynamoItemPrefixForTable(tableName, generation),
+		dynamoGSIPrefixForTable(tableName, generation),
+	}
+	for {
+		keys, err := d.scanDeleteCandidateKeysByPrefixes(ctx, prefixes)
 		if err != nil {
-			return errors.WithStack(err)
+			return err
 		}
-		if len(kvs) == 0 {
+		if len(keys) == 0 {
 			return nil
 		}
-		for _, kvp := range kvs {
-			if !bytes.HasPrefix(kvp.Key, prefix) {
-				continue
-			}
-			if err := d.dispatchSingleDelete(ctx, kvp.Key); err != nil {
-				return errors.WithStack(err)
-			}
+		if err := d.deleteKeysByBatches(ctx, keys); err != nil {
+			return err
+		}
+		if err := waitTransactRetryBackoff(ctx, transactRetryInitialBackoff); err != nil {
+			return errors.WithStack(err)
 		}
 	}
-	return errors.New("table cleanup did not converge")
+}
+
+func (d *DynamoDBServer) scanDeleteCandidateKeysByPrefixes(ctx context.Context, prefixes [][]byte) ([][]byte, error) {
+	keys := make([][]byte, 0, len(prefixes)*dynamoScanPageLimit)
+	for _, prefix := range prefixes {
+		prefixKeys, err := d.scanDeleteCandidateKeys(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, prefixKeys...)
+	}
+	return uniqueKeys(keys), nil
+}
+
+func (d *DynamoDBServer) scanDeleteCandidateKeys(ctx context.Context, prefix []byte) ([][]byte, error) {
+	kvs, err := d.scanAllByPrefix(ctx, prefix)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	keys := make([][]byte, 0, len(kvs))
+	for _, kvp := range kvs {
+		if !bytes.HasPrefix(kvp.Key, prefix) {
+			continue
+		}
+		keys = append(keys, kvp.Key)
+	}
+	return keys, nil
+}
+
+func (d *DynamoDBServer) deleteKeysByBatches(ctx context.Context, keys [][]byte) error {
+	for start := 0; start < len(keys); start += tableCleanupDeleteBatchSize {
+		end := start + tableCleanupDeleteBatchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		if err := d.dispatchDeleteBatch(ctx, keys[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DynamoDBServer) dispatchDeleteBatch(ctx context.Context, keys [][]byte) error {
+	elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+	for _, key := range keys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+	}
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn: false,
+		Elems: elems,
+	}
+	_, err := d.coordinator.Dispatch(ctx, req)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (d *DynamoDBServer) describeTable(w http.ResponseWriter, r *http.Request) {
@@ -576,35 +633,47 @@ func (d *DynamoDBServer) putItemWithRetry(ctx context.Context, in putItemInput) 
 		ctx,
 		in.TableName,
 		"put item retry attempts exhausted",
-		func(readTS uint64) ([]byte, []byte, uint64, error) {
+		func(readTS uint64) (*itemWritePlan, error) {
 			return d.preparePutItemWrite(ctx, in, readTS)
 		},
 	)
+}
+
+type itemWritePlan struct {
+	req        *kv.OperationGroup[kv.OP]
+	generation uint64
+	cleanup    [][]byte
 }
 
 func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	ctx context.Context,
 	tableName string,
 	exhaustedMessage string,
-	prepare func(readTS uint64) ([]byte, []byte, uint64, error),
+	prepare func(readTS uint64) (*itemWritePlan, error),
 ) error {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
 		readTS := d.nextTxnReadTS()
-		itemKey, payload, generation, err := prepare(readTS)
+		plan, err := prepare(readTS)
 		if err != nil {
 			return err
 		}
-		if err := d.commitItemWrite(ctx, itemKey, payload); err != nil {
+		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return errors.WithStack(err)
 			}
 		} else {
-			if err := d.verifyTableGeneration(ctx, tableName, generation); err == nil {
+			retry, verifyErr := d.handleGenerationFenceResult(
+				ctx,
+				d.verifyTableGeneration(ctx, tableName, plan.generation),
+				plan.cleanup,
+			)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if !retry {
 				return nil
-			} else if !errors.Is(err, errTableGenerationChanged) {
-				return err
 			}
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
@@ -615,33 +684,37 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
 }
 
-func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInput, readTS uint64) ([]byte, []byte, uint64, error) {
+func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInput, readTS uint64) (*itemWritePlan, error) {
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
 	if err != nil {
-		return nil, nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
 	itemKey, err := schema.itemKeyFromAttributes(in.Item)
 	if err != nil {
-		return nil, nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	payload, err := json.Marshal(in.Item)
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
 	if err != nil {
-		return nil, nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
-	return itemKey, payload, schema.Generation, nil
+	if !found {
+		current = nil
+	}
+	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, in.Item)
+	if err != nil {
+		return nil, err
+	}
+	return &itemWritePlan{
+		req:        req,
+		generation: schema.Generation,
+		cleanup:    cleanup,
+	}, nil
 }
 
-func (d *DynamoDBServer) commitItemWrite(ctx context.Context, itemKey []byte, payload []byte) error {
-	req := &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
-		StartTS: 0,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: itemKey, Value: payload},
-		},
-	}
+func (d *DynamoDBServer) commitItemWrite(ctx context.Context, req *kv.OperationGroup[kv.OP]) error {
 	_, err := d.coordinator.Dispatch(ctx, req)
 	if err != nil {
 		return errors.WithStack(err)
@@ -735,39 +808,47 @@ func (d *DynamoDBServer) updateItemWithRetry(ctx context.Context, in updateItemI
 		ctx,
 		in.TableName,
 		"update retry attempts exhausted",
-		func(readTS uint64) ([]byte, []byte, uint64, error) {
+		func(readTS uint64) (*itemWritePlan, error) {
 			return d.prepareUpdateItemWrite(ctx, in, readTS)
 		},
 	)
 }
 
-func (d *DynamoDBServer) prepareUpdateItemWrite(ctx context.Context, in updateItemInput, readTS uint64) ([]byte, []byte, uint64, error) {
+func (d *DynamoDBServer) prepareUpdateItemWrite(ctx context.Context, in updateItemInput, readTS uint64) (*itemWritePlan, error) {
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
 	if err != nil {
-		return nil, nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
 	itemKey, err := schema.itemKeyFromAttributes(in.Key)
 	if err != nil {
-		return nil, nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
 	if err != nil {
-		return nil, nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	if !found {
 		current = map[string]attributeValue{}
 	}
-	payload, err := buildUpdatedItemPayload(schema, in, current)
+	nextItem, err := buildUpdatedItem(schema, in, current)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, err
 	}
-	return itemKey, payload, schema.Generation, nil
+	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, nextItem)
+	if err != nil {
+		return nil, err
+	}
+	return &itemWritePlan{
+		req:        req,
+		generation: schema.Generation,
+		cleanup:    cleanup,
+	}, nil
 }
 
-func buildUpdatedItemPayload(schema *dynamoTableSchema, in updateItemInput, current map[string]attributeValue) ([]byte, error) {
+func buildUpdatedItem(schema *dynamoTableSchema, in updateItemInput, current map[string]attributeValue) (map[string]attributeValue, error) {
 	if err := validateConditionOnItem(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues, current); err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
@@ -781,11 +862,7 @@ func buildUpdatedItemPayload(schema *dynamoTableSchema, in updateItemInput, curr
 	if err := ensurePrimaryKeyUnchanged(schema.PrimaryKey, in.Key, nextItem); err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	payload, err := json.Marshal(nextItem)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return payload, nil
+	return nextItem, nil
 }
 
 func ensurePrimaryKeyUnchanged(keySchema dynamoKeySchema, originalKey map[string]attributeValue, nextItem map[string]attributeValue) error {
@@ -813,6 +890,69 @@ func ensureSinglePrimaryKeyUnchanged(attrName string, originalKey map[string]att
 		return errors.New("cannot update primary key attribute")
 	}
 	return nil
+}
+
+func buildItemWriteRequest(schema *dynamoTableSchema, itemKey []byte, current map[string]attributeValue, nextItem map[string]attributeValue) (*kv.OperationGroup[kv.OP], [][]byte, error) {
+	payload, err := json.Marshal(nextItem)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: itemKey, Value: payload},
+	}
+	cleanup := [][]byte{itemKey}
+	delKeys, putKeys, err := gsiDeltaKeys(schema, current, nextItem)
+	if err != nil {
+		return nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	for _, key := range delKeys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+	}
+	for _, key := range putKeys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: itemKey})
+		cleanup = append(cleanup, key)
+	}
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: 0,
+		Elems:   elems,
+	}, cleanup, nil
+}
+
+func gsiDeltaKeys(schema *dynamoTableSchema, current map[string]attributeValue, next map[string]attributeValue) ([][]byte, [][]byte, error) {
+	oldKeys, err := schema.gsiEntryKeysForItem(current)
+	if err != nil {
+		return nil, nil, err
+	}
+	newKeys, err := schema.gsiEntryKeysForItem(next)
+	if err != nil {
+		return nil, nil, err
+	}
+	oldSet := bytesToSet(oldKeys)
+	newSet := bytesToSet(newKeys)
+	delKeys := make([][]byte, 0, len(oldKeys))
+	for key, raw := range oldSet {
+		if _, ok := newSet[key]; ok {
+			continue
+		}
+		delKeys = append(delKeys, raw)
+	}
+	putKeys := make([][]byte, 0, len(newKeys))
+	for key, raw := range newSet {
+		if _, ok := oldSet[key]; ok {
+			continue
+		}
+		putKeys = append(putKeys, raw)
+	}
+	return delKeys, putKeys, nil
+}
+
+func bytesToSet(keys [][]byte) map[string][]byte {
+	out := make(map[string][]byte, len(keys))
+	for _, key := range keys {
+		out[string(key)] = key
+	}
+	return out
 }
 
 func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
@@ -870,15 +1010,7 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if err != nil {
 		return nil, err
 	}
-	scanPrefix, err := queryScanPrefix(schema, in, keySchema, expected)
-	if err != nil {
-		return nil, err
-	}
-	kvs, err := d.scanAllByPrefix(ctx, scanPrefix)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	items, err := filterQueryItems(kvs, attrName, expected)
+	items, scannedCount, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, attrName, expected)
 	if err != nil {
 		return nil, err
 	}
@@ -890,7 +1022,7 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	pagedItems, lastKey := paginateQueryItems(schema.PrimaryKey, items, limit)
 	return &queryOutput{
 		items:            pagedItems,
-		scannedCount:     len(kvs),
+		scannedCount:     scannedCount,
 		lastEvaluatedKey: lastKey,
 	}, nil
 }
@@ -945,10 +1077,68 @@ func orderQueryItems(items []map[string]attributeValue, rangeKey string, scanInd
 	}
 }
 
-func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoKeySchema, hashValue attributeValue) ([]byte, error) {
+func (d *DynamoDBServer) queryItemsByKeyCondition(
+	ctx context.Context,
+	in queryInput,
+	schema *dynamoTableSchema,
+	keySchema dynamoKeySchema,
+	attrName string,
+	expected attributeValue,
+) ([]map[string]attributeValue, int, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
+		return d.queryItemsByGSI(ctx, in, schema, attrName, expected)
 	}
+	scanPrefix, err := queryScanPrefix(schema, in, keySchema, expected)
+	if err != nil {
+		return nil, 0, err
+	}
+	kvs, err := d.scanAllByPrefix(ctx, scanPrefix)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	items, err := filterQueryItems(kvs, attrName, expected)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, len(kvs), nil
+}
+
+func (d *DynamoDBServer) queryItemsByGSI(
+	ctx context.Context,
+	in queryInput,
+	schema *dynamoTableSchema,
+	attrName string,
+	expected attributeValue,
+) ([]map[string]attributeValue, int, error) {
+	hashKey, err := attributeValueAsKey(expected)
+	if err != nil {
+		return nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	prefix := dynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey)
+	kvs, err := d.scanAllByPrefix(ctx, prefix)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	items := make([]map[string]attributeValue, 0, len(kvs))
+	for _, kvp := range kvs {
+		item, found, err := d.readItemAtKeyAt(ctx, kvp.Value, readTS)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !found {
+			continue
+		}
+		attr, ok := item[attrName]
+		if !ok || !attributeValueEqual(attr, expected) {
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, len(kvs), nil
+}
+
+func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoKeySchema, hashValue attributeValue) ([]byte, error) {
 	if keySchema.HashKey != schema.PrimaryKey.HashKey {
 		return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
 	}
@@ -1074,19 +1264,25 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
-		reqs, generations, err := d.buildTransactWriteItemsRequest(ctx, in)
+		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in)
 		if err != nil {
 			return err
 		}
-		if _, err := d.dispatchTransactWriteItemsWithRetry(ctx, reqs); err != nil {
+		if _, err = d.dispatchTransactWriteItemsWithRetry(ctx, reqs); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return err
 			}
 		} else {
-			if err := d.verifyTableGenerations(ctx, generations); err == nil {
+			retry, verifyErr := d.handleGenerationFenceResult(
+				ctx,
+				d.verifyTableGenerations(ctx, generations),
+				cleanupKeys,
+			)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if !retry {
 				return nil
-			} else if !errors.Is(err, errTableGenerationChanged) {
-				return err
 			}
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
@@ -1097,37 +1293,51 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "transact write retry attempts exhausted")
 }
 
-func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, error) {
+func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, [][]byte, error) {
+	readTS := d.nextTxnReadTS()
 	reqs := &kv.OperationGroup[kv.OP]{IsTxn: true}
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
+	cleanup := make([][]byte, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
 		if item.Put == nil {
-			return nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 		}
 		tableName := strings.TrimSpace(item.Put.TableName)
 		if tableName == "" {
-			return nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		}
-		schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName)
+		schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		elem, err := buildTransactPutElem(schema, item.Put.Item)
+		itemKey, err := schema.itemKeyFromAttributes(item.Put.Item)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 		}
-		reqs.Elems = append(reqs.Elems, elem)
+		current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+		if err != nil {
+			return nil, nil, nil, errors.WithStack(err)
+		}
+		if !found {
+			current = nil
+		}
+		itemReq, itemCleanup, err := buildItemWriteRequest(schema, itemKey, current, item.Put.Item)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		reqs.Elems = append(reqs.Elems, itemReq.Elems...)
 		tableGenerations[tableName] = schema.Generation
+		cleanup = append(cleanup, itemCleanup...)
 	}
-	return reqs, tableGenerations, nil
+	return reqs, tableGenerations, cleanup, nil
 }
 
-func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache map[string]*dynamoTableSchema, tableName string) (*dynamoTableSchema, error) {
+func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache map[string]*dynamoTableSchema, tableName string, readTS uint64) (*dynamoTableSchema, error) {
 	if schema := cache[tableName]; schema != nil {
 		return schema, nil
 	}
-	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1136,18 +1346,6 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 	}
 	cache[tableName] = schema
 	return schema, nil
-}
-
-func buildTransactPutElem(schema *dynamoTableSchema, item map[string]attributeValue) (*kv.Elem[kv.OP], error) {
-	itemKey, err := schema.itemKeyFromAttributes(item)
-	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
-	}
-	b, err := json.Marshal(item)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return &kv.Elem[kv.OP]{Op: kv.Put, Key: itemKey, Value: b}, nil
 }
 
 func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -1247,6 +1445,56 @@ func (d *DynamoDBServer) verifyTableGenerations(ctx context.Context, generations
 		}
 	}
 	return nil
+}
+
+func isGenerationFenceFailure(err error) bool {
+	return errors.Is(err, errTableGenerationChanged) || isTableNotFoundError(err)
+}
+
+func (d *DynamoDBServer) handleGenerationFenceResult(ctx context.Context, err error, cleanupKeys [][]byte) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if !isGenerationFenceFailure(err) {
+		return false, err
+	}
+	if cleanupErr := d.cleanupCommittedKeys(ctx, cleanupKeys); cleanupErr != nil {
+		return false, cleanupErr
+	}
+	if errors.Is(err, errTableGenerationChanged) {
+		return true, nil
+	}
+	return false, err
+}
+
+func isTableNotFoundError(err error) bool {
+	var apiErr *dynamoAPIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.errorType == dynamoErrResourceNotFound
+}
+
+func (d *DynamoDBServer) cleanupCommittedKeys(ctx context.Context, keys [][]byte) error {
+	uniq := uniqueKeys(keys)
+	if len(uniq) == 0 {
+		return nil
+	}
+	return d.dispatchDeleteBatch(ctx, uniq)
+}
+
+func uniqueKeys(keys [][]byte) [][]byte {
+	seen := make(map[string]struct{}, len(keys))
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		s := string(key)
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, key)
+	}
+	return out
 }
 
 type dynamoAPIError struct {
@@ -1397,13 +1645,20 @@ func splitTopLevelByKeyword(expr string, keyword string) []string {
 		return nil
 	}
 	upper := strings.ToUpper(expr)
-	target := " " + strings.ToUpper(keyword) + " "
+	target := strings.ToUpper(keyword)
+	targetLen := len(target)
+	if targetLen == 0 {
+		return nil
+	}
 	depth := 0
 	last := 0
 	parts := make([]string, 0, splitPartsInitialCapacity)
 	for i := 0; i < len(expr); i++ {
 		depth = nextParenDepth(depth, expr[i])
-		if depth != 0 || !matchesKeywordAt(upper, target, i) {
+		if depth != 0 || !matchesKeywordTokenAt(upper, target, i) {
+			continue
+		}
+		if !isLogicalKeywordBoundary(expr, i-1) || !isLogicalKeywordBoundary(expr, i+targetLen) {
 			continue
 		}
 		part, ok := trimmedNonEmpty(expr[last:i])
@@ -1411,7 +1666,7 @@ func splitTopLevelByKeyword(expr string, keyword string) []string {
 			return nil
 		}
 		parts = append(parts, part)
-		i += len(target) - 1
+		i += targetLen - 1
 		last = i + 1
 	}
 	return finalizeKeywordSplit(expr[last:], parts)
@@ -1525,12 +1780,23 @@ func nextParenDepth(depth int, ch byte) int {
 	}
 }
 
-func matchesKeywordAt(upperExpr string, target string, pos int) bool {
+func matchesKeywordTokenAt(upperExpr string, target string, pos int) bool {
 	end := pos + len(target)
 	if end > len(upperExpr) {
 		return false
 	}
 	return upperExpr[pos:end] == target
+}
+
+func isLogicalKeywordBoundary(s string, pos int) bool {
+	if pos < 0 || pos >= len(s) {
+		return true
+	}
+	ch := s[pos]
+	if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+		return false
+	}
+	return true
 }
 
 func trimmedNonEmpty(s string) (string, bool) {
@@ -1610,6 +1876,85 @@ func (t *dynamoTableSchema) itemKeyFromAttributes(attrs map[string]attributeValu
 		}
 	}
 	return dynamoItemKey(t.TableName, t.Generation, hashKey, rangeKey), nil
+}
+
+func (t *dynamoTableSchema) gsiEntryKeysForItem(attrs map[string]attributeValue) ([][]byte, error) {
+	if len(t.GlobalSecondaryIndexes) == 0 || len(attrs) == 0 {
+		return nil, nil
+	}
+	pkHash, pkRange, err := t.primaryKeyValues(attrs)
+	if err != nil {
+		return nil, err
+	}
+	indexNames := sortedGSIIndexNames(t.GlobalSecondaryIndexes)
+	keys := make([][]byte, 0, len(indexNames))
+	for _, indexName := range indexNames {
+		ks := t.GlobalSecondaryIndexes[indexName]
+		indexHash, indexRange, include, err := gsiKeyValues(attrs, ks)
+		if err != nil {
+			return nil, err
+		}
+		if !include {
+			continue
+		}
+		keys = append(keys, dynamoGSIKey(t.TableName, t.Generation, indexName, indexHash, indexRange, pkHash, pkRange))
+	}
+	return keys, nil
+}
+
+func (t *dynamoTableSchema) primaryKeyValues(attrs map[string]attributeValue) (string, string, error) {
+	hashAttr, ok := attrs[t.PrimaryKey.HashKey]
+	if !ok {
+		return "", "", errors.New("missing hash key attribute")
+	}
+	hash, err := attributeValueAsKey(hashAttr)
+	if err != nil {
+		return "", "", err
+	}
+	rangeKey := ""
+	if t.PrimaryKey.RangeKey != "" {
+		rangeAttr, ok := attrs[t.PrimaryKey.RangeKey]
+		if !ok {
+			return "", "", errors.New("missing range key attribute")
+		}
+		rangeKey, err = attributeValueAsKey(rangeAttr)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return hash, rangeKey, nil
+}
+
+func gsiKeyValues(attrs map[string]attributeValue, ks dynamoKeySchema) (string, string, bool, error) {
+	hashAttr, ok := attrs[ks.HashKey]
+	if !ok {
+		return "", "", false, nil
+	}
+	hash, err := attributeValueAsKey(hashAttr)
+	if err != nil {
+		return "", "", false, err
+	}
+	rangeKey := ""
+	if ks.RangeKey != "" {
+		rangeAttr, ok := attrs[ks.RangeKey]
+		if !ok {
+			return "", "", false, nil
+		}
+		rangeKey, err = attributeValueAsKey(rangeAttr)
+		if err != nil {
+			return "", "", false, err
+		}
+	}
+	return hash, rangeKey, true, nil
+}
+
+func sortedGSIIndexNames(indexes map[string]dynamoKeySchema) []string {
+	names := make([]string, 0, len(indexes))
+	for name := range indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func attributeValueAsKey(attr attributeValue) (string, error) {
@@ -1965,18 +2310,6 @@ func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uin
 	return item, true, nil
 }
 
-func (d *DynamoDBServer) dispatchSingleDelete(ctx context.Context, key []byte) error {
-	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: false,
-		Elems: []*kv.Elem[kv.OP]{{Op: kv.Del, Key: key}},
-	}
-	_, err := d.coordinator.Dispatch(ctx, req)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
-}
-
 func (d *DynamoDBServer) scanAllByPrefix(ctx context.Context, prefix []byte) ([]*store.KVPair, error) {
 	readTS := snapshotTS(d.coordinator.Clock(), d.store)
 	end := prefixScanEnd(prefix)
@@ -2032,6 +2365,37 @@ func dynamoItemHashPrefixForTable(tableName string, generation uint64, hashKey s
 			encodeDynamoSegment(tableName) + "|" +
 			strconv.FormatUint(generation, 10) + "|" +
 			encodeDynamoSegment(hashKey) + "|",
+	)
+}
+
+func dynamoGSIPrefixForTable(tableName string, generation uint64) []byte {
+	return []byte(
+		dynamoGSIPrefix +
+			encodeDynamoSegment(tableName) + "|" +
+			strconv.FormatUint(generation, 10) + "|",
+	)
+}
+
+func dynamoGSIHashPrefixForTable(tableName string, generation uint64, indexName string, hashKey string) []byte {
+	return []byte(
+		dynamoGSIPrefix +
+			encodeDynamoSegment(tableName) + "|" +
+			strconv.FormatUint(generation, 10) + "|" +
+			encodeDynamoSegment(indexName) + "|" +
+			encodeDynamoSegment(hashKey) + "|",
+	)
+}
+
+func dynamoGSIKey(tableName string, generation uint64, indexName string, indexHash string, indexRange string, pkHash string, pkRange string) []byte {
+	return []byte(
+		dynamoGSIPrefix +
+			encodeDynamoSegment(tableName) + "|" +
+			strconv.FormatUint(generation, 10) + "|" +
+			encodeDynamoSegment(indexName) + "|" +
+			encodeDynamoSegment(indexHash) + "|" +
+			encodeDynamoSegment(indexRange) + "|" +
+			encodeDynamoSegment(pkHash) + "|" +
+			encodeDynamoSegment(pkRange),
 	)
 }
 

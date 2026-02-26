@@ -118,7 +118,7 @@ func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv
 }
 
 func (a attributeValue) hasStringType() bool {
-	return (a.hasS || a.S != "") || !a.hasAnyExplicitNonStringType()
+	return a.hasS || a.S != ""
 }
 
 func (a attributeValue) hasNumberType() bool {
@@ -211,9 +211,7 @@ func (a *attributeValue) UnmarshalJSON(b []byte) error {
 
 	*a = attributeValue{}
 	if len(raw) == 0 {
-		a.S = ""
-		a.hasS = true
-		return nil
+		return errors.New("invalid attribute value")
 	}
 	if len(raw) != 1 {
 		return errors.New("invalid attribute value")

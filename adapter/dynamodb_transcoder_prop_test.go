@@ -70,3 +70,19 @@ func TestDynamoDBTranscoder_Property_TransactWrite(t *testing.T) {
 		require.Equal(t, v2, string(gotTx.Elems[1].Value))
 	})
 }
+
+func TestAttributeValue_UnmarshalJSON_RejectsEmptyObject(t *testing.T) {
+	var a attributeValue
+	err := json.Unmarshal([]byte(`{}`), &a)
+	require.Error(t, err)
+}
+
+func TestAttributeValue_HasStringType_IsExplicit(t *testing.T) {
+	var zero attributeValue
+	require.False(t, zero.hasStringType())
+
+	var parsed attributeValue
+	err := json.Unmarshal([]byte(`{"S":""}`), &parsed)
+	require.NoError(t, err)
+	require.True(t, parsed.hasStringType())
+}

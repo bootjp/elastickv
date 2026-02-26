@@ -169,6 +169,34 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	queryPendingAfterUpdate, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(threadsTable),
+		IndexName:              aws.String("statusIndex"),
+		KeyConditionExpression: aws.String("#status = :status"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
+		},
+		ScanIndexForward: aws.Bool(false),
+	})
+	require.NoError(t, err)
+	require.Len(t, queryPendingAfterUpdate.Items, 1)
+	queryAnsweredAfterUpdate, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(threadsTable),
+		IndexName:              aws.String("statusIndex"),
+		KeyConditionExpression: aws.String("#status = :status"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":status": &ddbTypes.AttributeValueMemberS{Value: "answered"},
+		},
+		ScanIndexForward: aws.Bool(false),
+	})
+	require.NoError(t, err)
+	require.Len(t, queryAnsweredAfterUpdate.Items, 2)
 
 	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(threadsTable),
@@ -255,6 +283,38 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "2026-01-01T00:00:01Z", mc0.Value)
 	require.Equal(t, "2026-01-01T00:00:02Z", mc1.Value)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbTypes.TransactWriteItem{
+			{
+				Put: &ddbTypes.Put{
+					TableName: aws.String(threadsTable),
+					Item: map[string]ddbTypes.AttributeValue{
+						"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t4"},
+						"title":       &ddbTypes.AttributeValueMemberS{Value: "title4"},
+						"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-04T00:00:00Z"},
+						"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
+						"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	queryPendingAfterTransact, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(threadsTable),
+		IndexName:              aws.String("statusIndex"),
+		KeyConditionExpression: aws.String("#status = :status"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
+		},
+		ScanIndexForward: aws.Bool(false),
+	})
+	require.NoError(t, err)
+	require.Len(t, queryPendingAfterTransact.Items, 2)
 
 	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(messagesTable)})
 	require.NoError(t, err)

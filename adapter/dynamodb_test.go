@@ -394,3 +394,20 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitTopLevelByKeyword_HandlesTokenBoundaries(t *testing.T) {
+	parts := splitTopLevelByKeyword("(attribute_exists(a))AND(attribute_exists(b))", "AND")
+	require.Equal(t, []string{"(attribute_exists(a))", "(attribute_exists(b))"}, parts)
+}
+
+func TestEvalConditionExpression_LogicalKeywordWithoutSpaces(t *testing.T) {
+	item := map[string]attributeValue{
+		"k": {S: "v"},
+	}
+	values := map[string]attributeValue{
+		":v": {S: "v"},
+	}
+	ok, err := evalConditionExpression("attribute_exists(k)AND(k = :v)", item, values)
+	require.NoError(t, err)
+	require.True(t, ok)
+}
