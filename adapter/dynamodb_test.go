@@ -467,7 +467,9 @@ func TestDynamoDB_TransactWriteItems_ValidationErrors(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{})
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{},
+	})
 	require.Error(t, err)
 	require.True(t,
 		strings.Contains(err.Error(), "missing transact items") ||
@@ -676,6 +678,102 @@ func TestDynamoDB_TransactWriteItems_DeleteConditionExpression(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, ngOut.Item)
+}
+
+func TestDynamoDB_TransactWriteItems_DeleteMissingItemNoop(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Delete: &types.Delete{
+					TableName: aws.String("t"),
+					Key:       map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "missing"}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestDynamoDB_TransactWriteItems_ConditionCheckOnly(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":    &types.AttributeValueMemberS{Value: "guard"},
+			"status": &types.AttributeValueMemberS{Value: "open"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName:           aws.String("t"),
+					Key:                 map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "guard"}},
+					ConditionExpression: aws.String("#s = :open"),
+					ExpressionAttributeNames: map[string]string{
+						"#s": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":open": &types.AttributeValueMemberS{Value: "open"},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName:           aws.String("t"),
+					Key:                 map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "guard"}},
+					ConditionExpression: aws.String("#s = :closed"),
+					ExpressionAttributeNames: map[string]string{
+						"#s": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":closed": &types.AttributeValueMemberS{Value: "closed"},
+					},
+				},
+			},
+		},
+	})
+	require.ErrorContains(t, err, "conditional check failed")
 }
 
 func TestDynamoDB_TransactWriteItems_RetriesOnWriteConflict(t *testing.T) {

@@ -633,8 +633,6 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		return
 	}
-	unlock := d.lockTableOperations([]string{in.TableName})
-	defer unlock()
 	if err := d.putItemWithRetry(r.Context(), in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -786,8 +784,6 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	unlockTable := d.lockTableOperations([]string{in.TableName})
-	defer unlockTable()
 	lockKey, err := dynamoItemUpdateLockKey(in.TableName, in.Key)
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
@@ -1424,13 +1420,10 @@ func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Reque
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	tables, err := collectTransactWriteTableNames(in)
-	if err != nil {
+	if _, err := collectTransactWriteTableNames(in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	unlock := d.lockTableOperations(tables)
-	defer unlock()
 	if err := d.transactWriteItemsWithRetry(r.Context(), in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
