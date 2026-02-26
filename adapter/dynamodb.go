@@ -37,6 +37,7 @@ const (
 const (
 	updateSplitCount            = 2
 	splitPartsInitialCapacity   = 2
+	replacerArgPairSize         = 2
 	transactRetryMaxAttempts    = 128
 	transactRetryMaxDuration    = 2 * time.Second
 	transactRetryInitialBackoff = 1 * time.Millisecond
@@ -1546,24 +1547,12 @@ func replaceNames(expr string, names map[string]string) string {
 		return len(keys[i]) > len(keys[j])
 	})
 
-	// Use a dynamic cap and cycle detection rather than a fixed depth.
-	seen := map[string]struct{}{expr: {}}
-	maxIterations := len(names) + 1
-	for i := 0; i < maxIterations; i++ {
-		next := expr
-		for _, key := range keys {
-			next = strings.ReplaceAll(next, key, names[key])
-		}
-		if next == expr {
-			return next
-		}
-		if _, exists := seen[next]; exists {
-			return next
-		}
-		seen[next] = struct{}{}
-		expr = next
+	// DynamoDB expression attribute names are substituted once.
+	args := make([]string, 0, len(keys)*replacerArgPairSize)
+	for _, key := range keys {
+		args = append(args, key, names[key])
 	}
-	return expr
+	return strings.NewReplacer(args...).Replace(expr)
 }
 
 func applyUpdateExpression(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
