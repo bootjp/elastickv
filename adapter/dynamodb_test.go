@@ -15,6 +15,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func createSimpleKeyTable(t *testing.T, ctx context.Context, client *dynamodb.Client) {
+	t.Helper()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("t"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("key"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("key"), KeyType: types.KeyTypeHash},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+}
+
 func TestDynamoDB_PutItem_GetItem(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -29,6 +44,7 @@ func TestDynamoDB_PutItem_GetItem(t *testing.T) {
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
 	})
+	createSimpleKeyTable(t, context.Background(), client)
 
 	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
 		TableName: aws.String("t"),
@@ -68,6 +84,7 @@ func TestDynamoDB_TransactWriteItems(t *testing.T) {
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
 	})
+	createSimpleKeyTable(t, context.Background(), client)
 
 	_, err = client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
@@ -130,6 +147,7 @@ func TestDynamoDB_UpdateItem_Condition(t *testing.T) {
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
 	})
+	createSimpleKeyTable(t, context.Background(), client)
 
 	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
 		TableName: aws.String("t"),
@@ -200,6 +218,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
 	})
+	createSimpleKeyTable(t, context.Background(), client)
 
 	wg := &sync.WaitGroup{}
 	numGoroutines := 100
@@ -282,6 +301,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
 	})
+	createSimpleKeyTable(t, context.Background(), client)
 
 	// Initialize some base keys that will be updated concurrently
 	baseKeys := []string{"shared-key-1", "shared-key-2", "shared-key-3"}
