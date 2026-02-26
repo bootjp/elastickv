@@ -21,8 +21,8 @@ func TestDynamoDBTranscoder_Property_PutItem(t *testing.T) {
 		input := putItemInput{
 			TableName: tableName,
 			Item: map[string]attributeValue{
-				"key":   {S: key},
-				"value": {S: value},
+				"key":   newStringAttributeValue(key),
+				"value": newStringAttributeValue(value),
 			},
 		}
 
@@ -48,8 +48,8 @@ func TestDynamoDBTranscoder_Property_TransactWrite(t *testing.T) {
 
 		txInput := transactWriteItemsInput{
 			TransactItems: []transactWriteItem{
-				{Put: &putItemInput{Item: map[string]attributeValue{"key": {S: k1}, "value": {S: v1}}}},
-				{Put: &putItemInput{Item: map[string]attributeValue{"key": {S: k2}, "value": {S: v2}}}},
+				{Put: &putItemInput{Item: map[string]attributeValue{"key": newStringAttributeValue(k1), "value": newStringAttributeValue(v1)}}},
+				{Put: &putItemInput{Item: map[string]attributeValue{"key": newStringAttributeValue(k2), "value": newStringAttributeValue(v2)}}},
 			},
 		}
 
@@ -85,4 +85,7 @@ func TestAttributeValue_HasStringType_IsExplicit(t *testing.T) {
 	err := json.Unmarshal([]byte(`{"S":""}`), &parsed)
 	require.NoError(t, err)
 	require.True(t, parsed.hasStringType())
+
+	programmatic := newStringAttributeValue("")
+	require.True(t, programmatic.hasStringType())
 }

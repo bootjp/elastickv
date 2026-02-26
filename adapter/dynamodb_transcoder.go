@@ -15,17 +15,12 @@ func newDynamoDBTranscoder() *dynamodbTranscoder { // create new transcoder
 }
 
 type attributeValue struct {
-	S    string                    `json:"S,omitempty"`
-	N    string                    `json:"N,omitempty"`
+	S    *string                   `json:"S,omitempty"`
+	N    *string                   `json:"N,omitempty"`
 	BOOL *bool                     `json:"BOOL,omitempty"`
 	NULL *bool                     `json:"NULL,omitempty"`
 	L    []attributeValue          `json:"L,omitempty"`
 	M    map[string]attributeValue `json:"M,omitempty"`
-
-	hasS bool `json:"-"`
-	hasN bool `json:"-"`
-	hasL bool `json:"-"`
-	hasM bool `json:"-"`
 }
 
 type putItemInput struct {
@@ -58,7 +53,7 @@ func (t *dynamodbTranscoder) PutItemToRequest(b []byte) (*kv.OperationGroup[kv.O
 		return nil, errors.New("key attribute must be S")
 	}
 
-	return t.valueAttrToOps([]byte(keyAttr.S), valAttr)
+	return t.valueAttrToOps([]byte(keyAttr.stringValue()), valAttr)
 }
 
 func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
@@ -84,7 +79,7 @@ func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.Operatio
 			return nil, errors.New("key attribute must be S")
 		}
 
-		ops, err := t.valueAttrToOps([]byte(keyAttr.S), valAttr)
+		ops, err := t.valueAttrToOps([]byte(keyAttr.stringValue()), valAttr)
 		if err != nil {
 			return nil, err
 		}
@@ -112,45 +107,66 @@ func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv
 		Elems: []*kv.Elem[kv.OP]{{
 			Op:    kv.Put,
 			Key:   key,
-			Value: []byte(val.S),
+			Value: []byte(val.stringValue()),
 		}},
 	}, nil
 }
 
 func (a attributeValue) hasStringType() bool {
-	return a.hasS || a.S != ""
+	return a.S != nil
 }
 
 func (a attributeValue) hasNumberType() bool {
-	return a.hasN || a.N != ""
+	return a.N != nil
 }
 
 func (a attributeValue) hasListType() bool {
-	return a.hasL || len(a.L) > 0
+	return a.L != nil
 }
 
 func (a attributeValue) hasMapType() bool {
-	return a.hasM || len(a.M) > 0
+	return a.M != nil
 }
 
 func (a attributeValue) hasAnyExplicitNonStringType() bool {
-	return a.hasN || a.N != "" || a.BOOL != nil || a.NULL != nil || a.hasL || len(a.L) > 0 || a.hasM || len(a.M) > 0
+	return a.N != nil || a.BOOL != nil || a.NULL != nil || a.L != nil || a.M != nil
 }
 
 func (a attributeValue) isSupportedScalarString() bool {
 	return a.hasStringType() && !a.hasAnyExplicitNonStringType()
 }
 
+func (a attributeValue) stringValue() string {
+	if a.S == nil {
+		return ""
+	}
+	return *a.S
+}
+
+func (a attributeValue) numberValue() string {
+	if a.N == nil {
+		return ""
+	}
+	return *a.N
+}
+
+func newStringAttributeValue(v string) attributeValue {
+	return attributeValue{S: &v}
+}
+
 func (t *dynamodbTranscoder) listAttributeToOps(key []byte, list []attributeValue) (*kv.OperationGroup[kv.OP], error) {
 	elems := make([]*kv.Elem[kv.OP], 0, len(list)+1)
 	for i, item := range list {
 		if !item.isSupportedScalarString() {
-			return nil, errors.New("nested lists are not supported")
+			if item.hasListType() {
+				return nil, errors.New("nested lists are not supported")
+			}
+			return nil, errors.New("only lists of scalar strings are supported")
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.ListItemKey(key, int64(i)),
-			Value: []byte(item.S),
+			Value: []byte(item.stringValue()),
 		})
 	}
 	meta := store.ListMeta{Head: 0, Tail: int64(len(list)), Len: int64(len(list))}
@@ -181,9 +197,9 @@ func (a attributeValue) MarshalJSON() ([]byte, error) {
 
 	switch {
 	case hasS:
-		return marshalAttributeValue(map[string]string{"S": a.S})
+		return marshalAttributeValue(map[string]string{"S": a.stringValue()})
 	case hasN:
-		return marshalAttributeValue(map[string]string{"N": a.N})
+		return marshalAttributeValue(map[string]string{"N": a.numberValue()})
 	case hasBOOL:
 		return marshalAttributeValue(map[string]bool{"BOOL": *a.BOOL})
 	case hasNULL:
@@ -243,18 +259,20 @@ func (a *attributeValue) unmarshalSingleAttributeValue(kind string, raw json.Raw
 }
 
 func (a *attributeValue) unmarshalString(raw json.RawMessage) error {
-	if err := json.Unmarshal(raw, &a.S); err != nil {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
 		return errors.WithStack(err)
 	}
-	a.hasS = true
+	a.S = &s
 	return nil
 }
 
 func (a *attributeValue) unmarshalNumber(raw json.RawMessage) error {
-	if err := json.Unmarshal(raw, &a.N); err != nil {
+	var n string
+	if err := json.Unmarshal(raw, &n); err != nil {
 		return errors.WithStack(err)
 	}
-	a.hasN = true
+	a.N = &n
 	return nil
 }
 
@@ -280,7 +298,6 @@ func (a *attributeValue) unmarshalList(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &a.L); err != nil {
 		return errors.WithStack(err)
 	}
-	a.hasL = true
 	return nil
 }
 
@@ -288,6 +305,5 @@ func (a *attributeValue) unmarshalMap(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &a.M); err != nil {
 		return errors.WithStack(err)
 	}
-	a.hasM = true
 	return nil
 }

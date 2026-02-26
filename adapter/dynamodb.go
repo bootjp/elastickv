@@ -1018,10 +1018,10 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if err != nil {
 		return nil, err
 	}
+	orderQueryItems(items, keySchema.RangeKey, in.ScanIndexForward)
 	if items, err = applyQueryExclusiveStartKey(schema, in.ExclusiveStartKey, items); err != nil {
 		return nil, err
 	}
-	orderQueryItems(items, keySchema.RangeKey, in.ScanIndexForward)
 	limit := resolveQueryLimit(in.Limit)
 	pagedItems, lastKey := paginateQueryItems(schema.PrimaryKey, items, limit)
 	return &queryOutput{
@@ -1974,9 +1974,9 @@ func attributeValueAsKey(attr attributeValue) (string, error) {
 	case attr.hasListType() || attr.hasMapType() || attr.BOOL != nil || attr.NULL != nil:
 		return "", errors.New("unsupported key attribute type")
 	case attr.hasNumberType():
-		return attr.N, nil
+		return attr.numberValue(), nil
 	case attr.hasStringType():
-		return attr.S, nil
+		return attr.stringValue(), nil
 	default:
 		return "", errors.New("unsupported key attribute type")
 	}
@@ -1998,7 +1998,13 @@ func attributeValueEqual(left attributeValue, right attributeValue) bool {
 	if handled, equal := compareNumberAttribute(left, right); handled {
 		return equal
 	}
-	return left.S == right.S
+	if !left.hasStringType() && !right.hasStringType() {
+		return true
+	}
+	if !left.hasStringType() || !right.hasStringType() {
+		return false
+	}
+	return left.stringValue() == right.stringValue()
 }
 
 func compareBoolAttribute(left attributeValue, right attributeValue) (bool, bool) {
@@ -2065,12 +2071,12 @@ func compareNumberAttribute(left attributeValue, right attributeValue) (bool, bo
 	if !left.hasNumberType() || !right.hasNumberType() {
 		return true, false
 	}
-	return true, left.N == right.N
+	return true, left.numberValue() == right.numberValue()
 }
 
 func compareAttributeValueSortKey(left attributeValue, right attributeValue) int {
 	if left.hasNumberType() && right.hasNumberType() {
-		if cmp, ok := compareNumericAttributeString(left.N, right.N); ok {
+		if cmp, ok := compareNumericAttributeString(left.numberValue(), right.numberValue()); ok {
 			return cmp
 		}
 	}
@@ -2092,7 +2098,7 @@ func compareNumericAttributeString(left string, right string) (int, bool) {
 func attributeValueSortFallback(attr attributeValue) string {
 	switch {
 	case attr.hasNumberType():
-		return attr.N
+		return attr.numberValue()
 	case attr.BOOL != nil:
 		if *attr.BOOL {
 			return "1"
@@ -2103,7 +2109,7 @@ func attributeValueSortFallback(attr attributeValue) string {
 	case attr.hasMapType() || attr.hasListType():
 		return ""
 	case attr.hasStringType():
-		return attr.S
+		return attr.stringValue()
 	default:
 		return ""
 	}

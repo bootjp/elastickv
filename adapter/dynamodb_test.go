@@ -402,12 +402,45 @@ func TestSplitTopLevelByKeyword_HandlesTokenBoundaries(t *testing.T) {
 
 func TestEvalConditionExpression_LogicalKeywordWithoutSpaces(t *testing.T) {
 	item := map[string]attributeValue{
-		"k": {S: "v"},
+		"k": newStringAttributeValue("v"),
 	}
 	values := map[string]attributeValue{
-		":v": {S: "v"},
+		":v": newStringAttributeValue("v"),
 	}
 	ok, err := evalConditionExpression("attribute_exists(k)AND(k = :v)", item, values)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+func TestQueryExclusiveStartKey_AppliesAfterOrdering(t *testing.T) {
+	schema := &dynamoTableSchema{
+		PrimaryKey: dynamoKeySchema{
+			HashKey:  "pk",
+			RangeKey: "sk",
+		},
+	}
+	items := []map[string]attributeValue{
+		{
+			"pk": newStringAttributeValue("h"),
+			"sk": newStringAttributeValue("1"),
+		},
+		{
+			"pk": newStringAttributeValue("h"),
+			"sk": newStringAttributeValue("2"),
+		},
+		{
+			"pk": newStringAttributeValue("h"),
+			"sk": newStringAttributeValue("3"),
+		},
+	}
+	scanIndexForward := false
+	orderQueryItems(items, "sk", &scanIndexForward)
+
+	paged, err := applyQueryExclusiveStartKey(schema, map[string]attributeValue{
+		"pk": newStringAttributeValue("h"),
+		"sk": newStringAttributeValue("2"),
+	}, items)
+	require.NoError(t, err)
+	require.Len(t, paged, 1)
+	require.Equal(t, "1", paged[0]["sk"].stringValue())
 }
