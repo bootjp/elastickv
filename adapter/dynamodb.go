@@ -1363,41 +1363,6 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 	return schema, nil
 }
 
-func (d *DynamoDBServer) dispatchTransactWriteItemsWithRetry(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	backoff := transactRetryInitialBackoff
-	var lastErr error
-	startedAt := time.Now()
-	deadline := startedAt.Add(transactRetryMaxDuration)
-
-	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
-		// Retry with a fresh transaction start timestamp.
-		reqs.StartTS = 0
-		resp, err := d.coordinator.Dispatch(ctx, reqs)
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = errors.WithStack(err)
-		if !isRetryableTransactWriteError(err) {
-			return nil, lastErr
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, errors.Wrapf(lastErr, "transact write retry timeout after %s (attempts: %d)", transactRetryMaxDuration, attempt+1)
-		}
-		retryDelay := backoff
-		if retryDelay > remaining {
-			retryDelay = remaining
-		}
-		if err := waitTransactRetryBackoff(ctx, retryDelay); err != nil {
-			combined := errors.Join(err, lastErr)
-			return nil, errors.Wrap(combined, "transact write retry canceled")
-		}
-		backoff = nextTransactRetryBackoff(backoff)
-	}
-
-	return nil, errors.Wrapf(lastErr, "transact write retry attempts exhausted after %s (attempts: %d)", time.Since(startedAt), transactRetryMaxAttempts)
-}
-
 func isRetryableTransactWriteError(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
 }

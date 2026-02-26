@@ -1,18 +1,11 @@
 package adapter
 
 import (
+	"bytes"
 	"encoding/json"
 
-	"github.com/bootjp/elastickv/kv"
-	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
-
-type dynamodbTranscoder struct{}
-
-func newDynamoDBTranscoder() *dynamodbTranscoder { // create new transcoder
-	return &dynamodbTranscoder{}
-}
 
 type attributeValue struct {
 	S    *string                   `json:"S,omitempty"`
@@ -36,82 +29,6 @@ type transactWriteItem struct {
 	Put *putItemInput `json:"Put,omitempty"`
 }
 
-func (t *dynamodbTranscoder) PutItemToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
-	var in putItemInput
-	if err := json.Unmarshal(b, &in); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	keyAttr, ok := in.Item["key"]
-	if !ok {
-		return nil, errors.New("missing key attribute")
-	}
-	valAttr, ok := in.Item["value"]
-	if !ok {
-		return nil, errors.New("missing value attribute")
-	}
-	if !keyAttr.hasStringType() {
-		return nil, errors.New("key attribute must be S")
-	}
-
-	return t.valueAttrToOps([]byte(keyAttr.stringValue()), valAttr)
-}
-
-func (t *dynamodbTranscoder) TransactWriteItemsToRequest(b []byte) (*kv.OperationGroup[kv.OP], error) {
-	var in transactWriteItemsInput
-	if err := json.Unmarshal(b, &in); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	var elems []*kv.Elem[kv.OP]
-	for _, item := range in.TransactItems {
-		if item.Put == nil {
-			return nil, errors.New("unsupported transact item")
-		}
-		keyAttr, ok := item.Put.Item["key"]
-		if !ok {
-			return nil, errors.New("missing key attribute")
-		}
-		valAttr, ok := item.Put.Item["value"]
-		if !ok {
-			return nil, errors.New("missing value attribute")
-		}
-		if !keyAttr.hasStringType() {
-			return nil, errors.New("key attribute must be S")
-		}
-
-		ops, err := t.valueAttrToOps([]byte(keyAttr.stringValue()), valAttr)
-		if err != nil {
-			return nil, err
-		}
-		elems = append(elems, ops.Elems...)
-	}
-
-	return &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
-		Elems: elems,
-	}, nil
-}
-
-func (t *dynamodbTranscoder) valueAttrToOps(key []byte, val attributeValue) (*kv.OperationGroup[kv.OP], error) {
-	// List handling: only lists of scalar strings are supported.
-	if val.hasListType() {
-		return t.listAttributeToOps(key, val.L)
-	}
-
-	// Default: simple string (allow empty string).
-	if !val.isSupportedScalarString() {
-		return nil, errors.New("unsupported attribute type (only S or L of S)")
-	}
-	return &kv.OperationGroup[kv.OP]{
-		IsTxn: false,
-		Elems: []*kv.Elem[kv.OP]{{
-			Op:    kv.Put,
-			Key:   key,
-			Value: []byte(val.stringValue()),
-		}},
-	}, nil
-}
-
 func (a attributeValue) hasStringType() bool {
 	return a.S != nil
 }
@@ -126,14 +43,6 @@ func (a attributeValue) hasListType() bool {
 
 func (a attributeValue) hasMapType() bool {
 	return a.M != nil
-}
-
-func (a attributeValue) hasAnyExplicitNonStringType() bool {
-	return a.N != nil || a.BOOL != nil || a.NULL != nil || a.L != nil || a.M != nil
-}
-
-func (a attributeValue) isSupportedScalarString() bool {
-	return a.hasStringType() && !a.hasAnyExplicitNonStringType()
 }
 
 func (a attributeValue) stringValue() string {
@@ -152,30 +61,6 @@ func (a attributeValue) numberValue() string {
 
 func newStringAttributeValue(v string) attributeValue {
 	return attributeValue{S: &v}
-}
-
-func (t *dynamodbTranscoder) listAttributeToOps(key []byte, list []attributeValue) (*kv.OperationGroup[kv.OP], error) {
-	elems := make([]*kv.Elem[kv.OP], 0, len(list)+1)
-	for i, item := range list {
-		if !item.isSupportedScalarString() {
-			if item.hasListType() {
-				return nil, errors.New("nested lists are not supported")
-			}
-			return nil, errors.New("only lists of scalar strings are supported")
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.ListItemKey(key, int64(i)),
-			Value: []byte(item.stringValue()),
-		})
-	}
-	meta := store.ListMeta{Head: 0, Tail: int64(len(list)), Len: int64(len(list))}
-	b, err := store.MarshalListMeta(meta)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaKey(key), Value: b})
-	return &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems}, nil
 }
 
 func (a attributeValue) MarshalJSON() ([]byte, error) {
@@ -203,7 +88,8 @@ func (a attributeValue) MarshalJSON() ([]byte, error) {
 	case hasBOOL:
 		return marshalAttributeValue(map[string]bool{"BOOL": *a.BOOL})
 	case hasNULL:
-		return marshalAttributeValue(map[string]bool{"NULL": *a.NULL})
+		// DynamoDB wire format only allows {"NULL": true}; always normalize.
+		return marshalAttributeValue(map[string]bool{"NULL": true})
 	case hasL:
 		return marshalAttributeValue(map[string][]attributeValue{"L": a.L})
 	default:
@@ -290,20 +176,37 @@ func (a *attributeValue) unmarshalNull(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &n); err != nil {
 		return errors.WithStack(err)
 	}
+	if !n {
+		return errors.New("dynamodb NULL attribute must be true")
+	}
 	a.NULL = &n
 	return nil
 }
 
 func (a *attributeValue) unmarshalList(raw json.RawMessage) error {
-	if err := json.Unmarshal(raw, &a.L); err != nil {
+	if isJSONNull(raw) {
+		return errors.New("dynamodb L attribute must be an array")
+	}
+	var list []attributeValue
+	if err := json.Unmarshal(raw, &list); err != nil {
 		return errors.WithStack(err)
 	}
+	a.L = list
 	return nil
 }
 
 func (a *attributeValue) unmarshalMap(raw json.RawMessage) error {
-	if err := json.Unmarshal(raw, &a.M); err != nil {
+	if isJSONNull(raw) {
+		return errors.New("dynamodb M attribute must be an object")
+	}
+	var m map[string]attributeValue
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return errors.WithStack(err)
 	}
+	a.M = m
 	return nil
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
