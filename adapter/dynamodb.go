@@ -1267,14 +1267,18 @@ func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error
 func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in transactWriteItemsInput) error {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
+	var lastErr error
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
 		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in)
 		if err != nil {
 			return err
 		}
-		if _, err = d.dispatchTransactWriteItemsWithRetry(ctx, reqs); err != nil {
+		// Retry with a fresh transaction start timestamp on every outer attempt.
+		reqs.StartTS = 0
+		if _, err = d.coordinator.Dispatch(ctx, reqs); err != nil {
+			lastErr = errors.WithStack(err)
 			if !isRetryableTransactWriteError(err) {
-				return err
+				return lastErr
 			}
 		} else {
 			retry, verifyErr := d.handleGenerationFenceResult(
@@ -1290,9 +1294,16 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 			}
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+			if lastErr != nil {
+				combined := errors.Join(err, lastErr)
+				return errors.Wrap(combined, "transact write retry canceled")
+			}
 			return errors.WithStack(err)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
+	}
+	if lastErr != nil {
+		return errors.Wrapf(lastErr, "transact write retry attempts exhausted after %s", transactRetryMaxDuration)
 	}
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "transact write retry attempts exhausted")
 }
