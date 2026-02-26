@@ -768,3 +768,580 @@ func TestDynamoDB_UpdateItem_OverlappingExpressionNames(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "answered", status.Value)
 }
+
+func TestDynamoDB_Query_RangeKeyConditions(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "query_range_conditions"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String("status"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: ddbTypes.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: ddbTypes.KeyTypeRange},
+		},
+		GlobalSecondaryIndexes: []ddbTypes.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String("statusIndex"),
+				KeySchema: []ddbTypes.KeySchemaElement{
+					{AttributeName: aws.String("status"), KeyType: ddbTypes.KeyTypeHash},
+					{AttributeName: aws.String("sk"), KeyType: ddbTypes.KeyTypeRange},
+				},
+				Projection: &ddbTypes.Projection{ProjectionType: ddbTypes.ProjectionTypeAll},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	put := func(pk, sk, status string) {
+		_, putErr := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(table),
+			Item: map[string]ddbTypes.AttributeValue{
+				"pk":     &ddbTypes.AttributeValueMemberS{Value: pk},
+				"sk":     &ddbTypes.AttributeValueMemberS{Value: sk},
+				"status": &ddbTypes.AttributeValueMemberS{Value: status},
+			},
+		})
+		require.NoError(t, putErr)
+	}
+	put("u1", "2026-01-01", "pending")
+	put("u1", "2026-01-02", "pending")
+	put("u1", "2026-02-01", "pending")
+	put("u2", "2026-01-03", "pending")
+
+	geOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(table),
+		KeyConditionExpression: aws.String("pk = :pk AND sk >= :from"),
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":pk":   &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":from": &ddbTypes.AttributeValueMemberS{Value: "2026-01-02"},
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, geOut.Items, 2)
+
+	betweenOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(table),
+		KeyConditionExpression: aws.String("pk = :pk AND sk BETWEEN :from AND :to"),
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":pk":   &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":from": &ddbTypes.AttributeValueMemberS{Value: "2026-01-01"},
+			":to":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-31"},
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, betweenOut.Items, 2)
+
+	beginsWithOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(table),
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":pk":     &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":prefix": &ddbTypes.AttributeValueMemberS{Value: "2026-01"},
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, beginsWithOut.Items, 2)
+
+	gsiOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(table),
+		IndexName:              aws.String("statusIndex"),
+		KeyConditionExpression: aws.String("status = :status AND sk BETWEEN :from AND :to"),
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
+			":from":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-01"},
+			":to":     &ddbTypes.AttributeValueMemberS{Value: "2026-01-31"},
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, gsiOut.Items, 3)
+}
+
+func TestDynamoDB_UpdateItem_MultipleActions(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "update_multiple_actions"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("id"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("id"), KeyType: ddbTypes.KeyTypeHash},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":      &ddbTypes.AttributeValueMemberS{Value: "1"},
+			"counter": &ddbTypes.AttributeValueMemberN{Value: "1"},
+			"a":       &ddbTypes.AttributeValueMemberS{Value: "old-a"},
+			"b":       &ddbTypes.AttributeValueMemberS{Value: "remove-me"},
+			"legacy":  &ddbTypes.AttributeValueMemberS{Value: "delete-me"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+		UpdateExpression: aws.String("SET #a = :a, #c = :c ADD #counter :inc REMOVE #b DELETE #legacy"),
+		ExpressionAttributeNames: map[string]string{
+			"#a":       "a",
+			"#c":       "c",
+			"#counter": "counter",
+			"#b":       "b",
+			"#legacy":  "legacy",
+		},
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":a":   &ddbTypes.AttributeValueMemberS{Value: "new-a"},
+			":c":   &ddbTypes.AttributeValueMemberS{Value: "new-c"},
+			":inc": &ddbTypes.AttributeValueMemberN{Value: "2"},
+		},
+	})
+	require.NoError(t, err)
+
+	out, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, out.Item)
+
+	counter, ok := out.Item["counter"].(*ddbTypes.AttributeValueMemberN)
+	require.True(t, ok)
+	require.Equal(t, "3", counter.Value)
+	_, hasB := out.Item["b"]
+	require.False(t, hasB)
+	_, hasLegacy := out.Item["legacy"]
+	require.False(t, hasLegacy)
+	_, hasC := out.Item["c"]
+	require.True(t, hasC)
+}
+
+func TestDynamoDB_TransactWriteItems_MixedActions(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "transact_mixed_actions"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("id"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("id"), KeyType: ddbTypes.KeyTypeHash},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":    &ddbTypes.AttributeValueMemberS{Value: "1"},
+			"value": &ddbTypes.AttributeValueMemberS{Value: "old"},
+		},
+	})
+	require.NoError(t, err)
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":    &ddbTypes.AttributeValueMemberS{Value: "2"},
+			"value": &ddbTypes.AttributeValueMemberS{Value: "keep"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbTypes.TransactWriteItem{
+			{
+				ConditionCheck: &ddbTypes.ConditionCheck{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+					},
+					ConditionExpression: aws.String("attribute_exists(#id)"),
+					ExpressionAttributeNames: map[string]string{
+						"#id": "id",
+					},
+				},
+			},
+			{
+				Update: &ddbTypes.Update{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+					},
+					UpdateExpression: aws.String("SET #value = :next"),
+					ExpressionAttributeNames: map[string]string{
+						"#value": "value",
+					},
+					ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+						":next": &ddbTypes.AttributeValueMemberS{Value: "updated"},
+					},
+				},
+			},
+			{
+				Delete: &ddbTypes.Delete{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	out1, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+	})
+	require.NoError(t, err)
+	value1, ok := out1.Item["value"].(*ddbTypes.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "updated", value1.Value)
+
+	out2, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+		},
+	})
+	require.NoError(t, err)
+	require.Empty(t, out2.Item)
+}
+
+func TestDynamoDB_Query_RangeKeyComparisonOperators(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "query_range_compare_ops"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String("seq"), AttributeType: ddbTypes.ScalarAttributeTypeN},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: ddbTypes.KeyTypeHash},
+			{AttributeName: aws.String("seq"), KeyType: ddbTypes.KeyTypeRange},
+		},
+	})
+	require.NoError(t, err)
+
+	for _, seq := range []string{"1", "2", "3"} {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(table),
+			Item: map[string]ddbTypes.AttributeValue{
+				"pk":  &ddbTypes.AttributeValueMemberS{Value: "u1"},
+				"seq": &ddbTypes.AttributeValueMemberN{Value: seq},
+			},
+		})
+		require.NoError(t, err)
+	}
+
+	run := func(expr string, values map[string]ddbTypes.AttributeValue) *dynamodb.QueryOutput {
+		out, qErr := client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 aws.String(table),
+			KeyConditionExpression:    aws.String(expr),
+			ExpressionAttributeValues: values,
+			ScanIndexForward:          aws.Bool(true),
+		})
+		require.NoError(t, qErr)
+		return out
+	}
+
+	ltOut := run(
+		"pk = :pk AND seq < :v",
+		map[string]ddbTypes.AttributeValue{
+			":pk": &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":v":  &ddbTypes.AttributeValueMemberN{Value: "2"},
+		},
+	)
+	require.Len(t, ltOut.Items, 1)
+	ltSeq, ok := ltOut.Items[0]["seq"].(*ddbTypes.AttributeValueMemberN)
+	require.True(t, ok)
+	require.Equal(t, "1", ltSeq.Value)
+
+	leOut := run(
+		"pk = :pk AND seq <= :v",
+		map[string]ddbTypes.AttributeValue{
+			":pk": &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":v":  &ddbTypes.AttributeValueMemberN{Value: "2"},
+		},
+	)
+	require.Len(t, leOut.Items, 2)
+
+	gtOut := run(
+		"pk = :pk AND seq > :v",
+		map[string]ddbTypes.AttributeValue{
+			":pk": &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":v":  &ddbTypes.AttributeValueMemberN{Value: "2"},
+		},
+	)
+	require.Len(t, gtOut.Items, 1)
+	gtSeq, ok := gtOut.Items[0]["seq"].(*ddbTypes.AttributeValueMemberN)
+	require.True(t, ok)
+	require.Equal(t, "3", gtSeq.Value)
+
+	eqOut := run(
+		"pk = :pk AND seq = :v",
+		map[string]ddbTypes.AttributeValue{
+			":pk": &ddbTypes.AttributeValueMemberS{Value: "u1"},
+			":v":  &ddbTypes.AttributeValueMemberN{Value: "2"},
+		},
+	)
+	require.Len(t, eqOut.Items, 1)
+	eqSeq, ok := eqOut.Items[0]["seq"].(*ddbTypes.AttributeValueMemberN)
+	require.True(t, ok)
+	require.Equal(t, "2", eqSeq.Value)
+}
+
+func TestDynamoDB_TransactWriteItems_ConditionFailureRollsBack(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "transact_conditional_rollback"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("id"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("id"), KeyType: ddbTypes.KeyTypeHash},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":    &ddbTypes.AttributeValueMemberS{Value: "1"},
+			"value": &ddbTypes.AttributeValueMemberS{Value: "old"},
+		},
+	})
+	require.NoError(t, err)
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":    &ddbTypes.AttributeValueMemberS{Value: "2"},
+			"guard": &ddbTypes.AttributeValueMemberS{Value: "open"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []ddbTypes.TransactWriteItem{
+			{
+				Update: &ddbTypes.Update{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+					},
+					UpdateExpression: aws.String("SET #value = :next"),
+					ExpressionAttributeNames: map[string]string{
+						"#value": "value",
+					},
+					ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+						":next": &ddbTypes.AttributeValueMemberS{Value: "updated"},
+					},
+				},
+			},
+			{
+				ConditionCheck: &ddbTypes.ConditionCheck{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+					},
+					ConditionExpression: aws.String("#guard = :closed"),
+					ExpressionAttributeNames: map[string]string{
+						"#guard": "guard",
+					},
+					ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+						":closed": &ddbTypes.AttributeValueMemberS{Value: "closed"},
+					},
+				},
+			},
+			{
+				Delete: &ddbTypes.Delete{
+					TableName: aws.String(table),
+					Key: map[string]ddbTypes.AttributeValue{
+						"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+					},
+				},
+			},
+		},
+	})
+	require.Error(t, err)
+
+	out1, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+	})
+	require.NoError(t, err)
+	value1, ok := out1.Item["value"].(*ddbTypes.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "old", value1.Value)
+
+	out2, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+		},
+	})
+	require.NoError(t, err)
+	guard, ok := out2.Item["guard"].(*ddbTypes.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "open", guard.Value)
+}
+
+func TestDynamoDB_UpdateItem_AddDecimalAndNegativeNumber(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	ctx := context.Background()
+	table := "update_add_decimal"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: ddbTypes.BillingModePayPerRequest,
+		AttributeDefinitions: []ddbTypes.AttributeDefinition{
+			{AttributeName: aws.String("id"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []ddbTypes.KeySchemaElement{
+			{AttributeName: aws.String("id"), KeyType: ddbTypes.KeyTypeHash},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id":      &ddbTypes.AttributeValueMemberS{Value: "1"},
+			"counter": &ddbTypes.AttributeValueMemberN{Value: "1.5"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+		UpdateExpression: aws.String("ADD #counter :delta"),
+		ExpressionAttributeNames: map[string]string{
+			"#counter": "counter",
+		},
+		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+			":delta": &ddbTypes.AttributeValueMemberN{Value: "-0.4"},
+		},
+	})
+	require.NoError(t, err)
+
+	out, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(table),
+		Key: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "1"},
+		},
+	})
+	require.NoError(t, err)
+	counter, ok := out.Item["counter"].(*ddbTypes.AttributeValueMemberN)
+	require.True(t, ok)
+	require.Equal(t, "1.1", counter.Value)
+}

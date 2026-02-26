@@ -26,7 +26,35 @@ type transactWriteItemsInput struct {
 }
 
 type transactWriteItem struct {
-	Put *putItemInput `json:"Put,omitempty"`
+	Put            *putItemInput           `json:"Put,omitempty"`
+	Update         *transactUpdateInput    `json:"Update,omitempty"`
+	Delete         *transactDeleteInput    `json:"Delete,omitempty"`
+	ConditionCheck *transactConditionInput `json:"ConditionCheck,omitempty"`
+}
+
+type transactUpdateInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	UpdateExpression          string                    `json:"UpdateExpression"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
+type transactDeleteInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
+type transactConditionInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
 }
 
 func (a attributeValue) hasStringType() bool {

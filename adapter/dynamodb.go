@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -39,6 +40,7 @@ const (
 	splitPartsInitialCapacity   = 2
 	replacerArgPairSize         = 2
 	gsiQueryReadWorkerCount     = 16
+	numericUpdateScaleDigits    = 20
 	transactRetryMaxAttempts    = 128
 	transactRetryMaxDuration    = 2 * time.Second
 	transactRetryInitialBackoff = 1 * time.Millisecond
@@ -420,7 +422,13 @@ func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), tableCleanupAsyncTimeout)
 		defer cancel()
-		_ = d.cleanupDeletedTableGeneration(ctx, tableName, generation)
+		if err := d.cleanupDeletedTableGeneration(ctx, tableName, generation); err != nil {
+			slog.Error("dynamodb delete table cleanup failed",
+				"table", tableName,
+				"generation", generation,
+				"error", err,
+			)
+		}
 	}()
 }
 
@@ -1004,6 +1012,31 @@ type queryOutput struct {
 	lastEvaluatedKey map[string]attributeValue
 }
 
+type queryRangeOperator string
+
+const (
+	queryRangeOpEqual      queryRangeOperator = "="
+	queryRangeOpLessThan   queryRangeOperator = "<"
+	queryRangeOpLessOrEq   queryRangeOperator = "<="
+	queryRangeOpGreater    queryRangeOperator = ">"
+	queryRangeOpGreaterEq  queryRangeOperator = ">="
+	queryRangeOpBetween    queryRangeOperator = "BETWEEN"
+	queryRangeOpBeginsWith queryRangeOperator = "BEGINS_WITH"
+)
+
+type queryRangeCondition struct {
+	attr   string
+	op     queryRangeOperator
+	value1 attributeValue
+	value2 attributeValue
+}
+
+type queryCondition struct {
+	hashAttr  string
+	hashValue attributeValue
+	rangeCond *queryRangeCondition
+}
+
 func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryOutput, error) {
 	schema, exists, err := d.loadTableSchema(ctx, in.TableName)
 	if err != nil {
@@ -1012,11 +1045,11 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if !exists {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
-	attrName, expected, keySchema, err := resolveQueryCondition(in, schema)
+	keySchema, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
 		return nil, err
 	}
-	items, scannedCount, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, attrName, expected)
+	items, scannedCount, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond)
 	if err != nil {
 		return nil, err
 	}
@@ -1033,34 +1066,30 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	}, nil
 }
 
-func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (string, attributeValue, dynamoKeySchema, error) {
-	attrName, placeholder, err := parseKeyConditionExpression(replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames))
-	if err != nil {
-		return "", attributeValue{}, dynamoKeySchema{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
-	}
-	expected, ok := in.ExpressionAttributeValues[placeholder]
-	if !ok {
-		return "", attributeValue{}, dynamoKeySchema{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing key condition value")
-	}
+func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeySchema, queryCondition, error) {
 	keySchema, err := schema.keySchemaForQuery(in.IndexName)
 	if err != nil {
-		return "", attributeValue{}, dynamoKeySchema{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	if attrName != keySchema.HashKey {
-		return "", attributeValue{}, dynamoKeySchema{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported key condition")
+	parsed, err := parseKeyConditionExpression(replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames))
+	if err != nil {
+		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	return attrName, expected, keySchema, nil
+	cond, err := buildQueryCondition(keySchema, parsed, in.ExpressionAttributeValues)
+	if err != nil {
+		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return keySchema, cond, nil
 }
 
-func filterQueryItems(kvs []*store.KVPair, attrName string, expected attributeValue) ([]map[string]attributeValue, error) {
+func filterQueryItems(kvs []*store.KVPair, cond queryCondition) ([]map[string]attributeValue, error) {
 	items := make([]map[string]attributeValue, 0, len(kvs))
 	for _, kvp := range kvs {
 		item := map[string]attributeValue{}
 		if err := json.Unmarshal(kvp.Value, &item); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		attr, ok := item[attrName]
-		if !ok || !attributeValueEqual(attr, expected) {
+		if !matchesQueryCondition(item, cond) {
 			continue
 		}
 		items = append(items, item)
@@ -1088,13 +1117,12 @@ func (d *DynamoDBServer) queryItemsByKeyCondition(
 	in queryInput,
 	schema *dynamoTableSchema,
 	keySchema dynamoKeySchema,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 ) ([]map[string]attributeValue, int, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		return d.queryItemsByGSI(ctx, in, schema, attrName, expected)
+		return d.queryItemsByGSI(ctx, in, schema, cond)
 	}
-	scanPrefix, err := queryScanPrefix(schema, in, keySchema, expected)
+	scanPrefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1102,7 +1130,7 @@ func (d *DynamoDBServer) queryItemsByKeyCondition(
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}
-	items, err := filterQueryItems(kvs, attrName, expected)
+	items, err := filterQueryItems(kvs, cond)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1113,10 +1141,9 @@ func (d *DynamoDBServer) queryItemsByGSI(
 	ctx context.Context,
 	in queryInput,
 	schema *dynamoTableSchema,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 ) ([]map[string]attributeValue, int, error) {
-	hashKey, err := attributeValueAsKey(expected)
+	hashKey, err := attributeValueAsKey(cond.hashValue)
 	if err != nil {
 		return nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -1127,7 +1154,7 @@ func (d *DynamoDBServer) queryItemsByGSI(
 	}
 	readTS := snapshotTS(d.coordinator.Clock(), d.store)
 	itemKeys := uniqueGSIItemKeys(kvs)
-	items, err := d.readItemsForGSIQuery(ctx, itemKeys, readTS, attrName, expected)
+	items, err := d.readItemsForGSIQuery(ctx, itemKeys, readTS, cond)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1176,8 +1203,7 @@ func (d *DynamoDBServer) readItemsForGSIQuery(
 	ctx context.Context,
 	itemKeys [][]byte,
 	readTS uint64,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 ) ([]map[string]attributeValue, error) {
 	if len(itemKeys) == 0 {
 		return nil, nil
@@ -1189,7 +1215,7 @@ func (d *DynamoDBServer) readItemsForGSIQuery(
 	defer cancel()
 
 	var wg sync.WaitGroup
-	d.startGSIReadWorkers(&wg, workerCount, workerCtx, readTS, attrName, expected, jobs, results, cancel)
+	d.startGSIReadWorkers(&wg, workerCount, workerCtx, readTS, cond, jobs, results, cancel)
 	enqueueGSIReadJobs(workerCtx, jobs, itemKeys)
 	close(jobs)
 	wg.Wait()
@@ -1203,8 +1229,7 @@ func (d *DynamoDBServer) startGSIReadWorkers(
 	workerCount int,
 	ctx context.Context,
 	readTS uint64,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 	jobs <-chan gsiReadJob,
 	results chan<- gsiReadResult,
 	cancel context.CancelFunc,
@@ -1213,7 +1238,7 @@ func (d *DynamoDBServer) startGSIReadWorkers(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.gsiReadWorker(ctx, readTS, attrName, expected, jobs, results, cancel)
+			d.gsiReadWorker(ctx, readTS, cond, jobs, results, cancel)
 		}()
 	}
 }
@@ -1254,8 +1279,7 @@ func collectOrderedGSIReadResults(
 func (d *DynamoDBServer) gsiReadWorker(
 	ctx context.Context,
 	readTS uint64,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 	jobs <-chan gsiReadJob,
 	results chan<- gsiReadResult,
 	cancel context.CancelFunc,
@@ -1265,7 +1289,7 @@ func (d *DynamoDBServer) gsiReadWorker(
 		if !ok {
 			return
 		}
-		item, emit, err := d.executeGSIReadJob(ctx, readTS, attrName, expected, job.key)
+		item, emit, err := d.executeGSIReadJob(ctx, readTS, cond, job.key)
 		if err != nil {
 			sendGSIReadError(results, err)
 			cancel()
@@ -1295,8 +1319,7 @@ func nextGSIReadJob(ctx context.Context, jobs <-chan gsiReadJob) (gsiReadJob, bo
 func (d *DynamoDBServer) executeGSIReadJob(
 	ctx context.Context,
 	readTS uint64,
-	attrName string,
-	expected attributeValue,
+	cond queryCondition,
 	key []byte,
 ) (map[string]attributeValue, bool, error) {
 	item, found, err := d.readItemAtKeyAt(ctx, key, readTS)
@@ -1306,8 +1329,7 @@ func (d *DynamoDBServer) executeGSIReadJob(
 	if !found {
 		return nil, false, nil
 	}
-	attr, ok := item[attrName]
-	if !ok || !attributeValueEqual(attr, expected) {
+	if !matchesQueryCondition(item, cond) {
 		return nil, false, nil
 	}
 	return item, true, nil
@@ -1435,10 +1457,10 @@ func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error
 	seen := map[string]struct{}{}
 	names := make([]string, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		if item.Put == nil {
-			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+		tableName, err := transactWriteItemTableName(item)
+		if err != nil {
+			return nil, err
 		}
-		tableName := strings.TrimSpace(item.Put.TableName)
 		if tableName == "" {
 			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		}
@@ -1451,6 +1473,43 @@ func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error
 	return names, nil
 }
 
+func transactWriteItemTableName(item transactWriteItem) (string, error) {
+	switch countTransactWriteItemActions(item) {
+	case 0:
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing transact action")
+	case 1:
+	default:
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "multiple transact actions are not supported")
+	}
+	switch {
+	case item.Put != nil:
+		return strings.TrimSpace(item.Put.TableName), nil
+	case item.Update != nil:
+		return strings.TrimSpace(item.Update.TableName), nil
+	case item.Delete != nil:
+		return strings.TrimSpace(item.Delete.TableName), nil
+	default:
+		return strings.TrimSpace(item.ConditionCheck.TableName), nil
+	}
+}
+
+func countTransactWriteItemActions(item transactWriteItem) int {
+	count := 0
+	if item.Put != nil {
+		count++
+	}
+	if item.Update != nil {
+		count++
+	}
+	if item.Delete != nil {
+		count++
+	}
+	if item.ConditionCheck != nil {
+		count++
+	}
+	return count
+}
+
 func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in transactWriteItemsInput) error {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
@@ -1460,25 +1519,15 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 		if err != nil {
 			return err
 		}
-		// Retry with a fresh transaction start timestamp on every outer attempt.
-		reqs.StartTS = 0
-		if _, err = d.coordinator.Dispatch(ctx, reqs); err != nil {
-			lastErr = errors.WithStack(err)
-			if !isRetryableTransactWriteError(err) {
-				return lastErr
-			}
-		} else {
-			retry, verifyErr := d.handleGenerationFenceResult(
-				ctx,
-				d.verifyTableGenerations(ctx, generations),
-				cleanupKeys,
-			)
-			if verifyErr != nil {
-				return verifyErr
-			}
-			if !retry {
-				return nil
-			}
+		done, retryErr, fatalErr := d.runTransactWriteAttempt(ctx, reqs, generations, cleanupKeys)
+		if fatalErr != nil {
+			return fatalErr
+		}
+		if done {
+			return nil
+		}
+		if retryErr != nil {
+			lastErr = retryErr
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
 			if lastErr != nil {
@@ -1495,44 +1544,277 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "transact write retry attempts exhausted")
 }
 
+func (d *DynamoDBServer) runTransactWriteAttempt(
+	ctx context.Context,
+	reqs *kv.OperationGroup[kv.OP],
+	generations map[string]uint64,
+	cleanupKeys [][]byte,
+) (bool, error, error) {
+	if len(reqs.Elems) == 0 {
+		return true, nil, nil
+	}
+	if _, err := d.coordinator.Dispatch(ctx, reqs); err != nil {
+		wrapped := errors.WithStack(err)
+		if !isRetryableTransactWriteError(err) {
+			return false, nil, wrapped
+		}
+		return false, wrapped, nil
+	}
+	retry, verifyErr := d.handleGenerationFenceResult(
+		ctx,
+		d.verifyTableGenerations(ctx, generations),
+		cleanupKeys,
+	)
+	if verifyErr != nil {
+		return false, nil, verifyErr
+	}
+	if !retry {
+		return true, nil, nil
+	}
+	return false, nil, nil
+}
+
 func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, [][]byte, error) {
 	readTS := d.nextTxnReadTS()
-	reqs := &kv.OperationGroup[kv.OP]{IsTxn: true}
+	reqs := &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: readTS,
+	}
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
 	cleanup := make([][]byte, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		if item.Put == nil {
-			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
-		}
-		tableName := strings.TrimSpace(item.Put.TableName)
-		if tableName == "" {
-			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+		tableName, err := transactWriteItemTableName(item)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 		schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		itemKey, err := schema.itemKeyFromAttributes(item.Put.Item)
-		if err != nil {
-			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
-		}
-		current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
-		if err != nil {
-			return nil, nil, nil, errors.WithStack(err)
-		}
-		if !found {
-			current = nil
-		}
-		itemReq, itemCleanup, err := buildItemWriteRequest(schema, itemKey, current, item.Put.Item)
+		plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		reqs.Elems = append(reqs.Elems, itemReq.Elems...)
+		reqs.Elems = append(reqs.Elems, plan.elems...)
+		if !plan.writes {
+			continue
+		}
 		tableGenerations[tableName] = schema.Generation
-		cleanup = append(cleanup, itemCleanup...)
+		cleanup = append(cleanup, plan.cleanup...)
 	}
 	return reqs, tableGenerations, cleanup, nil
+}
+
+type transactWriteItemPlan struct {
+	elems   []*kv.Elem[kv.OP]
+	cleanup [][]byte
+	writes  bool
+}
+
+func (d *DynamoDBServer) buildTransactWriteItemPlan(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	item transactWriteItem,
+	readTS uint64,
+) (*transactWriteItemPlan, error) {
+	switch {
+	case item.Put != nil:
+		return d.buildTransactPutPlan(ctx, schema, *item.Put, readTS)
+	case item.Update != nil:
+		return d.buildTransactUpdatePlan(ctx, schema, *item.Update, readTS)
+	case item.Delete != nil:
+		return d.buildTransactDeletePlan(ctx, schema, *item.Delete, readTS)
+	case item.ConditionCheck != nil:
+		return d.buildTransactConditionCheckPlan(ctx, schema, *item.ConditionCheck, readTS)
+	default:
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+	}
+}
+
+func (d *DynamoDBServer) buildTransactPutPlan(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	in putItemInput,
+	readTS uint64,
+) (*transactWriteItemPlan, error) {
+	itemKey, err := schema.itemKeyFromAttributes(in.Item)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !found {
+		current = nil
+	}
+	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, in.Item)
+	if err != nil {
+		return nil, err
+	}
+	return &transactWriteItemPlan{
+		elems:   req.Elems,
+		cleanup: cleanup,
+		writes:  true,
+	}, nil
+}
+
+func (d *DynamoDBServer) buildTransactUpdatePlan(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	in transactUpdateInput,
+	readTS uint64,
+) (*transactWriteItemPlan, error) {
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !found {
+		current = map[string]attributeValue{}
+	}
+	updateIn := updateItemInput(in)
+	nextItem, err := buildUpdatedItem(schema, updateIn, current)
+	if err != nil {
+		return nil, err
+	}
+	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, nextItem)
+	if err != nil {
+		return nil, err
+	}
+	return &transactWriteItemPlan{
+		elems:   req.Elems,
+		cleanup: cleanup,
+		writes:  true,
+	}, nil
+}
+
+func (d *DynamoDBServer) buildTransactDeletePlan(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	in transactDeleteInput,
+	readTS uint64,
+) (*transactWriteItemPlan, error) {
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
+	if !found {
+		return &transactWriteItemPlan{}, nil
+	}
+	req, err := buildItemDeleteRequest(schema, itemKey, current)
+	if err != nil {
+		return nil, err
+	}
+	return &transactWriteItemPlan{
+		elems:  req.Elems,
+		writes: true,
+	}, nil
+}
+
+func (d *DynamoDBServer) buildTransactConditionCheckPlan(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	in transactConditionInput,
+	readTS uint64,
+) (*transactWriteItemPlan, error) {
+	if strings.TrimSpace(in.ConditionExpression) == "" {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing condition expression")
+	}
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
+	lockReq, lockCleanup, err := buildConditionCheckLockRequest(itemKey, current, found)
+	if err != nil {
+		return nil, err
+	}
+	return &transactWriteItemPlan{
+		elems:   lockReq.Elems,
+		cleanup: lockCleanup,
+		writes:  true,
+	}, nil
+}
+
+func valueOrEmptyMap(item map[string]attributeValue, found bool) map[string]attributeValue {
+	if found {
+		return item
+	}
+	return map[string]attributeValue{}
+}
+
+func buildItemDeleteRequest(
+	schema *dynamoTableSchema,
+	itemKey []byte,
+	current map[string]attributeValue,
+) (*kv.OperationGroup[kv.OP], error) {
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: itemKey},
+	}
+	delKeys, _, err := gsiDeltaKeys(schema, current, nil)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	for _, key := range delKeys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+	}
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: 0,
+		Elems:   elems,
+	}, nil
+}
+
+func buildConditionCheckLockRequest(
+	itemKey []byte,
+	current map[string]attributeValue,
+	found bool,
+) (*kv.OperationGroup[kv.OP], [][]byte, error) {
+	elems := make([]*kv.Elem[kv.OP], 0, 1)
+	if found {
+		payload, err := json.Marshal(current)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: itemKey, Value: payload})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey})
+	}
+	return &kv.OperationGroup[kv.OP]{
+			IsTxn:   true,
+			StartTS: 0,
+			Elems:   elems,
+		},
+		[][]byte{itemKey},
+		nil
 }
 
 func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache map[string]*dynamoTableSchema, tableName string, readTS uint64) (*dynamoTableSchema, error) {
@@ -1743,11 +2025,130 @@ func replaceNames(expr string, names map[string]string) string {
 
 func applyUpdateExpression(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
 	updExpr := strings.TrimSpace(replaceNames(expr, names))
-	if !strings.HasPrefix(strings.ToUpper(updExpr), "SET ") {
-		return errors.New("unsupported update expression")
+	sections, err := parseUpdateExpressionSections(updExpr)
+	if err != nil {
+		return err
 	}
-	assign := strings.TrimSpace(updExpr[len("SET "):])
-	parts := strings.SplitN(assign, "=", updateSplitCount)
+	for _, section := range sections {
+		if err := applyUpdateExpressionSection(section, values, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type updateExpressionSection struct {
+	action string
+	body   string
+}
+
+func parseUpdateExpressionSections(expr string) ([]updateExpressionSection, error) {
+	if strings.TrimSpace(expr) == "" {
+		return nil, errors.New("unsupported update expression")
+	}
+	sections := make([]updateExpressionSection, 0, updateSplitCount)
+	seen := map[string]struct{}{}
+	i := skipSpaces(expr, 0)
+	for i < len(expr) {
+		action, nextPos, ok := parseUpdateActionToken(expr, i)
+		if !ok {
+			return nil, errors.New("unsupported update expression")
+		}
+		if _, exists := seen[action]; exists {
+			return nil, errors.New("duplicate update action")
+		}
+		seen[action] = struct{}{}
+		bodyStart := skipSpaces(expr, nextPos)
+		bodyEnd := findNextUpdateAction(expr, bodyStart)
+		if bodyEnd < 0 {
+			bodyEnd = len(expr)
+		}
+		body := strings.TrimSpace(expr[bodyStart:bodyEnd])
+		if body == "" {
+			return nil, errors.New("unsupported update expression")
+		}
+		sections = append(sections, updateExpressionSection{action: action, body: body})
+		if bodyEnd >= len(expr) {
+			break
+		}
+		i = bodyEnd
+	}
+	if len(sections) == 0 {
+		return nil, errors.New("unsupported update expression")
+	}
+	return sections, nil
+}
+
+func applyUpdateExpressionSection(section updateExpressionSection, values map[string]attributeValue, item map[string]attributeValue) error {
+	switch section.action {
+	case "SET":
+		return applySetUpdateAction(section.body, values, item)
+	case "REMOVE":
+		return applyRemoveUpdateAction(section.body, item)
+	case "ADD":
+		return applyAddUpdateAction(section.body, values, item)
+	case "DELETE":
+		return applyDeleteUpdateAction(section.body, item)
+	default:
+		return errors.New("unsupported update action")
+	}
+}
+
+func parseUpdateActionToken(expr string, pos int) (string, int, bool) {
+	actions := []string{"SET", "REMOVE", "ADD", "DELETE"}
+	for _, action := range actions {
+		end := pos + len(action)
+		if end > len(expr) {
+			continue
+		}
+		if !strings.EqualFold(expr[pos:end], action) {
+			continue
+		}
+		if !isLogicalKeywordBoundary(expr, pos-1) || !isLogicalKeywordBoundary(expr, end) {
+			continue
+		}
+		return action, end, true
+	}
+	return "", 0, false
+}
+
+func skipSpaces(expr string, pos int) int {
+	for pos < len(expr) && (expr[pos] == ' ' || expr[pos] == '\t' || expr[pos] == '\n' || expr[pos] == '\r') {
+		pos++
+	}
+	return pos
+}
+
+func findNextUpdateAction(expr string, start int) int {
+	depth := 0
+	for i := start; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth != 0 {
+			continue
+		}
+		_, _, ok := parseUpdateActionToken(expr, i)
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+func applySetUpdateAction(body string, values map[string]attributeValue, item map[string]attributeValue) error {
+	assignments, err := splitTopLevelByComma(body)
+	if err != nil {
+		return errors.New("invalid update expression")
+	}
+	for _, assignment := range assignments {
+		if err := applySingleSetAssignment(assignment, values, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applySingleSetAssignment(assignment string, values map[string]attributeValue, item map[string]attributeValue) error {
+	parts := strings.SplitN(assignment, "=", updateSplitCount)
 	if len(parts) != updateSplitCount {
 		return errors.New("invalid update expression")
 	}
@@ -1762,6 +2163,140 @@ func applyUpdateExpression(expr string, names map[string]string, values map[stri
 	}
 	item[attrName] = valAttr
 	return nil
+}
+
+func applyRemoveUpdateAction(body string, item map[string]attributeValue) error {
+	attrs, err := splitTopLevelByComma(body)
+	if err != nil {
+		return errors.New("invalid update expression")
+	}
+	for _, attr := range attrs {
+		attrName := strings.TrimSpace(attr)
+		if attrName == "" {
+			return errors.New("invalid update expression attribute")
+		}
+		delete(item, attrName)
+	}
+	return nil
+}
+
+func applyAddUpdateAction(body string, values map[string]attributeValue, item map[string]attributeValue) error {
+	terms, err := splitTopLevelByComma(body)
+	if err != nil {
+		return errors.New("invalid update expression")
+	}
+	for _, term := range terms {
+		if err := applySingleAddTerm(term, values, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applySingleAddTerm(term string, values map[string]attributeValue, item map[string]attributeValue) error {
+	parts := strings.Fields(term)
+	if len(parts) != updateSplitCount {
+		return errors.New("invalid update expression")
+	}
+	attrName := strings.TrimSpace(parts[0])
+	placeholder := strings.TrimSpace(parts[1])
+	if attrName == "" || !strings.HasPrefix(placeholder, ":") {
+		return errors.New("invalid update expression")
+	}
+	addValue, ok := values[placeholder]
+	if !ok {
+		return errors.New("missing value attribute")
+	}
+	if !addValue.hasNumberType() {
+		return errors.New("ADD supports only number attributes")
+	}
+	current, exists := item[attrName]
+	if !exists {
+		item[attrName] = addValue
+		return nil
+	}
+	if !current.hasNumberType() {
+		return errors.New("ADD supports only number attributes")
+	}
+	sum, err := addNumericAttributeValues(current.numberValue(), addValue.numberValue())
+	if err != nil {
+		return err
+	}
+	item[attrName] = attributeValue{N: &sum}
+	return nil
+}
+
+func addNumericAttributeValues(left string, right string) (string, error) {
+	leftRat, rightRat := &big.Rat{}, &big.Rat{}
+	if _, ok := leftRat.SetString(strings.TrimSpace(left)); !ok {
+		return "", errors.New("invalid number attribute")
+	}
+	if _, ok := rightRat.SetString(strings.TrimSpace(right)); !ok {
+		return "", errors.New("invalid number attribute")
+	}
+	sum := &big.Rat{}
+	sum.Add(leftRat, rightRat)
+	if sum.IsInt() {
+		return sum.Num().String(), nil
+	}
+	out := strings.TrimRight(sum.FloatString(numericUpdateScaleDigits), "0")
+	out = strings.TrimRight(out, ".")
+	if out == "" {
+		return "0", nil
+	}
+	return out, nil
+}
+
+func applyDeleteUpdateAction(body string, item map[string]attributeValue) error {
+	terms, err := splitTopLevelByComma(body)
+	if err != nil {
+		return errors.New("invalid update expression")
+	}
+	for _, term := range terms {
+		attrName := deleteTermAttributeName(term)
+		if attrName == "" {
+			return errors.New("invalid update expression")
+		}
+		delete(item, attrName)
+	}
+	return nil
+}
+
+func deleteTermAttributeName(term string) string {
+	fields := strings.Fields(strings.TrimSpace(term))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func splitTopLevelByComma(expr string) ([]string, error) {
+	depth := 0
+	last := 0
+	parts := make([]string, 0, splitPartsInitialCapacity)
+	for i := 0; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth < 0 {
+			return nil, errors.New("invalid expression")
+		}
+		if depth != 0 || expr[i] != ',' {
+			continue
+		}
+		part := strings.TrimSpace(expr[last:i])
+		if part == "" {
+			return nil, errors.New("invalid expression")
+		}
+		parts = append(parts, part)
+		last = i + 1
+	}
+	if depth != 0 {
+		return nil, errors.New("invalid expression")
+	}
+	tail := strings.TrimSpace(expr[last:])
+	if tail == "" {
+		return nil, errors.New("invalid expression")
+	}
+	return append(parts, tail), nil
 }
 
 func validateConditionOnItem(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
@@ -1980,17 +2515,344 @@ func finalizeKeywordSplit(tailExpr string, parts []string) []string {
 	return append(parts, tail)
 }
 
-func parseKeyConditionExpression(expr string) (string, string, error) {
-	parts := strings.SplitN(strings.TrimSpace(expr), "=", updateSplitCount)
+type parsedKeyConditionTerm struct {
+	attr         string
+	op           queryRangeOperator
+	placeholder1 string
+	placeholder2 string
+}
+
+func parseKeyConditionExpression(expr string) ([]parsedKeyConditionTerm, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil, errors.New("unsupported key condition expression")
+	}
+	parts, err := splitKeyConditionTerms(expr)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) > updateSplitCount {
+		return nil, errors.New("unsupported key condition expression")
+	}
+	terms := make([]parsedKeyConditionTerm, 0, len(parts))
+	for _, part := range parts {
+		term, err := parseKeyConditionTerm(part)
+		if err != nil {
+			return nil, err
+		}
+		terms = append(terms, term)
+	}
+	return terms, nil
+}
+
+func splitKeyConditionTerms(expr string) ([]string, error) {
+	upper := strings.ToUpper(expr)
+	depth := 0
+	last := 0
+	betweenPending := false
+	parts := make([]string, 0, splitPartsInitialCapacity)
+	for i := 0; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth != 0 {
+			continue
+		}
+		keyword := keyConditionKeywordAt(expr, upper, i)
+		if keyword == "" {
+			continue
+		}
+		if keyword == "BETWEEN" {
+			betweenPending = true
+			i += len(keyword) - 1
+			continue
+		}
+		if betweenPending {
+			betweenPending = false
+			i += len(keyword) - 1
+			continue
+		}
+		part, ok := trimmedNonEmpty(expr[last:i])
+		if !ok {
+			return nil, errors.New("unsupported key condition expression")
+		}
+		parts = append(parts, part)
+		i += len(keyword) - 1
+		last = i + 1
+	}
+	if betweenPending {
+		return nil, errors.New("unsupported key condition expression")
+	}
+	tail, ok := trimmedNonEmpty(expr[last:])
+	if !ok {
+		return nil, errors.New("unsupported key condition expression")
+	}
+	if len(parts) == 0 {
+		return []string{tail}, nil
+	}
+	return append(parts, tail), nil
+}
+
+func keyConditionKeywordAt(expr string, upper string, pos int) string {
+	if matchesKeywordTokenAt(upper, "BETWEEN", pos) &&
+		isLogicalKeywordBoundary(expr, pos-1) &&
+		isLogicalKeywordBoundary(expr, pos+len("BETWEEN")) {
+		return "BETWEEN"
+	}
+	if matchesKeywordTokenAt(upper, "AND", pos) &&
+		isLogicalKeywordBoundary(expr, pos-1) &&
+		isLogicalKeywordBoundary(expr, pos+len("AND")) {
+		return "AND"
+	}
+	return ""
+}
+
+func parseKeyConditionTerm(term string) (parsedKeyConditionTerm, error) {
+	term = strings.TrimSpace(term)
+	if t, ok, err := parseBeginsWithKeyConditionTerm(term); ok || err != nil {
+		return t, err
+	}
+	if t, ok, err := parseBetweenKeyConditionTerm(term); ok || err != nil {
+		return t, err
+	}
+	return parseComparisonKeyConditionTerm(term)
+}
+
+func parseBeginsWithKeyConditionTerm(term string) (parsedKeyConditionTerm, bool, error) {
+	const prefix = "BEGINS_WITH("
+	upper := strings.ToUpper(term)
+	if !strings.HasPrefix(upper, prefix) {
+		return parsedKeyConditionTerm{}, false, nil
+	}
+	if !strings.HasSuffix(term, ")") {
+		return parsedKeyConditionTerm{}, true, errors.New("unsupported key condition expression")
+	}
+	inner := strings.TrimSpace(term[len(prefix) : len(term)-1])
+	parts := strings.SplitN(inner, ",", updateSplitCount)
 	if len(parts) != updateSplitCount {
-		return "", "", errors.New("unsupported key condition expression")
+		return parsedKeyConditionTerm{}, true, errors.New("unsupported key condition expression")
 	}
 	attrName := strings.TrimSpace(parts[0])
 	placeholder := strings.TrimSpace(parts[1])
 	if attrName == "" || !strings.HasPrefix(placeholder, ":") {
-		return "", "", errors.New("unsupported key condition expression")
+		return parsedKeyConditionTerm{}, true, errors.New("unsupported key condition expression")
 	}
-	return attrName, placeholder, nil
+	return parsedKeyConditionTerm{
+		attr:         attrName,
+		op:           queryRangeOpBeginsWith,
+		placeholder1: placeholder,
+	}, true, nil
+}
+
+func parseBetweenKeyConditionTerm(term string) (parsedKeyConditionTerm, bool, error) {
+	upper := strings.ToUpper(term)
+	betweenIdx := strings.Index(upper, " BETWEEN ")
+	if betweenIdx < 0 {
+		return parsedKeyConditionTerm{}, false, nil
+	}
+	attrName := strings.TrimSpace(term[:betweenIdx])
+	rest := strings.TrimSpace(term[betweenIdx+len(" BETWEEN "):])
+	andIdx := strings.Index(strings.ToUpper(rest), " AND ")
+	if andIdx < 0 {
+		return parsedKeyConditionTerm{}, true, errors.New("unsupported key condition expression")
+	}
+	placeholder1 := strings.TrimSpace(rest[:andIdx])
+	placeholder2 := strings.TrimSpace(rest[andIdx+len(" AND "):])
+	if attrName == "" || !strings.HasPrefix(placeholder1, ":") || !strings.HasPrefix(placeholder2, ":") {
+		return parsedKeyConditionTerm{}, true, errors.New("unsupported key condition expression")
+	}
+	return parsedKeyConditionTerm{
+		attr:         attrName,
+		op:           queryRangeOpBetween,
+		placeholder1: placeholder1,
+		placeholder2: placeholder2,
+	}, true, nil
+}
+
+func parseComparisonKeyConditionTerm(term string) (parsedKeyConditionTerm, error) {
+	operators := []queryRangeOperator{
+		queryRangeOpLessOrEq,
+		queryRangeOpGreaterEq,
+		queryRangeOpLessThan,
+		queryRangeOpGreater,
+		queryRangeOpEqual,
+	}
+	for _, op := range operators {
+		if t, ok := splitComparisonTerm(term, op); ok {
+			return t, nil
+		}
+	}
+	return parsedKeyConditionTerm{}, errors.New("unsupported key condition expression")
+}
+
+func splitComparisonTerm(term string, op queryRangeOperator) (parsedKeyConditionTerm, bool) {
+	opStr := string(op)
+	idx := strings.Index(term, opStr)
+	if idx < 0 {
+		return parsedKeyConditionTerm{}, false
+	}
+	left := strings.TrimSpace(term[:idx])
+	right := strings.TrimSpace(term[idx+len(opStr):])
+	if left == "" || !strings.HasPrefix(right, ":") {
+		return parsedKeyConditionTerm{}, false
+	}
+	return parsedKeyConditionTerm{
+		attr:         left,
+		op:           op,
+		placeholder1: right,
+	}, true
+}
+
+func buildQueryCondition(keySchema dynamoKeySchema, terms []parsedKeyConditionTerm, values map[string]attributeValue) (queryCondition, error) {
+	hashTerm, rangeTerm, err := classifyQueryConditionTerms(keySchema, terms)
+	if err != nil {
+		return queryCondition{}, err
+	}
+	hashValue, ok := values[hashTerm.placeholder1]
+	if !ok {
+		return queryCondition{}, errors.New("missing key condition value")
+	}
+	cond := queryCondition{
+		hashAttr:  keySchema.HashKey,
+		hashValue: hashValue,
+	}
+	if rangeTerm == nil {
+		return cond, nil
+	}
+	value1, ok := values[rangeTerm.placeholder1]
+	if !ok {
+		return queryCondition{}, errors.New("missing key condition value")
+	}
+	rangeCond := &queryRangeCondition{
+		attr:   keySchema.RangeKey,
+		op:     rangeTerm.op,
+		value1: value1,
+	}
+	if rangeTerm.op == queryRangeOpBetween {
+		value2, ok := values[rangeTerm.placeholder2]
+		if !ok {
+			return queryCondition{}, errors.New("missing key condition value")
+		}
+		rangeCond.value2 = value2
+	}
+	cond.rangeCond = rangeCond
+	return cond, nil
+}
+
+func classifyQueryConditionTerms(
+	keySchema dynamoKeySchema,
+	terms []parsedKeyConditionTerm,
+) (parsedKeyConditionTerm, *parsedKeyConditionTerm, error) {
+	if len(terms) == 0 || len(terms) > updateSplitCount {
+		return parsedKeyConditionTerm{}, nil, errors.New("unsupported key condition")
+	}
+	hashTerm, ok := findHashConditionTerm(keySchema.HashKey, terms)
+	if !ok {
+		return parsedKeyConditionTerm{}, nil, errors.New("unsupported key condition")
+	}
+	if len(terms) == 1 {
+		return hashTerm, nil, nil
+	}
+	rangeTerm, ok := findRangeConditionTerm(keySchema.RangeKey, terms, hashTerm)
+	if !ok {
+		return parsedKeyConditionTerm{}, nil, errors.New("unsupported key condition")
+	}
+	return hashTerm, &rangeTerm, nil
+}
+
+func findHashConditionTerm(hashKey string, terms []parsedKeyConditionTerm) (parsedKeyConditionTerm, bool) {
+	var hashTerm parsedKeyConditionTerm
+	found := false
+	for _, term := range terms {
+		if term.attr != hashKey || term.op != queryRangeOpEqual {
+			continue
+		}
+		if found {
+			return parsedKeyConditionTerm{}, false
+		}
+		hashTerm = term
+		found = true
+	}
+	return hashTerm, found
+}
+
+func findRangeConditionTerm(
+	rangeKey string,
+	terms []parsedKeyConditionTerm,
+	hashTerm parsedKeyConditionTerm,
+) (parsedKeyConditionTerm, bool) {
+	if strings.TrimSpace(rangeKey) == "" {
+		return parsedKeyConditionTerm{}, false
+	}
+	for _, term := range terms {
+		if term == hashTerm {
+			continue
+		}
+		if term.attr != rangeKey {
+			return parsedKeyConditionTerm{}, false
+		}
+		return term, true
+	}
+	return parsedKeyConditionTerm{}, false
+}
+
+func matchesQueryCondition(item map[string]attributeValue, cond queryCondition) bool {
+	hashAttr, ok := item[cond.hashAttr]
+	if !ok || !attributeValueEqual(hashAttr, cond.hashValue) {
+		return false
+	}
+	if cond.rangeCond == nil {
+		return true
+	}
+	rangeAttr, ok := item[cond.rangeCond.attr]
+	if !ok {
+		return false
+	}
+	return matchesQueryRangeCondition(rangeAttr, *cond.rangeCond)
+}
+
+func matchesQueryRangeCondition(attr attributeValue, cond queryRangeCondition) bool {
+	if cond.op == queryRangeOpBeginsWith {
+		return matchesQueryRangeBeginsWith(attr, cond.value1)
+	}
+	if cond.op == queryRangeOpBetween {
+		return matchesQueryRangeBetween(attr, cond.value1, cond.value2)
+	}
+	return matchesQueryRangeCompare(attr, cond.value1, cond.op)
+}
+
+func matchesQueryRangeCompare(attr attributeValue, right attributeValue, op queryRangeOperator) bool {
+	switch op {
+	case queryRangeOpEqual:
+		return attributeValueEqual(attr, right)
+	case queryRangeOpLessThan:
+		return compareAttributeValueSortKey(attr, right) < 0
+	case queryRangeOpLessOrEq:
+		return compareAttributeValueSortKey(attr, right) <= 0
+	case queryRangeOpGreater:
+		return compareAttributeValueSortKey(attr, right) > 0
+	case queryRangeOpGreaterEq:
+		return compareAttributeValueSortKey(attr, right) >= 0
+	case queryRangeOpBetween, queryRangeOpBeginsWith:
+		return false
+	default:
+		return false
+	}
+}
+
+func matchesQueryRangeBetween(attr attributeValue, lower attributeValue, upper attributeValue) bool {
+	return compareAttributeValueSortKey(attr, lower) >= 0 &&
+		compareAttributeValueSortKey(attr, upper) <= 0
+}
+
+func matchesQueryRangeBeginsWith(attr attributeValue, prefixValue attributeValue) bool {
+	attrKey, err := attributeValueAsKey(attr)
+	if err != nil {
+		return false
+	}
+	prefix, err := attributeValueAsKey(prefixValue)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(attrKey, prefix)
 }
 
 func parseCreateTableKeySchema(elems []createTableKeySchemaElement) (dynamoKeySchema, error) {
