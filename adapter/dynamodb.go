@@ -42,10 +42,10 @@ const (
 	transactRetryInitialBackoff = 1 * time.Millisecond
 	transactRetryMaxBackoff     = 10 * time.Millisecond
 	transactRetryBackoffFactor  = 2
+	tableCleanupAsyncTimeout    = 5 * time.Minute
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
 	queryDefaultLimit           = 100
-	maxReplaceNameDepth         = 32
 	tableCleanupDeleteBatchSize = 256
 
 	dynamoTableMetaPrefix       = "!ddb|meta|table|"
@@ -64,22 +64,20 @@ const (
 )
 
 type DynamoDBServer struct {
-	listen           net.Listener
-	store            store.MVCCStore
-	coordinator      kv.Coordinator
-	dynamoTranscoder *dynamodbTranscoder
-	httpServer       *http.Server
-	targetHandlers   map[string]func(http.ResponseWriter, *http.Request)
-	itemUpdateLocks  [itemUpdateLockStripeCount]sync.Mutex
-	tableLocks       [tableLockStripeCount]sync.Mutex
+	listen          net.Listener
+	store           store.MVCCStore
+	coordinator     kv.Coordinator
+	httpServer      *http.Server
+	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
+	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
+	tableLocks      [tableLockStripeCount]sync.Mutex
 }
 
 func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator) *DynamoDBServer {
 	d := &DynamoDBServer{
-		listen:           listen,
-		store:            st,
-		coordinator:      coordinate,
-		dynamoTranscoder: newDynamoDBTranscoder(),
+		listen:      listen,
+		store:       st,
+		coordinator: coordinate,
 	}
 	d.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		createTableTarget:        d.createTable,
@@ -404,9 +402,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 				return errors.WithStack(err)
 			}
 		} else {
-			if err := d.cleanupDeletedTableGeneration(ctx, tableName, schema.Generation); err != nil {
-				return errors.WithStack(err)
-			}
+			d.launchDeletedTableCleanup(tableName, schema.Generation)
 			return nil
 		}
 
@@ -416,6 +412,14 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete table retry attempts exhausted")
+}
+
+func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation uint64) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), tableCleanupAsyncTimeout)
+		defer cancel()
+		_ = d.cleanupDeletedTableGeneration(ctx, tableName, generation)
+	}()
 }
 
 func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tableName string, generation uint64) error {
@@ -1565,7 +1569,11 @@ func replaceNames(expr string, names map[string]string) string {
 		}
 		return len(keys[i]) > len(keys[j])
 	})
-	for i := 0; i < maxReplaceNameDepth; i++ {
+
+	// Use a dynamic cap and cycle detection rather than a fixed depth.
+	seen := map[string]struct{}{expr: {}}
+	maxIterations := len(names) + 1
+	for i := 0; i < maxIterations; i++ {
 		next := expr
 		for _, key := range keys {
 			next = strings.ReplaceAll(next, key, names[key])
@@ -1573,6 +1581,10 @@ func replaceNames(expr string, names map[string]string) string {
 		if next == expr {
 			return next
 		}
+		if _, exists := seen[next]; exists {
+			return next
+		}
+		seen[next] = struct{}{}
 		expr = next
 	}
 	return expr
