@@ -33,6 +33,7 @@ import (
 var (
 	address       = flag.String("address", ":50051", "gRPC/Raft address")
 	redisAddress  = flag.String("redisAddress", ":6379", "Redis address")
+	dynamoAddress = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
 	raftID        = flag.String("raftId", "", "Raft ID")
 	raftDataDir   = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
 	raftBootstrap = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
@@ -57,6 +58,7 @@ func init() {
 type config struct {
 	address       string
 	redisAddress  string
+	dynamoAddress string
 	raftID        string
 	raftDataDir   string
 	raftBootstrap bool
@@ -73,6 +75,7 @@ func main() {
 		cfg := config{
 			address:       *address,
 			redisAddress:  *redisAddress,
+			dynamoAddress: *dynamoAddress,
 			raftID:        *raftID,
 			raftDataDir:   *raftDataDir,
 			raftBootstrap: *raftBootstrap,
@@ -89,6 +92,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50051",
 				redisAddress:  "127.0.0.1:63791",
+				dynamoAddress: "127.0.0.1:63801",
 				raftID:        "n1",
 				raftDataDir:   "", // In-memory
 				raftBootstrap: true,
@@ -96,6 +100,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50052",
 				redisAddress:  "127.0.0.1:63792",
+				dynamoAddress: "127.0.0.1:63802",
 				raftID:        "n2",
 				raftDataDir:   "",
 				raftBootstrap: false,
@@ -103,6 +108,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50053",
 				redisAddress:  "127.0.0.1:63793",
+				dynamoAddress: "127.0.0.1:63803",
 				raftID:        "n3",
 				raftDataDir:   "",
 				raftBootstrap: false,
@@ -357,12 +363,19 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return err
 	}
+	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	ds := adapter.NewDynamoDBServer(dynamoL, st, coordinator)
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
 	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
 	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))
 	eg.Go(redisServeTask(rd, cfg.redisAddress))
+	eg.Go(dynamoShutdownTask(ctx, ds, cfg.dynamoAddress))
+	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
 
 	return nil
 }
@@ -417,6 +430,26 @@ func redisServeTask(redisServer *adapter.RedisServer, address string) func() err
 	return func() error {
 		slog.Info("Starting Redis server", "address", address)
 		err := redisServer.Run()
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+func dynamoShutdownTask(ctx context.Context, dynamoServer *adapter.DynamoDBServer, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down DynamoDB server", "address", address, "reason", ctx.Err())
+		dynamoServer.Stop()
+		return nil
+	}
+}
+
+func dynamoServeTask(dynamoServer *adapter.DynamoDBServer, address string) func() error {
+	return func() error {
+		slog.Info("Starting DynamoDB server", "address", address)
+		err := dynamoServer.Run()
 		if err == nil || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
