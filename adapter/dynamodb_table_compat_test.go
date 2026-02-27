@@ -32,292 +32,271 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 	threadsTable := "threads"
 	messagesTable := "messages"
 
-	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(threadsTable),
-		BillingMode: ddbTypes.BillingModePayPerRequest,
-		AttributeDefinitions: []ddbTypes.AttributeDefinition{
-			{AttributeName: aws.String("threadId"), AttributeType: ddbTypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String("status"), AttributeType: ddbTypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String("createdAt"), AttributeType: ddbTypes.ScalarAttributeTypeS},
-		},
-		KeySchema: []ddbTypes.KeySchemaElement{
-			{AttributeName: aws.String("threadId"), KeyType: ddbTypes.KeyTypeHash},
-		},
-		GlobalSecondaryIndexes: []ddbTypes.GlobalSecondaryIndex{
-			{
-				IndexName: aws.String("statusIndex"),
-				KeySchema: []ddbTypes.KeySchemaElement{
-					{AttributeName: aws.String("status"), KeyType: ddbTypes.KeyTypeHash},
-					{AttributeName: aws.String("createdAt"), KeyType: ddbTypes.KeyTypeRange},
-				},
-				Projection: &ddbTypes.Projection{ProjectionType: ddbTypes.ProjectionTypeAll},
+	createThreadsTable := func(tb testing.TB) {
+		tb.Helper()
+		_, createErr := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+			TableName:   aws.String(threadsTable),
+			BillingMode: ddbTypes.BillingModePayPerRequest,
+			AttributeDefinitions: []ddbTypes.AttributeDefinition{
+				{AttributeName: aws.String("threadId"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+				{AttributeName: aws.String("status"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+				{AttributeName: aws.String("createdAt"), AttributeType: ddbTypes.ScalarAttributeTypeS},
 			},
-		},
-	})
-	require.NoError(t, err)
+			KeySchema: []ddbTypes.KeySchemaElement{
+				{AttributeName: aws.String("threadId"), KeyType: ddbTypes.KeyTypeHash},
+			},
+			GlobalSecondaryIndexes: []ddbTypes.GlobalSecondaryIndex{
+				{
+					IndexName: aws.String("statusIndex"),
+					KeySchema: []ddbTypes.KeySchemaElement{
+						{AttributeName: aws.String("status"), KeyType: ddbTypes.KeyTypeHash},
+						{AttributeName: aws.String("createdAt"), KeyType: ddbTypes.KeyTypeRange},
+					},
+					Projection: &ddbTypes.Projection{ProjectionType: ddbTypes.ProjectionTypeAll},
+				},
+			},
+		})
+		require.NoError(tb, createErr)
+	}
 
-	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(messagesTable),
-		BillingMode: ddbTypes.BillingModePayPerRequest,
-		AttributeDefinitions: []ddbTypes.AttributeDefinition{
-			{AttributeName: aws.String("threadId"), AttributeType: ddbTypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String("createdAt"), AttributeType: ddbTypes.ScalarAttributeTypeS},
-		},
-		KeySchema: []ddbTypes.KeySchemaElement{
-			{AttributeName: aws.String("threadId"), KeyType: ddbTypes.KeyTypeHash},
-			{AttributeName: aws.String("createdAt"), KeyType: ddbTypes.KeyTypeRange},
-		},
-	})
-	require.NoError(t, err)
+	createMessagesTable := func(tb testing.TB) {
+		tb.Helper()
+		_, createErr := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+			TableName:   aws.String(messagesTable),
+			BillingMode: ddbTypes.BillingModePayPerRequest,
+			AttributeDefinitions: []ddbTypes.AttributeDefinition{
+				{AttributeName: aws.String("threadId"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+				{AttributeName: aws.String("createdAt"), AttributeType: ddbTypes.ScalarAttributeTypeS},
+			},
+			KeySchema: []ddbTypes.KeySchemaElement{
+				{AttributeName: aws.String("threadId"), KeyType: ddbTypes.KeyTypeHash},
+				{AttributeName: aws.String("createdAt"), KeyType: ddbTypes.KeyTypeRange},
+			},
+		})
+		require.NoError(tb, createErr)
+	}
 
-	listAllOut, err := client.ListTables(ctx, &dynamodb.ListTablesInput{})
-	require.NoError(t, err)
-	require.ElementsMatch(t, []string{threadsTable, messagesTable}, listAllOut.TableNames)
-	listPageOut, err := client.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(1)})
-	require.NoError(t, err)
-	require.Len(t, listPageOut.TableNames, 1)
-	require.NotEmpty(t, aws.ToString(listPageOut.LastEvaluatedTableName))
-	desc, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(threadsTable)})
-	require.NoError(t, err)
-	require.NotNil(t, desc.Table)
-	require.Equal(t, threadsTable, aws.ToString(desc.Table.TableName))
+	putThread := func(tb testing.TB, threadID string, title string, createdAt string, status string, accessToken string) {
+		tb.Helper()
+		_, putErr := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(threadsTable),
+			Item: map[string]ddbTypes.AttributeValue{
+				"threadId":    &ddbTypes.AttributeValueMemberS{Value: threadID},
+				"title":       &ddbTypes.AttributeValueMemberS{Value: title},
+				"createdAt":   &ddbTypes.AttributeValueMemberS{Value: createdAt},
+				"status":      &ddbTypes.AttributeValueMemberS{Value: status},
+				"accessToken": &ddbTypes.AttributeValueMemberS{Value: accessToken},
+			},
+		})
+		require.NoError(tb, putErr)
+	}
 
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(threadsTable),
-		Item: map[string]ddbTypes.AttributeValue{
-			"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t1"},
-			"title":       &ddbTypes.AttributeValueMemberS{Value: "title1"},
-			"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-01T00:00:00Z"},
-			"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
-			"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
-		},
-	})
-	require.NoError(t, err)
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(threadsTable),
-		Item: map[string]ddbTypes.AttributeValue{
-			"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t2"},
-			"title":       &ddbTypes.AttributeValueMemberS{Value: "title2"},
-			"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-02T00:00:00Z"},
-			"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
-			"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
-		},
-	})
-	require.NoError(t, err)
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(threadsTable),
-		Item: map[string]ddbTypes.AttributeValue{
-			"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t3"},
-			"title":       &ddbTypes.AttributeValueMemberS{Value: "title3"},
-			"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-03T00:00:00Z"},
-			"status":      &ddbTypes.AttributeValueMemberS{Value: "answered"},
-			"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
-		},
-	})
-	require.NoError(t, err)
+	queryThreadsByStatus := func(tb testing.TB, status string, scanIndexForward bool) *dynamodb.QueryOutput {
+		tb.Helper()
+		out, queryErr := client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(threadsTable),
+			IndexName:              aws.String("statusIndex"),
+			KeyConditionExpression: aws.String("#status = :status"),
+			ExpressionAttributeNames: map[string]string{
+				"#status": "status",
+			},
+			ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+				":status": &ddbTypes.AttributeValueMemberS{Value: status},
+			},
+			ScanIndexForward: aws.Bool(scanIndexForward),
+		})
+		require.NoError(tb, queryErr)
+		return out
+	}
 
-	getOut, err := client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(threadsTable),
-		Key: map[string]ddbTypes.AttributeValue{
-			"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
-		},
-	})
-	require.NoError(t, err)
-	require.NotNil(t, getOut.Item)
-	threadID, ok := getOut.Item["threadId"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	require.Equal(t, "t1", threadID.Value)
-	status, ok := getOut.Item["status"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	require.Equal(t, "pending", status.Value)
-	title, ok := getOut.Item["title"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	require.Equal(t, "title1", title.Value)
+	t.Run("TableLifecycle", func(t *testing.T) {
+		createThreadsTable(t)
+		createMessagesTable(t)
 
-	queryThreadsOut, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(threadsTable),
-		IndexName:              aws.String("statusIndex"),
-		KeyConditionExpression: aws.String("#status = :status"),
-		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
-		},
-		ScanIndexForward: aws.Bool(false),
-	})
-	require.NoError(t, err)
-	require.Len(t, queryThreadsOut.Items, 2)
-	created0, ok := queryThreadsOut.Items[0]["createdAt"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	created1, ok := queryThreadsOut.Items[1]["createdAt"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	require.Equal(t, "2026-01-02T00:00:00Z", created0.Value)
-	require.Equal(t, "2026-01-01T00:00:00Z", created1.Value)
+		listAllOut, listErr := client.ListTables(ctx, &dynamodb.ListTablesInput{})
+		require.NoError(t, listErr)
+		require.ElementsMatch(t, []string{threadsTable, messagesTable}, listAllOut.TableNames)
 
-	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(threadsTable),
-		Key: map[string]ddbTypes.AttributeValue{
-			"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
-		},
-		UpdateExpression: aws.String("SET #status = :status"),
-		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":status": &ddbTypes.AttributeValueMemberS{Value: "answered"},
-		},
-	})
-	require.NoError(t, err)
-	queryPendingAfterUpdate, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(threadsTable),
-		IndexName:              aws.String("statusIndex"),
-		KeyConditionExpression: aws.String("#status = :status"),
-		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
-		},
-		ScanIndexForward: aws.Bool(false),
-	})
-	require.NoError(t, err)
-	require.Len(t, queryPendingAfterUpdate.Items, 1)
-	queryAnsweredAfterUpdate, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(threadsTable),
-		IndexName:              aws.String("statusIndex"),
-		KeyConditionExpression: aws.String("#status = :status"),
-		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":status": &ddbTypes.AttributeValueMemberS{Value: "answered"},
-		},
-		ScanIndexForward: aws.Bool(false),
-	})
-	require.NoError(t, err)
-	require.Len(t, queryAnsweredAfterUpdate.Items, 2)
+		listPageOut, listPageErr := client.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(1)})
+		require.NoError(t, listPageErr)
+		require.Len(t, listPageOut.TableNames, 1)
+		require.NotEmpty(t, aws.ToString(listPageOut.LastEvaluatedTableName))
 
-	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(threadsTable),
-		Key: map[string]ddbTypes.AttributeValue{
-			"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
-		},
-		UpdateExpression:    aws.String("SET #accessToken = :accessToken"),
-		ConditionExpression: aws.String("attribute_exists(#threadId) AND (attribute_not_exists(#accessToken) OR #accessToken = :empty)"),
-		ExpressionAttributeNames: map[string]string{
-			"#threadId":    "threadId",
-			"#accessToken": "accessToken",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":accessToken": &ddbTypes.AttributeValueMemberS{Value: "token1"},
-			":empty":       &ddbTypes.AttributeValueMemberS{Value: ""},
-		},
+		desc, descErr := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(threadsTable)})
+		require.NoError(t, descErr)
+		require.NotNil(t, desc.Table)
+		require.Equal(t, threadsTable, aws.ToString(desc.Table.TableName))
 	})
-	require.NoError(t, err)
 
-	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(threadsTable),
-		Key: map[string]ddbTypes.AttributeValue{
-			"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
-		},
-		UpdateExpression:    aws.String("SET #accessToken = :accessToken"),
-		ConditionExpression: aws.String("attribute_exists(#threadId) AND (attribute_not_exists(#accessToken) OR #accessToken = :empty)"),
-		ExpressionAttributeNames: map[string]string{
-			"#threadId":    "threadId",
-			"#accessToken": "accessToken",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":accessToken": &ddbTypes.AttributeValueMemberS{Value: "token2"},
-			":empty":       &ddbTypes.AttributeValueMemberS{Value: ""},
-		},
-	})
-	require.Error(t, err)
-	var condErr *ddbTypes.ConditionalCheckFailedException
-	require.ErrorAs(t, err, &condErr)
-	getOut, err = client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(threadsTable),
-		Key: map[string]ddbTypes.AttributeValue{
-			"threadId": &ddbTypes.AttributeValueMemberS{Value: "does-not-exist"},
-		},
-	})
-	require.NoError(t, err)
-	require.Empty(t, getOut.Item)
+	t.Run("ThreadItemOperations", func(t *testing.T) {
+		putThread(t, "t1", "title1", "2026-01-01T00:00:00Z", "pending", "")
+		putThread(t, "t2", "title2", "2026-01-02T00:00:00Z", "pending", "")
+		putThread(t, "t3", "title3", "2026-01-03T00:00:00Z", "answered", "")
 
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(messagesTable),
-		Item: map[string]ddbTypes.AttributeValue{
-			"messageId": &ddbTypes.AttributeValueMemberS{Value: "m1"},
-			"threadId":  &ddbTypes.AttributeValueMemberS{Value: "t1"},
-			"content":   &ddbTypes.AttributeValueMemberS{Value: "hello"},
-			"sender":    &ddbTypes.AttributeValueMemberS{Value: "user"},
-			"createdAt": &ddbTypes.AttributeValueMemberS{Value: "2026-01-01T00:00:01Z"},
-		},
-	})
-	require.NoError(t, err)
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(messagesTable),
-		Item: map[string]ddbTypes.AttributeValue{
-			"messageId": &ddbTypes.AttributeValueMemberS{Value: "m2"},
-			"threadId":  &ddbTypes.AttributeValueMemberS{Value: "t1"},
-			"content":   &ddbTypes.AttributeValueMemberS{Value: "world"},
-			"sender":    &ddbTypes.AttributeValueMemberS{Value: "admin"},
-			"createdAt": &ddbTypes.AttributeValueMemberS{Value: "2026-01-01T00:00:02Z"},
-		},
-	})
-	require.NoError(t, err)
+		getOut, getErr := client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(threadsTable),
+			Key: map[string]ddbTypes.AttributeValue{
+				"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
+			},
+		})
+		require.NoError(t, getErr)
+		require.NotNil(t, getOut.Item)
+		threadID, ok := getOut.Item["threadId"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		require.Equal(t, "t1", threadID.Value)
+		threadStatus, ok := getOut.Item["status"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		require.Equal(t, "pending", threadStatus.Value)
+		title, ok := getOut.Item["title"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		require.Equal(t, "title1", title.Value)
 
-	queryMessagesOut, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(messagesTable),
-		KeyConditionExpression: aws.String("threadId = :threadId"),
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
-		},
-		ScanIndexForward: aws.Bool(true),
-	})
-	require.NoError(t, err)
-	require.Len(t, queryMessagesOut.Items, 2)
-	mc0, ok := queryMessagesOut.Items[0]["createdAt"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	mc1, ok := queryMessagesOut.Items[1]["createdAt"].(*ddbTypes.AttributeValueMemberS)
-	require.True(t, ok)
-	require.Equal(t, "2026-01-01T00:00:01Z", mc0.Value)
-	require.Equal(t, "2026-01-01T00:00:02Z", mc1.Value)
+		queryThreadsOut := queryThreadsByStatus(t, "pending", false)
+		require.Len(t, queryThreadsOut.Items, 2)
+		created0, ok := queryThreadsOut.Items[0]["createdAt"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		created1, ok := queryThreadsOut.Items[1]["createdAt"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		require.Equal(t, "2026-01-02T00:00:00Z", created0.Value)
+		require.Equal(t, "2026-01-01T00:00:00Z", created1.Value)
 
-	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: []ddbTypes.TransactWriteItem{
-			{
-				Put: &ddbTypes.Put{
-					TableName: aws.String(threadsTable),
-					Item: map[string]ddbTypes.AttributeValue{
-						"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t4"},
-						"title":       &ddbTypes.AttributeValueMemberS{Value: "title4"},
-						"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-04T00:00:00Z"},
-						"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
-						"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
+		_, updateErr := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(threadsTable),
+			Key: map[string]ddbTypes.AttributeValue{
+				"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
+			},
+			UpdateExpression: aws.String("SET #status = :status"),
+			ExpressionAttributeNames: map[string]string{
+				"#status": "status",
+			},
+			ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+				":status": &ddbTypes.AttributeValueMemberS{Value: "answered"},
+			},
+		})
+		require.NoError(t, updateErr)
+
+		queryPendingAfterUpdate := queryThreadsByStatus(t, "pending", false)
+		require.Len(t, queryPendingAfterUpdate.Items, 1)
+		queryAnsweredAfterUpdate := queryThreadsByStatus(t, "answered", false)
+		require.Len(t, queryAnsweredAfterUpdate.Items, 2)
+
+		_, updateErr = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(threadsTable),
+			Key: map[string]ddbTypes.AttributeValue{
+				"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
+			},
+			UpdateExpression:    aws.String("SET #accessToken = :accessToken"),
+			ConditionExpression: aws.String("attribute_exists(#threadId) AND (attribute_not_exists(#accessToken) OR #accessToken = :empty)"),
+			ExpressionAttributeNames: map[string]string{
+				"#threadId":    "threadId",
+				"#accessToken": "accessToken",
+			},
+			ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+				":accessToken": &ddbTypes.AttributeValueMemberS{Value: "token1"},
+				":empty":       &ddbTypes.AttributeValueMemberS{Value: ""},
+			},
+		})
+		require.NoError(t, updateErr)
+
+		_, updateErr = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(threadsTable),
+			Key: map[string]ddbTypes.AttributeValue{
+				"threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
+			},
+			UpdateExpression:    aws.String("SET #accessToken = :accessToken"),
+			ConditionExpression: aws.String("attribute_exists(#threadId) AND (attribute_not_exists(#accessToken) OR #accessToken = :empty)"),
+			ExpressionAttributeNames: map[string]string{
+				"#threadId":    "threadId",
+				"#accessToken": "accessToken",
+			},
+			ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+				":accessToken": &ddbTypes.AttributeValueMemberS{Value: "token2"},
+				":empty":       &ddbTypes.AttributeValueMemberS{Value: ""},
+			},
+		})
+		require.Error(t, updateErr)
+		var condErr *ddbTypes.ConditionalCheckFailedException
+		require.ErrorAs(t, updateErr, &condErr)
+
+		missingOut, missingErr := client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(threadsTable),
+			Key: map[string]ddbTypes.AttributeValue{
+				"threadId": &ddbTypes.AttributeValueMemberS{Value: "does-not-exist"},
+			},
+		})
+		require.NoError(t, missingErr)
+		require.Empty(t, missingOut.Item)
+	})
+
+	t.Run("MessagesQuery", func(t *testing.T) {
+		_, putErr := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(messagesTable),
+			Item: map[string]ddbTypes.AttributeValue{
+				"messageId": &ddbTypes.AttributeValueMemberS{Value: "m1"},
+				"threadId":  &ddbTypes.AttributeValueMemberS{Value: "t1"},
+				"content":   &ddbTypes.AttributeValueMemberS{Value: "hello"},
+				"sender":    &ddbTypes.AttributeValueMemberS{Value: "user"},
+				"createdAt": &ddbTypes.AttributeValueMemberS{Value: "2026-01-01T00:00:01Z"},
+			},
+		})
+		require.NoError(t, putErr)
+		_, putErr = client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(messagesTable),
+			Item: map[string]ddbTypes.AttributeValue{
+				"messageId": &ddbTypes.AttributeValueMemberS{Value: "m2"},
+				"threadId":  &ddbTypes.AttributeValueMemberS{Value: "t1"},
+				"content":   &ddbTypes.AttributeValueMemberS{Value: "world"},
+				"sender":    &ddbTypes.AttributeValueMemberS{Value: "admin"},
+				"createdAt": &ddbTypes.AttributeValueMemberS{Value: "2026-01-01T00:00:02Z"},
+			},
+		})
+		require.NoError(t, putErr)
+
+		queryMessagesOut, queryErr := client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(messagesTable),
+			KeyConditionExpression: aws.String("threadId = :threadId"),
+			ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
+				":threadId": &ddbTypes.AttributeValueMemberS{Value: "t1"},
+			},
+			ScanIndexForward: aws.Bool(true),
+		})
+		require.NoError(t, queryErr)
+		require.Len(t, queryMessagesOut.Items, 2)
+		mc0, ok := queryMessagesOut.Items[0]["createdAt"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		mc1, ok := queryMessagesOut.Items[1]["createdAt"].(*ddbTypes.AttributeValueMemberS)
+		require.True(t, ok)
+		require.Equal(t, "2026-01-01T00:00:01Z", mc0.Value)
+		require.Equal(t, "2026-01-01T00:00:02Z", mc1.Value)
+	})
+
+	t.Run("TransactWriteItems", func(t *testing.T) {
+		_, txErr := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []ddbTypes.TransactWriteItem{
+				{
+					Put: &ddbTypes.Put{
+						TableName: aws.String(threadsTable),
+						Item: map[string]ddbTypes.AttributeValue{
+							"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t4"},
+							"title":       &ddbTypes.AttributeValueMemberS{Value: "title4"},
+							"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-04T00:00:00Z"},
+							"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
+							"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
+						},
 					},
 				},
 			},
-		},
-	})
-	require.NoError(t, err)
-	queryPendingAfterTransact, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(threadsTable),
-		IndexName:              aws.String("statusIndex"),
-		KeyConditionExpression: aws.String("#status = :status"),
-		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-		},
-		ExpressionAttributeValues: map[string]ddbTypes.AttributeValue{
-			":status": &ddbTypes.AttributeValueMemberS{Value: "pending"},
-		},
-		ScanIndexForward: aws.Bool(false),
-	})
-	require.NoError(t, err)
-	require.Len(t, queryPendingAfterTransact.Items, 2)
+		})
+		require.NoError(t, txErr)
 
-	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(messagesTable)})
-	require.NoError(t, err)
+		queryPendingAfterTransact := queryThreadsByStatus(t, "pending", false)
+		require.Len(t, queryPendingAfterTransact.Items, 2)
+	})
+
+	t.Run("DeleteTable", func(t *testing.T) {
+		_, deleteErr := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(messagesTable)})
+		require.NoError(t, deleteErr)
+	})
 }
 
 func TestDynamoDB_UpdateItem_ConditionOnMissingItemFails(t *testing.T) {
