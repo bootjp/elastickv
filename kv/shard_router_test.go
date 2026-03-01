@@ -274,3 +274,31 @@ func TestShardRouterCommitFailure(t *testing.T) {
 		t.Fatalf("unexpected abort on successful group")
 	}
 }
+
+func TestShardRouterRoutesListKeys(t *testing.T) {
+	e := distribution.NewEngine()
+	e.UpdateRoute([]byte("a"), []byte("m"), 1)
+	e.UpdateRoute([]byte("m"), nil, 2)
+
+	router := NewShardRouter(e)
+
+	ok := &fakeTM{}
+	fail := &fakeTM{}
+	router.Register(1, ok, nil)
+	router.Register(2, fail, nil)
+
+	listMetaKey := store.ListMetaKey([]byte("b"))
+	reqs := []*pb.Request{
+		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: listMetaKey, Value: []byte("v")}}},
+	}
+
+	if _, err := router.Commit(reqs); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if ok.commitCalls != 1 {
+		t.Fatalf("expected commit routed to group1")
+	}
+	if fail.commitCalls != 0 {
+		t.Fatalf("unexpected commit on group2")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -16,13 +17,14 @@ import (
 	"github.com/Jille/raftadmin"
 	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -31,6 +33,7 @@ import (
 var (
 	address       = flag.String("address", ":50051", "gRPC/Raft address")
 	redisAddress  = flag.String("redisAddress", ":6379", "Redis address")
+	dynamoAddress = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
 	raftID        = flag.String("raftId", "", "Raft ID")
 	raftDataDir   = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
 	raftBootstrap = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
@@ -55,6 +58,7 @@ func init() {
 type config struct {
 	address       string
 	redisAddress  string
+	dynamoAddress string
 	raftID        string
 	raftDataDir   string
 	raftBootstrap bool
@@ -64,19 +68,20 @@ type config struct {
 func main() {
 	flag.Parse()
 
-	eg := &errgroup.Group{}
+	eg, runCtx := errgroup.WithContext(context.Background())
 
 	if *raftID != "" {
 		// Single node mode
 		cfg := config{
 			address:       *address,
 			redisAddress:  *redisAddress,
+			dynamoAddress: *dynamoAddress,
 			raftID:        *raftID,
 			raftDataDir:   *raftDataDir,
 			raftBootstrap: *raftBootstrap,
 			raftRedisMap:  *raftRedisMap,
 		}
-		if err := run(eg, cfg); err != nil {
+		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
 			os.Exit(1)
 		}
@@ -87,6 +92,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50051",
 				redisAddress:  "127.0.0.1:63791",
+				dynamoAddress: "127.0.0.1:63801",
 				raftID:        "n1",
 				raftDataDir:   "", // In-memory
 				raftBootstrap: true,
@@ -94,6 +100,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50052",
 				redisAddress:  "127.0.0.1:63792",
+				dynamoAddress: "127.0.0.1:63802",
 				raftID:        "n2",
 				raftDataDir:   "",
 				raftBootstrap: false,
@@ -101,6 +108,7 @@ func main() {
 			{
 				address:       "127.0.0.1:50053",
 				redisAddress:  "127.0.0.1:63793",
+				dynamoAddress: "127.0.0.1:63803",
 				raftID:        "n3",
 				raftDataDir:   "",
 				raftBootstrap: false,
@@ -117,7 +125,7 @@ func main() {
 		for _, n := range nodes {
 			n.raftRedisMap = raftRedisMapStr
 			cfg := n // capture loop variable
-			if err := run(eg, cfg); err != nil {
+			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
 				os.Exit(1)
 			}
@@ -154,7 +162,7 @@ func main() {
 			// BUT, looking at the previous demo.go (if I could), it probably did the joins.
 
 			// Let's add a joiner goroutine.
-			return joinCluster(nodes)
+			return joinCluster(runCtx, nodes)
 		})
 	}
 
@@ -164,10 +172,12 @@ func main() {
 	}
 }
 
-func joinCluster(nodes []config) error {
+func joinCluster(ctx context.Context, nodes []config) error {
 	leader := nodes[0]
 	// Give servers some time to start
-	time.Sleep(joinWait)
+	if err := waitForJoinRetry(ctx, joinWait); err != nil {
+		return joinClusterWaitError(err)
+	}
 
 	// Connect to leader
 	conn, err := grpc.NewClient(leader.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -177,7 +187,6 @@ func joinCluster(nodes []config) error {
 	defer conn.Close()
 	client := raftadminpb.NewRaftAdminClient(conn)
 
-	ctx := context.Background()
 	for _, n := range nodes[1:] {
 		var joined bool
 		for i := 0; i < joinRetries; i++ {
@@ -192,14 +201,38 @@ func joinCluster(nodes []config) error {
 				joined = true
 				break
 			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return joinClusterWaitError(errors.WithStack(err))
+			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
-			time.Sleep(joinRetryInterval)
+			if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
+				return joinClusterWaitError(err)
+			}
 		}
 		if !joined {
 			return fmt.Errorf("failed to join node %s after retries", n.raftID)
 		}
 	}
 	return nil
+}
+
+func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+func joinClusterWaitError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Do not override the original errgroup cause with cancellation.
+		return nil
+	}
+	return err
 }
 
 func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
@@ -224,17 +257,19 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	return ldb, sdb, fss, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate) *grpc.Server {
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
-	gs := adapter.NewGRPCServer(st, coordinator)
+	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
+	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
 	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
+	pb.RegisterDistributionServer(s, distServer)
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
-	return s
+	return s, gs
 }
 
 func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string) (*adapter.RedisServer, error) {
@@ -258,8 +293,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
 }
 
-func run(eg *errgroup.Group, cfg config) error {
-	ctx := context.Background()
+func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 
 	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
@@ -307,28 +341,118 @@ func run(eg *errgroup.Group, cfg config) error {
 
 	trx := kv.NewTransaction(r)
 	coordinator := kv.NewCoordinator(trx, r)
+	distEngine := distribution.NewEngineWithDefaultRoute()
+	distCatalog := distribution.NewCatalogStore(st)
+	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
+		return errors.WithStack(err)
+	}
+	distServer := adapter.NewDistributionServer(
+		distEngine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(coordinator),
+	)
 
-	s := setupGRPC(r, st, tm, coordinator)
+	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	eg.Go(func() error {
-		slog.Info("Starting gRPC server", "address", cfg.address)
-		return errors.WithStack(s.Serve(grpcSock))
-	})
-
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
 	if err != nil {
 		return err
 	}
+	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	ds := adapter.NewDynamoDBServer(dynamoL, st, coordinator)
 
-	eg.Go(func() error {
-		slog.Info("Starting Redis server", "address", cfg.redisAddress)
-		return errors.WithStack(rd.Run())
-	})
+	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
+	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
+	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
+	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))
+	eg.Go(redisServeTask(rd, cfg.redisAddress))
+	eg.Go(dynamoShutdownTask(ctx, ds, cfg.dynamoAddress))
+	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
 
 	return nil
+}
+
+func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
+	return func() error {
+		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default()); err != nil {
+			return errors.Wrapf(err, "catalog watcher failed")
+		}
+		return nil
+	}
+}
+
+func grpcShutdownTask(ctx context.Context, server *grpc.Server, listener net.Listener, address string, closer io.Closer) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down gRPC server", "address", address, "reason", ctx.Err())
+		server.GracefulStop()
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			slog.Error("Failed to close gRPC listener", "address", address, "err", err)
+		}
+		if closer != nil {
+			if err := closer.Close(); err != nil {
+				slog.Error("Failed to close gRPC service", "address", address, "err", err)
+			}
+		}
+		return nil
+	}
+}
+
+func grpcServeTask(server *grpc.Server, listener net.Listener, address string) func() error {
+	return func() error {
+		slog.Info("Starting gRPC server", "address", address)
+		err := server.Serve(listener)
+		if err == nil || errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+func redisShutdownTask(ctx context.Context, redisServer *adapter.RedisServer, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down Redis server", "address", address, "reason", ctx.Err())
+		redisServer.Stop()
+		return nil
+	}
+}
+
+func redisServeTask(redisServer *adapter.RedisServer, address string) func() error {
+	return func() error {
+		slog.Info("Starting Redis server", "address", address)
+		err := redisServer.Run()
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+func dynamoShutdownTask(ctx context.Context, dynamoServer *adapter.DynamoDBServer, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down DynamoDB server", "address", address, "reason", ctx.Err())
+		dynamoServer.Stop()
+		return nil
+	}
+}
+
+func dynamoServeTask(dynamoServer *adapter.DynamoDBServer, address string) func() error {
+	return func() error {
+		slog.Info("Starting DynamoDB server", "address", address)
+		err := dynamoServer.Run()
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
 }

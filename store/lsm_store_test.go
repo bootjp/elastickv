@@ -62,6 +62,25 @@ func TestPebbleStore_Basic(t *testing.T) {
 	assert.Equal(t, []byte("val20"), val)
 }
 
+func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-last-ts-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v"), 42, 0))
+	require.Equal(t, uint64(42), s.LastCommitTS())
+	require.NoError(t, s.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	require.Equal(t, uint64(42), reopened.LastCommitTS())
+}
+
 func TestPebbleStore_Scan(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-scan-test")
 	require.NoError(t, err)
@@ -104,6 +123,66 @@ func TestPebbleStore_Scan(t *testing.T) {
 	pairs, err = s.ScanAt(ctx, []byte("k"), nil, 10, 5)
 	require.NoError(t, err)
 	assert.Len(t, pairs, 0)
+}
+
+func TestPebbleStore_Scan_TombstoneMasksOlderVersions(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-scan-tombstone-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
+	require.NoError(t, s.DeleteAt(ctx, []byte("k1"), 20))
+
+	pairs, err := s.ScanAt(ctx, []byte("k"), nil, 10, 25)
+	require.NoError(t, err)
+	assert.Len(t, pairs, 0)
+}
+
+func TestPebbleStore_Scan_SkipsKeyWithOnlyFutureVersions(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-scan-future-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v100"), 100, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v110"), 110, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v80"), 80, 0))
+
+	pairs, err := s.ScanAt(ctx, []byte("k"), nil, 10, 85)
+	require.NoError(t, err)
+	require.Len(t, pairs, 1)
+	assert.Equal(t, []byte("k2"), pairs[0].Key)
+	assert.Equal(t, []byte("v80"), pairs[0].Value)
+}
+
+func TestPebbleStore_Scan_IgnoresInternalMetaKey(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-scan-meta-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v2"), 20, 0))
+
+	// Full-range scan should not decode/expose the internal _meta_last_commit_ts key.
+	pairs, err := s.ScanAt(ctx, []byte(""), nil, 10, 30)
+	require.NoError(t, err)
+	require.Len(t, pairs, 2)
+	assert.Equal(t, []byte("k1"), pairs[0].Key)
+	assert.Equal(t, []byte("k2"), pairs[1].Key)
 }
 
 func TestPebbleStore_SnapshotRestore(t *testing.T) {

@@ -1,0 +1,93 @@
+package kv
+
+import (
+	"context"
+	"io"
+	"time"
+
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
+	"github.com/hashicorp/raft"
+)
+
+const leaderForwardTimeout = 5 * time.Second
+
+// LeaderProxy forwards transactional requests to the current raft leader when
+// the local node is not the leader.
+type LeaderProxy struct {
+	raft *raft.Raft
+	tm   *TransactionManager
+
+	connCache GRPCConnCache
+}
+
+// NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
+func NewLeaderProxy(r *raft.Raft) *LeaderProxy {
+	return &LeaderProxy{
+		raft: r,
+		tm:   NewTransaction(r),
+	}
+}
+
+func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	if p.raft.State() != raft.Leader {
+		return p.forward(reqs)
+	}
+	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
+	if err := verifyRaftLeader(p.raft); err != nil {
+		return p.forward(reqs)
+	}
+	return p.tm.Commit(reqs)
+}
+
+func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+	if p.raft.State() != raft.Leader {
+		return p.forward(reqs)
+	}
+	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
+	if err := verifyRaftLeader(p.raft); err != nil {
+		return p.forward(reqs)
+	}
+	return p.tm.Abort(reqs)
+}
+
+func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
+	if len(reqs) == 0 {
+		return &TransactionResponse{}, nil
+	}
+	addr, _ := p.raft.LeaderWithID()
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	conn, err := p.connCache.ConnFor(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	cli := pb.NewInternalClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), leaderForwardTimeout)
+	defer cancel()
+
+	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
+		IsTxn:    reqs[0].IsTxn,
+		Requests: reqs,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !resp.Success {
+		return nil, ErrInvalidRequest
+	}
+	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+}
+
+var _ Transactional = (*LeaderProxy)(nil)
+var _ io.Closer = (*LeaderProxy)(nil)
+
+func (p *LeaderProxy) Close() error {
+	if p == nil {
+		return nil
+	}
+	return p.connCache.Close()
+}
