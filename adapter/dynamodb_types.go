@@ -147,21 +147,10 @@ func (a *attributeValue) UnmarshalJSON(b []byte) error {
 		return errors.New("invalid attribute value")
 	}
 
-	var (
-		kind     string
-		valueRaw json.RawMessage
-		found    bool
-	)
 	for k, v := range raw {
-		kind = k
-		valueRaw = v
-		found = true
-		break
+		return a.unmarshalSingleAttributeValue(k, v)
 	}
-	if !found {
-		return errors.New("invalid attribute value")
-	}
-	return a.unmarshalSingleAttributeValue(kind, valueRaw)
+	return errors.New("invalid attribute value")
 }
 
 func (a *attributeValue) unmarshalSingleAttributeValue(kind string, raw json.RawMessage) error {

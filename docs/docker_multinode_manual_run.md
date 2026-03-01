@@ -1,18 +1,27 @@
-# Dockerで4〜5ノードのElastickvクラスタを複数VMで手動構築する（docker compose不使用）
+# Run a 4-5 Node Elastickv Cluster on Multiple VMs (Docker `run`, No Docker Compose)
 
-このドキュメントは、`docker run` のみで Elastickv の Raft クラスタを **複数VM** 上に構築する手順です。  
-`docker compose` は使いません。**単一VMへの全ノード同居は想定しません。**
+This guide explains how to run Elastickv as a Raft cluster across multiple VMs using only `docker run`.
 
-## 想定構成
+- No Docker Compose
+- Not a single-VM deployment
+- One Elastickv node per VM
 
-- 1ノード = 1VM
-- VM数は 4 または 5
-- 各VMは相互にTCP疎通できる（少なくとも `50051/tcp`）
-- 各VMに Docker Engine が入っている
+## English Summary
 
-例（5ノード）:
+Use `docker run` on 4 or 5 separate VMs and bootstrap the cluster from a fixed voter list via `--raftBootstrapMembers`.
+Start `n1` with `--raftBootstrap`, then start enough additional nodes to reach quorum before sending write traffic.
+Use private VM IPs for all bind addresses and lock down network access because gRPC, Redis, and DynamoDB-compatible endpoints are unauthenticated by default.
 
-| ノードID | VM名 | IP |
+## Target Topology
+
+- 1 node = 1 VM
+- Total nodes: 4 or 5
+- VMs must be able to reach each other over TCP (at minimum `50051/tcp`)
+- Docker Engine installed on every VM
+
+Example (5 nodes):
+
+| Node ID | VM | IP |
 | --- | --- | --- |
 | n1 | vm1 | 10.0.0.11 |
 | n2 | vm2 | 10.0.0.12 |
@@ -20,59 +29,73 @@
 | n4 | vm4 | 10.0.0.14 |
 | n5 | vm5 | 10.0.0.15 |
 
-4ノード構成にする場合は `n5` を除外してください。
+For a 4-node cluster, remove `n5`.
 
-## ノード数と耐障害性
+## Fault Tolerance
 
-| ノード数 | クォーラム | 許容同時障害数 |
+| Nodes | Quorum | Tolerated Simultaneous Failures |
 | --- | --- | --- |
 | 4 | 3 | 1 |
-| 5 | 3 | 2 (推奨) |
+| 5 | 3 | 2 (recommended) |
 
-耐障害性を重視するなら 5 ノード構成を推奨します。
+If fault tolerance is a priority, use 5 nodes.
 
-## 手順
+## Security Requirements (Stronger Defaults)
 
-### 1) すべてのVMでイメージ取得
+These examples prioritize operational clarity, not hardening. Treat them as baseline only.
+
+- Do not expose cluster ports to public networks.
+- Restrict inbound sources with firewall/security groups/NACLs.
+- Endpoints are unauthenticated by default: gRPC (including `RaftAdmin`), Redis API, and DynamoDB-compatible API.
+- Prefer private subnets and trusted east-west networking only.
+- Use network segmentation and, where possible, mTLS/TLS termination via your platform or proxy layer.
+- Do not bind advertised service addresses to `0.0.0.0` or `localhost` in cluster flags.
+  - Use each VM's routable private IP instead (for example, `10.0.0.11`).
+
+## 1) Pull the Image on All VMs
 
 ```bash
 docker pull ghcr.io/bootjp/elastickv:latest
 ```
 
-### 2) すべてのVMでデータディレクトリ作成
+## 2) Prepare Data Directory on All VMs
 
 ```bash
 sudo mkdir -p /var/lib/elastickv
 ```
 
-### 3) 各VMでノード起動（`docker run`）
+## 3) Define Shared Cluster Variables
 
-`--network host` を使い、RaftアドレスにVMの固定IPを指定します。  
-`--raftBootstrap` を付けるのは `n1` のみです。  
-`n1` は固定メンバー一覧 `--raftBootstrapMembers` を使ってクラスタを初期化します。
+`RAFT_TO_REDIS_MAP` is only for Redis leader routing.  
+It is not used for Raft transport membership.
 
-`--raftRedisMap` は **Raft通信の設定ではなく**、Redisコマンドをリーダー側Redisへプロキシするときの対応表です。  
-Raftノード間通信は `--address`（gRPC）で行われます。
+Raft node-to-node communication uses `--address` (gRPC transport).
 
-補足: `RaftAdmin/AddVoter` で後からノード追加する場合、`address` にはそのノードの `--address`（Adapter/raftadmin を提供している共有 gRPC エンドポイント）を指定してください。
-
-共通の `RAFT_TO_REDIS_MAP`（5ノード例）:
+Shared `RAFT_TO_REDIS_MAP` (5-node example):
 
 ```bash
 RAFT_TO_REDIS_MAP="10.0.0.11:50051=10.0.0.11:6379,10.0.0.12:50051=10.0.0.12:6379,10.0.0.13:50051=10.0.0.13:6379,10.0.0.14:50051=10.0.0.14:6379,10.0.0.15:50051=10.0.0.15:6379"
 ```
 
-4ノード構成では最後の `10.0.0.15` エントリを削除してください。
-
-固定メンバー一覧（5ノード例）:
+Shared fixed bootstrap voters (5-node example):
 
 ```bash
 RAFT_BOOTSTRAP_MEMBERS="n1=10.0.0.11:50051,n2=10.0.0.12:50051,n3=10.0.0.13:50051,n4=10.0.0.14:50051,n5=10.0.0.15:50051"
 ```
 
-4ノード構成では `n5` を削除してください。
+For a 4-node cluster, remove the `n5` entry from both variables.
 
-`n1` (bootstrap node) の起動例:
+## 4) Start Nodes with `docker run`
+
+This guide uses `--network host` and explicit VM private IPs.
+
+Binding guidance:
+
+- Set `--address`, `--redisAddress`, and `--dynamoAddress` to the VM private IP.
+- Do not use `0.0.0.0` as the advertised address.
+- Do not use `localhost` for cluster communication.
+
+`n1` (bootstrap node):
 
 ```bash
 docker rm -f elastickv 2>/dev/null || true
@@ -84,8 +107,8 @@ docker run -d \
   -v /var/lib/elastickv:/var/lib/elastickv \
   ghcr.io/bootjp/elastickv:latest /app \
   --address "10.0.0.11:50051" \
-  --redisAddress "0.0.0.0:6379" \
-  --dynamoAddress "0.0.0.0:8000" \
+  --redisAddress "10.0.0.11:6379" \
+  --dynamoAddress "10.0.0.11:8000" \
   --raftId "n1" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
@@ -93,7 +116,7 @@ docker run -d \
   --raftBootstrap
 ```
 
-`n2` 以降（非bootstrap）の起動例:
+`n2` (non-bootstrap):
 
 ```bash
 docker rm -f elastickv 2>/dev/null || true
@@ -105,23 +128,43 @@ docker run -d \
   -v /var/lib/elastickv:/var/lib/elastickv \
   ghcr.io/bootjp/elastickv:latest /app \
   --address "10.0.0.12:50051" \
-  --redisAddress "0.0.0.0:6379" \
-  --dynamoAddress "0.0.0.0:8000" \
+  --redisAddress "10.0.0.12:6379" \
+  --dynamoAddress "10.0.0.12:8000" \
   --raftId "n2" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}"
 ```
 
-`n3`〜`n5` も同様に `--address` と `--raftId` を置き換えて起動します。
+Start `n3` to `n5` the same way by replacing:
 
-### 4) クラスタ収束確認
+- `--address`
+- `--redisAddress`
+- `--dynamoAddress`
+- `--raftId`
 
-以下は `n1` 上で実行します。
+## Startup Order and Quorum Caution
+
+Recommended startup sequence:
+
+1. Start `n1` (bootstrap).
+2. Immediately start enough peers to form quorum (`n2` and `n3` at minimum).
+3. Start remaining nodes (`n4`, `n5`).
+4. Send write traffic only after quorum is confirmed and leader election is stable.
+
+Important behavior:
+
+- In a 5-node cluster, at least 3 voters must be up for writes to commit.
+- In a 4-node cluster, at least 3 voters must be up for writes to commit.
+- If fewer than quorum nodes are running, leader election/commit may stall and writes may fail or hang.
+
+## 5) Verify Cluster Convergence
+
+Run on `n1`:
 
 ```bash
 GRPCURL_IMG="fullstorydev/grpcurl:v1.9.3"
 
-# 全ノードのgRPC起動待ち
+# Wait for every node gRPC endpoint
 for ip in 10.0.0.11 10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15; do
   until docker run --rm --network host "${GRPCURL_IMG}" \
     -plaintext "${ip}:50051" list >/dev/null 2>&1; do
@@ -129,55 +172,57 @@ for ip in 10.0.0.11 10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15; do
   done
 done
 
-# メンバー確認
+# Check Raft members
 docker run --rm --network host "${GRPCURL_IMG}" \
   -plaintext -d '{}' 10.0.0.11:50051 RaftAdmin/GetConfiguration
 ```
 
-4ノード構成では `10.0.0.15` / `n5` を上記ループから除外してください。
+For a 4-node cluster, remove `10.0.0.15` from the loop.
 
-### 5) 動作確認
+## 6) Validate Read/Write
 
-`n1` など任意のノードで:
+Check leader:
 
 ```bash
 docker run --rm --network host fullstorydev/grpcurl:v1.9.3 \
   -plaintext -d '{}' 10.0.0.11:50051 RaftAdmin/Leader
 ```
 
-任意のクライアント端末から:
+Write/read through Redis endpoints:
 
 ```bash
 redis-cli -h 10.0.0.11 -p 6379 SET health ok
 redis-cli -h 10.0.0.12 -p 6379 GET health
 ```
 
-### 6) 耐障害性確認
+## 7) Fault Tolerance Drill
 
-5ノード構成なら、2ノード停止まで継続可能です。  
-例: `n4`, `n5` のVMで以下を実行:
+With 5 nodes, the cluster should continue serving with up to 2 node failures.
+
+Example: stop `n4` and `n5`:
 
 ```bash
 docker stop elastickv
 ```
 
-その後、他ノードに対して書き込み・読み取りできることを確認:
+Then verify writes/reads still succeed from remaining nodes:
 
 ```bash
 redis-cli -h 10.0.0.11 -p 6379 SET survive yes
 redis-cli -h 10.0.0.12 -p 6379 GET survive
 ```
 
-## 停止・クリーンアップ
+## Stop and Cleanup
 
-各VMで実行:
+Stop/remove on each VM:
 
 ```bash
 docker rm -f elastickv 2>/dev/null || true
 ```
 
-データも削除する場合:
+Remove persisted data (if required):
 
 ```bash
 sudo rm -rf /var/lib/elastickv/*
 ```
+

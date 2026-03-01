@@ -109,10 +109,11 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 		return out
 	}
 
-	t.Run("TableLifecycle", func(t *testing.T) {
-		createThreadsTable(t)
-		createMessagesTable(t)
+	// Shared setup for all sub-tests so each sub-test can run in isolation with -run.
+	createThreadsTable(t)
+	createMessagesTable(t)
 
+	t.Run("TableLifecycle", func(t *testing.T) {
 		listAllOut, listErr := client.ListTables(ctx, &dynamodb.ListTablesInput{})
 		require.NoError(t, listErr)
 		require.ElementsMatch(t, []string{threadsTable, messagesTable}, listAllOut.TableNames)

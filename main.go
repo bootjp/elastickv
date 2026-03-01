@@ -182,7 +182,7 @@ func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string)
 var (
 	ErrBootstrapMembersRequireSingleGroup = errors.New("flag --raftBootstrapMembers requires exactly one raft group")
 	ErrBootstrapMembersMissingLocalNode   = errors.New("flag --raftBootstrapMembers must include local --raftId")
-	ErrBootstrapMembersLocalAddrMismatch  = errors.New("flag --raftBootstrapMembers local address must match --address")
+	ErrBootstrapMembersLocalAddrMismatch  = errors.New("flag --raftBootstrapMembers local address must match local raft group address")
 	ErrNoBootstrapMembersConfigured       = errors.New("no bootstrap members configured")
 )
 
