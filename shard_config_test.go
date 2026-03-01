@@ -115,6 +115,33 @@ func TestParseRaftRedisMap(t *testing.T) {
 	})
 }
 
+func TestParseRaftBootstrapMembers(t *testing.T) {
+	t.Run("parses members", func(t *testing.T) {
+		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
+		require.NoError(t, err)
+		require.Equal(t, []raft.Server{
+			{Suffrage: raft.Voter, ID: raft.ServerID("n1"), Address: raft.ServerAddress("10.0.0.11:50051")},
+			{Suffrage: raft.Voter, ID: raft.ServerID("n2"), Address: raft.ServerAddress("10.0.0.12:50051")},
+		}, members)
+	})
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		members, err := parseRaftBootstrapMembers(" n1 = 10.0.0.11:50051 , n2=10.0.0.12:50051 ")
+		require.NoError(t, err)
+		require.Len(t, members, 2)
+	})
+
+	t.Run("duplicate id errors", func(t *testing.T) {
+		_, err := parseRaftBootstrapMembers("n1=a,n1=b")
+		require.ErrorIs(t, err, ErrInvalidRaftBootstrapMembersEntry)
+	})
+
+	t.Run("invalid entry errors", func(t *testing.T) {
+		_, err := parseRaftBootstrapMembers("n1=a,nope")
+		require.ErrorIs(t, err, ErrInvalidRaftBootstrapMembersEntry)
+	})
+}
+
 func TestDefaultGroupID(t *testing.T) {
 	require.Equal(t, uint64(1), defaultGroupID(nil))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))

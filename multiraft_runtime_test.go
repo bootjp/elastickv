@@ -37,6 +37,7 @@ func TestNewRaftGroupBootstrap(t *testing.T) {
 		baseDir,
 		true, // multi
 		true, // bootstrap
+		nil,
 		fsm,
 	)
 	require.NoError(t, err)

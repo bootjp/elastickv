@@ -76,7 +76,7 @@ func groupDataDir(baseDir, raftID string, groupID uint64, multi bool) string {
 	return filepath.Join(baseDir, raftID, fmt.Sprintf("group-%d", groupID))
 }
 
-func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bootstrap bool, fsm raft.FSM) (*raft.Raft, *transport.Manager, func(), error) {
+func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bootstrap bool, bootstrapServers []raft.Server, fsm raft.FSM) (*raft.Raft, *transport.Manager, func(), error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(raftID)
 	c.HeartbeatTimeout = heartbeatTimeout
@@ -127,15 +127,17 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 	}
 
 	if bootstrap {
-		cfg := raft.Configuration{
-			Servers: []raft.Server{
+		servers := bootstrapServers
+		if len(servers) == 0 {
+			servers = []raft.Server{
 				{
 					Suffrage: raft.Voter,
 					ID:       raft.ServerID(raftID),
 					Address:  raft.ServerAddress(group.address),
 				},
-			},
+			}
 		}
+		cfg := raft.Configuration{Servers: servers}
 		f := r.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
 			_ = r.Shutdown().Error()

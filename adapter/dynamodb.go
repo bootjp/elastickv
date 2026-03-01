@@ -1570,7 +1570,10 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, [][]byte, error) {
 	readTS := d.nextTxnReadTS()
 	reqs := &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
+		IsTxn: true,
+		// Keep transaction start aligned with the snapshot used to evaluate
+		// ConditionCheck/ConditionExpression so concurrent writes after readTS
+		// are detected as write conflicts at commit time.
 		StartTS: readTS,
 	}
 	schemaCache := make(map[string]*dynamoTableSchema)
