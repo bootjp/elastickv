@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -126,7 +127,8 @@ func startBootstrapE2ECluster(
 
 	for attempt := 0; attempt < startupAttempts; attempt++ {
 		endpoints := allocateBootstrapE2EEndpoints(t, nodeCount)
-		started, err := tryStartBootstrapE2ECluster(baseDir, endpoints)
+		attemptDir := filepath.Join(baseDir, fmt.Sprintf("attempt-%d", attempt))
+		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints)
 		if err == nil {
 			return endpoints, started
 		}

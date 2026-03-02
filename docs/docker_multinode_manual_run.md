@@ -162,7 +162,8 @@ Important behavior:
 Run on `n1`:
 
 ```bash
-GRPCURL_IMG="fullstorydev/grpcurl:v1.9.3"
+# Pin to an immutable digest (replace with a verified digest from your supply-chain policy).
+GRPCURL_IMG="fullstorydev/grpcurl@sha256:<verified_digest>"
 
 # Wait for every node gRPC endpoint
 for ip in 10.0.0.11 10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15; do
@@ -184,7 +185,7 @@ For a 4-node cluster, remove `10.0.0.15` from the loop.
 Check leader:
 
 ```bash
-docker run --rm --network host fullstorydev/grpcurl:v1.9.3 \
+docker run --rm --network host "${GRPCURL_IMG}" \
   -plaintext -d '{}' 10.0.0.11:50051 RaftAdmin/Leader
 ```
 
@@ -225,4 +226,3 @@ Remove persisted data (if required):
 ```bash
 sudo rm -rf /var/lib/elastickv/*
 ```
-

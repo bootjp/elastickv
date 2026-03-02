@@ -109,7 +109,7 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 		return out
 	}
 
-	// Shared setup for all sub-tests so each sub-test can run in isolation with -run.
+	// Shared setup for all sub-tests in this end-to-end scenario.
 	createThreadsTable(t)
 	createMessagesTable(t)
 
@@ -281,7 +281,7 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 							"threadId":    &ddbTypes.AttributeValueMemberS{Value: "t4"},
 							"title":       &ddbTypes.AttributeValueMemberS{Value: "title4"},
 							"createdAt":   &ddbTypes.AttributeValueMemberS{Value: "2026-01-04T00:00:00Z"},
-							"status":      &ddbTypes.AttributeValueMemberS{Value: "pending"},
+							"status":      &ddbTypes.AttributeValueMemberS{Value: "pending_txn"},
 							"accessToken": &ddbTypes.AttributeValueMemberS{Value: ""},
 						},
 					},
@@ -290,8 +290,8 @@ func TestDynamoDB_TableAPICompatibility(t *testing.T) {
 		})
 		require.NoError(t, txErr)
 
-		queryPendingAfterTransact := queryThreadsByStatus(t, "pending", false)
-		require.Len(t, queryPendingAfterTransact.Items, 2)
+		queryPendingAfterTransact := queryThreadsByStatus(t, "pending_txn", false)
+		require.Len(t, queryPendingAfterTransact.Items, 1)
 	})
 
 	t.Run("DeleteTable", func(t *testing.T) {

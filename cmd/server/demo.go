@@ -205,6 +205,9 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
 		}
+		if i == joinRetries-1 {
+			break
+		}
 		if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
 			return joinClusterWaitError(err)
 		}
