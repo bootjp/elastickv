@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -70,27 +71,15 @@ func (n *bootstrapE2ENode) close() error {
 
 func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 	const (
-		nodeCount    = 4
-		waitTimeout  = 20 * time.Second
-		waitInterval = 100 * time.Millisecond
+		startupAttempts = 5
+		nodeCount       = 4
+		waitTimeout     = 20 * time.Second
+		waitInterval    = 100 * time.Millisecond
+		rpcTimeout      = 2 * time.Second
 	)
 
 	baseDir := t.TempDir()
-	endpoints := make([]bootstrapE2EEndpoint, 0, nodeCount)
-	for i := 0; i < nodeCount; i++ {
-		endpoints = append(endpoints, bootstrapE2EEndpoint{
-			id:         fmt.Sprintf("n%d", i+1),
-			raftAddr:   reserveTCPAddr(t),
-			redisAddr:  reserveTCPAddr(t),
-			dynamoAddr: reserveTCPAddr(t),
-		})
-	}
-
-	bootstrapMembers := bootstrapMembersArg(endpoints)
-	nodes := make([]*bootstrapE2ENode, 0, nodeCount)
-	for i, ep := range endpoints {
-		nodes = append(nodes, startBootstrapE2ENode(t, baseDir, ep, i == 0, bootstrapMembers))
-	}
+	endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 
 	expected := bootstrapExpectedServers(endpoints)
@@ -108,19 +97,100 @@ func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 	key := []byte("bootstrap-members-e2e-key")
 	value := []byte("bootstrap-members-e2e-value")
 
-	_, err := clients[writerIdx].RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: value})
-	require.NoError(t, err)
+	require.NoError(t, rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout))
 
 	for i := range clients {
 		client := clients[i]
 		require.Eventually(t, func() bool {
-			resp, getErr := client.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+			resp, getErr := rawGetWithTimeout(client, key, rpcTimeout)
 			if getErr != nil {
 				return false
 			}
 			return resp.Exists && bytes.Equal(resp.Value, value)
 		}, waitTimeout, waitInterval)
 	}
+}
+
+func startBootstrapE2ECluster(
+	t *testing.T,
+	baseDir string,
+	nodeCount int,
+	startupAttempts int,
+) ([]bootstrapE2EEndpoint, []*bootstrapE2ENode) {
+	t.Helper()
+
+	var (
+		lastErr error
+		nodes   []*bootstrapE2ENode
+	)
+
+	for attempt := 0; attempt < startupAttempts; attempt++ {
+		endpoints := allocateBootstrapE2EEndpoints(t, nodeCount)
+		started, err := tryStartBootstrapE2ECluster(baseDir, endpoints)
+		if err == nil {
+			return endpoints, started
+		}
+		closeBootstrapE2ENodesIgnoreError(started)
+		lastErr = err
+		if !isAddressInUseError(err) {
+			break
+		}
+		nodes = nil
+	}
+
+	require.NoError(t, lastErr)
+	return nil, nodes
+}
+
+func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) []bootstrapE2EEndpoint {
+	t.Helper()
+
+	endpoints := make([]bootstrapE2EEndpoint, 0, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		endpoints = append(endpoints, bootstrapE2EEndpoint{
+			id:         fmt.Sprintf("n%d", i+1),
+			raftAddr:   reserveTCPAddr(t),
+			redisAddr:  reserveTCPAddr(t),
+			dynamoAddr: reserveTCPAddr(t),
+		})
+	}
+	return endpoints
+}
+
+func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint) ([]*bootstrapE2ENode, error) {
+	bootstrapMembers := bootstrapMembersArg(endpoints)
+	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
+	for i, ep := range endpoints {
+		node, err := startBootstrapE2ENode(baseDir, ep, i == 0, bootstrapMembers)
+		if err != nil {
+			return nodes, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+func closeBootstrapE2ENodesIgnoreError(nodes []*bootstrapE2ENode) {
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		_ = n.close()
+	}
+}
+
+func isAddressInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && strings.Contains(strings.ToLower(opErr.Error()), "address already in use") {
+		return true
+	}
+	return false
 }
 
 func reserveTCPAddr(t *testing.T) string {
@@ -154,17 +224,21 @@ func bootstrapExpectedServers(endpoints []bootstrapE2EEndpoint) []raft.Server {
 	return servers
 }
 
-func startBootstrapE2ENode(t *testing.T, baseDir string, ep bootstrapE2EEndpoint, bootstrap bool, bootstrapMembers string) *bootstrapE2ENode {
-	t.Helper()
-
+func startBootstrapE2ENode(baseDir string, ep bootstrapE2EEndpoint, bootstrap bool, bootstrapMembers string) (*bootstrapE2ENode, error) {
 	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "")
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	bootstrapServers, err := resolveBootstrapServers(ep.id, cfg.groups, bootstrap, bootstrapMembers)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
@@ -179,7 +253,7 @@ func startBootstrapE2ENode(t *testing.T, baseDir string, ep bootstrapE2EEndpoint
 		for _, rt := range runtimes {
 			rt.Close()
 		}
-		require.NoError(t, err)
+		return nil, err
 	}
 
 	eg.Go(func() error {
@@ -213,7 +287,7 @@ func startBootstrapE2ENode(t *testing.T, baseDir string, ep bootstrapE2EEndpoint
 		for _, rt := range runtimes {
 			rt.Close()
 		}
-		require.NoError(t, err)
+		return nil, err
 	}
 
 	return &bootstrapE2ENode{
@@ -222,7 +296,7 @@ func startBootstrapE2ENode(t *testing.T, baseDir string, ep bootstrapE2EEndpoint
 		shardStore: shardStore,
 		cancel:     cancel,
 		eg:         eg,
-	}
+	}, nil
 }
 
 func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {
@@ -293,13 +367,25 @@ func rawKVClients(t *testing.T, endpoints []bootstrapE2EEndpoint) ([]pb.RawKVCli
 	for _, ep := range endpoints {
 		conn, err := grpc.NewClient(ep.raftAddr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 		)
 		require.NoError(t, err)
 		conns = append(conns, conn)
 		clients = append(clients, pb.NewRawKVClient(conn))
 	}
 	return clients, conns
+}
+
+func rawPutWithTimeout(client pb.RawKVClient, key []byte, value []byte, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := client.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: value})
+	return err
+}
+
+func rawGetWithTimeout(client pb.RawKVClient, key []byte, timeout time.Duration) (*pb.RawGetResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return client.RawGet(ctx, &pb.RawGetRequest{Key: key})
 }
 
 func containsRaftServer(servers []raft.Server, expected raft.Server) bool {

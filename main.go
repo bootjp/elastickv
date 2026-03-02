@@ -208,11 +208,11 @@ func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrap bool, 
 			continue
 		}
 		if string(s.Address) != localAddr {
-			return nil, errors.WithStack(errors.Wrapf(ErrBootstrapMembersLocalAddrMismatch, "expected %q got %q", localAddr, s.Address))
+			return nil, errors.Wrapf(ErrBootstrapMembersLocalAddrMismatch, "expected %q got %q", localAddr, s.Address)
 		}
 		return servers, nil
 	}
-	return nil, errors.WithStack(errors.Wrapf(ErrBootstrapMembersMissingLocalNode, "raftId=%q", raftID))
+	return nil, errors.Wrapf(ErrBootstrapMembersMissingLocalNode, "raftId=%q", raftID)
 }
 
 func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi bool, bootstrap bool, bootstrapServers []raft.Server) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {

@@ -3,8 +3,10 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +17,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/raft"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -27,11 +28,15 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 	const (
 		waitTimeout  = 12 * time.Second
 		waitInterval = 100 * time.Millisecond
+		rpcTimeout   = 2 * time.Second
 	)
 
 	ctx := context.Background()
-	nodes := setupAddVoterJoinPathNodes(t, ctx)
-	t.Cleanup(func() { shutdown(nodes) })
+	nodes, servers := setupAddVoterJoinPathNodes(t, ctx)
+	t.Cleanup(func() {
+		shutdown(nodes)
+		servers.AwaitNoError(t, waitTimeout)
+	})
 
 	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
 	require.Eventually(t, func() bool {
@@ -43,7 +48,7 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 	t.Cleanup(func() { _ = adminConn.Close() })
 	admin := raftadminpb.NewRaftAdminClient(adminConn)
 
-	addVotersAndAwait(t, ctx, admin, nodes, []int{1, 2})
+	addVotersAndAwait(t, ctx, rpcTimeout, admin, nodes, []int{1, 2})
 
 	expectedCfg := expectedVoterConfig(nodes)
 	waitForConfigReplication(t, expectedCfg, nodes, waitTimeout, waitInterval)
@@ -51,7 +56,6 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 
 	followerConn, err := grpc.NewClient(nodes[1].grpcAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = followerConn.Close() })
@@ -59,19 +63,18 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 
 	leaderConn, err := grpc.NewClient(nodes[0].grpcAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = leaderConn.Close() })
 	leaderRaw := pb.NewRawKVClient(leaderConn)
 
-	putAndWaitForRead(t, ctx, followerRaw, leaderRaw, []byte("addvoter-key"), []byte("ok"), waitTimeout, waitInterval)
+	putAndWaitForRead(t, ctx, rpcTimeout, followerRaw, leaderRaw, []byte("addvoter-key"), []byte("ok"), waitTimeout, waitInterval)
 
 	// Simulate a partition-like failure by isolating node2's raft transport.
 	require.NoError(t, nodes[2].tm.Close())
 	nodes[2].tm = nil
 
-	putAndWaitForRead(t, ctx, followerRaw, leaderRaw, []byte("partition-survive-key"), []byte("ok2"), waitTimeout, waitInterval)
+	putAndWaitForRead(t, ctx, rpcTimeout, followerRaw, leaderRaw, []byte("partition-survive-key"), []byte("ok2"), waitTimeout, waitInterval)
 
 	// Force leader change while one node is isolated, then confirm write/read path.
 	require.NoError(t, nodes[0].raft.LeadershipTransferToServer(raft.ServerID("1"), raft.ServerAddress(nodes[1].raftAddress)).Error())
@@ -79,10 +82,10 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 		return nodes[1].raft.State() == raft.Leader
 	}, waitTimeout, waitInterval)
 
-	putAndWaitForRead(t, ctx, leaderRaw, followerRaw, []byte("leader-transfer-key"), []byte("ok3"), waitTimeout, waitInterval)
+	putAndWaitForRead(t, ctx, rpcTimeout, leaderRaw, followerRaw, []byte("leader-transfer-key"), []byte("ok3"), waitTimeout, waitInterval)
 }
 
-func setupAddVoterJoinPathNodes(t *testing.T, ctx context.Context) []Node {
+func setupAddVoterJoinPathNodes(t *testing.T, ctx context.Context) ([]Node, *serverWorkers) {
 	t.Helper()
 
 	ports, lis := reserveAddVoterJoinListeners(t, ctx, 3)
@@ -107,11 +110,12 @@ func setupAddVoterJoinPathNodes(t *testing.T, ctx context.Context) []Node {
 		},
 	}
 
+	workers := newServerWorkers(len(ports) * 3)
 	nodes := make([]Node, 0, len(ports))
 	for i := range ports {
-		nodes = append(nodes, startAddVoterJoinNode(t, i, ports[i], lis[i], bootstrapCfg, leaderRedisMap))
+		nodes = append(nodes, startAddVoterJoinNode(t, workers, i, ports[i], lis[i], bootstrapCfg, leaderRedisMap))
 	}
-	return nodes
+	return nodes, workers
 }
 
 func reserveAddVoterJoinListeners(t *testing.T, ctx context.Context, n int) ([]portsAdress, []listeners) {
@@ -137,6 +141,7 @@ func reserveAddVoterJoinListeners(t *testing.T, ctx context.Context, n int) ([]p
 
 func startAddVoterJoinNode(
 	t *testing.T,
+	workers *serverWorkers,
 	idx int,
 	port portsAdress,
 	lis listeners,
@@ -168,19 +173,31 @@ func startAddVoterJoinNode(
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
 
-	go func(srv *grpc.Server, l net.Listener) {
-		assert.NoError(t, srv.Serve(l))
-	}(s, lis.grpc)
+	workers.Go(func() error {
+		err := s.Serve(lis.grpc)
+		if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
 
 	rd := NewRedisServer(lis.redis, st, coordinator, leaderRedisMap)
-	go func(server *RedisServer) {
-		assert.NoError(t, server.Run())
-	}(rd)
+	workers.Go(func() error {
+		err := rd.Run()
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
 
 	ds := NewDynamoDBServer(lis.dynamo, st, coordinator)
-	go func() {
-		assert.NoError(t, ds.Run())
-	}()
+	workers.Go(func() error {
+		err := ds.Run()
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
 
 	return newNode(
 		port.grpcAddress,
@@ -199,6 +216,7 @@ func startAddVoterJoinNode(
 func addVotersAndAwait(
 	t *testing.T,
 	ctx context.Context,
+	rpcTimeout time.Duration,
 	admin raftadminpb.RaftAdminClient,
 	nodes []Node,
 	targets []int,
@@ -206,14 +224,18 @@ func addVotersAndAwait(
 	t.Helper()
 
 	for _, target := range targets {
-		future, err := admin.AddVoter(ctx, &raftadminpb.AddVoterRequest{
+		addCtx, cancelAdd := context.WithTimeout(ctx, rpcTimeout)
+		future, err := admin.AddVoter(addCtx, &raftadminpb.AddVoterRequest{
 			Id:            strconv.Itoa(target),
 			Address:       nodes[target].grpcAddress,
 			PreviousIndex: 0,
 		})
+		cancelAdd()
 		require.NoError(t, err)
 
-		await, err := admin.Await(ctx, future)
+		awaitCtx, cancelAwait := context.WithTimeout(ctx, rpcTimeout)
+		await, err := admin.Await(awaitCtx, future)
+		cancelAwait()
 		require.NoError(t, err)
 		require.Empty(t, await.GetError())
 		require.Greater(t, await.GetIndex(), uint64(0))
@@ -235,6 +257,7 @@ func expectedVoterConfig(nodes []Node) raft.Configuration {
 func putAndWaitForRead(
 	t *testing.T,
 	ctx context.Context,
+	rpcTimeout time.Duration,
 	writer pb.RawKVClient,
 	reader pb.RawKVClient,
 	key []byte,
@@ -244,14 +267,64 @@ func putAndWaitForRead(
 ) {
 	t.Helper()
 
-	_, err := writer.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: value})
+	putCtx, cancelPut := context.WithTimeout(ctx, rpcTimeout)
+	_, err := writer.RawPut(putCtx, &pb.RawPutRequest{Key: key, Value: value})
+	cancelPut()
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		resp, getErr := reader.RawGet(ctx, &pb.RawGetRequest{Key: key})
+		getCtx, cancelGet := context.WithTimeout(ctx, rpcTimeout)
+		resp, getErr := reader.RawGet(getCtx, &pb.RawGetRequest{Key: key})
+		cancelGet()
 		if getErr != nil {
 			return false
 		}
 		return resp.Exists && bytes.Equal(resp.Value, value)
 	}, waitTimeout, waitInterval)
+}
+
+type serverWorkers struct {
+	wg    sync.WaitGroup
+	errCh chan error
+}
+
+func newServerWorkers(buffer int) *serverWorkers {
+	return &serverWorkers{errCh: make(chan error, buffer)}
+}
+
+func (w *serverWorkers) Go(run func() error) {
+	if w == nil || run == nil {
+		return
+	}
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		if err := run(); err != nil {
+			w.errCh <- err
+		}
+	}()
+}
+
+func (w *serverWorkers) AwaitNoError(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	if w == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		require.FailNow(t, "server goroutines did not finish in time")
+	}
+
+	close(w.errCh)
+	for err := range w.errCh {
+		require.NoError(t, err)
+	}
 }
