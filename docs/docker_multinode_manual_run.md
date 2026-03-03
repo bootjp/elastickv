@@ -9,7 +9,7 @@ This guide explains how to run Elastickv as a Raft cluster across multiple VMs u
 ## English Summary
 
 Use `docker run` on 4 or 5 separate VMs and bootstrap the cluster from a fixed voter list via `--raftBootstrapMembers`.
-Start `n1` with `--raftBootstrap`, then start enough additional nodes to reach quorum before sending write traffic.
+Start all initial nodes (`n1` to `n4`/`n5`) with both `--raftBootstrapMembers` and `--raftBootstrap`, then wait for quorum before sending write traffic.
 Use private VM IPs for all bind addresses and lock down network access because gRPC, Redis, and DynamoDB-compatible endpoints are unauthenticated by default.
 
 ## Target Topology
@@ -95,7 +95,7 @@ Binding guidance:
 - Do not use `0.0.0.0` as the advertised address.
 - Do not use `localhost` for cluster communication.
 
-`n1` (bootstrap node):
+`n1` (initial voter):
 
 ```bash
 docker rm -f elastickv 2>/dev/null || true
@@ -116,7 +116,7 @@ docker run -d \
   --raftBootstrap
 ```
 
-`n2` (non-bootstrap):
+`n2` (initial voter):
 
 ```bash
 docker rm -f elastickv 2>/dev/null || true
@@ -132,7 +132,9 @@ docker run -d \
   --dynamoAddress "10.0.0.12:8000" \
   --raftId "n2" \
   --raftDataDir "/var/lib/elastickv" \
-  --raftRedisMap "${RAFT_TO_REDIS_MAP}"
+  --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
+  --raftBootstrapMembers "${RAFT_BOOTSTRAP_MEMBERS}" \
+  --raftBootstrap
 ```
 
 Start `n3` to `n5` the same way by replacing:
@@ -146,7 +148,7 @@ Start `n3` to `n5` the same way by replacing:
 
 Recommended startup sequence:
 
-1. Start `n1` (bootstrap).
+1. Start `n1`.
 2. Immediately start enough peers to form quorum (`n2` and `n3` at minimum).
 3. Start remaining nodes (`n4`, `n5`).
 4. Send write traffic only after quorum is confirmed and leader election is stable.

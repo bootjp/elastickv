@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -188,7 +190,7 @@ func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoin
 	bootstrapMembers := bootstrapMembersArg(endpoints)
 	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
 	for i := range endpoints {
-		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], i == 0, bootstrapMembers)
+		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], true, bootstrapMembers)
 		if err != nil {
 			return nodes, err
 		}
@@ -224,11 +226,15 @@ func isAddressInUseError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+	if errors.Is(err, syscall.EADDRINUSE) {
 		return true
 	}
 	var opErr *net.OpError
-	if errors.As(err, &opErr) && strings.Contains(strings.ToLower(opErr.Error()), "address already in use") {
+	if errors.As(err, &opErr) && errors.Is(opErr.Err, syscall.EADDRINUSE) {
+		return true
+	}
+	var sysErr *os.SyscallError
+	if errors.As(err, &sysErr) && errors.Is(sysErr.Err, syscall.EADDRINUSE) {
 		return true
 	}
 	return false
@@ -266,10 +272,11 @@ func startBootstrapE2ENode(
 		return nil, err
 	}
 
-	bootstrapServers, err := resolveBootstrapServers(ep.id, cfg.groups, bootstrap, bootstrapMembers)
+	bootstrapServers, err := resolveBootstrapServers(ep.id, cfg.groups, bootstrapMembers)
 	if err != nil {
 		return nil, err
 	}
+	bootstrap = bootstrap || len(bootstrapServers) > 0
 
 	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
 	if err != nil {
@@ -314,8 +321,6 @@ func startBootstrapE2ENode(
 		listeners,
 	)
 	if err != nil {
-		cancel()
-		_ = eg.Wait()
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()

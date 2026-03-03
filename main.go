@@ -61,12 +61,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrap, *raftBootstrapMembers)
+	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
 	if err != nil {
 		return err
 	}
+	bootstrap := *raftBootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, *raftBootstrap, bootstrapServers)
+	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
 	if err != nil {
 		return err
 	}
@@ -187,8 +188,8 @@ var (
 	ErrNoBootstrapMembersConfigured       = errors.New("no bootstrap members configured")
 )
 
-func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrap bool, bootstrapMembers string) ([]raft.Server, error) {
-	if !bootstrap || strings.TrimSpace(bootstrapMembers) == "" {
+func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raft.Server, error) {
+	if strings.TrimSpace(bootstrapMembers) == "" {
 		return nil, nil
 	}
 	if len(groups) != 1 {

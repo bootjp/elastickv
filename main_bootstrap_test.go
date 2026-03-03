@@ -8,14 +8,16 @@ import (
 )
 
 func TestResolveBootstrapServers(t *testing.T) {
-	t.Run("disabled bootstrap ignores members", func(t *testing.T) {
-		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, false, "n1=10.0.0.11:50051")
+	t.Run("members imply fixed bootstrap servers", func(t *testing.T) {
+		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, "n1=10.0.0.11:50051")
 		require.NoError(t, err)
-		require.Nil(t, servers)
+		require.Equal(t, []raft.Server{
+			{Suffrage: raft.Voter, ID: "n1", Address: "10.0.0.11:50051"},
+		}, servers)
 	})
 
-	t.Run("empty members keeps self bootstrap behavior", func(t *testing.T) {
-		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, true, "")
+	t.Run("empty members returns nil", func(t *testing.T) {
+		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, "")
 		require.NoError(t, err)
 		require.Nil(t, servers)
 	})
@@ -24,7 +26,6 @@ func TestResolveBootstrapServers(t *testing.T) {
 		servers, err := resolveBootstrapServers(
 			"n1",
 			[]groupSpec{{id: 1, address: "10.0.0.11:50051"}},
-			true,
 			"n1=10.0.0.11:50051,n2=10.0.0.12:50051",
 		)
 		require.NoError(t, err)
@@ -38,7 +39,6 @@ func TestResolveBootstrapServers(t *testing.T) {
 		_, err := resolveBootstrapServers(
 			"n1",
 			[]groupSpec{{id: 1, address: "10.0.0.11:50051"}, {id: 2, address: "10.0.0.11:50052"}},
-			true,
 			"n1=10.0.0.11:50051,n2=10.0.0.12:50051",
 		)
 		require.ErrorIs(t, err, ErrBootstrapMembersRequireSingleGroup)
@@ -48,7 +48,6 @@ func TestResolveBootstrapServers(t *testing.T) {
 		_, err := resolveBootstrapServers(
 			"n1",
 			[]groupSpec{{id: 1, address: "10.0.0.11:50051"}},
-			true,
 			"n2=10.0.0.12:50051",
 		)
 		require.ErrorIs(t, err, ErrBootstrapMembersMissingLocalNode)
@@ -58,14 +57,13 @@ func TestResolveBootstrapServers(t *testing.T) {
 		_, err := resolveBootstrapServers(
 			"n1",
 			[]groupSpec{{id: 1, address: "10.0.0.11:50051"}},
-			true,
 			"n1=10.0.0.99:50051,n2=10.0.0.12:50051",
 		)
 		require.ErrorIs(t, err, ErrBootstrapMembersLocalAddrMismatch)
 	})
 
 	t.Run("only separators are rejected", func(t *testing.T) {
-		_, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, true, " , , ")
+		_, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, " , , ")
 		require.ErrorIs(t, err, ErrNoBootstrapMembersConfigured)
 	})
 }
