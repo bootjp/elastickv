@@ -201,8 +201,9 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 		if err := tryJoinNode(ctx, client, n); err == nil {
 			return nil
 		} else {
-			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
-				return joinClusterWaitError(errors.WithStack(err))
+			if ctx.Err() != nil {
+				// Retry loop should stop immediately once the parent context is canceled.
+				return joinRetryCancelResult(ctx)
 			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
 		}
@@ -210,10 +211,23 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 			break
 		}
 		if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
-			return joinClusterWaitError(err)
+			if ctx.Err() != nil {
+				return joinRetryCancelResult(ctx)
+			}
+			return err
 		}
 	}
+	if ctx.Err() != nil {
+		return joinRetryCancelResult(ctx)
+	}
 	return fmt.Errorf("failed to join node %s after retries", n.raftID)
+}
+
+func joinRetryCancelResult(ctx context.Context) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	return joinClusterWaitError(errors.WithStack(ctx.Err()))
 }
 
 func tryJoinNode(ctx context.Context, client raftadminpb.RaftAdminClient, n config) error {
