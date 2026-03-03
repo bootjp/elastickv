@@ -47,6 +47,7 @@ const (
 	joinRetries         = 20
 	joinWait            = 3 * time.Second
 	joinRetryInterval   = 1 * time.Second
+	joinRPCTimeout      = 3 * time.Second
 )
 
 func init() {
@@ -200,7 +201,7 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 		if err := tryJoinNode(ctx, client, n); err == nil {
 			return nil
 		} else {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
 				return joinClusterWaitError(errors.WithStack(err))
 			}
 			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
@@ -217,7 +218,9 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 
 func tryJoinNode(ctx context.Context, client raftadminpb.RaftAdminClient, n config) error {
 	slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
-	future, err := client.AddVoter(ctx, &raftadminpb.AddVoterRequest{
+	addCtx, cancelAdd := context.WithTimeout(ctx, joinRPCTimeout)
+	defer cancelAdd()
+	future, err := client.AddVoter(addCtx, &raftadminpb.AddVoterRequest{
 		Id:            n.raftID,
 		Address:       n.address,
 		PreviousIndex: 0,
@@ -226,7 +229,9 @@ func tryJoinNode(ctx context.Context, client raftadminpb.RaftAdminClient, n conf
 		return errors.WithStack(err)
 	}
 
-	await, err := client.Await(ctx, future)
+	awaitCtx, cancelAwait := context.WithTimeout(ctx, joinRPCTimeout)
+	defer cancelAwait()
+	await, err := client.Await(awaitCtx, future)
 	if err != nil {
 		return errors.WithStack(err)
 	}

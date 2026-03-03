@@ -8,9 +8,12 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
+	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -19,6 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 )
 
 type bootstrapE2EEndpoint struct {
@@ -26,6 +30,12 @@ type bootstrapE2EEndpoint struct {
 	raftAddr   string
 	redisAddr  string
 	dynamoAddr string
+}
+
+type bootstrapE2EListeners struct {
+	grpc   net.Listener
+	redis  net.Listener
+	dynamo net.Listener
 }
 
 type bootstrapE2ENode struct {
@@ -126,13 +136,14 @@ func startBootstrapE2ECluster(
 	)
 
 	for attempt := 0; attempt < startupAttempts; attempt++ {
-		endpoints := allocateBootstrapE2EEndpoints(t, nodeCount)
+		endpoints, listeners := allocateBootstrapE2EEndpoints(t, nodeCount)
 		attemptDir := filepath.Join(baseDir, fmt.Sprintf("attempt-%d", attempt))
-		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints)
+		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints, listeners)
 		if err == nil {
 			return endpoints, started
 		}
 		closeBootstrapE2ENodesIgnoreError(started)
+		closeBootstrapE2EListeners(listeners)
 		lastErr = err
 		if !isAddressInUseError(err) {
 			break
@@ -144,32 +155,60 @@ func startBootstrapE2ECluster(
 	return nil, nodes
 }
 
-func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) []bootstrapE2EEndpoint {
+func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EEndpoint, []bootstrapE2EListeners) {
 	t.Helper()
 
+	var lc net.ListenConfig
 	endpoints := make([]bootstrapE2EEndpoint, 0, nodeCount)
+	listeners := make([]bootstrapE2EListeners, 0, nodeCount)
 	for i := 0; i < nodeCount; i++ {
+		grpcL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		redisL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		dynamoL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
 		endpoints = append(endpoints, bootstrapE2EEndpoint{
 			id:         fmt.Sprintf("n%d", i+1),
-			raftAddr:   reserveTCPAddr(t),
-			redisAddr:  reserveTCPAddr(t),
-			dynamoAddr: reserveTCPAddr(t),
+			raftAddr:   grpcL.Addr().String(),
+			redisAddr:  redisL.Addr().String(),
+			dynamoAddr: dynamoL.Addr().String(),
+		})
+		listeners = append(listeners, bootstrapE2EListeners{
+			grpc:   grpcL,
+			redis:  redisL,
+			dynamo: dynamoL,
 		})
 	}
-	return endpoints
+	return endpoints, listeners
 }
 
-func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint) ([]*bootstrapE2ENode, error) {
+func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint, listeners []bootstrapE2EListeners) ([]*bootstrapE2ENode, error) {
 	bootstrapMembers := bootstrapMembersArg(endpoints)
 	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
-	for i, ep := range endpoints {
-		node, err := startBootstrapE2ENode(baseDir, ep, i == 0, bootstrapMembers)
+	for i := range endpoints {
+		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], i == 0, bootstrapMembers)
 		if err != nil {
 			return nodes, err
 		}
 		nodes = append(nodes, node)
 	}
 	return nodes, nil
+}
+
+func closeBootstrapE2EListeners(listeners []bootstrapE2EListeners) {
+	for _, lis := range listeners {
+		if lis.grpc != nil {
+			_ = lis.grpc.Close()
+		}
+		if lis.redis != nil {
+			_ = lis.redis.Close()
+		}
+		if lis.dynamo != nil {
+			_ = lis.dynamo.Close()
+		}
+	}
 }
 
 func closeBootstrapE2ENodesIgnoreError(nodes []*bootstrapE2ENode) {
@@ -195,17 +234,6 @@ func isAddressInUseError(err error) bool {
 	return false
 }
 
-func reserveTCPAddr(t *testing.T) string {
-	t.Helper()
-
-	var lc net.ListenConfig
-	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := l.Addr().String()
-	require.NoError(t, l.Close())
-	return addr
-}
-
 func bootstrapMembersArg(endpoints []bootstrapE2EEndpoint) string {
 	parts := make([]string, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -226,7 +254,13 @@ func bootstrapExpectedServers(endpoints []bootstrapE2EEndpoint) []raft.Server {
 	return servers
 }
 
-func startBootstrapE2ENode(baseDir string, ep bootstrapE2EEndpoint, bootstrap bool, bootstrapMembers string) (*bootstrapE2ENode, error) {
+func startBootstrapE2ENode(
+	baseDir string,
+	ep bootstrapE2EEndpoint,
+	listeners bootstrapE2EListeners,
+	bootstrap bool,
+	bootstrapMembers string,
+) (*bootstrapE2ENode, error) {
 	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "")
 	if err != nil {
 		return nil, err
@@ -268,19 +302,16 @@ func startBootstrapE2ENode(baseDir string, ep bootstrapE2EEndpoint, bootstrap bo
 		adapter.WithDistributionCoordinator(coordinate),
 	)
 
-	var lc net.ListenConfig
-	err = startRuntimeServers(
+	err = startRuntimeServersWithBoundListeners(
 		runCtx,
-		&lc,
 		eg,
 		cancel,
 		runtimes,
 		shardStore,
 		coordinate,
 		distServer,
-		ep.redisAddr,
 		cfg.leaderRedis,
-		ep.dynamoAddr,
+		listeners,
 	)
 	if err != nil {
 		cancel()
@@ -299,6 +330,154 @@ func startBootstrapE2ENode(baseDir string, ep bootstrapE2EEndpoint, bootstrap bo
 		cancel:     cancel,
 		eg:         eg,
 	}, nil
+}
+
+func startRuntimeServersWithBoundListeners(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cancel context.CancelFunc,
+	runtimes []*raftGroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	leaderRedis map[raft.ServerAddress]string,
+	listeners bootstrapE2EListeners,
+) error {
+	if len(runtimes) != 1 {
+		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected exactly one runtime, got %d", len(runtimes)))
+	}
+	rt := runtimes[0]
+
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, listeners.grpc); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	return nil
+}
+
+func startBoundGRPCServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	rt *raftGroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	listener net.Listener,
+) error {
+	if rt == nil || rt.raft == nil || rt.tm == nil {
+		return fmt.Errorf("raft runtime is not ready")
+	}
+	if listener == nil {
+		return fmt.Errorf("grpc listener is required")
+	}
+
+	gs := grpc.NewServer()
+	trx := kv.NewTransaction(rt.raft)
+	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
+	pb.RegisterRawKVServer(gs, grpcSvc)
+	pb.RegisterTransactionalKVServer(gs, grpcSvc)
+	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock()))
+	pb.RegisterDistributionServer(gs, distServer)
+	rt.tm.Register(gs)
+	leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
+	raftadmin.Register(gs, rt.raft)
+	reflection.Register(gs)
+
+	srv := gs
+	lis := listener
+	grpcService := grpcSvc
+	eg.Go(func() error {
+		var closeOnce sync.Once
+		closeService := func() {
+			closeOnce.Do(func() { _ = grpcService.Close() })
+		}
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				srv.GracefulStop()
+				_ = lis.Close()
+				closeService()
+			case <-stop:
+			}
+		}()
+		err := srv.Serve(lis)
+		close(stop)
+		closeService()
+		if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+func startBoundRedisServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	listener net.Listener,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	leaderRedis map[raft.ServerAddress]string,
+) error {
+	if listener == nil {
+		return fmt.Errorf("redis listener is required")
+	}
+	redisServer := adapter.NewRedisServer(listener, shardStore, coordinate, leaderRedis)
+	eg.Go(func() error {
+		defer redisServer.Stop()
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				redisServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := redisServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+func startBoundDynamoDBServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	listener net.Listener,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+) error {
+	if listener == nil {
+		return fmt.Errorf("dynamodb listener is required")
+	}
+	dynamoServer := adapter.NewDynamoDBServer(listener, shardStore, coordinate)
+	eg.Go(func() error {
+		defer dynamoServer.Stop()
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				dynamoServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := dynamoServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
 }
 
 func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {

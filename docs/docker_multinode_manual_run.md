@@ -162,8 +162,13 @@ Important behavior:
 Run on `n1`:
 
 ```bash
-# Pin to an immutable digest (replace with a verified digest from your supply-chain policy).
-GRPCURL_IMG="fullstorydev/grpcurl@sha256:<verified_digest>"
+# Pin to an immutable digest.
+GRPCURL_IMG="fullstorydev/grpcurl@sha256:085e183ca334eb4e81ca81ee12cbb2b2737505d1d77f5e33dabc5d066593d998"
+
+# Optional: re-check the current digest for v1.9.3 before use.
+# TOKEN=$(curl -fsSL 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:fullstorydev/grpcurl:pull' | jq -r .token)
+# curl -fsSI -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+#   https://registry-1.docker.io/v2/fullstorydev/grpcurl/manifests/v1.9.3 | tr -d '\r' | grep -i docker-content-digest
 
 # Wait for every node gRPC endpoint
 for ip in 10.0.0.11 10.0.0.12 10.0.0.13 10.0.0.14 10.0.0.15; do
