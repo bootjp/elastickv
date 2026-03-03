@@ -96,19 +96,20 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 	)
 
-	if err := startRuntimeServers(
-		runCtx,
-		&lc,
-		eg,
-		cancel,
-		runtimes,
-		shardStore,
-		coordinate,
-		distServer,
-		*redisAddr,
-		cfg.leaderRedis,
-		*dynamoAddr,
-	); err != nil {
+	runner := runtimeServerRunner{
+		ctx:           runCtx,
+		lc:            &lc,
+		eg:            eg,
+		cancel:        cancel,
+		runtimes:      runtimes,
+		shardStore:    shardStore,
+		coordinate:    coordinate,
+		distServer:    distServer,
+		redisAddress:  *redisAddr,
+		leaderRedis:   cfg.leaderRedis,
+		dynamoAddress: *dynamoAddr,
+	}
+	if err := runner.start(); err != nil {
 		return err
 	}
 
@@ -418,27 +419,29 @@ func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Gro
 	return startupErr
 }
 
-func startRuntimeServers(
-	ctx context.Context,
-	lc *net.ListenConfig,
-	eg *errgroup.Group,
-	cancel context.CancelFunc,
-	runtimes []*raftGroupRuntime,
-	shardStore *kv.ShardStore,
-	coordinate kv.Coordinator,
-	distServer *adapter.DistributionServer,
-	redisAddress string,
-	leaderRedis map[raft.ServerAddress]string,
-	dynamoAddress string,
-) error {
-	if err := startRaftServers(ctx, lc, eg, runtimes, shardStore, coordinate, distServer); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+type runtimeServerRunner struct {
+	ctx           context.Context
+	lc            *net.ListenConfig
+	eg            *errgroup.Group
+	cancel        context.CancelFunc
+	runtimes      []*raftGroupRuntime
+	shardStore    *kv.ShardStore
+	coordinate    kv.Coordinator
+	distServer    *adapter.DistributionServer
+	redisAddress  string
+	leaderRedis   map[raft.ServerAddress]string
+	dynamoAddress string
+}
+
+func (r runtimeServerRunner) start() error {
+	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startRedisServer(ctx, lc, eg, redisAddress, shardStore, coordinate, leaderRedis); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startDynamoDBServer(ctx, lc, eg, dynamoAddress, shardStore, coordinate); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	return nil
 }
