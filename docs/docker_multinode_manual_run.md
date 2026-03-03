@@ -44,13 +44,13 @@ If fault tolerance is a priority, use 5 nodes.
 
 These examples prioritize operational clarity, not hardening. Treat them as baseline only.
 
-- Do not expose cluster ports to public networks.
-- Restrict inbound sources with firewall/security groups/NACLs.
-- Endpoints are unauthenticated by default: gRPC (including `RaftAdmin`), Redis API, and DynamoDB-compatible API.
-- Prefer private subnets and trusted east-west networking only.
-- Use network segmentation and, where possible, mTLS/TLS termination via your platform or proxy layer.
-- Do not bind advertised service addresses to `0.0.0.0` or `localhost` in cluster flags.
-  - Use each VM's routable private IP instead (for example, `10.0.0.11`).
+- Mandatory isolation: do not expose any Elastickv cluster port to the public Internet or to shared/multi-tenant networks.
+- Restrict inbound sources with firewall/security groups/NACLs so only Elastickv nodes and tightly controlled admin hosts can connect.
+- Endpoints are unauthenticated and plaintext by default: gRPC (including `RaftAdmin`), Redis API, and DynamoDB-compatible API.
+- Any principal with network access to these ports can read/modify data and reconfigure cluster membership.
+- Run Elastickv on dedicated private subnets/VPCs for the cluster, without direct Internet routing and without cross-tenant sharing.
+- Enforce network segmentation and, where possible, add TLS/mTLS and authentication via Elastickv features or a trusted terminating proxy/service mesh.
+- Do not bind advertised service addresses to `0.0.0.0` or `localhost` in cluster flags; use each VM's routable private IP (for example, `10.0.0.11`).
 
 ## 1) Pull the Image on All VMs
 

@@ -211,10 +211,7 @@ func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, 
 			break
 		}
 		if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
-			if ctx.Err() != nil {
-				return joinRetryCancelResult(ctx)
-			}
-			return err
+			return joinRetryCancelResult(ctx)
 		}
 	}
 	if ctx.Err() != nil {

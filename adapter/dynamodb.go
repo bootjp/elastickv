@@ -1067,7 +1067,11 @@ func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeyS
 	if err != nil {
 		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	parsed, err := parseKeyConditionExpression(replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames))
+	keyExpr, err := replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames)
+	if err != nil {
+		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	parsed, err := parseKeyConditionExpression(keyExpr)
 	if err != nil {
 		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -1996,9 +2000,12 @@ func writeDynamoJSON(w http.ResponseWriter, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func replaceNames(expr string, names map[string]string) string {
+func replaceNames(expr string, names map[string]string) (string, error) {
 	if expr == "" || len(names) == 0 {
-		return expr
+		return expr, nil
+	}
+	if err := validateExpressionAttributeNames(names); err != nil {
+		return "", err
 	}
 	keys := make([]string, 0, len(names))
 	for k := range names {
@@ -2016,11 +2023,51 @@ func replaceNames(expr string, names map[string]string) string {
 	for _, key := range keys {
 		args = append(args, key, names[key])
 	}
-	return strings.NewReplacer(args...).Replace(expr)
+	return strings.NewReplacer(args...).Replace(expr), nil
+}
+
+func validateExpressionAttributeNames(names map[string]string) error {
+	for placeholder, name := range names {
+		if !isExpressionAttributePlaceholder(placeholder) {
+			return errors.Errorf("invalid expression attribute placeholder %q", placeholder)
+		}
+		if !isExpressionAttributeIdentifier(name) {
+			return errors.Errorf("invalid expression attribute name %q for placeholder %q", name, placeholder)
+		}
+	}
+	return nil
+}
+
+func isExpressionAttributePlaceholder(s string) bool {
+	if len(s) <= 1 || s[0] != '#' {
+		return false
+	}
+	return isExpressionAttributeIdentifier(s[1:])
+}
+
+func isExpressionAttributeIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if isExpressionAttributeIdentByte(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isExpressionAttributeIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 func applyUpdateExpression(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
-	updExpr := strings.TrimSpace(replaceNames(expr, names))
+	updExpr, err := replaceNames(expr, names)
+	if err != nil {
+		return err
+	}
+	updExpr = strings.TrimSpace(updExpr)
 	sections, err := parseUpdateExpressionSections(updExpr)
 	if err != nil {
 		return err
@@ -2296,7 +2343,11 @@ func splitTopLevelByComma(expr string) ([]string, error) {
 }
 
 func validateConditionOnItem(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
-	cond := strings.TrimSpace(replaceNames(expr, names))
+	cond, err := replaceNames(expr, names)
+	if err != nil {
+		return err
+	}
+	cond = strings.TrimSpace(cond)
 	if cond == "" {
 		return nil
 	}
