@@ -2031,7 +2031,7 @@ func validateExpressionAttributeNames(names map[string]string) error {
 		if !isExpressionAttributePlaceholder(placeholder) {
 			return errors.Errorf("invalid expression attribute placeholder %q", placeholder)
 		}
-		if !isExpressionAttributeIdentifier(name) {
+		if !isExpressionAttributeName(name) {
 			return errors.Errorf("invalid expression attribute name %q for placeholder %q", name, placeholder)
 		}
 	}
@@ -2042,15 +2042,15 @@ func isExpressionAttributePlaceholder(s string) bool {
 	if len(s) <= 1 || s[0] != '#' {
 		return false
 	}
-	return isExpressionAttributeIdentifier(s[1:])
+	return isExpressionPlaceholderIdentifier(s[1:])
 }
 
-func isExpressionAttributeIdentifier(s string) bool {
+func isExpressionPlaceholderIdentifier(s string) bool {
 	if s == "" {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		if isExpressionAttributeIdentByte(s[i]) {
+		if isExpressionPlaceholderIdentByte(s[i]) {
 			continue
 		}
 		return false
@@ -2058,8 +2058,25 @@ func isExpressionAttributeIdentifier(s string) bool {
 	return true
 }
 
-func isExpressionAttributeIdentByte(b byte) bool {
+func isExpressionPlaceholderIdentByte(b byte) bool {
 	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func isExpressionAttributeName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if isExpressionAttributeNameByte(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isExpressionAttributeNameByte(b byte) bool {
+	return b == '_' || b == '.' || b == '-' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 func applyUpdateExpression(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
@@ -2538,9 +2555,9 @@ func isLogicalKeywordBoundary(s string, pos int) bool {
 		return true
 	}
 	ch := s[pos]
-	// Keep ASCII letters/digits/underscore as identifier token characters so
-	// expressions like "MY_AND_VAR" are not split at the "AND" substring.
-	if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+	// Keep identifier-style characters as token characters so expressions like
+	// "MY_AND_VAR" or "a-OR-b" are not split at logical keyword substrings.
+	if isExpressionAttributeNameByte(ch) {
 		return false
 	}
 	return true

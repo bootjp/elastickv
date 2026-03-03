@@ -483,6 +483,14 @@ func TestReplaceNames_ValidatesExpressionAttributeNames(t *testing.T) {
 		require.ErrorContains(t, err, `invalid expression attribute placeholder "name"`)
 	})
 
+	t.Run("invalid placeholder character", func(t *testing.T) {
+		t.Parallel()
+		_, err := replaceNames("attribute_exists(#na-me)", map[string]string{
+			"#na-me": "value",
+		})
+		require.ErrorContains(t, err, `invalid expression attribute placeholder "#na-me"`)
+	})
+
 	t.Run("invalid attribute name", func(t *testing.T) {
 		t.Parallel()
 		_, err := replaceNames("attribute_exists(#name)", map[string]string{
@@ -499,6 +507,33 @@ func TestReplaceNames_ValidatesExpressionAttributeNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "attribute_exists(value_1)", expr)
 	})
+
+	t.Run("valid replacement with dot and hyphen", func(t *testing.T) {
+		t.Parallel()
+		expr, err := replaceNames("#left = :l AND #right = :r", map[string]string{
+			"#left":  "data.field",
+			"#right": "my-attribute",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "data.field = :l AND my-attribute = :r", expr)
+	})
+}
+
+func TestValidateConditionOnItem_AttributeNameContainsLogicalKeywordSubstring(t *testing.T) {
+	t.Parallel()
+
+	item := map[string]attributeValue{
+		"a-OR-b": newStringAttributeValue("ok"),
+	}
+	values := map[string]attributeValue{
+		":v": newStringAttributeValue("ok"),
+	}
+	names := map[string]string{
+		"#k": "a-OR-b",
+	}
+
+	err := validateConditionOnItem("#k = :v", names, values, item)
+	require.NoError(t, err)
 }
 
 func TestQueryExclusiveStartKey_AppliesAfterOrdering(t *testing.T) {
