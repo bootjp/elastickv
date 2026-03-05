@@ -25,6 +25,10 @@ Architecture diagrams are available in:
 
 - `docs/architecture_overview.md`
 
+Deployment/runbook documents:
+
+- `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
+
 
 ## Example Usage
 

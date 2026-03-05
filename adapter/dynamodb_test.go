@@ -210,6 +210,60 @@ func TestDynamoDB_UpdateItem_Condition(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDynamoDB_UpdateItem_RejectsExpressionAttributeNameInjection(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "test"},
+			"value": &types.AttributeValueMemberS{Value: "v1"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "test"},
+		},
+		UpdateExpression:    aws.String("SET #v = :val"),
+		ConditionExpression: aws.String("attribute_exists(#guard)"),
+		ExpressionAttributeNames: map[string]string{
+			"#v":     "value",
+			"#guard": "missing) OR attribute_exists(key",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":val": &types.AttributeValueMemberS{Value: "v2"},
+		},
+	})
+	require.ErrorContains(t, err, "invalid expression attribute name")
+
+	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "test"},
+		},
+	})
+	require.NoError(t, err)
+	valueAttr, ok := out.Item["value"].(*types.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "v1", valueAttr.Value)
+}
+
 func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -416,6 +470,70 @@ func TestEvalConditionExpression_LogicalKeywordWithoutSpaces(t *testing.T) {
 	ok, err := evalConditionExpression("attribute_exists(k)AND(k = :v)", item, values)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+func TestReplaceNames_ValidatesExpressionAttributeNames(t *testing.T) {
+	t.Parallel()
+
+	t.Run("invalid placeholder", func(t *testing.T) {
+		t.Parallel()
+		_, err := replaceNames("attribute_exists(#name)", map[string]string{
+			"name": "value",
+		})
+		require.ErrorContains(t, err, `invalid expression attribute placeholder "name"`)
+	})
+
+	t.Run("invalid placeholder character", func(t *testing.T) {
+		t.Parallel()
+		_, err := replaceNames("attribute_exists(#na-me)", map[string]string{
+			"#na-me": "value",
+		})
+		require.ErrorContains(t, err, `invalid expression attribute placeholder "#na-me"`)
+	})
+
+	t.Run("invalid attribute name", func(t *testing.T) {
+		t.Parallel()
+		_, err := replaceNames("attribute_exists(#name)", map[string]string{
+			"#name": "value OR attribute_exists(key)",
+		})
+		require.ErrorContains(t, err, `invalid expression attribute name "value OR attribute_exists(key)"`)
+	})
+
+	t.Run("valid replacement", func(t *testing.T) {
+		t.Parallel()
+		expr, err := replaceNames("attribute_exists(#name)", map[string]string{
+			"#name": "value_1",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "attribute_exists(value_1)", expr)
+	})
+
+	t.Run("valid replacement with dot and hyphen", func(t *testing.T) {
+		t.Parallel()
+		expr, err := replaceNames("#left = :l AND #right = :r", map[string]string{
+			"#left":  "data.field",
+			"#right": "my-attribute",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "data.field = :l AND my-attribute = :r", expr)
+	})
+}
+
+func TestValidateConditionOnItem_AttributeNameContainsLogicalKeywordSubstring(t *testing.T) {
+	t.Parallel()
+
+	item := map[string]attributeValue{
+		"a-OR-b": newStringAttributeValue("ok"),
+	}
+	values := map[string]attributeValue{
+		":v": newStringAttributeValue("ok"),
+	}
+	names := map[string]string{
+		"#k": "a-OR-b",
+	}
+
+	err := validateConditionOnItem("#k = :v", names, values, item)
+	require.NoError(t, err)
 }
 
 func TestQueryExclusiveStartKey_AppliesAfterOrdering(t *testing.T) {

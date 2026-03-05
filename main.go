@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,15 +30,16 @@ const (
 )
 
 var (
-	myAddr        = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	redisAddr     = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
-	dynamoAddr    = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
-	raftId        = flag.String("raftId", "", "Node id used by Raft")
-	raftDir       = flag.String("raftDataDir", "data/", "Raft data dir")
-	raftBootstrap = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
-	raftGroups    = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
-	shardRanges   = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
-	raftRedisMap  = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
+	redisAddr            = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
+	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	raftId               = flag.String("raftId", "", "Node id used by Raft")
+	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
+	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
+	raftBootstrapMembers = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
+	raftGroups           = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
+	shardRanges          = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
+	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 )
 
 func main() {
@@ -59,8 +61,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
+	if err != nil {
+		return err
+	}
+	bootstrap := *raftBootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, *raftBootstrap)
+	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
 	if err != nil {
 		return err
 	}
@@ -90,14 +97,21 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 	)
 
-	if err := startRaftServers(runCtx, &lc, eg, runtimes, shardStore, coordinate, distServer); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	runner := runtimeServerRunner{
+		ctx:           runCtx,
+		lc:            &lc,
+		eg:            eg,
+		cancel:        cancel,
+		runtimes:      runtimes,
+		shardStore:    shardStore,
+		coordinate:    coordinate,
+		distServer:    distServer,
+		redisAddress:  *redisAddr,
+		leaderRedis:   cfg.leaderRedis,
+		dynamoAddress: *dynamoAddr,
 	}
-	if err := startRedisServer(runCtx, &lc, eg, *redisAddr, shardStore, coordinate, cfg.leaderRedis); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
-	}
-	if err := startDynamoDBServer(runCtx, &lc, eg, *dynamoAddr, shardStore, coordinate); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	if err := runner.start(); err != nil {
+		return err
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -167,13 +181,49 @@ func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string)
 	return leaderRedis, nil
 }
 
-func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi bool, bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
+var (
+	ErrBootstrapMembersRequireSingleGroup = errors.New("flag --raftBootstrapMembers requires exactly one raft group")
+	ErrBootstrapMembersMissingLocalNode   = errors.New("flag --raftBootstrapMembers must include local --raftId")
+	ErrBootstrapMembersLocalAddrMismatch  = errors.New("flag --raftBootstrapMembers local address must match local raft group address")
+	ErrNoBootstrapMembersConfigured       = errors.New("no bootstrap members configured")
+)
+
+func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raft.Server, error) {
+	if strings.TrimSpace(bootstrapMembers) == "" {
+		return nil, nil
+	}
+	if len(groups) != 1 {
+		return nil, errors.WithStack(ErrBootstrapMembersRequireSingleGroup)
+	}
+
+	servers, err := parseRaftBootstrapMembers(bootstrapMembers)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse raft bootstrap members")
+	}
+	if len(servers) == 0 {
+		return nil, errors.WithStack(ErrNoBootstrapMembersConfigured)
+	}
+
+	localAddr := groups[0].address
+	for _, s := range servers {
+		if string(s.ID) != raftID {
+			continue
+		}
+		if string(s.Address) != localAddr {
+			return nil, errors.Wrapf(ErrBootstrapMembersLocalAddrMismatch, "expected %q got %q", localAddr, s.Address)
+		}
+		return servers, nil
+	}
+	return nil, errors.Wrapf(ErrBootstrapMembersMissingLocalNode, "raftId=%q", raftID)
+}
+
+func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi bool, bootstrap bool, bootstrapServers []raft.Server) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
 		st := store.NewMVCCStore()
 		fsm := kv.NewKvFSM(st)
-		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, fsm)
+		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, fsm)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
@@ -368,4 +418,31 @@ func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Gro
 		return errors.Wrap(joined, "startup failed")
 	}
 	return startupErr
+}
+
+type runtimeServerRunner struct {
+	ctx           context.Context
+	lc            *net.ListenConfig
+	eg            *errgroup.Group
+	cancel        context.CancelFunc
+	runtimes      []*raftGroupRuntime
+	shardStore    *kv.ShardStore
+	coordinate    kv.Coordinator
+	distServer    *adapter.DistributionServer
+	redisAddress  string
+	leaderRedis   map[raft.ServerAddress]string
+	dynamoAddress string
+}
+
+func (r runtimeServerRunner) start() error {
+	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	return nil
 }
