@@ -405,7 +405,9 @@ func startBoundGRPCServer(
 		go func() {
 			select {
 			case <-ctx.Done():
-				srv.GracefulStop()
+				// Force-stop to avoid cleanup hangs when long-lived raft RPC streams
+				// keep GracefulStop waiting indefinitely under -race/CI load.
+				srv.Stop()
 				_ = lis.Close()
 				closeService()
 			case <-stop:
