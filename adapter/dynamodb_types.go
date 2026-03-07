@@ -21,6 +21,15 @@ type putItemInput struct {
 	Item      map[string]attributeValue `json:"Item"`
 }
 
+type deleteItemInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
+}
+
 type transactWriteItemsInput struct {
 	TransactItems []transactWriteItem `json:"TransactItems"`
 }

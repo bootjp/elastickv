@@ -29,6 +29,7 @@ const (
 	describeTableTarget      = targetPrefix + "DescribeTable"
 	listTablesTarget         = targetPrefix + "ListTables"
 	putItemTarget            = targetPrefix + "PutItem"
+	deleteItemTarget         = targetPrefix + "DeleteItem"
 	getItemTarget            = targetPrefix + "GetItem"
 	queryTarget              = targetPrefix + "Query"
 	updateItemTarget         = targetPrefix + "UpdateItem"
@@ -89,6 +90,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		describeTableTarget:      d.describeTable,
 		listTablesTarget:         d.listTables,
 		putItemTarget:            d.putItem,
+		deleteItemTarget:         d.deleteItem,
 		getItemTarget:            d.getItem,
 		queryTarget:              d.query,
 		updateItemTarget:         d.updateItem,
@@ -776,6 +778,142 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeDynamoJSON(w, map[string]any{"Item": item})
+}
+
+func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
+	in, shouldReturnOld, err := decodeDeleteItemInput(r.Body)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	lockKey, err := dynamoItemUpdateLockKey(in.TableName, in.Key)
+	if err != nil {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return
+	}
+	unlock := d.lockItemUpdate(lockKey)
+	defer unlock()
+	oldItem, err := d.deleteItemWithRetry(r.Context(), in)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	resp := map[string]any{}
+	if shouldReturnOld && len(oldItem) > 0 {
+		resp["Attributes"] = oldItem
+	}
+	writeDynamoJSON(w, resp)
+}
+
+func decodeDeleteItemInput(bodyReader io.Reader) (deleteItemInput, bool, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in deleteItemInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if strings.TrimSpace(in.TableName) == "" {
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+	}
+	shouldReturnOld, err := parseDeleteItemReturnValues(in.ReturnValues)
+	if err != nil {
+		return deleteItemInput{}, false, err
+	}
+	return in, shouldReturnOld, nil
+}
+
+func parseDeleteItemReturnValues(returnValues string) (bool, error) {
+	switch strings.TrimSpace(returnValues) {
+	case "", "NONE":
+		return false, nil
+	case "ALL_OLD":
+		return true, nil
+	default:
+		return false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
+	}
+}
+
+type deleteItemPlan struct {
+	req        *kv.OperationGroup[kv.OP]
+	generation uint64
+	oldItem    map[string]attributeValue
+}
+
+func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemInput) (map[string]attributeValue, error) {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
+		readTS := d.nextTxnReadTS()
+		plan, err := d.prepareDeleteItemWrite(ctx, in, readTS)
+		if err != nil {
+			return nil, err
+		}
+		if plan.req == nil {
+			return plan.oldItem, nil
+		}
+		if err = d.commitItemWrite(ctx, plan.req); err != nil {
+			if !isRetryableTransactWriteError(err) {
+				return nil, errors.WithStack(err)
+			}
+		} else {
+			retry, verifyErr := d.handleGenerationFenceResult(
+				ctx,
+				d.verifyTableGeneration(ctx, in.TableName, plan.generation),
+				nil,
+			)
+			if verifyErr != nil {
+				return nil, verifyErr
+			}
+			if !retry {
+				return plan.oldItem, nil
+			}
+		}
+		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete retry attempts exhausted")
+}
+
+func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteItemInput, readTS uint64) (*deleteItemPlan, error) {
+	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
+	if !found {
+		return &deleteItemPlan{oldItem: nil}, nil
+	}
+	req, err := buildItemDeleteRequest(schema, itemKey, current)
+	if err != nil {
+		return nil, err
+	}
+	return &deleteItemPlan{
+		req:        req,
+		generation: schema.Generation,
+		oldItem:    cloneAttributeValueMap(current),
+	}, nil
 }
 
 func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
