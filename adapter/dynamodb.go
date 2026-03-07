@@ -674,6 +674,10 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 		if err != nil {
 			return err
 		}
+		if plan.req == nil {
+			return nil
+		}
+		plan.req.StartTS = readTS
 		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return errors.WithStack(err)
@@ -843,41 +847,27 @@ type deleteItemPlan struct {
 }
 
 func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemInput) (map[string]attributeValue, error) {
-	backoff := transactRetryInitialBackoff
-	deadline := time.Now().Add(transactRetryMaxDuration)
-	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
-		readTS := d.nextTxnReadTS()
-		plan, err := d.prepareDeleteItemWrite(ctx, in, readTS)
-		if err != nil {
-			return nil, err
-		}
-		if plan.req == nil {
-			return plan.oldItem, nil
-		}
-		plan.req.StartTS = readTS
-		if err = d.commitItemWrite(ctx, plan.req); err != nil {
-			if !isRetryableTransactWriteError(err) {
-				return nil, errors.WithStack(err)
+	var oldItem map[string]attributeValue
+	err := d.retryItemWriteWithGeneration(
+		ctx,
+		in.TableName,
+		"delete retry attempts exhausted",
+		func(readTS uint64) (*itemWritePlan, error) {
+			plan, err := d.prepareDeleteItemWrite(ctx, in, readTS)
+			if err != nil {
+				return nil, err
 			}
-		} else {
-			retry, verifyErr := d.handleGenerationFenceResult(
-				ctx,
-				d.verifyTableGeneration(ctx, in.TableName, plan.generation),
-				nil,
-			)
-			if verifyErr != nil {
-				return nil, verifyErr
-			}
-			if !retry {
-				return plan.oldItem, nil
-			}
-		}
-		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		backoff = nextTransactRetryBackoff(backoff)
+			oldItem = plan.oldItem
+			return &itemWritePlan{
+				req:        plan.req,
+				generation: plan.generation,
+			}, nil
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
-	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete retry attempts exhausted")
+	return oldItem, nil
 }
 
 func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteItemInput, readTS uint64) (*deleteItemPlan, error) {
