@@ -52,6 +52,7 @@ const (
 	tableLockStripeCount        = 128
 	queryDefaultLimit           = 100
 	tableCleanupDeleteBatchSize = 256
+	dynamoMaxRequestBodyBytes   = 1 << 20
 
 	dynamoTableMetaPrefix       = "!ddb|meta|table|"
 	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
@@ -781,7 +782,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
-	in, shouldReturnOld, err := decodeDeleteItemInput(r.Body)
+	in, shouldReturnOld, err := decodeDeleteItemInput(http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -853,6 +854,7 @@ func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemI
 		if plan.req == nil {
 			return plan.oldItem, nil
 		}
+		plan.req.StartTS = readTS
 		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return nil, errors.WithStack(err)
