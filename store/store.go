@@ -44,6 +44,8 @@ type MVCCStore interface {
 	ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error)
 	// ScanAt returns versions visible at the given timestamp.
 	ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
+	// ReverseScanAt returns visible versions in descending key order for keys in [start, end).
+	ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
 	// PutAt commits a value at the provided commit timestamp and optional expireAt.
 	PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error
 	// DeleteAt commits a tombstone at the provided commit timestamp.

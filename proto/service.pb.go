@@ -435,6 +435,7 @@ type RawScanAtRequest struct {
 	EndKey        []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
 	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
 	Ts            uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
+	Reverse       bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -495,6 +496,13 @@ func (x *RawScanAtRequest) GetTs() uint64 {
 		return x.Ts
 	}
 	return 0
+}
+
+func (x *RawScanAtRequest) GetReverse() bool {
+	if x != nil {
+		return x.Reverse
+	}
+	return false
 }
 
 type RawKVPair struct {
@@ -1440,12 +1448,13 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"n\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x88\x01\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x03R\x05limit\x12\x0e\n" +
-	"\x02ts\x18\x04 \x01(\x04R\x02ts\"3\n" +
+	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
+	"\areverse\x18\x05 \x01(\bR\areverse\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +

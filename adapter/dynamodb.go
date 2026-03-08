@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"hash/fnv"
 	"io"
@@ -61,6 +62,11 @@ const (
 	dynamoItemPrefix            = "!ddb|item|"
 	dynamoGSIPrefix             = "!ddb|gsi|"
 	dynamoScanPageLimit         = 1024
+	dynamoKeyEscapeByte         = byte(0x00)
+	dynamoKeyTerminatorByte     = byte(0x01)
+	dynamoKeyEscapedZeroByte    = byte(0xFF)
+	dynamoKeySegmentOverhead    = 2
+	dynamoOrderedKeyEncodingV2  = 2
 )
 
 const (
@@ -252,6 +258,7 @@ type dynamoTableSchema struct {
 	AttributeDefinitions   map[string]string                     `json:"attribute_definitions,omitempty"`
 	PrimaryKey             dynamoKeySchema                       `json:"primary_key"`
 	GlobalSecondaryIndexes map[string]dynamoGlobalSecondaryIndex `json:"global_secondary_indexes,omitempty"`
+	KeyEncodingVersion     int                                   `json:"key_encoding_version,omitempty"`
 	Generation             uint64                                `json:"generation"`
 }
 
@@ -330,6 +337,7 @@ func buildCreateTableSchema(in createTableInput) (*dynamoTableSchema, error) {
 		AttributeDefinitions:   attrDefs,
 		PrimaryKey:             primary,
 		GlobalSecondaryIndexes: gsis,
+		KeyEncodingVersion:     dynamoOrderedKeyEncodingV2,
 	}, nil
 }
 
@@ -1416,6 +1424,10 @@ type readPageOptions struct {
 	lastEvaluatedKeyBuilder   func(map[string]attributeValue) map[string]attributeValue
 }
 
+type dynamoReadIterator interface {
+	Next(context.Context) (map[string]attributeValue, bool, error)
+}
+
 type queryRangeOperator string
 
 const (
@@ -1457,16 +1469,7 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if err != nil {
 		return nil, err
 	}
-	items, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond, readTS)
-	if err != nil {
-		return nil, err
-	}
-	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
-	if err != nil {
-		return nil, err
-	}
-	orderQueryItems(items, keySchema.RangeKey, in.ScanIndexForward)
-	return finalizeReadPage(schema, items, readPageOptions{
+	opts := readPageOptions{
 		filterExpression:          in.FilterExpression,
 		projectionExpression:      in.ProjectionExpression,
 		expressionAttributeNames:  in.ExpressionAttributeNames,
@@ -1477,7 +1480,20 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 		lastEvaluatedKeyBuilder: func(item map[string]attributeValue) map[string]attributeValue {
 			return makeReadLastEvaluatedKey(schema.PrimaryKey, keySchema, item)
 		},
-	})
+	}
+	if out, ok, err := d.streamQueryItems(ctx, in, schema, keySchema, cond, readTS, opts); ok || err != nil {
+		return out, err
+	}
+	items, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond, readTS)
+	if err != nil {
+		return nil, err
+	}
+	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
+	if err != nil {
+		return nil, err
+	}
+	orderQueryItems(items, keySchema.RangeKey, in.ScanIndexForward)
+	return finalizeReadPage(schema, items, opts)
 }
 
 func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOutput, error) {
@@ -1499,15 +1515,7 @@ func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOut
 			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 		}
 	}
-	items, err := d.scanItemsBySource(ctx, in, schema, readTS)
-	if err != nil {
-		return nil, err
-	}
-	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
-	if err != nil {
-		return nil, err
-	}
-	return finalizeReadPage(schema, items, readPageOptions{
+	opts := readPageOptions{
 		filterExpression:          in.FilterExpression,
 		projectionExpression:      in.ProjectionExpression,
 		expressionAttributeNames:  in.ExpressionAttributeNames,
@@ -1518,7 +1526,19 @@ func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOut
 		lastEvaluatedKeyBuilder: func(item map[string]attributeValue) map[string]attributeValue {
 			return makeReadLastEvaluatedKey(schema.PrimaryKey, indexKeySchema, item)
 		},
-	})
+	}
+	if out, ok, err := d.streamScanItems(ctx, in, schema, readTS, opts); ok || err != nil {
+		return out, err
+	}
+	items, err := d.scanItemsBySource(ctx, in, schema, readTS)
+	if err != nil {
+		return nil, err
+	}
+	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
+	if err != nil {
+		return nil, err
+	}
+	return finalizeReadPage(schema, items, opts)
 }
 
 func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
@@ -1677,6 +1697,248 @@ func resolveReadLimit(limit *int32) (int, bool, error) {
 	return int(*limit), true, nil
 }
 
+func readIteratorPageLimit(limit *int32) int {
+	resolved, hasLimit, err := resolveReadLimit(limit)
+	if err != nil || !hasLimit {
+		return dynamoScanPageLimit
+	}
+	pageLimit := resolved + 1
+	if pageLimit > dynamoScanPageLimit {
+		return dynamoScanPageLimit
+	}
+	if pageLimit < 1 {
+		return 1
+	}
+	return pageLimit
+}
+
+func (d *DynamoDBServer) streamQueryItems(
+	ctx context.Context,
+	in queryInput,
+	schema *dynamoTableSchema,
+	keySchema dynamoKeySchema,
+	cond queryCondition,
+	readTS uint64,
+	opts readPageOptions,
+) (*queryOutput, bool, error) {
+	iter, ok, err := d.newQueryReadIterator(in, schema, keySchema, cond, readTS, opts)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	out, err := finalizeReadIterator(ctx, schema, iter, opts)
+	if err != nil {
+		return nil, true, err
+	}
+	return out, true, nil
+}
+
+func (d *DynamoDBServer) streamScanItems(
+	ctx context.Context,
+	in scanInput,
+	schema *dynamoTableSchema,
+	readTS uint64,
+	opts readPageOptions,
+) (*queryOutput, bool, error) {
+	iter, ok, err := d.newScanReadIterator(in, schema, readTS, opts)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	out, err := finalizeReadIterator(ctx, schema, iter, opts)
+	if err != nil {
+		return nil, true, err
+	}
+	return out, true, nil
+}
+
+func finalizeReadIterator(
+	ctx context.Context,
+	schema *dynamoTableSchema,
+	iter dynamoReadIterator,
+	opts readPageOptions,
+) (*queryOutput, error) {
+	state, err := newReadPageState(schema, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := state.consumeIterator(ctx, iter); err != nil {
+		return nil, err
+	}
+	return state.output(), nil
+}
+
+func (d *DynamoDBServer) newQueryReadIterator(
+	in queryInput,
+	schema *dynamoTableSchema,
+	keySchema dynamoKeySchema,
+	cond queryCondition,
+	readTS uint64,
+	opts readPageOptions,
+) (dynamoReadIterator, bool, error) {
+	projector := d.readItemProjector(schema, in.IndexName)
+	filter := itemReadFilter(func(item map[string]attributeValue) bool {
+		return matchesQueryCondition(item, cond)
+	})
+	pageLimit := readIteratorPageLimit(opts.limit)
+	bounds, ok, err := resolveQueryReadBounds(schema, in, keySchema, cond, opts.exclusiveStartKey)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	if strings.TrimSpace(in.IndexName) == "" {
+		return newTableReadIterator(d, bounds, readTS, pageLimit, projector, filter), true, nil
+	}
+	return newGSIReadIterator(d, bounds, readTS, pageLimit, projector, filter), true, nil
+}
+
+func (d *DynamoDBServer) newScanReadIterator(
+	in scanInput,
+	schema *dynamoTableSchema,
+	readTS uint64,
+	opts readPageOptions,
+) (dynamoReadIterator, bool, error) {
+	projector := d.readItemProjector(schema, in.IndexName)
+	pageLimit := readIteratorPageLimit(opts.limit)
+	if strings.TrimSpace(in.IndexName) == "" {
+		bounds, err := resolveTableReadBounds(schema, in.TableName, opts.exclusiveStartKey)
+		if err != nil {
+			return nil, false, err
+		}
+		return newTableReadIterator(d, bounds, readTS, pageLimit, projector, nil), true, nil
+	}
+	if _, err := schema.keySchemaForQuery(in.IndexName); err != nil {
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	bounds, ok, err := resolveGSIReadBounds(schema, in.TableName, in.IndexName, opts.exclusiveStartKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(opts.exclusiveStartKey) > 0 && !ok {
+		return nil, false, nil
+	}
+	return newGSIReadIterator(d, bounds, readTS, pageLimit, projector, nil), true, nil
+}
+
+func resolveTableReadBounds(
+	schema *dynamoTableSchema,
+	tableName string,
+	startKey map[string]attributeValue,
+) (dynamoReadBounds, error) {
+	lower := dynamoItemPrefixForTable(tableName, schema.Generation)
+	upper := prefixScanEnd(lower)
+	if len(startKey) == 0 {
+		return dynamoReadBounds{lower: lower, upper: upper}, nil
+	}
+	key, err := schema.itemKeyFromAttributes(startKey)
+	if err != nil {
+		return dynamoReadBounds{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ExclusiveStartKey")
+	}
+	return dynamoReadBounds{lower: maxBytes(lower, nextScanCursor(key)), upper: upper}, nil
+}
+
+func resolveGSIReadBounds(
+	schema *dynamoTableSchema,
+	tableName string,
+	indexName string,
+	startKey map[string]attributeValue,
+) (dynamoReadBounds, bool, error) {
+	lower := dynamoGSIIndexPrefixForTable(tableName, schema.Generation, indexName)
+	upper := prefixScanEnd(lower)
+	if len(startKey) == 0 {
+		return dynamoReadBounds{lower: lower, upper: upper}, true, nil
+	}
+	key, ok, err := schema.gsiKeyFromAttributes(indexName, startKey)
+	if err != nil {
+		return dynamoReadBounds{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ExclusiveStartKey")
+	}
+	if !ok {
+		return dynamoReadBounds{}, false, nil
+	}
+	return dynamoReadBounds{lower: maxBytes(lower, nextScanCursor(key)), upper: upper}, true, nil
+}
+
+func resolveQueryReadBounds(
+	schema *dynamoTableSchema,
+	in queryInput,
+	keySchema dynamoKeySchema,
+	cond queryCondition,
+	startKey map[string]attributeValue,
+) (dynamoReadBounds, bool, error) {
+	if !schema.usesOrderedKeyEncoding() {
+		return dynamoReadBounds{}, false, nil
+	}
+	basePrefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	if err != nil {
+		return dynamoReadBounds{}, false, err
+	}
+	bounds := dynamoReadBounds{
+		lower:   basePrefix,
+		upper:   prefixScanEnd(basePrefix),
+		reverse: queryReadReverse(in.ScanIndexForward),
+	}
+	if keySchema.RangeKey != "" && cond.rangeCond != nil {
+		bounds, err = refineQueryReadBounds(bounds, basePrefix, *cond.rangeCond)
+		if err != nil {
+			return dynamoReadBounds{}, false, err
+		}
+	}
+	if len(startKey) == 0 {
+		return bounds, true, nil
+	}
+	startCursor, ok, err := resolveQueryExclusiveStartKey(schema, in, startKey)
+	if err != nil {
+		return dynamoReadBounds{}, false, err
+	}
+	if !ok {
+		return dynamoReadBounds{}, false, nil
+	}
+	if bounds.reverse {
+		bounds.upper = minBytes(bounds.upper, startCursor)
+	} else {
+		bounds.lower = maxBytes(bounds.lower, nextScanCursor(startCursor))
+	}
+	return bounds, true, nil
+}
+
+func resolveQueryExclusiveStartKey(
+	schema *dynamoTableSchema,
+	in queryInput,
+	startKey map[string]attributeValue,
+) ([]byte, bool, error) {
+	if len(startKey) == 0 {
+		return nil, true, nil
+	}
+	if strings.TrimSpace(in.IndexName) == "" {
+		key, err := schema.itemKeyFromAttributes(startKey)
+		if err != nil {
+			return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ExclusiveStartKey")
+		}
+		return key, true, nil
+	}
+	key, ok, err := schema.gsiKeyFromAttributes(in.IndexName, startKey)
+	if err != nil {
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ExclusiveStartKey")
+	}
+	return key, ok, nil
+}
+
+func queryReadReverse(scanIndexForward *bool) bool {
+	return scanIndexForward != nil && !*scanIndexForward
+}
+
+type readItemProjector func(map[string]attributeValue) (map[string]attributeValue, error)
+
+func (d *DynamoDBServer) readItemProjector(schema *dynamoTableSchema, indexName string) readItemProjector {
+	if strings.TrimSpace(indexName) == "" {
+		return identityReadItemProjector
+	}
+	return func(item map[string]attributeValue) (map[string]attributeValue, error) {
+		return schema.projectItemForIndex(indexName, item)
+	}
+}
+
+func identityReadItemProjector(item map[string]attributeValue) (map[string]attributeValue, error) {
+	return item, nil
+}
+
 func finalizeReadPage(schema *dynamoTableSchema, items []map[string]attributeValue, opts readPageOptions) (*queryOutput, error) {
 	items, err := applyQueryExclusiveStartKey(schema, opts.exclusiveStartKey, items)
 	if err != nil {
@@ -1704,6 +1966,42 @@ type readPageState struct {
 	outCount         int
 	scannedCount     int
 	lastEvaluatedKey map[string]attributeValue
+}
+
+type dynamoReadBounds struct {
+	lower   []byte
+	upper   []byte
+	reverse bool
+}
+
+type keyRangeKVIterator struct {
+	server    *DynamoDBServer
+	lower     []byte
+	upper     []byte
+	cursor    []byte
+	readTS    uint64
+	pageLimit int
+	reverse   bool
+	page      []*store.KVPair
+	index     int
+	done      bool
+}
+
+type emptyReadIterator struct{}
+
+type tableReadIterator struct {
+	kv        *keyRangeKVIterator
+	projector readItemProjector
+	filter    itemReadFilter
+}
+
+type gsiReadIterator struct {
+	server    *DynamoDBServer
+	kv        *keyRangeKVIterator
+	readTS    uint64
+	projector readItemProjector
+	filter    itemReadFilter
+	seen      map[string]struct{}
 }
 
 func newReadPageState(schema *dynamoTableSchema, opts readPageOptions) (*readPageState, error) {
@@ -1743,11 +2041,37 @@ func (s *readPageState) consume(items []map[string]attributeValue) error {
 	return nil
 }
 
+func (s *readPageState) consumeIterator(ctx context.Context, iter dynamoReadIterator) error {
+	var lastItem map[string]attributeValue
+	for !s.reachedLimit() {
+		item, ok, err := iter.Next(ctx)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !ok {
+			return nil
+		}
+		if err := s.consumeReadItem(item); err != nil {
+			return err
+		}
+		lastItem = item
+	}
+	if lastItem == nil {
+		return nil
+	}
+	if nextItem, ok, err := iter.Next(ctx); err != nil {
+		return errors.WithStack(err)
+	} else if ok && nextItem != nil {
+		s.lastEvaluatedKey = s.buildLastEvaluatedKey(lastItem)
+	}
+	return nil
+}
+
 func (s *readPageState) reachedLimit() bool {
 	return s.hasLimit && s.scannedCount == s.limit
 }
 
-func (s *readPageState) consumeItem(i int, item map[string]attributeValue, totalItems int) error {
+func (s *readPageState) consumeReadItem(item map[string]attributeValue) error {
 	s.scannedCount++
 	match, err := matchesReadFilter(s.filterExpr, item, s.opts.expressionAttributeValues)
 	if err != nil {
@@ -1755,6 +2079,13 @@ func (s *readPageState) consumeItem(i int, item map[string]attributeValue, total
 	}
 	if match {
 		s.recordMatch(item)
+	}
+	return nil
+}
+
+func (s *readPageState) consumeItem(i int, item map[string]attributeValue, totalItems int) error {
+	if err := s.consumeReadItem(item); err != nil {
+		return err
 	}
 	if s.shouldSetLastEvaluatedKey(i, totalItems) {
 		s.lastEvaluatedKey = s.buildLastEvaluatedKey(item)
@@ -1791,6 +2122,220 @@ func (s *readPageState) output() *queryOutput {
 		count:            s.outCount,
 		scannedCount:     s.scannedCount,
 		lastEvaluatedKey: s.lastEvaluatedKey,
+	}
+}
+
+func (emptyReadIterator) Next(context.Context) (map[string]attributeValue, bool, error) {
+	return nil, false, nil
+}
+
+func newKeyRangeKVIterator(
+	server *DynamoDBServer,
+	bounds dynamoReadBounds,
+	readTS uint64,
+	pageLimit int,
+) *keyRangeKVIterator {
+	cursor := bytes.Clone(bounds.lower)
+	if bounds.reverse {
+		cursor = bytes.Clone(bounds.upper)
+	}
+	return &keyRangeKVIterator{
+		server:    server,
+		lower:     bytes.Clone(bounds.lower),
+		upper:     bytes.Clone(bounds.upper),
+		cursor:    cursor,
+		readTS:    readTS,
+		pageLimit: pageLimit,
+		reverse:   bounds.reverse,
+	}
+}
+
+func (it *keyRangeKVIterator) Next(ctx context.Context) (*store.KVPair, bool, error) {
+	for {
+		if it.index < len(it.page) {
+			kvp := it.page[it.index]
+			it.index++
+			return kvp, true, nil
+		}
+		if it.done {
+			return nil, false, nil
+		}
+		if err := it.loadNextPage(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+}
+
+func (it *keyRangeKVIterator) loadNextPage(ctx context.Context) error {
+	if it.reverse {
+		return it.loadNextPageReverse(ctx)
+	}
+	return it.loadNextPageForward(ctx)
+}
+
+func (it *keyRangeKVIterator) loadNextPageForward(ctx context.Context) error {
+	kvs, err := it.server.store.ScanAt(ctx, it.cursor, it.upper, it.pageLimit, it.readTS)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(kvs) == 0 {
+		it.done = true
+		it.page = nil
+		return nil
+	}
+	it.page, it.done = filterBoundedKVPairsForward(kvs, it.lower, it.upper, it.pageLimit)
+	it.index = 0
+	if !it.done {
+		it.cursor = nextScanCursor(kvs[len(kvs)-1].Key)
+		if it.upper != nil && bytes.Compare(it.cursor, it.upper) >= 0 {
+			it.done = true
+		}
+	}
+	return nil
+}
+
+func (it *keyRangeKVIterator) loadNextPageReverse(ctx context.Context) error {
+	kvs, err := it.server.store.ReverseScanAt(ctx, it.lower, it.cursor, it.pageLimit, it.readTS)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(kvs) == 0 {
+		it.done = true
+		it.page = nil
+		return nil
+	}
+	it.page, it.done = filterBoundedKVPairsReverse(kvs, it.lower, it.cursor, it.pageLimit)
+	it.index = 0
+	if !it.done {
+		it.cursor = bytes.Clone(kvs[len(kvs)-1].Key)
+	}
+	return nil
+}
+
+func filterBoundedKVPairsForward(kvs []*store.KVPair, lower []byte, upper []byte, pageLimit int) ([]*store.KVPair, bool) {
+	page := make([]*store.KVPair, 0, minInt(len(kvs), pageLimit))
+	done := len(kvs) < pageLimit
+	for _, kvp := range kvs {
+		if lower != nil && bytes.Compare(kvp.Key, lower) < 0 {
+			continue
+		}
+		if upper != nil && bytes.Compare(kvp.Key, upper) >= 0 {
+			done = true
+			break
+		}
+		page = append(page, kvp)
+	}
+	if len(page) == 0 {
+		done = true
+	}
+	return page, done
+}
+
+func filterBoundedKVPairsReverse(kvs []*store.KVPair, lower []byte, upper []byte, pageLimit int) ([]*store.KVPair, bool) {
+	page := make([]*store.KVPair, 0, minInt(len(kvs), pageLimit))
+	done := len(kvs) < pageLimit
+	for _, kvp := range kvs {
+		if lower != nil && bytes.Compare(kvp.Key, lower) < 0 {
+			done = true
+			break
+		}
+		if upper != nil && bytes.Compare(kvp.Key, upper) >= 0 {
+			continue
+		}
+		page = append(page, kvp)
+	}
+	if len(page) == 0 {
+		done = true
+	}
+	return page, done
+}
+
+func newTableReadIterator(
+	server *DynamoDBServer,
+	bounds dynamoReadBounds,
+	readTS uint64,
+	pageLimit int,
+	projector readItemProjector,
+	filter itemReadFilter,
+) dynamoReadIterator {
+	if bounds.upper != nil && bytes.Compare(bounds.lower, bounds.upper) >= 0 {
+		return emptyReadIterator{}
+	}
+	return &tableReadIterator{
+		kv:        newKeyRangeKVIterator(server, bounds, readTS, pageLimit),
+		projector: projector,
+		filter:    filter,
+	}
+}
+
+func (it *tableReadIterator) Next(ctx context.Context) (map[string]attributeValue, bool, error) {
+	for {
+		kvp, ok, err := it.kv.Next(ctx)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		item := map[string]attributeValue{}
+		if err := json.Unmarshal(kvp.Value, &item); err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		item, err = it.projector(item)
+		if err != nil {
+			return nil, false, err
+		}
+		if it.filter != nil && !it.filter(item) {
+			continue
+		}
+		return item, true, nil
+	}
+}
+
+func newGSIReadIterator(
+	server *DynamoDBServer,
+	bounds dynamoReadBounds,
+	readTS uint64,
+	pageLimit int,
+	projector readItemProjector,
+	filter itemReadFilter,
+) dynamoReadIterator {
+	if bounds.upper != nil && bytes.Compare(bounds.lower, bounds.upper) >= 0 {
+		return emptyReadIterator{}
+	}
+	return &gsiReadIterator{
+		server:    server,
+		kv:        newKeyRangeKVIterator(server, bounds, readTS, pageLimit),
+		readTS:    readTS,
+		projector: projector,
+		filter:    filter,
+		seen:      map[string]struct{}{},
+	}
+}
+
+func (it *gsiReadIterator) Next(ctx context.Context) (map[string]attributeValue, bool, error) {
+	for {
+		kvp, ok, err := it.kv.Next(ctx)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		itemKey := string(kvp.Value)
+		if _, exists := it.seen[itemKey]; exists {
+			continue
+		}
+		it.seen[itemKey] = struct{}{}
+		item, found, err := it.server.readItemAtKeyAt(ctx, kvp.Value, it.readTS)
+		if err != nil {
+			return nil, false, err
+		}
+		if !found {
+			continue
+		}
+		item, err = it.projector(item)
+		if err != nil {
+			return nil, false, err
+		}
+		if it.filter != nil && !it.filter(item) {
+			continue
+		}
+		return item, true, nil
 	}
 }
 
@@ -1895,11 +2440,14 @@ func (d *DynamoDBServer) queryItemsByGSI(
 	cond queryCondition,
 	readTS uint64,
 ) ([]map[string]attributeValue, error) {
-	hashKey, err := attributeValueAsKey(cond.hashValue)
+	keySchema, err := schema.keySchemaForQuery(in.IndexName)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	prefix := dynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey)
+	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	if err != nil {
+		return nil, err
+	}
 	kvs, err := d.scanAllByPrefixAt(ctx, prefix, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -2148,14 +2696,155 @@ func sendGSIReadResult(ctx context.Context, results chan<- gsiReadResult, result
 }
 
 func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoKeySchema, hashValue attributeValue) ([]byte, error) {
-	if keySchema.HashKey != schema.PrimaryKey.HashKey {
-		return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
+	if !schema.usesOrderedKeyEncoding() {
+		hashKey, err := attributeValueAsKey(hashValue)
+		if err != nil {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		}
+		if strings.TrimSpace(in.IndexName) != "" {
+			return legacyDynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey), nil
+		}
+		if keySchema.HashKey != schema.PrimaryKey.HashKey {
+			return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
+		}
+		return legacyDynamoItemHashPrefixForTable(in.TableName, schema.Generation, hashKey), nil
 	}
-	hashKey, err := attributeValueAsKey(hashValue)
+	hashKey, err := attributeValueAsKeySegment(hashValue)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
+	if strings.TrimSpace(in.IndexName) != "" {
+		return dynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey), nil
+	}
+	if keySchema.HashKey != schema.PrimaryKey.HashKey {
+		return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
+	}
 	return dynamoItemHashPrefixForTable(in.TableName, schema.Generation, hashKey), nil
+}
+
+func refineQueryReadBounds(
+	bounds dynamoReadBounds,
+	basePrefix []byte,
+	cond queryRangeCondition,
+) (dynamoReadBounds, error) {
+	switch cond.op {
+	case queryRangeOpEqual, queryRangeOpLessThan, queryRangeOpLessOrEq, queryRangeOpGreater, queryRangeOpGreaterEq:
+		return refineQueryComparisonBounds(bounds, basePrefix, cond)
+	case queryRangeOpBetween:
+		return refineQueryBetweenBounds(bounds, basePrefix, cond)
+	case queryRangeOpBeginsWith:
+		return refineQueryBeginsWithBounds(bounds, basePrefix, cond.value1)
+	default:
+		return bounds, nil
+	}
+}
+
+func refineQueryComparisonBounds(
+	bounds dynamoReadBounds,
+	basePrefix []byte,
+	cond queryRangeCondition,
+) (dynamoReadBounds, error) {
+	prefix, err := appendRangeConditionPrefix(basePrefix, cond.value1)
+	if err != nil {
+		return dynamoReadBounds{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if cond.op == queryRangeOpEqual {
+		bounds.lower = prefix
+		bounds.upper = prefixScanEnd(prefix)
+		return bounds, nil
+	}
+	if cond.op == queryRangeOpLessThan {
+		bounds.upper = minBytes(bounds.upper, prefix)
+		return bounds, nil
+	}
+	if cond.op == queryRangeOpLessOrEq {
+		bounds.upper = minBytes(bounds.upper, prefixScanEnd(prefix))
+		return bounds, nil
+	}
+	if cond.op == queryRangeOpGreater {
+		bounds.lower = maxBytes(bounds.lower, prefixScanEnd(prefix))
+		return bounds, nil
+	}
+	if cond.op == queryRangeOpGreaterEq {
+		bounds.lower = maxBytes(bounds.lower, prefix)
+		return bounds, nil
+	}
+	return bounds, nil
+}
+
+func refineQueryBetweenBounds(
+	bounds dynamoReadBounds,
+	basePrefix []byte,
+	cond queryRangeCondition,
+) (dynamoReadBounds, error) {
+	lower, err := appendRangeConditionPrefix(basePrefix, cond.value1)
+	if err != nil {
+		return dynamoReadBounds{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	upper, err := appendRangeConditionPrefix(basePrefix, cond.value2)
+	if err != nil {
+		return dynamoReadBounds{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	bounds.lower = maxBytes(bounds.lower, lower)
+	bounds.upper = minBytes(bounds.upper, prefixScanEnd(upper))
+	return bounds, nil
+}
+
+func refineQueryBeginsWithBounds(
+	bounds dynamoReadBounds,
+	basePrefix []byte,
+	value attributeValue,
+) (dynamoReadBounds, error) {
+	prefix, err := appendRangeConditionPrefixMatch(basePrefix, value)
+	if err != nil {
+		return dynamoReadBounds{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	bounds.lower = maxBytes(bounds.lower, prefix)
+	bounds.upper = minBytes(bounds.upper, prefixScanEnd(prefix))
+	return bounds, nil
+}
+
+func appendRangeConditionPrefix(basePrefix []byte, value attributeValue) ([]byte, error) {
+	segment, err := attributeValueAsKeySegment(value)
+	if err != nil {
+		return nil, err
+	}
+	return append(bytes.Clone(basePrefix), segment...), nil
+}
+
+func appendRangeConditionPrefixMatch(basePrefix []byte, value attributeValue) ([]byte, error) {
+	raw, err := attributeValueAsKeyBytes(value)
+	if err != nil {
+		return nil, err
+	}
+	segment := encodeDynamoKeySegmentPrefix(raw)
+	return append(bytes.Clone(basePrefix), segment...), nil
+}
+
+func maxBytes(left []byte, right []byte) []byte {
+	if left == nil {
+		return bytes.Clone(right)
+	}
+	if right == nil {
+		return bytes.Clone(left)
+	}
+	if bytes.Compare(left, right) >= 0 {
+		return bytes.Clone(left)
+	}
+	return bytes.Clone(right)
+}
+
+func minBytes(left []byte, right []byte) []byte {
+	if left == nil {
+		return bytes.Clone(right)
+	}
+	if right == nil {
+		return bytes.Clone(left)
+	}
+	if bytes.Compare(left, right) <= 0 {
+		return bytes.Clone(left)
+	}
+	return bytes.Clone(right)
 }
 
 func applyQueryExclusiveStartKey(schema *dynamoTableSchema, startKey map[string]attributeValue, items []map[string]attributeValue) ([]map[string]attributeValue, error) {
@@ -5113,7 +5802,22 @@ func (t *dynamoTableSchema) projectItemForIndex(indexName string, item map[strin
 	return out, nil
 }
 
+func (t *dynamoTableSchema) usesOrderedKeyEncoding() bool {
+	return t != nil && t.KeyEncodingVersion >= dynamoOrderedKeyEncodingV2
+}
+
 func (t *dynamoTableSchema) itemKeyFromAttributes(attrs map[string]attributeValue) ([]byte, error) {
+	if !t.usesOrderedKeyEncoding() {
+		return t.legacyItemKeyFromAttributes(attrs)
+	}
+	primary, err := t.primaryKeyValues(attrs)
+	if err != nil {
+		return nil, err
+	}
+	return dynamoItemKey(t.TableName, t.Generation, primary.hash, primary.rangeKey), nil
+}
+
+func (t *dynamoTableSchema) legacyItemKeyFromAttributes(attrs map[string]attributeValue) ([]byte, error) {
 	hashAttr, ok := attrs[t.PrimaryKey.HashKey]
 	if !ok {
 		return nil, errors.New("missing hash key attribute")
@@ -5133,14 +5837,52 @@ func (t *dynamoTableSchema) itemKeyFromAttributes(attrs map[string]attributeValu
 			return nil, err
 		}
 	}
-	return dynamoItemKey(t.TableName, t.Generation, hashKey, rangeKey), nil
+	return legacyDynamoItemKey(t.TableName, t.Generation, hashKey, rangeKey), nil
+}
+
+func (t *dynamoTableSchema) gsiKeyFromAttributes(indexName string, attrs map[string]attributeValue) ([]byte, bool, error) {
+	if !t.usesOrderedKeyEncoding() {
+		return t.legacyGSIKeyFromAttributes(indexName, attrs)
+	}
+	gsi, ok := t.GlobalSecondaryIndexes[indexName]
+	if !ok {
+		return nil, false, errors.New("global secondary index not found")
+	}
+	primary, err := t.primaryKeyValues(attrs)
+	if err != nil {
+		return nil, false, err
+	}
+	index, include, err := gsiKeyValues(attrs, gsi.KeySchema)
+	if err != nil || !include {
+		return nil, include, err
+	}
+	return dynamoGSIKey(t.TableName, t.Generation, indexName, index.hash, index.rangeKey, primary.hash, primary.rangeKey), true, nil
+}
+
+func (t *dynamoTableSchema) legacyGSIKeyFromAttributes(indexName string, attrs map[string]attributeValue) ([]byte, bool, error) {
+	gsi, ok := t.GlobalSecondaryIndexes[indexName]
+	if !ok {
+		return nil, false, errors.New("global secondary index not found")
+	}
+	pkHash, pkRange, err := t.legacyPrimaryKeyValues(attrs)
+	if err != nil {
+		return nil, false, err
+	}
+	indexHash, indexRange, include, err := legacyGSIKeyValues(attrs, gsi.KeySchema)
+	if err != nil || !include {
+		return nil, include, err
+	}
+	return legacyDynamoGSIKey(t.TableName, t.Generation, indexName, indexHash, indexRange, pkHash, pkRange), true, nil
 }
 
 func (t *dynamoTableSchema) gsiEntryKeysForItem(attrs map[string]attributeValue) ([][]byte, error) {
 	if len(t.GlobalSecondaryIndexes) == 0 || len(attrs) == 0 {
 		return nil, nil
 	}
-	pkHash, pkRange, err := t.primaryKeyValues(attrs)
+	if !t.usesOrderedKeyEncoding() {
+		return t.legacyGSIEntryKeysForItem(attrs)
+	}
+	primary, err := t.primaryKeyValues(attrs)
 	if err != nil {
 		return nil, err
 	}
@@ -5148,19 +5890,40 @@ func (t *dynamoTableSchema) gsiEntryKeysForItem(attrs map[string]attributeValue)
 	keys := make([][]byte, 0, len(indexNames))
 	for _, indexName := range indexNames {
 		gsi := t.GlobalSecondaryIndexes[indexName]
-		indexHash, indexRange, include, err := gsiKeyValues(attrs, gsi.KeySchema)
+		index, include, err := gsiKeyValues(attrs, gsi.KeySchema)
 		if err != nil {
 			return nil, err
 		}
 		if !include {
 			continue
 		}
-		keys = append(keys, dynamoGSIKey(t.TableName, t.Generation, indexName, indexHash, indexRange, pkHash, pkRange))
+		keys = append(keys, dynamoGSIKey(t.TableName, t.Generation, indexName, index.hash, index.rangeKey, primary.hash, primary.rangeKey))
 	}
 	return keys, nil
 }
 
-func (t *dynamoTableSchema) primaryKeyValues(attrs map[string]attributeValue) (string, string, error) {
+func (t *dynamoTableSchema) legacyGSIEntryKeysForItem(attrs map[string]attributeValue) ([][]byte, error) {
+	primaryHash, primaryRange, err := t.legacyPrimaryKeyValues(attrs)
+	if err != nil {
+		return nil, err
+	}
+	indexNames := sortedGSIIndexNames(t.GlobalSecondaryIndexes)
+	keys := make([][]byte, 0, len(indexNames))
+	for _, indexName := range indexNames {
+		gsi := t.GlobalSecondaryIndexes[indexName]
+		indexHash, indexRange, include, err := legacyGSIKeyValues(attrs, gsi.KeySchema)
+		if err != nil {
+			return nil, err
+		}
+		if !include {
+			continue
+		}
+		keys = append(keys, legacyDynamoGSIKey(t.TableName, t.Generation, indexName, indexHash, indexRange, primaryHash, primaryRange))
+	}
+	return keys, nil
+}
+
+func (t *dynamoTableSchema) legacyPrimaryKeyValues(attrs map[string]attributeValue) (string, string, error) {
 	hashAttr, ok := attrs[t.PrimaryKey.HashKey]
 	if !ok {
 		return "", "", errors.New("missing hash key attribute")
@@ -5183,7 +5946,58 @@ func (t *dynamoTableSchema) primaryKeyValues(attrs map[string]attributeValue) (s
 	return hash, rangeKey, nil
 }
 
-func gsiKeyValues(attrs map[string]attributeValue, ks dynamoKeySchema) (string, string, bool, error) {
+type dynamoEncodedKeyValues struct {
+	hash     []byte
+	rangeKey []byte
+}
+
+func (t *dynamoTableSchema) primaryKeyValues(attrs map[string]attributeValue) (dynamoEncodedKeyValues, error) {
+	hashAttr, ok := attrs[t.PrimaryKey.HashKey]
+	if !ok {
+		return dynamoEncodedKeyValues{}, errors.New("missing hash key attribute")
+	}
+	hash, err := attributeValueAsKeySegment(hashAttr)
+	if err != nil {
+		return dynamoEncodedKeyValues{}, err
+	}
+	var rangeKey []byte
+	if t.PrimaryKey.RangeKey != "" {
+		rangeAttr, ok := attrs[t.PrimaryKey.RangeKey]
+		if !ok {
+			return dynamoEncodedKeyValues{}, errors.New("missing range key attribute")
+		}
+		rangeKey, err = attributeValueAsKeySegment(rangeAttr)
+		if err != nil {
+			return dynamoEncodedKeyValues{}, err
+		}
+	}
+	return dynamoEncodedKeyValues{hash: hash, rangeKey: rangeKey}, nil
+}
+
+func gsiKeyValues(attrs map[string]attributeValue, ks dynamoKeySchema) (dynamoEncodedKeyValues, bool, error) {
+	hashAttr, ok := attrs[ks.HashKey]
+	if !ok {
+		return dynamoEncodedKeyValues{}, false, nil
+	}
+	hash, err := attributeValueAsKeySegment(hashAttr)
+	if err != nil {
+		return dynamoEncodedKeyValues{}, false, err
+	}
+	var rangeKey []byte
+	if ks.RangeKey != "" {
+		rangeAttr, ok := attrs[ks.RangeKey]
+		if !ok {
+			return dynamoEncodedKeyValues{}, false, nil
+		}
+		rangeKey, err = attributeValueAsKeySegment(rangeAttr)
+		if err != nil {
+			return dynamoEncodedKeyValues{}, false, err
+		}
+	}
+	return dynamoEncodedKeyValues{hash: hash, rangeKey: rangeKey}, true, nil
+}
+
+func legacyGSIKeyValues(attrs map[string]attributeValue, ks dynamoKeySchema) (string, string, bool, error) {
 	hashAttr, ok := attrs[ks.HashKey]
 	if !ok {
 		return "", "", false, nil
@@ -5219,6 +6033,15 @@ var attributeValueKeyExtractors = map[attributeValueKind]func(attributeValue) st
 	attributeValueKindString: func(attr attributeValue) string { return attr.stringValue() },
 	attributeValueKindNumber: func(attr attributeValue) string { return attr.numberValue() },
 	attributeValueKindBinary: func(attr attributeValue) string { return string(attr.B) },
+}
+
+var attributeValueKeyByteExtractors = map[attributeValueKind]func(attributeValue) []byte{
+	attributeValueKindString: func(attr attributeValue) []byte {
+		return []byte(attr.stringValue())
+	},
+	attributeValueKindBinary: func(attr attributeValue) []byte {
+		return bytes.Clone(attr.B)
+	},
 }
 
 var attributeValueScalarEqualityComparators = map[attributeValueKind]func(attributeValue, attributeValue) bool{
@@ -5259,6 +6082,229 @@ func attributeValueAsKey(attr attributeValue) (string, error) {
 		return "", errors.New("unsupported key attribute type")
 	}
 	return extract(attr), nil
+}
+
+func attributeValueAsKeyBytes(attr attributeValue) ([]byte, error) {
+	kind, count := detectAttributeValueKind(attr)
+	if count != 1 {
+		return nil, errors.New("unsupported key attribute type")
+	}
+	if kind == attributeValueKindNumber {
+		return encodeNumericKeyBytes(attr.numberValue())
+	}
+	extract, ok := attributeValueKeyByteExtractors[kind]
+	if !ok {
+		return nil, errors.New("unsupported key attribute type")
+	}
+	return extract(attr), nil
+}
+
+func attributeValueAsKeySegment(attr attributeValue) ([]byte, error) {
+	raw, err := attributeValueAsKeyBytes(attr)
+	if err != nil {
+		return nil, err
+	}
+	return encodeDynamoKeySegment(raw), nil
+}
+
+type numericKeyParts struct {
+	negative bool
+	exponent int64
+	digits   []byte
+}
+
+func encodeNumericKeyBytes(v string) ([]byte, error) {
+	parts, err := parseNumericKeyParts(v)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts.digits) == 0 {
+		return []byte{0x01}, nil
+	}
+	body := encodeOrderedSignedInt64(parts.exponent)
+	body = append(body, dynamoKeyEscapeByte)
+	body = append(body, parts.digits...)
+	if !parts.negative {
+		return append([]byte{0x02}, body...), nil
+	}
+	return append([]byte{0x00}, invertBytes(body)...), nil
+}
+
+func parseNumericKeyParts(v string) (numericKeyParts, error) {
+	trimmed, negative, exp10, err := parseNumericKeyLiteral(v)
+	if err != nil {
+		return numericKeyParts{}, err
+	}
+	digits, exponent, zero, err := normalizeNumericKeyParts(trimmed, exp10)
+	if err != nil {
+		return numericKeyParts{}, err
+	}
+	if zero {
+		return numericKeyParts{}, nil
+	}
+	return numericKeyParts{
+		negative: negative,
+		exponent: exponent,
+		digits:   digits,
+	}, nil
+}
+
+func parseNumericKeyLiteral(v string) (string, bool, int64, error) {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return "", false, 0, errors.New("unsupported key attribute type")
+	}
+
+	negative := false
+	switch trimmed[0] {
+	case '+':
+		trimmed = trimmed[1:]
+	case '-':
+		negative = true
+		trimmed = trimmed[1:]
+	}
+	if trimmed == "" {
+		return "", false, 0, errors.New("unsupported key attribute type")
+	}
+
+	exp10 := int64(0)
+	if idx := strings.IndexAny(trimmed, "eE"); idx >= 0 {
+		expPart := strings.TrimSpace(trimmed[idx+1:])
+		trimmed = trimmed[:idx]
+		parsedExp, err := parseNumericExponent(expPart)
+		if err != nil {
+			return "", false, 0, err
+		}
+		exp10 = parsedExp
+	}
+	return trimmed, negative, exp10, nil
+}
+
+func parseNumericExponent(expPart string) (int64, error) {
+	if expPart == "" {
+		return 0, errors.New("unsupported key attribute type")
+	}
+	parsedExp, err := strconv.ParseInt(expPart, 10, 64)
+	if err != nil {
+		return 0, errors.New("unsupported key attribute type")
+	}
+	return parsedExp, nil
+}
+
+func normalizeNumericKeyParts(trimmed string, exp10 int64) ([]byte, int64, bool, error) {
+	intPart, fracPart, err := splitNumericMantissa(trimmed)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	combined := intPart + fracPart
+	leadingZeros := leadingZeroCount(combined)
+	if leadingZeros == len(combined) {
+		return nil, 0, true, nil
+	}
+	digits := []byte(strings.TrimRight(combined[leadingZeros:], "0"))
+	if len(digits) == 0 {
+		return nil, 0, true, nil
+	}
+	exponent := int64(len(intPart)) + exp10 - int64(leadingZeros)
+	return digits, exponent, false, nil
+}
+
+func splitNumericMantissa(trimmed string) (string, string, error) {
+	if strings.Count(trimmed, ".") > 1 {
+		return "", "", errors.New("unsupported key attribute type")
+	}
+	intPart := trimmed
+	fracPart := ""
+	if dot := strings.IndexByte(trimmed, '.'); dot >= 0 {
+		intPart = trimmed[:dot]
+		fracPart = trimmed[dot+1:]
+	}
+	if intPart == "" && fracPart == "" {
+		return "", "", errors.New("unsupported key attribute type")
+	}
+	if !decimalDigitsOnly(intPart) || !decimalDigitsOnly(fracPart) {
+		return "", "", errors.New("unsupported key attribute type")
+	}
+	return intPart, fracPart, nil
+}
+
+func leadingZeroCount(v string) int {
+	count := 0
+	for count < len(v) && v[count] == '0' {
+		count++
+	}
+	return count
+}
+
+func decimalDigitsOnly(v string) bool {
+	for i := range v {
+		if v[i] < '0' || v[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeOrderedSignedInt64(v int64) []byte {
+	switch {
+	case v < 0:
+		return append([]byte{0x00}, invertBytes(encodeOrderedUint64(signedMagnitude(v)))...)
+	case v == 0:
+		return []byte{0x01}
+	default:
+		return append([]byte{0x02}, encodeOrderedUint64(uint64(v))...)
+	}
+}
+
+func signedMagnitude(v int64) uint64 {
+	if v >= 0 {
+		return uint64(v)
+	}
+	abs := big.NewInt(v)
+	abs.Abs(abs)
+	return abs.Uint64()
+}
+
+func encodeOrderedUint64(v uint64) []byte {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], v)
+	start := 0
+	for start < len(buf)-1 && buf[start] == 0 {
+		start++
+	}
+	out := make([]byte, 0, len(buf)-start+1)
+	out = append(out, byte(len(buf)-start))
+	out = append(out, buf[start:]...)
+	return out
+}
+
+func invertBytes(in []byte) []byte {
+	out := make([]byte, len(in))
+	for i := range in {
+		out[i] = ^in[i]
+	}
+	return out
+}
+
+func encodeDynamoKeySegment(raw []byte) []byte {
+	out := encodeDynamoKeySegmentPrefix(raw)
+	out = append(out, dynamoKeyEscapeByte, dynamoKeyTerminatorByte)
+	return out
+}
+
+func encodeDynamoKeySegmentPrefix(raw []byte) []byte {
+	return appendEscapedDynamoKeyBytes(make([]byte, 0, len(raw)+dynamoKeySegmentOverhead), raw)
+}
+
+func appendEscapedDynamoKeyBytes(dst []byte, raw []byte) []byte {
+	for _, b := range raw {
+		if b == dynamoKeyEscapeByte {
+			dst = append(dst, dynamoKeyEscapeByte, dynamoKeyEscapedZeroByte)
+			continue
+		}
+		dst = append(dst, b)
+	}
+	return dst
 }
 
 func attributeValueEqual(left attributeValue, right attributeValue) bool {
@@ -5737,6 +6783,13 @@ func nextScanCursor(lastKey []byte) []byte {
 	return next
 }
 
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func dynamoTableMetaKey(tableName string) []byte {
 	return []byte(dynamoTableMetaPrefix + encodeDynamoSegment(tableName))
 }
@@ -5749,7 +6802,12 @@ func dynamoItemPrefixForTable(tableName string, generation uint64) []byte {
 	return []byte(dynamoItemPrefix + encodeDynamoSegment(tableName) + "|" + strconv.FormatUint(generation, 10) + "|")
 }
 
-func dynamoItemHashPrefixForTable(tableName string, generation uint64, hashKey string) []byte {
+func dynamoItemHashPrefixForTable(tableName string, generation uint64, hashKey []byte) []byte {
+	base := dynamoItemPrefixForTable(tableName, generation)
+	return append(base, hashKey...)
+}
+
+func legacyDynamoItemHashPrefixForTable(tableName string, generation uint64, hashKey string) []byte {
 	return []byte(
 		dynamoItemPrefix +
 			encodeDynamoSegment(tableName) + "|" +
@@ -5775,7 +6833,12 @@ func dynamoGSIIndexPrefixForTable(tableName string, generation uint64, indexName
 	)
 }
 
-func dynamoGSIHashPrefixForTable(tableName string, generation uint64, indexName string, hashKey string) []byte {
+func dynamoGSIHashPrefixForTable(tableName string, generation uint64, indexName string, hashKey []byte) []byte {
+	base := dynamoGSIIndexPrefixForTable(tableName, generation, indexName)
+	return append(base, hashKey...)
+}
+
+func legacyDynamoGSIHashPrefixForTable(tableName string, generation uint64, indexName string, hashKey string) []byte {
 	return []byte(
 		dynamoGSIPrefix +
 			encodeDynamoSegment(tableName) + "|" +
@@ -5785,7 +6848,24 @@ func dynamoGSIHashPrefixForTable(tableName string, generation uint64, indexName 
 	)
 }
 
-func dynamoGSIKey(tableName string, generation uint64, indexName string, indexHash string, indexRange string, pkHash string, pkRange string) []byte {
+func dynamoGSIKey(
+	tableName string,
+	generation uint64,
+	indexName string,
+	indexHash []byte,
+	indexRange []byte,
+	pkHash []byte,
+	pkRange []byte,
+) []byte {
+	key := dynamoGSIIndexPrefixForTable(tableName, generation, indexName)
+	key = append(key, indexHash...)
+	key = append(key, indexRange...)
+	key = append(key, pkHash...)
+	key = append(key, pkRange...)
+	return key
+}
+
+func legacyDynamoGSIKey(tableName string, generation uint64, indexName string, indexHash string, indexRange string, pkHash string, pkRange string) []byte {
 	return []byte(
 		dynamoGSIPrefix +
 			encodeDynamoSegment(tableName) + "|" +
@@ -5798,7 +6878,14 @@ func dynamoGSIKey(tableName string, generation uint64, indexName string, indexHa
 	)
 }
 
-func dynamoItemKey(tableName string, generation uint64, hashKey, rangeKey string) []byte {
+func dynamoItemKey(tableName string, generation uint64, hashKey []byte, rangeKey []byte) []byte {
+	key := dynamoItemPrefixForTable(tableName, generation)
+	key = append(key, hashKey...)
+	key = append(key, rangeKey...)
+	return key
+}
+
+func legacyDynamoItemKey(tableName string, generation uint64, hashKey, rangeKey string) []byte {
 	return []byte(
 		dynamoItemPrefix +
 			encodeDynamoSegment(tableName) + "|" +

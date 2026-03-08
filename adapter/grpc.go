@@ -128,7 +128,12 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		readTS = snapshotTS(r.clock(), r.store)
 	}
 
-	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	var res []*store.KVPair
+	if req.GetReverse() {
+		res, err = r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	} else {
+		res, err = r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	}
 	if err != nil {
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
 	}
