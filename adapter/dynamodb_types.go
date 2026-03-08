@@ -17,8 +17,38 @@ type attributeValue struct {
 }
 
 type putItemInput struct {
-	TableName string                    `json:"TableName"`
-	Item      map[string]attributeValue `json:"Item"`
+	TableName                 string                    `json:"TableName"`
+	Item                      map[string]attributeValue `json:"Item"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
+}
+
+type deleteItemInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
+}
+
+type batchWriteItemInput struct {
+	RequestItems map[string][]batchWriteRequest `json:"RequestItems"`
+}
+
+type batchWriteRequest struct {
+	PutRequest    *batchPutRequest    `json:"PutRequest,omitempty"`
+	DeleteRequest *batchDeleteRequest `json:"DeleteRequest,omitempty"`
+}
+
+type batchPutRequest struct {
+	Item map[string]attributeValue `json:"Item"`
+}
+
+type batchDeleteRequest struct {
+	Key map[string]attributeValue `json:"Key"`
 }
 
 type transactWriteItemsInput struct {

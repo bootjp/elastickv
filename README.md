@@ -9,7 +9,7 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 - **Raft-based Data Replication**: KV state replication is implemented on Raft, with leader-based commit and follower forwarding paths.
 - **Shard-aware Data Plane**: Static shard ranges across multiple Raft groups with shard routing/coordinator are implemented.
 - **Durable Route Control Plane (Milestone 1)**: Durable route catalog, versioned route snapshot apply, watcher-based route refresh, and manual `ListRoutes`/`SplitRange` (same-group split) are implemented.
-- **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis (core commands + `MULTI/EXEC` and list operations), and DynamoDB-compatible API (`PutItem`/`GetItem`/`UpdateItem`/`TransactWriteItems`) implementations are available (runtime exposure depends on the selected server entrypoint/configuration).
+- **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis (core commands + `MULTI/EXEC` and list operations), and DynamoDB-compatible API (`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems`) implementations are available (runtime exposure depends on the selected server entrypoint/configuration).
 - **Basic Consistency Behaviors**: Write-after-read checks, leader redirection/forwarding paths, and OCC conflict detection for transactional writes are covered by tests.
 
 ## Planned Features

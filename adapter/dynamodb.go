@@ -29,9 +29,12 @@ const (
 	describeTableTarget      = targetPrefix + "DescribeTable"
 	listTablesTarget         = targetPrefix + "ListTables"
 	putItemTarget            = targetPrefix + "PutItem"
+	deleteItemTarget         = targetPrefix + "DeleteItem"
 	getItemTarget            = targetPrefix + "GetItem"
 	queryTarget              = targetPrefix + "Query"
+	scanTarget               = targetPrefix + "Scan"
 	updateItemTarget         = targetPrefix + "UpdateItem"
+	batchWriteItemTarget     = targetPrefix + "BatchWriteItem"
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
@@ -49,8 +52,8 @@ const (
 	tableCleanupAsyncTimeout    = 5 * time.Minute
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
-	queryDefaultLimit           = 100
 	tableCleanupDeleteBatchSize = 256
+	batchWriteItemMaxItems      = 25
 
 	dynamoTableMetaPrefix       = "!ddb|meta|table|"
 	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
@@ -65,6 +68,15 @@ const (
 	dynamoErrConditionalFailed = "ConditionalCheckFailedException"
 	dynamoErrResourceNotFound  = "ResourceNotFoundException"
 	dynamoErrResourceInUse     = "ResourceInUseException"
+)
+
+const (
+	dynamoReturnValueNone       = "NONE"
+	dynamoReturnValueAllOld     = "ALL_OLD"
+	dynamoReturnValueUpdatedOld = "UPDATED_OLD"
+	dynamoReturnValueAllNew     = "ALL_NEW"
+	dynamoReturnValueUpdatedNew = "UPDATED_NEW"
+	dynamoSelectCount           = "COUNT"
 )
 
 type DynamoDBServer struct {
@@ -89,9 +101,12 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		describeTableTarget:      d.describeTable,
 		listTablesTarget:         d.listTables,
 		putItemTarget:            d.putItem,
+		deleteItemTarget:         d.deleteItem,
 		getItemTarget:            d.getItem,
 		queryTarget:              d.query,
+		scanTarget:               d.scan,
 		updateItemTarget:         d.updateItem,
+		batchWriteItemTarget:     d.batchWriteItem,
 		transactWriteItemsTarget: d.transactWriteItems,
 	}
 	mux := http.NewServeMux()
@@ -168,16 +183,36 @@ type queryInput struct {
 	TableName                 string                    `json:"TableName"`
 	IndexName                 string                    `json:"IndexName"`
 	KeyConditionExpression    string                    `json:"KeyConditionExpression"`
+	FilterExpression          string                    `json:"FilterExpression"`
+	ProjectionExpression      string                    `json:"ProjectionExpression"`
 	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
 	ScanIndexForward          *bool                     `json:"ScanIndexForward"`
 	Limit                     *int32                    `json:"Limit"`
 	ExclusiveStartKey         map[string]attributeValue `json:"ExclusiveStartKey"`
+	Select                    string                    `json:"Select"`
+	ConsistentRead            *bool                     `json:"ConsistentRead"`
 }
 
 type getItemInput struct {
-	TableName string                    `json:"TableName"`
-	Key       map[string]attributeValue `json:"Key"`
+	TableName                string                    `json:"TableName"`
+	Key                      map[string]attributeValue `json:"Key"`
+	ProjectionExpression     string                    `json:"ProjectionExpression"`
+	ExpressionAttributeNames map[string]string         `json:"ExpressionAttributeNames"`
+	ConsistentRead           *bool                     `json:"ConsistentRead"`
+}
+
+type scanInput struct {
+	TableName                 string                    `json:"TableName"`
+	IndexName                 string                    `json:"IndexName"`
+	FilterExpression          string                    `json:"FilterExpression"`
+	ProjectionExpression      string                    `json:"ProjectionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ExclusiveStartKey         map[string]attributeValue `json:"ExclusiveStartKey"`
+	Limit                     *int32                    `json:"Limit"`
+	Select                    string                    `json:"Select"`
+	ConsistentRead            *bool                     `json:"ConsistentRead"`
 }
 
 type updateItemInput struct {
@@ -187,6 +222,7 @@ type updateItemInput struct {
 	ConditionExpression       string                    `json:"ConditionExpression"`
 	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
 }
 
 type dynamoKeySchema struct {
@@ -619,28 +655,51 @@ func (d *DynamoDBServer) listTableNames(ctx context.Context) ([]string, error) {
 }
 
 func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	in, err := decodePutItemInput(r.Body)
 	if err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
-	}
-	var in putItemInput
-	if err := json.Unmarshal(body, &in); err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
-	}
-	if strings.TrimSpace(in.TableName) == "" {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
-		return
-	}
-	if err := d.putItemWithRetry(r.Context(), in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	writeDynamoJSON(w, map[string]any{})
+	plan, err := d.putItemWithRetry(r.Context(), in)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	resp := map[string]any{}
+	if attrs := putItemReturnAttributes(in.ReturnValues, plan.current); len(attrs) > 0 {
+		resp["Attributes"] = attrs
+	}
+	writeDynamoJSON(w, resp)
 }
 
-func (d *DynamoDBServer) putItemWithRetry(ctx context.Context, in putItemInput) error {
+func decodePutItemInput(bodyReader io.Reader) (putItemInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return putItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in putItemInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return putItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if strings.TrimSpace(in.TableName) == "" {
+		return putItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+	}
+	if err := validatePutItemReturnValues(in.ReturnValues); err != nil {
+		return putItemInput{}, err
+	}
+	return in, nil
+}
+
+func validatePutItemReturnValues(returnValues string) error {
+	switch strings.TrimSpace(returnValues) {
+	case "", dynamoReturnValueNone, dynamoReturnValueAllOld:
+		return nil
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
+	}
+}
+
+func (d *DynamoDBServer) putItemWithRetry(ctx context.Context, in putItemInput) (*itemWritePlan, error) {
 	return d.retryItemWriteWithGeneration(
 		ctx,
 		in.TableName,
@@ -655,6 +714,8 @@ type itemWritePlan struct {
 	req        *kv.OperationGroup[kv.OP]
 	generation uint64
 	cleanup    [][]byte
+	current    map[string]attributeValue
+	next       map[string]attributeValue
 }
 
 func (d *DynamoDBServer) retryItemWriteWithGeneration(
@@ -662,18 +723,18 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	tableName string,
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
-) error {
+) (*itemWritePlan, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
 		readTS := d.nextTxnReadTS()
 		plan, err := prepare(readTS)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
-				return errors.WithStack(err)
+				return nil, errors.WithStack(err)
 			}
 		} else {
 			retry, verifyErr := d.handleGenerationFenceResult(
@@ -682,18 +743,18 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 				plan.cleanup,
 			)
 			if verifyErr != nil {
-				return verifyErr
+				return nil, verifyErr
 			}
 			if !retry {
-				return nil
+				return plan, nil
 			}
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			return errors.WithStack(err)
+			return nil, errors.WithStack(err)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}
-	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
+	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
 }
 
 func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInput, readTS uint64) (*itemWritePlan, error) {
@@ -715,6 +776,14 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 	if !found {
 		current = nil
 	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
 	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, in.Item)
 	if err != nil {
 		return nil, err
@@ -723,6 +792,8 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 		req:        req,
 		generation: schema.Generation,
 		cleanup:    cleanup,
+		current:    cloneAttributeValueMap(current),
+		next:       cloneAttributeValueMap(in.Item),
 	}, nil
 }
 
@@ -775,7 +846,171 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoJSON(w, map[string]any{})
 		return
 	}
-	writeDynamoJSON(w, map[string]any{"Item": item})
+	projected, err := projectItem(item, in.ProjectionExpression, in.ExpressionAttributeNames)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	writeDynamoJSON(w, map[string]any{"Item": projected})
+}
+
+func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
+	in, err := decodeDeleteItemInput(r.Body)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	lockKey, err := dynamoItemUpdateLockKey(in.TableName, in.Key)
+	if err != nil {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return
+	}
+	unlock := d.lockItemUpdate(lockKey)
+	defer unlock()
+	plan, err := d.deleteItemWithRetry(r.Context(), in)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	resp := map[string]any{}
+	if attrs := deleteItemReturnAttributes(in.ReturnValues, plan.current); len(attrs) > 0 {
+		resp["Attributes"] = attrs
+	}
+	writeDynamoJSON(w, resp)
+}
+
+func decodeDeleteItemInput(bodyReader io.Reader) (deleteItemInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in deleteItemInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if strings.TrimSpace(in.TableName) == "" {
+		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+	}
+	if err := validateDeleteItemReturnValues(in.ReturnValues); err != nil {
+		return deleteItemInput{}, err
+	}
+	return in, nil
+}
+
+func validateDeleteItemReturnValues(returnValues string) error {
+	switch strings.TrimSpace(returnValues) {
+	case "", dynamoReturnValueNone, dynamoReturnValueAllOld:
+		return nil
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
+	}
+}
+
+type deleteItemPlan struct {
+	req        *kv.OperationGroup[kv.OP]
+	generation uint64
+	current    map[string]attributeValue
+}
+
+func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemInput) (*deleteItemPlan, error) {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
+		plan, retry, err := d.executeDeleteItemAttempt(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		if !retry {
+			return plan, nil
+		}
+		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete item retry attempts exhausted")
+}
+
+func (d *DynamoDBServer) executeDeleteItemAttempt(ctx context.Context, in deleteItemInput) (*deleteItemPlan, bool, error) {
+	plan, err := d.prepareDeleteItemWrite(ctx, in, d.nextTxnReadTS())
+	if err != nil {
+		return nil, false, err
+	}
+	if len(plan.req.Elems) == 0 {
+		return d.finishDeleteItemAttempt(ctx, in.TableName, plan)
+	}
+	if err := d.commitItemWrite(ctx, plan.req); err != nil {
+		return plan, isRetryableDeleteItemError(err), wrapNonRetryableDeleteItemError(err)
+	}
+	return d.finishDeleteItemAttempt(ctx, in.TableName, plan)
+}
+
+func (d *DynamoDBServer) finishDeleteItemAttempt(ctx context.Context, tableName string, plan *deleteItemPlan) (*deleteItemPlan, bool, error) {
+	if err := d.verifyDeleteItemGeneration(ctx, tableName, plan.generation); err != nil {
+		return nil, false, err
+	}
+	return plan, false, nil
+}
+
+func isRetryableDeleteItemError(err error) bool {
+	return err != nil && isRetryableTransactWriteError(err)
+}
+
+func wrapNonRetryableDeleteItemError(err error) error {
+	if err == nil || isRetryableTransactWriteError(err) {
+		return nil
+	}
+	return errors.WithStack(err)
+}
+
+func (d *DynamoDBServer) verifyDeleteItemGeneration(ctx context.Context, tableName string, generation uint64) error {
+	err := d.verifyTableGeneration(ctx, tableName, generation)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errTableGenerationChanged), isTableNotFoundError(err):
+		return nil
+	default:
+		return err
+	}
+}
+
+func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteItemInput, readTS uint64) (*deleteItemPlan, error) {
+	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	current, found, err := d.readItemAtKeyAt(ctx, itemKey, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
+	req := &kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: 0}
+	if found {
+		req, err = buildItemDeleteRequest(schema, itemKey, current)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &deleteItemPlan{
+		req:        req,
+		generation: schema.Generation,
+		current:    cloneAttributeValueMap(current),
+	}, nil
 }
 
 func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
@@ -791,11 +1026,16 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	unlock := d.lockItemUpdate(lockKey)
 	defer unlock()
-	if err := d.updateItemWithRetry(r.Context(), in); err != nil {
+	plan, err := d.updateItemWithRetry(r.Context(), in)
+	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	writeDynamoJSON(w, map[string]any{})
+	resp := map[string]any{}
+	if attrs := updateItemReturnAttributes(in.ReturnValues, plan.current, plan.next); len(attrs) > 0 {
+		resp["Attributes"] = attrs
+	}
+	writeDynamoJSON(w, resp)
 }
 
 func decodeUpdateItemInput(bodyReader io.Reader) (updateItemInput, error) {
@@ -810,10 +1050,27 @@ func decodeUpdateItemInput(bodyReader io.Reader) (updateItemInput, error) {
 	if strings.TrimSpace(in.TableName) == "" {
 		return updateItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
 	}
+	if err := validateUpdateItemReturnValues(in.ReturnValues); err != nil {
+		return updateItemInput{}, err
+	}
 	return in, nil
 }
 
-func (d *DynamoDBServer) updateItemWithRetry(ctx context.Context, in updateItemInput) error {
+func validateUpdateItemReturnValues(returnValues string) error {
+	switch strings.TrimSpace(returnValues) {
+	case "",
+		dynamoReturnValueNone,
+		dynamoReturnValueAllOld,
+		dynamoReturnValueUpdatedOld,
+		dynamoReturnValueAllNew,
+		dynamoReturnValueUpdatedNew:
+		return nil
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
+	}
+}
+
+func (d *DynamoDBServer) updateItemWithRetry(ctx context.Context, in updateItemInput) (*itemWritePlan, error) {
 	return d.retryItemWriteWithGeneration(
 		ctx,
 		in.TableName,
@@ -855,6 +1112,8 @@ func (d *DynamoDBServer) prepareUpdateItemWrite(ctx context.Context, in updateIt
 		req:        req,
 		generation: schema.Generation,
 		cleanup:    cleanup,
+		current:    cloneAttributeValueMap(current),
+		next:       cloneAttributeValueMap(nextItem),
 	}, nil
 }
 
@@ -965,6 +1224,92 @@ func bytesToSet(keys [][]byte) map[string][]byte {
 	return out
 }
 
+func putItemReturnAttributes(returnValues string, current map[string]attributeValue) map[string]attributeValue {
+	if !strings.EqualFold(strings.TrimSpace(returnValues), dynamoReturnValueAllOld) || len(current) == 0 {
+		return nil
+	}
+	return cloneAttributeValueMap(current)
+}
+
+func deleteItemReturnAttributes(returnValues string, current map[string]attributeValue) map[string]attributeValue {
+	if !strings.EqualFold(strings.TrimSpace(returnValues), dynamoReturnValueAllOld) || len(current) == 0 {
+		return nil
+	}
+	return cloneAttributeValueMap(current)
+}
+
+func updateItemReturnAttributes(returnValues string, current map[string]attributeValue, next map[string]attributeValue) map[string]attributeValue {
+	switch strings.TrimSpace(returnValues) {
+	case "", dynamoReturnValueNone:
+		return nil
+	case dynamoReturnValueAllOld:
+		if len(current) == 0 {
+			return nil
+		}
+		return cloneAttributeValueMap(current)
+	case dynamoReturnValueAllNew:
+		return cloneAttributeValueMap(next)
+	case dynamoReturnValueUpdatedOld:
+		return selectUpdatedAttributes(current, next, true)
+	case dynamoReturnValueUpdatedNew:
+		return selectUpdatedAttributes(current, next, false)
+	default:
+		return nil
+	}
+}
+
+func selectUpdatedAttributes(current map[string]attributeValue, next map[string]attributeValue, oldValues bool) map[string]attributeValue {
+	keys := updatedAttributeNames(current, next)
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]attributeValue, len(keys))
+	for _, key := range keys {
+		if oldValues {
+			if value, ok := current[key]; ok {
+				out[key] = value
+			}
+			continue
+		}
+		if value, ok := next[key]; ok {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func updatedAttributeNames(current map[string]attributeValue, next map[string]attributeValue) []string {
+	seen := make(map[string]struct{}, len(current)+len(next))
+	names := make([]string, 0, len(current)+len(next))
+	for name := range current {
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for name := range next {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		oldVal, oldOK := current[name]
+		newVal, newOK := next[name]
+		if !oldOK && !newOK {
+			continue
+		}
+		if oldOK && newOK && attributeValueEqual(oldVal, newVal) {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 	in, err := decodeQueryInput(r.Body)
 	if err != nil {
@@ -978,7 +1323,29 @@ func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{
 		"Items":        out.items,
-		"Count":        len(out.items),
+		"Count":        out.count,
+		"ScannedCount": out.scannedCount,
+	}
+	if len(out.lastEvaluatedKey) > 0 {
+		resp["LastEvaluatedKey"] = out.lastEvaluatedKey
+	}
+	writeDynamoJSON(w, resp)
+}
+
+func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
+	in, err := decodeScanInput(r.Body)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	out, err := d.scanItems(r.Context(), in)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	resp := map[string]any{
+		"Items":        out.items,
+		"Count":        out.count,
 		"ScannedCount": out.scannedCount,
 	}
 	if len(out.lastEvaluatedKey) > 0 {
@@ -999,13 +1366,52 @@ func decodeQueryInput(bodyReader io.Reader) (queryInput, error) {
 	if strings.TrimSpace(in.TableName) == "" {
 		return queryInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
 	}
+	if err := validateReadSelect(in.Select); err != nil {
+		return queryInput{}, err
+	}
+	if _, _, err := resolveReadLimit(in.Limit); err != nil {
+		return queryInput{}, err
+	}
+	return in, nil
+}
+
+func decodeScanInput(bodyReader io.Reader) (scanInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return scanInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in scanInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return scanInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if strings.TrimSpace(in.TableName) == "" {
+		return scanInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+	}
+	if err := validateReadSelect(in.Select); err != nil {
+		return scanInput{}, err
+	}
+	if _, _, err := resolveReadLimit(in.Limit); err != nil {
+		return scanInput{}, err
+	}
 	return in, nil
 }
 
 type queryOutput struct {
 	items            []map[string]attributeValue
+	count            int
 	scannedCount     int
 	lastEvaluatedKey map[string]attributeValue
+}
+
+type readPageOptions struct {
+	filterExpression          string
+	projectionExpression      string
+	expressionAttributeNames  map[string]string
+	expressionAttributeValues map[string]attributeValue
+	exclusiveStartKey         map[string]attributeValue
+	limit                     *int32
+	selectValue               string
+	lastEvaluatedKeyBuilder   func(map[string]attributeValue) map[string]attributeValue
 }
 
 type queryRangeOperator string
@@ -1034,7 +1440,8 @@ type queryCondition struct {
 }
 
 func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryOutput, error) {
-	schema, exists, err := d.loadTableSchema(ctx, in.TableName)
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1045,21 +1452,57 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if err != nil {
 		return nil, err
 	}
-	items, scannedCount, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond)
+	items, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond, readTS)
 	if err != nil {
 		return nil, err
 	}
 	orderQueryItems(items, keySchema.RangeKey, in.ScanIndexForward)
-	if items, err = applyQueryExclusiveStartKey(schema, in.ExclusiveStartKey, items); err != nil {
+	return finalizeReadPage(schema, items, readPageOptions{
+		filterExpression:          in.FilterExpression,
+		projectionExpression:      in.ProjectionExpression,
+		expressionAttributeNames:  in.ExpressionAttributeNames,
+		expressionAttributeValues: in.ExpressionAttributeValues,
+		exclusiveStartKey:         in.ExclusiveStartKey,
+		limit:                     in.Limit,
+		selectValue:               in.Select,
+		lastEvaluatedKeyBuilder: func(item map[string]attributeValue) map[string]attributeValue {
+			return makeReadLastEvaluatedKey(schema.PrimaryKey, keySchema, item)
+		},
+	})
+}
+
+func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOutput, error) {
+	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	indexKeySchema := schema.PrimaryKey
+	if strings.TrimSpace(in.IndexName) != "" {
+		indexKeySchema, err = schema.keySchemaForQuery(in.IndexName)
+		if err != nil {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		}
+	}
+	items, err := d.scanItemsBySource(ctx, in, schema, readTS)
+	if err != nil {
 		return nil, err
 	}
-	limit := resolveQueryLimit(in.Limit)
-	pagedItems, lastKey := paginateQueryItems(schema.PrimaryKey, items, limit)
-	return &queryOutput{
-		items:            pagedItems,
-		scannedCount:     scannedCount,
-		lastEvaluatedKey: lastKey,
-	}, nil
+	return finalizeReadPage(schema, items, readPageOptions{
+		filterExpression:          in.FilterExpression,
+		projectionExpression:      in.ProjectionExpression,
+		expressionAttributeNames:  in.ExpressionAttributeNames,
+		expressionAttributeValues: in.ExpressionAttributeValues,
+		exclusiveStartKey:         in.ExclusiveStartKey,
+		limit:                     in.Limit,
+		selectValue:               in.Select,
+		lastEvaluatedKeyBuilder: func(item map[string]attributeValue) map[string]attributeValue {
+			return makeReadLastEvaluatedKey(schema.PrimaryKey, indexKeySchema, item)
+		},
+	})
 }
 
 func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeySchema, queryCondition, error) {
@@ -1108,29 +1551,226 @@ func orderQueryItems(items []map[string]attributeValue, rangeKey string, scanInd
 	}
 }
 
+func validateReadSelect(selectValue string) error {
+	switch strings.TrimSpace(selectValue) {
+	case "", "ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "SPECIFIC_ATTRIBUTES", "COUNT":
+		return nil
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported Select")
+	}
+}
+
+func resolveReadLimit(limit *int32) (int, bool, error) {
+	if limit == nil {
+		return 0, false, nil
+	}
+	if *limit <= 0 {
+		return 0, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid Limit")
+	}
+	return int(*limit), true, nil
+}
+
+func finalizeReadPage(schema *dynamoTableSchema, items []map[string]attributeValue, opts readPageOptions) (*queryOutput, error) {
+	items, err := applyQueryExclusiveStartKey(schema, opts.exclusiveStartKey, items)
+	if err != nil {
+		return nil, err
+	}
+	state, err := newReadPageState(schema, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := state.consume(items); err != nil {
+		return nil, err
+	}
+	return state.output(), nil
+}
+
+type readPageState struct {
+	schema           *dynamoTableSchema
+	opts             readPageOptions
+	projection       []string
+	filterExpr       string
+	includeItems     bool
+	limit            int
+	hasLimit         bool
+	outItems         []map[string]attributeValue
+	outCount         int
+	scannedCount     int
+	lastEvaluatedKey map[string]attributeValue
+}
+
+func newReadPageState(schema *dynamoTableSchema, opts readPageOptions) (*readPageState, error) {
+	limit, hasLimit, err := resolveReadLimit(opts.limit)
+	if err != nil {
+		return nil, err
+	}
+	projection, err := resolveProjectionAttributes(opts.projectionExpression, opts.expressionAttributeNames)
+	if err != nil {
+		return nil, err
+	}
+	return &readPageState{
+		schema:       schema,
+		opts:         opts,
+		projection:   projection,
+		filterExpr:   strings.TrimSpace(replaceNames(opts.filterExpression, opts.expressionAttributeNames)),
+		includeItems: !strings.EqualFold(strings.TrimSpace(opts.selectValue), dynamoSelectCount),
+		limit:        limit,
+		hasLimit:     hasLimit,
+		outItems:     make([]map[string]attributeValue, 0),
+	}, nil
+}
+
+func (s *readPageState) consume(items []map[string]attributeValue) error {
+	for i, item := range items {
+		if s.reachedLimit() {
+			break
+		}
+		if err := s.consumeItem(i, item, len(items)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *readPageState) reachedLimit() bool {
+	return s.hasLimit && s.scannedCount == s.limit
+}
+
+func (s *readPageState) consumeItem(i int, item map[string]attributeValue, totalItems int) error {
+	s.scannedCount++
+	match, err := matchesReadFilter(s.filterExpr, item, s.opts.expressionAttributeValues)
+	if err != nil {
+		return err
+	}
+	if match {
+		s.recordMatch(item)
+	}
+	if s.shouldSetLastEvaluatedKey(i, totalItems) {
+		s.lastEvaluatedKey = s.buildLastEvaluatedKey(item)
+	}
+	return nil
+}
+
+func (s *readPageState) recordMatch(item map[string]attributeValue) {
+	s.outCount++
+	if !s.includeItems {
+		return
+	}
+	s.outItems = append(s.outItems, projectItemByAttributes(item, s.projection))
+}
+
+func (s *readPageState) shouldSetLastEvaluatedKey(i int, totalItems int) bool {
+	return s.hasLimit && s.scannedCount == s.limit && i < totalItems-1
+}
+
+func (s *readPageState) buildLastEvaluatedKey(item map[string]attributeValue) map[string]attributeValue {
+	if s.opts.lastEvaluatedKeyBuilder != nil {
+		return s.opts.lastEvaluatedKeyBuilder(item)
+	}
+	return makeLastEvaluatedKey(s.schema.PrimaryKey, item)
+}
+
+func (s *readPageState) output() *queryOutput {
+	items := s.outItems
+	if !s.includeItems {
+		items = nil
+	}
+	return &queryOutput{
+		items:            items,
+		count:            s.outCount,
+		scannedCount:     s.scannedCount,
+		lastEvaluatedKey: s.lastEvaluatedKey,
+	}
+}
+
+func matchesReadFilter(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	if strings.TrimSpace(expr) == "" {
+		return true, nil
+	}
+	ok, err := evalConditionExpression(expr, item, values)
+	if err != nil {
+		return false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return ok, nil
+}
+
+func resolveProjectionAttributes(expr string, names map[string]string) ([]string, error) {
+	projection := strings.TrimSpace(replaceNames(expr, names))
+	if projection == "" {
+		return nil, nil
+	}
+	parts, err := splitTopLevelByComma(projection)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ProjectionExpression")
+	}
+	attrs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		attr := strings.TrimSpace(part)
+		if attr == "" {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ProjectionExpression")
+		}
+		attrs = append(attrs, attr)
+	}
+	return attrs, nil
+}
+
+func projectItem(item map[string]attributeValue, expr string, names map[string]string) (map[string]attributeValue, error) {
+	attrs, err := resolveProjectionAttributes(expr, names)
+	if err != nil {
+		return nil, err
+	}
+	return projectItemByAttributes(item, attrs), nil
+}
+
+func projectItemByAttributes(item map[string]attributeValue, attrs []string) map[string]attributeValue {
+	if len(attrs) == 0 {
+		return cloneAttributeValueMap(item)
+	}
+	out := make(map[string]attributeValue, len(attrs))
+	for _, attr := range attrs {
+		if value, ok := item[attr]; ok {
+			out[attr] = value
+		}
+	}
+	return out
+}
+
+func decodeItemsFromKVPairs(kvs []*store.KVPair) ([]map[string]attributeValue, error) {
+	items := make([]map[string]attributeValue, 0, len(kvs))
+	for _, kvp := range kvs {
+		item := map[string]attributeValue{}
+		if err := json.Unmarshal(kvp.Value, &item); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func (d *DynamoDBServer) queryItemsByKeyCondition(
 	ctx context.Context,
 	in queryInput,
 	schema *dynamoTableSchema,
 	keySchema dynamoKeySchema,
 	cond queryCondition,
-) ([]map[string]attributeValue, int, error) {
+	readTS uint64,
+) ([]map[string]attributeValue, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		return d.queryItemsByGSI(ctx, in, schema, cond)
+		return d.queryItemsByGSI(ctx, in, schema, cond, readTS)
 	}
 	scanPrefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	kvs, err := d.scanAllByPrefix(ctx, scanPrefix)
+	kvs, err := d.scanAllByPrefixAt(ctx, scanPrefix, readTS)
 	if err != nil {
-		return nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	items, err := filterQueryItems(kvs, cond)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return items, len(kvs), nil
+	return items, nil
 }
 
 func (d *DynamoDBServer) queryItemsByGSI(
@@ -1138,23 +1778,47 @@ func (d *DynamoDBServer) queryItemsByGSI(
 	in queryInput,
 	schema *dynamoTableSchema,
 	cond queryCondition,
-) ([]map[string]attributeValue, int, error) {
+	readTS uint64,
+) ([]map[string]attributeValue, error) {
 	hashKey, err := attributeValueAsKey(cond.hashValue)
 	if err != nil {
-		return nil, 0, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	prefix := dynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey)
-	kvs, err := d.scanAllByPrefix(ctx, prefix)
+	kvs, err := d.scanAllByPrefixAt(ctx, prefix, readTS)
 	if err != nil {
-		return nil, 0, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
-	readTS := snapshotTS(d.coordinator.Clock(), d.store)
 	itemKeys := uniqueGSIItemKeys(kvs)
 	items, err := d.readItemsForGSIQuery(ctx, itemKeys, readTS, cond)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return items, len(kvs), nil
+	return items, nil
+}
+
+func (d *DynamoDBServer) scanItemsBySource(
+	ctx context.Context,
+	in scanInput,
+	schema *dynamoTableSchema,
+	readTS uint64,
+) ([]map[string]attributeValue, error) {
+	if strings.TrimSpace(in.IndexName) == "" {
+		kvs, err := d.scanAllByPrefixAt(ctx, dynamoItemPrefixForTable(in.TableName, schema.Generation), readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return decodeItemsFromKVPairs(kvs)
+	}
+	if _, err := schema.keySchemaForQuery(in.IndexName); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	kvs, err := d.scanAllByPrefixAt(ctx, dynamoGSIIndexPrefixForTable(in.TableName, schema.Generation, in.IndexName), readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	itemKeys := uniqueGSIItemKeys(kvs)
+	return d.readItemsAtKeys(ctx, itemKeys, readTS)
 }
 
 func uniqueGSIItemKeys(kvs []*store.KVPair) [][]byte {
@@ -1185,6 +1849,8 @@ type gsiReadResult struct {
 	err   error
 }
 
+type itemReadFilter func(map[string]attributeValue) bool
+
 func resolveGSIReadWorkerCount(n int) int {
 	if n <= 0 {
 		return 0
@@ -1201,6 +1867,25 @@ func (d *DynamoDBServer) readItemsForGSIQuery(
 	readTS uint64,
 	cond queryCondition,
 ) ([]map[string]attributeValue, error) {
+	return d.readItemsAtKeysMatching(ctx, itemKeys, readTS, func(item map[string]attributeValue) bool {
+		return matchesQueryCondition(item, cond)
+	})
+}
+
+func (d *DynamoDBServer) readItemsAtKeys(
+	ctx context.Context,
+	itemKeys [][]byte,
+	readTS uint64,
+) ([]map[string]attributeValue, error) {
+	return d.readItemsAtKeysMatching(ctx, itemKeys, readTS, nil)
+}
+
+func (d *DynamoDBServer) readItemsAtKeysMatching(
+	ctx context.Context,
+	itemKeys [][]byte,
+	readTS uint64,
+	filter itemReadFilter,
+) ([]map[string]attributeValue, error) {
 	if len(itemKeys) == 0 {
 		return nil, nil
 	}
@@ -1211,7 +1896,7 @@ func (d *DynamoDBServer) readItemsForGSIQuery(
 	defer cancel()
 
 	var wg sync.WaitGroup
-	d.startGSIReadWorkers(&wg, workerCount, workerCtx, readTS, cond, jobs, results, cancel)
+	d.startGSIReadWorkers(&wg, workerCount, workerCtx, readTS, filter, jobs, results, cancel)
 	enqueueGSIReadJobs(workerCtx, jobs, itemKeys)
 	close(jobs)
 	wg.Wait()
@@ -1225,7 +1910,7 @@ func (d *DynamoDBServer) startGSIReadWorkers(
 	workerCount int,
 	ctx context.Context,
 	readTS uint64,
-	cond queryCondition,
+	filter itemReadFilter,
 	jobs <-chan gsiReadJob,
 	results chan<- gsiReadResult,
 	cancel context.CancelFunc,
@@ -1234,7 +1919,7 @@ func (d *DynamoDBServer) startGSIReadWorkers(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.gsiReadWorker(ctx, readTS, cond, jobs, results, cancel)
+			d.gsiReadWorker(ctx, readTS, filter, jobs, results, cancel)
 		}()
 	}
 }
@@ -1275,7 +1960,7 @@ func collectOrderedGSIReadResults(
 func (d *DynamoDBServer) gsiReadWorker(
 	ctx context.Context,
 	readTS uint64,
-	cond queryCondition,
+	filter itemReadFilter,
 	jobs <-chan gsiReadJob,
 	results chan<- gsiReadResult,
 	cancel context.CancelFunc,
@@ -1285,7 +1970,7 @@ func (d *DynamoDBServer) gsiReadWorker(
 		if !ok {
 			return
 		}
-		item, emit, err := d.executeGSIReadJob(ctx, readTS, cond, job.key)
+		item, emit, err := d.executeGSIReadJob(ctx, readTS, filter, job.key)
 		if err != nil {
 			sendGSIReadError(results, err)
 			cancel()
@@ -1315,7 +2000,7 @@ func nextGSIReadJob(ctx context.Context, jobs <-chan gsiReadJob) (gsiReadJob, bo
 func (d *DynamoDBServer) executeGSIReadJob(
 	ctx context.Context,
 	readTS uint64,
-	cond queryCondition,
+	filter itemReadFilter,
 	key []byte,
 ) (map[string]attributeValue, bool, error) {
 	item, found, err := d.readItemAtKeyAt(ctx, key, readTS)
@@ -1325,7 +2010,7 @@ func (d *DynamoDBServer) executeGSIReadJob(
 	if !found {
 		return nil, false, nil
 	}
-	if !matchesQueryCondition(item, cond) {
+	if filter != nil && !filter(item) {
 		return nil, false, nil
 	}
 	return item, true, nil
@@ -1366,36 +2051,60 @@ func applyQueryExclusiveStartKey(schema *dynamoTableSchema, startKey map[string]
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid ExclusiveStartKey")
 	}
-	startIndex := -1
+	descending, hasDirection := queryItemOrderDirection(schema, items)
 	for i, item := range items {
+		if remaining, ok := exclusiveStartRemainingItems(schema, item, items, i, startItemKey, descending, hasDirection); ok {
+			return remaining, nil
+		}
+	}
+	return nil, nil
+}
+
+func exclusiveStartRemainingItems(
+	schema *dynamoTableSchema,
+	item map[string]attributeValue,
+	items []map[string]attributeValue,
+	index int,
+	startItemKey []byte,
+	descending bool,
+	hasDirection bool,
+) ([]map[string]attributeValue, bool) {
+	itemKey, err := schema.itemKeyFromAttributes(item)
+	if err != nil {
+		return nil, false
+	}
+	if bytes.Equal(itemKey, startItemKey) {
+		return items[index+1:], true
+	}
+	if !hasDirection || !exclusiveStartShouldAdvance(descending, itemKey, startItemKey) {
+		return nil, false
+	}
+	return items[index:], true
+}
+
+func exclusiveStartShouldAdvance(descending bool, itemKey []byte, startItemKey []byte) bool {
+	cmp := bytes.Compare(itemKey, startItemKey)
+	return (!descending && cmp > 0) || (descending && cmp < 0)
+}
+
+func queryItemOrderDirection(schema *dynamoTableSchema, items []map[string]attributeValue) (bool, bool) {
+	var previous []byte
+	for _, item := range items {
 		itemKey, err := schema.itemKeyFromAttributes(item)
 		if err != nil {
 			continue
 		}
-		if bytes.Equal(itemKey, startItemKey) {
-			startIndex = i
-			break
+		if previous == nil {
+			previous = itemKey
+			continue
 		}
+		cmp := bytes.Compare(itemKey, previous)
+		if cmp == 0 {
+			continue
+		}
+		return cmp < 0, true
 	}
-	if startIndex < 0 {
-		return items, nil
-	}
-	return items[startIndex+1:], nil
-}
-
-func resolveQueryLimit(limit *int32) int {
-	if limit == nil || *limit <= 0 {
-		return queryDefaultLimit
-	}
-	return int(*limit)
-}
-
-func paginateQueryItems(keySchema dynamoKeySchema, items []map[string]attributeValue, limit int) ([]map[string]attributeValue, map[string]attributeValue) {
-	if limit <= 0 || len(items) <= limit {
-		return items, nil
-	}
-	out := items[:limit]
-	return out, makeLastEvaluatedKey(keySchema, out[len(out)-1])
+	return false, false
 }
 
 func makeLastEvaluatedKey(keySchema dynamoKeySchema, item map[string]attributeValue) map[string]attributeValue {
@@ -1412,6 +2121,242 @@ func makeLastEvaluatedKey(keySchema dynamoKeySchema, item map[string]attributeVa
 		return nil
 	}
 	return out
+}
+
+func makeReadLastEvaluatedKey(primary dynamoKeySchema, index dynamoKeySchema, item map[string]attributeValue) map[string]attributeValue {
+	out := makeLastEvaluatedKey(primary, item)
+	if len(out) == 0 {
+		out = map[string]attributeValue{}
+	}
+	if hash, ok := item[index.HashKey]; ok {
+		out[index.HashKey] = hash
+	}
+	if index.RangeKey != "" {
+		if rk, ok := item[index.RangeKey]; ok {
+			out[index.RangeKey] = rk
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (d *DynamoDBServer) batchWriteItem(w http.ResponseWriter, r *http.Request) {
+	in, err := decodeBatchWriteItemInput(r.Body)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	unprocessed, err := d.batchWriteItems(r.Context(), in)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	writeDynamoJSON(w, map[string]any{"UnprocessedItems": unprocessed})
+}
+
+func decodeBatchWriteItemInput(bodyReader io.Reader) (batchWriteItemInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in batchWriteItemInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if len(in.RequestItems) == 0 {
+		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing RequestItems")
+	}
+	total := 0
+	for tableName, requests := range in.RequestItems {
+		if strings.TrimSpace(tableName) == "" {
+			return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+		}
+		total += len(requests)
+	}
+	if total == 0 {
+		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing write requests")
+	}
+	if total > batchWriteItemMaxItems {
+		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "too many items in BatchWriteItem")
+	}
+	return in, nil
+}
+
+func (d *DynamoDBServer) batchWriteItems(
+	ctx context.Context,
+	in batchWriteItemInput,
+) (map[string][]batchWriteRequest, error) {
+	tableNames := make([]string, 0, len(in.RequestItems))
+	for tableName := range in.RequestItems {
+		tableNames = append(tableNames, tableName)
+	}
+	sort.Strings(tableNames)
+	unlock := d.lockTableOperations(tableNames)
+	defer unlock()
+	if err := d.validateBatchWriteRequests(ctx, tableNames, in.RequestItems); err != nil {
+		return nil, err
+	}
+	unprocessed := make(map[string][]batchWriteRequest)
+	for _, tableName := range tableNames {
+		requests := in.RequestItems[tableName]
+		for _, request := range requests {
+			err := d.executeBatchWriteRequest(ctx, tableName, request)
+			if err == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return nil, errors.WithStack(ctx.Err())
+			}
+			unprocessed[tableName] = append(unprocessed[tableName], request)
+		}
+	}
+	return unprocessed, nil
+}
+
+func (d *DynamoDBServer) validateBatchWriteRequests(
+	ctx context.Context,
+	tableNames []string,
+	requestItems map[string][]batchWriteRequest,
+) error {
+	for _, tableName := range tableNames {
+		schema, exists, err := d.loadTableSchema(ctx, tableName)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !exists {
+			return newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+		}
+		seenKeys := make(map[string]struct{}, len(requestItems[tableName]))
+		for _, request := range requestItems[tableName] {
+			key, err := validateBatchWriteRequestForSchema(schema, request)
+			if err != nil {
+				return err
+			}
+			if _, ok := seenKeys[string(key)]; ok {
+				return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "duplicate item in BatchWriteItem")
+			}
+			seenKeys[string(key)] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func validateBatchWriteRequestForSchema(schema *dynamoTableSchema, request batchWriteRequest) ([]byte, error) {
+	switch countBatchWriteActions(request) {
+	case 1:
+	default:
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
+	}
+	switch {
+	case request.PutRequest != nil:
+		key, err := schema.itemKeyFromAttributes(request.PutRequest.Item)
+		if err != nil {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		}
+		return key, nil
+	case request.DeleteRequest != nil:
+		key, err := schema.itemKeyFromAttributes(request.DeleteRequest.Key)
+		if err != nil {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		}
+		return key, nil
+	default:
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
+	}
+}
+
+func (d *DynamoDBServer) executeBatchWriteRequest(
+	ctx context.Context,
+	tableName string,
+	request batchWriteRequest,
+) error {
+	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !exists {
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	keyAttrs, err := batchWriteRequestKey(schema, request)
+	if err != nil {
+		return err
+	}
+	lockKey, err := dynamoItemUpdateLockKey(tableName, keyAttrs)
+	if err != nil {
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	unlock := d.lockItemUpdate(lockKey)
+	defer unlock()
+	switch countBatchWriteActions(request) {
+	case 1:
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
+	}
+	switch {
+	case request.PutRequest != nil:
+		_, err := d.putItemWithRetry(ctx, putItemInput{
+			TableName: tableName,
+			Item:      request.PutRequest.Item,
+		})
+		return err
+	case request.DeleteRequest != nil:
+		_, err := d.deleteItemWithRetry(ctx, deleteItemInput{
+			TableName: tableName,
+			Key:       request.DeleteRequest.Key,
+		})
+		return err
+	default:
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
+	}
+}
+
+func batchWriteRequestKey(schema *dynamoTableSchema, request batchWriteRequest) (map[string]attributeValue, error) {
+	switch {
+	case request.PutRequest != nil:
+		return primaryKeyAttributes(schema.PrimaryKey, request.PutRequest.Item)
+	case request.DeleteRequest != nil:
+		return primaryKeyAttributes(schema.PrimaryKey, request.DeleteRequest.Key)
+	default:
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
+	}
+}
+
+func primaryKeyAttributes(keySchema dynamoKeySchema, attrs map[string]attributeValue) (map[string]attributeValue, error) {
+	out := make(map[string]attributeValue, primaryKeyAttributeCapacity(keySchema))
+	hash, ok := attrs[keySchema.HashKey]
+	if !ok {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing hash key attribute")
+	}
+	out[keySchema.HashKey] = hash
+	if keySchema.RangeKey != "" {
+		rangeValue, ok := attrs[keySchema.RangeKey]
+		if !ok {
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing range key attribute")
+		}
+		out[keySchema.RangeKey] = rangeValue
+	}
+	return out, nil
+}
+
+func primaryKeyAttributeCapacity(keySchema dynamoKeySchema) int {
+	size := 1
+	if keySchema.RangeKey != "" {
+		size++
+	}
+	return size
+}
+
+func countBatchWriteActions(request batchWriteRequest) int {
+	count := 0
+	if request.PutRequest != nil {
+		count++
+	}
+	if request.DeleteRequest != nil {
+		count++
+	}
+	return count
 }
 
 func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
@@ -1642,6 +2587,14 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 	if !found {
 		current = nil
 	}
+	if err := validateConditionOnItem(
+		in.ConditionExpression,
+		in.ExpressionAttributeNames,
+		in.ExpressionAttributeValues,
+		valueOrEmptyMap(current, found),
+	); err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
+	}
 	req, cleanup, err := buildItemWriteRequest(schema, itemKey, current, in.Item)
 	if err != nil {
 		return nil, err
@@ -1670,7 +2623,14 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 	if !found {
 		current = map[string]attributeValue{}
 	}
-	updateIn := updateItemInput(in)
+	updateIn := updateItemInput{
+		TableName:                 in.TableName,
+		Key:                       in.Key,
+		UpdateExpression:          in.UpdateExpression,
+		ConditionExpression:       in.ConditionExpression,
+		ExpressionAttributeNames:  in.ExpressionAttributeNames,
+		ExpressionAttributeValues: in.ExpressionAttributeValues,
+	}
 	nextItem, err := buildUpdatedItem(schema, updateIn, current)
 	if err != nil {
 		return nil, err
@@ -3337,7 +4297,10 @@ func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uin
 }
 
 func (d *DynamoDBServer) scanAllByPrefix(ctx context.Context, prefix []byte) ([]*store.KVPair, error) {
-	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	return d.scanAllByPrefixAt(ctx, prefix, snapshotTS(d.coordinator.Clock(), d.store))
+}
+
+func (d *DynamoDBServer) scanAllByPrefixAt(ctx context.Context, prefix []byte, readTS uint64) ([]*store.KVPair, error) {
 	end := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
 
@@ -3399,6 +4362,15 @@ func dynamoGSIPrefixForTable(tableName string, generation uint64) []byte {
 		dynamoGSIPrefix +
 			encodeDynamoSegment(tableName) + "|" +
 			strconv.FormatUint(generation, 10) + "|",
+	)
+}
+
+func dynamoGSIIndexPrefixForTable(tableName string, generation uint64, indexName string) []byte {
+	return []byte(
+		dynamoGSIPrefix +
+			encodeDynamoSegment(tableName) + "|" +
+			strconv.FormatUint(generation, 10) + "|" +
+			encodeDynamoSegment(indexName) + "|",
 	)
 }
 
