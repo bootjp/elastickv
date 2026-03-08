@@ -8,6 +8,7 @@ import (
 
 	_ "github.com/Jille/grpc-multi-resolver"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -97,6 +98,30 @@ func Test_grpc_scan(t *testing.T) {
 		assert.Equal(t, key, resp.Kv[i].Key, "Scan RPC failed")
 		assert.Equal(t, want, resp.Kv[i].Value, "Scan RPC failed")
 	}
+}
+
+func TestGRPCServer_RawScanAt_RejectsOversizedLimit(t *testing.T) {
+	t.Parallel()
+
+	s := NewGRPCServer(store.NewMVCCStore(), nil)
+
+	_, err := s.RawScanAt(context.Background(), &pb.RawScanAtRequest{
+		Limit: maxGRPCScanLimit + 1,
+	})
+
+	assert.Error(t, err)
+}
+
+func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
+	t.Parallel()
+
+	s := NewGRPCServer(store.NewMVCCStore(), nil)
+
+	_, err := s.Scan(context.Background(), &pb.ScanRequest{
+		Limit: maxGRPCScanLimit + 1,
+	})
+
+	assert.Error(t, err)
 }
 
 func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {

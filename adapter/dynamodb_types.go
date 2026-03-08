@@ -42,7 +42,9 @@ type attributeValueKindDetector struct {
 	match func(attributeValue) bool
 }
 
-type attributeValueUnmarshalFunc func(*attributeValue, json.RawMessage) error
+type attributeValueUnmarshalFunc func(*attributeValue, json.RawMessage, int) error
+
+const maxAttributeValueNestingDepth = 32
 
 var attributeValueKindDetectors = []attributeValueKindDetector{
 	{kind: attributeValueKindString, match: func(a attributeValue) bool { return a.hasStringType() }},
@@ -70,19 +72,6 @@ var attributeValueMarshalers = map[attributeValueKind]func(attributeValue) any{
 	attributeValueKindMap: func(a attributeValue) any {
 		return map[string]map[string]attributeValue{"M": cloneAttributeValueMap(a.M)}
 	},
-}
-
-var attributeValueUnmarshalers = map[string]attributeValueUnmarshalFunc{
-	"S":    (*attributeValue).unmarshalString,
-	"N":    (*attributeValue).unmarshalNumber,
-	"B":    (*attributeValue).unmarshalBinary,
-	"BOOL": (*attributeValue).unmarshalBool,
-	"NULL": (*attributeValue).unmarshalNull,
-	"SS":   (*attributeValue).unmarshalStringSet,
-	"NS":   (*attributeValue).unmarshalNumberSet,
-	"BS":   (*attributeValue).unmarshalBinarySet,
-	"L":    (*attributeValue).unmarshalList,
-	"M":    (*attributeValue).unmarshalMap,
 }
 
 func (a attributeValue) hasStringType() bool {
@@ -160,6 +149,14 @@ func marshalAttributeValue(v any) ([]byte, error) {
 }
 
 func (a *attributeValue) UnmarshalJSON(b []byte) error {
+	return a.unmarshalJSONWithDepth(b, 1)
+}
+
+func (a *attributeValue) unmarshalJSONWithDepth(b []byte, depth int) error {
+	if depth > maxAttributeValueNestingDepth {
+		return errors.New("attribute value nesting exceeds maximum depth")
+	}
+
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return errors.WithStack(err)
@@ -174,17 +171,32 @@ func (a *attributeValue) UnmarshalJSON(b []byte) error {
 	}
 
 	for k, v := range raw {
-		return a.unmarshalSingleAttributeValue(k, v)
+		return a.unmarshalSingleAttributeValue(k, v, depth)
 	}
 	return errors.New("invalid attribute value")
 }
 
-func (a *attributeValue) unmarshalSingleAttributeValue(kind string, raw json.RawMessage) error {
-	unmarshal, ok := attributeValueUnmarshalers[kind]
-	if !ok {
+func (a *attributeValue) unmarshalSingleAttributeValue(kind string, raw json.RawMessage, depth int) error {
+	unmarshal := attributeValueUnmarshaller(kind)
+	if unmarshal == nil {
 		return errors.New("unsupported attribute value type")
 	}
-	return unmarshal(a, raw)
+	return unmarshal(a, raw, depth)
+}
+
+func attributeValueUnmarshaller(kind string) attributeValueUnmarshalFunc {
+	return map[string]attributeValueUnmarshalFunc{
+		"S":    (*attributeValue).unmarshalString,
+		"N":    (*attributeValue).unmarshalNumber,
+		"B":    (*attributeValue).unmarshalBinary,
+		"BOOL": (*attributeValue).unmarshalBool,
+		"NULL": (*attributeValue).unmarshalNull,
+		"SS":   (*attributeValue).unmarshalStringSet,
+		"NS":   (*attributeValue).unmarshalNumberSet,
+		"BS":   (*attributeValue).unmarshalBinarySet,
+		"L":    (*attributeValue).unmarshalList,
+		"M":    (*attributeValue).unmarshalMap,
+	}[kind]
 }
 
 func detectAttributeValueKind(a attributeValue) (attributeValueKind, int) {
@@ -202,7 +214,7 @@ func detectAttributeValueKind(a attributeValue) (attributeValueKind, int) {
 	return kind, count
 }
 
-func (a *attributeValue) unmarshalString(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalString(raw json.RawMessage, _ int) error {
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return errors.WithStack(err)
@@ -211,7 +223,7 @@ func (a *attributeValue) unmarshalString(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalNumber(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalNumber(raw json.RawMessage, _ int) error {
 	var n string
 	if err := json.Unmarshal(raw, &n); err != nil {
 		return errors.WithStack(err)
@@ -220,7 +232,7 @@ func (a *attributeValue) unmarshalNumber(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalBinary(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalBinary(raw json.RawMessage, _ int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb B attribute must be a string")
 	}
@@ -232,7 +244,7 @@ func (a *attributeValue) unmarshalBinary(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalBool(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalBool(raw json.RawMessage, _ int) error {
 	var b bool
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return errors.WithStack(err)
@@ -241,7 +253,7 @@ func (a *attributeValue) unmarshalBool(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalNull(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalNull(raw json.RawMessage, _ int) error {
 	var n bool
 	if err := json.Unmarshal(raw, &n); err != nil {
 		return errors.WithStack(err)
@@ -253,7 +265,7 @@ func (a *attributeValue) unmarshalNull(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalStringSet(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalStringSet(raw json.RawMessage, _ int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb SS attribute must be an array")
 	}
@@ -265,7 +277,7 @@ func (a *attributeValue) unmarshalStringSet(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalNumberSet(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalNumberSet(raw json.RawMessage, _ int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb NS attribute must be an array")
 	}
@@ -277,7 +289,7 @@ func (a *attributeValue) unmarshalNumberSet(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalBinarySet(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalBinarySet(raw json.RawMessage, _ int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb BS attribute must be an array")
 	}
@@ -289,25 +301,39 @@ func (a *attributeValue) unmarshalBinarySet(raw json.RawMessage) error {
 	return nil
 }
 
-func (a *attributeValue) unmarshalList(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalList(raw json.RawMessage, depth int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb L attribute must be an array")
 	}
-	var list []attributeValue
-	if err := json.Unmarshal(raw, &list); err != nil {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
 		return errors.WithStack(err)
+	}
+	list := make([]attributeValue, len(elems))
+	for i := range elems {
+		if err := list[i].unmarshalJSONWithDepth(elems[i], depth+1); err != nil {
+			return err
+		}
 	}
 	a.L = list
 	return nil
 }
 
-func (a *attributeValue) unmarshalMap(raw json.RawMessage) error {
+func (a *attributeValue) unmarshalMap(raw json.RawMessage, depth int) error {
 	if isJSONNull(raw) {
 		return errors.New("dynamodb M attribute must be an object")
 	}
-	var m map[string]attributeValue
-	if err := json.Unmarshal(raw, &m); err != nil {
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawMap); err != nil {
 		return errors.WithStack(err)
+	}
+	m := make(map[string]attributeValue, len(rawMap))
+	for key, value := range rawMap {
+		var attr attributeValue
+		if err := attr.unmarshalJSONWithDepth(value, depth+1); err != nil {
+			return err
+		}
+		m[key] = attr
 	}
 	a.M = m
 	return nil
