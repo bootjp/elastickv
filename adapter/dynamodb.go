@@ -156,8 +156,14 @@ type createTableKeySchemaElement struct {
 }
 
 type createTableGSI struct {
-	IndexName string                        `json:"IndexName"`
-	KeySchema []createTableKeySchemaElement `json:"KeySchema"`
+	IndexName  string                        `json:"IndexName"`
+	KeySchema  []createTableKeySchemaElement `json:"KeySchema"`
+	Projection createTableProjection         `json:"Projection"`
+}
+
+type createTableProjection struct {
+	ProjectionType   string   `json:"ProjectionType"`
+	NonKeyAttributes []string `json:"NonKeyAttributes"`
 }
 
 type createTableInput struct {
@@ -231,12 +237,22 @@ type dynamoKeySchema struct {
 	RangeKey string `json:"range_key,omitempty"`
 }
 
+type dynamoGSIProjection struct {
+	ProjectionType   string   `json:"projection_type"`
+	NonKeyAttributes []string `json:"non_key_attributes,omitempty"`
+}
+
+type dynamoGlobalSecondaryIndex struct {
+	KeySchema  dynamoKeySchema     `json:"key_schema"`
+	Projection dynamoGSIProjection `json:"projection"`
+}
+
 type dynamoTableSchema struct {
-	TableName              string                     `json:"table_name"`
-	AttributeDefinitions   map[string]string          `json:"attribute_definitions,omitempty"`
-	PrimaryKey             dynamoKeySchema            `json:"primary_key"`
-	GlobalSecondaryIndexes map[string]dynamoKeySchema `json:"global_secondary_indexes,omitempty"`
-	Generation             uint64                     `json:"generation"`
+	TableName              string                                `json:"table_name"`
+	AttributeDefinitions   map[string]string                     `json:"attribute_definitions,omitempty"`
+	PrimaryKey             dynamoKeySchema                       `json:"primary_key"`
+	GlobalSecondaryIndexes map[string]dynamoGlobalSecondaryIndex `json:"global_secondary_indexes,omitempty"`
+	Generation             uint64                                `json:"generation"`
 }
 
 func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +307,7 @@ func buildCreateTableSchema(in createTableInput) (*dynamoTableSchema, error) {
 		}
 		attrDefs[def.AttributeName] = def.AttributeType
 	}
-	gsis := make(map[string]dynamoKeySchema, len(in.GlobalSecondaryIndexes))
+	gsis := make(map[string]dynamoGlobalSecondaryIndex, len(in.GlobalSecondaryIndexes))
 	for _, gsi := range in.GlobalSecondaryIndexes {
 		if strings.TrimSpace(gsi.IndexName) == "" {
 			return nil, errors.New("invalid global secondary index")
@@ -300,7 +316,14 @@ func buildCreateTableSchema(in createTableInput) (*dynamoTableSchema, error) {
 		if err != nil {
 			return nil, err
 		}
-		gsis[gsi.IndexName] = ks
+		projection, err := buildCreateTableProjection(gsi.Projection)
+		if err != nil {
+			return nil, err
+		}
+		gsis[gsi.IndexName] = dynamoGlobalSecondaryIndex{
+			KeySchema:  ks,
+			Projection: projection,
+		}
 	}
 	return &dynamoTableSchema{
 		TableName:              in.TableName,
@@ -308,6 +331,22 @@ func buildCreateTableSchema(in createTableInput) (*dynamoTableSchema, error) {
 		PrimaryKey:             primary,
 		GlobalSecondaryIndexes: gsis,
 	}, nil
+}
+
+func buildCreateTableProjection(in createTableProjection) (dynamoGSIProjection, error) {
+	switch strings.TrimSpace(in.ProjectionType) {
+	case "", "ALL":
+		return dynamoGSIProjection{ProjectionType: "ALL"}, nil
+	case "KEYS_ONLY":
+		return dynamoGSIProjection{ProjectionType: "KEYS_ONLY"}, nil
+	case "INCLUDE":
+		return dynamoGSIProjection{
+			ProjectionType:   "INCLUDE",
+			NonKeyAttributes: append([]string(nil), in.NonKeyAttributes...),
+		}, nil
+	default:
+		return dynamoGSIProjection{}, errors.New("invalid projection")
+	}
 }
 
 func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName string, baseSchema *dynamoTableSchema) error {
@@ -733,6 +772,9 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 		if err != nil {
 			return nil, err
 		}
+		if plan.req == nil {
+			return plan, nil
+		}
 		plan.req.StartTS = readTS
 		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
@@ -823,7 +865,8 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schema, exists, err := d.loadTableSchema(r.Context(), in.TableName)
+	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
+	schema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
 	if err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
@@ -839,7 +882,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, found, err := d.readItemAtKey(r.Context(), itemKey)
+	item, found, err := d.readItemAtKeyAt(r.Context(), itemKey, readTS)
 	if err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
@@ -857,7 +900,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeDeleteItemInput(http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes))
+	in, shouldReturnOld, err := decodeDeleteItemInput(http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -875,36 +918,39 @@ func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := map[string]any{}
-	if attrs := deleteItemReturnAttributes(in.ReturnValues, plan.current); len(attrs) > 0 {
-		resp["Attributes"] = attrs
+	if shouldReturnOld && len(plan.current) > 0 {
+		resp["Attributes"] = plan.current
 	}
 	writeDynamoJSON(w, resp)
 }
 
-func decodeDeleteItemInput(bodyReader io.Reader) (deleteItemInput, error) {
+func decodeDeleteItemInput(bodyReader io.Reader) (deleteItemInput, bool, error) {
 	body, err := io.ReadAll(bodyReader)
 	if err != nil {
-		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	var in deleteItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
-		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	if strings.TrimSpace(in.TableName) == "" {
-		return deleteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
+		return deleteItemInput{}, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
 	}
-	if err := validateDeleteItemReturnValues(in.ReturnValues); err != nil {
-		return deleteItemInput{}, err
+	shouldReturnOld, err := parseDeleteItemReturnValues(in.ReturnValues)
+	if err != nil {
+		return deleteItemInput{}, false, err
 	}
-	return in, nil
+	return in, shouldReturnOld, nil
 }
 
-func validateDeleteItemReturnValues(returnValues string) error {
+func parseDeleteItemReturnValues(returnValues string) (bool, error) {
 	switch strings.TrimSpace(returnValues) {
-	case "", dynamoReturnValueNone, dynamoReturnValueAllOld:
-		return nil
+	case "", dynamoReturnValueNone:
+		return false, nil
+	case dynamoReturnValueAllOld:
+		return true, nil
 	default:
-		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
+		return false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported ReturnValues")
 	}
 }
 
@@ -915,66 +961,27 @@ type deleteItemPlan struct {
 }
 
 func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemInput) (*deleteItemPlan, error) {
-	backoff := transactRetryInitialBackoff
-	deadline := time.Now().Add(transactRetryMaxDuration)
-	for attempt := 0; attempt < transactRetryMaxAttempts; attempt++ {
-		plan, retry, err := d.executeDeleteItemAttempt(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		if !retry {
-			return plan, nil
-		}
-		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		backoff = nextTransactRetryBackoff(backoff)
-	}
-	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete item retry attempts exhausted")
-}
-
-func (d *DynamoDBServer) executeDeleteItemAttempt(ctx context.Context, in deleteItemInput) (*deleteItemPlan, bool, error) {
-	plan, err := d.prepareDeleteItemWrite(ctx, in, d.nextTxnReadTS())
+	var deletePlan *deleteItemPlan
+	_, err := d.retryItemWriteWithGeneration(
+		ctx,
+		in.TableName,
+		"delete retry attempts exhausted",
+		func(readTS uint64) (*itemWritePlan, error) {
+			var err error
+			deletePlan, err = d.prepareDeleteItemWrite(ctx, in, readTS)
+			if err != nil {
+				return nil, err
+			}
+			return &itemWritePlan{
+				req:        deletePlan.req,
+				generation: deletePlan.generation,
+			}, nil
+		},
+	)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	if len(plan.req.Elems) == 0 {
-		return d.finishDeleteItemAttempt(ctx, in.TableName, plan)
-	}
-	if err := d.commitItemWrite(ctx, plan.req); err != nil {
-		return plan, isRetryableDeleteItemError(err), wrapNonRetryableDeleteItemError(err)
-	}
-	return d.finishDeleteItemAttempt(ctx, in.TableName, plan)
-}
-
-func (d *DynamoDBServer) finishDeleteItemAttempt(ctx context.Context, tableName string, plan *deleteItemPlan) (*deleteItemPlan, bool, error) {
-	if err := d.verifyDeleteItemGeneration(ctx, tableName, plan.generation); err != nil {
-		return nil, false, err
-	}
-	return plan, false, nil
-}
-
-func isRetryableDeleteItemError(err error) bool {
-	return err != nil && isRetryableTransactWriteError(err)
-}
-
-func wrapNonRetryableDeleteItemError(err error) error {
-	if err == nil || isRetryableTransactWriteError(err) {
-		return nil
-	}
-	return errors.WithStack(err)
-}
-
-func (d *DynamoDBServer) verifyDeleteItemGeneration(ctx context.Context, tableName string, generation uint64) error {
-	err := d.verifyTableGeneration(ctx, tableName, generation)
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, errTableGenerationChanged), isTableNotFoundError(err):
-		return nil
-	default:
-		return err
-	}
+	return deletePlan, nil
 }
 
 func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteItemInput, readTS uint64) (*deleteItemPlan, error) {
@@ -1001,12 +1008,12 @@ func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteIt
 	); err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
-	req := &kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: 0}
-	if found {
-		req, err = buildItemDeleteRequest(schema, itemKey, current)
-		if err != nil {
-			return nil, err
-		}
+	if !found {
+		return &deleteItemPlan{current: nil}, nil
+	}
+	req, err := buildItemDeleteRequest(schema, itemKey, current)
+	if err != nil {
+		return nil, err
 	}
 	return &deleteItemPlan{
 		req:        req,
@@ -1233,13 +1240,6 @@ func putItemReturnAttributes(returnValues string, current map[string]attributeVa
 	return cloneAttributeValueMap(current)
 }
 
-func deleteItemReturnAttributes(returnValues string, current map[string]attributeValue) map[string]attributeValue {
-	if !strings.EqualFold(strings.TrimSpace(returnValues), dynamoReturnValueAllOld) || len(current) == 0 {
-		return nil
-	}
-	return cloneAttributeValueMap(current)
-}
-
 func updateItemReturnAttributes(returnValues string, current map[string]attributeValue, next map[string]attributeValue) map[string]attributeValue {
 	switch strings.TrimSpace(returnValues) {
 	case "", dynamoReturnValueNone:
@@ -1442,7 +1442,7 @@ type queryCondition struct {
 }
 
 func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryOutput, error) {
-	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1450,11 +1450,18 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if !exists {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
+	if err := validateGSIReadOptions(schema, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead); err != nil {
+		return nil, err
+	}
 	keySchema, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
 		return nil, err
 	}
 	items, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond, readTS)
+	if err != nil {
+		return nil, err
+	}
+	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
 	if err != nil {
 		return nil, err
 	}
@@ -1474,13 +1481,16 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 }
 
 func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOutput, error) {
-	readTS := snapshotTS(d.coordinator.Clock(), d.store)
+	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if !exists {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	if err := validateGSIReadOptions(schema, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead); err != nil {
+		return nil, err
 	}
 	indexKeySchema := schema.PrimaryKey
 	if strings.TrimSpace(in.IndexName) != "" {
@@ -1490,6 +1500,10 @@ func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOut
 		}
 	}
 	items, err := d.scanItemsBySource(ctx, in, schema, readTS)
+	if err != nil {
+		return nil, err
+	}
+	items, err = projectReadItemsForIndex(schema, in.IndexName, items)
 	if err != nil {
 		return nil, err
 	}
@@ -1505,6 +1519,93 @@ func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOut
 			return makeReadLastEvaluatedKey(schema.PrimaryKey, indexKeySchema, item)
 		},
 	})
+}
+
+func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
+	if consistentRead != nil && *consistentRead {
+		return d.nextTxnReadTS()
+	}
+	return snapshotTS(d.coordinator.Clock(), d.store)
+}
+
+func validateGSIReadOptions(
+	schema *dynamoTableSchema,
+	indexName string,
+	selectValue string,
+	projectionExpression string,
+	names map[string]string,
+	consistentRead *bool,
+) error {
+	if strings.TrimSpace(indexName) == "" {
+		return nil
+	}
+	attrs, err := resolveProjectionAttributes(projectionExpression, names)
+	if err != nil {
+		return err
+	}
+	return validateProjectedGSIRead(schema, indexName, selectValue, attrs, consistentRead)
+}
+
+func validateProjectedGSIRead(
+	schema *dynamoTableSchema,
+	indexName string,
+	selectValue string,
+	attrs []string,
+	consistentRead *bool,
+) error {
+	if err := validateGSIConsistentRead(consistentRead); err != nil {
+		return err
+	}
+	allProjected, projected, err := schema.gsiProjectedAttributeSet(indexName)
+	if err != nil {
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if err := validateGSISelectValue(selectValue, allProjected); err != nil {
+		return err
+	}
+	return validateProjectedAttributes(attrs, projected, allProjected)
+}
+
+func validateGSIConsistentRead(consistentRead *bool) error {
+	if consistentRead == nil || !*consistentRead {
+		return nil
+	}
+	return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "ConsistentRead is not supported on global secondary indexes")
+}
+
+func validateGSISelectValue(selectValue string, allProjected bool) error {
+	if !strings.EqualFold(strings.TrimSpace(selectValue), "ALL_ATTRIBUTES") || allProjected {
+		return nil
+	}
+	return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "ALL_ATTRIBUTES is not supported for this index projection")
+}
+
+func validateProjectedAttributes(attrs []string, projected map[string]struct{}, allProjected bool) error {
+	if allProjected || len(attrs) == 0 {
+		return nil
+	}
+	for _, attr := range attrs {
+		if _, ok := projected[attr]; ok {
+			continue
+		}
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "requested attribute is not projected into index")
+	}
+	return nil
+}
+
+func projectReadItemsForIndex(schema *dynamoTableSchema, indexName string, items []map[string]attributeValue) ([]map[string]attributeValue, error) {
+	if strings.TrimSpace(indexName) == "" || len(items) == 0 {
+		return items, nil
+	}
+	out := make([]map[string]attributeValue, 0, len(items))
+	for _, item := range items {
+		projected, err := schema.projectItemForIndex(indexName, item)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, projected)
+	}
+	return out, nil
 }
 
 func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeySchema, queryCondition, error) {
@@ -3118,7 +3219,7 @@ func applyUpdateExpressionSection(section updateExpressionSection, values map[st
 	case "ADD":
 		return applyAddUpdateAction(section.body, values, item)
 	case "DELETE":
-		return applyDeleteUpdateAction(section.body, item)
+		return applyDeleteUpdateAction(section.body, values, item)
 	default:
 		return errors.New("unsupported update action")
 	}
@@ -3182,17 +3283,16 @@ func applySingleSetAssignment(assignment string, values map[string]attributeValu
 	if len(parts) != updateSplitCount {
 		return errors.New("invalid update expression")
 	}
-	attrName := strings.TrimSpace(parts[0])
-	if attrName == "" {
+	path := strings.TrimSpace(parts[0])
+	if path == "" {
 		return errors.New("invalid update expression attribute")
 	}
-	valPlaceholder := strings.TrimSpace(parts[1])
-	valAttr, ok := values[valPlaceholder]
-	if !ok {
-		return errors.New("missing value attribute")
+	valueExpr := strings.TrimSpace(parts[1])
+	valueAttr, err := evalUpdateValueExpression(valueExpr, values, item)
+	if err != nil {
+		return err
 	}
-	item[attrName] = valAttr
-	return nil
+	return setDocumentPath(item, path, valueAttr)
 }
 
 func applyRemoveUpdateAction(body string, item map[string]attributeValue) error {
@@ -3201,11 +3301,13 @@ func applyRemoveUpdateAction(body string, item map[string]attributeValue) error 
 		return errors.New("invalid update expression")
 	}
 	for _, attr := range attrs {
-		attrName := strings.TrimSpace(attr)
-		if attrName == "" {
+		path := strings.TrimSpace(attr)
+		if path == "" {
 			return errors.New("invalid update expression attribute")
 		}
-		delete(item, attrName)
+		if err := removeDocumentPath(item, path); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -3228,32 +3330,24 @@ func applySingleAddTerm(term string, values map[string]attributeValue, item map[
 	if len(parts) != updateSplitCount {
 		return errors.New("invalid update expression")
 	}
-	attrName := strings.TrimSpace(parts[0])
+	path := strings.TrimSpace(parts[0])
 	placeholder := strings.TrimSpace(parts[1])
-	if attrName == "" || !strings.HasPrefix(placeholder, ":") {
+	if path == "" || !strings.HasPrefix(placeholder, ":") {
 		return errors.New("invalid update expression")
 	}
 	addValue, ok := values[placeholder]
 	if !ok {
 		return errors.New("missing value attribute")
 	}
-	if !addValue.hasNumberType() {
-		return errors.New("ADD supports only number attributes")
-	}
-	current, exists := item[attrName]
-	if !exists {
-		item[attrName] = addValue
-		return nil
-	}
-	if !current.hasNumberType() {
-		return errors.New("ADD supports only number attributes")
-	}
-	sum, err := addNumericAttributeValues(current.numberValue(), addValue.numberValue())
+	current, exists, err := resolveDocumentPath(item, path)
 	if err != nil {
 		return err
 	}
-	item[attrName] = attributeValue{N: &sum}
-	return nil
+	next, err := addAttributeValue(current, exists, addValue)
+	if err != nil {
+		return err
+	}
+	return setDocumentPath(item, path, next)
 }
 
 func addNumericAttributeValues(left string, right string) (string, error) {
@@ -3277,27 +3371,55 @@ func addNumericAttributeValues(left string, right string) (string, error) {
 	return out, nil
 }
 
-func applyDeleteUpdateAction(body string, item map[string]attributeValue) error {
+func applyDeleteUpdateAction(body string, values map[string]attributeValue, item map[string]attributeValue) error {
 	terms, err := splitTopLevelByComma(body)
 	if err != nil {
 		return errors.New("invalid update expression")
 	}
 	for _, term := range terms {
-		attrName := deleteTermAttributeName(term)
-		if attrName == "" {
-			return errors.New("invalid update expression")
+		if err := applySingleDeleteTerm(term, values, item); err != nil {
+			return err
 		}
-		delete(item, attrName)
 	}
 	return nil
 }
 
-func deleteTermAttributeName(term string) string {
+func applySingleDeleteTerm(term string, values map[string]attributeValue, item map[string]attributeValue) error {
 	fields := strings.Fields(strings.TrimSpace(term))
-	if len(fields) == 0 {
-		return ""
+	switch len(fields) {
+	case 0:
+		return errors.New("invalid update expression")
+	case 1:
+		return removeDocumentPath(item, fields[0])
+	case updateSplitCount:
+		return applyDeleteSetTerm(fields[0], fields[1], values, item)
+	default:
+		return errors.New("invalid update expression")
 	}
-	return fields[0]
+}
+
+func applyDeleteSetTerm(pathExpr string, placeholderExpr string, values map[string]attributeValue, item map[string]attributeValue) error {
+	path := strings.TrimSpace(pathExpr)
+	placeholder := strings.TrimSpace(placeholderExpr)
+	if path == "" || !strings.HasPrefix(placeholder, ":") {
+		return errors.New("invalid update expression")
+	}
+	deleteValue, ok := values[placeholder]
+	if !ok {
+		return errors.New("missing value attribute")
+	}
+	current, found, err := resolveDocumentPath(item, path)
+	if err != nil || !found {
+		return err
+	}
+	next, removeAttr, err := deleteAttributeValueElements(current, deleteValue)
+	if err != nil {
+		return err
+	}
+	if removeAttr {
+		return removeDocumentPath(item, path)
+	}
+	return setDocumentPath(item, path, next)
 }
 
 func splitTopLevelByComma(expr string) ([]string, error) {
@@ -3327,6 +3449,583 @@ func splitTopLevelByComma(expr string) ([]string, error) {
 		return nil, errors.New("invalid expression")
 	}
 	return append(parts, tail), nil
+}
+
+type documentPathToken struct {
+	attr    string
+	index   int
+	isIndex bool
+}
+
+func parseDocumentPath(path string) ([]documentPathToken, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, errors.New("invalid document path")
+	}
+	tokens := make([]documentPathToken, 0, updateSplitCount)
+	for pos := 0; pos < len(path); {
+		nextPos, token, err := consumeDocumentPathToken(path, pos)
+		if err != nil {
+			return nil, err
+		}
+		pos = nextPos
+		if token.attr != "" || token.isIndex {
+			tokens = append(tokens, token)
+		}
+	}
+	if len(tokens) == 0 {
+		return nil, errors.New("invalid document path")
+	}
+	return tokens, nil
+}
+
+func consumeDocumentPathToken(path string, pos int) (int, documentPathToken, error) {
+	switch path[pos] {
+	case '.':
+		return pos + 1, documentPathToken{}, nil
+	case '[':
+		return consumeDocumentPathIndex(path, pos)
+	default:
+		return consumeDocumentPathAttr(path, pos)
+	}
+}
+
+func consumeDocumentPathIndex(path string, pos int) (int, documentPathToken, error) {
+	end := strings.IndexByte(path[pos:], ']')
+	if end <= 1 {
+		return 0, documentPathToken{}, errors.New("invalid document path")
+	}
+	indexValue, err := strconv.Atoi(path[pos+1 : pos+end])
+	if err != nil || indexValue < 0 {
+		return 0, documentPathToken{}, errors.New("invalid document path")
+	}
+	return pos + end + 1, documentPathToken{index: indexValue, isIndex: true}, nil
+}
+
+func consumeDocumentPathAttr(path string, pos int) (int, documentPathToken, error) {
+	start := pos
+	for pos < len(path) && path[pos] != '.' && path[pos] != '[' {
+		pos++
+	}
+	attr := strings.TrimSpace(path[start:pos])
+	if attr == "" {
+		return 0, documentPathToken{}, errors.New("invalid document path")
+	}
+	return pos, documentPathToken{attr: attr}, nil
+}
+
+func resolveDocumentPath(item map[string]attributeValue, path string) (attributeValue, bool, error) {
+	tokens, err := parseDocumentPath(path)
+	if err != nil {
+		return attributeValue{}, false, err
+	}
+	current := attributeValue{M: item}
+	found := true
+	for _, token := range tokens {
+		current, found = nextDocumentPathValue(current, found, token)
+		if !found {
+			return attributeValue{}, false, nil
+		}
+	}
+	return cloneAttributeValue(current), true, nil
+}
+
+func nextDocumentPathValue(current attributeValue, found bool, token documentPathToken) (attributeValue, bool) {
+	if !found {
+		return attributeValue{}, false
+	}
+	if token.isIndex {
+		if !current.hasListType() || token.index >= len(current.L) {
+			return attributeValue{}, false
+		}
+		return current.L[token.index], true
+	}
+	if !current.hasMapType() {
+		return attributeValue{}, false
+	}
+	value, ok := current.M[token.attr]
+	if !ok {
+		return attributeValue{}, false
+	}
+	return value, true
+}
+
+func setDocumentPath(item map[string]attributeValue, path string, value attributeValue) error {
+	tokens, err := parseDocumentPath(path)
+	if err != nil {
+		return err
+	}
+	root, err := setDocumentPathValue(attributeValue{M: cloneAttributeValueMap(item)}, true, tokens, value)
+	if err != nil {
+		return err
+	}
+	replaceAttributeValueMap(item, root.M)
+	return nil
+}
+
+func setDocumentPathValue(current attributeValue, exists bool, tokens []documentPathToken, value attributeValue) (attributeValue, error) {
+	if len(tokens) == 0 {
+		return cloneAttributeValue(value), nil
+	}
+	token := tokens[0]
+	if token.isIndex {
+		return setDocumentPathIndex(current, exists, token, tokens[1:], value)
+	}
+	return setDocumentPathAttribute(current, exists, token, tokens[1:], value)
+}
+
+func setDocumentPathIndex(current attributeValue, exists bool, token documentPathToken, rest []documentPathToken, value attributeValue) (attributeValue, error) {
+	if !exists || !current.hasListType() {
+		return attributeValue{}, errors.New("invalid document path")
+	}
+	list := cloneAttributeValueList(current.L)
+	if token.index > len(list) {
+		return attributeValue{}, errors.New("invalid document path")
+	}
+	if token.index == len(list) {
+		return appendDocumentPathIndex(list, rest, value)
+	}
+	nextValue, err := setDocumentPathValue(list[token.index], true, rest, value)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	list[token.index] = nextValue
+	return attributeValue{L: list}, nil
+}
+
+func appendDocumentPathIndex(list []attributeValue, rest []documentPathToken, value attributeValue) (attributeValue, error) {
+	child := value
+	if len(rest) > 0 {
+		var err error
+		child, err = setDocumentPathValue(newDocumentContainer(rest[0]), true, rest, value)
+		if err != nil {
+			return attributeValue{}, err
+		}
+	}
+	list = append(list, cloneAttributeValue(child))
+	return attributeValue{L: list}, nil
+}
+
+func setDocumentPathAttribute(current attributeValue, exists bool, token documentPathToken, rest []documentPathToken, value attributeValue) (attributeValue, error) {
+	var object map[string]attributeValue
+	if exists {
+		if !current.hasMapType() {
+			return attributeValue{}, errors.New("invalid document path")
+		}
+		object = cloneAttributeValueMap(current.M)
+	} else {
+		object = map[string]attributeValue{}
+	}
+	child, childExists := object[token.attr]
+	if !childExists && len(rest) > 0 {
+		child = newDocumentContainer(rest[0])
+		childExists = true
+	}
+	nextValue, err := setDocumentPathValue(child, childExists, rest, value)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	object[token.attr] = nextValue
+	return attributeValue{M: object}, nil
+}
+
+func newDocumentContainer(next documentPathToken) attributeValue {
+	if next.isIndex {
+		return attributeValue{L: []attributeValue{}}
+	}
+	return attributeValue{M: map[string]attributeValue{}}
+}
+
+func removeDocumentPath(item map[string]attributeValue, path string) error {
+	tokens, err := parseDocumentPath(path)
+	if err != nil {
+		return err
+	}
+	root, err := removeDocumentPathValue(attributeValue{M: cloneAttributeValueMap(item)}, true, tokens)
+	if err != nil {
+		return err
+	}
+	replaceAttributeValueMap(item, root.M)
+	return nil
+}
+
+func removeDocumentPathValue(current attributeValue, exists bool, tokens []documentPathToken) (attributeValue, error) {
+	if !exists || len(tokens) == 0 {
+		return current, nil
+	}
+	token := tokens[0]
+	if token.isIndex {
+		return removeDocumentPathIndex(current, token, tokens[1:])
+	}
+	return removeDocumentPathAttribute(current, token, tokens[1:])
+}
+
+func removeDocumentPathIndex(current attributeValue, token documentPathToken, rest []documentPathToken) (attributeValue, error) {
+	if !current.hasListType() || token.index >= len(current.L) {
+		return current, nil
+	}
+	list := cloneAttributeValueList(current.L)
+	if len(rest) == 0 {
+		list = append(list[:token.index], list[token.index+1:]...)
+		return attributeValue{L: list}, nil
+	}
+	nextValue, err := removeDocumentPathValue(list[token.index], true, rest)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	list[token.index] = nextValue
+	return attributeValue{L: list}, nil
+}
+
+func removeDocumentPathAttribute(current attributeValue, token documentPathToken, rest []documentPathToken) (attributeValue, error) {
+	if !current.hasMapType() {
+		return current, nil
+	}
+	object := cloneAttributeValueMap(current.M)
+	child, ok := object[token.attr]
+	if !ok {
+		return current, nil
+	}
+	if len(rest) == 0 {
+		delete(object, token.attr)
+		return attributeValue{M: object}, nil
+	}
+	nextValue, err := removeDocumentPathValue(child, true, rest)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	object[token.attr] = nextValue
+	return attributeValue{M: object}, nil
+}
+
+func replaceAttributeValueMap(dst map[string]attributeValue, src map[string]attributeValue) {
+	clear(dst)
+	for key, value := range src {
+		dst[key] = value
+	}
+}
+
+func deleteAttributeValueElements(current attributeValue, deleteValue attributeValue) (attributeValue, bool, error) {
+	currentKind, _ := detectAttributeValueKind(current)
+	deleteKind, _ := detectAttributeValueKind(deleteValue)
+	if currentKind != deleteKind {
+		return attributeValue{}, false, errors.New("DELETE supports only matching set attribute types")
+	}
+	switch currentKind {
+	case attributeValueKindStringSet:
+		return buildDeleteSetResult(attributeValue{SS: subtractStringSet(current.SS, deleteValue.SS)})
+	case attributeValueKindNumberSet:
+		return buildDeleteSetResult(attributeValue{NS: subtractNumberSet(current.NS, deleteValue.NS)})
+	case attributeValueKindBinarySet:
+		return buildDeleteSetResult(attributeValue{BS: subtractBinarySet(current.BS, deleteValue.BS)})
+	case attributeValueKindInvalid,
+		attributeValueKindString,
+		attributeValueKindNumber,
+		attributeValueKindBinary,
+		attributeValueKindBool,
+		attributeValueKindNull,
+		attributeValueKindList,
+		attributeValueKindMap:
+		return attributeValue{}, false, errors.New("DELETE supports only matching set attribute types")
+	}
+	return attributeValue{}, false, errors.New("DELETE supports only matching set attribute types")
+}
+
+func buildDeleteSetResult(next attributeValue) (attributeValue, bool, error) {
+	if next.hasStringSetType() && len(next.SS) == 0 {
+		return attributeValue{}, true, nil
+	}
+	if next.hasNumberSetType() && len(next.NS) == 0 {
+		return attributeValue{}, true, nil
+	}
+	if next.hasBinarySetType() && len(next.BS) == 0 {
+		return attributeValue{}, true, nil
+	}
+	return next, false, nil
+}
+
+func subtractStringSet(current []string, remove []string) []string {
+	removeSet := make(map[string]struct{}, len(remove))
+	for _, value := range remove {
+		removeSet[value] = struct{}{}
+	}
+	out := make([]string, 0, len(current))
+	for _, value := range current {
+		if _, ok := removeSet[value]; ok {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func subtractNumberSet(current []string, remove []string) []string {
+	removeSet := make(map[string]struct{}, len(remove))
+	for _, value := range remove {
+		removeSet[canonicalNumberString(value)] = struct{}{}
+	}
+	out := make([]string, 0, len(current))
+	for _, value := range current {
+		if _, ok := removeSet[canonicalNumberString(value)]; ok {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func subtractBinarySet(current [][]byte, remove [][]byte) [][]byte {
+	removeSet := make(map[string]struct{}, len(remove))
+	for _, value := range remove {
+		removeSet[string(value)] = struct{}{}
+	}
+	out := make([][]byte, 0, len(current))
+	for _, value := range current {
+		if _, ok := removeSet[string(value)]; ok {
+			continue
+		}
+		out = append(out, bytes.Clone(value))
+	}
+	return out
+}
+
+func evalUpdateValueExpression(expr string, values map[string]attributeValue, item map[string]attributeValue) (attributeValue, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return attributeValue{}, errors.New("invalid update expression")
+	}
+	if value, handled, err := evalArithmeticUpdateOperand(expr, values, item); handled {
+		return value, err
+	}
+	if value, handled, err := evalNamedUpdateFunction(expr, values, item, "if_not_exists", evalIfNotExistsUpdateValue); handled {
+		return value, err
+	}
+	if value, handled, err := evalNamedUpdateFunction(expr, values, item, "list_append", evalListAppendUpdateValue); handled {
+		return value, err
+	}
+	return evalUpdateTerminalValue(expr, values, item)
+}
+
+func evalArithmeticUpdateOperand(expr string, values map[string]attributeValue, item map[string]attributeValue) (attributeValue, bool, error) {
+	index, op, ok := findTopLevelArithmeticOperator(expr)
+	if !ok {
+		return attributeValue{}, false, nil
+	}
+	left, err := evalUpdateValueExpression(expr[:index], values, item)
+	if err != nil {
+		return attributeValue{}, true, err
+	}
+	right, err := evalUpdateValueExpression(expr[index+1:], values, item)
+	if err != nil {
+		return attributeValue{}, true, err
+	}
+	value, err := applyArithmeticUpdateValue(left, right, op)
+	return value, true, err
+}
+
+func evalNamedUpdateFunction(
+	expr string,
+	values map[string]attributeValue,
+	item map[string]attributeValue,
+	name string,
+	eval func([]string, map[string]attributeValue, map[string]attributeValue) (attributeValue, error),
+) (attributeValue, bool, error) {
+	args, ok, err := parseExpressionFunctionArgs(expr, name)
+	if err != nil {
+		return attributeValue{}, true, err
+	}
+	if !ok {
+		return attributeValue{}, false, nil
+	}
+	value, err := eval(args, values, item)
+	return value, true, err
+}
+
+func evalUpdateTerminalValue(expr string, values map[string]attributeValue, item map[string]attributeValue) (attributeValue, error) {
+	if strings.HasPrefix(expr, ":") {
+		value, ok := values[expr]
+		if !ok {
+			return attributeValue{}, errors.New("missing value attribute")
+		}
+		return cloneAttributeValue(value), nil
+	}
+	value, found, err := resolveDocumentPath(item, expr)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	if !found {
+		return attributeValue{}, errors.New("missing value attribute")
+	}
+	return value, nil
+}
+
+func evalIfNotExistsUpdateValue(args []string, values map[string]attributeValue, item map[string]attributeValue) (attributeValue, error) {
+	if len(args) != updateSplitCount {
+		return attributeValue{}, errors.New("invalid update expression")
+	}
+	current, found, err := resolveDocumentPath(item, strings.TrimSpace(args[0]))
+	if err != nil {
+		return attributeValue{}, err
+	}
+	if found {
+		return current, nil
+	}
+	return evalUpdateValueExpression(args[1], values, item)
+}
+
+func evalListAppendUpdateValue(args []string, values map[string]attributeValue, item map[string]attributeValue) (attributeValue, error) {
+	if len(args) != updateSplitCount {
+		return attributeValue{}, errors.New("invalid update expression")
+	}
+	left, err := evalUpdateValueExpression(args[0], values, item)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	right, err := evalUpdateValueExpression(args[1], values, item)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	if !left.hasListType() || !right.hasListType() {
+		return attributeValue{}, errors.New("list_append supports only list attributes")
+	}
+	out := make([]attributeValue, 0, len(left.L)+len(right.L))
+	for _, value := range left.L {
+		out = append(out, cloneAttributeValue(value))
+	}
+	for _, value := range right.L {
+		out = append(out, cloneAttributeValue(value))
+	}
+	return attributeValue{L: out}, nil
+}
+
+func applyArithmeticUpdateValue(left attributeValue, right attributeValue, op byte) (attributeValue, error) {
+	if !left.hasNumberType() || !right.hasNumberType() {
+		return attributeValue{}, errors.New("arithmetic update supports only number attributes")
+	}
+	rightValue := right.numberValue()
+	if op == '-' {
+		rightValue = "-" + rightValue
+	}
+	sum, err := addNumericAttributeValues(left.numberValue(), rightValue)
+	if err != nil {
+		return attributeValue{}, err
+	}
+	return attributeValue{N: &sum}, nil
+}
+
+func findTopLevelArithmeticOperator(expr string) (int, byte, bool) {
+	depth := 0
+	for i := 0; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth != 0 {
+			continue
+		}
+		switch expr[i] {
+		case '+', '-':
+			if i == 0 {
+				continue
+			}
+			return i, expr[i], true
+		}
+	}
+	return 0, 0, false
+}
+
+func parseExpressionFunctionArgs(expr string, funcName string) ([]string, bool, error) {
+	prefix := funcName + "("
+	if !strings.HasPrefix(strings.ToLower(expr), strings.ToLower(prefix)) || !strings.HasSuffix(expr, ")") {
+		return nil, false, nil
+	}
+	inner := strings.TrimSpace(expr[len(prefix) : len(expr)-1])
+	parts, err := splitTopLevelByComma(inner)
+	if err != nil {
+		return nil, true, errors.New("invalid expression")
+	}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts, true, nil
+}
+
+func addAttributeValue(current attributeValue, exists bool, addValue attributeValue) (attributeValue, error) {
+	if addValue.hasNumberType() {
+		return addNumericUpdateValue(current, exists, addValue)
+	}
+	if addValue.hasStringSetType() || addValue.hasNumberSetType() || addValue.hasBinarySetType() {
+		return addSetUpdateValue(current, exists, addValue)
+	}
+	return attributeValue{}, errors.New("ADD supports only number or set attributes")
+}
+
+func addNumericUpdateValue(current attributeValue, exists bool, addValue attributeValue) (attributeValue, error) {
+	if !exists {
+		return cloneAttributeValue(addValue), nil
+	}
+	if !current.hasNumberType() {
+		return attributeValue{}, errors.New("ADD supports only number attributes")
+	}
+	sum, err := addNumericAttributeValues(current.numberValue(), addValue.numberValue())
+	if err != nil {
+		return attributeValue{}, err
+	}
+	return attributeValue{N: &sum}, nil
+}
+
+func addSetUpdateValue(current attributeValue, exists bool, addValue attributeValue) (attributeValue, error) {
+	if !exists {
+		return cloneAttributeValue(addValue), nil
+	}
+	switch {
+	case current.hasStringSetType() && addValue.hasStringSetType():
+		return attributeValue{SS: mergeStringSet(current.SS, addValue.SS)}, nil
+	case current.hasNumberSetType() && addValue.hasNumberSetType():
+		return attributeValue{NS: mergeNumberSet(current.NS, addValue.NS)}, nil
+	case current.hasBinarySetType() && addValue.hasBinarySetType():
+		return attributeValue{BS: mergeBinarySet(current.BS, addValue.BS)}, nil
+	default:
+		return attributeValue{}, errors.New("ADD supports only matching set attribute types")
+	}
+}
+
+func mergeStringSet(current []string, add []string) []string {
+	out := make([]string, 0, len(current)+len(add))
+	seen := make(map[string]struct{}, len(current)+len(add))
+	for _, value := range append(append([]string(nil), current...), add...) {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func mergeNumberSet(current []string, add []string) []string {
+	out := make([]string, 0, len(current)+len(add))
+	seen := make(map[string]struct{}, len(current)+len(add))
+	for _, value := range append(append([]string(nil), current...), add...) {
+		key := canonicalNumberString(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func mergeBinarySet(current [][]byte, add [][]byte) [][]byte {
+	out := make([][]byte, 0, len(current)+len(add))
+	seen := make(map[string]struct{}, len(current)+len(add))
+	for _, value := range append(cloneBinarySet(current), add...) {
+		key := string(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, bytes.Clone(value))
+	}
+	return out
 }
 
 func validateConditionOnItem(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
@@ -3359,6 +4058,13 @@ func evalConditionExpression(expr string, item map[string]attributeValue, values
 	if ok, handled, err := evalLogicalCondition(expr, "AND", item, values); handled {
 		return ok, err
 	}
+	if rest, ok := trimLeadingKeyword(expr, "NOT"); ok {
+		ok, err := evalConditionExpression(rest, item, values)
+		if err != nil {
+			return false, err
+		}
+		return !ok, nil
+	}
 	return evalAtomicCondition(expr, item, values)
 }
 
@@ -3384,13 +4090,19 @@ func splitTopLevelByKeyword(expr string, keyword string) []string {
 	}
 	depth := 0
 	last := 0
+	betweenPending := false
 	parts := make([]string, 0, splitPartsInitialCapacity)
 	for i := 0; i < len(expr); i++ {
 		depth = nextParenDepth(depth, expr[i])
-		if depth != 0 || !matchesKeywordTokenAt(upper, target, i) {
+		if depth != 0 {
 			continue
 		}
-		if !isLogicalKeywordBoundary(expr, i-1) || !isLogicalKeywordBoundary(expr, i+targetLen) {
+		if nextIndex, handled, nextPending := consumeBetweenSplitState(expr, upper, keyword, i, betweenPending); handled {
+			betweenPending = nextPending
+			i = nextIndex
+			continue
+		}
+		if !shouldSplitKeywordAt(expr, upper, target, targetLen, i) {
 			continue
 		}
 		part, ok := trimmedNonEmpty(expr[last:i])
@@ -3402,6 +4114,31 @@ func splitTopLevelByKeyword(expr string, keyword string) []string {
 		last = i + 1
 	}
 	return finalizeKeywordSplit(expr[last:], parts)
+}
+
+func consumeBetweenSplitState(expr string, upper string, keyword string, index int, betweenPending bool) (int, bool, bool) {
+	if !strings.EqualFold(keyword, "AND") {
+		return index, false, betweenPending
+	}
+	if matchesLogicalKeyword(expr, upper, "BETWEEN", index) {
+		return index + len("BETWEEN") - 1, true, true
+	}
+	if betweenPending && matchesLogicalKeyword(expr, upper, "AND", index) {
+		return index + len("AND") - 1, true, false
+	}
+	return index, false, betweenPending
+}
+
+func shouldSplitKeywordAt(expr string, upper string, target string, targetLen int, index int) bool {
+	return matchesKeywordTokenAt(upper, target, index) &&
+		isLogicalKeywordBoundary(expr, index-1) &&
+		isLogicalKeywordBoundary(expr, index+targetLen)
+}
+
+func matchesLogicalKeyword(expr string, upper string, keyword string, index int) bool {
+	return matchesKeywordTokenAt(upper, keyword, index) &&
+		isLogicalKeywordBoundary(expr, index-1) &&
+		isLogicalKeywordBoundary(expr, index+len(keyword))
 }
 
 func evalLogicalCondition(expr string, keyword string, item map[string]attributeValue, values map[string]attributeValue) (bool, bool, error) {
@@ -3444,44 +4181,463 @@ func evalConditionAll(parts []string, item map[string]attributeValue, values map
 }
 
 func evalAtomicCondition(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
-	if attr, ok := parseConditionFuncAttr(expr, "attribute_exists"); ok {
-		_, exists := item[attr]
-		return exists, nil
+	for _, handler := range conditionFunctionHandlers {
+		if ok, handled, err := evalNamedConditionFunction(expr, item, values, handler); handled {
+			return ok, err
+		}
 	}
-	if attr, ok := parseConditionFuncAttr(expr, "attribute_not_exists"); ok {
-		_, exists := item[attr]
-		return !exists, nil
+	if ok, handled, err := evalConditionBetween(expr, item, values); handled {
+		return ok, err
 	}
-	return evalConditionEquals(expr, item, values)
+	if ok, handled, err := evalConditionIn(expr, item, values); handled {
+		return ok, err
+	}
+	return evalConditionComparison(expr, item, values)
 }
 
-func parseConditionFuncAttr(expr string, funcName string) (string, bool) {
-	prefix := funcName + "("
-	if !strings.HasPrefix(expr, prefix) || !strings.HasSuffix(expr, ")") {
-		return "", false
-	}
-	return strings.TrimSpace(expr[len(prefix) : len(expr)-1]), true
+type conditionFunctionHandler struct {
+	name string
+	eval func([]string, map[string]attributeValue, map[string]attributeValue) (bool, error)
 }
 
-func evalConditionEquals(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
-	parts := strings.SplitN(expr, "=", updateSplitCount)
-	if len(parts) != updateSplitCount {
-		return false, errors.New("unsupported condition expression")
+var conditionFunctionHandlers = []conditionFunctionHandler{
+	{
+		name: "attribute_exists",
+		eval: func(args []string, item map[string]attributeValue, _ map[string]attributeValue) (bool, error) {
+			return evalAttributeExistsCondition(args, item)
+		},
+	},
+	{
+		name: "attribute_not_exists",
+		eval: func(args []string, item map[string]attributeValue, _ map[string]attributeValue) (bool, error) {
+			return evalAttributeNotExistsCondition(args, item)
+		},
+	},
+	{name: "attribute_type", eval: evalAttributeTypeCondition},
+	{name: "begins_with", eval: evalBeginsWithCondition},
+	{name: "contains", eval: evalContainsCondition},
+}
+
+func evalNamedConditionFunction(
+	expr string,
+	item map[string]attributeValue,
+	values map[string]attributeValue,
+	handler conditionFunctionHandler,
+) (bool, bool, error) {
+	args, ok, err := parseExpressionFunctionArgs(expr, handler.name)
+	if err != nil {
+		return false, true, err
 	}
-	left := strings.TrimSpace(parts[0])
-	right := strings.TrimSpace(parts[1])
-	if !strings.HasPrefix(right, ":") {
-		return false, errors.New("unsupported condition expression")
-	}
-	lhs, ok := item[left]
 	if !ok {
-		return false, nil
+		return false, false, nil
 	}
-	rhs, ok := values[right]
+	value, err := handler.eval(args, item, values)
+	return value, true, err
+}
+
+func evalAttributeExistsCondition(args []string, item map[string]attributeValue) (bool, error) {
+	if len(args) != 1 {
+		return false, errors.New("unsupported condition expression")
+	}
+	_, found, err := resolveDocumentPath(item, args[0])
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func evalAttributeNotExistsCondition(args []string, item map[string]attributeValue) (bool, error) {
+	ok, err := evalAttributeExistsCondition(args, item)
+	if err != nil {
+		return false, err
+	}
+	return !ok, nil
+}
+
+func evalAttributeTypeCondition(args []string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	if len(args) != updateSplitCount {
+		return false, errors.New("unsupported condition expression")
+	}
+	value, found, err := resolveDocumentPath(item, args[0])
+	if err != nil || !found {
+		return false, err
+	}
+	typeValue, ok := values[strings.TrimSpace(args[1])]
+	if !ok || !typeValue.hasStringType() {
+		return false, errors.New("unsupported condition expression")
+	}
+	return dynamoAttributeType(value) == typeValue.stringValue(), nil
+}
+
+func evalBeginsWithCondition(args []string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	if len(args) != updateSplitCount {
+		return false, errors.New("unsupported condition expression")
+	}
+	left, found, err := resolveDocumentPath(item, args[0])
+	if err != nil || !found {
+		return false, err
+	}
+	right, ok := values[strings.TrimSpace(args[1])]
 	if !ok {
 		return false, errors.New("missing condition value")
 	}
-	return attributeValueEqual(lhs, rhs), nil
+	switch {
+	case left.hasStringType() && right.hasStringType():
+		return strings.HasPrefix(left.stringValue(), right.stringValue()), nil
+	case left.hasBinaryType() && right.hasBinaryType():
+		return bytes.HasPrefix(left.B, right.B), nil
+	default:
+		return false, nil
+	}
+}
+
+func evalContainsCondition(args []string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	if len(args) != updateSplitCount {
+		return false, errors.New("unsupported condition expression")
+	}
+	left, found, err := resolveDocumentPath(item, args[0])
+	if err != nil || !found {
+		return false, err
+	}
+	right, ok := values[strings.TrimSpace(args[1])]
+	if !ok {
+		return false, errors.New("missing condition value")
+	}
+	return attributeValueContains(left, right), nil
+}
+
+func attributeValueContains(left attributeValue, right attributeValue) bool {
+	for _, eval := range attributeValueContainsEvaluators {
+		if handled, ok := eval(left, right); handled {
+			return ok
+		}
+	}
+	return false
+}
+
+type attributeValueContainsEvaluator func(attributeValue, attributeValue) (bool, bool)
+
+var attributeValueContainsEvaluators = []attributeValueContainsEvaluator{
+	containsStringAttributeValue,
+	containsBinaryAttributeValue,
+	containsListAttributeValue,
+	containsStringSetAttributeValue,
+	containsNumberSetAttributeValue,
+	containsBinarySetAttributeValue,
+}
+
+func containsStringAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasStringType() || !right.hasStringType() {
+		return false, false
+	}
+	return true, strings.Contains(left.stringValue(), right.stringValue())
+}
+
+func containsBinaryAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasBinaryType() || !right.hasBinaryType() {
+		return false, false
+	}
+	return true, bytes.Contains(left.B, right.B)
+}
+
+func containsListAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasListType() {
+		return false, false
+	}
+	return true, listContainsAttributeValue(left.L, right)
+}
+
+func containsStringSetAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasStringSetType() || !right.hasStringType() {
+		return false, false
+	}
+	return true, stringSetContains(left.SS, right.stringValue())
+}
+
+func containsNumberSetAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasNumberSetType() || !right.hasNumberType() {
+		return false, false
+	}
+	return true, numberSetContains(left.NS, right.numberValue())
+}
+
+func containsBinarySetAttributeValue(left attributeValue, right attributeValue) (bool, bool) {
+	if !left.hasBinarySetType() || !right.hasBinaryType() {
+		return false, false
+	}
+	return true, binarySetContains(left.BS, right.B)
+}
+
+func listContainsAttributeValue(values []attributeValue, needle attributeValue) bool {
+	for _, value := range values {
+		if attributeValueEqual(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSetContains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func numberSetContains(values []string, needle string) bool {
+	for _, value := range values {
+		if cmp, ok := compareNumericAttributeString(value, needle); ok && cmp == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func binarySetContains(values [][]byte, needle []byte) bool {
+	for _, value := range values {
+		if bytes.Equal(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func evalConditionBetween(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, bool, error) {
+	betweenIndex := findTopLevelKeywordIndex(expr, "BETWEEN")
+	if betweenIndex < 0 {
+		return false, false, nil
+	}
+	leftExpr := strings.TrimSpace(expr[:betweenIndex])
+	rest := strings.TrimSpace(expr[betweenIndex+len("BETWEEN"):])
+	andIndex := findTopLevelKeywordIndex(rest, "AND")
+	if andIndex < 0 {
+		return false, true, errors.New("unsupported condition expression")
+	}
+	lowerExpr := strings.TrimSpace(rest[:andIndex])
+	upperExpr := strings.TrimSpace(rest[andIndex+len("AND"):])
+	left, found, err := resolveConditionOperand(leftExpr, item, values)
+	if err != nil || !found {
+		return false, true, err
+	}
+	lower, found, err := resolveConditionOperand(lowerExpr, item, values)
+	if err != nil || !found {
+		return false, true, err
+	}
+	upper, found, err := resolveConditionOperand(upperExpr, item, values)
+	if err != nil || !found {
+		return false, true, err
+	}
+	return compareAttributeValueSortKey(left, lower) >= 0 && compareAttributeValueSortKey(left, upper) <= 0, true, nil
+}
+
+func evalConditionIn(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, bool, error) {
+	inIndex := findTopLevelKeywordIndex(expr, "IN")
+	if inIndex < 0 {
+		return false, false, nil
+	}
+	left, parts, err := parseConditionInOperands(expr, inIndex, item, values)
+	if err != nil {
+		return false, true, err
+	}
+	ok, err := conditionInListContains(left, parts, item, values)
+	return ok, true, err
+}
+
+func parseConditionInOperands(expr string, inIndex int, item map[string]attributeValue, values map[string]attributeValue) (attributeValue, []string, error) {
+	leftExpr := strings.TrimSpace(expr[:inIndex])
+	rest := strings.TrimSpace(expr[inIndex+len("IN"):])
+	if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+		return attributeValue{}, nil, errors.New("unsupported condition expression")
+	}
+	left, found, err := resolveConditionOperand(leftExpr, item, values)
+	if err != nil || !found {
+		return attributeValue{}, nil, err
+	}
+	parts, err := splitTopLevelByComma(rest[1 : len(rest)-1])
+	if err != nil {
+		return attributeValue{}, nil, errors.New("unsupported condition expression")
+	}
+	return left, parts, nil
+}
+
+func conditionInListContains(left attributeValue, parts []string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	for _, part := range parts {
+		candidate, found, err := resolveConditionOperand(part, item, values)
+		if err != nil {
+			return false, err
+		}
+		if found && attributeValueEqual(left, candidate) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func evalConditionComparison(expr string, item map[string]attributeValue, values map[string]attributeValue) (bool, error) {
+	index, operator, ok := findTopLevelConditionComparator(expr)
+	if !ok {
+		return false, errors.New("unsupported condition expression")
+	}
+	left, right, err := resolveConditionComparisonOperands(expr, index, operator, item, values)
+	if err != nil {
+		return false, err
+	}
+	return compareConditionValues(operator, left, right)
+}
+
+func resolveConditionComparisonOperands(
+	expr string,
+	index int,
+	operator string,
+	item map[string]attributeValue,
+	values map[string]attributeValue,
+) (attributeValue, attributeValue, error) {
+	leftExpr := strings.TrimSpace(expr[:index])
+	rightExpr := strings.TrimSpace(expr[index+len(operator):])
+	left, found, err := resolveConditionOperand(leftExpr, item, values)
+	if err != nil || !found {
+		return attributeValue{}, attributeValue{}, err
+	}
+	right, found, err := resolveConditionOperand(rightExpr, item, values)
+	if err != nil || !found {
+		return attributeValue{}, attributeValue{}, err
+	}
+	return left, right, nil
+}
+
+func compareConditionValues(operator string, left attributeValue, right attributeValue) (bool, error) {
+	switch operator {
+	case "=":
+		return attributeValueEqual(left, right), nil
+	case "<>":
+		return !attributeValueEqual(left, right), nil
+	case "<":
+		return compareAttributeValueSortKey(left, right) < 0, nil
+	case "<=":
+		return compareAttributeValueSortKey(left, right) <= 0, nil
+	case ">":
+		return compareAttributeValueSortKey(left, right) > 0, nil
+	case ">=":
+		return compareAttributeValueSortKey(left, right) >= 0, nil
+	default:
+		return false, errors.New("unsupported condition expression")
+	}
+}
+
+func resolveConditionOperand(expr string, item map[string]attributeValue, values map[string]attributeValue) (attributeValue, bool, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return attributeValue{}, false, errors.New("unsupported condition expression")
+	}
+	if args, ok, err := parseExpressionFunctionArgs(expr, "size"); ok || err != nil {
+		if err != nil {
+			return attributeValue{}, false, err
+		}
+		return resolveConditionSizeOperand(args, item)
+	}
+	if strings.HasPrefix(expr, ":") {
+		value, ok := values[expr]
+		if !ok {
+			return attributeValue{}, false, errors.New("missing condition value")
+		}
+		return cloneAttributeValue(value), true, nil
+	}
+	value, found, err := resolveDocumentPath(item, expr)
+	if err != nil {
+		return attributeValue{}, false, err
+	}
+	return value, found, nil
+}
+
+func resolveConditionSizeOperand(args []string, item map[string]attributeValue) (attributeValue, bool, error) {
+	if len(args) != 1 {
+		return attributeValue{}, false, errors.New("unsupported condition expression")
+	}
+	value, found, err := resolveDocumentPath(item, args[0])
+	if err != nil || !found {
+		return attributeValue{}, false, err
+	}
+	size := attributeValueSize(value)
+	sizeString := strconv.Itoa(size)
+	return attributeValue{N: &sizeString}, true, nil
+}
+
+func attributeValueSize(value attributeValue) int {
+	switch {
+	case value.hasStringType():
+		return len(value.stringValue())
+	case value.hasBinaryType():
+		return len(value.B)
+	case value.hasStringSetType():
+		return len(value.SS)
+	case value.hasNumberSetType():
+		return len(value.NS)
+	case value.hasBinarySetType():
+		return len(value.BS)
+	case value.hasListType():
+		return len(value.L)
+	case value.hasMapType():
+		return len(value.M)
+	default:
+		return 0
+	}
+}
+
+func findTopLevelKeywordIndex(expr string, keyword string) int {
+	upper := strings.ToUpper(expr)
+	target := strings.ToUpper(keyword)
+	depth := 0
+	for i := 0; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth != 0 || !matchesKeywordTokenAt(upper, target, i) {
+			continue
+		}
+		if !isLogicalKeywordBoundary(expr, i-1) || !isLogicalKeywordBoundary(expr, i+len(target)) {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+func trimLeadingKeyword(expr string, keyword string) (string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(expr))
+	keyword = strings.ToUpper(keyword)
+	if !strings.HasPrefix(upper, keyword) {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(expr)
+	if !isLogicalKeywordBoundary(trimmed, len(keyword)) {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[len(keyword):]), true
+}
+
+func findTopLevelConditionComparator(expr string) (int, string, bool) {
+	operators := []string{"<>", "<=", ">=", "=", "<", ">"}
+	depth := 0
+	for i := 0; i < len(expr); i++ {
+		depth = nextParenDepth(depth, expr[i])
+		if depth != 0 {
+			continue
+		}
+		for _, operator := range operators {
+			if strings.HasPrefix(expr[i:], operator) {
+				return i, operator, true
+			}
+		}
+	}
+	return 0, "", false
+}
+
+func dynamoAttributeType(value attributeValue) string {
+	kind, count := detectAttributeValueKind(value)
+	if count != 1 {
+		return ""
+	}
+	return string(kind)
 }
 
 func hasOuterParens(expr string) bool {
@@ -3909,11 +5065,52 @@ func (t *dynamoTableSchema) keySchemaForQuery(indexName string) (dynamoKeySchema
 	if strings.TrimSpace(indexName) == "" {
 		return t.PrimaryKey, nil
 	}
-	ks, ok := t.GlobalSecondaryIndexes[indexName]
+	gsi, ok := t.GlobalSecondaryIndexes[indexName]
 	if !ok {
 		return dynamoKeySchema{}, errors.New("unknown index")
 	}
-	return ks, nil
+	return gsi.KeySchema, nil
+}
+
+func (t *dynamoTableSchema) gsiProjectedAttributeSet(indexName string) (bool, map[string]struct{}, error) {
+	gsi, ok := t.GlobalSecondaryIndexes[indexName]
+	if !ok {
+		return false, nil, errors.New("unknown index")
+	}
+	if strings.EqualFold(gsi.Projection.ProjectionType, "ALL") {
+		return true, nil, nil
+	}
+	out := map[string]struct{}{
+		t.PrimaryKey.HashKey:  {},
+		gsi.KeySchema.HashKey: {},
+	}
+	if t.PrimaryKey.RangeKey != "" {
+		out[t.PrimaryKey.RangeKey] = struct{}{}
+	}
+	if gsi.KeySchema.RangeKey != "" {
+		out[gsi.KeySchema.RangeKey] = struct{}{}
+	}
+	for _, attr := range gsi.Projection.NonKeyAttributes {
+		out[attr] = struct{}{}
+	}
+	return false, out, nil
+}
+
+func (t *dynamoTableSchema) projectItemForIndex(indexName string, item map[string]attributeValue) (map[string]attributeValue, error) {
+	allProjected, projected, err := t.gsiProjectedAttributeSet(indexName)
+	if err != nil {
+		return nil, err
+	}
+	if allProjected {
+		return cloneAttributeValueMap(item), nil
+	}
+	out := make(map[string]attributeValue, len(projected))
+	for attr := range projected {
+		if value, ok := item[attr]; ok {
+			out[attr] = cloneAttributeValue(value)
+		}
+	}
+	return out, nil
 }
 
 func (t *dynamoTableSchema) itemKeyFromAttributes(attrs map[string]attributeValue) ([]byte, error) {
@@ -3950,8 +5147,8 @@ func (t *dynamoTableSchema) gsiEntryKeysForItem(attrs map[string]attributeValue)
 	indexNames := sortedGSIIndexNames(t.GlobalSecondaryIndexes)
 	keys := make([][]byte, 0, len(indexNames))
 	for _, indexName := range indexNames {
-		ks := t.GlobalSecondaryIndexes[indexName]
-		indexHash, indexRange, include, err := gsiKeyValues(attrs, ks)
+		gsi := t.GlobalSecondaryIndexes[indexName]
+		indexHash, indexRange, include, err := gsiKeyValues(attrs, gsi.KeySchema)
 		if err != nil {
 			return nil, err
 		}
@@ -4009,7 +5206,7 @@ func gsiKeyValues(attrs map[string]attributeValue, ks dynamoKeySchema) (string, 
 	return hash, rangeKey, true, nil
 }
 
-func sortedGSIIndexNames(indexes map[string]dynamoKeySchema) []string {
+func sortedGSIIndexNames(indexes map[string]dynamoGlobalSecondaryIndex) []string {
 	names := make([]string, 0, len(indexes))
 	for name := range indexes {
 		names = append(names, name)
@@ -4018,109 +5215,105 @@ func sortedGSIIndexNames(indexes map[string]dynamoKeySchema) []string {
 	return names
 }
 
+var attributeValueKeyExtractors = map[attributeValueKind]func(attributeValue) string{
+	attributeValueKindString: func(attr attributeValue) string { return attr.stringValue() },
+	attributeValueKindNumber: func(attr attributeValue) string { return attr.numberValue() },
+	attributeValueKindBinary: func(attr attributeValue) string { return string(attr.B) },
+}
+
+var attributeValueScalarEqualityComparators = map[attributeValueKind]func(attributeValue, attributeValue) bool{
+	attributeValueKindString: func(left attributeValue, right attributeValue) bool { return left.stringValue() == right.stringValue() },
+	attributeValueKindNumber: numberAttributeValueEqual,
+	attributeValueKindBinary: func(left attributeValue, right attributeValue) bool { return bytes.Equal(left.B, right.B) },
+	attributeValueKindBool:   func(left attributeValue, right attributeValue) bool { return *left.BOOL == *right.BOOL },
+	attributeValueKindNull:   func(left attributeValue, right attributeValue) bool { return *left.NULL == *right.NULL },
+	attributeValueKindStringSet: func(left attributeValue, right attributeValue) bool {
+		return unorderedStringSlicesEqual(left.SS, right.SS)
+	},
+	attributeValueKindNumberSet: func(left attributeValue, right attributeValue) bool {
+		return unorderedNumberSlicesEqual(left.NS, right.NS)
+	},
+	attributeValueKindBinarySet: func(left attributeValue, right attributeValue) bool {
+		return unorderedBinarySlicesEqual(left.BS, right.BS)
+	},
+}
+
+var attributeValueSortFormatters = map[attributeValueKind]func(attributeValue) string{
+	attributeValueKindString:    func(attr attributeValue) string { return attr.stringValue() },
+	attributeValueKindNumber:    func(attr attributeValue) string { return attr.numberValue() },
+	attributeValueKindBinary:    func(attr attributeValue) string { return base64.RawURLEncoding.EncodeToString(attr.B) },
+	attributeValueKindBool:      formatBoolAttributeValue,
+	attributeValueKindNull:      func(attributeValue) string { return "" },
+	attributeValueKindStringSet: func(attr attributeValue) string { return strings.Join(sortedStringSlice(attr.SS), "\x00") },
+	attributeValueKindNumberSet: func(attr attributeValue) string { return strings.Join(sortedNumberStrings(attr.NS), "\x00") },
+	attributeValueKindBinarySet: func(attr attributeValue) string { return strings.Join(sortedBinaryStrings(attr.BS), "\x00") },
+}
+
 func attributeValueAsKey(attr attributeValue) (string, error) {
-	switch {
-	case attr.hasListType() || attr.hasMapType() || attr.BOOL != nil || attr.NULL != nil:
-		return "", errors.New("unsupported key attribute type")
-	case attr.hasNumberType():
-		return attr.numberValue(), nil
-	case attr.hasStringType():
-		return attr.stringValue(), nil
-	default:
+	kind, count := detectAttributeValueKind(attr)
+	if count != 1 {
 		return "", errors.New("unsupported key attribute type")
 	}
+	extract, ok := attributeValueKeyExtractors[kind]
+	if !ok {
+		return "", errors.New("unsupported key attribute type")
+	}
+	return extract(attr), nil
 }
 
 func attributeValueEqual(left attributeValue, right attributeValue) bool {
-	if handled, equal := compareBoolAttribute(left, right); handled {
-		return equal
-	}
-	if handled, equal := compareNullAttribute(left, right); handled {
-		return equal
-	}
-	if handled, equal := compareMapAttribute(left, right); handled {
-		return equal
-	}
-	if handled, equal := compareListAttribute(left, right); handled {
-		return equal
-	}
-	if handled, equal := compareNumberAttribute(left, right); handled {
-		return equal
-	}
-	if !left.hasStringType() && !right.hasStringType() {
+	leftKind, leftCount := detectAttributeValueKind(left)
+	rightKind, rightCount := detectAttributeValueKind(right)
+	if leftCount == 0 && rightCount == 0 {
 		return true
 	}
-	if !left.hasStringType() || !right.hasStringType() {
+	if leftCount != 1 || rightCount != 1 || leftKind != rightKind {
 		return false
 	}
-	return left.stringValue() == right.stringValue()
+	if leftKind == attributeValueKindMap {
+		return mapAttributeValueEqual(left, right)
+	}
+	if leftKind == attributeValueKindList {
+		return listAttributeValueEqual(left, right)
+	}
+	compare, ok := attributeValueScalarEqualityComparators[leftKind]
+	if !ok {
+		return false
+	}
+	return compare(left, right)
 }
 
-func compareBoolAttribute(left attributeValue, right attributeValue) (bool, bool) {
-	if left.BOOL == nil && right.BOOL == nil {
-		return false, false
+func numberAttributeValueEqual(left attributeValue, right attributeValue) bool {
+	cmp, ok := compareNumericAttributeString(left.numberValue(), right.numberValue())
+	if !ok {
+		return left.numberValue() == right.numberValue()
 	}
-	if left.BOOL == nil || right.BOOL == nil {
-		return true, false
-	}
-	return true, *left.BOOL == *right.BOOL
+	return cmp == 0
 }
 
-func compareNullAttribute(left attributeValue, right attributeValue) (bool, bool) {
-	if left.NULL == nil && right.NULL == nil {
-		return false, false
-	}
-	if left.NULL == nil || right.NULL == nil {
-		return true, false
-	}
-	return true, *left.NULL == *right.NULL
-}
-
-func compareMapAttribute(left attributeValue, right attributeValue) (bool, bool) {
-	if !left.hasMapType() && !right.hasMapType() {
-		return false, false
-	}
-	if !left.hasMapType() || !right.hasMapType() {
-		return true, false
-	}
+func mapAttributeValueEqual(left attributeValue, right attributeValue) bool {
 	if len(left.M) != len(right.M) {
-		return true, false
+		return false
 	}
-	for k, lv := range left.M {
-		rv, ok := right.M[k]
-		if !ok || !attributeValueEqual(lv, rv) {
-			return true, false
+	for key, leftValue := range left.M {
+		rightValue, ok := right.M[key]
+		if !ok || !attributeValueEqual(leftValue, rightValue) {
+			return false
 		}
 	}
-	return true, true
+	return true
 }
 
-func compareListAttribute(left attributeValue, right attributeValue) (bool, bool) {
-	if !left.hasListType() && !right.hasListType() {
-		return false, false
-	}
-	if !left.hasListType() || !right.hasListType() {
-		return true, false
-	}
+func listAttributeValueEqual(left attributeValue, right attributeValue) bool {
 	if len(left.L) != len(right.L) {
-		return true, false
+		return false
 	}
 	for i := range left.L {
 		if !attributeValueEqual(left.L[i], right.L[i]) {
-			return true, false
+			return false
 		}
 	}
-	return true, true
-}
-
-func compareNumberAttribute(left attributeValue, right attributeValue) (bool, bool) {
-	if !left.hasNumberType() && !right.hasNumberType() {
-		return false, false
-	}
-	if !left.hasNumberType() || !right.hasNumberType() {
-		return true, false
-	}
-	return true, left.numberValue() == right.numberValue()
+	return true
 }
 
 func compareAttributeValueSortKey(left attributeValue, right attributeValue) int {
@@ -4128,6 +5321,9 @@ func compareAttributeValueSortKey(left attributeValue, right attributeValue) int
 		if cmp, ok := compareNumericAttributeString(left.numberValue(), right.numberValue()); ok {
 			return cmp
 		}
+	}
+	if left.hasBinaryType() && right.hasBinaryType() {
+		return bytes.Compare(left.B, right.B)
 	}
 	return strings.Compare(attributeValueSortFallback(left), attributeValueSortFallback(right))
 }
@@ -4145,23 +5341,96 @@ func compareNumericAttributeString(left string, right string) (int, bool) {
 }
 
 func attributeValueSortFallback(attr attributeValue) string {
-	switch {
-	case attr.hasNumberType():
-		return attr.numberValue()
-	case attr.BOOL != nil:
-		if *attr.BOOL {
-			return "1"
-		}
-		return "0"
-	case attr.NULL != nil:
-		return ""
-	case attr.hasMapType() || attr.hasListType():
-		return ""
-	case attr.hasStringType():
-		return attr.stringValue()
-	default:
+	kind, count := detectAttributeValueKind(attr)
+	if count != 1 {
 		return ""
 	}
+	format, ok := attributeValueSortFormatters[kind]
+	if !ok {
+		return ""
+	}
+	return format(attr)
+}
+
+func formatBoolAttributeValue(attr attributeValue) string {
+	if *attr.BOOL {
+		return "1"
+	}
+	return "0"
+}
+
+func unorderedStringSlicesEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	lv := sortedStringSlice(left)
+	rv := sortedStringSlice(right)
+	for i := range lv {
+		if lv[i] != rv[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func unorderedNumberSlicesEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	lv := sortedNumberStrings(left)
+	rv := sortedNumberStrings(right)
+	for i := range lv {
+		if lv[i] != rv[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func unorderedBinarySlicesEqual(left [][]byte, right [][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	lv := sortedBinaryStrings(left)
+	rv := sortedBinaryStrings(right)
+	for i := range lv {
+		if lv[i] != rv[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedStringSlice(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func sortedNumberStrings(in []string) []string {
+	out := make([]string, len(in))
+	for i := range in {
+		out[i] = canonicalNumberString(in[i])
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedBinaryStrings(in [][]byte) []string {
+	out := make([]string, len(in))
+	for i := range in {
+		out[i] = base64.RawURLEncoding.EncodeToString(in[i])
+	}
+	sort.Strings(out)
+	return out
+}
+
+func canonicalNumberString(v string) string {
+	rat := &big.Rat{}
+	if _, ok := rat.SetString(strings.TrimSpace(v)); !ok {
+		return strings.TrimSpace(v)
+	}
+	return rat.RatString()
 }
 
 func reverseItems(items []map[string]attributeValue) {
@@ -4270,7 +5539,14 @@ func describeTableShape(t *dynamoTableSchema) map[string]any {
 		}
 		sort.Strings(indexNames)
 		for _, name := range indexNames {
-			ks := t.GlobalSecondaryIndexes[name]
+			gsi := t.GlobalSecondaryIndexes[name]
+			ks := gsi.KeySchema
+			projection := map[string]any{
+				"ProjectionType": gsi.Projection.ProjectionType,
+			}
+			if len(gsi.Projection.NonKeyAttributes) > 0 {
+				projection["NonKeyAttributes"] = append([]string(nil), gsi.Projection.NonKeyAttributes...)
+			}
 			idxKeySchema := []map[string]string{{
 				"AttributeName": ks.HashKey,
 				"KeyType":       "HASH",
@@ -4285,9 +5561,7 @@ func describeTableShape(t *dynamoTableSchema) map[string]any {
 				"IndexName":   name,
 				"IndexStatus": "ACTIVE",
 				"KeySchema":   idxKeySchema,
-				"Projection": map[string]string{
-					"ProjectionType": "ALL",
-				},
+				"Projection":  projection,
 			}
 			gsis = append(gsis, indexDesc)
 		}
@@ -4298,9 +5572,59 @@ func describeTableShape(t *dynamoTableSchema) map[string]any {
 }
 
 func cloneAttributeValueMap(in map[string]attributeValue) map[string]attributeValue {
+	if in == nil {
+		return nil
+	}
 	out := make(map[string]attributeValue, len(in))
 	for k, v := range in {
-		out[k] = v
+		out[k] = cloneAttributeValue(v)
+	}
+	return out
+}
+
+func cloneAttributeValueList(in []attributeValue) []attributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make([]attributeValue, 0, len(in))
+	for _, value := range in {
+		out = append(out, cloneAttributeValue(value))
+	}
+	return out
+}
+
+func cloneAttributeValue(in attributeValue) attributeValue {
+	out := attributeValue{}
+	if in.S != nil {
+		s := *in.S
+		out.S = &s
+	}
+	if in.N != nil {
+		n := *in.N
+		out.N = &n
+	}
+	if in.B != nil {
+		out.B = bytes.Clone(in.B)
+	}
+	if in.BOOL != nil {
+		b := *in.BOOL
+		out.BOOL = &b
+	}
+	if in.NULL != nil {
+		n := *in.NULL
+		out.NULL = &n
+	}
+	out.SS = cloneStringSlice(in.SS)
+	out.NS = cloneStringSlice(in.NS)
+	out.BS = cloneBinarySet(in.BS)
+	if in.L != nil {
+		out.L = make([]attributeValue, len(in.L))
+		for i := range in.L {
+			out.L[i] = cloneAttributeValue(in.L[i])
+		}
+	}
+	if in.M != nil {
+		out.M = cloneAttributeValueMap(in.M)
 	}
 	return out
 }
@@ -4356,10 +5680,6 @@ func (d *DynamoDBServer) loadTableGenerationAt(ctx context.Context, tableName st
 		return 0, errors.WithStack(err)
 	}
 	return gen, nil
-}
-
-func (d *DynamoDBServer) readItemAtKey(ctx context.Context, key []byte) (map[string]attributeValue, bool, error) {
-	return d.readItemAtKeyAt(ctx, key, snapshotTS(d.coordinator.Clock(), d.store))
 }
 
 func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uint64) (map[string]attributeValue, bool, error) {
