@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 )
@@ -320,7 +321,7 @@ func cloneStringSlice(in []string) []string {
 	if in == nil {
 		return nil
 	}
-	return append([]string(nil), in...)
+	return slices.Clone(in)
 }
 
 func cloneBinarySet(in [][]byte) [][]byte {

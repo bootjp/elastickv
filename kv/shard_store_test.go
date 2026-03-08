@@ -78,7 +78,40 @@ func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
 		{Key: []byte("b"), Value: []byte("vb")},
 	}
 
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("d"), 10)
-	require.Equal(t, []byte("b"), lockStart)
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("d"), 2)
+	require.Equal(t, []byte("a"), lockStart)
 	require.Equal(t, nextScanCursor([]byte("c")), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_PreservesOriginalStart(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("vc")},
+		{Key: []byte("e"), Value: []byte("ve")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("z"), 2)
+	require.Equal(t, []byte("a"), lockStart)
+	require.Equal(t, nextScanCursor([]byte("e")), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_IncompleteScanUsesOriginalRange(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("vc")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("z"), 2)
+	require.Equal(t, []byte("a"), lockStart)
+	require.Equal(t, []byte("z"), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_EmptyUsesOriginalRange(t *testing.T) {
+	t.Parallel()
+
+	lockStart, lockEnd := scanLockBoundsForKVs(nil, []byte("a"), []byte("z"), 10)
+	require.Equal(t, []byte("a"), lockStart)
+	require.Equal(t, []byte("z"), lockEnd)
 }

@@ -29,6 +29,18 @@ const (
 
 var Tombstone = []byte{0x00}
 
+const scanResultCapacityLimit = 1024
+
+func boundedScanResultCapacity(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > scanResultCapacityLimit {
+		return scanResultCapacityLimit
+	}
+	return limit
+}
+
 // HybridClock provides monotonically increasing timestamps (HLC).
 type HybridClock interface {
 	Now() uint64

@@ -275,7 +275,7 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 		return []*KVPair{}, nil
 	}
 
-	capHint := limit
+	capHint := boundedScanResultCapacity(limit)
 	if size := s.tree.Size(); size < capHint {
 		capHint = size
 	}
@@ -316,7 +316,7 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 		return []*KVPair{}, nil
 	}
 
-	capHint := limit
+	capHint := boundedScanResultCapacity(limit)
 	if size := s.tree.Size(); size < capHint {
 		capHint = size
 	}

@@ -358,7 +358,7 @@ func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 }
 
 func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
-	result := make([]*KVPair, 0, limit)
+	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
 		userKey, version, ok := nextScannableUserKey(iter)
@@ -413,7 +413,7 @@ func (s *pebbleStore) collectReverseScanResults(
 	limit int,
 	ts uint64,
 ) ([]*KVPair, error) {
-	result := make([]*KVPair, 0, limit)
+	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
 
 	valid := seekReverseScanStart(iter, end)
 	for valid && len(result) < limit {
