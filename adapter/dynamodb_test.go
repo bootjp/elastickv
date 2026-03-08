@@ -2,6 +2,8 @@ package adapter
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +76,142 @@ func TestDynamoDB_PutItem_GetItem(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "test", keyAttr.Value)
 	assert.Equal(t, "v", valueAttr.Value)
+}
+
+func TestDynamoDB_DeleteItem(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "delete-target"},
+			"value": &types.AttributeValueMemberS{Value: "v"},
+		},
+	})
+	require.NoError(t, err)
+
+	delOut, err := client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "delete-target"},
+		},
+		ReturnValues: types.ReturnValueAllOld,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, delOut.Attributes)
+	oldValue, ok := delOut.Attributes["value"].(*types.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "v", oldValue.Value)
+
+	getOut, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "delete-target"},
+		},
+	})
+	require.NoError(t, err)
+	require.Empty(t, getOut.Item)
+}
+
+func TestDynamoDB_DeleteItem_Condition(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "cond-target"},
+			"value": &types.AttributeValueMemberS{Value: "v"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "cond-target"},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(#k)"),
+		ExpressionAttributeNames: map[string]string{
+			"#k": "key",
+		},
+	})
+	require.Error(t, err)
+	var condErr *types.ConditionalCheckFailedException
+	require.ErrorAs(t, err, &condErr)
+
+	getOut, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "cond-target"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, getOut.Item)
+
+	_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: aws.String("t"),
+		Key: map[string]types.AttributeValue{
+			"key": &types.AttributeValueMemberS{Value: "cond-target"},
+		},
+		ConditionExpression: aws.String("attribute_exists(#k)"),
+		ExpressionAttributeNames: map[string]string{
+			"#k": "key",
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestDynamoDB_DeleteItem_RequestBodyTooLarge(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	reqBody := strings.Repeat("a", dynamoMaxRequestBodyBytes+1)
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://"+nodes[0].dynamoAddress+"/",
+		strings.NewReader(reqBody),
+	)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Target", deleteItemTarget)
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), dynamoErrValidation)
+	require.Contains(t, string(body), "too large")
 }
 
 func TestDynamoDB_TransactWriteItems(t *testing.T) {
