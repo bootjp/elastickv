@@ -6617,6 +6617,8 @@ func signedMagnitude(v int64) uint64 {
 	return abs.Uint64()
 }
 
+var orderedUint64LengthPrefix = [...]byte{0, 1, 2, 3, 4, 5, 6, 7, 8}
+
 func encodeOrderedUint64(v uint64) []byte {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], v)
@@ -6624,8 +6626,9 @@ func encodeOrderedUint64(v uint64) []byte {
 	for start < len(buf)-1 && buf[start] == 0 {
 		start++
 	}
-	out := make([]byte, 0, len(buf)-start+1)
-	out = append(out, byte(len(buf)-start))
+	width := len(buf) - start
+	out := make([]byte, 0, width+1)
+	out = append(out, orderedUint64LengthPrefix[width])
 	out = append(out, buf[start:]...)
 	return out
 }
