@@ -33,7 +33,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.0"
+          go-version: "1.26.1"
 
       - name: Bring up Jepsen VMs
         working-directory: jepsen
@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: jepsen-results
           path: artifacts/results.tgz

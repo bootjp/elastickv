@@ -54,6 +54,7 @@ const (
 	tableLockStripeCount        = 128
 	tableCleanupDeleteBatchSize = 256
 	batchWriteItemMaxItems      = 25
+	dynamoMaxRequestBodyBytes   = 1 << 20
 
 	dynamoTableMetaPrefix       = "!ddb|meta|table|"
 	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
@@ -732,6 +733,7 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 		if err != nil {
 			return nil, err
 		}
+		plan.req.StartTS = readTS
 		if err = d.commitItemWrite(ctx, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return nil, errors.WithStack(err)
@@ -855,7 +857,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeDeleteItemInput(r.Body)
+	in, err := decodeDeleteItemInput(http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1510,7 +1512,11 @@ func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeyS
 	if err != nil {
 		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	parsed, err := parseKeyConditionExpression(replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames))
+	keyExpr, err := replaceNames(in.KeyConditionExpression, in.ExpressionAttributeNames)
+	if err != nil {
+		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	parsed, err := parseKeyConditionExpression(keyExpr)
 	if err != nil {
 		return dynamoKeySchema{}, queryCondition{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -1608,11 +1614,15 @@ func newReadPageState(schema *dynamoTableSchema, opts readPageOptions) (*readPag
 	if err != nil {
 		return nil, err
 	}
+	filterExpr, err := replaceNames(opts.filterExpression, opts.expressionAttributeNames)
+	if err != nil {
+		return nil, err
+	}
 	return &readPageState{
 		schema:       schema,
 		opts:         opts,
 		projection:   projection,
-		filterExpr:   strings.TrimSpace(replaceNames(opts.filterExpression, opts.expressionAttributeNames)),
+		filterExpr:   strings.TrimSpace(filterExpr),
 		includeItems: !strings.EqualFold(strings.TrimSpace(opts.selectValue), dynamoSelectCount),
 		limit:        limit,
 		hasLimit:     hasLimit,
@@ -1695,7 +1705,11 @@ func matchesReadFilter(expr string, item map[string]attributeValue, values map[s
 }
 
 func resolveProjectionAttributes(expr string, names map[string]string) ([]string, error) {
-	projection := strings.TrimSpace(replaceNames(expr, names))
+	projectionExpr, err := replaceNames(expr, names)
+	if err != nil {
+		return nil, err
+	}
+	projection := strings.TrimSpace(projectionExpr)
 	if projection == "" {
 		return nil, nil
 	}
@@ -2515,7 +2529,10 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, [][]byte, error) {
 	readTS := d.nextTxnReadTS()
 	reqs := &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
+		IsTxn: true,
+		// Keep transaction start aligned with the snapshot used to evaluate
+		// ConditionCheck/ConditionExpression so concurrent writes after readTS
+		// are detected as write conflicts at commit time.
 		StartTS: readTS,
 	}
 	schemaCache := make(map[string]*dynamoTableSchema)
@@ -2953,9 +2970,12 @@ func writeDynamoJSON(w http.ResponseWriter, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func replaceNames(expr string, names map[string]string) string {
+func replaceNames(expr string, names map[string]string) (string, error) {
 	if expr == "" || len(names) == 0 {
-		return expr
+		return expr, nil
+	}
+	if err := validateExpressionAttributeNames(names); err != nil {
+		return "", err
 	}
 	keys := make([]string, 0, len(names))
 	for k := range names {
@@ -2973,11 +2993,68 @@ func replaceNames(expr string, names map[string]string) string {
 	for _, key := range keys {
 		args = append(args, key, names[key])
 	}
-	return strings.NewReplacer(args...).Replace(expr)
+	return strings.NewReplacer(args...).Replace(expr), nil
+}
+
+func validateExpressionAttributeNames(names map[string]string) error {
+	for placeholder, name := range names {
+		if !isExpressionAttributePlaceholder(placeholder) {
+			return errors.Errorf("invalid expression attribute placeholder %q", placeholder)
+		}
+		if !isExpressionAttributeName(name) {
+			return errors.Errorf("invalid expression attribute name %q for placeholder %q", name, placeholder)
+		}
+	}
+	return nil
+}
+
+func isExpressionAttributePlaceholder(s string) bool {
+	if len(s) <= 1 || s[0] != '#' {
+		return false
+	}
+	return isExpressionPlaceholderIdentifier(s[1:])
+}
+
+func isExpressionPlaceholderIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if isExpressionPlaceholderIdentByte(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isExpressionPlaceholderIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func isExpressionAttributeName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if isExpressionAttributeNameByte(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isExpressionAttributeNameByte(b byte) bool {
+	return b == '_' || b == '.' || b == '-' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 func applyUpdateExpression(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
-	updExpr := strings.TrimSpace(replaceNames(expr, names))
+	updExpr, err := replaceNames(expr, names)
+	if err != nil {
+		return err
+	}
+	updExpr = strings.TrimSpace(updExpr)
 	sections, err := parseUpdateExpressionSections(updExpr)
 	if err != nil {
 		return err
@@ -3253,7 +3330,11 @@ func splitTopLevelByComma(expr string) ([]string, error) {
 }
 
 func validateConditionOnItem(expr string, names map[string]string, values map[string]attributeValue, item map[string]attributeValue) error {
-	cond := strings.TrimSpace(replaceNames(expr, names))
+	cond, err := replaceNames(expr, names)
+	if err != nil {
+		return err
+	}
+	cond = strings.TrimSpace(cond)
 	if cond == "" {
 		return nil
 	}
@@ -3444,9 +3525,9 @@ func isLogicalKeywordBoundary(s string, pos int) bool {
 		return true
 	}
 	ch := s[pos]
-	// Keep ASCII letters/digits/underscore as identifier token characters so
-	// expressions like "MY_AND_VAR" are not split at the "AND" substring.
-	if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+	// Keep identifier-style characters as token characters so expressions like
+	// "MY_AND_VAR" or "a-OR-b" are not split at logical keyword substrings.
+	if isExpressionAttributeNameByte(ch) {
 		return false
 	}
 	return true

@@ -27,9 +27,10 @@ var (
 	ErrNoRaftGroupsConfigured  = errors.New("no raft groups configured")
 	ErrNoShardRangesConfigured = errors.New("no shard ranges configured")
 
-	ErrInvalidRaftGroupsEntry   = errors.New("invalid raftGroups entry")
-	ErrInvalidShardRangesEntry  = errors.New("invalid shardRanges entry")
-	ErrInvalidRaftRedisMapEntry = errors.New("invalid raftRedisMap entry")
+	ErrInvalidRaftGroupsEntry           = errors.New("invalid raftGroups entry")
+	ErrInvalidShardRangesEntry          = errors.New("invalid shardRanges entry")
+	ErrInvalidRaftRedisMapEntry         = errors.New("invalid raftRedisMap entry")
+	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
 )
 
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
@@ -136,6 +137,41 @@ func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 		out[raft.ServerAddress(k)] = v
 	}
 	return out, nil
+}
+
+func parseRaftBootstrapMembers(raw string) ([]raft.Server, error) {
+	servers := make([]raft.Server, 0)
+	if raw == "" {
+		return servers, nil
+	}
+	seen := make(map[raft.ServerID]struct{})
+	parts := strings.Split(raw, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", splitParts)
+		if len(kv) != splitParts {
+			return nil, errors.Wrapf(ErrInvalidRaftBootstrapMembersEntry, "%q", part)
+		}
+		id := strings.TrimSpace(kv[0])
+		addr := strings.TrimSpace(kv[1])
+		if id == "" || addr == "" {
+			return nil, errors.Wrapf(ErrInvalidRaftBootstrapMembersEntry, "%q", part)
+		}
+		sid := raft.ServerID(id)
+		if _, exists := seen[sid]; exists {
+			return nil, errors.Wrapf(ErrInvalidRaftBootstrapMembersEntry, "duplicate id %q", id)
+		}
+		seen[sid] = struct{}{}
+		servers = append(servers, raft.Server{
+			Suffrage: raft.Voter,
+			ID:       sid,
+			Address:  raft.ServerAddress(addr),
+		})
+	}
+	return servers, nil
 }
 
 func defaultGroupID(groups []groupSpec) uint64 {
