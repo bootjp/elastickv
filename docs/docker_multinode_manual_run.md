@@ -220,6 +220,28 @@ redis-cli -h 10.0.0.11 -p 6379 SET survive yes
 redis-cli -h 10.0.0.12 -p 6379 GET survive
 ```
 
+## DynamoDB Compatibility Notes
+
+Current DynamoDB-compatible API coverage includes:
+
+- `CreateTable`
+- `DeleteTable`
+- `DescribeTable`
+- `ListTables`
+- `PutItem`
+- `GetItem`
+- `DeleteItem`
+- `UpdateItem`
+- `Query`
+- `TransactWriteItems`
+
+Currently unsupported commands:
+
+- `Scan`
+- `BatchWriteItem`
+
+If you migrate existing DynamoDB data, use key-based reads (`GetItem`/`Query`) and write with `PutItem`/`TransactWriteItems` instead of `Scan`/`BatchWriteItem`.
+
 ## Stop and Cleanup
 
 Stop/remove on each VM:
