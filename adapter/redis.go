@@ -39,7 +39,6 @@ const (
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
-	maxByteValue             = 0xFF
 )
 
 //nolint:mnd
@@ -464,23 +463,6 @@ func listPatternScanBounds(prefix string, pattern []byte) ([]byte, []byte) {
 	}
 	end := append(bytes.Clone(prefixBytes), userEnd...)
 	return start, end
-}
-
-func prefixScanEnd(prefix []byte) []byte {
-	if len(prefix) == 0 {
-		return nil
-	}
-
-	end := bytes.Clone(prefix)
-	for i := len(end) - 1; i >= 0; i-- {
-		if end[i] == maxByteValue {
-			continue
-		}
-		end[i]++
-		return end[:i+1]
-	}
-
-	return nil
 }
 
 func matchesAsteriskPattern(pattern, key []byte) bool {
