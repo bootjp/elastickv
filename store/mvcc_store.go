@@ -326,7 +326,7 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 
 	result := make([]*KVPair, 0, capHint)
 	it := s.tree.Iterator()
-	if !seekReverseIteratorStart(&it, end) {
+	if !seekReverseIteratorStart(s.tree, &it, end) {
 		return result, nil
 	}
 	collectReverseVisibleKVs(&it, start, limit, ts, &result)
@@ -334,16 +334,29 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 	return result, nil
 }
 
-func seekReverseIteratorStart(it *treemap.Iterator, end []byte) bool {
-	ok := it.Last()
-	for ok && end != nil {
-		k, keyOK := it.Key().([]byte)
-		if keyOK && bytes.Compare(k, end) < 0 {
-			return true
-		}
-		ok = it.Prev()
+func seekReverseIteratorStart(tree *treemap.Map, it *treemap.Iterator, end []byte) bool {
+	if end == nil {
+		return it.Last()
 	}
-	return ok
+	floorKey, _ := tree.Floor(end)
+	if floorKey == nil {
+		return false
+	}
+	target, ok := floorKey.([]byte)
+	if !ok {
+		return false
+	}
+	it.End()
+	if bytes.Compare(target, end) < 0 {
+		return it.PrevTo(func(key interface{}, value interface{}) bool {
+			k, keyOK := key.([]byte)
+			return keyOK && bytes.Equal(k, target)
+		})
+	}
+	return it.PrevTo(func(key interface{}, value interface{}) bool {
+		k, keyOK := key.([]byte)
+		return keyOK && bytes.Compare(k, end) < 0
+	})
 }
 
 func collectReverseVisibleKVs(

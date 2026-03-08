@@ -69,3 +69,16 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k1, kvs[1].Key)
 	require.Equal(t, k2, kvs[2].Key)
 }
+
+func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("vc")},
+		{Key: []byte("b"), Value: []byte("vb")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("d"), 10)
+	require.Equal(t, []byte("b"), lockStart)
+	require.Equal(t, nextScanCursor([]byte("c")), lockEnd)
+}

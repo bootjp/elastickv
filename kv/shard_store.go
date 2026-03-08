@@ -281,6 +281,9 @@ func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte,
 	if len(firstUserKey) == 0 || len(lastUserKey) == 0 {
 		return scanStart, scanEnd
 	}
+	if bytes.Compare(firstUserKey, lastUserKey) > 0 {
+		firstUserKey, lastUserKey = lastUserKey, firstUserKey
+	}
 	bound := nextScanCursor(lastUserKey)
 	if scanEnd == nil || bytes.Compare(bound, scanEnd) < 0 {
 		scanEnd = bound

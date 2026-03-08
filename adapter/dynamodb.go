@@ -142,6 +142,10 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func maxDynamoBodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
+	return http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes)
+}
+
 func (d *DynamoDBServer) dispatchByTarget(target string, w http.ResponseWriter, r *http.Request) bool {
 	handler, ok := d.targetHandlers[target]
 	if !ok {
@@ -238,6 +242,77 @@ type updateItemInput struct {
 	ReturnValues              string                    `json:"ReturnValues"`
 }
 
+type putItemInput struct {
+	TableName                 string                    `json:"TableName"`
+	Item                      map[string]attributeValue `json:"Item"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
+}
+
+type deleteItemInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+	ReturnValues              string                    `json:"ReturnValues"`
+}
+
+type batchWriteItemInput struct {
+	RequestItems map[string][]batchWriteRequest `json:"RequestItems"`
+}
+
+type batchWriteRequest struct {
+	PutRequest    *batchPutRequest    `json:"PutRequest,omitempty"`
+	DeleteRequest *batchDeleteRequest `json:"DeleteRequest,omitempty"`
+}
+
+type batchPutRequest struct {
+	Item map[string]attributeValue `json:"Item"`
+}
+
+type batchDeleteRequest struct {
+	Key map[string]attributeValue `json:"Key"`
+}
+
+type transactWriteItemsInput struct {
+	TransactItems []transactWriteItem `json:"TransactItems"`
+}
+
+type transactWriteItem struct {
+	Put            *putItemInput           `json:"Put,omitempty"`
+	Update         *transactUpdateInput    `json:"Update,omitempty"`
+	Delete         *transactDeleteInput    `json:"Delete,omitempty"`
+	ConditionCheck *transactConditionInput `json:"ConditionCheck,omitempty"`
+}
+
+type transactUpdateInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	UpdateExpression          string                    `json:"UpdateExpression"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
+type transactDeleteInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
+type transactConditionInput struct {
+	TableName                 string                    `json:"TableName"`
+	Key                       map[string]attributeValue `json:"Key"`
+	ConditionExpression       string                    `json:"ConditionExpression"`
+	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
+}
+
 type dynamoKeySchema struct {
 	HashKey  string `json:"hash_key"`
 	RangeKey string `json:"range_key,omitempty"`
@@ -264,7 +339,7 @@ type dynamoTableSchema struct {
 }
 
 func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeCreateTableInput(r.Body)
+	in, err := decodeCreateTableInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -433,7 +508,7 @@ func makeCreateTableRequest(baseSchema *dynamoTableSchema, nextGeneration uint64
 }
 
 func (d *DynamoDBServer) deleteTable(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeDeleteTableInput(r.Body)
+	in, err := decodeDeleteTableInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -598,7 +673,7 @@ func (d *DynamoDBServer) dispatchDeleteBatch(ctx context.Context, keys [][]byte)
 }
 
 func (d *DynamoDBServer) describeTable(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
 		return
@@ -629,7 +704,7 @@ func (d *DynamoDBServer) describeTable(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) listTables(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeListTablesInput(r.Body)
+	in, err := decodeListTablesInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -710,7 +785,7 @@ func (d *DynamoDBServer) listTableNames(ctx context.Context) ([]string, error) {
 }
 
 func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
-	in, err := decodePutItemInput(r.Body)
+	in, err := decodePutItemInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -874,7 +949,7 @@ func (d *DynamoDBServer) commitItemWrite(ctx context.Context, req *kv.OperationG
 }
 
 func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
 		return
@@ -922,7 +997,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
-	in, shouldReturnOld, err := decodeDeleteItemInput(http.MaxBytesReader(w, r.Body, dynamoMaxRequestBodyBytes))
+	in, shouldReturnOld, err := decodeDeleteItemInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1049,7 +1124,7 @@ func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteIt
 }
 
 func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeUpdateItemInput(r.Body)
+	in, err := decodeUpdateItemInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1347,15 +1422,14 @@ func selectUpdatedAttributes(current map[string]attributeValue, next map[string]
 
 func updatedAttributeNames(current map[string]attributeValue, next map[string]attributeValue) []string {
 	seen := make(map[string]struct{}, len(current)+len(next))
-	names := make([]string, 0, len(current)+len(next))
 	for name := range current {
 		seen[name] = struct{}{}
-		names = append(names, name)
 	}
 	for name := range next {
-		if _, ok := seen[name]; ok {
-			continue
-		}
+		seen[name] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -1375,7 +1449,7 @@ func updatedAttributeNames(current map[string]attributeValue, next map[string]at
 }
 
 func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeQueryInput(r.Body)
+	in, err := decodeQueryInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1397,7 +1471,7 @@ func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeScanInput(r.Body)
+	in, err := decodeScanInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -3173,7 +3247,7 @@ func makeReadLastEvaluatedKey(primary dynamoKeySchema, index dynamoKeySchema, it
 }
 
 func (d *DynamoDBServer) batchWriteItem(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeBatchWriteItemInput(r.Body)
+	in, err := decodeBatchWriteItemInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -3395,7 +3469,7 @@ func countBatchWriteActions(request batchWriteRequest) int {
 }
 
 func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Request) {
-	in, err := decodeTransactWriteItemsInput(r.Body)
+	in, err := decodeTransactWriteItemsInput(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return

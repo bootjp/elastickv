@@ -65,8 +65,10 @@ var attributeValueMarshalers = map[attributeValueKind]func(attributeValue) any{
 	attributeValueKindStringSet: func(a attributeValue) any { return map[string][]string{"SS": cloneStringSlice(a.SS)} },
 	attributeValueKindNumberSet: func(a attributeValue) any { return map[string][]string{"NS": cloneStringSlice(a.NS)} },
 	attributeValueKindBinarySet: func(a attributeValue) any { return map[string][][]byte{"BS": cloneBinarySet(a.BS)} },
-	attributeValueKindList:      func(a attributeValue) any { return map[string][]attributeValue{"L": a.L} },
-	attributeValueKindMap:       func(a attributeValue) any { return map[string]map[string]attributeValue{"M": a.M} },
+	attributeValueKindList:      func(a attributeValue) any { return map[string][]attributeValue{"L": cloneAttributeValueList(a.L)} },
+	attributeValueKindMap: func(a attributeValue) any {
+		return map[string]map[string]attributeValue{"M": cloneAttributeValueMap(a.M)}
+	},
 }
 
 var attributeValueUnmarshalers = map[string]attributeValueUnmarshalFunc{
@@ -80,77 +82,6 @@ var attributeValueUnmarshalers = map[string]attributeValueUnmarshalFunc{
 	"BS":   (*attributeValue).unmarshalBinarySet,
 	"L":    (*attributeValue).unmarshalList,
 	"M":    (*attributeValue).unmarshalMap,
-}
-
-type putItemInput struct {
-	TableName                 string                    `json:"TableName"`
-	Item                      map[string]attributeValue `json:"Item"`
-	ConditionExpression       string                    `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
-	ReturnValues              string                    `json:"ReturnValues"`
-}
-
-type deleteItemInput struct {
-	TableName                 string                    `json:"TableName"`
-	Key                       map[string]attributeValue `json:"Key"`
-	ConditionExpression       string                    `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
-	ReturnValues              string                    `json:"ReturnValues"`
-}
-
-type batchWriteItemInput struct {
-	RequestItems map[string][]batchWriteRequest `json:"RequestItems"`
-}
-
-type batchWriteRequest struct {
-	PutRequest    *batchPutRequest    `json:"PutRequest,omitempty"`
-	DeleteRequest *batchDeleteRequest `json:"DeleteRequest,omitempty"`
-}
-
-type batchPutRequest struct {
-	Item map[string]attributeValue `json:"Item"`
-}
-
-type batchDeleteRequest struct {
-	Key map[string]attributeValue `json:"Key"`
-}
-
-type transactWriteItemsInput struct {
-	TransactItems []transactWriteItem `json:"TransactItems"`
-}
-
-type transactWriteItem struct {
-	Put            *putItemInput           `json:"Put,omitempty"`
-	Update         *transactUpdateInput    `json:"Update,omitempty"`
-	Delete         *transactDeleteInput    `json:"Delete,omitempty"`
-	ConditionCheck *transactConditionInput `json:"ConditionCheck,omitempty"`
-}
-
-type transactUpdateInput struct {
-	TableName                 string                    `json:"TableName"`
-	Key                       map[string]attributeValue `json:"Key"`
-	UpdateExpression          string                    `json:"UpdateExpression"`
-	ConditionExpression       string                    `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
-}
-
-type transactDeleteInput struct {
-	TableName                 string                    `json:"TableName"`
-	Key                       map[string]attributeValue `json:"Key"`
-	ConditionExpression       string                    `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
-}
-
-type transactConditionInput struct {
-	TableName                 string                    `json:"TableName"`
-	Key                       map[string]attributeValue `json:"Key"`
-	ConditionExpression       string                    `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
 }
 
 func (a attributeValue) hasStringType() bool {
