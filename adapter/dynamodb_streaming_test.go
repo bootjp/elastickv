@@ -184,7 +184,7 @@ func TestDynamoDB_QueryItems_StreamsGSIIndexPages(t *testing.T) {
 	require.Equal(t, 1, out.scannedCount)
 	require.Equal(t, 1, tracking.scanCalls)
 	require.Equal(t, []int{2}, tracking.scanLimits)
-	require.Equal(t, 3, tracking.getCalls)
+	require.Equal(t, 4, tracking.getCalls)
 }
 
 func TestDynamoDB_QueryItems_StreamsReverseGSIIndexPages(t *testing.T) {
@@ -217,7 +217,7 @@ func TestDynamoDB_QueryItems_StreamsReverseGSIIndexPages(t *testing.T) {
 	require.Equal(t, 1, tracking.reverseScanCalls)
 	require.Zero(t, tracking.scanCalls)
 	require.Equal(t, []int{2}, tracking.reverseLimits)
-	require.Equal(t, 3, tracking.getCalls)
+	require.Equal(t, 4, tracking.getCalls)
 }
 
 func TestDynamoDB_ScanItems_StreamsGSIIndexPages(t *testing.T) {
@@ -244,7 +244,7 @@ func TestDynamoDB_ScanItems_StreamsGSIIndexPages(t *testing.T) {
 	require.Equal(t, 1, out.scannedCount)
 	require.Equal(t, 1, tracking.scanCalls)
 	require.Equal(t, []int{2}, tracking.scanLimits)
-	require.Equal(t, 3, tracking.getCalls)
+	require.Equal(t, 4, tracking.getCalls)
 }
 
 func newStreamingTestServer(t *testing.T, withGSI bool) (*dynamoTableSchema, *DynamoDBServer, *dynamoTrackingStore) {
