@@ -87,6 +87,7 @@ func run() error {
 			rt.Close()
 		}
 	}()
+	defer cancel()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {

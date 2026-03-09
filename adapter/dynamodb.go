@@ -251,9 +251,7 @@ func (d *DynamoDBServer) Stop() {
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	target := r.Header.Get("X-Amz-Target")
 	if d.requestObserver == nil {
-		if !d.dispatchByTarget(target, w, r) {
-			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
-		}
+		d.dispatchOrWriteUnsupported(target, w, r)
 		return
 	}
 
@@ -268,9 +266,7 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	recorder := &dynamoResponseRecorder{ResponseWriter: w}
 	started := time.Now()
 
-	if !d.dispatchByTarget(target, recorder, r) {
-		writeDynamoError(recorder, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
-	}
+	d.dispatchOrWriteUnsupported(target, recorder, r)
 
 	d.requestObserver.ObserveDynamoDBRequest(monitoring.DynamoDBRequestReport{
 		Operation:     operation,
@@ -295,6 +291,13 @@ func (d *DynamoDBServer) dispatchByTarget(target string, w http.ResponseWriter, 
 	}
 	handler(w, r)
 	return true
+}
+
+func (d *DynamoDBServer) dispatchOrWriteUnsupported(target string, w http.ResponseWriter, r *http.Request) {
+	if d.dispatchByTarget(target, w, r) {
+		return
+	}
+	writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
 }
 
 func dynamoOperationName(target string) string {
