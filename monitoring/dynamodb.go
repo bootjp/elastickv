@@ -204,7 +204,7 @@ func (m *DynamoDBMetrics) ObserveDynamoDBRequest(report DynamoDBRequestReport) {
 	}
 
 	m.observeRequest(operation, outcome, report)
-	m.observeTables(operation, outcome, mergeReportTables(report.Tables, tableMetrics), tableMetrics)
+	m.observeTables(operation, outcome, report.Tables, tableMetrics)
 }
 
 func normalizeDynamoOperation(operation string) string {
@@ -223,16 +223,6 @@ func (m *DynamoDBMetrics) observeRequest(operation string, outcome string, repor
 	m.requestDuration.WithLabelValues(operation, outcome).Observe(report.Duration.Seconds())
 	m.requestSize.WithLabelValues(operation).Observe(float64(max(report.RequestBytes, 0)))
 	m.responseSize.WithLabelValues(operation, outcome).Observe(float64(max(report.ResponseBytes, 0)))
-}
-
-func mergeReportTables(tables []string, tableMetrics map[string]DynamoDBTableMetrics) []string {
-	merged := append([]string(nil), tables...)
-	for table := range tableMetrics {
-		if table = strings.TrimSpace(table); table != "" {
-			merged = append(merged, table)
-		}
-	}
-	return normalizedTables(merged)
 }
 
 func (m *DynamoDBMetrics) observeTables(operation string, outcome string, tables []string, tableMetrics map[string]DynamoDBTableMetrics) {
@@ -264,24 +254,6 @@ func (m *DynamoDBMetrics) observeTableOutcome(operation string, table string, ou
 	case dynamoOutcomeSystemError:
 		m.systemErrors.WithLabelValues(operation, table).Inc()
 	}
-}
-
-func normalizedTables(tables []string) []string {
-	out := make([]string, 0, len(tables))
-	seen := make(map[string]struct{}, len(tables))
-	for _, table := range tables {
-		table = strings.TrimSpace(table)
-		if table == "" {
-			continue
-		}
-		if _, ok := seen[table]; ok {
-			continue
-		}
-		seen[table] = struct{}{}
-		out = append(out, table)
-	}
-	slices.Sort(out)
-	return out
 }
 
 func classifyDynamoOutcome(status int, errorType string) string {

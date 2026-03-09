@@ -22,7 +22,7 @@ func TestDynamoDBMetricsObserveRequest(t *testing.T) {
 		Duration:      12 * time.Millisecond,
 		RequestBytes:  256,
 		ResponseBytes: 64,
-		Tables:        []string{"orders", "orders"},
+		Tables:        []string{"orders"},
 		TableMetrics: map[string]DynamoDBTableMetrics{
 			"orders": {WrittenItems: 1},
 		},

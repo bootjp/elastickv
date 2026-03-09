@@ -88,3 +88,9 @@ func TestDynamoRequestMetricsStateIgnoresUnknownTableMetrics(t *testing.T) {
 		"orders": {WrittenItems: 1},
 	}, state.tableMetrics())
 }
+
+func TestDynamoOperationNameRejectsUnknownTargets(t *testing.T) {
+	require.Equal(t, "PutItem", dynamoOperationName(putItemTarget))
+	require.Equal(t, "unknown", dynamoOperationName(targetPrefix+"PutItem-random"))
+	require.Equal(t, "unknown", dynamoOperationName("random"))
+}

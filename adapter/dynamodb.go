@@ -70,6 +70,21 @@ const (
 	dynamoOrderedKeyEncodingV2  = 2
 )
 
+var dynamoOperationTargets = map[string]string{
+	batchWriteItemTarget:     "BatchWriteItem",
+	createTableTarget:        "CreateTable",
+	deleteItemTarget:         "DeleteItem",
+	deleteTableTarget:        "DeleteTable",
+	describeTableTarget:      "DescribeTable",
+	getItemTarget:            "GetItem",
+	listTablesTarget:         "ListTables",
+	putItemTarget:            "PutItem",
+	queryTarget:              "Query",
+	scanTarget:               "Scan",
+	transactWriteItemsTarget: "TransactWriteItems",
+	updateItemTarget:         "UpdateItem",
+}
+
 const (
 	dynamoErrValidation        = "ValidationException"
 	dynamoErrInternal          = "InternalServerError"
@@ -283,11 +298,10 @@ func (d *DynamoDBServer) dispatchByTarget(target string, w http.ResponseWriter, 
 }
 
 func dynamoOperationName(target string) string {
-	op := strings.TrimSpace(strings.TrimPrefix(target, targetPrefix))
-	if op == "" || op == target {
-		return "unknown"
+	if operation, ok := dynamoOperationTargets[strings.TrimSpace(target)]; ok {
+		return operation
 	}
-	return op
+	return "unknown"
 }
 
 func dynamoRequestMetricsFromContext(ctx context.Context) *dynamoRequestMetricsState {
