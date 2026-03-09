@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -86,17 +87,106 @@ const (
 	dynamoSelectCount           = "COUNT"
 )
 
+type DynamoDBServerOption func(*DynamoDBServer)
+
 type DynamoDBServer struct {
 	listen          net.Listener
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	httpServer      *http.Server
 	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
+	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
 }
 
-func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator) *DynamoDBServer {
+// WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
+func WithDynamoDBRequestObserver(observer monitoring.DynamoDBRequestObserver) DynamoDBServerOption {
+	return func(server *DynamoDBServer) {
+		server.requestObserver = observer
+	}
+}
+
+type dynamoRequestMetricsContextKey struct{}
+
+type dynamoRequestMetricsState struct {
+	tables map[string]monitoring.DynamoDBTableMetrics
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	bytesRead int
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	if c == nil || c.ReadCloser == nil {
+		return 0, io.EOF
+	}
+	n, err := c.ReadCloser.Read(p)
+	c.bytesRead += n
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	return n, errors.WithStack(err)
+}
+
+func (c *countingReadCloser) Close() error {
+	if c == nil || c.ReadCloser == nil {
+		return nil
+	}
+	if err := c.ReadCloser.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (c *countingReadCloser) BytesRead() int {
+	if c == nil {
+		return 0
+	}
+	return c.bytesRead
+}
+
+type dynamoResponseRecorder struct {
+	http.ResponseWriter
+	statusCode   int
+	bytesWritten int
+}
+
+func (r *dynamoResponseRecorder) WriteHeader(statusCode int) {
+	if r.statusCode == 0 {
+		r.statusCode = statusCode
+	}
+	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (r *dynamoResponseRecorder) Write(p []byte) (int, error) {
+	if r.statusCode == 0 {
+		r.WriteHeader(http.StatusOK)
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytesWritten += n
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	return n, nil
+}
+
+func (r *dynamoResponseRecorder) StatusCode() int {
+	if r == nil || r.statusCode == 0 {
+		return http.StatusOK
+	}
+	return r.statusCode
+}
+
+func (r *dynamoResponseRecorder) BytesWritten() int {
+	if r == nil {
+		return 0
+	}
+	return r.bytesWritten
+}
+
+func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator, opts ...DynamoDBServerOption) *DynamoDBServer {
 	d := &DynamoDBServer{
 		listen:      listen,
 		store:       st,
@@ -119,6 +209,11 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
 	d.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(d)
+		}
+	}
 	return d
 }
 
@@ -137,9 +232,38 @@ func (d *DynamoDBServer) Stop() {
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	target := r.Header.Get("X-Amz-Target")
-	if !d.dispatchByTarget(target, w, r) {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
+	if d.requestObserver == nil {
+		if !d.dispatchByTarget(target, w, r) {
+			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
+		}
+		return
 	}
+
+	operation := dynamoOperationName(target)
+	d.requestObserver.ObserveInFlightChange(operation, 1)
+	defer d.requestObserver.ObserveInFlightChange(operation, -1)
+
+	state := &dynamoRequestMetricsState{tables: make(map[string]monitoring.DynamoDBTableMetrics)}
+	r = r.WithContext(context.WithValue(r.Context(), dynamoRequestMetricsContextKey{}, state))
+	bodyCounter := &countingReadCloser{ReadCloser: r.Body}
+	r.Body = bodyCounter
+	recorder := &dynamoResponseRecorder{ResponseWriter: w}
+	started := time.Now()
+
+	if !d.dispatchByTarget(target, recorder, r) {
+		writeDynamoError(recorder, http.StatusBadRequest, dynamoErrValidation, "unsupported operation")
+	}
+
+	d.requestObserver.ObserveDynamoDBRequest(monitoring.DynamoDBRequestReport{
+		Operation:     operation,
+		HTTPStatus:    recorder.StatusCode(),
+		ErrorType:     recorder.Header().Get("x-amzn-ErrorType"),
+		Duration:      time.Since(started),
+		RequestBytes:  bodyCounter.BytesRead(),
+		ResponseBytes: recorder.BytesWritten(),
+		Tables:        state.tableNames(),
+		TableMetrics:  state.tableMetrics(),
+	})
 }
 
 func maxDynamoBodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
@@ -153,6 +277,105 @@ func (d *DynamoDBServer) dispatchByTarget(target string, w http.ResponseWriter, 
 	}
 	handler(w, r)
 	return true
+}
+
+func dynamoOperationName(target string) string {
+	op := strings.TrimSpace(strings.TrimPrefix(target, targetPrefix))
+	if op == "" || op == target {
+		return "unknown"
+	}
+	return op
+}
+
+func dynamoRequestMetricsFromContext(ctx context.Context) *dynamoRequestMetricsState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(dynamoRequestMetricsContextKey{}).(*dynamoRequestMetricsState)
+	return state
+}
+
+func (s *dynamoRequestMetricsState) recordTable(table string) {
+	if s == nil {
+		return
+	}
+	table = strings.TrimSpace(table)
+	if table == "" {
+		return
+	}
+	if s.tables == nil {
+		s.tables = make(map[string]monitoring.DynamoDBTableMetrics)
+	}
+	if _, ok := s.tables[table]; !ok {
+		s.tables[table] = monitoring.DynamoDBTableMetrics{}
+	}
+}
+
+func (s *dynamoRequestMetricsState) addTableMetrics(table string, returnedItems int, scannedItems int, writtenItems int) {
+	if s == nil {
+		return
+	}
+	table = strings.TrimSpace(table)
+	if table == "" {
+		return
+	}
+	if s.tables == nil {
+		s.tables = make(map[string]monitoring.DynamoDBTableMetrics)
+	}
+	metrics := s.tables[table]
+	metrics.ReturnedItems += returnedItems
+	metrics.ScannedItems += scannedItems
+	metrics.WrittenItems += writtenItems
+	s.tables[table] = metrics
+}
+
+func (s *dynamoRequestMetricsState) tableNames() []string {
+	if s == nil || len(s.tables) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(s.tables))
+	for table := range s.tables {
+		names = append(names, table)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (s *dynamoRequestMetricsState) tableMetrics() map[string]monitoring.DynamoDBTableMetrics {
+	if s == nil || len(s.tables) == 0 {
+		return nil
+	}
+	out := make(map[string]monitoring.DynamoDBTableMetrics, len(s.tables))
+	for table, metrics := range s.tables {
+		out[table] = metrics
+	}
+	return out
+}
+
+func (d *DynamoDBServer) observeTables(ctx context.Context, tables ...string) {
+	state := dynamoRequestMetricsFromContext(ctx)
+	if state == nil {
+		return
+	}
+	for _, table := range tables {
+		state.recordTable(table)
+	}
+}
+
+func (d *DynamoDBServer) observeReadMetrics(ctx context.Context, table string, returnedItems int, scannedItems int) {
+	state := dynamoRequestMetricsFromContext(ctx)
+	if state == nil {
+		return
+	}
+	state.addTableMetrics(table, returnedItems, scannedItems, 0)
+}
+
+func (d *DynamoDBServer) observeWrittenItems(ctx context.Context, table string, writtenItems int) {
+	state := dynamoRequestMetricsFromContext(ctx)
+	if state == nil {
+		return
+	}
+	state.addTableMetrics(table, 0, 0, writtenItems)
 }
 
 type createTableAttributeDefinition struct {
@@ -328,6 +551,39 @@ type dynamoGlobalSecondaryIndex struct {
 	Projection dynamoGSIProjection `json:"projection"`
 }
 
+func (g *dynamoGlobalSecondaryIndex) UnmarshalJSON(b []byte) error {
+	type rawGSI struct {
+		KeySchema  *dynamoKeySchema     `json:"key_schema"`
+		Projection *dynamoGSIProjection `json:"projection"`
+		HashKey    string               `json:"hash_key"`
+		RangeKey   string               `json:"range_key"`
+	}
+
+	var raw rawGSI
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if raw.KeySchema != nil {
+		g.KeySchema = *raw.KeySchema
+	} else {
+		g.KeySchema = dynamoKeySchema{
+			HashKey:  raw.HashKey,
+			RangeKey: raw.RangeKey,
+		}
+	}
+
+	if raw.Projection != nil && strings.TrimSpace(raw.Projection.ProjectionType) != "" {
+		g.Projection = *raw.Projection
+	} else {
+		// Older schema snapshots stored only the key schema. Those GSIs behaved
+		// like ALL projections, so preserve that behavior when normalizing.
+		g.Projection = dynamoGSIProjection{ProjectionType: "ALL"}
+	}
+
+	return nil
+}
+
 type dynamoTableSchema struct {
 	TableName               string                                `json:"table_name"`
 	AttributeDefinitions    map[string]string                     `json:"attribute_definitions,omitempty"`
@@ -344,6 +600,7 @@ func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	unlock := d.lockTableOperations([]string{in.TableName})
 	defer unlock()
 	schema, err := buildCreateTableSchema(in)
@@ -513,6 +770,7 @@ func (d *DynamoDBServer) deleteTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	unlock := d.lockTableOperations([]string{in.TableName})
 	defer unlock()
 	if err := d.deleteTableWithRetry(r.Context(), in.TableName); err != nil {
@@ -687,6 +945,7 @@ func (d *DynamoDBServer) describeTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -790,6 +1049,7 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -799,6 +1059,7 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeWrittenItems(r.Context(), in.TableName, 1)
 	resp := map[string]any{}
 	if attrs := putItemReturnAttributes(in.ReturnValues, plan.current); len(attrs) > 0 {
 		resp["Attributes"] = attrs
@@ -963,6 +1224,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -988,6 +1250,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoJSON(w, map[string]any{})
 		return
 	}
+	d.observeReadMetrics(r.Context(), in.TableName, 1, 1)
 	projected, err := projectItem(current.item, in.ProjectionExpression, in.ExpressionAttributeNames)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
@@ -1002,6 +1265,7 @@ func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1017,6 +1281,9 @@ func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
+	}
+	if len(plan.current) > 0 {
+		d.observeWrittenItems(r.Context(), in.TableName, 1)
 	}
 	resp := map[string]any{}
 	if shouldReturnOld && len(plan.current) > 0 {
@@ -1129,6 +1396,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1145,6 +1413,7 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeWrittenItems(r.Context(), in.TableName, 1)
 	resp := map[string]any{}
 	if attrs := updateItemReturnAttributes(in.ReturnValues, plan.current, plan.next); len(attrs) > 0 {
 		resp["Attributes"] = attrs
@@ -1454,11 +1723,13 @@ func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	out, err := d.queryItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeReadMetrics(r.Context(), in.TableName, out.count, out.scannedCount)
 	resp := map[string]any{
 		"Items":        out.items,
 		"Count":        out.count,
@@ -1476,11 +1747,13 @@ func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), in.TableName)
 	out, err := d.scanItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeReadMetrics(r.Context(), in.TableName, out.count, out.scannedCount)
 	resp := map[string]any{
 		"Items":        out.items,
 		"Count":        out.count,
@@ -3252,10 +3525,14 @@ func (d *DynamoDBServer) batchWriteItem(w http.ResponseWriter, r *http.Request) 
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), batchWriteTableNames(in)...)
 	unprocessed, err := d.batchWriteItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
+	}
+	for table, written := range batchWriteCommittedCounts(in, unprocessed) {
+		d.observeWrittenItems(r.Context(), table, written)
 	}
 	writeDynamoJSON(w, map[string]any{"UnprocessedItems": unprocessed})
 }
@@ -3286,6 +3563,26 @@ func decodeBatchWriteItemInput(bodyReader io.Reader) (batchWriteItemInput, error
 		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "too many items in BatchWriteItem")
 	}
 	return in, nil
+}
+
+func batchWriteTableNames(in batchWriteItemInput) []string {
+	names := make([]string, 0, len(in.RequestItems))
+	for table := range in.RequestItems {
+		names = append(names, table)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func batchWriteCommittedCounts(in batchWriteItemInput, unprocessed map[string][]batchWriteRequest) map[string]int {
+	out := make(map[string]int, len(in.RequestItems))
+	for table, requests := range in.RequestItems {
+		written := len(requests) - len(unprocessed[table])
+		if written > 0 {
+			out[table] = written
+		}
+	}
+	return out
 }
 
 func (d *DynamoDBServer) batchWriteItems(
@@ -3474,13 +3771,18 @@ func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Reque
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	if _, err := collectTransactWriteTableNames(in); err != nil {
+	tableNames, err := collectTransactWriteTableNames(in)
+	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), tableNames...)
 	if err := d.transactWriteItemsWithRetry(r.Context(), in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
+	}
+	for table, written := range transactWriteWrittenCounts(in) {
+		d.observeWrittenItems(r.Context(), table, written)
 	}
 	writeDynamoJSON(w, map[string]any{})
 }
@@ -3518,6 +3820,21 @@ func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error
 		names = append(names, tableName)
 	}
 	return names, nil
+}
+
+func transactWriteWrittenCounts(in transactWriteItemsInput) map[string]int {
+	out := make(map[string]int)
+	for _, item := range in.TransactItems {
+		tableName, err := transactWriteItemTableName(item)
+		if err != nil || strings.TrimSpace(tableName) == "" {
+			continue
+		}
+		switch {
+		case item.Put != nil, item.Update != nil, item.Delete != nil:
+			out[tableName]++
+		}
+	}
+	return out
 }
 
 func transactWriteItemTableName(item transactWriteItem) (string, error) {

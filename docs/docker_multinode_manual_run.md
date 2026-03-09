@@ -17,6 +17,7 @@ Use private VM IPs for all bind addresses and lock down network access because g
 - 1 node = 1 VM
 - Total nodes: 4 or 5
 - VMs must be able to reach each other over TCP (at minimum `50051/tcp`)
+- Prometheus must be able to reach each node's metrics endpoint if you want centralized monitoring (`9090/tcp` in the examples below)
 - Docker Engine installed on every VM
 
 Example (5 nodes):
@@ -92,6 +93,7 @@ This guide uses `--network host` and explicit VM private IPs.
 Binding guidance:
 
 - Set `--address`, `--redisAddress`, and `--dynamoAddress` to the VM private IP.
+- Set `--metricsAddress` to the VM private IP if Prometheus scrapes from another host.
 - Do not use `0.0.0.0` as the advertised address.
 - Do not use `localhost` for cluster communication.
 
@@ -109,6 +111,7 @@ docker run -d \
   --address "10.0.0.11:50051" \
   --redisAddress "10.0.0.11:6379" \
   --dynamoAddress "10.0.0.11:8000" \
+  --metricsAddress "10.0.0.11:9090" \
   --raftId "n1" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
@@ -130,6 +133,7 @@ docker run -d \
   --address "10.0.0.12:50051" \
   --redisAddress "10.0.0.12:6379" \
   --dynamoAddress "10.0.0.12:8000" \
+  --metricsAddress "10.0.0.12:9090" \
   --raftId "n2" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
@@ -142,6 +146,7 @@ Start `n3` to `n5` the same way by replacing:
 - `--address`
 - `--redisAddress`
 - `--dynamoAddress`
+- `--metricsAddress`
 - `--raftId`
 
 ## Startup Order and Quorum Caution
@@ -202,6 +207,16 @@ Write/read through Redis endpoints:
 redis-cli -h 10.0.0.11 -p 6379 SET health ok
 redis-cli -h 10.0.0.12 -p 6379 GET health
 ```
+
+## 6.5) Validate Metrics
+
+Check the local Prometheus endpoint on any node:
+
+```bash
+curl -fsS http://10.0.0.11:9090/metrics | grep '^elastickv_'
+```
+
+Grafana/Prometheus provisioning examples are available under `monitoring/`.
 
 ## 7) Fault Tolerance Drill
 
