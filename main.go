@@ -78,10 +78,10 @@ func run() error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	clock := kv.NewHLC()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	defer func() {
+		cancel()
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()
