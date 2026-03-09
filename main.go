@@ -30,6 +30,7 @@ const (
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
+	metricsShutdownTimeout     = 5 * time.Second
 )
 
 var (
@@ -416,7 +417,9 @@ func serveMetricsUntilCanceled(ctx context.Context, server *http.Server, listene
 func watchMetricsShutdown(ctx context.Context, server *http.Server, stop <-chan struct{}, metricsAddr string) {
 	select {
 	case <-ctx.Done():
-		if err := server.Shutdown(context.Background()); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			log.Printf("metrics server shutdown error on %s: %v", metricsAddr, err)
 		}
 	case <-stop:
