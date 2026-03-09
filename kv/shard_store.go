@@ -105,6 +105,22 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	return out, nil
 }
 
+func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+
+	routes, clampToRoutes := s.routesForScan(start, end)
+	out, err := s.reverseScanRoutesAt(ctx, routes, start, end, limit, ts, clampToRoutes)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
@@ -137,9 +153,42 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 			scanEnd = clampScanEnd(end, route.End)
 		}
 
-		// Fetch up to 'limit' items from each shard. The final result will be
-		// sorted and truncated by ScanAt.
-		kvs, err := s.scanRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false)
+		if err != nil {
+			return nil, err
+		}
+		if clampToRoutes {
+			out = append(out, kvs...)
+			if len(out) >= limit {
+				out = out[:limit]
+				break
+			}
+			continue
+		}
+		out = mergeAndTrimScanResults(out, kvs, limit)
+	}
+	return out, nil
+}
+
+func (s *ShardStore) reverseScanRoutesAt(
+	ctx context.Context,
+	routes []distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	clampToRoutes bool,
+) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0)
+	for i := len(routes) - 1; i >= 0 && len(out) < limit; i-- {
+		route := routes[i]
+		scanStart := start
+		scanEnd := end
+		if clampToRoutes {
+			scanStart = clampScanStart(start, route.Start)
+			scanEnd = clampScanEnd(end, route.End)
+		}
+		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
 		if err != nil {
 			return nil, err
 		}
@@ -148,28 +197,33 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 	return out, nil
 }
 
-func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) scanRouteAtDirection(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, error) {
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil
 	}
 
 	if g.Raft == nil {
-		kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
+		kvs, err := s.scanRouteLocal(ctx, g, start, end, limit, ts, reverse)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		// Keep ScanAt behavior consistent even when running without raft.
 		return filterTxnInternalKVs(kvs), nil
 	}
 
-	// Reads should come from the shard's leader to avoid returning stale or
-	// incomplete results when this node is a follower for a given shard.
 	if isVerifiedRaftLeader(g.Raft) {
-		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts)
+		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts)
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse)
 	if err != nil {
 		return nil, err
 	}
@@ -178,40 +232,122 @@ func (s *ShardStore) scanRouteAt(ctx context.Context, route distribution.Route, 
 	return filterTxnInternalKVs(kvs), nil
 }
 
-func (s *ShardStore) scanRouteAtLeader(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) scanRouteLocal(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, error) {
+	if reverse {
+		kvs, err := g.Store.ReverseScanAt(ctx, start, end, limit, ts)
+		return kvs, errors.WithStack(err)
+	}
 	kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
+	return kvs, errors.WithStack(err)
+}
+
+func (s *ShardStore) scanRouteAtLeader(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, error) {
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if reverse {
+		kvs, err = g.Store.ReverseScanAt(ctx, start, end, limit, ts)
+	} else {
+		kvs, err = g.Store.ScanAt(ctx, start, end, limit, ts)
+	}
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	lockEnd := scanLockUpperBoundForKVs(kvs, end)
-	lockKVs, err := scanTxnLockRangeAt(ctx, g, start, lockEnd, ts)
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, limit)
+	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, limit)
 	if err != nil {
 		return nil, err
 	}
 	return s.resolveScanLocks(ctx, g, kvs, lockKVs, ts)
 }
 
-func scanLockUpperBoundForKVs(kvs []*store.KVPair, scanEnd []byte) []byte {
-	lastUserKey := lastNonInternalScanKey(kvs)
-	if len(lastUserKey) == 0 {
-		return scanEnd
+func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int) ([]byte, []byte) {
+	if countNonInternalKVs(kvs) < limit {
+		return scanStart, scanEnd
+	}
+	_, lastUserKey, ok := observedScanUserBounds(kvs)
+	if !ok {
+		return scanStart, scanEnd
 	}
 	bound := nextScanCursor(lastUserKey)
 	if scanEnd == nil || bytes.Compare(bound, scanEnd) < 0 {
-		return bound
+		scanEnd = bound
 	}
-	return scanEnd
+	return scanStart, scanEnd
 }
 
-func lastNonInternalScanKey(kvs []*store.KVPair) []byte {
-	for i := len(kvs) - 1; i >= 0; i-- {
-		kvp := kvs[i]
+func observedScanUserBounds(kvs []*store.KVPair) ([]byte, []byte, bool) {
+	var minKey []byte
+	var maxKey []byte
+	for _, kvp := range kvs {
+		userKey, ok := scanUserKey(kvp)
+		if !ok {
+			continue
+		}
+		if minKey == nil || bytes.Compare(userKey, minKey) < 0 {
+			minKey = userKey
+		}
+		if maxKey == nil || bytes.Compare(userKey, maxKey) > 0 {
+			maxKey = userKey
+		}
+	}
+	if len(minKey) == 0 || len(maxKey) == 0 {
+		return nil, nil, false
+	}
+	return minKey, maxKey, true
+}
+
+func scanUserKey(kvp *store.KVPair) ([]byte, bool) {
+	if kvp == nil || len(kvp.Key) == 0 {
+		return nil, false
+	}
+	if !isTxnInternalKey(kvp.Key) {
+		return kvp.Key, true
+	}
+	return txnUserKeyFromLockKey(kvp.Key)
+}
+
+func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
+	if len(kvs) == 0 {
+		return out
+	}
+	out = append(out, kvs...)
+	if len(out) <= limit {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	clear(out[limit:])
+	return out[:limit]
+}
+
+func countNonInternalKVs(kvs []*store.KVPair) int {
+	count := 0
+	for _, kvp := range kvs {
 		if kvp == nil || isTxnInternalKey(kvp.Key) {
 			continue
 		}
-		return kvp.Key
+		count++
 	}
-	return nil
+	return count
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {
@@ -592,17 +728,17 @@ func txnUserKeyFromLockKey(lockKey []byte) ([]byte, bool) {
 	return bytes.Clone(lockKey[len(txnLockPrefix):]), true
 }
 
-func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, ts uint64) ([]*store.KVPair, error) {
+func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, ts uint64, limit int) ([]*store.KVPair, error) {
 	if g == nil || g.Store == nil {
 		return []*store.KVPair{}, nil
 	}
 
 	lockStart, lockEnd := txnLockScanBounds(start, end)
-	return scanTxnLockPagesAt(ctx, g.Store, lockStart, lockEnd, ts)
+	return scanTxnLockPagesAt(ctx, g.Store, lockStart, lockEnd, ts, boundedTxnLockScanLimit(limit))
 }
 
-func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64) ([]*store.KVPair, error) {
-	out := make([]*store.KVPair, 0)
+func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64, limit int) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
 	cursor := start
 	for {
 		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
@@ -610,16 +746,33 @@ func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, e
 			return nil, err
 		}
 		out = append(out, lockKVs...)
+		if len(out) >= limit && !done {
+			return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
+		}
 		if done {
+			if len(out) > limit {
+				out = out[:limit]
+			}
 			return out, nil
 		}
 		cursor = nextCursor
 	}
 }
 
-func scanTxnLockPageAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64) ([]*store.KVPair, []byte, bool, error) {
-	const lockPageLimit = 256
+const lockPageLimit = 256
+const maxTxnLockScanResults = 1024
 
+func boundedTxnLockScanLimit(limit int) int {
+	if limit < lockPageLimit {
+		return lockPageLimit
+	}
+	if limit > maxTxnLockScanResults {
+		return maxTxnLockScanResults
+	}
+	return limit
+}
+
+func scanTxnLockPageAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64) ([]*store.KVPair, []byte, bool, error) {
 	lockKVs, err := st.ScanAt(ctx, start, end, lockPageLimit, ts)
 	if err != nil {
 		return nil, nil, false, errors.WithStack(err)
@@ -1017,7 +1170,15 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 	return resp.Value, nil
 }
 
-func (s *ShardStore) proxyRawScanAt(ctx context.Context, g *ShardGroup, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) proxyRawScanAt(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, error) {
 	if g == nil || g.Raft == nil {
 		return nil, store.ErrNotSupported
 	}
@@ -1037,6 +1198,7 @@ func (s *ShardStore) proxyRawScanAt(ctx context.Context, g *ShardGroup, start []
 		EndKey:   end,
 		Limit:    int64(limit),
 		Ts:       ts,
+		Reverse:  reverse,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

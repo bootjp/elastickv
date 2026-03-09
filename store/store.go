@@ -29,6 +29,18 @@ const (
 
 var Tombstone = []byte{0x00}
 
+const scanResultCapacityLimit = 1024
+
+func boundedScanResultCapacity(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > scanResultCapacityLimit {
+		return scanResultCapacityLimit
+	}
+	return limit
+}
+
 // HybridClock provides monotonically increasing timestamps (HLC).
 type HybridClock interface {
 	Now() uint64
@@ -44,6 +56,8 @@ type MVCCStore interface {
 	ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error)
 	// ScanAt returns versions visible at the given timestamp.
 	ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
+	// ReverseScanAt returns visible versions in descending key order for keys in [start, end).
+	ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
 	// PutAt commits a value at the provided commit timestamp and optional expireAt.
 	PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error
 	// DeleteAt commits a tombstone at the provided commit timestamp.

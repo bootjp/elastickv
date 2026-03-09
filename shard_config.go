@@ -119,8 +119,8 @@ func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 	if raw == "" {
 		return out, nil
 	}
-	parts := strings.Split(raw, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(raw, ",")
+	for part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -145,8 +145,8 @@ func parseRaftBootstrapMembers(raw string) ([]raft.Server, error) {
 		return servers, nil
 	}
 	seen := make(map[raft.ServerID]struct{})
-	parts := strings.Split(raw, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(raw, ",")
+	for part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue

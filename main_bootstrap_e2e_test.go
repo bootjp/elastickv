@@ -137,7 +137,7 @@ func startBootstrapE2ECluster(
 		nodes   []*bootstrapE2ENode
 	)
 
-	for attempt := 0; attempt < startupAttempts; attempt++ {
+	for attempt := range startupAttempts {
 		endpoints, listeners := allocateBootstrapE2EEndpoints(t, nodeCount)
 		attemptDir := filepath.Join(baseDir, fmt.Sprintf("attempt-%d", attempt))
 		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints, listeners)
@@ -163,7 +163,7 @@ func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EE
 	var lc net.ListenConfig
 	endpoints := make([]bootstrapE2EEndpoint, 0, nodeCount)
 	listeners := make([]bootstrapE2EListeners, 0, nodeCount)
-	for i := 0; i < nodeCount; i++ {
+	for i := range nodeCount {
 		grpcL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 		require.NoError(t, err)
 		redisL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")

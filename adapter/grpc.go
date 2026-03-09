@@ -128,7 +128,12 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		readTS = snapshotTS(r.clock(), r.store)
 	}
 
-	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	var res []*store.KVPair
+	if req.GetReverse() {
+		res, err = r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	} else {
+		res, err = r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	}
 	if err != nil {
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
 	}
@@ -144,7 +149,19 @@ func rawScanLimit(limit64 int64) (int, error) {
 	if limit64 > maxInt64 {
 		return 0, errors.WithStack(internal.ErrIntOverflow)
 	}
-	return int(limit64), nil
+	return grpcScanLimit(int(limit64))
+}
+
+const maxGRPCScanLimit = 1024
+
+func grpcScanLimit(limit int) (int, error) {
+	if limit < 0 {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	if limit > maxGRPCScanLimit {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	return limit, nil
 }
 
 func rawKvPairs(res []*store.KVPair) []*pb.RawKVPair {
@@ -287,6 +304,12 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 		return &pb.ScanResponse{
 			Kv: nil,
 		}, errors.WithStack(err)
+	}
+	limit, err = grpcScanLimit(limit)
+	if err != nil {
+		return &pb.ScanResponse{
+			Kv: nil,
+		}, err
 	}
 	readTS := snapshotTS(r.clock(), r.store)
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)

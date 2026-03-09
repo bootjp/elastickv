@@ -275,7 +275,7 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 		return []*KVPair{}, nil
 	}
 
-	capHint := limit
+	capHint := boundedScanResultCapacity(limit)
 	if size := s.tree.Size(); size < capHint {
 		capHint = size
 	}
@@ -306,6 +306,88 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 	})
 
 	return result, nil
+}
+
+func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	if limit <= 0 {
+		return []*KVPair{}, nil
+	}
+
+	capHint := boundedScanResultCapacity(limit)
+	if size := s.tree.Size(); size < capHint {
+		capHint = size
+	}
+	if capHint < 0 {
+		capHint = 0
+	}
+
+	result := make([]*KVPair, 0, capHint)
+	it := s.tree.Iterator()
+	if !seekReverseIteratorStart(s.tree, &it, end) {
+		return result, nil
+	}
+	collectReverseVisibleKVs(&it, start, limit, ts, &result)
+
+	return result, nil
+}
+
+func seekReverseIteratorStart(tree *treemap.Map, it *treemap.Iterator, end []byte) bool {
+	if end == nil {
+		return it.Last()
+	}
+	floorKey, _ := tree.Floor(end)
+	if floorKey == nil {
+		return false
+	}
+	target, ok := floorKey.([]byte)
+	if !ok {
+		return false
+	}
+	it.End()
+	if bytes.Compare(target, end) < 0 {
+		return it.PrevTo(func(key interface{}, value interface{}) bool {
+			k, keyOK := key.([]byte)
+			return keyOK && bytes.Equal(k, target)
+		})
+	}
+	return it.PrevTo(func(key interface{}, value interface{}) bool {
+		k, keyOK := key.([]byte)
+		return keyOK && bytes.Compare(k, end) < 0
+	})
+}
+
+func collectReverseVisibleKVs(
+	it *treemap.Iterator,
+	start []byte,
+	limit int,
+	ts uint64,
+	result *[]*KVPair,
+) {
+	for ok := true; ok && len(*result) < limit; ok = it.Prev() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if start != nil && bytes.Compare(k, start) < 0 {
+			return
+		}
+		appendVisibleReverseKV(it, k, ts, result)
+	}
+}
+
+func appendVisibleReverseKV(it *treemap.Iterator, key []byte, ts uint64, result *[]*KVPair) {
+	versions, _ := it.Value().([]VersionedValue)
+	val, visible := visibleValue(versions, ts)
+	if !visible {
+		return
+	}
+	*result = append(*result, &KVPair{
+		Key:   bytes.Clone(key),
+		Value: bytes.Clone(val),
+	})
 }
 
 func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {

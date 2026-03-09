@@ -93,7 +93,14 @@ func (s *LeaderRoutedStore) proxyRawLatestCommitTS(ctx context.Context, key []by
 	return resp.Ts, resp.Exists, nil
 }
 
-func (s *LeaderRoutedStore) proxyRawScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *LeaderRoutedStore) proxyRawScanAt(
+	ctx context.Context,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, error) {
 	addr := s.leaderAddrForKey(start)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
@@ -110,6 +117,7 @@ func (s *LeaderRoutedStore) proxyRawScanAt(ctx context.Context, start []byte, en
 		EndKey:   end,
 		Limit:    int64(limit),
 		Ts:       ts,
+		Reverse:  reverse,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -158,7 +166,21 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 		kvs, err := s.local.ScanAt(ctx, start, end, limit, ts)
 		return kvs, errors.WithStack(err)
 	}
-	return s.proxyRawScanAt(ctx, start, end, limit, ts)
+	return s.proxyRawScanAt(ctx, start, end, limit, ts, false)
+}
+
+func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if s == nil || s.local == nil {
+		return []*store.KVPair{}, nil
+	}
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	if s.leaderOKForKey(start) {
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, ts)
+		return kvs, errors.WithStack(err)
+	}
+	return s.proxyRawScanAt(ctx, start, end, limit, ts, true)
 }
 
 func (s *LeaderRoutedStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
