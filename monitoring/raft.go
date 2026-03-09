@@ -3,6 +3,7 @@ package monitoring
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ var raftStates = []string{
 	"shutdown",
 	"unknown",
 }
+
+var loggedLastContactParseValues sync.Map
 
 const defaultObserveInterval = 5 * time.Second
 
@@ -307,6 +310,9 @@ func parseLastContactSeconds(raw string) float64 {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
+		if _, loaded := loggedLastContactParseValues.LoadOrStore(raw, struct{}{}); !loaded {
+			slog.Warn("failed to parse raft last_contact metric", "raw", raw, "err", err)
+		}
 		return 0
 	}
 	return d.Seconds()

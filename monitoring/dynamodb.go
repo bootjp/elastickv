@@ -17,6 +17,21 @@ const (
 	dynamoOperationUnknown              = "unknown"
 )
 
+var dynamoOperations = []string{
+	"BatchWriteItem",
+	"CreateTable",
+	"DeleteItem",
+	"DeleteTable",
+	"DescribeTable",
+	"GetItem",
+	"ListTables",
+	"PutItem",
+	"Query",
+	"Scan",
+	"TransactWriteItems",
+	"UpdateItem",
+}
+
 // DynamoDBRequestObserver records per-request DynamoDB-compatible API metrics.
 type DynamoDBRequestObserver interface {
 	ObserveInFlightChange(operation string, delta float64)
@@ -195,6 +210,9 @@ func (m *DynamoDBMetrics) ObserveDynamoDBRequest(report DynamoDBRequestReport) {
 func normalizeDynamoOperation(operation string) string {
 	operation = strings.TrimSpace(operation)
 	if operation == "" {
+		return dynamoOperationUnknown
+	}
+	if !slices.Contains(dynamoOperations, operation) {
 		return dynamoOperationUnknown
 	}
 	return operation

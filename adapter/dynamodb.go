@@ -124,8 +124,11 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 	}
 	n, err := c.ReadCloser.Read(p)
 	c.bytesRead += n
-	if err == nil || errors.Is(err, io.EOF) {
-		return n, err
+	if err == nil {
+		return n, nil
+	}
+	if errors.Is(err, io.EOF) {
+		return n, io.EOF
 	}
 	return n, errors.WithStack(err)
 }
@@ -319,10 +322,10 @@ func (s *dynamoRequestMetricsState) addTableMetrics(table string, returnedItems 
 	if table == "" {
 		return
 	}
-	if s.tables == nil {
-		s.tables = make(map[string]monitoring.DynamoDBTableMetrics)
+	metrics, ok := s.tables[table]
+	if !ok {
+		return
 	}
-	metrics := s.tables[table]
 	metrics.ReturnedItems += returnedItems
 	metrics.ScannedItems += scannedItems
 	metrics.WrittenItems += writtenItems
@@ -600,7 +603,6 @@ func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	unlock := d.lockTableOperations([]string{in.TableName})
 	defer unlock()
 	schema, err := buildCreateTableSchema(in)
@@ -612,6 +614,7 @@ func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	d.observeTables(r.Context(), schema.TableName)
 	writeDynamoJSON(w, map[string]any{
 		"TableDescription": map[string]any{
 			"TableName":   in.TableName,
@@ -770,7 +773,6 @@ func (d *DynamoDBServer) deleteTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	unlock := d.lockTableOperations([]string{in.TableName})
 	defer unlock()
 	if err := d.deleteTableWithRetry(r.Context(), in.TableName); err != nil {
@@ -945,7 +947,6 @@ func (d *DynamoDBServer) describeTable(w http.ResponseWriter, r *http.Request) {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1049,7 +1050,6 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1224,7 +1224,6 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1265,7 +1264,6 @@ func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1396,7 +1394,6 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -1723,7 +1720,6 @@ func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	out, err := d.queryItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
@@ -1747,7 +1743,6 @@ func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), in.TableName)
 	out, err := d.scanItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
@@ -3525,7 +3520,6 @@ func (d *DynamoDBServer) batchWriteItem(w http.ResponseWriter, r *http.Request) 
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	d.observeTables(r.Context(), batchWriteTableNames(in)...)
 	unprocessed, err := d.batchWriteItems(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
@@ -3563,15 +3557,6 @@ func decodeBatchWriteItemInput(bodyReader io.Reader) (batchWriteItemInput, error
 		return batchWriteItemInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "too many items in BatchWriteItem")
 	}
 	return in, nil
-}
-
-func batchWriteTableNames(in batchWriteItemInput) []string {
-	names := make([]string, 0, len(in.RequestItems))
-	for table := range in.RequestItems {
-		names = append(names, table)
-	}
-	sort.Strings(names)
-	return names
 }
 
 func batchWriteCommittedCounts(in batchWriteItemInput, unprocessed map[string][]batchWriteRequest) map[string]int {
@@ -3771,12 +3756,6 @@ func (d *DynamoDBServer) transactWriteItems(w http.ResponseWriter, r *http.Reque
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	tableNames, err := collectTransactWriteTableNames(in)
-	if err != nil {
-		writeDynamoErrorFromErr(w, err)
-		return
-	}
-	d.observeTables(r.Context(), tableNames...)
 	if err := d.transactWriteItemsWithRetry(r.Context(), in); err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
@@ -7382,6 +7361,7 @@ func (d *DynamoDBServer) loadTableSchemaAt(ctx context.Context, tableName string
 	if err := json.Unmarshal(b, schema); err != nil {
 		return nil, false, errors.WithStack(err)
 	}
+	d.observeTables(ctx, schema.TableName)
 	return schema, true, nil
 }
 

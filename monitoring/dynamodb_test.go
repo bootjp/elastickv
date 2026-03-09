@@ -72,3 +72,28 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 	)
 	require.NoError(t, err)
 }
+
+func TestDynamoDBMetricsNormalizesUnknownOperation(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
+	require.True(t, ok)
+
+	metrics.ObserveInFlightChange("InjectedOperation", 1)
+	metrics.ObserveInFlightChange("InjectedOperation", -1)
+	metrics.ObserveDynamoDBRequest(DynamoDBRequestReport{
+		Operation:  "InjectedOperation",
+		HTTPStatus: 200,
+		Duration:   time.Millisecond,
+	})
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_dynamodb_requests_total Total number of DynamoDB-compatible API requests by operation and outcome.
+# TYPE elastickv_dynamodb_requests_total counter
+elastickv_dynamodb_requests_total{node_address="10.0.0.1:50051",node_id="n1",operation="unknown",outcome="success"} 1
+`),
+		"elastickv_dynamodb_requests_total",
+	)
+	require.NoError(t, err)
+}

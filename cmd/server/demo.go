@@ -51,6 +51,7 @@ const (
 	joinWait            = 3 * time.Second
 	joinRetryInterval   = 1 * time.Second
 	joinRPCTimeout      = 3 * time.Second
+	raftObserveInterval = 5 * time.Second
 )
 
 func init() {
@@ -368,20 +369,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return errors.WithStack(err)
 	}
 
-	if cfg.raftBootstrap {
-		cfg := raft.Configuration{
-			Servers: []raft.Server{
-				{
-					Suffrage: raft.Voter,
-					ID:       raft.ServerID(cfg.raftID),
-					Address:  raft.ServerAddress(cfg.address),
-				},
-			},
-		}
-		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
-			return errors.WithStack(err)
-		}
+	if err := bootstrapClusterIfNeeded(r, cfg); err != nil {
+		return err
 	}
 
 	trx := kv.NewTransaction(r)
@@ -397,7 +386,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		adapter.WithDistributionCoordinator(coordinator),
 	)
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
-	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, 5*time.Second)
+	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
 
 	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer)
 
@@ -439,6 +428,25 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(metricsShutdownTask(ctx, ms, cfg.metricsAddress))
 	eg.Go(metricsServeTask(ms, metricsL, cfg.metricsAddress))
 
+	return nil
+}
+
+func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
+	if !cfg.raftBootstrap {
+		return nil
+	}
+	bootstrapCfg := raft.Configuration{
+		Servers: []raft.Server{
+			{
+				Suffrage: raft.Voter,
+				ID:       raft.ServerID(cfg.raftID),
+				Address:  raft.ServerAddress(cfg.address),
+			},
+		},
+	}
+	if err := r.BootstrapCluster(bootstrapCfg).Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+		return errors.WithStack(err)
+	}
 	return nil
 }
 

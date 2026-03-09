@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,7 +25,7 @@ func TestDynamoDBServerHandleObservesSuccessMetrics(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"TableName":"orders"}`))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", strings.NewReader(`{"TableName":"orders"}`))
 	req.Header.Set("X-Amz-Target", putItemTarget)
 	rec := httptest.NewRecorder()
 	server.handle(rec, req)
@@ -57,7 +58,7 @@ func TestDynamoDBServerHandleObservesConditionalFailures(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"TableName":"orders"}`))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", strings.NewReader(`{"TableName":"orders"}`))
 	req.Header.Set("X-Amz-Target", updateItemTarget)
 	rec := httptest.NewRecorder()
 	server.handle(rec, req)
@@ -73,4 +74,17 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 		"elastickv_dynamodb_conditional_check_failed_total",
 	)
 	require.NoError(t, err)
+}
+
+func TestDynamoRequestMetricsStateIgnoresUnknownTableMetrics(t *testing.T) {
+	state := &dynamoRequestMetricsState{}
+
+	state.addTableMetrics("orders", 0, 0, 1)
+	require.Nil(t, state.tableMetrics())
+
+	state.recordTable("orders")
+	state.addTableMetrics("orders", 0, 0, 1)
+	require.Equal(t, map[string]monitoring.DynamoDBTableMetrics{
+		"orders": {WrittenItems: 1},
+	}, state.tableMetrics())
 }
