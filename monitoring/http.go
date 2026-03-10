@@ -1,10 +1,20 @@
 package monitoring
 
 import (
+	"context"
 	"crypto/subtle"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/cockroachdb/errors"
+)
+
+const (
+	metricsReadHeaderTimeout = time.Second
+	metricsShutdownTimeout   = 5 * time.Second
 )
 
 // MetricsAddressRequiresToken reports whether the metrics endpoint is exposed beyond loopback.
@@ -42,4 +52,48 @@ func ProtectHandler(handler http.Handler, bearerToken string) http.Handler {
 		}
 		handler.ServeHTTP(w, r)
 	})
+}
+
+// NewMetricsServer constructs an HTTP server for the protected metrics handler.
+func NewMetricsServer(handler http.Handler, bearerToken string) *http.Server {
+	if handler == nil {
+		return nil
+	}
+	return &http.Server{
+		Handler:           ProtectHandler(handler, bearerToken),
+		ReadHeaderTimeout: metricsReadHeaderTimeout,
+	}
+}
+
+// MetricsShutdownTask returns an errgroup task that stops the metrics server on context cancellation.
+func MetricsShutdownTask(ctx context.Context, server *http.Server, address string) func() error {
+	return func() error {
+		if server == nil {
+			return nil
+		}
+		<-ctx.Done()
+		slog.Info("Shutting down metrics server", "address", address, "reason", ctx.Err())
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
+		defer cancel()
+		err := server.Shutdown(shutdownCtx)
+		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+// MetricsServeTask returns an errgroup task that serves the metrics endpoint until shutdown.
+func MetricsServeTask(server *http.Server, listener net.Listener, address string) func() error {
+	return func() error {
+		if server == nil || listener == nil {
+			return nil
+		}
+		slog.Info("Starting metrics server", "address", address)
+		err := server.Serve(listener)
+		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
 }

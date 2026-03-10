@@ -39,3 +39,11 @@ elastickv_raft_member_present{group="1",member_address="10.0.0.1:50051",member_i
 	)
 	require.NoError(t, err)
 }
+
+func TestParseLastContactSeconds(t *testing.T) {
+	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds(""))
+	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("never"))
+	require.Equal(t, 0.0, parseLastContactSeconds("0"))
+	require.Equal(t, 0.25, parseLastContactSeconds("250ms"))
+	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("invalid"))
+}

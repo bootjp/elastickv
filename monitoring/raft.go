@@ -23,7 +23,10 @@ var raftStates = []string{
 
 var loggedLastContactParseValues sync.Map
 
-const defaultObserveInterval = 5 * time.Second
+const (
+	defaultObserveInterval  = 5 * time.Second
+	lastContactUnknownValue = -1
+)
 
 // RaftRuntime describes a raft group observed by the metrics exporter.
 type RaftRuntime struct {
@@ -304,7 +307,7 @@ func parseLastContactSeconds(raw string) float64 {
 	raw = strings.TrimSpace(raw)
 	switch raw {
 	case "", "never":
-		return 0
+		return lastContactUnknownValue
 	case "0":
 		return 0
 	}
@@ -313,7 +316,7 @@ func parseLastContactSeconds(raw string) float64 {
 		if _, loaded := loggedLastContactParseValues.LoadOrStore(raw, struct{}{}); !loaded {
 			slog.Warn("failed to parse raft last_contact metric", "raw", raw, "err", err)
 		}
-		return 0
+		return lastContactUnknownValue
 	}
 	return d.Seconds()
 }

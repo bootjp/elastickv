@@ -347,6 +347,8 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
+	cleanup := startupCleanup{}
+	defer cleanup.Run()
 
 	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
 	if err != nil {
@@ -400,11 +402,15 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	cleanup.Add(func() {
+		_ = grpcSock.Close()
+	})
 
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
 	if err != nil {
 		return err
 	}
+	cleanup.Add(rd.Stop)
 	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
 	if err != nil {
 		return errors.WithStack(err)
@@ -415,10 +421,14 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		coordinator,
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 	)
+	cleanup.Add(ds.Stop)
 	metricsL, ms, err := setupMetricsHTTPServer(ctx, lc, cfg.metricsAddress, cfg.metricsToken, metricsRegistry.Handler())
 	if err != nil {
 		return err
 	}
+	cleanup.Add(func() {
+		_ = metricsL.Close()
+	})
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
@@ -427,9 +437,10 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(redisServeTask(rd, cfg.redisAddress))
 	eg.Go(dynamoShutdownTask(ctx, ds, cfg.dynamoAddress))
 	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
-	eg.Go(metricsShutdownTask(ctx, ms, cfg.metricsAddress))
-	eg.Go(metricsServeTask(ms, metricsL, cfg.metricsAddress))
+	eg.Go(monitoring.MetricsShutdownTask(ctx, ms, cfg.metricsAddress))
+	eg.Go(monitoring.MetricsServeTask(ms, metricsL, cfg.metricsAddress))
 
+	cleanup.Release()
 	return nil
 }
 
@@ -441,11 +452,29 @@ func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAdd
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
-	ms := &http.Server{
-		Handler:           monitoring.ProtectHandler(handler, metricsToken),
-		ReadHeaderTimeout: time.Second,
-	}
+	ms := monitoring.NewMetricsServer(handler, metricsToken)
 	return metricsL, ms, nil
+}
+
+type startupCleanup struct {
+	funcs []func()
+}
+
+func (c *startupCleanup) Add(fn func()) {
+	if fn == nil {
+		return
+	}
+	c.funcs = append(c.funcs, fn)
+}
+
+func (c *startupCleanup) Release() {
+	c.funcs = nil
+}
+
+func (c *startupCleanup) Run() {
+	for i := len(c.funcs) - 1; i >= 0; i-- {
+		c.funcs[i]()
+	}
 }
 
 func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
@@ -538,25 +567,6 @@ func dynamoServeTask(dynamoServer *adapter.DynamoDBServer, address string) func(
 		slog.Info("Starting DynamoDB server", "address", address)
 		err := dynamoServer.Run()
 		if err == nil || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return errors.WithStack(err)
-	}
-}
-
-func metricsShutdownTask(ctx context.Context, server *http.Server, address string) func() error {
-	return func() error {
-		<-ctx.Done()
-		slog.Info("Shutting down metrics server", "address", address, "reason", ctx.Err())
-		return server.Shutdown(context.Background())
-	}
-}
-
-func metricsServeTask(server *http.Server, listener net.Listener, address string) func() error {
-	return func() error {
-		slog.Info("Starting metrics server", "address", address)
-		err := server.Serve(listener)
-		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
 		return errors.WithStack(err)

@@ -30,7 +30,6 @@ const (
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
-	metricsShutdownTimeout     = 5 * time.Second
 )
 
 var (
@@ -397,38 +396,10 @@ func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", metricsAddr)
 	}
-	metricsServer := &http.Server{
-		Handler:           monitoring.ProtectHandler(handler, metricsToken),
-		ReadHeaderTimeout: time.Second,
-	}
-	eg.Go(func() error {
-		return serveMetricsUntilCanceled(ctx, metricsServer, metricsL, metricsAddr)
-	})
+	metricsServer := monitoring.NewMetricsServer(handler, metricsToken)
+	eg.Go(monitoring.MetricsShutdownTask(ctx, metricsServer, metricsAddr))
+	eg.Go(monitoring.MetricsServeTask(metricsServer, metricsL, metricsAddr))
 	return nil
-}
-
-func serveMetricsUntilCanceled(ctx context.Context, server *http.Server, listener net.Listener, metricsAddr string) error {
-	stop := make(chan struct{})
-	go watchMetricsShutdown(ctx, server, stop, metricsAddr)
-
-	err := server.Serve(listener)
-	close(stop)
-	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	return errors.WithStack(err)
-}
-
-func watchMetricsShutdown(ctx context.Context, server *http.Server, stop <-chan struct{}, metricsAddr string) {
-	select {
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			log.Printf("metrics server shutdown error on %s: %v", metricsAddr, err)
-		}
-	case <-stop:
-	}
 }
 
 func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint64) *distribution.CatalogStore {
