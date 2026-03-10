@@ -1,6 +1,8 @@
 package monitoring
 
 import (
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,6 +96,40 @@ func TestDynamoDBMetricsNormalizesUnknownOperation(t *testing.T) {
 elastickv_dynamodb_requests_total{node_address="10.0.0.1:50051",node_id="n1",operation="unknown",outcome="success"} 1
 `),
 		"elastickv_dynamodb_requests_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestDynamoDBMetricsCollapsesOverflowTables(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
+	require.True(t, ok)
+
+	for i := 0; i < dynamoMaxTrackedTables; i++ {
+		metrics.trackedTables["table-"+strconv.Itoa(i)] = struct{}{}
+	}
+
+	metrics.ObserveDynamoDBRequest(DynamoDBRequestReport{
+		Operation:  "PutItem",
+		HTTPStatus: http.StatusOK,
+		Tables:     []string{"orders-overflow"},
+		TableMetrics: map[string]DynamoDBTableMetrics{
+			"orders-overflow": {WrittenItems: 2},
+		},
+	})
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_dynamodb_table_requests_total Total number of table-scoped DynamoDB-compatible API requests by operation and outcome.
+# TYPE elastickv_dynamodb_table_requests_total counter
+elastickv_dynamodb_table_requests_total{node_address="10.0.0.1:50051",node_id="n1",operation="PutItem",outcome="success",table="_other"} 1
+# HELP elastickv_dynamodb_written_items_total Total number of items written or deleted by DynamoDB-compatible write APIs.
+# TYPE elastickv_dynamodb_written_items_total counter
+elastickv_dynamodb_written_items_total{node_address="10.0.0.1:50051",node_id="n1",operation="PutItem",table="_other"} 2
+`),
+		"elastickv_dynamodb_table_requests_total",
+		"elastickv_dynamodb_written_items_total",
 	)
 	require.NoError(t, err)
 }

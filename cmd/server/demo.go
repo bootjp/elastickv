@@ -36,7 +36,8 @@ var (
 	address        = flag.String("address", ":50051", "gRPC/Raft address")
 	redisAddress   = flag.String("redisAddress", ":6379", "Redis address")
 	dynamoAddress  = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
-	metricsAddress = flag.String("metricsAddress", ":9090", "Prometheus metrics address")
+	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
+	metricsToken   = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	raftID         = flag.String("raftId", "", "Raft ID")
 	raftDataDir    = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
 	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
@@ -65,6 +66,7 @@ type config struct {
 	redisAddress   string
 	dynamoAddress  string
 	metricsAddress string
+	metricsToken   string
 	raftID         string
 	raftDataDir    string
 	raftBootstrap  bool
@@ -83,6 +85,7 @@ func main() {
 			redisAddress:   *redisAddress,
 			dynamoAddress:  *dynamoAddress,
 			metricsAddress: *metricsAddress,
+			metricsToken:   *metricsToken,
 			raftID:         *raftID,
 			raftDataDir:    *raftDataDir,
 			raftBootstrap:  *raftBootstrap,
@@ -101,6 +104,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63791",
 				dynamoAddress:  "127.0.0.1:63801",
 				metricsAddress: "127.0.0.1:9091",
+				metricsToken:   *metricsToken,
 				raftID:         "n1",
 				raftDataDir:    "", // In-memory
 				raftBootstrap:  true,
@@ -110,6 +114,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63792",
 				dynamoAddress:  "127.0.0.1:63802",
 				metricsAddress: "127.0.0.1:9092",
+				metricsToken:   *metricsToken,
 				raftID:         "n2",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -119,6 +124,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63793",
 				dynamoAddress:  "127.0.0.1:63803",
 				metricsAddress: "127.0.0.1:9093",
+				metricsToken:   *metricsToken,
 				raftID:         "n3",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -409,13 +415,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		coordinator,
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 	)
-	metricsL, err := lc.Listen(ctx, "tcp", cfg.metricsAddress)
+	metricsL, ms, err := setupMetricsHTTPServer(ctx, lc, cfg.metricsAddress, cfg.metricsToken, metricsRegistry.Handler())
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	ms := &http.Server{
-		Handler:           metricsRegistry.Handler(),
-		ReadHeaderTimeout: time.Second,
+		return err
 	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
@@ -429,6 +431,21 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(metricsServeTask(ms, metricsL, cfg.metricsAddress))
 
 	return nil
+}
+
+func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAddress string, metricsToken string, handler http.Handler) (net.Listener, *http.Server, error) {
+	if monitoring.MetricsAddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
+		return nil, nil, errors.New("metricsToken is required when metricsAddress is not loopback")
+	}
+	metricsL, err := lc.Listen(ctx, "tcp", metricsAddress)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	ms := &http.Server{
+		Handler:           monitoring.ProtectHandler(handler, metricsToken),
+		ReadHeaderTimeout: time.Second,
+	}
+	return metricsL, ms, nil
 }
 
 func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {

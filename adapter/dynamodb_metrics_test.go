@@ -76,13 +76,9 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 	require.NoError(t, err)
 }
 
-func TestDynamoRequestMetricsStateIgnoresUnknownTableMetrics(t *testing.T) {
+func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t *testing.T) {
 	state := &dynamoRequestMetricsState{}
 
-	state.addTableMetrics("orders", 0, 0, 1)
-	require.Nil(t, state.tableMetrics())
-
-	state.recordTable("orders")
 	state.addTableMetrics("orders", 0, 0, 1)
 	require.Equal(t, map[string]monitoring.DynamoDBTableMetrics{
 		"orders": {WrittenItems: 1},

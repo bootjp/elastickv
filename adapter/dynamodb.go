@@ -339,10 +339,8 @@ func (s *dynamoRequestMetricsState) addTableMetrics(table string, returnedItems 
 	if table == "" {
 		return
 	}
-	metrics, ok := s.tables[table]
-	if !ok {
-		return
-	}
+	s.recordTable(table)
+	metrics := s.tables[table]
 	metrics.ReturnedItems += returnedItems
 	metrics.ScannedItems += scannedItems
 	metrics.WrittenItems += writtenItems

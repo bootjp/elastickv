@@ -38,6 +38,7 @@ var (
 	redisAddr            = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
 	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
 	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
+	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	raftId               = flag.String("raftId", "", "Node id used by Raft")
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -117,6 +118,7 @@ func run() error {
 		leaderRedis:     cfg.leaderRedis,
 		dynamoAddress:   *dynamoAddr,
 		metricsAddress:  *metricsAddr,
+		metricsToken:    *metricsToken,
 		metricsRegistry: metricsRegistry,
 	}
 	if err := runner.start(); err != nil {
@@ -384,16 +386,19 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	return nil
 }
 
-func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, handler http.Handler) error {
+func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
 	if strings.TrimSpace(metricsAddr) == "" || handler == nil {
 		return nil
+	}
+	if monitoring.MetricsAddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
+		return errors.New("metricsToken is required when metricsAddress is not loopback")
 	}
 	metricsL, err := lc.Listen(ctx, "tcp", metricsAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", metricsAddr)
 	}
 	metricsServer := &http.Server{
-		Handler:           handler,
+		Handler:           monitoring.ProtectHandler(handler, metricsToken),
 		ReadHeaderTimeout: time.Second,
 	}
 	eg.Go(func() error {
@@ -503,6 +508,7 @@ type runtimeServerRunner struct {
 	leaderRedis     map[raft.ServerAddress]string
 	dynamoAddress   string
 	metricsAddress  string
+	metricsToken    string
 	metricsRegistry *monitoring.Registry
 }
 
@@ -516,7 +522,7 @@ func (r runtimeServerRunner) start() error {
 	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsRegistry.Handler()); err != nil {
+	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +16,8 @@ const (
 	dynamoOutcomeSystemError            = "system_error"
 	dynamoOutcomeConditionalCheckFailed = "conditional_check_failed"
 	dynamoOperationUnknown              = "unknown"
+	dynamoTableOverflow                 = "_other"
+	dynamoMaxTrackedTables              = 512
 )
 
 var dynamoOperations = []string{
@@ -70,6 +73,9 @@ type DynamoDBMetrics struct {
 	userErrors       *prometheus.CounterVec
 	systemErrors     *prometheus.CounterVec
 	conditionalFails *prometheus.CounterVec
+
+	mu            sync.Mutex
+	trackedTables map[string]struct{}
 }
 
 func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
@@ -161,6 +167,7 @@ func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
 			},
 			[]string{"operation", "table"},
 		),
+		trackedTables: make(map[string]struct{}),
 	}
 
 	registerer.MustRegister(
@@ -202,9 +209,10 @@ func (m *DynamoDBMetrics) ObserveDynamoDBRequest(report DynamoDBRequestReport) {
 	if tableMetrics == nil {
 		tableMetrics = map[string]DynamoDBTableMetrics{}
 	}
+	tables, tableMetrics := m.normalizeReportTables(report.Tables, tableMetrics)
 
 	m.observeRequest(operation, outcome, report)
-	m.observeTables(operation, outcome, report.Tables, tableMetrics)
+	m.observeTables(operation, outcome, tables, tableMetrics)
 }
 
 func normalizeDynamoOperation(operation string) string {
@@ -231,6 +239,71 @@ func (m *DynamoDBMetrics) observeTables(operation string, outcome string, tables
 		m.observeTableActivity(operation, table, tableMetrics[table])
 		m.observeTableOutcome(operation, table, outcome)
 	}
+}
+
+func (m *DynamoDBMetrics) normalizeReportTables(tables []string, tableMetrics map[string]DynamoDBTableMetrics) ([]string, map[string]DynamoDBTableMetrics) {
+	if m == nil {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(tables)+len(tableMetrics))
+	seen := make(map[string]struct{}, len(tables)+len(tableMetrics))
+	aggregated := make(map[string]DynamoDBTableMetrics, len(tableMetrics))
+
+	addTable := func(table string) {
+		table = m.normalizeTable(table)
+		if table == "" {
+			return
+		}
+		if _, ok := seen[table]; ok {
+			return
+		}
+		seen[table] = struct{}{}
+		normalized = append(normalized, table)
+	}
+
+	for _, table := range tables {
+		addTable(table)
+	}
+	for table, metrics := range tableMetrics {
+		table = m.normalizeTable(table)
+		if table == "" {
+			continue
+		}
+		addTable(table)
+		current := aggregated[table]
+		current.ReturnedItems += metrics.ReturnedItems
+		current.ScannedItems += metrics.ScannedItems
+		current.WrittenItems += metrics.WrittenItems
+		aggregated[table] = current
+	}
+
+	slices.Sort(normalized)
+	return normalized, aggregated
+}
+
+func (m *DynamoDBMetrics) normalizeTable(table string) string {
+	if m == nil {
+		return ""
+	}
+	table = strings.TrimSpace(table)
+	if table == "" {
+		return ""
+	}
+	if table == dynamoTableOverflow {
+		return dynamoTableOverflow
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.trackedTables[table]; ok {
+		return table
+	}
+	if len(m.trackedTables) >= dynamoMaxTrackedTables {
+		return dynamoTableOverflow
+	}
+	m.trackedTables[table] = struct{}{}
+	return table
 }
 
 func (m *DynamoDBMetrics) observeTableActivity(operation string, table string, metrics DynamoDBTableMetrics) {
