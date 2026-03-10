@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -22,12 +23,12 @@ func TestProtectHandlerRequiresBearerToken(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}), "secret-token")
 
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 
-	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
 	rec = httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
