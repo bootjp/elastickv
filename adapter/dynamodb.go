@@ -139,13 +139,13 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 	}
 	n, err := c.ReadCloser.Read(p)
 	c.bytesRead += n
-	if err == nil {
-		return n, nil
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return n, io.EOF
+		}
+		return n, errors.WithStack(err)
 	}
-	if errors.Is(err, io.EOF) {
-		return n, io.EOF
-	}
-	return n, errors.WithStack(err)
+	return n, nil
 }
 
 func (c *countingReadCloser) Close() error {
