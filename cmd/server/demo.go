@@ -19,6 +19,7 @@ import (
 	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -98,13 +99,14 @@ func main() {
 	} else {
 		// Demo cluster mode (3 nodes)
 		slog.Info("Starting demo cluster with 3 nodes...")
+		demoMetricsToken := effectiveDemoMetricsToken(*metricsToken)
 		nodes := []config{
 			{
 				address:        "127.0.0.1:50051",
 				redisAddress:   "127.0.0.1:63791",
 				dynamoAddress:  "127.0.0.1:63801",
-				metricsAddress: "127.0.0.1:9091",
-				metricsToken:   *metricsToken,
+				metricsAddress: "0.0.0.0:9091",
+				metricsToken:   demoMetricsToken,
 				raftID:         "n1",
 				raftDataDir:    "", // In-memory
 				raftBootstrap:  true,
@@ -113,8 +115,8 @@ func main() {
 				address:        "127.0.0.1:50052",
 				redisAddress:   "127.0.0.1:63792",
 				dynamoAddress:  "127.0.0.1:63802",
-				metricsAddress: "127.0.0.1:9092",
-				metricsToken:   *metricsToken,
+				metricsAddress: "0.0.0.0:9092",
+				metricsToken:   demoMetricsToken,
 				raftID:         "n2",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -123,8 +125,8 @@ func main() {
 				address:        "127.0.0.1:50053",
 				redisAddress:   "127.0.0.1:63793",
 				dynamoAddress:  "127.0.0.1:63803",
-				metricsAddress: "127.0.0.1:9093",
-				metricsToken:   *metricsToken,
+				metricsAddress: "0.0.0.0:9093",
+				metricsToken:   demoMetricsToken,
 				raftID:         "n3",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -186,6 +188,14 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+func effectiveDemoMetricsToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token != "" {
+		return token
+	}
+	return strings.Join([]string{"demo", "metrics", "token"}, "-")
 }
 
 func joinCluster(ctx context.Context, nodes []config) error {
@@ -347,7 +357,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
-	cleanup := startupCleanup{}
+	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
 	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
@@ -454,27 +464,6 @@ func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAdd
 	}
 	ms := monitoring.NewMetricsServer(handler, metricsToken)
 	return metricsL, ms, nil
-}
-
-type startupCleanup struct {
-	funcs []func()
-}
-
-func (c *startupCleanup) Add(fn func()) {
-	if fn == nil {
-		return
-	}
-	c.funcs = append(c.funcs, fn)
-}
-
-func (c *startupCleanup) Release() {
-	c.funcs = nil
-}
-
-func (c *startupCleanup) Run() {
-	for i := len(c.funcs) - 1; i >= 0; i-- {
-		c.funcs[i]()
-	}
 }
 
 func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {

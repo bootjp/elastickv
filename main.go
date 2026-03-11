@@ -14,6 +14,7 @@ import (
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -77,16 +78,19 @@ func run() error {
 		return err
 	}
 
+	cleanup := internalutil.CleanupStack{}
+	defer cleanup.Run()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	clock := kv.NewHLC()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	defer func() {
+	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()
 		}
-	}()
-	defer cancel()
+	})
+	cleanup.Add(cancel)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {

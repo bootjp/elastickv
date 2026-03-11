@@ -249,27 +249,27 @@ func (m *DynamoDBMetrics) normalizeReportTables(tables []string, tableMetrics ma
 	seen := make(map[string]struct{}, len(tables)+len(tableMetrics))
 	aggregated := make(map[string]DynamoDBTableMetrics, len(tableMetrics))
 
-	addTable := func(table string) {
+	addTable := func(table string) string {
 		table = m.normalizeTable(table)
 		if table == "" {
-			return
+			return ""
 		}
 		if _, ok := seen[table]; ok {
-			return
+			return table
 		}
 		seen[table] = struct{}{}
 		normalized = append(normalized, table)
+		return table
 	}
 
 	for _, table := range tables {
 		addTable(table)
 	}
 	for table, metrics := range tableMetrics {
-		table = m.normalizeTable(table)
+		table = addTable(table)
 		if table == "" {
 			continue
 		}
-		addTable(table)
 		current := aggregated[table]
 		current.ReturnedItems += metrics.ReturnedItems
 		current.ScannedItems += metrics.ScannedItems

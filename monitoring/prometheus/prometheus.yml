@@ -4,6 +4,9 @@ global:
 
 scrape_configs:
   - job_name: elastickv
+    authorization:
+      type: Bearer
+      credentials: demo-metrics-token
     static_configs:
       - targets:
           - host.docker.internal:9091

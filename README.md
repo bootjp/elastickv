@@ -32,7 +32,7 @@ Deployment/runbook documents:
 
 ## Metrics and Grafana
 
-Elastickv now exposes Prometheus metrics on `--metricsAddress` (default: `localhost:9090` in `main.go`, `:9090` in `cmd/server/demo.go`).
+Elastickv now exposes Prometheus metrics on `--metricsAddress` (default: `localhost:9090` in `main.go`, `127.0.0.1:9090` in `cmd/server/demo.go` single-node mode). The built-in 3-node demo binds metrics on `0.0.0.0:9091`, `0.0.0.0:9092`, and `0.0.0.0:9093`, and uses the bearer token `demo-metrics-token` unless `--metricsToken` is set.
 
 The exported metrics cover:
 
@@ -46,7 +46,17 @@ Provisioned monitoring assets live under:
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
 
-To scrape a multi-node deployment, bind `--metricsAddress` to each node's private IP, for example `--metricsAddress "10.0.0.11:9090"`.
+If you bind `--metricsAddress` to a non-loopback address, `--metricsToken` is required. Prometheus must send the same bearer token, for example:
+
+```yaml
+scrape_configs:
+  - job_name: elastickv
+    authorization:
+      type: Bearer
+      credentials: YOUR_METRICS_TOKEN
+```
+
+To scrape a multi-node deployment, bind `--metricsAddress` to each node's private IP and set `--metricsToken`, for example `--metricsAddress "10.0.0.11:9090" --metricsToken "YOUR_METRICS_TOKEN"`.
 
 For the local 3-node demo, start Grafana and Prometheus with:
 
@@ -54,6 +64,8 @@ For the local 3-node demo, start Grafana and Prometheus with:
 cd monitoring
 docker compose up -d
 ```
+
+`monitoring/prometheus/prometheus.yml` assumes the demo token `demo-metrics-token`. If you override `--metricsToken` when running `go run ./cmd/server/demo.go`, update `authorization.credentials` in that file to match.
 
 
 ## Example Usage
