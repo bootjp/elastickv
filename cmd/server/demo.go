@@ -436,9 +436,11 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return err
 	}
-	cleanup.Add(func() {
-		_ = metricsL.Close()
-	})
+	if metricsL != nil {
+		cleanup.Add(func() {
+			_ = metricsL.Close()
+		})
+	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
@@ -455,6 +457,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 }
 
 func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAddress string, metricsToken string, handler http.Handler) (net.Listener, *http.Server, error) {
+	if strings.TrimSpace(metricsAddress) == "" || handler == nil {
+		return nil, nil, nil
+	}
 	if monitoring.MetricsAddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
 		return nil, nil, errors.New("metricsToken is required when metricsAddress is not loopback")
 	}
