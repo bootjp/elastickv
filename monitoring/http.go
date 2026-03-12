@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"log/slog"
 	"net"
@@ -43,9 +44,18 @@ func ProtectHandler(handler http.Handler, bearerToken string) http.Handler {
 	if token == "" {
 		return handler
 	}
-	expected := "Bearer " + token
+	expectedTokenHash := sha256.Sum256([]byte(token))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(r.Header.Get("Authorization"))), []byte(expected)) != 1 {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		const bearerPrefix = "Bearer "
+		if !strings.HasPrefix(authHeader, bearerPrefix) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		providedToken := strings.TrimSpace(authHeader[len(bearerPrefix):])
+		providedTokenHash := sha256.Sum256([]byte(providedToken))
+		if subtle.ConstantTimeCompare(providedTokenHash[:], expectedTokenHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
