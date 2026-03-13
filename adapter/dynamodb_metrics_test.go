@@ -77,6 +77,24 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 	require.NoError(t, err)
 }
 
+func TestDynamoDBServerHealthzSkipsDynamoMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, dynamoHealthPath, nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "ok\n", rec.Body.String())
+
+	metricFamilies, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+	for _, family := range metricFamilies {
+		require.NotEqual(t, "elastickv_dynamodb_requests_total", family.GetName())
+	}
+}
+
 func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t *testing.T) {
 	state := &dynamoRequestMetricsState{}
 

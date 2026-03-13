@@ -214,6 +214,29 @@ func TestDynamoDB_DeleteItem_RequestBodyTooLarge(t *testing.T) {
 	require.Contains(t, string(body), "too large")
 }
 
+func TestDynamoDB_Healthz(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"http://"+nodes[0].dynamoAddress+dynamoHealthPath,
+		nil,
+	)
+	require.NoError(t, err)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "ok\n", string(body))
+}
+
 func TestDynamoDB_PutItem_RequestBodyTooLarge(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
