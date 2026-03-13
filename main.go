@@ -395,7 +395,7 @@ func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.
 		return nil
 	}
 	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
-		return errors.Wrapf(err, "invalid metricsAddr %q; expected host:port", metricsAddr)
+		return errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
 	}
 	if monitoring.MetricsAddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
 		return errors.New("metricsToken is required when metricsAddress is not loopback")
