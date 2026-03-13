@@ -92,7 +92,16 @@ func marshalStoredDynamoMessage(prefix []byte, msg gproto.Message) ([]byte, erro
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	out := make([]byte, len(prefix)+len(body))
+
+	prefixLen := len(prefix)
+	bodyLen := len(body)
+	maxInt := int(^uint(0) >> 1)
+	if bodyLen > maxInt-prefixLen {
+		return nil, errors.New("stored dynamo message too large")
+	}
+
+	totalLen := prefixLen + bodyLen
+	out := make([]byte, totalLen)
 	copy(out, prefix)
 	copy(out[len(prefix):], body)
 	return out, nil
