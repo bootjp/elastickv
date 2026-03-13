@@ -235,23 +235,11 @@ func readTxnSizedBytes(r *bytes.Reader, n uint64) ([]byte, error) {
 		return nil, nil
 	}
 
-	var out []byte
-	var chunkBuf [txnReadChunkSize]byte
-	remaining := n
-	for remaining >= txnReadChunkSize {
-		if _, err := io.ReadFull(r, chunkBuf[:]); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		out = append(out, chunkBuf[:]...)
-		remaining -= txnReadChunkSize
-	}
-	for remaining > 0 {
-		b, err := r.ReadByte()
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		out = append(out, b)
-		remaining--
+	// n has already been validated by readTxnField to be <= math.MaxInt,
+	// so this conversion is safe.
+	out := make([]byte, int(n))
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil, errors.WithStack(err)
 	}
 	return out, nil
 }
