@@ -87,10 +87,7 @@ func encodeSortableInt64(dst []byte, seq int64) {
 	if len(dst) < sortableInt64Bytes {
 		return
 	}
-	buf := bytes.NewBuffer(dst[:0])
-	// binary.Write cannot fail here: the payload is a fixed-size int64 and the
-	// destination is an in-memory bytes.Buffer.
-	_ = binary.Write(buf, binary.BigEndian, seq^math.MinInt64)
+	binary.BigEndian.PutUint64(dst, uint64(seq^math.MinInt64))
 }
 
 // IsListMetaKey Exported helpers for other packages (e.g., Redis adapter).
