@@ -40,7 +40,7 @@ type mvccSnapshotEntry struct {
 	Versions []VersionedValue
 }
 
-func byteSliceComparator(a, b interface{}) int {
+func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
 	switch {
@@ -284,7 +284,7 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 	}
 
 	result := make([]*KVPair, 0, capHint)
-	s.tree.Each(func(key interface{}, value interface{}) {
+	s.tree.Each(func(key any, value any) {
 		if len(result) >= limit {
 			return
 		}
@@ -348,12 +348,12 @@ func seekReverseIteratorStart(tree *treemap.Map, it *treemap.Iterator, end []byt
 	}
 	it.End()
 	if bytes.Compare(target, end) < 0 {
-		return it.PrevTo(func(key interface{}, value interface{}) bool {
+		return it.PrevTo(func(key any, value any) bool {
 			k, keyOK := key.([]byte)
 			return keyOK && bytes.Equal(k, target)
 		})
 	}
-	return it.PrevTo(func(key interface{}, value interface{}) bool {
+	return it.PrevTo(func(key any, value any) bool {
 		k, keyOK := key.([]byte)
 		return keyOK && bytes.Compare(k, end) < 0
 	})
@@ -472,7 +472,7 @@ func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 	defer s.mtx.RUnlock()
 
 	entries := make([]mvccSnapshotEntry, 0, s.tree.Size())
-	s.tree.Each(func(key interface{}, value interface{}) {
+	s.tree.Each(func(key any, value any) {
 		k, ok := key.([]byte)
 		if !ok {
 			return

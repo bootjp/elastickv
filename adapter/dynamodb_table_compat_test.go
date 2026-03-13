@@ -378,7 +378,7 @@ func TestDynamoDB_UpdateItem_ConcurrentNoLostUpdate(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(threadsTable),
 			Item: map[string]ddbTypes.AttributeValue{

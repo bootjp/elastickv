@@ -34,7 +34,7 @@ type Engine struct {
 	mu               sync.RWMutex
 	routes           []Route
 	catalogVersion   uint64
-	ts               uint64
+	ts               atomic.Uint64
 	hotspotThreshold uint64
 }
 
@@ -147,7 +147,7 @@ func (e *Engine) GetRoute(key []byte) (Route, bool) {
 
 // NextTimestamp returns a monotonic increasing timestamp.
 func (e *Engine) NextTimestamp() uint64 {
-	return atomic.AddUint64(&e.ts, 1)
+	return e.ts.Add(1)
 }
 
 // RecordAccess increases the access counter for the range containing key and

@@ -37,7 +37,7 @@ var _ raft.FSM = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
 
-func (f *kvFSM) Apply(l *raft.Log) interface{} {
+func (f *kvFSM) Apply(l *raft.Log) any {
 	ctx := context.TODO()
 
 	r := &pb.Request{}

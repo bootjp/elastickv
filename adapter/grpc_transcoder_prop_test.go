@@ -90,7 +90,7 @@ func TestGrpcTranscoder_Property_TxnOps(t *testing.T) {
 
 func applyOps(t interface {
 	Helper()
-	Errorf(string, ...interface{})
+	Errorf(string, ...any)
 	FailNow()
 }, mem map[string][]byte, group *kv.OperationGroup[kv.OP]) {
 	t.Helper()

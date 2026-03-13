@@ -105,7 +105,7 @@ func TestDynamoDBMetricsCollapsesOverflowTables(t *testing.T) {
 	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
 	require.True(t, ok)
 
-	for i := 0; i < dynamoMaxTrackedTables; i++ {
+	for i := range dynamoMaxTrackedTables {
 		metrics.trackedTables["table-"+strconv.Itoa(i)] = struct{}{}
 	}
 
