@@ -287,7 +287,7 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) bool {
-	if r == nil || r.URL == nil || r.URL.Path != dynamoHealthPath {
+	if r.URL.Path != dynamoHealthPath {
 		return false
 	}
 
