@@ -40,6 +40,8 @@ const (
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
+const dynamoHealthPath = "/healthz"
+
 const (
 	updateSplitCount            = 2
 	splitPartsInitialCapacity   = 2
@@ -249,6 +251,10 @@ func (d *DynamoDBServer) Stop() {
 }
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
+	if serveDynamoHealthz(w, r) {
+		return
+	}
+
 	target := r.Header.Get("X-Amz-Target")
 	if d.requestObserver == nil {
 		d.dispatchOrWriteUnsupported(target, w, r)
@@ -278,6 +284,27 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 		Tables:        state.tableNames(),
 		TableMetrics:  state.tableMetrics(),
 	})
+}
+
+func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != dynamoHealthPath {
+		return false
+	}
+
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return true
+		}
+		_, _ = w.Write([]byte("ok\n"))
+		return true
+	default:
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return true
+	}
 }
 
 func maxDynamoBodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
