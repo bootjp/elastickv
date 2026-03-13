@@ -235,8 +235,12 @@ func u64ToInt(v uint64) (int, error) {
 	if strconv.IntSize == 32 && v > uint64(^uint32(0)>>1) {
 		return 0, errors.New("txn codec: length overflows int32")
 	}
-	if strconv.IntSize == 64 && v > (^uint64(0)>>1) {
+	if strconv.IntSize == 64 && v > uint64(^uint(0)>>1) {
 		return 0, errors.New("txn codec: length overflows int64")
 	}
-	return int(v), nil
+	parsed, err := strconv.Atoi(strconv.FormatUint(v, 10))
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return parsed, nil
 }

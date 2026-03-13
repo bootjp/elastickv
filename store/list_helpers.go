@@ -87,11 +87,8 @@ func encodeSortableInt64(dst []byte, seq int64) {
 	if len(dst) < sortableInt64Bytes {
 		return
 	}
-	sortable := seq ^ math.MinInt64
-	for i := sortableInt64Bytes - 1; i >= 0; i-- {
-		dst[i] = byte(sortable)
-		sortable >>= 8
-	}
+	buf := bytes.NewBuffer(dst[:0])
+	_ = binary.Write(buf, binary.BigEndian, seq^math.MinInt64)
 }
 
 // IsListMetaKey Exported helpers for other packages (e.g., Redis adapter).
