@@ -3,7 +3,7 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
-	"strconv"
+	"io"
 
 	"github.com/cockroachdb/errors"
 )
@@ -14,6 +14,7 @@ const (
 	txnIntentVersion   byte = 1
 	txnCommitVersion   byte = 1
 	txnRollbackVersion byte = 1
+	txnReadChunkSize        = 4096
 )
 
 const txnLockFlagPrimary byte = 0x01
@@ -62,16 +63,9 @@ func DecodeTxnMeta(b []byte) (TxnMeta, error) {
 	if primaryLen == 0 {
 		return TxnMeta{PrimaryKey: nil, LockTTLms: ttl, CommitTS: commitTS}, nil
 	}
-	plen, err := u64ToInt(primaryLen)
+	pk, err := readTxnField(r, primaryLen, "txn meta: primary key truncated")
 	if err != nil {
-		return TxnMeta{}, errors.WithStack(err)
-	}
-	if plen > r.Len() {
-		return TxnMeta{}, errors.New("txn meta: primary key truncated")
-	}
-	pk := make([]byte, plen)
-	if _, err := r.Read(pk); err != nil {
-		return TxnMeta{}, errors.WithStack(err)
+		return TxnMeta{}, err
 	}
 	return TxnMeta{PrimaryKey: pk, LockTTLms: ttl, CommitTS: commitTS}, nil
 }
@@ -125,16 +119,9 @@ func decodeTxnLock(b []byte) (txnLock, error) {
 	if err := binary.Read(r, binary.BigEndian, &primaryLen); err != nil {
 		return txnLock{}, errors.WithStack(err)
 	}
-	plen, err := u64ToInt(primaryLen)
+	primaryKey, err := readTxnField(r, primaryLen, "txn lock: primary key truncated")
 	if err != nil {
-		return txnLock{}, errors.WithStack(err)
-	}
-	if plen > r.Len() {
-		return txnLock{}, errors.New("txn lock: primary key truncated")
-	}
-	primaryKey := make([]byte, plen)
-	if _, err := r.Read(primaryKey); err != nil {
-		return txnLock{}, errors.WithStack(err)
+		return txnLock{}, err
 	}
 	return txnLock{
 		StartTS:      startTS,
@@ -188,19 +175,9 @@ func decodeTxnIntent(b []byte) (txnIntent, error) {
 	if err := binary.Read(r, binary.BigEndian, &valLen); err != nil {
 		return txnIntent{}, errors.WithStack(err)
 	}
-	vlen, err := u64ToInt(valLen)
+	val, err := readTxnField(r, valLen, "txn intent: value truncated")
 	if err != nil {
-		return txnIntent{}, errors.WithStack(err)
-	}
-	if vlen > r.Len() {
-		return txnIntent{}, errors.New("txn intent: value truncated")
-	}
-	var val []byte
-	if vlen > 0 {
-		val = make([]byte, vlen)
-		if _, err := r.Read(val); err != nil {
-			return txnIntent{}, errors.WithStack(err)
-		}
+		return txnIntent{}, err
 	}
 	return txnIntent{StartTS: startTS, Op: op, Value: val}, nil
 }
@@ -231,16 +208,39 @@ func encodeTxnRollbackRecord() []byte {
 	return []byte{txnRollbackVersion}
 }
 
-func u64ToInt(v uint64) (int, error) {
-	if strconv.IntSize == 32 && v > uint64(^uint32(0)>>1) {
-		return 0, errors.New("txn codec: length overflows int32")
+func readTxnField(r *bytes.Reader, n uint64, truncatedMessage string) ([]byte, error) {
+	b, err := readTxnSizedBytes(r, n)
+	if err == nil {
+		return b, nil
 	}
-	if strconv.IntSize == 64 && v > uint64(^uint(0)>>1) {
-		return 0, errors.New("txn codec: length overflows int64")
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, errors.New(truncatedMessage)
 	}
-	parsed, err := strconv.Atoi(strconv.FormatUint(v, 10))
-	if err != nil {
-		return 0, errors.WithStack(err)
+	return nil, errors.WithStack(err)
+}
+
+func readTxnSizedBytes(r *bytes.Reader, n uint64) ([]byte, error) {
+	if n == 0 {
+		return nil, nil
 	}
-	return parsed, nil
+
+	var out []byte
+	var chunkBuf [txnReadChunkSize]byte
+	remaining := n
+	for remaining >= txnReadChunkSize {
+		if _, err := io.ReadFull(r, chunkBuf[:]); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = append(out, chunkBuf[:]...)
+		remaining -= txnReadChunkSize
+	}
+	for remaining > 0 {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = append(out, b)
+		remaining--
+	}
+	return out, nil
 }
