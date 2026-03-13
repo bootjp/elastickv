@@ -158,11 +158,7 @@ func parseDynamoKeyEncodingVersion(v uint64) (int, error) {
 		return 0, errors.New("dynamo key encoding version overflows int")
 	}
 
-	parsed, err := strconv.Atoi(strconv.FormatUint(v, 10))
-	if err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return parsed, nil
+	return int(v), nil
 }
 
 func dynamoKeySchemaToProto(schema dynamoKeySchema) *pb.DynamoKeySchema {
