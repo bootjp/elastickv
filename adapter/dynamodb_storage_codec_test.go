@@ -60,6 +60,23 @@ func TestStoredDynamoItemCodec_LegacyJSONFallback(t *testing.T) {
 	require.Equal(t, legacy, decoded)
 }
 
+func TestStoredDynamoItemCodec_NormalizesNullTrue(t *testing.T) {
+	t.Parallel()
+
+	falseVal := false
+	item := map[string]attributeValue{
+		"gone": {NULL: &falseVal},
+	}
+
+	body, err := encodeStoredDynamoItem(item)
+	require.NoError(t, err)
+
+	decoded, err := decodeStoredDynamoItem(body)
+	require.NoError(t, err)
+	require.NotNil(t, decoded["gone"].NULL)
+	require.True(t, *decoded["gone"].NULL)
+}
+
 func TestStoredDynamoTableSchemaCodec_LegacyJSONFallback(t *testing.T) {
 	t.Parallel()
 

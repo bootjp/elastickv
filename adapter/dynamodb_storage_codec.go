@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
-	"strconv"
 	"strings"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -16,6 +15,16 @@ var (
 	storedDynamoSchemaProtoPrefix = []byte{0x00, 'D', 'S', 0x01}
 	storedDynamoItemProtoPrefix   = []byte{0x00, 'D', 'I', 0x01}
 	storedDynamoMarshalOptions    = gproto.MarshalOptions{Deterministic: true}
+
+	errStoredDynamoMessageTooLarge        = errors.New("stored dynamo message too large")
+	errNilDynamoTableSchema               = errors.New("nil dynamo table schema")
+	errInvalidDynamoKeyEncodingVersion    = errors.New("invalid key encoding version")
+	errDynamoKeyEncodingVersionOverflow   = errors.New("dynamo key encoding version overflows int")
+	errNilDynamoItem                      = errors.New("nil dynamo item")
+	errDynamoAttributeValueNestingTooDeep = errors.New("attribute value nesting exceeds maximum depth")
+	errInvalidDynamoAttributeValue        = errors.New("invalid attribute value")
+	errDynamoNullAttributeMustBeSet       = errors.New("dynamodb NULL attribute must be set")
+	errDynamoNullAttributeMustBeTrue      = errors.New("dynamodb NULL attribute must be true")
 
 	dynamoAttributeValueProtoEncoders = map[attributeValueKind]func(attributeValue) *pb.DynamoAttributeValue{
 		attributeValueKindString:    dynamoStringAttributeValueToProto,
@@ -97,7 +106,7 @@ func marshalStoredDynamoMessage(prefix []byte, msg gproto.Message) ([]byte, erro
 	bodyLen := len(body)
 	maxInt := int(^uint(0) >> 1)
 	if bodyLen > maxInt-prefixLen {
-		return nil, errors.New("stored dynamo message too large")
+		return nil, errStoredDynamoMessageTooLarge
 	}
 
 	totalLen := prefixLen + bodyLen
@@ -113,10 +122,10 @@ func hasStoredDynamoPrefix(b []byte, prefix []byte) bool {
 
 func dynamoTableSchemaToProto(schema *dynamoTableSchema) (*pb.DynamoTableSchema, error) {
 	if schema == nil {
-		return nil, errors.New("nil dynamo table schema")
+		return nil, errNilDynamoTableSchema
 	}
 	if schema.KeyEncodingVersion < 0 {
-		return nil, errors.New("invalid key encoding version")
+		return nil, errInvalidDynamoKeyEncodingVersion
 	}
 
 	gsis := make(map[string]*pb.DynamoGlobalSecondaryIndex, len(schema.GlobalSecondaryIndexes))
@@ -137,7 +146,7 @@ func dynamoTableSchemaToProto(schema *dynamoTableSchema) (*pb.DynamoTableSchema,
 
 func dynamoTableSchemaFromProto(msg *pb.DynamoTableSchema) (*dynamoTableSchema, error) {
 	if msg == nil {
-		return nil, errors.New("nil dynamo table schema")
+		return nil, errNilDynamoTableSchema
 	}
 
 	keyEncodingVersion, err := parseDynamoKeyEncodingVersion(msg.GetKeyEncodingVersion())
@@ -164,7 +173,7 @@ func dynamoTableSchemaFromProto(msg *pb.DynamoTableSchema) (*dynamoTableSchema, 
 func parseDynamoKeyEncodingVersion(v uint64) (int, error) {
 	maxInt := uint64(int(^uint(0) >> 1))
 	if v > maxInt {
-		return 0, errors.New("dynamo key encoding version overflows int")
+		return 0, errDynamoKeyEncodingVersionOverflow
 	}
 
 	return int(v), nil
@@ -236,7 +245,7 @@ func dynamoItemToProto(item map[string]attributeValue) (*pb.DynamoItem, error) {
 
 func dynamoItemFromProto(msg *pb.DynamoItem) (map[string]attributeValue, error) {
 	if msg == nil {
-		return nil, errors.New("nil dynamo item")
+		return nil, errNilDynamoItem
 	}
 	item := make(map[string]attributeValue, len(msg.GetAttributes()))
 	for name, value := range msg.GetAttributes() {
@@ -251,12 +260,12 @@ func dynamoItemFromProto(msg *pb.DynamoItem) (map[string]attributeValue, error) 
 
 func dynamoAttributeValueToProto(value attributeValue, depth int) (*pb.DynamoAttributeValue, error) {
 	if depth > maxAttributeValueNestingDepth {
-		return nil, errors.New("attribute value nesting exceeds maximum depth")
+		return nil, errDynamoAttributeValueNestingTooDeep
 	}
 
 	kind, count := detectAttributeValueKind(value)
 	if count != 1 {
-		return nil, errors.New("invalid attribute value")
+		return nil, errInvalidDynamoAttributeValue
 	}
 
 	encode := dynamoAttributeValueProtoEncoders[kind]
@@ -272,7 +281,7 @@ func dynamoAttributeValueToProto(value attributeValue, depth int) (*pb.DynamoAtt
 	if kind == attributeValueKindMap {
 		return dynamoMapAttributeValueToProto(value, depth)
 	}
-	return nil, errors.New("invalid attribute value")
+	return nil, errInvalidDynamoAttributeValue
 }
 
 func dynamoStringAttributeValueToProto(value attributeValue) *pb.DynamoAttributeValue {
@@ -292,8 +301,8 @@ func dynamoBoolAttributeValueToProto(value attributeValue) *pb.DynamoAttributeVa
 }
 
 func dynamoNullAttributeValueToProto(value attributeValue) (*pb.DynamoAttributeValue, error) {
-	if value.NULL == nil || !*value.NULL {
-		return nil, errors.New("dynamodb NULL attribute must be true")
+	if value.NULL == nil {
+		return nil, errDynamoNullAttributeMustBeSet
 	}
 	return &pb.DynamoAttributeValue{Value: &pb.DynamoAttributeValue_NullValue{NullValue: true}}, nil
 }
@@ -346,10 +355,10 @@ func dynamoMapAttributeValueToProto(value attributeValue, depth int) (*pb.Dynamo
 
 func dynamoAttributeValueFromProto(msg *pb.DynamoAttributeValue, depth int) (attributeValue, error) {
 	if depth > maxAttributeValueNestingDepth {
-		return attributeValue{}, errors.New("attribute value nesting exceeds maximum depth")
+		return attributeValue{}, errDynamoAttributeValueNestingTooDeep
 	}
 	if msg == nil {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 
 	decode := dynamoAttributeValueProtoDecoders[reflect.TypeOf(msg.Value)]
@@ -362,13 +371,13 @@ func dynamoAttributeValueFromProto(msg *pb.DynamoAttributeValue, depth int) (att
 	if typed, ok := msg.Value.(*pb.DynamoAttributeValue_M); ok {
 		return dynamoMapAttributeValueFromProto(typed.M, depth)
 	}
-	return attributeValue{}, errors.New("invalid attribute value")
+	return attributeValue{}, errInvalidDynamoAttributeValue
 }
 
 func dynamoStringAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_S)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	return newStringAttributeValue(typed.S), nil
 }
@@ -376,7 +385,7 @@ func dynamoStringAttributeValueFromProto(value any, _ int) (attributeValue, erro
 func dynamoNumberAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_N)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	numberValue := typed.N
 	return attributeValue{N: &numberValue}, nil
@@ -385,7 +394,7 @@ func dynamoNumberAttributeValueFromProto(value any, _ int) (attributeValue, erro
 func dynamoBinaryAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_B)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	return attributeValue{B: bytes.Clone(typed.B)}, nil
 }
@@ -393,7 +402,7 @@ func dynamoBinaryAttributeValueFromProto(value any, _ int) (attributeValue, erro
 func dynamoBoolAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_BoolValue)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	boolValue := typed.BoolValue
 	return attributeValue{BOOL: &boolValue}, nil
@@ -402,10 +411,10 @@ func dynamoBoolAttributeValueFromProto(value any, _ int) (attributeValue, error)
 func dynamoNullAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_NullValue)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	if !typed.NullValue {
-		return attributeValue{}, errors.New("dynamodb NULL attribute must be true")
+		return attributeValue{}, errDynamoNullAttributeMustBeTrue
 	}
 	nullValue := true
 	return attributeValue{NULL: &nullValue}, nil
@@ -414,7 +423,7 @@ func dynamoNullAttributeValueFromProto(value any, _ int) (attributeValue, error)
 func dynamoStringSetAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_Ss)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	return attributeValue{SS: cloneStringSlice(typed.Ss.GetValues())}, nil
 }
@@ -422,7 +431,7 @@ func dynamoStringSetAttributeValueFromProto(value any, _ int) (attributeValue, e
 func dynamoNumberSetAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_Ns)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	return attributeValue{NS: cloneStringSlice(typed.Ns.GetValues())}, nil
 }
@@ -430,7 +439,7 @@ func dynamoNumberSetAttributeValueFromProto(value any, _ int) (attributeValue, e
 func dynamoBinarySetAttributeValueFromProto(value any, _ int) (attributeValue, error) {
 	typed, ok := value.(*pb.DynamoAttributeValue_Bs)
 	if !ok {
-		return attributeValue{}, errors.New("invalid attribute value")
+		return attributeValue{}, errInvalidDynamoAttributeValue
 	}
 	return attributeValue{BS: cloneBinarySet(typed.Bs.GetValues())}, nil
 }
