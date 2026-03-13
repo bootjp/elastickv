@@ -118,7 +118,11 @@ func marshalStoredDynamoMessage(prefix []byte, msg gproto.Message) ([]byte, erro
 		return nil, errStoredDynamoMessageTooLarge
 	}
 
-	return append(bytes.Clone(prefix), body...), nil
+	totalLen := int(prefixLen + bodyLen)
+	buf := make([]byte, totalLen)
+	copy(buf, prefix)
+	copy(buf[len(prefix):], body)
+	return buf, nil
 }
 
 func hasStoredDynamoPrefix(b []byte, prefix []byte) bool {
