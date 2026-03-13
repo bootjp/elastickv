@@ -13,5 +13,5 @@ import (
 func TestStartMetricsServerRejectsInvalidAddressBeforeTokenCheck(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	err := startMetricsServer(ctx, &net.ListenConfig{}, eg, "localhost", "", http.NewServeMux())
-	require.ErrorContains(t, err, `invalid metricsAddr "localhost"`)
+	require.ErrorContains(t, err, `invalid metricsAddress "localhost"`)
 }
