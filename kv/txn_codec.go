@@ -217,7 +217,7 @@ func readTxnField(r *bytes.Reader, n uint64, truncatedMessage string) ([]byte, e
 
 	// Guard against excessively large fields before attempting to read them.
 	if n > uint64(math.MaxInt) {
-		return nil, errors.New("transaction field size overflows int")
+		return nil, errors.Newf("%s: field size %d overflows int", truncatedMessage, n)
 	}
 
 	b, err := readTxnSizedBytes(r, n)
