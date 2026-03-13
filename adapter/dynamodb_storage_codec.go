@@ -63,7 +63,11 @@ func decodeStoredDynamoTableSchema(b []byte) (*dynamoTableSchema, error) {
 		if err := gproto.Unmarshal(b[len(storedDynamoSchemaProtoPrefix):], msg); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return dynamoTableSchemaFromProto(msg)
+schema, err := dynamoTableSchemaFromProto(msg)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return schema, nil
 	}
 
 	schema := &dynamoTableSchema{}
