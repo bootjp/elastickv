@@ -215,12 +215,7 @@ func readTxnField(r *bytes.Reader, n uint64, truncatedMessage string) ([]byte, e
 		return nil, nil
 	}
 
-	// Ensure the requested length does not exceed the remaining reader length.
-	if n > uint64(r.Len()) {
-		return nil, errors.New(truncatedMessage)
-	}
-
-	// Guard against uint64 -> int overflow / excessively large allocations.
+	// Guard against excessively large fields before attempting to read them.
 	if n > uint64(math.MaxInt) {
 		return nil, errors.New("transaction field size overflows int")
 	}
@@ -240,12 +235,23 @@ func readTxnSizedBytes(r *bytes.Reader, n uint64) ([]byte, error) {
 		return nil, nil
 	}
 
-	// At this point, callers are expected to have validated that n is safe to
-	// convert to int and does not exceed the remaining reader length.
-	size := int(n)
-	out := make([]byte, size)
-	if _, err := io.ReadFull(r, out); err != nil {
-		return nil, errors.WithStack(err)
+	var out []byte
+	var chunkBuf [txnReadChunkSize]byte
+	remaining := n
+	for remaining >= txnReadChunkSize {
+		if _, err := io.ReadFull(r, chunkBuf[:]); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = append(out, chunkBuf[:]...)
+		remaining -= txnReadChunkSize
+	}
+	for remaining > 0 {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = append(out, b)
+		remaining--
 	}
 	return out, nil
 }
