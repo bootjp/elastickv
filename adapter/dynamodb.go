@@ -795,7 +795,7 @@ func makeCreateTableRequest(baseSchema *dynamoTableSchema, nextGeneration uint64
 		MigratingFromGeneration: baseSchema.MigratingFromGeneration,
 		Generation:              nextGeneration,
 	}
-	schemaBytes, err := json.Marshal(schema)
+	schemaBytes, err := encodeStoredDynamoTableSchema(schema)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1598,7 +1598,7 @@ func buildItemWriteRequestWithSource(
 	nextItem map[string]attributeValue,
 	current *dynamoItemLocation,
 ) (*kv.OperationGroup[kv.OP], [][]byte, error) {
-	payload, err := json.Marshal(nextItem)
+	payload, err := encodeStoredDynamoItem(nextItem)
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
@@ -2155,9 +2155,9 @@ func resolveQueryCondition(in queryInput, schema *dynamoTableSchema) (dynamoKeyS
 func filterQueryItems(kvs []*store.KVPair, cond queryCondition) ([]map[string]attributeValue, error) {
 	items := make([]map[string]attributeValue, 0, len(kvs))
 	for _, kvp := range kvs {
-		item := map[string]attributeValue{}
-		if err := json.Unmarshal(kvp.Value, &item); err != nil {
-			return nil, errors.WithStack(err)
+		item, err := decodeStoredDynamoItem(kvp.Value)
+		if err != nil {
+			return nil, err
 		}
 		if !matchesQueryCondition(item, cond) {
 			continue
@@ -2884,9 +2884,9 @@ func (it *tableReadIterator) Next(ctx context.Context) (map[string]attributeValu
 		if err != nil || !ok {
 			return nil, ok, err
 		}
-		item := map[string]attributeValue{}
-		if err := json.Unmarshal(kvp.Value, &item); err != nil {
-			return nil, false, errors.WithStack(err)
+		item, err := decodeStoredDynamoItem(kvp.Value)
+		if err != nil {
+			return nil, false, err
 		}
 		item, err = it.projector(item)
 		if err != nil {
@@ -3008,9 +3008,9 @@ func projectItemByAttributes(item map[string]attributeValue, attrs []string) map
 func decodeItemsFromKVPairs(kvs []*store.KVPair) ([]map[string]attributeValue, error) {
 	items := make([]map[string]attributeValue, 0, len(kvs))
 	for _, kvp := range kvs {
-		item := map[string]attributeValue{}
-		if err := json.Unmarshal(kvp.Value, &item); err != nil {
-			return nil, errors.WithStack(err)
+		item, err := decodeStoredDynamoItem(kvp.Value)
+		if err != nil {
+			return nil, err
 		}
 		items = append(items, item)
 	}
@@ -4232,7 +4232,7 @@ func buildConditionCheckLockRequest(
 ) (*kv.OperationGroup[kv.OP], [][]byte, error) {
 	elems := make([]*kv.Elem[kv.OP], 0, 1)
 	if found {
-		payload, err := json.Marshal(current)
+		payload, err := encodeStoredDynamoItem(current)
 		if err != nil {
 			return nil, nil, errors.WithStack(err)
 		}
@@ -7399,9 +7399,9 @@ func (d *DynamoDBServer) loadTableSchemaAt(ctx context.Context, tableName string
 		}
 		return nil, false, errors.WithStack(err)
 	}
-	schema := &dynamoTableSchema{}
-	if err := json.Unmarshal(b, schema); err != nil {
-		return nil, false, errors.WithStack(err)
+	schema, err := decodeStoredDynamoTableSchema(b)
+	if err != nil {
+		return nil, false, err
 	}
 	d.observeTables(ctx, schema.TableName)
 	return schema, true, nil
@@ -7430,9 +7430,9 @@ func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uin
 		}
 		return nil, false, errors.WithStack(err)
 	}
-	item := map[string]attributeValue{}
-	if err := json.Unmarshal(b, &item); err != nil {
-		return nil, false, errors.WithStack(err)
+	item, err := decodeStoredDynamoItem(b)
+	if err != nil {
+		return nil, false, err
 	}
 	return item, true, nil
 }
@@ -7650,9 +7650,9 @@ func (d *DynamoDBServer) migrateLegacySourcePage(
 		if !bytes.HasPrefix(kvp.Key, prefix) {
 			return nil, true, nil
 		}
-		item := map[string]attributeValue{}
-		if err := json.Unmarshal(kvp.Value, &item); err != nil {
-			return nil, false, errors.WithStack(err)
+		item, err := decodeStoredDynamoItem(kvp.Value)
+		if err != nil {
+			return nil, false, err
 		}
 		if err := d.migrateLegacyItem(ctx, targetSchema, sourceSchema, kvp.Key, item); err != nil {
 			return nil, false, err
@@ -7737,7 +7737,7 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 	oldGeneration := schema.MigratingFromGeneration
 	finalized := *schema
 	finalized.MigratingFromGeneration = 0
-	body, err := json.Marshal(&finalized)
+	body, err := encodeStoredDynamoTableSchema(&finalized)
 	if err != nil {
 		return errors.WithStack(err)
 	}

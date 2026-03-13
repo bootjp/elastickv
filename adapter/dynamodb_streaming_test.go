@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -55,7 +54,7 @@ func (w *dynamoFixtureWriter) put(key []byte, value []byte) {
 
 func (w *dynamoFixtureWriter) writeSchema(schema *dynamoTableSchema) {
 	w.t.Helper()
-	body, err := json.Marshal(schema)
+	body, err := encodeStoredDynamoTableSchema(schema)
 	require.NoError(w.t, err)
 	w.put(dynamoTableMetaKey(schema.TableName), body)
 	w.put(dynamoTableGenerationKey(schema.TableName), []byte(fmt.Sprintf("%d", schema.Generation)))
@@ -65,7 +64,7 @@ func (w *dynamoFixtureWriter) writeItem(schema *dynamoTableSchema, item map[stri
 	w.t.Helper()
 	itemKey, err := schema.itemKeyFromAttributes(item)
 	require.NoError(w.t, err)
-	body, err := json.Marshal(item)
+	body, err := encodeStoredDynamoItem(item)
 	require.NoError(w.t, err)
 	w.put(itemKey, body)
 	gsiKeys, err := schema.gsiEntryKeysForItem(item)
