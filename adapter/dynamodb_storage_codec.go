@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"reflect"
 	"strings"
 
@@ -37,14 +38,14 @@ var (
 	}
 
 	dynamoAttributeValueProtoDecoders = map[reflect.Type]func(any, int) (attributeValue, error){
-		reflect.TypeOf((*pb.DynamoAttributeValue_S)(nil)):         dynamoStringAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_N)(nil)):         dynamoNumberAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_B)(nil)):         dynamoBinaryAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_BoolValue)(nil)): dynamoBoolAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_NullValue)(nil)): dynamoNullAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_Ss)(nil)):        dynamoStringSetAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_Ns)(nil)):        dynamoNumberSetAttributeValueFromProto,
-		reflect.TypeOf((*pb.DynamoAttributeValue_Bs)(nil)):        dynamoBinarySetAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_S]():         dynamoStringAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_N]():         dynamoNumberAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_B]():         dynamoBinaryAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_BoolValue](): dynamoBoolAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_NullValue](): dynamoNullAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_Ss]():        dynamoStringSetAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_Ns]():        dynamoNumberSetAttributeValueFromProto,
+		reflect.TypeFor[*pb.DynamoAttributeValue_Bs]():        dynamoBinarySetAttributeValueFromProto,
 	}
 )
 
@@ -102,18 +103,14 @@ func marshalStoredDynamoMessage(prefix []byte, msg gproto.Message) ([]byte, erro
 		return nil, errors.WithStack(err)
 	}
 
-	prefixLen := len(prefix)
-	bodyLen := len(body)
-	maxInt := int(^uint(0) >> 1)
-	if bodyLen > maxInt-prefixLen {
+	prefixLen := uint64(len(prefix))
+	bodyLen := uint64(len(body))
+	maxInt := uint64(int(^uint(0) >> 1))
+	if prefixLen > maxInt || bodyLen > maxInt-prefixLen {
 		return nil, errStoredDynamoMessageTooLarge
 	}
 
-	totalLen := prefixLen + bodyLen
-	out := make([]byte, totalLen)
-	copy(out, prefix)
-	copy(out[len(prefix):], body)
-	return out, nil
+	return append(bytes.Clone(prefix), body...), nil
 }
 
 func hasStoredDynamoPrefix(b []byte, prefix []byte) bool {
@@ -479,8 +476,6 @@ func cloneStringMap(in map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
+	maps.Copy(out, in)
 	return out
 }

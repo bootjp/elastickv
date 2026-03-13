@@ -32,7 +32,7 @@ func TestMVCCStore_ScanConcurrentWithWrites(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 1000; i++ {
+		for range 1000 {
 			if _, err := st.Scan(ctx, nil, nil, 100); err != nil {
 				errCh <- err
 				return

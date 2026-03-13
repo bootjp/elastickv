@@ -12,7 +12,7 @@ func TestHLCNextIsMonotonic(t *testing.T) {
 
 	h := NewHLC()
 	last := h.Next()
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		next := h.Next()
 		require.Greater(t, next, last)
 		last = next

@@ -273,7 +273,7 @@ func containsServer(servers []raft.Server, expected raft.Server) bool {
 
 func assignPorts(n int) []portsAdress {
 	ports := make([]portsAdress, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		ports[i] = portAssigner()
 	}
 	return ports
@@ -281,7 +281,7 @@ func assignPorts(n int) []portsAdress {
 
 func buildRaftConfig(n int, ports []portsAdress) raft.Configuration {
 	cfg := raft.Configuration{}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		suffrage := raft.Nonvoter
 		if i == 0 {
 			suffrage = raft.Voter
@@ -306,7 +306,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 	var nodes []Node
 	lc := net.ListenConfig{}
 	lis := make([]listeners, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		var (
 			bound portsAdress
 			l     listeners
@@ -332,7 +332,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		leaderRedisMap[raft.ServerAddress(p.raftAddress)] = p.redisAddress
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := store.NewMVCCStore()
 		fsm := kv.NewKvFSM(st)
 

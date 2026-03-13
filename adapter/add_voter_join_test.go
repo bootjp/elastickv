@@ -296,13 +296,11 @@ func (w *serverWorkers) Go(run func() error) {
 	if w == nil || run == nil {
 		return
 	}
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
+	w.wg.Go(func() {
 		if err := run(); err != nil {
 			w.errCh <- err
 		}
-	}()
+	})
 }
 
 func (w *serverWorkers) AwaitNoError(t *testing.T, timeout time.Duration) {

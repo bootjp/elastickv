@@ -471,7 +471,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	numGoroutines := 100
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -568,7 +568,7 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	numGoroutines := 50
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

@@ -70,11 +70,11 @@ func TestAttributeValue_UnmarshalJSON_AllowsMaxMapNestingDepth(t *testing.T) {
 
 func nestedListAttributeJSON(depth int) string {
 	var b strings.Builder
-	for i := 0; i < depth; i++ {
+	for range depth {
 		b.WriteString(`{"L":[`)
 	}
 	b.WriteString(`{"S":"leaf"}`)
-	for i := 0; i < depth; i++ {
+	for range depth {
 		b.WriteString(`]}`)
 	}
 	return b.String()
@@ -82,11 +82,11 @@ func nestedListAttributeJSON(depth int) string {
 
 func nestedMapAttributeJSON(depth int) string {
 	var b strings.Builder
-	for i := 0; i < depth; i++ {
+	for range depth {
 		b.WriteString(`{"M":{"child":`)
 	}
 	b.WriteString(`{"S":"leaf"}`)
-	for i := 0; i < depth; i++ {
+	for range depth {
 		b.WriteString(`}}`)
 	}
 	return b.String()

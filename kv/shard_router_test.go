@@ -34,7 +34,7 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 func setupInmemTransports(id string, n int) ([]raft.ServerAddress, []*raft.InmemTransport) {
 	addrs := make([]raft.ServerAddress, n)
 	trans := make([]*raft.InmemTransport, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		addr, tr := raft.NewInmemTransport(raft.ServerAddress(fmt.Sprintf("%s-%d", id, i)))
 		addrs[i] = addr
 		trans[i] = tr
@@ -44,7 +44,7 @@ func setupInmemTransports(id string, n int) ([]raft.ServerAddress, []*raft.Inmem
 
 func connectInmemTransports(addrs []raft.ServerAddress, trans []*raft.InmemTransport) {
 	// fully connect transports
-	for i := 0; i < len(trans); i++ {
+	for i := range trans {
 		for j := i + 1; j < len(trans); j++ {
 			trans[i].Connect(addrs[j], trans[j])
 			trans[j].Connect(addrs[i], trans[i])
@@ -55,7 +55,7 @@ func connectInmemTransports(addrs []raft.ServerAddress, trans []*raft.InmemTrans
 func buildRaftConfig(id string, addrs []raft.ServerAddress) raft.Configuration {
 	// cluster configuration
 	cfg := raft.Configuration{}
-	for i := 0; i < len(addrs); i++ {
+	for i := range addrs {
 		cfg.Servers = append(cfg.Servers, raft.Server{
 			ID:      raft.ServerID(fmt.Sprintf("%s-%d", id, i)),
 			Address: addrs[i],
@@ -68,7 +68,7 @@ func initTestRafts(t *testing.T, cfg raft.Configuration, trans []*raft.InmemTran
 	t.Helper()
 
 	rafts := make([]*raft.Raft, len(trans))
-	for i := 0; i < len(trans); i++ {
+	for i := range trans {
 		c := raft.DefaultConfig()
 		c.LocalID = cfg.Servers[i].ID
 		if i == 0 {
@@ -106,7 +106,7 @@ func waitForLeader(t *testing.T, id string, leader *raft.Raft) {
 	t.Helper()
 
 	// node 0 should become leader quickly during tests
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if leader.State() == raft.Leader {
 			break
 		}

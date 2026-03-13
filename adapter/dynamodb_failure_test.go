@@ -101,7 +101,7 @@ func createCompositeKeyTable(t *testing.T, ctx context.Context, client *dynamodb
 func putCompositeItems(t *testing.T, ctx context.Context, client *dynamodb.Client, tableName string, total int) {
 	t.Helper()
 
-	for i := 0; i < total; i++ {
+	for i := range total {
 		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(tableName),
 			Item: map[string]ddbTypes.AttributeValue{

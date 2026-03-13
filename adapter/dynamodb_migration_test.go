@@ -175,7 +175,7 @@ func TestDynamoDB_EnsureLegacyTableMigration_NormalizesLegacyGSIJSONFormat(t *te
 	})
 	require.NoError(t, err)
 	writer.put(dynamoTableMetaKey(legacySchema.TableName), legacyBody)
-	writer.put(dynamoTableGenerationKey(legacySchema.TableName), []byte(fmt.Sprintf("%d", legacySchema.Generation)))
+	writer.put(dynamoTableGenerationKey(legacySchema.TableName), fmt.Appendf(nil, "%d", legacySchema.Generation))
 
 	writer.writeItem(legacySchema, map[string]attributeValue{
 		"pk":     newStringAttributeValue("tenant"),

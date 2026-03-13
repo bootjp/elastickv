@@ -30,13 +30,7 @@ func MaxLatestCommitTS(ctx context.Context, st store.MVCCStore, keys [][]byte) (
 		return maxLatestCommitTSSequential(ctx, st, uniq)
 	}
 
-	limit := maxLatestCommitTSConcurrency
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > len(uniq) {
-		limit = len(uniq)
-	}
+	limit := min(max(maxLatestCommitTSConcurrency, 1), len(uniq))
 
 	return maxLatestCommitTSParallel(ctx, st, uniq, limit)
 }

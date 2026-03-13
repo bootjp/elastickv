@@ -49,7 +49,7 @@ func TestEngineRouteUnmatchedAfterEnd(t *testing.T) {
 func TestEngineTimestampMonotonic(t *testing.T) {
 	e := NewEngine()
 	last := e.NextTimestamp()
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		ts := e.NextTimestamp()
 		if ts <= last {
 			t.Fatalf("timestamp not monotonic: %d <= %d", ts, last)
@@ -114,12 +114,10 @@ func TestEngineRecordAccessConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	const workers = 10
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range workers {
+		wg.Go(func() {
 			e.RecordAccess([]byte("b"))
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -440,9 +438,7 @@ func TestEngineApplySnapshot_Concurrent(t *testing.T) {
 
 	for version := uint64(1); version <= maxVersion; version++ {
 		v := version
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 
 			err := e.ApplySnapshot(CatalogSnapshot{
 				Version: v,
@@ -459,7 +455,7 @@ func TestEngineApplySnapshot_Concurrent(t *testing.T) {
 			if err != nil && !errors.Is(err, ErrEngineSnapshotVersionStale) {
 				errs <- err
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

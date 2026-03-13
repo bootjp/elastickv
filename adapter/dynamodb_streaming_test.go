@@ -57,7 +57,7 @@ func (w *dynamoFixtureWriter) writeSchema(schema *dynamoTableSchema) {
 	body, err := encodeStoredDynamoTableSchema(schema)
 	require.NoError(w.t, err)
 	w.put(dynamoTableMetaKey(schema.TableName), body)
-	w.put(dynamoTableGenerationKey(schema.TableName), []byte(fmt.Sprintf("%d", schema.Generation)))
+	w.put(dynamoTableGenerationKey(schema.TableName), fmt.Appendf(nil, "%d", schema.Generation))
 }
 
 func (w *dynamoFixtureWriter) writeItem(schema *dynamoTableSchema, item map[string]attributeValue) {
@@ -80,7 +80,7 @@ func TestDynamoDB_QueryItems_StreamsPrimaryPrefixPages(t *testing.T) {
 	schema, server, tracking := newStreamingTestServer(t, false)
 	writer := newDynamoFixtureWriter(t, tracking)
 	writer.writeSchema(schema)
-	for i := 0; i < dynamoScanPageLimit*2+1; i++ {
+	for i := range dynamoScanPageLimit*2 + 1 {
 		writer.writeItem(schema, map[string]attributeValue{
 			"pk": newStringAttributeValue("tenant"),
 			"sk": newStringAttributeValue(fmt.Sprintf("%04d", i)),
@@ -137,7 +137,7 @@ func TestDynamoDB_ScanItems_StreamsPrimaryPrefixPages(t *testing.T) {
 	schema, server, tracking := newStreamingTestServer(t, false)
 	writer := newDynamoFixtureWriter(t, tracking)
 	writer.writeSchema(schema)
-	for i := 0; i < dynamoScanPageLimit*2+1; i++ {
+	for i := range dynamoScanPageLimit*2 + 1 {
 		writer.writeItem(schema, map[string]attributeValue{
 			"pk": newStringAttributeValue(fmt.Sprintf("pk-%04d", i)),
 			"sk": newStringAttributeValue("row"),
@@ -161,7 +161,7 @@ func TestDynamoDB_QueryItems_StreamsGSIIndexPages(t *testing.T) {
 	schema, server, tracking := newStreamingTestServer(t, true)
 	writer := newDynamoFixtureWriter(t, tracking)
 	writer.writeSchema(schema)
-	for i := 0; i < dynamoScanPageLimit*2+1; i++ {
+	for i := range dynamoScanPageLimit*2 + 1 {
 		writer.writeItem(schema, map[string]attributeValue{
 			"pk":     newStringAttributeValue(fmt.Sprintf("pk-%04d", i)),
 			"sk":     newStringAttributeValue(fmt.Sprintf("%04d", i)),
@@ -192,7 +192,7 @@ func TestDynamoDB_QueryItems_StreamsReverseGSIIndexPages(t *testing.T) {
 	schema, server, tracking := newStreamingTestServer(t, true)
 	writer := newDynamoFixtureWriter(t, tracking)
 	writer.writeSchema(schema)
-	for i := 0; i < dynamoScanPageLimit*2+1; i++ {
+	for i := range dynamoScanPageLimit*2 + 1 {
 		writer.writeItem(schema, map[string]attributeValue{
 			"pk":     newStringAttributeValue(fmt.Sprintf("pk-%04d", i)),
 			"sk":     newStringAttributeValue(fmt.Sprintf("%04d", i)),
@@ -225,7 +225,7 @@ func TestDynamoDB_ScanItems_StreamsGSIIndexPages(t *testing.T) {
 	schema, server, tracking := newStreamingTestServer(t, true)
 	writer := newDynamoFixtureWriter(t, tracking)
 	writer.writeSchema(schema)
-	for i := 0; i < dynamoScanPageLimit*2+1; i++ {
+	for i := range dynamoScanPageLimit*2 + 1 {
 		writer.writeItem(schema, map[string]attributeValue{
 			"pk":     newStringAttributeValue(fmt.Sprintf("pk-%04d", i)),
 			"sk":     newStringAttributeValue(fmt.Sprintf("%04d", i)),

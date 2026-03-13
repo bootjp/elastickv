@@ -32,7 +32,7 @@ func TestRedis_MultiExecAtomic(t *testing.T) {
 	// commit
 	execRes, err := rdb.Do(ctx, "EXEC").Result()
 	require.NoError(t, err)
-	vals, ok := execRes.([]interface{})
+	vals, ok := execRes.([]any)
 	require.True(t, ok, "exec result should be []interface{}")
 	require.Len(t, vals, 2)
 	require.Equal(t, "OK", vals[0])
@@ -63,11 +63,11 @@ func TestRedis_RPushLRange(t *testing.T) {
 
 	rangeRes, err := rdb.Do(ctx, "LRANGE", "listk", 0, -1).Result()
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{"a", "b", "c"}, rangeRes)
+	require.Equal(t, []any{"a", "b", "c"}, rangeRes)
 
 	rangeEmpty, err := rdb.Do(ctx, "LRANGE", "listk", 5, 10).Result()
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{}, rangeEmpty)
+	require.Equal(t, []any{}, rangeEmpty)
 }
 
 func TestRedis_DiscardClearsTxn(t *testing.T) {
@@ -103,9 +103,9 @@ func TestRedis_DelList_RemovesLargeListAndInternalKeys(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	ctx := context.Background()
 
-	args := make([]interface{}, 0, 1302)
+	args := make([]any, 0, 1302)
 	args = append(args, "RPUSH", "list-big-del")
-	for i := 0; i < 1300; i++ {
+	for i := range 1300 {
 		args = append(args, "v"+strconv.Itoa(i))
 	}
 	_, err := rdb.Do(ctx, args...).Result()
@@ -117,7 +117,7 @@ func TestRedis_DelList_RemovesLargeListAndInternalKeys(t *testing.T) {
 
 	rangeRes, err := rdb.Do(ctx, "LRANGE", "list-big-del", 0, -1).Result()
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{}, rangeRes)
+	require.Equal(t, []any{}, rangeRes)
 
 	readTS := nodes[0].redisServer.readTS()
 	_, err = nodes[0].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-big-del")), readTS)
@@ -184,7 +184,7 @@ func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
 
 	execRes, err := rdb.Do(ctx, "EXEC").Result()
 	require.NoError(t, err)
-	vals, ok := execRes.([]interface{})
+	vals, ok := execRes.([]any)
 	require.True(t, ok)
 	require.Len(t, vals, 2)
 	require.Equal(t, int64(1), vals[0])
@@ -192,7 +192,7 @@ func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
 
 	rangeRes, err := rdb.Do(ctx, "LRANGE", "list-del-rpush", 0, -1).Result()
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{"new1", "new2"}, rangeRes)
+	require.Equal(t, []any{"new1", "new2"}, rangeRes)
 
 	readTS := nodes[1].redisServer.readTS()
 	metaRaw, err := nodes[1].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-del-rpush")), readTS)

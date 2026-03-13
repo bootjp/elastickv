@@ -72,7 +72,7 @@ func Test_grpc_scan(t *testing.T) {
 	c := transactionalKVClient(t, adders)
 	defer shutdown(nodes)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		key := []byte("test-key-" + strconv.Itoa(i))
 		want := []byte(strconv.Itoa(i))
 		res, err := c.Put(
@@ -92,7 +92,7 @@ func Test_grpc_scan(t *testing.T) {
 	assert.NoError(t, err, "Scan RPC failed")
 	assert.Equal(t, 10, len(resp.Kv), "Scan RPC failed")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		key := []byte("test-key-" + strconv.Itoa(i))
 		want := []byte(strconv.Itoa(i))
 		assert.Equal(t, key, resp.Kv[i].Key, "Scan RPC failed")
@@ -131,7 +131,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(1000)
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		go func(i int) {
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
 			want := []byte(strconv.Itoa(i))
@@ -161,7 +161,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 
 	key := []byte("test-key-sequence")
 
-	for i := 0; i < 9999; i++ {
+	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
 		_, err := c.RawPut(
 			context.Background(),
@@ -187,7 +187,7 @@ func Test_grpc_transaction(t *testing.T) {
 
 	key := []byte("test-key-sequence")
 
-	for i := 0; i < 9999; i++ {
+	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
 		_, err := c.Put(
 			context.Background(),

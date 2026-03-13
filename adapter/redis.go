@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"maps"
 	"math"
 	"net"
 	"sort"
@@ -404,9 +405,7 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		for k, v := range r.collectUserKeys(keys, pattern) {
-			keyset[k] = v
-		}
+		maps.Copy(keyset, r.collectUserKeys(keys, pattern))
 		return nil
 	}
 

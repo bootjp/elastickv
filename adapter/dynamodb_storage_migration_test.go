@@ -88,7 +88,7 @@ func TestDynamoDB_EnsureLegacyTableMigration_RewritesLegacyJSONSchemaToProto(t *
 	body, err := json.Marshal(legacySchema)
 	require.NoError(t, err)
 	writer.put(dynamoTableMetaKey(legacySchema.TableName), body)
-	writer.put(dynamoTableGenerationKey(legacySchema.TableName), []byte(fmt.Sprintf("%d", legacySchema.Generation)))
+	writer.put(dynamoTableGenerationKey(legacySchema.TableName), fmt.Appendf(nil, "%d", legacySchema.Generation))
 
 	require.NoError(t, server.ensureLegacyTableMigration(context.Background(), legacySchema.TableName))
 

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -221,7 +221,7 @@ func commitSecondaryWithRetry(g *ShardGroup, req *pb.Request) (*TransactionRespo
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	var lastErr error
-	for attempt := 0; attempt < txnSecondaryCommitRetryAttempts; attempt++ {
+	for attempt := range txnSecondaryCommitRetryAttempts {
 		resp, err := g.Txn.Commit([]*pb.Request{req})
 		if err == nil {
 			return resp, nil
@@ -508,7 +508,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 	for gid := range grouped {
 		gids = append(gids, gid)
 	}
-	sort.Slice(gids, func(i, j int) bool { return gids[i] < gids[j] })
+	slices.Sort(gids)
 	return grouped, gids, nil
 }
 

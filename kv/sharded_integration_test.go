@@ -41,7 +41,7 @@ func newSingleRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 		t.Fatalf("bootstrap: %v", err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if r.State() == raft.Leader {
 			break
 		}

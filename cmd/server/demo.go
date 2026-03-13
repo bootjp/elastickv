@@ -222,7 +222,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 }
 
 func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, n config) error {
-	for i := 0; i < joinRetries; i++ {
+	for i := range joinRetries {
 		if err := tryJoinNode(ctx, client, n); err == nil {
 			return nil
 		} else {
@@ -337,8 +337,8 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string) (*adapter.RedisServer, error) {
 	leaderRedis := make(map[raft.ServerAddress]string)
 	if raftRedisMapStr != "" {
-		parts := strings.Split(raftRedisMapStr, ",")
-		for _, part := range parts {
+		parts := strings.SplitSeq(raftRedisMapStr, ",")
+		for part := range parts {
 			kv := strings.Split(part, "=")
 			if len(kv) == kvParts {
 				leaderRedis[raft.ServerAddress(kv[0])] = kv[1]
