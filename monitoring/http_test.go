@@ -33,4 +33,10 @@ func TestProtectHandlerRequiresBearerToken(t *testing.T) {
 	rec = httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "bearer secret-token")
+	rec = httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
 }

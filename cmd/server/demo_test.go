@@ -20,3 +20,10 @@ func TestSetupMetricsHTTPServerAllowsBlankAddress(t *testing.T) {
 	require.Nil(t, listener)
 	require.Nil(t, server)
 }
+
+func TestSetupMetricsHTTPServerRejectsInvalidAddressBeforeTokenCheck(t *testing.T) {
+	listener, server, err := setupMetricsHTTPServer(context.Background(), net.ListenConfig{}, "localhost", "", http.NewServeMux())
+	require.ErrorContains(t, err, `invalid metricsAddress "localhost"`)
+	require.Nil(t, listener)
+	require.Nil(t, server)
+}

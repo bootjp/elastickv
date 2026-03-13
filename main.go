@@ -390,8 +390,12 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 }
 
 func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
-	if strings.TrimSpace(metricsAddr) == "" || handler == nil {
+	metricsAddr = strings.TrimSpace(metricsAddr)
+	if metricsAddr == "" || handler == nil {
 		return nil
+	}
+	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
+		return errors.Wrapf(err, "invalid metricsAddr %q; expected host:port", metricsAddr)
 	}
 	if monitoring.MetricsAddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
 		return errors.New("metricsToken is required when metricsAddress is not loopback")

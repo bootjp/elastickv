@@ -195,7 +195,7 @@ func effectiveDemoMetricsToken(token string) string {
 	if token != "" {
 		return token
 	}
-	return strings.Join([]string{"demo", "metrics", "token"}, "-")
+	return "demo-metrics-token"
 }
 
 func joinCluster(ctx context.Context, nodes []config) error {
@@ -457,8 +457,12 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 }
 
 func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAddress string, metricsToken string, handler http.Handler) (net.Listener, *http.Server, error) {
-	if strings.TrimSpace(metricsAddress) == "" || handler == nil {
+	metricsAddress = strings.TrimSpace(metricsAddress)
+	if metricsAddress == "" || handler == nil {
 		return nil, nil, nil
+	}
+	if _, _, err := net.SplitHostPort(metricsAddress); err != nil {
+		return nil, nil, errors.Wrapf(err, "invalid metricsAddress %q", metricsAddress)
 	}
 	if monitoring.MetricsAddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
 		return nil, nil, errors.New("metricsToken is required when metricsAddress is not loopback")

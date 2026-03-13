@@ -47,13 +47,13 @@ func ProtectHandler(handler http.Handler, bearerToken string) http.Handler {
 	expectedTokenHash := sha256.Sum256([]byte(token))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-		const bearerPrefix = "Bearer "
-		if !strings.HasPrefix(authHeader, bearerPrefix) {
+		parts := strings.Fields(authHeader)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		providedToken := strings.TrimSpace(authHeader[len(bearerPrefix):])
+		providedToken := parts[1]
 		providedTokenHash := sha256.Sum256([]byte(providedToken))
 		if subtle.ConstantTimeCompare(providedTokenHash[:], expectedTokenHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
