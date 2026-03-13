@@ -30,6 +30,43 @@ Deployment/runbook documents:
 
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
 
+## Metrics and Grafana
+
+Elastickv now exposes Prometheus metrics on `--metricsAddress` (default: `localhost:9090` in `main.go`, `127.0.0.1:9090` in `cmd/server/demo.go` single-node mode). The built-in 3-node demo binds metrics on `0.0.0.0:9091`, `0.0.0.0:9092`, and `0.0.0.0:9093`, and uses the bearer token `demo-metrics-token` unless `--metricsToken` is set.
+
+The exported metrics cover:
+
+- DynamoDB-compatible API request rate, success/error split, latency, request/response size, and per-table read/write item counts
+- Raft local state, leader identity, current members, commit/applied index, and leader contact lag
+
+Provisioned monitoring assets live under:
+
+- `monitoring/prometheus/prometheus.yml`
+- `monitoring/grafana/dashboards/elastickv-cluster-overview.json`
+- `monitoring/grafana/provisioning/`
+- `monitoring/docker-compose.yml`
+
+If you bind `--metricsAddress` to a non-loopback address, `--metricsToken` is required. Prometheus must send the same bearer token, for example:
+
+```yaml
+scrape_configs:
+  - job_name: elastickv
+    authorization:
+      type: Bearer
+      credentials: YOUR_METRICS_TOKEN
+```
+
+To scrape a multi-node deployment, bind `--metricsAddress` to each node's private IP and set `--metricsToken`, for example `--metricsAddress "10.0.0.11:9090" --metricsToken "YOUR_METRICS_TOKEN"`.
+
+For the local 3-node demo, start Grafana and Prometheus with:
+
+```bash
+cd monitoring
+docker compose up -d
+```
+
+`monitoring/prometheus/prometheus.yml` assumes the demo token `demo-metrics-token`. If you override `--metricsToken` when running `go run ./cmd/server/demo.go`, update `authorization.credentials` in that file to match.
+
 
 ## Example Usage
 
@@ -39,6 +76,16 @@ This section provides sample commands to demonstrate how to use the project. Mak
 To start the server, use the following command:
 ```bash
 go run cmd/server/demo.go
+```
+
+To expose metrics on a dedicated port:
+```bash
+go run . \
+  --address "127.0.0.1:50051" \
+  --redisAddress "127.0.0.1:6379" \
+  --dynamoAddress "127.0.0.1:8000" \
+  --metricsAddress "127.0.0.1:9090" \
+  --raftId "n1"
 ```
 
 ### Starting the Client

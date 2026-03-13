@@ -17,6 +17,7 @@ Use private VM IPs for all bind addresses and lock down network access because g
 - 1 node = 1 VM
 - Total nodes: 4 or 5
 - VMs must be able to reach each other over TCP (at minimum `50051/tcp`)
+- Prometheus must be able to reach each node's metrics endpoint if you want centralized monitoring (`9090/tcp` in the examples below)
 - Docker Engine installed on every VM
 
 Example (5 nodes):
@@ -83,6 +84,12 @@ Shared fixed bootstrap voters (5-node example):
 RAFT_BOOTSTRAP_MEMBERS="n1=10.0.0.11:50051,n2=10.0.0.12:50051,n3=10.0.0.13:50051,n4=10.0.0.14:50051,n5=10.0.0.15:50051"
 ```
 
+Shared metrics bearer token (required because the examples bind `--metricsAddress` to non-loopback VM IPs):
+
+```bash
+ELASTICKV_METRICS_TOKEN="$(openssl rand -hex 32)"
+```
+
 For a 4-node cluster, remove the `n5` entry from both variables.
 
 ## 4) Start Nodes with `docker run`
@@ -92,6 +99,8 @@ This guide uses `--network host` and explicit VM private IPs.
 Binding guidance:
 
 - Set `--address`, `--redisAddress`, and `--dynamoAddress` to the VM private IP.
+- Set `--metricsAddress` to the VM private IP if Prometheus scrapes from another host.
+- Set `--metricsToken` to the same shared bearer token on every node whenever `--metricsAddress` is non-loopback.
 - Do not use `0.0.0.0` as the advertised address.
 - Do not use `localhost` for cluster communication.
 
@@ -109,6 +118,8 @@ docker run -d \
   --address "10.0.0.11:50051" \
   --redisAddress "10.0.0.11:6379" \
   --dynamoAddress "10.0.0.11:8000" \
+  --metricsAddress "10.0.0.11:9090" \
+  --metricsToken "${ELASTICKV_METRICS_TOKEN}" \
   --raftId "n1" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
@@ -130,6 +141,8 @@ docker run -d \
   --address "10.0.0.12:50051" \
   --redisAddress "10.0.0.12:6379" \
   --dynamoAddress "10.0.0.12:8000" \
+  --metricsAddress "10.0.0.12:9090" \
+  --metricsToken "${ELASTICKV_METRICS_TOKEN}" \
   --raftId "n2" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
@@ -142,6 +155,7 @@ Start `n3` to `n5` the same way by replacing:
 - `--address`
 - `--redisAddress`
 - `--dynamoAddress`
+- `--metricsAddress`
 - `--raftId`
 
 ## Startup Order and Quorum Caution
@@ -202,6 +216,27 @@ Write/read through Redis endpoints:
 redis-cli -h 10.0.0.11 -p 6379 SET health ok
 redis-cli -h 10.0.0.12 -p 6379 GET health
 ```
+
+## 6.5) Validate Metrics
+
+Check the local Prometheus endpoint on any node:
+
+```bash
+curl -fsS -H "Authorization: Bearer ${ELASTICKV_METRICS_TOKEN}" \
+  http://10.0.0.11:9090/metrics | grep '^elastickv_'
+```
+
+Prometheus must send the same bearer token when scraping:
+
+```yaml
+scrape_configs:
+  - job_name: elastickv
+    authorization:
+      type: Bearer
+      credentials: ${ELASTICKV_METRICS_TOKEN}
+```
+
+Grafana/Prometheus provisioning examples are available under `monitoring/`.
 
 ## 7) Fault Tolerance Drill
 

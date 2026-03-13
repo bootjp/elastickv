@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,9 @@ import (
 	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -31,13 +34,15 @@ import (
 )
 
 var (
-	address       = flag.String("address", ":50051", "gRPC/Raft address")
-	redisAddress  = flag.String("redisAddress", ":6379", "Redis address")
-	dynamoAddress = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
-	raftID        = flag.String("raftId", "", "Raft ID")
-	raftDataDir   = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
-	raftBootstrap = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
-	raftRedisMap  = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	address        = flag.String("address", ":50051", "gRPC/Raft address")
+	redisAddress   = flag.String("redisAddress", ":6379", "Redis address")
+	dynamoAddress  = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
+	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
+	metricsToken   = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	raftID         = flag.String("raftId", "", "Raft ID")
+	raftDataDir    = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
+	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
+	raftRedisMap   = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 )
 
 const (
@@ -48,6 +53,7 @@ const (
 	joinWait            = 3 * time.Second
 	joinRetryInterval   = 1 * time.Second
 	joinRPCTimeout      = 3 * time.Second
+	raftObserveInterval = 5 * time.Second
 )
 
 func init() {
@@ -57,13 +63,15 @@ func init() {
 }
 
 type config struct {
-	address       string
-	redisAddress  string
-	dynamoAddress string
-	raftID        string
-	raftDataDir   string
-	raftBootstrap bool
-	raftRedisMap  string
+	address        string
+	redisAddress   string
+	dynamoAddress  string
+	metricsAddress string
+	metricsToken   string
+	raftID         string
+	raftDataDir    string
+	raftBootstrap  bool
+	raftRedisMap   string
 }
 
 func main() {
@@ -74,13 +82,15 @@ func main() {
 	if *raftID != "" {
 		// Single node mode
 		cfg := config{
-			address:       *address,
-			redisAddress:  *redisAddress,
-			dynamoAddress: *dynamoAddress,
-			raftID:        *raftID,
-			raftDataDir:   *raftDataDir,
-			raftBootstrap: *raftBootstrap,
-			raftRedisMap:  *raftRedisMap,
+			address:        *address,
+			redisAddress:   *redisAddress,
+			dynamoAddress:  *dynamoAddress,
+			metricsAddress: *metricsAddress,
+			metricsToken:   *metricsToken,
+			raftID:         *raftID,
+			raftDataDir:    *raftDataDir,
+			raftBootstrap:  *raftBootstrap,
+			raftRedisMap:   *raftRedisMap,
 		}
 		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
@@ -89,30 +99,37 @@ func main() {
 	} else {
 		// Demo cluster mode (3 nodes)
 		slog.Info("Starting demo cluster with 3 nodes...")
+		demoMetricsToken := effectiveDemoMetricsToken(*metricsToken)
 		nodes := []config{
 			{
-				address:       "127.0.0.1:50051",
-				redisAddress:  "127.0.0.1:63791",
-				dynamoAddress: "127.0.0.1:63801",
-				raftID:        "n1",
-				raftDataDir:   "", // In-memory
-				raftBootstrap: true,
+				address:        "127.0.0.1:50051",
+				redisAddress:   "127.0.0.1:63791",
+				dynamoAddress:  "127.0.0.1:63801",
+				metricsAddress: "0.0.0.0:9091",
+				metricsToken:   demoMetricsToken,
+				raftID:         "n1",
+				raftDataDir:    "", // In-memory
+				raftBootstrap:  true,
 			},
 			{
-				address:       "127.0.0.1:50052",
-				redisAddress:  "127.0.0.1:63792",
-				dynamoAddress: "127.0.0.1:63802",
-				raftID:        "n2",
-				raftDataDir:   "",
-				raftBootstrap: false,
+				address:        "127.0.0.1:50052",
+				redisAddress:   "127.0.0.1:63792",
+				dynamoAddress:  "127.0.0.1:63802",
+				metricsAddress: "0.0.0.0:9092",
+				metricsToken:   demoMetricsToken,
+				raftID:         "n2",
+				raftDataDir:    "",
+				raftBootstrap:  false,
 			},
 			{
-				address:       "127.0.0.1:50053",
-				redisAddress:  "127.0.0.1:63793",
-				dynamoAddress: "127.0.0.1:63803",
-				raftID:        "n3",
-				raftDataDir:   "",
-				raftBootstrap: false,
+				address:        "127.0.0.1:50053",
+				redisAddress:   "127.0.0.1:63793",
+				dynamoAddress:  "127.0.0.1:63803",
+				metricsAddress: "0.0.0.0:9093",
+				metricsToken:   demoMetricsToken,
+				raftID:         "n3",
+				raftDataDir:    "",
+				raftBootstrap:  false,
 			},
 		}
 
@@ -171,6 +188,14 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+func effectiveDemoMetricsToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token != "" {
+		return token
+	}
+	return "demo-metrics-token"
 }
 
 func joinCluster(ctx context.Context, nodes []config) error {
@@ -332,6 +357,8 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
+	cleanup := internalutil.CleanupStack{}
+	defer cleanup.Run()
 
 	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
 	if err != nil {
@@ -360,20 +387,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return errors.WithStack(err)
 	}
 
-	if cfg.raftBootstrap {
-		cfg := raft.Configuration{
-			Servers: []raft.Server{
-				{
-					Suffrage: raft.Voter,
-					ID:       raft.ServerID(cfg.raftID),
-					Address:  raft.ServerAddress(cfg.address),
-				},
-			},
-		}
-		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
-			return errors.WithStack(err)
-		}
+	if err := bootstrapClusterIfNeeded(r, cfg); err != nil {
+		return err
 	}
 
 	trx := kv.NewTransaction(r)
@@ -388,6 +403,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinator),
 	)
+	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
+	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
 
 	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer)
 
@@ -395,16 +412,35 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	cleanup.Add(func() {
+		_ = grpcSock.Close()
+	})
 
 	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
 	if err != nil {
 		return err
 	}
+	cleanup.Add(rd.Stop)
 	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	ds := adapter.NewDynamoDBServer(dynamoL, st, coordinator)
+	ds := adapter.NewDynamoDBServer(
+		dynamoL,
+		st,
+		coordinator,
+		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
+	)
+	cleanup.Add(ds.Stop)
+	metricsL, ms, err := setupMetricsHTTPServer(ctx, lc, cfg.metricsAddress, cfg.metricsToken, metricsRegistry.Handler())
+	if err != nil {
+		return err
+	}
+	if metricsL != nil {
+		cleanup.Add(func() {
+			_ = metricsL.Close()
+		})
+	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
@@ -413,7 +449,48 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(redisServeTask(rd, cfg.redisAddress))
 	eg.Go(dynamoShutdownTask(ctx, ds, cfg.dynamoAddress))
 	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
+	eg.Go(monitoring.MetricsShutdownTask(ctx, ms, cfg.metricsAddress))
+	eg.Go(monitoring.MetricsServeTask(ms, metricsL, cfg.metricsAddress))
 
+	cleanup.Release()
+	return nil
+}
+
+func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAddress string, metricsToken string, handler http.Handler) (net.Listener, *http.Server, error) {
+	metricsAddress = strings.TrimSpace(metricsAddress)
+	if metricsAddress == "" || handler == nil {
+		return nil, nil, nil
+	}
+	if _, _, err := net.SplitHostPort(metricsAddress); err != nil {
+		return nil, nil, errors.Wrapf(err, "invalid metricsAddress %q", metricsAddress)
+	}
+	if monitoring.MetricsAddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
+		return nil, nil, errors.New("metricsToken is required when metricsAddress is not loopback")
+	}
+	metricsL, err := lc.Listen(ctx, "tcp", metricsAddress)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	ms := monitoring.NewMetricsServer(handler, metricsToken)
+	return metricsL, ms, nil
+}
+
+func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
+	if !cfg.raftBootstrap {
+		return nil
+	}
+	bootstrapCfg := raft.Configuration{
+		Servers: []raft.Server{
+			{
+				Suffrage: raft.Voter,
+				ID:       raft.ServerID(cfg.raftID),
+				Address:  raft.ServerAddress(cfg.address),
+			},
+		},
+	}
+	if err := r.BootstrapCluster(bootstrapCfg).Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+		return errors.WithStack(err)
+	}
 	return nil
 }
 

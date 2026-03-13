@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,9 @@ import (
 	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -24,15 +27,18 @@ import (
 )
 
 const (
-	heartbeatTimeout = 200 * time.Millisecond
-	electionTimeout  = 2000 * time.Millisecond
-	leaderLease      = 100 * time.Millisecond
+	heartbeatTimeout           = 200 * time.Millisecond
+	electionTimeout            = 2000 * time.Millisecond
+	leaderLease                = 100 * time.Millisecond
+	raftMetricsObserveInterval = 5 * time.Second
 )
 
 var (
 	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
 	redisAddr            = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
 	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
+	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	raftId               = flag.String("raftId", "", "Node id used by Raft")
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -72,16 +78,19 @@ func run() error {
 		return err
 	}
 
+	cleanup := internalutil.CleanupStack{}
+	defer cleanup.Run()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	clock := kv.NewHLC()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	defer func() {
-		cancel()
+	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
 			rt.Close()
 		}
-	}()
+	})
+	cleanup.Add(cancel)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
@@ -96,19 +105,24 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 	)
+	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
+	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 
 	runner := runtimeServerRunner{
-		ctx:           runCtx,
-		lc:            &lc,
-		eg:            eg,
-		cancel:        cancel,
-		runtimes:      runtimes,
-		shardStore:    shardStore,
-		coordinate:    coordinate,
-		distServer:    distServer,
-		redisAddress:  *redisAddr,
-		leaderRedis:   cfg.leaderRedis,
-		dynamoAddress: *dynamoAddr,
+		ctx:             runCtx,
+		lc:              &lc,
+		eg:              eg,
+		cancel:          cancel,
+		runtimes:        runtimes,
+		shardStore:      shardStore,
+		coordinate:      coordinate,
+		distServer:      distServer,
+		redisAddress:    *redisAddr,
+		leaderRedis:     cfg.leaderRedis,
+		dynamoAddress:   *dynamoAddr,
+		metricsAddress:  *metricsAddr,
+		metricsToken:    *metricsToken,
+		metricsRegistry: metricsRegistry,
 	}
 	if err := runner.start(); err != nil {
 		return err
@@ -256,6 +270,20 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 	return runtimes, shardGroups, nil
 }
 
+func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
+	out := make([]monitoring.RaftRuntime, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.raft == nil {
+			continue
+		}
+		out = append(out, monitoring.RaftRuntime{
+			GroupID: runtime.spec.id,
+			Raft:    runtime.raft,
+		})
+	}
+	return out
+}
+
 func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer) error {
 	for _, rt := range runtimes {
 		gs := grpc.NewServer()
@@ -330,12 +358,17 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) error {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
 	}
-	dynamoServer := adapter.NewDynamoDBServer(dynamoL, shardStore, coordinate)
+	dynamoServer := adapter.NewDynamoDBServer(
+		dynamoL,
+		shardStore,
+		coordinate,
+		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
+	)
 	eg.Go(func() error {
 		defer dynamoServer.Stop()
 		stop := make(chan struct{})
@@ -353,6 +386,27 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		}
 		return errors.WithStack(err)
 	})
+	return nil
+}
+
+func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
+	metricsAddr = strings.TrimSpace(metricsAddr)
+	if metricsAddr == "" || handler == nil {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
+		return errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
+	}
+	if monitoring.MetricsAddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
+		return errors.New("metricsToken is required when metricsAddress is not loopback")
+	}
+	metricsL, err := lc.Listen(ctx, "tcp", metricsAddr)
+	if err != nil {
+		return errors.Wrapf(err, "failed to listen on %s", metricsAddr)
+	}
+	metricsServer := monitoring.NewMetricsServer(handler, metricsToken)
+	eg.Go(monitoring.MetricsShutdownTask(ctx, metricsServer, metricsAddr))
+	eg.Go(monitoring.MetricsServeTask(metricsServer, metricsL, metricsAddr))
 	return nil
 }
 
@@ -421,17 +475,20 @@ func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Gro
 }
 
 type runtimeServerRunner struct {
-	ctx           context.Context
-	lc            *net.ListenConfig
-	eg            *errgroup.Group
-	cancel        context.CancelFunc
-	runtimes      []*raftGroupRuntime
-	shardStore    *kv.ShardStore
-	coordinate    kv.Coordinator
-	distServer    *adapter.DistributionServer
-	redisAddress  string
-	leaderRedis   map[raft.ServerAddress]string
-	dynamoAddress string
+	ctx             context.Context
+	lc              *net.ListenConfig
+	eg              *errgroup.Group
+	cancel          context.CancelFunc
+	runtimes        []*raftGroupRuntime
+	shardStore      *kv.ShardStore
+	coordinate      kv.Coordinator
+	distServer      *adapter.DistributionServer
+	redisAddress    string
+	leaderRedis     map[raft.ServerAddress]string
+	dynamoAddress   string
+	metricsAddress  string
+	metricsToken    string
+	metricsRegistry *monitoring.Registry
 }
 
 func (r runtimeServerRunner) start() error {
@@ -441,7 +498,10 @@ func (r runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate); err != nil {
+	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	return nil
