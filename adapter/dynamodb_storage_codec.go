@@ -91,7 +91,11 @@ func decodeStoredDynamoItem(b []byte) (map[string]attributeValue, error) {
 		if err := gproto.Unmarshal(b[len(storedDynamoItemProtoPrefix):], msg); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return dynamoItemFromProto(msg)
+item, err := dynamoItemFromProto(msg)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return item, nil
 	}
 
 	item := map[string]attributeValue{}
