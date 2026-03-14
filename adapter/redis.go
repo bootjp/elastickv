@@ -23,18 +23,61 @@ import (
 )
 
 const (
-	cmdGet       = "GET"
-	cmdSet       = "SET"
-	cmdDel       = "DEL"
-	cmdExists    = "EXISTS"
-	cmdPing      = "PING"
-	cmdKeys      = "KEYS"
-	cmdMulti     = "MULTI"
-	cmdExec      = "EXEC"
-	cmdDiscard   = "DISCARD"
-	cmdLRange    = "LRANGE"
-	cmdRPush     = "RPUSH"
-	minKeyedArgs = 2
+	cmdBZPopMin        = "BZPOPMIN"
+	cmdClient          = "CLIENT"
+	cmdDel             = "DEL"
+	cmdDiscard         = "DISCARD"
+	cmdExec            = "EXEC"
+	cmdExists          = "EXISTS"
+	cmdExpire          = "EXPIRE"
+	cmdGet             = "GET"
+	cmdHDel            = "HDEL"
+	cmdHExists         = "HEXISTS"
+	cmdHGet            = "HGET"
+	cmdHGetAll         = "HGETALL"
+	cmdHIncrBy         = "HINCRBY"
+	cmdHLen            = "HLEN"
+	cmdHMGet           = "HMGET"
+	cmdHMSet           = "HMSET"
+	cmdHSet            = "HSET"
+	cmdInfo            = "INFO"
+	cmdIncr            = "INCR"
+	cmdKeys            = "KEYS"
+	cmdLIndex          = "LINDEX"
+	cmdLPush           = "LPUSH"
+	cmdLRange          = "LRANGE"
+	cmdLTrim           = "LTRIM"
+	cmdMulti           = "MULTI"
+	cmdPExpire         = "PEXPIRE"
+	cmdPFAdd           = "PFADD"
+	cmdPFCount         = "PFCOUNT"
+	cmdPing            = "PING"
+	cmdPTTL            = "PTTL"
+	cmdPublish         = "PUBLISH"
+	cmdQuit            = "QUIT"
+	cmdRPush           = "RPUSH"
+	cmdSAdd            = "SADD"
+	cmdScan            = "SCAN"
+	cmdSelect          = "SELECT"
+	cmdSet             = "SET"
+	cmdSIsMember       = "SISMEMBER"
+	cmdSMembers        = "SMEMBERS"
+	cmdSRem            = "SREM"
+	cmdSubscribe       = "SUBSCRIBE"
+	cmdType            = "TYPE"
+	cmdTTL             = "TTL"
+	cmdXAdd            = "XADD"
+	cmdXLen            = "XLEN"
+	cmdXRead           = "XREAD"
+	cmdXRange          = "XRANGE"
+	cmdXRevRange       = "XREVRANGE"
+	cmdXTrim           = "XTRIM"
+	cmdZAdd            = "ZADD"
+	cmdZIncrBy         = "ZINCRBY"
+	cmdZRange          = "ZRANGE"
+	cmdZRem            = "ZREM"
+	cmdZRemRangeByRank = "ZREMRANGEBYRANK"
+	minKeyedArgs       = 2
 )
 
 const (
@@ -44,17 +87,60 @@ const (
 
 //nolint:mnd
 var argsLen = map[string]int{
-	cmdGet:     2,
-	cmdSet:     3,
-	cmdDel:     2,
-	cmdExists:  2,
-	cmdPing:    1,
-	cmdKeys:    2,
-	cmdMulti:   1,
-	cmdExec:    1,
-	cmdDiscard: 1,
-	cmdLRange:  4,
-	cmdRPush:   -3, // negative means minimum number of args
+	cmdBZPopMin:        -3,
+	cmdClient:          -2,
+	cmdDel:             -2,
+	cmdDiscard:         1,
+	cmdExec:            1,
+	cmdExists:          -2,
+	cmdExpire:          -3,
+	cmdGet:             2,
+	cmdHDel:            -3,
+	cmdHExists:         3,
+	cmdHGet:            3,
+	cmdHGetAll:         2,
+	cmdHIncrBy:         4,
+	cmdHLen:            2,
+	cmdHMGet:           -3,
+	cmdHMSet:           -4,
+	cmdHSet:            -4,
+	cmdInfo:            -1,
+	cmdIncr:            2,
+	cmdKeys:            2,
+	cmdLIndex:          3,
+	cmdLPush:           -3,
+	cmdLRange:          4,
+	cmdLTrim:           4,
+	cmdMulti:           1,
+	cmdPExpire:         -3,
+	cmdPFAdd:           -3,
+	cmdPFCount:         -2,
+	cmdPing:            -1,
+	cmdPTTL:            2,
+	cmdPublish:         3,
+	cmdQuit:            1,
+	cmdRPush:           -3,
+	cmdSAdd:            -3,
+	cmdScan:            -2,
+	cmdSelect:          2,
+	cmdSet:             -3,
+	cmdSIsMember:       3,
+	cmdSMembers:        2,
+	cmdSRem:            -3,
+	cmdSubscribe:       -2,
+	cmdTTL:             2,
+	cmdType:            2,
+	cmdXAdd:            -5,
+	cmdXLen:            2,
+	cmdXRead:           -4,
+	cmdXRange:          -4,
+	cmdXRevRange:       -4,
+	cmdXTrim:           -4,
+	cmdZAdd:            -4,
+	cmdZIncrBy:         4,
+	cmdZRange:          -4,
+	cmdZRem:            -3,
+	cmdZRemRangeByRank: 4,
 }
 
 type RedisServer struct {
@@ -62,6 +148,7 @@ type RedisServer struct {
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
+	pubsub          redcon.PubSub
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -103,17 +190,60 @@ func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate kv.Co
 	}
 
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		cmdPing:    r.ping,
-		cmdSet:     r.set,
-		cmdGet:     r.get,
-		cmdDel:     r.del,
-		cmdExists:  r.exists,
-		cmdKeys:    r.keys,
-		cmdMulti:   r.multi,
-		cmdExec:    r.exec,
-		cmdDiscard: r.discard,
-		cmdRPush:   r.rpush,
-		cmdLRange:  r.lrange,
+		cmdBZPopMin:        r.bzpopmin,
+		cmdClient:          r.client,
+		cmdDel:             r.del,
+		cmdDiscard:         r.discard,
+		cmdExec:            r.exec,
+		cmdExists:          r.exists,
+		cmdExpire:          r.expire,
+		cmdGet:             r.get,
+		cmdHDel:            r.hdel,
+		cmdHExists:         r.hexists,
+		cmdHGet:            r.hget,
+		cmdHGetAll:         r.hgetall,
+		cmdHIncrBy:         r.hincrby,
+		cmdHLen:            r.hlen,
+		cmdHMGet:           r.hmget,
+		cmdHMSet:           r.hmset,
+		cmdHSet:            r.hset,
+		cmdInfo:            r.info,
+		cmdIncr:            r.incr,
+		cmdKeys:            r.keys,
+		cmdLIndex:          r.lindex,
+		cmdLPush:           r.lpush,
+		cmdLRange:          r.lrange,
+		cmdLTrim:           r.ltrim,
+		cmdMulti:           r.multi,
+		cmdPExpire:         r.pexpire,
+		cmdPFAdd:           r.pfadd,
+		cmdPFCount:         r.pfcount,
+		cmdPing:            r.ping,
+		cmdPTTL:            r.pttl,
+		cmdPublish:         r.publish,
+		cmdQuit:            r.quit,
+		cmdRPush:           r.rpush,
+		cmdSAdd:            r.sadd,
+		cmdScan:            r.scan,
+		cmdSelect:          r.selectDB,
+		cmdSet:             r.set,
+		cmdSIsMember:       r.sismember,
+		cmdSMembers:        r.smembers,
+		cmdSRem:            r.srem,
+		cmdSubscribe:       r.subscribe,
+		cmdTTL:             r.ttl,
+		cmdType:            r.typeCmd,
+		cmdXAdd:            r.xadd,
+		cmdXLen:            r.xlen,
+		cmdXRead:           r.xread,
+		cmdXRange:          r.xrange,
+		cmdXRevRange:       r.xrevrange,
+		cmdXTrim:           r.xtrim,
+		cmdZAdd:            r.zadd,
+		cmdZIncrBy:         r.zincrby,
+		cmdZRange:          r.zrange,
+		cmdZRem:            r.zrem,
+		cmdZRemRangeByRank: r.zremrangebyrank,
 	}
 
 	return r
@@ -210,40 +340,125 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
-	// Prevent overwriting list keys with string values without cleanup.
-	isList, err := r.isListKey(context.Background(), cmd.Args[1])
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
+	var (
+		existsCond  bool
+		missingCond bool
+		returnOld   bool
+		ttl         *time.Time
+	)
+
+	for i := 3; i < len(cmd.Args); i++ {
+		opt := strings.ToUpper(string(cmd.Args[i]))
+		switch opt {
+		case "EX", "PX":
+			if i+1 >= len(cmd.Args) {
+				conn.WriteError("ERR syntax error")
+				return
+			}
+			n, err := strconv.ParseInt(string(cmd.Args[i+1]), 10, 64)
+			if err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
+			if n <= 0 {
+				conn.WriteError("ERR invalid expire time in 'set' command")
+				return
+			}
+			if opt == "EX" {
+				t := time.Now().Add(time.Duration(n) * time.Second)
+				ttl = &t
+			} else {
+				t := time.Now().Add(time.Duration(n) * time.Millisecond)
+				ttl = &t
+			}
+			i++
+		case "NX":
+			missingCond = true
+		case "XX":
+			existsCond = true
+		case "GET":
+			returnOld = true
+		default:
+			conn.WriteError("ERR syntax error")
+			return
+		}
 	}
-	if isList {
-		conn.WriteError("WRONGTYPE Operation against a key holding the wrong kind of value")
+	if existsCond && missingCond {
+		conn.WriteError("ERR syntax error")
 		return
 	}
 
-	res, err := r.redisTranscoder.SetToRequest(cmd.Args[1], cmd.Args[2])
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
+	}
+	exists := typ != redisTypeNone
+	if existsCond && !exists {
+		conn.WriteNull()
+		return
+	}
+	if missingCond && exists {
+		conn.WriteNull()
+		return
+	}
+	if returnOld && exists && typ != redisTypeString {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+
+	var oldValue []byte
+	if returnOld && typ == redisTypeString {
+		oldValue, err = r.readValueAt(cmd.Args[1], readTS)
+		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+			conn.WriteError(err.Error())
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	_, err = r.coordinator.Dispatch(ctx, res)
+
+	elems, _, err := r.deleteLogicalKeyElems(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: cmd.Args[1], Value: bytes.Clone(cmd.Args[2])})
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
+	}
+	if err := r.dispatchElems(ctx, true, elems); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
 
+	if returnOld {
+		if oldValue == nil {
+			conn.WriteNull()
+			return
+		}
+		conn.WriteBulk(oldValue)
+		return
+	}
 	conn.WriteString("OK")
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
-	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
+	typ, err := r.keyType(context.Background(), cmd.Args[1])
+	if err != nil {
 		conn.WriteError(err.Error())
 		return
-	} else if ok {
-		conn.WriteError("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	if typ == redisTypeNone {
+		conn.WriteNull()
+		return
+	}
+	if typ != redisTypeString {
+		conn.WriteError(wrongTypeMessage)
 		return
 	}
 
@@ -269,71 +484,43 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
-	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
-		conn.WriteError(err.Error())
-		return
-	} else if ok {
-		if err := r.deleteList(context.Background(), cmd.Args[1]); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteInt(1)
-		return
-	}
-
-	res, err := r.redisTranscoder.DeleteToRequest(cmd.Args[1])
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	_, err = r.coordinator.Dispatch(ctx, res)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	conn.WriteInt(1)
-}
-
-func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
-	if !r.coordinator.IsLeaderForKey(cmd.Args[1]) {
-		res, err := r.proxyExists(cmd.Args[1])
+	elems := []*kv.Elem[kv.OP]{}
+	removed := 0
+	readTS := r.readTS()
+	for _, key := range cmd.Args[1:] {
+		keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
-		conn.WriteInt(res)
-		return
+		if existed {
+			removed++
+		}
+		elems = append(elems, keyElems...)
 	}
-
-	if err := r.coordinator.VerifyLeaderForKey(cmd.Args[1]); err != nil {
+	if err := r.dispatchElems(ctx, true, elems); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
+	conn.WriteInt(removed)
+}
 
-	if ok, err := r.isListKey(context.Background(), cmd.Args[1]); err != nil {
-		conn.WriteError(err.Error())
-		return
-	} else if ok {
-		conn.WriteInt(1)
-		return
-	}
-
+func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
-	ok, err := r.store.ExistsAt(context.Background(), cmd.Args[1], readTS)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
+	count := 0
+	for _, key := range cmd.Args[1:] {
+		ok, err := r.logicalExistsAt(context.Background(), key, readTS)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		if ok {
+			count++
+		}
 	}
-
-	if ok {
-		conn.WriteInt(1)
-		return
-	}
-	conn.WriteInt(0)
+	conn.WriteInt(count)
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
@@ -344,7 +531,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteError(err.Error())
 			return
 		}
-		keys, err := r.localKeys(pattern)
+		keys, err := r.visibleKeys(pattern)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
@@ -376,20 +563,11 @@ func (r *RedisServer) localKeys(pattern []byte) ([][]byte, error) {
 }
 
 func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
-	readTS := r.readTS()
-	res, err := r.store.ExistsAt(context.Background(), pattern, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if res {
-		return [][]byte{bytes.Clone(pattern)}, nil
-	}
-
-	isList, err := r.isListKeyAt(context.Background(), pattern, readTS)
+	typ, err := r.keyTypeAt(context.Background(), pattern, r.readTS())
 	if err != nil {
 		return nil, err
 	}
-	if isList {
+	if typ != redisTypeNone {
 		return [][]byte{bytes.Clone(pattern)}, nil
 	}
 	return [][]byte{}, nil
@@ -413,16 +591,27 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 		return nil, err
 	}
 
-	// User-key bounded scans like "foo*" do not naturally include internal list
-	// keys ("!lst|..."), so scan list namespaces separately with mapped bounds.
-	if start != nil || end != nil {
-		metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
-		if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
-			return nil, err
-		}
+	// User-key scans do not naturally include internal data namespaces, so scan
+	// those separately and map them back to logical user keys.
+	metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
+	if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
+		return nil, err
+	}
 
-		itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
-		if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
+	itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
+	if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
+		return nil, err
+	}
+
+	for _, prefix := range []string{
+		redisHashPrefix,
+		redisSetPrefix,
+		redisHLLPrefix,
+		redisZSetPrefix,
+		redisStreamPrefix,
+	} {
+		internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
+		if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
 			return nil, err
 		}
 	}
@@ -501,6 +690,9 @@ func matchesAsteriskPattern(pattern, key []byte) bool {
 func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[string][]byte {
 	keyset := map[string][]byte{}
 	for _, kvPair := range kvs {
+		if bytes.HasPrefix(kvPair.Key, []byte("!txn|")) {
+			continue
+		}
 		if store.IsListMetaKey(kvPair.Key) || store.IsListItemKey(kvPair.Key) {
 			if userKey := store.ExtractListUserKey(kvPair.Key); userKey != nil {
 				if !matchesAsteriskPattern(pattern, userKey) {
@@ -508,6 +700,16 @@ func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[s
 				}
 				keyset[string(userKey)] = userKey
 			}
+			continue
+		}
+		if userKey := extractRedisInternalUserKey(kvPair.Key); userKey != nil {
+			if !matchesAsteriskPattern(pattern, userKey) {
+				continue
+			}
+			keyset[string(userKey)] = userKey
+			continue
+		}
+		if isRedisTTLKey(kvPair.Key) {
 			continue
 		}
 		if !matchesAsteriskPattern(pattern, kvPair.Key) {
@@ -592,6 +794,8 @@ type txnContext struct {
 	server     *RedisServer
 	working    map[string]*txnValue
 	listStates map[string]*listTxnState
+	zsetStates map[string]*zsetTxnState
+	ttlStates  map[string]*ttlTxnState
 	startTS    uint64
 }
 
@@ -602,6 +806,17 @@ type listTxnState struct {
 	deleted    bool
 	purge      bool
 	purgeMeta  store.ListMeta
+}
+
+type zsetTxnState struct {
+	members map[string]float64
+	exists  bool
+	dirty   bool
+}
+
+type ttlTxnState struct {
+	value *time.Time
+	dirty bool
 }
 
 func stageListDelete(st *listTxnState) {
@@ -656,6 +871,62 @@ func (t *txnContext) listLength(st *listTxnState) int64 {
 	return st.meta.Len + int64(len(st.appends))
 }
 
+func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
+	k := string(key)
+	if st, ok := t.zsetStates[k]; ok {
+		return st, nil
+	}
+	value, exists, err := t.server.loadZSetAt(context.Background(), key, t.startTS)
+	if err != nil {
+		return nil, err
+	}
+	st := &zsetTxnState{
+		members: zsetEntriesToMap(value.Entries),
+		exists:  exists,
+	}
+	t.zsetStates[k] = st
+	return st, nil
+}
+
+func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
+	k := string(key)
+	if st, ok := t.ttlStates[k]; ok {
+		return st, nil
+	}
+	value, err := t.server.ttlAt(context.Background(), key, t.startTS)
+	if err != nil {
+		return nil, err
+	}
+	st := &ttlTxnState{value: value}
+	t.ttlStates[k] = st
+	return st, nil
+}
+
+func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
+	k := string(key)
+	if st, ok := t.zsetStates[k]; ok && (st.dirty || st.exists) {
+		if len(st.members) == 0 {
+			return redisTypeNone, nil
+		}
+		return redisTypeZSet, nil
+	}
+	if st, ok := t.listStates[k]; ok {
+		if st.deleted {
+			return redisTypeNone, nil
+		}
+		if st.metaExists || len(st.appends) > 0 {
+			return redisTypeList, nil
+		}
+	}
+	if tv, ok := t.working[k]; ok {
+		if tv.deleted || tv.raw == nil {
+			return redisTypeNone, nil
+		}
+		return redisTypeString, nil
+	}
+	return t.server.keyTypeAt(context.Background(), key, t.startTS)
+}
+
 func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
 	switch strings.ToUpper(string(cmd.Args[0])) {
 	case cmdSet:
@@ -670,6 +941,12 @@ func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
 		return t.applyRPush(cmd)
 	case cmdLRange:
 		return t.applyLRange(cmd)
+	case cmdZIncrBy:
+		return t.applyZIncrBy(cmd)
+	case cmdExpire:
+		return t.applyExpire(cmd, time.Second)
+	case cmdPExpire:
+		return t.applyExpire(cmd, time.Millisecond)
 	default:
 		return redisResult{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", cmd.Args[0]))
 	}
@@ -790,6 +1067,66 @@ func (t *txnContext) applyLRange(cmd redcon.Command) (redisResult, error) {
 	return redisResult{typ: resultArray, arr: out}, nil
 }
 
+func (t *txnContext) applyZIncrBy(cmd redcon.Command) (redisResult, error) {
+	typ, err := t.stagedKeyType(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	if typ != redisTypeNone && typ != redisTypeZSet {
+		return redisResult{typ: resultError, err: wrongTypeError()}, nil
+	}
+
+	inc, err := strconv.ParseFloat(string(cmd.Args[2]), 64)
+	if err != nil {
+		return redisResult{}, errors.WithStack(err)
+	}
+	st, err := t.loadZSetState(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	member := string(cmd.Args[3])
+	st.members[member] += inc
+	st.dirty = true
+	return redisResult{typ: resultBulk, bulk: []byte(formatRedisFloat(st.members[member]))}, nil
+}
+
+func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisResult, error) {
+	typ, err := t.stagedKeyType(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	if typ == redisTypeNone {
+		return redisResult{typ: resultInt, integer: 0}, nil
+	}
+
+	ttl, err := strconv.ParseInt(string(cmd.Args[2]), 10, 64)
+	if err != nil {
+		return redisResult{}, errors.WithStack(err)
+	}
+	nxOnly := false
+	for _, arg := range cmd.Args[3:] {
+		switch strings.ToUpper(string(arg)) {
+		case "NX":
+			nxOnly = true
+		default:
+			return redisResult{}, errors.New("ERR syntax error")
+		}
+	}
+
+	state, err := t.loadTTLState(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	if nxOnly && state.value != nil && state.value.After(time.Now()) {
+		return redisResult{typ: resultInt, integer: 0}, nil
+	}
+
+	expireAt := time.Now().Add(time.Duration(ttl) * unit)
+	state.value = &expireAt
+	state.dirty = true
+	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
 func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
 	start, err := parseInt(startRaw)
 	if err != nil {
@@ -836,8 +1173,18 @@ func (t *txnContext) commit() error {
 	if err != nil {
 		return err
 	}
+	zsetElems, err := t.buildZSetElems()
+	if err != nil {
+		return err
+	}
+	ttlElems, err := t.buildTTLElems()
+	if err != nil {
+		return err
+	}
 
 	elems = append(elems, listElems...)
+	elems = append(elems, zsetElems...)
+	elems = append(elems, ttlElems...)
 	if len(elems) == 0 {
 		return nil
 	}
@@ -937,6 +1284,54 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 	return elems, nil
 }
 
+func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
+	keys := make([]string, 0, len(t.zsetStates))
+	for k := range t.zsetStates {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+	for _, k := range keys {
+		st := t.zsetStates[k]
+		if !st.dirty {
+			continue
+		}
+		if len(st.members) == 0 {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey([]byte(k))})
+			continue
+		}
+		payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey([]byte(k)), Value: payload})
+	}
+	return elems, nil
+}
+
+func (t *txnContext) buildTTLElems() ([]*kv.Elem[kv.OP], error) {
+	keys := make([]string, 0, len(t.ttlStates))
+	for k := range t.ttlStates {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+	for _, k := range keys {
+		st := t.ttlStates[k]
+		if !st.dirty {
+			continue
+		}
+		if st.value == nil {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey([]byte(k))})
+			continue
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(k)), Value: encodeRedisTTL(*st.value)})
+	}
+	return elems, nil
+}
+
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
 	startTS, err := r.txnStartTS(queue)
 	if err != nil {
@@ -947,6 +1342,8 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 		server:     r,
 		working:    map[string]*txnValue{},
 		listStates: map[string]*listTxnState{},
+		zsetStates: map[string]*zsetTxnState{},
+		ttlStates:  map[string]*ttlTxnState{},
 		startTS:    startTS,
 	}
 
@@ -992,7 +1389,7 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 	// the transaction. kv.MaxLatestCommitTS deduplicates keys and performs the
 	// lookups in parallel, but very large transactions can still make this a
 	// latency hot path. If needed, add batching/caching at the storage layer.
-	const txnLatestCommitKeysPerCmd = 2
+	const txnLatestCommitKeysPerCmd = 4
 	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
 	for _, cmd := range queue {
 		if len(cmd.Args) < minKeyedArgs {
@@ -1000,11 +1397,13 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 		}
 		name := strings.ToUpper(string(cmd.Args[0]))
 		switch name {
-		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange:
+		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange, cmdExpire, cmdPExpire, cmdZIncrBy:
 			key := cmd.Args[1]
 			keys = append(keys, key)
 			// Also account for list metadata keys to avoid stale typing decisions.
 			keys = append(keys, listMetaKey(key))
+			keys = append(keys, redisZSetKey(key))
+			keys = append(keys, redisTTLKey(key))
 		}
 	}
 	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
@@ -1204,6 +1603,17 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
 	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	switch typ {
+	case redisTypeNone:
+		return []string{}, nil
+	case redisTypeList:
+	default:
+		return nil, wrongTypeError()
+	}
 	if !r.coordinator.IsLeaderForKey(key) {
 		return r.proxyLRange(key, startRaw, endRaw)
 	}
@@ -1321,6 +1731,14 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
+	expired, err := r.hasExpiredTTLAt(context.Background(), key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return nil, errors.WithStack(store.ErrKeyNotFound)
+	}
+
 	if r.coordinator.IsLeaderForKey(key) {
 		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
 			return nil, errors.WithStack(err)
@@ -1332,10 +1750,20 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if typ != redisTypeNone && typ != redisTypeList {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+
 	ctx := context.Background()
 
 	var length int64
-	var err error
 	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
 		length, err = r.listRPush(ctx, cmd.Args[1], cmd.Args[2:])
 	} else {

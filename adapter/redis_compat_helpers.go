@@ -1,0 +1,345 @@
+package adapter
+
+import (
+	"context"
+	"math"
+	"sort"
+
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
+)
+
+const wrongTypeMessage = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+func wrongTypeError() error {
+	return errors.New(wrongTypeMessage)
+}
+
+func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	checks := []struct {
+		typ redisValueType
+		key []byte
+	}{
+		{typ: redisTypeList, key: store.ListMetaKey(key)},
+		{typ: redisTypeHash, key: redisHashKey(key)},
+		{typ: redisTypeSet, key: redisSetKey(key)},
+		{typ: redisTypeZSet, key: redisZSetKey(key)},
+		{typ: redisTypeStream, key: redisStreamKey(key)},
+		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
+		{typ: redisTypeString, key: redisHLLKey(key)},
+		{typ: redisTypeString, key: key},
+	}
+	for _, check := range checks {
+		exists, err := r.store.ExistsAt(ctx, check.key, readTS)
+		if err != nil {
+			return redisTypeNone, errors.WithStack(err)
+		}
+		if exists {
+			return check.typ, nil
+		}
+	}
+	return redisTypeNone, nil
+}
+
+func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
+	if err != nil || typ == redisTypeNone {
+		return typ, err
+	}
+	expired, err := r.hasExpiredTTLAt(ctx, key, readTS)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if expired {
+		return redisTypeNone, nil
+	}
+	return typ, nil
+}
+
+func (r *RedisServer) keyType(ctx context.Context, key []byte) (redisValueType, error) {
+	return r.keyTypeAt(ctx, key, r.readTS())
+}
+
+func (r *RedisServer) logicalExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	typ, err := r.keyTypeAt(ctx, key, readTS)
+	if err != nil {
+		return false, err
+	}
+	return typ != redisTypeNone, nil
+}
+
+func (r *RedisServer) loadHashAt(ctx context.Context, key []byte, readTS uint64) (redisHashValue, bool, error) {
+	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return redisHashValue{}, false, nil
+		}
+		return nil, false, errors.WithStack(err)
+	}
+	val, err := unmarshalHashValue(raw)
+	return val, true, err
+}
+
+func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, readTS uint64) (redisSetValue, bool, error) {
+	storageKey := redisExactSetStorageKey(kind, key)
+	raw, err := r.store.GetAt(ctx, storageKey, readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return redisSetValue{}, false, nil
+		}
+		return redisSetValue{}, false, errors.WithStack(err)
+	}
+	val, err := unmarshalSetValue(raw)
+	return val, true, err
+}
+
+func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64) (redisZSetValue, bool, error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return redisZSetValue{}, false, nil
+		}
+		return redisZSetValue{}, false, errors.WithStack(err)
+	}
+	val, err := unmarshalZSetValue(raw)
+	return val, true, err
+}
+
+func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, bool, error) {
+	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return redisStreamValue{}, false, nil
+		}
+		return redisStreamValue{}, false, errors.WithStack(err)
+	}
+	val, err := unmarshalStreamValue(raw)
+	return val, true, err
+}
+
+func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, elems []*kv.Elem[kv.OP]) error {
+	if len(elems) == 0 {
+		return nil
+	}
+	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn: isTxn,
+		Elems: elems,
+	})
+	return errors.WithStack(err)
+}
+
+func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload []byte, keepTTL bool, userKey []byte) error {
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: storageKey, Value: payload},
+	}
+	if !keepTTL {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+	}
+	return r.dispatchElems(ctx, false, elems)
+}
+
+func (r *RedisServer) saveHash(ctx context.Context, key []byte, value redisHashValue) error {
+	payload, err := marshalHashValue(value)
+	if err != nil {
+		return err
+	}
+	return r.saveBytes(ctx, redisHashKey(key), payload, true, key)
+}
+
+func (r *RedisServer) saveSet(ctx context.Context, kind string, key []byte, value redisSetValue) error {
+	payload, err := marshalSetValue(value)
+	if err != nil {
+		return err
+	}
+	return r.saveBytes(ctx, redisExactSetStorageKey(kind, key), payload, true, key)
+}
+
+func (r *RedisServer) saveZSet(ctx context.Context, key []byte, value redisZSetValue) error {
+	payload, err := marshalZSetValue(value)
+	if err != nil {
+		return err
+	}
+	return r.saveBytes(ctx, redisZSetKey(key), payload, true, key)
+}
+
+func (r *RedisServer) saveStream(ctx context.Context, key []byte, value redisStreamValue) error {
+	payload, err := marshalStreamValue(value)
+	if err != nil {
+		return err
+	}
+	return r.saveBytes(ctx, redisStreamKey(key), payload, true, key)
+}
+
+func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	existed, err := r.logicalExistsAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+
+	elems := []*kv.Elem[kv.OP]{}
+
+	stringExists, err := r.store.ExistsAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if stringExists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+	}
+
+	for _, internalKey := range [][]byte{
+		redisHashKey(key),
+		redisSetKey(key),
+		redisHLLKey(key),
+		redisZSetKey(key),
+		redisStreamKey(key),
+		redisTTLKey(key),
+	} {
+		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		if ok {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: internalKey})
+		}
+	}
+
+	meta, listExists, err := r.loadListMetaAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if listExists {
+		for seq := meta.Head; seq < meta.Tail; seq++ {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+	}
+
+	return elems, existed, nil
+}
+
+func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint64) ([]string, error) {
+	meta, exists, err := r.loadListMetaAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || meta.Len == 0 {
+		return []string{}, nil
+	}
+	return r.fetchListRange(ctx, key, meta, 0, meta.Len-1, readTS)
+}
+
+func (r *RedisServer) rewriteList(ctx context.Context, key []byte, values []string) error {
+	readTS := r.readTS()
+	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+
+	if len(values) == 0 {
+		return r.dispatchElems(ctx, true, elems)
+	}
+
+	rawValues := make([][]byte, 0, len(values))
+	for _, value := range values {
+		rawValues = append(rawValues, []byte(value))
+	}
+	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues)
+	if err != nil {
+		return err
+	}
+	elems = append(elems, ops...)
+	return r.dispatchElems(ctx, true, elems)
+}
+
+func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {
+	keys, err := r.localKeys(pattern)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([][]byte, 0, len(keys))
+	readTS := r.readTS()
+	for _, key := range keys {
+		ok, err := r.logicalExistsAt(context.Background(), key, readTS)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			visible = append(visible, key)
+		}
+	}
+	sort.Slice(visible, func(i, j int) bool {
+		return string(visible[i]) < string(visible[j])
+	})
+	return visible, nil
+}
+
+func normalizeRankRange(start, end, length int) (int, int) {
+	if start < 0 {
+		start = length + start
+	}
+	if end < 0 {
+		end = length + end
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end >= length {
+		end = length - 1
+	}
+	if length == 0 || end < start || start >= length {
+		return 0, -1
+	}
+	return start, end
+}
+
+func normalizeIndex(index, length int) int {
+	if index < 0 {
+		index = length + index
+	}
+	if index < 0 || index >= length {
+		return -1
+	}
+	return index
+}
+
+func minRedisInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxRedisInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func streamBoundary(raw string, highest bool) (redisStreamID, bool, error) {
+	switch raw {
+	case "-":
+		return redisStreamID{}, false, nil
+	case "+":
+		return redisStreamID{ms: math.MaxUint64, seq: math.MaxUint64}, false, nil
+	}
+	exclusive := false
+	if len(raw) > 0 && raw[0] == '(' {
+		exclusive = true
+		raw = raw[1:]
+	}
+	id, err := parseRedisStreamID(raw)
+	if err != nil {
+		return redisStreamID{}, false, err
+	}
+	if highest && exclusive {
+		if id.seq < math.MaxUint64 {
+			id.seq++
+		} else if id.ms < math.MaxUint64 {
+			id.ms++
+			id.seq = 0
+		}
+	}
+	return id, exclusive, nil
+}
