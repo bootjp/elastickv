@@ -73,6 +73,97 @@ func TestRedis_MisskeyPubSubCompatibility(t *testing.T) {
 	require.Equal(t, `{"channel":"internal","message":{"type":"metaUpdated"}}`, msg.Payload)
 }
 
+func TestRedis_MisskeyPubSubClusterFanout(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	pub := redis.NewClient(&redis.Options{Addr: nodes[2].redisAddress})
+	sub1 := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	sub2 := redis.NewClient(&redis.Options{Addr: nodes[1].redisAddress})
+	defer func() {
+		_ = pub.Close()
+		_ = sub1.Close()
+		_ = sub2.Close()
+	}()
+
+	ctx := context.Background()
+	ps1 := sub1.Subscribe(ctx, "misskey.cluster.test")
+	ps2 := sub2.Subscribe(ctx, "misskey.cluster.test")
+	defer func() {
+		_ = ps1.Close()
+		_ = ps2.Close()
+	}()
+
+	_, err := ps1.ReceiveTimeout(ctx, 2*time.Second)
+	require.NoError(t, err)
+	_, err = ps2.ReceiveTimeout(ctx, 2*time.Second)
+	require.NoError(t, err)
+
+	count, err := pub.Publish(ctx, "misskey.cluster.test", `{"type":"cluster"}`).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), count)
+
+	msg1, err := ps1.ReceiveMessage(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "misskey.cluster.test", msg1.Channel)
+	require.Equal(t, `{"type":"cluster"}`, msg1.Payload)
+
+	msg2, err := ps2.ReceiveMessage(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "misskey.cluster.test", msg2.Channel)
+	require.Equal(t, `{"type":"cluster"}`, msg2.Payload)
+}
+
+func TestRedis_MisskeyAdminCompatibility(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	sub := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() {
+		_ = rdb.Close()
+		_ = sub.Close()
+	}()
+
+	ctx := context.Background()
+
+	require.NoError(t, rdb.Set(ctx, "cache:one", "1", 0).Err())
+	require.NoError(t, rdb.HSet(ctx, "cache:two", "field", "2").Err())
+
+	size, err := rdb.DBSize(ctx).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), size)
+
+	ps := sub.Subscribe(ctx, "misskey.pubsub.one", "misskey.pubsub.two")
+	defer func() { _ = ps.Close() }()
+	for i := 0; i < 2; i++ {
+		_, err = ps.ReceiveTimeout(ctx, 2*time.Second)
+		require.NoError(t, err)
+	}
+
+	channels, err := rdb.Do(ctx, "PUBSUB", "CHANNELS", "misskey.pubsub.*").StringSlice()
+	require.NoError(t, err)
+	require.Equal(t, []string{"misskey.pubsub.one", "misskey.pubsub.two"}, channels)
+
+	numsub, err := rdb.Do(ctx, "PUBSUB", "NUMSUB", "misskey.pubsub.one", "missing").Result()
+	require.NoError(t, err)
+	values, ok := numsub.([]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"misskey.pubsub.one", int64(1), "missing", int64(0)}, values)
+
+	numpat, err := rdb.Do(ctx, "PUBSUB", "NUMPAT").Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), numpat)
+
+	require.Equal(t, "OK", rdb.FlushDB(ctx).Val())
+
+	size, err = rdb.DBSize(ctx).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), size)
+}
+
 func TestRedis_MisskeyDirectDataStructures(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

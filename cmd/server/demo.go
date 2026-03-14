@@ -20,6 +20,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -27,7 +28,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -301,14 +301,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	if dir == "" {
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
 	}
-	if err := os.MkdirAll(dir, defaultFileMode); err != nil {
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	ldb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
-	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	sdb, err := raftboltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
+	raftStore, err := raftstore.NewPebbleStore(filepath.Join(dir, "raft.db"))
 	if err != nil {
 		return nil, nil, nil, errors.WithStack(err)
 	}
@@ -316,10 +309,10 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	if err != nil {
 		return nil, nil, nil, errors.WithStack(err)
 	}
-	return ldb, sdb, fss, nil
+	return raftStore, raftStore, fss, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
@@ -327,14 +320,14 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
-	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock()))
+	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock(), relay))
 	pb.RegisterDistributionServer(s, distServer)
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
 	return s, gs
 }
 
-func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string) (*adapter.RedisServer, error) {
+func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay) (*adapter.RedisServer, error) {
 	leaderRedis := make(map[raft.ServerAddress]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
@@ -352,7 +345,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return adapter.NewRedisServer(l, st, coordinator, leaderRedis), nil
+	return adapter.NewRedisServer(l, redisAddr, st, coordinator, leaderRedis, relay), nil
 }
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
@@ -405,8 +398,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
+	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer)
+	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer, relay)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
@@ -416,7 +410,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		_ = grpcSock.Close()
 	})
 
-	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap)
+	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay)
 	if err != nil {
 		return err
 	}

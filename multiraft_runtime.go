@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	transport "github.com/Jille/raft-grpc-transport"
+	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	boltdb "github.com/hashicorp/raft-boltdb/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -22,6 +23,8 @@ type raftGroupRuntime struct {
 
 	closeStores func()
 }
+
+const raftCommitTimeout = 1 * time.Millisecond
 
 func (r *raftGroupRuntime) Close() {
 	if r == nil {
@@ -45,18 +48,12 @@ func (r *raftGroupRuntime) Close() {
 	}
 }
 
-func closeBoltStores(ldb, sdb **boltdb.BoltStore) {
-	if ldb == nil || sdb == nil {
+func closeRaftStore(raftStore **raftstore.PebbleStore) {
+	if raftStore == nil || *raftStore == nil {
 		return
 	}
-	if *ldb != nil {
-		_ = (*ldb).Close()
-		*ldb = nil
-	}
-	if *sdb != nil {
-		_ = (*sdb).Close()
-		*sdb = nil
-	}
+	_ = (*raftStore).Close()
+	*raftStore = nil
 }
 
 func closeTransportManager(tm **transport.Manager) {
@@ -79,6 +76,7 @@ func groupDataDir(baseDir, raftID string, groupID uint64, multi bool) string {
 func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bootstrap bool, bootstrapServers []raft.Server, fsm raft.FSM) (*raft.Raft, *transport.Manager, func(), error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(raftID)
+	c.CommitTimeout = raftCommitTimeout
 	c.HeartbeatTimeout = heartbeatTimeout
 	c.ElectionTimeout = electionTimeout
 	c.LeaderLeaseTimeout = leaderLease
@@ -88,25 +86,18 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		return nil, nil, nil, errors.WithStack(err)
 	}
 
-	var ldb *boltdb.BoltStore
-	var sdb *boltdb.BoltStore
+	var raftStore *raftstore.PebbleStore
 	var tm *transport.Manager
 
-	closeStores := func() { closeBoltStores(&ldb, &sdb) }
+	closeStores := func() { closeRaftStore(&raftStore) }
 	cleanup := func() {
 		closeTransportManager(&tm)
 		closeStores()
 	}
 
 	var err error
-	ldb, err = boltdb.NewBoltStore(filepath.Join(dir, "logs.dat"))
+	raftStore, err = raftstore.NewPebbleStore(filepath.Join(dir, "raft.db"))
 	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
-	}
-
-	sdb, err = boltdb.NewBoltStore(filepath.Join(dir, "stable.dat"))
-	if err != nil {
-		cleanup()
 		return nil, nil, nil, errors.WithStack(err)
 	}
 
@@ -120,7 +111,7 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	})
 
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
+	r, err := raft.NewRaft(c, fsm, raftStore, raftStore, fss, tm.Transport())
 	if err != nil {
 		cleanup()
 		return nil, nil, nil, errors.WithStack(err)

@@ -1,9 +1,11 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -135,6 +137,18 @@ func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload 
 	}
 	if !keepTTL {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+	}
+	return r.dispatchElems(ctx, false, elems)
+}
+
+func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: key, Value: bytes.Clone(value)},
+	}
+	if ttl == nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	}
 	return r.dispatchElems(ctx, false, elems)
 }

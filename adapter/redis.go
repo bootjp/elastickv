@@ -3,12 +3,16 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log"
 	"maps"
 	"math"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -23,124 +27,171 @@ import (
 )
 
 const (
-	cmdBZPopMin        = "BZPOPMIN"
-	cmdClient          = "CLIENT"
-	cmdDel             = "DEL"
-	cmdDiscard         = "DISCARD"
-	cmdExec            = "EXEC"
-	cmdExists          = "EXISTS"
-	cmdExpire          = "EXPIRE"
-	cmdGet             = "GET"
-	cmdHDel            = "HDEL"
-	cmdHExists         = "HEXISTS"
-	cmdHGet            = "HGET"
-	cmdHGetAll         = "HGETALL"
-	cmdHIncrBy         = "HINCRBY"
-	cmdHLen            = "HLEN"
-	cmdHMGet           = "HMGET"
-	cmdHMSet           = "HMSET"
-	cmdHSet            = "HSET"
-	cmdInfo            = "INFO"
-	cmdIncr            = "INCR"
-	cmdKeys            = "KEYS"
-	cmdLIndex          = "LINDEX"
-	cmdLPush           = "LPUSH"
-	cmdLRange          = "LRANGE"
-	cmdLTrim           = "LTRIM"
-	cmdMulti           = "MULTI"
-	cmdPExpire         = "PEXPIRE"
-	cmdPFAdd           = "PFADD"
-	cmdPFCount         = "PFCOUNT"
-	cmdPing            = "PING"
-	cmdPTTL            = "PTTL"
-	cmdPublish         = "PUBLISH"
-	cmdQuit            = "QUIT"
-	cmdRPush           = "RPUSH"
-	cmdSAdd            = "SADD"
-	cmdScan            = "SCAN"
-	cmdSelect          = "SELECT"
-	cmdSet             = "SET"
-	cmdSIsMember       = "SISMEMBER"
-	cmdSMembers        = "SMEMBERS"
-	cmdSRem            = "SREM"
-	cmdSubscribe       = "SUBSCRIBE"
-	cmdType            = "TYPE"
-	cmdTTL             = "TTL"
-	cmdXAdd            = "XADD"
-	cmdXLen            = "XLEN"
-	cmdXRead           = "XREAD"
-	cmdXRange          = "XRANGE"
-	cmdXRevRange       = "XREVRANGE"
-	cmdXTrim           = "XTRIM"
-	cmdZAdd            = "ZADD"
-	cmdZIncrBy         = "ZINCRBY"
-	cmdZRange          = "ZRANGE"
-	cmdZRem            = "ZREM"
-	cmdZRemRangeByRank = "ZREMRANGEBYRANK"
-	minKeyedArgs       = 2
+	cmdBZPopMin         = "BZPOPMIN"
+	cmdClient           = "CLIENT"
+	cmdDBSize           = "DBSIZE"
+	cmdDel              = "DEL"
+	cmdDiscard          = "DISCARD"
+	cmdEval             = "EVAL"
+	cmdEvalSHA          = "EVALSHA"
+	cmdExec             = "EXEC"
+	cmdExists           = "EXISTS"
+	cmdExpire           = "EXPIRE"
+	cmdFlushAll         = "FLUSHALL"
+	cmdFlushDB          = "FLUSHDB"
+	cmdGet              = "GET"
+	cmdHDel             = "HDEL"
+	cmdHExists          = "HEXISTS"
+	cmdHGet             = "HGET"
+	cmdHGetAll          = "HGETALL"
+	cmdHIncrBy          = "HINCRBY"
+	cmdHLen             = "HLEN"
+	cmdHMGet            = "HMGET"
+	cmdHMSet            = "HMSET"
+	cmdHSet             = "HSET"
+	cmdInfo             = "INFO"
+	cmdIncr             = "INCR"
+	cmdKeys             = "KEYS"
+	cmdLIndex           = "LINDEX"
+	cmdLLen             = "LLEN"
+	cmdLPop             = "LPOP"
+	cmdLPos             = "LPOS"
+	cmdLPush            = "LPUSH"
+	cmdLRange           = "LRANGE"
+	cmdLRem             = "LREM"
+	cmdLSet             = "LSET"
+	cmdLTrim            = "LTRIM"
+	cmdMulti            = "MULTI"
+	cmdPExpire          = "PEXPIRE"
+	cmdPFAdd            = "PFADD"
+	cmdPFCount          = "PFCOUNT"
+	cmdPing             = "PING"
+	cmdPTTL             = "PTTL"
+	cmdPublish          = "PUBLISH"
+	cmdPubSub           = "PUBSUB"
+	cmdQuit             = "QUIT"
+	cmdRename           = "RENAME"
+	cmdRPop             = "RPOP"
+	cmdRPopLPush        = "RPOPLPUSH"
+	cmdRPush            = "RPUSH"
+	cmdSAdd             = "SADD"
+	cmdSCard            = "SCARD"
+	cmdScan             = "SCAN"
+	cmdSelect           = "SELECT"
+	cmdSet              = "SET"
+	cmdSIsMember        = "SISMEMBER"
+	cmdSMembers         = "SMEMBERS"
+	cmdSRem             = "SREM"
+	cmdSubscribe        = "SUBSCRIBE"
+	cmdType             = "TYPE"
+	cmdTTL              = "TTL"
+	cmdXAdd             = "XADD"
+	cmdXLen             = "XLEN"
+	cmdXRead            = "XREAD"
+	cmdXRange           = "XRANGE"
+	cmdXRevRange        = "XREVRANGE"
+	cmdXTrim            = "XTRIM"
+	cmdZAdd             = "ZADD"
+	cmdZCard            = "ZCARD"
+	cmdZCount           = "ZCOUNT"
+	cmdZIncrBy          = "ZINCRBY"
+	cmdZRange           = "ZRANGE"
+	cmdZRangeByScore    = "ZRANGEBYSCORE"
+	cmdZRem             = "ZREM"
+	cmdZRemRangeByScore = "ZREMRANGEBYSCORE"
+	cmdZRemRangeByRank  = "ZREMRANGEBYRANK"
+	cmdZPopMin          = "ZPOPMIN"
+	cmdZRevRange        = "ZREVRANGE"
+	cmdZRevRangeByScore = "ZREVRANGEBYSCORE"
+	cmdZScore           = "ZSCORE"
+	minKeyedArgs        = 2
 )
 
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
+	redisRelayPublishTimeout = 2 * time.Second
 )
 
 //nolint:mnd
 var argsLen = map[string]int{
-	cmdBZPopMin:        -3,
-	cmdClient:          -2,
-	cmdDel:             -2,
-	cmdDiscard:         1,
-	cmdExec:            1,
-	cmdExists:          -2,
-	cmdExpire:          -3,
-	cmdGet:             2,
-	cmdHDel:            -3,
-	cmdHExists:         3,
-	cmdHGet:            3,
-	cmdHGetAll:         2,
-	cmdHIncrBy:         4,
-	cmdHLen:            2,
-	cmdHMGet:           -3,
-	cmdHMSet:           -4,
-	cmdHSet:            -4,
-	cmdInfo:            -1,
-	cmdIncr:            2,
-	cmdKeys:            2,
-	cmdLIndex:          3,
-	cmdLPush:           -3,
-	cmdLRange:          4,
-	cmdLTrim:           4,
-	cmdMulti:           1,
-	cmdPExpire:         -3,
-	cmdPFAdd:           -3,
-	cmdPFCount:         -2,
-	cmdPing:            -1,
-	cmdPTTL:            2,
-	cmdPublish:         3,
-	cmdQuit:            1,
-	cmdRPush:           -3,
-	cmdSAdd:            -3,
-	cmdScan:            -2,
-	cmdSelect:          2,
-	cmdSet:             -3,
-	cmdSIsMember:       3,
-	cmdSMembers:        2,
-	cmdSRem:            -3,
-	cmdSubscribe:       -2,
-	cmdTTL:             2,
-	cmdType:            2,
-	cmdXAdd:            -5,
-	cmdXLen:            2,
-	cmdXRead:           -4,
-	cmdXRange:          -4,
-	cmdXRevRange:       -4,
-	cmdXTrim:           -4,
-	cmdZAdd:            -4,
-	cmdZIncrBy:         4,
-	cmdZRange:          -4,
-	cmdZRem:            -3,
-	cmdZRemRangeByRank: 4,
+	cmdBZPopMin:         -3,
+	cmdClient:           -2,
+	cmdDBSize:           1,
+	cmdDel:              -2,
+	cmdDiscard:          1,
+	cmdEval:             -3,
+	cmdEvalSHA:          -3,
+	cmdExec:             1,
+	cmdExists:           -2,
+	cmdExpire:           -3,
+	cmdFlushAll:         1,
+	cmdFlushDB:          1,
+	cmdGet:              2,
+	cmdHDel:             -3,
+	cmdHExists:          3,
+	cmdHGet:             3,
+	cmdHGetAll:          2,
+	cmdHIncrBy:          4,
+	cmdHLen:             2,
+	cmdHMGet:            -3,
+	cmdHMSet:            -4,
+	cmdHSet:             -4,
+	cmdInfo:             -1,
+	cmdIncr:             2,
+	cmdKeys:             2,
+	cmdLIndex:           3,
+	cmdLLen:             2,
+	cmdLPop:             2,
+	cmdLPush:            -3,
+	cmdLPos:             -3,
+	cmdLRange:           4,
+	cmdLRem:             4,
+	cmdLSet:             4,
+	cmdLTrim:            4,
+	cmdMulti:            1,
+	cmdPExpire:          -3,
+	cmdPFAdd:            -3,
+	cmdPFCount:          -2,
+	cmdPing:             -1,
+	cmdPTTL:             2,
+	cmdPublish:          3,
+	cmdPubSub:           -2,
+	cmdQuit:             1,
+	cmdRename:           3,
+	cmdRPop:             2,
+	cmdRPopLPush:        3,
+	cmdRPush:            -3,
+	cmdSAdd:             -3,
+	cmdSCard:            2,
+	cmdScan:             -2,
+	cmdSelect:           2,
+	cmdSet:              -3,
+	cmdSIsMember:        3,
+	cmdSMembers:         2,
+	cmdSRem:             -3,
+	cmdSubscribe:        -2,
+	cmdTTL:              2,
+	cmdType:             2,
+	cmdXAdd:             -5,
+	cmdXLen:             2,
+	cmdXRead:            -4,
+	cmdXRange:           -4,
+	cmdXRevRange:        -4,
+	cmdXTrim:            -4,
+	cmdZAdd:             -4,
+	cmdZCard:            2,
+	cmdZCount:           4,
+	cmdZIncrBy:          4,
+	cmdZRange:           -4,
+	cmdZRangeByScore:    -4,
+	cmdZRem:             -3,
+	cmdZRemRangeByScore: 4,
+	cmdZRemRangeByRank:  4,
+	cmdZPopMin:          -2,
+	cmdZRevRange:        -4,
+	cmdZRevRangeByScore: -4,
+	cmdZScore:           3,
 }
 
 type RedisServer struct {
@@ -149,6 +200,15 @@ type RedisServer struct {
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
 	pubsub          redcon.PubSub
+	pubsubMu        sync.Mutex
+	pubsubChannels  map[string]int
+	scriptMu        sync.RWMutex
+	scriptCache     map[string]string
+	traceCommands   bool
+	traceSeq        atomic.Uint64
+	redisAddr       string
+	relay           *RedisPubSubRelay
+	relayConnCache  kv.GRPCConnCache
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -156,8 +216,9 @@ type RedisServer struct {
 }
 
 type connState struct {
-	inTxn bool
-	queue []redcon.Command
+	inTxn         bool
+	queue         []redcon.Command
+	subscriptions map[string]struct{}
 }
 
 type resultType int
@@ -180,70 +241,102 @@ type redisResult struct {
 	err     error
 }
 
-func NewRedisServer(listen net.Listener, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string) *RedisServer {
+func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *RedisPubSubRelay) *RedisServer {
+	if relay == nil {
+		relay = NewRedisPubSubRelay()
+	}
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
 		coordinator:     coordinate,
 		redisTranscoder: newRedisTranscoder(),
+		redisAddr:       redisAddr,
+		relay:           relay,
 		leaderRedis:     leaderRedis,
+		pubsubChannels:  map[string]int{},
+		scriptCache:     map[string]string{},
+		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 	}
+	r.relay.Bind(r.publishLocal)
 
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		cmdBZPopMin:        r.bzpopmin,
-		cmdClient:          r.client,
-		cmdDel:             r.del,
-		cmdDiscard:         r.discard,
-		cmdExec:            r.exec,
-		cmdExists:          r.exists,
-		cmdExpire:          r.expire,
-		cmdGet:             r.get,
-		cmdHDel:            r.hdel,
-		cmdHExists:         r.hexists,
-		cmdHGet:            r.hget,
-		cmdHGetAll:         r.hgetall,
-		cmdHIncrBy:         r.hincrby,
-		cmdHLen:            r.hlen,
-		cmdHMGet:           r.hmget,
-		cmdHMSet:           r.hmset,
-		cmdHSet:            r.hset,
-		cmdInfo:            r.info,
-		cmdIncr:            r.incr,
-		cmdKeys:            r.keys,
-		cmdLIndex:          r.lindex,
-		cmdLPush:           r.lpush,
-		cmdLRange:          r.lrange,
-		cmdLTrim:           r.ltrim,
-		cmdMulti:           r.multi,
-		cmdPExpire:         r.pexpire,
-		cmdPFAdd:           r.pfadd,
-		cmdPFCount:         r.pfcount,
-		cmdPing:            r.ping,
-		cmdPTTL:            r.pttl,
-		cmdPublish:         r.publish,
-		cmdQuit:            r.quit,
-		cmdRPush:           r.rpush,
-		cmdSAdd:            r.sadd,
-		cmdScan:            r.scan,
-		cmdSelect:          r.selectDB,
-		cmdSet:             r.set,
-		cmdSIsMember:       r.sismember,
-		cmdSMembers:        r.smembers,
-		cmdSRem:            r.srem,
-		cmdSubscribe:       r.subscribe,
-		cmdTTL:             r.ttl,
-		cmdType:            r.typeCmd,
-		cmdXAdd:            r.xadd,
-		cmdXLen:            r.xlen,
-		cmdXRead:           r.xread,
-		cmdXRange:          r.xrange,
-		cmdXRevRange:       r.xrevrange,
-		cmdXTrim:           r.xtrim,
-		cmdZAdd:            r.zadd,
-		cmdZIncrBy:         r.zincrby,
-		cmdZRange:          r.zrange,
-		cmdZRem:            r.zrem,
-		cmdZRemRangeByRank: r.zremrangebyrank,
+		cmdBZPopMin:         r.bzpopmin,
+		cmdClient:           r.client,
+		cmdDBSize:           r.dbsize,
+		cmdDel:              r.del,
+		cmdDiscard:          r.discard,
+		cmdEval:             r.eval,
+		cmdEvalSHA:          r.evalsha,
+		cmdExec:             r.exec,
+		cmdExists:           r.exists,
+		cmdExpire:           r.expire,
+		cmdFlushAll:         r.flushall,
+		cmdFlushDB:          r.flushdb,
+		cmdGet:              r.get,
+		cmdHDel:             r.hdel,
+		cmdHExists:          r.hexists,
+		cmdHGet:             r.hget,
+		cmdHGetAll:          r.hgetall,
+		cmdHIncrBy:          r.hincrby,
+		cmdHLen:             r.hlen,
+		cmdHMGet:            r.hmget,
+		cmdHMSet:            r.hmset,
+		cmdHSet:             r.hset,
+		cmdInfo:             r.info,
+		cmdIncr:             r.incr,
+		cmdKeys:             r.keys,
+		cmdLIndex:           r.lindex,
+		cmdLLen:             r.llen,
+		cmdLPop:             r.lpop,
+		cmdLPos:             r.lpos,
+		cmdLPush:            r.lpush,
+		cmdLRange:           r.lrange,
+		cmdLRem:             r.lrem,
+		cmdLSet:             r.lset,
+		cmdLTrim:            r.ltrim,
+		cmdMulti:            r.multi,
+		cmdPExpire:          r.pexpire,
+		cmdPFAdd:            r.pfadd,
+		cmdPFCount:          r.pfcount,
+		cmdPing:             r.ping,
+		cmdPTTL:             r.pttl,
+		cmdPublish:          r.publish,
+		cmdPubSub:           r.pubsubCmd,
+		cmdQuit:             r.quit,
+		cmdRename:           r.rename,
+		cmdRPop:             r.rpop,
+		cmdRPopLPush:        r.rpoplpush,
+		cmdRPush:            r.rpush,
+		cmdSAdd:             r.sadd,
+		cmdSCard:            r.scard,
+		cmdScan:             r.scan,
+		cmdSelect:           r.selectDB,
+		cmdSet:              r.set,
+		cmdSIsMember:        r.sismember,
+		cmdSMembers:         r.smembers,
+		cmdSRem:             r.srem,
+		cmdSubscribe:        r.subscribe,
+		cmdTTL:              r.ttl,
+		cmdType:             r.typeCmd,
+		cmdXAdd:             r.xadd,
+		cmdXLen:             r.xlen,
+		cmdXRead:            r.xread,
+		cmdXRange:           r.xrange,
+		cmdXRevRange:        r.xrevrange,
+		cmdXTrim:            r.xtrim,
+		cmdZAdd:             r.zadd,
+		cmdZCard:            r.zcard,
+		cmdZCount:           r.zcount,
+		cmdZIncrBy:          r.zincrby,
+		cmdZRange:           r.zrange,
+		cmdZRangeByScore:    r.zrangebyscore,
+		cmdZRem:             r.zrem,
+		cmdZRemRangeByScore: r.zremrangebyscore,
+		cmdZRemRangeByRank:  r.zremrangebyrank,
+		cmdZPopMin:          r.zpopmin,
+		cmdZRevRange:        r.zrevrange,
+		cmdZRevRangeByScore: r.zrevrangebyscore,
+		cmdZScore:           r.zscore,
 	}
 
 	return r
@@ -268,27 +361,32 @@ func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			state := getConnState(conn)
-			f, ok := r.route[strings.ToUpper(string(cmd.Args[0]))]
+			name := strings.ToUpper(string(cmd.Args[0]))
+			f, ok := r.route[name]
 			if !ok {
+				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
 				return
 			}
 
 			if err := r.validateCmd(cmd); err != nil {
+				r.traceCommandError(conn, name, cmd.Args[1:], err.Error())
 				conn.WriteError(err.Error())
 				return
 			}
 
-			name := strings.ToUpper(string(cmd.Args[0]))
 			if state.inTxn && name != cmdExec && name != cmdDiscard && name != cmdMulti {
 				// redcon reuses the underlying argument buffers; copy queued commands
 				// so MULTI/EXEC works reliably under concurrency and with -race.
 				state.queue = append(state.queue, cloneCommand(cmd))
+				r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
 				conn.WriteString("QUEUED")
 				return
 			}
 
+			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
 			f(conn, cmd)
+			r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
@@ -298,6 +396,7 @@ func (r *RedisServer) Run() error {
 		func(conn redcon.Conn, err error) {
 			// This is called when the connection has been closed
 			// log.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
+			r.cleanupConnSubscriptions(conn)
 		})
 
 	return errors.WithStack(err)
@@ -314,8 +413,149 @@ func cloneCommand(cmd redcon.Command) redcon.Command {
 	return out
 }
 
+func (r *RedisServer) traceCommandStart(conn redcon.Conn, name string, args [][]byte) (uint64, time.Time) {
+	if !r.traceCommands {
+		return 0, time.Time{}
+	}
+	id := r.traceSeq.Add(1)
+	log.Printf("redis trace start id=%d remote=%s cmd=%s args=%s", id, conn.RemoteAddr(), name, formatTraceArgs(args))
+	return id, time.Now()
+}
+
+func (r *RedisServer) traceCommandFinish(id uint64, conn redcon.Conn, name string, dur time.Duration) {
+	if !r.traceCommands {
+		return
+	}
+	log.Printf("redis trace done id=%d remote=%s cmd=%s dur=%s", id, conn.RemoteAddr(), name, dur)
+}
+
+func (r *RedisServer) traceCommandDone(conn redcon.Conn, name string, args [][]byte, dur time.Duration, queued bool) {
+	if !r.traceCommands {
+		return
+	}
+	status := "done"
+	if queued {
+		status = "queued"
+	}
+	log.Printf("redis trace %s remote=%s cmd=%s args=%s dur=%s", status, conn.RemoteAddr(), name, formatTraceArgs(args), dur)
+}
+
+func (r *RedisServer) traceCommandError(conn redcon.Conn, name string, args [][]byte, err string) {
+	if !r.traceCommands {
+		return
+	}
+	log.Printf("redis trace error remote=%s cmd=%s args=%s err=%q", conn.RemoteAddr(), name, formatTraceArgs(args), err)
+}
+
+func formatTraceArgs(args [][]byte) string {
+	if len(args) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, min(len(args), 6))
+	for i, arg := range args {
+		if i >= 6 {
+			parts = append(parts, "...")
+			break
+		}
+		s := strconv.QuoteToASCII(string(arg))
+		if len(s) > 96 {
+			s = s[:93] + "..."
+		}
+		parts = append(parts, s)
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+func (r *RedisServer) trackSubscription(conn redcon.Conn, channel string) {
+	state := getConnState(conn)
+	if state.subscriptions == nil {
+		state.subscriptions = map[string]struct{}{}
+	}
+	if _, ok := state.subscriptions[channel]; ok {
+		return
+	}
+	state.subscriptions[channel] = struct{}{}
+
+	r.pubsubMu.Lock()
+	defer r.pubsubMu.Unlock()
+	r.pubsubChannels[channel]++
+}
+
+func (r *RedisServer) cleanupConnSubscriptions(conn redcon.Conn) {
+	ctx := conn.Context()
+	state, ok := ctx.(*connState)
+	if !ok || len(state.subscriptions) == 0 {
+		return
+	}
+
+	r.pubsubMu.Lock()
+	defer r.pubsubMu.Unlock()
+	for channel := range state.subscriptions {
+		if n := r.pubsubChannels[channel]; n <= 1 {
+			delete(r.pubsubChannels, channel)
+		} else {
+			r.pubsubChannels[channel] = n - 1
+		}
+	}
+	state.subscriptions = nil
+}
+
 func (r *RedisServer) Stop() {
+	_ = r.relayConnCache.Close()
 	_ = r.listen.Close()
+}
+
+func (r *RedisServer) publishLocal(channel, message []byte) int64 {
+	return int64(r.pubsub.Publish(string(channel), string(message)))
+}
+
+func (r *RedisServer) relayPeers() []raft.ServerAddress {
+	if len(r.leaderRedis) == 0 {
+		return nil
+	}
+
+	byRedis := make(map[string]raft.ServerAddress, len(r.leaderRedis))
+	for addr, redisAddr := range r.leaderRedis {
+		if redisAddr == "" || redisAddr == r.redisAddr {
+			continue
+		}
+		prev, ok := byRedis[redisAddr]
+		if !ok || string(addr) < string(prev) {
+			byRedis[redisAddr] = addr
+		}
+	}
+
+	peers := make([]raft.ServerAddress, 0, len(byRedis))
+	for _, addr := range byRedis {
+		peers = append(peers, addr)
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return string(peers[i]) < string(peers[j])
+	})
+	return peers
+}
+
+func (r *RedisServer) publishCluster(ctx context.Context, channel, message []byte) int64 {
+	delivered := r.publishLocal(channel, message)
+	for _, peer := range r.relayPeers() {
+		conn, err := r.relayConnCache.ConnFor(peer)
+		if err != nil {
+			log.Printf("redis relay publish dial peer=%s err=%v", peer, err)
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, redisRelayPublishTimeout)
+		resp, err := pb.NewInternalClient(conn).RelayPublish(callCtx, &pb.RelayPublishRequest{
+			Channel: bytes.Clone(channel),
+			Message: bytes.Clone(message),
+		})
+		cancel()
+		if err != nil {
+			log.Printf("redis relay publish peer=%s err=%v", peer, err)
+			continue
+		}
+		delivered += resp.GetSubscribers()
+	}
+	return delivered
 }
 
 func (r *RedisServer) validateCmd(cmd redcon.Command) error {
@@ -388,6 +628,18 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if !returnOld && !existsCond && !missingCond {
+		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], ttl); err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteString("OK")
+		return
+	}
+
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -417,8 +669,14 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
+	if !returnOld && !existsCond && !missingCond && (typ == redisTypeNone || typ == redisTypeString) {
+		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], ttl); err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteString("OK")
+		return
+	}
 
 	elems, _, err := r.deleteLogicalKeyElems(ctx, cmd.Args[1], readTS)
 	if err != nil {
@@ -486,21 +744,28 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	elems := []*kv.Elem[kv.OP]{}
 	removed := 0
-	readTS := r.readTS()
-	for _, key := range cmd.Args[1:] {
-		keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-		if err != nil {
-			conn.WriteError(err.Error())
-			return
+	err := r.retryRedisWrite(ctx, func() error {
+		elems := []*kv.Elem[kv.OP]{}
+		nextRemoved := 0
+		readTS := r.readTS()
+		for _, key := range cmd.Args[1:] {
+			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+			if err != nil {
+				return err
+			}
+			if existed {
+				nextRemoved++
+			}
+			elems = append(elems, keyElems...)
 		}
-		if existed {
-			removed++
+		if err := r.dispatchElems(ctx, true, elems); err != nil {
+			return err
 		}
-		elems = append(elems, keyElems...)
-	}
-	if err := r.dispatchElems(ctx, true, elems); err != nil {
+		removed = nextRemoved
+		return nil
+	})
+	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -710,6 +975,9 @@ func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[s
 			continue
 		}
 		if isRedisTTLKey(kvPair.Key) {
+			continue
+		}
+		if bytes.HasPrefix(kvPair.Key, []byte("!")) {
 			continue
 		}
 		if !matchesAsteriskPattern(pattern, kvPair.Key) {

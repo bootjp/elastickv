@@ -352,11 +352,13 @@ func startRuntimeServersWithBoundListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected exactly one runtime, got %d", len(runtimes)))
 	}
 	rt := runtimes[0]
+	relay := adapter.NewRedisPubSubRelay()
+	redisAddr := leaderRedis[raft.ServerAddress(rt.spec.address)]
 
-	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, listeners.grpc); err != nil {
+	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis); err != nil {
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, listeners.grpc); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
@@ -372,6 +374,7 @@ func startBoundGRPCServer(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	relay *adapter.RedisPubSubRelay,
 	listener net.Listener,
 ) error {
 	if rt == nil || rt.raft == nil || rt.tm == nil {
@@ -386,7 +389,7 @@ func startBoundGRPCServer(
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
-	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock()))
+	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock(), relay))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.tm.Register(gs)
 	leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
@@ -431,11 +434,13 @@ func startBoundRedisServer(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	leaderRedis map[raft.ServerAddress]string,
+	redisAddr string,
+	relay *adapter.RedisPubSubRelay,
 ) error {
 	if listener == nil {
 		return fmt.Errorf("redis listener is required")
 	}
-	redisServer := adapter.NewRedisServer(listener, shardStore, coordinate, leaderRedis)
+	redisServer := adapter.NewRedisServer(listener, redisAddr, shardStore, coordinate, leaderRedis, relay)
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})

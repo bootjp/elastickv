@@ -3,12 +3,17 @@ package adapter
 import (
 	"context"
 	"errors"
+	"log"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/tidwall/btree"
 	"github.com/tidwall/redcon"
 )
 
@@ -227,14 +232,168 @@ func (r *RedisServer) scan(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) publish(conn redcon.Conn, cmd redcon.Command) {
-	count := r.pubsub.Publish(string(cmd.Args[1]), string(cmd.Args[2]))
-	conn.WriteInt(count)
+	count := r.publishCluster(context.Background(), cmd.Args[1], cmd.Args[2])
+	if r.traceCommands {
+		log.Printf("redis trace publish remote=%s channel=%q subscribers=%d", conn.RemoteAddr(), string(cmd.Args[1]), count)
+	}
+	conn.WriteInt64(count)
 }
 
 func (r *RedisServer) subscribe(conn redcon.Conn, cmd redcon.Command) {
 	for _, channel := range cmd.Args[1:] {
+		r.trackSubscription(conn, string(channel))
 		r.pubsub.Subscribe(conn, string(channel))
+		if r.traceCommands {
+			log.Printf("redis trace subscribe remote=%s channel=%q snapshot=%v", conn.RemoteAddr(), string(channel), r.pubsubChannelCounts())
+		}
 	}
+}
+
+func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
+	if !r.coordinator.IsLeader() {
+		size, err := r.proxyDBSize()
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt(size)
+		return
+	}
+	if err := r.coordinator.VerifyLeader(); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	keys, err := r.visibleKeys([]byte("*"))
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	conn.WriteInt(len(keys))
+}
+
+func (r *RedisServer) flushdb(conn redcon.Conn, _ redcon.Command) {
+	r.flushDatabase(conn, false)
+}
+
+func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
+	r.flushDatabase(conn, true)
+}
+
+func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
+	if !r.coordinator.IsLeader() {
+		if err := r.proxyFlushDatabase(all); err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteString("OK")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if err := r.retryRedisWrite(ctx, func() error {
+		if err := r.coordinator.VerifyLeader(); err != nil {
+			return err
+		}
+
+		keys, err := r.visibleKeys([]byte("*"))
+		if err != nil {
+			return err
+		}
+		if len(keys) == 0 {
+			return nil
+		}
+
+		readTS := r.readTS()
+		elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+		for _, key := range keys {
+			keyElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+			if err != nil {
+				return err
+			}
+			elems = append(elems, keyElems...)
+		}
+		if len(elems) == 0 {
+			return nil
+		}
+		return r.dispatchElems(ctx, true, elems)
+	}); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteString("OK")
+}
+
+func (r *RedisServer) pubsubCmd(conn redcon.Conn, cmd redcon.Command) {
+	sub := strings.ToUpper(string(cmd.Args[1]))
+	switch sub {
+	case "CHANNELS":
+		pattern := []byte("*")
+		if len(cmd.Args) >= 3 {
+			pattern = cmd.Args[2]
+		}
+
+		counts := r.pubsubChannelCounts()
+		channels := make([]string, 0, len(counts))
+		for channel, count := range counts {
+			if count <= 0 || !matchesAsteriskPattern(pattern, []byte(channel)) {
+				continue
+			}
+			channels = append(channels, channel)
+		}
+
+		sort.Strings(channels)
+		conn.WriteArray(len(channels))
+		for _, channel := range channels {
+			conn.WriteBulkString(channel)
+		}
+	case "NUMSUB":
+		snapshot := r.pubsubChannelCounts()
+		counts := make([]int, 0, len(cmd.Args)-2)
+		for _, channel := range cmd.Args[2:] {
+			counts = append(counts, snapshot[string(channel)])
+		}
+
+		conn.WriteArray((len(cmd.Args) - 2) * 2)
+		for i, channel := range cmd.Args[2:] {
+			conn.WriteBulk(channel)
+			conn.WriteInt(counts[i])
+		}
+	case "NUMPAT":
+		conn.WriteInt(0)
+	default:
+		conn.WriteError("ERR unsupported PUBSUB subcommand '" + sub + "'")
+	}
+}
+
+func (r *RedisServer) pubsubChannelCounts() map[string]int {
+	ps := reflect.ValueOf(&r.pubsub).Elem()
+	muField := ps.FieldByName("mu")
+	mu := (*sync.RWMutex)(unsafe.Pointer(muField.UnsafeAddr()))
+	mu.RLock()
+	defer mu.RUnlock()
+
+	chansField := ps.FieldByName("chans")
+	if chansField.IsNil() {
+		return map[string]int{}
+	}
+
+	tree := reflect.NewAt(chansField.Type(), unsafe.Pointer(chansField.UnsafeAddr())).Elem().Interface().(*btree.BTree)
+	counts := map[string]int{}
+	tree.Walk(func(items []interface{}) {
+		for _, item := range items {
+			entry := reflect.ValueOf(item).Elem()
+			if entry.FieldByName("pattern").Bool() {
+				continue
+			}
+			channel := entry.FieldByName("channel").String()
+			counts[channel]++
+		}
+	})
+	return counts
 }
 
 func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {

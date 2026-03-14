@@ -353,12 +353,13 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		s := grpc.NewServer()
 		trx := kv.NewTransaction(r)
 		coordinator := kv.NewCoordinator(trx, r)
+		relay := NewRedisPubSubRelay()
 		routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 		gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock()))
+		pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock(), relay))
 
 		leaderhealth.Setup(r, s, []string{"Example"})
 		raftadmin.Register(s, r)
@@ -369,7 +370,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, srv.Serve(lis))
 		}(s, grpcSock)
 
-		rd := NewRedisServer(redisSock, st, coordinator, leaderRedisMap)
+		rd := NewRedisServer(redisSock, port.redisAddress, st, coordinator, leaderRedisMap, relay)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)
@@ -399,6 +400,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration, electionTimeout time.Duration) (*raft.Raft, *transport.Manager, error) {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(myID)
+	c.CommitTimeout = 1 * time.Millisecond
 
 	if electionTimeout > 0 {
 		c.ElectionTimeout = electionTimeout

@@ -119,6 +119,7 @@ func run() error {
 		distServer:      distServer,
 		redisAddress:    *redisAddr,
 		leaderRedis:     cfg.leaderRedis,
+		pubsubRelay:     adapter.NewRedisPubSubRelay(),
 		dynamoAddress:   *dynamoAddr,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
@@ -284,14 +285,14 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 	return out
 }
 
-func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer) error {
+func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) error {
 	for _, rt := range runtimes {
 		gs := grpc.NewServer()
 		trx := kv.NewTransaction(rt.raft)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock()))
+		pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock(), relay))
 		pb.RegisterDistributionServer(gs, distServer)
 		rt.tm.Register(gs)
 		leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
@@ -332,12 +333,12 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string) error {
+func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay) error {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	redisServer := adapter.NewRedisServer(redisL, shardStore, coordinate, leaderRedis)
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay)
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})
@@ -485,6 +486,7 @@ type runtimeServerRunner struct {
 	distServer      *adapter.DistributionServer
 	redisAddress    string
 	leaderRedis     map[raft.ServerAddress]string
+	pubsubRelay     *adapter.RedisPubSubRelay
 	dynamoAddress   string
 	metricsAddress  string
 	metricsToken    string
@@ -492,10 +494,10 @@ type runtimeServerRunner struct {
 }
 
 func (r runtimeServerRunner) start() error {
-	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer); err != nil {
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis); err != nil {
+	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer, r.pubsubRelay); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry); err != nil {

@@ -129,17 +129,22 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateR
 }
 
 func (c *Coordinate) dispatchRaw(req []*Elem[OP]) (*CoordinateResponse, error) {
-	var logs []*pb.Request
-	for _, req := range req {
-		m := c.toRawRequest(req)
-		logs = append(logs, m)
+	muts := make([]*pb.Mutation, 0, len(req))
+	for _, elem := range req {
+		muts = append(muts, elemToMutation(elem))
 	}
+
+	logs := []*pb.Request{{
+		IsTxn:     false,
+		Phase:     pb.Phase_NONE,
+		Ts:        c.clock.Next(),
+		Mutations: muts,
+	}}
 
 	r, err := c.transactionManager.Commit(logs)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
 	}, nil
