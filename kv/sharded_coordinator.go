@@ -414,37 +414,6 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 	return route.GroupID
 }
 
-func (c *ShardedCoordinator) toRawRequest(req *Elem[OP]) *pb.Request {
-	switch req.Op {
-	case Put:
-		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
-			Mutations: []*pb.Mutation{
-				{
-					Op:    pb.Op_PUT,
-					Key:   req.Key,
-					Value: req.Value,
-				},
-			},
-		}
-	case Del:
-		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
-			Mutations: []*pb.Mutation{
-				{
-					Op:  pb.Op_DEL,
-					Key: req.Key,
-				},
-			},
-		}
-	}
-	panic("unreachable")
-}
-
 var _ Coordinator = (*ShardedCoordinator)(nil)
 
 func validateOperationGroup(reqs *OperationGroup[OP]) error {

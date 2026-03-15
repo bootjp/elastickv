@@ -111,7 +111,45 @@ const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
 	redisRelayPublishTimeout = 2 * time.Second
+	redisTraceArgLimit       = 6
+	redisTraceArgMaxLen      = 96
+	redisTraceArgEllipsis    = "..."
+	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
 )
+
+var redisTxnKeyPrefix = []byte("!txn|")
+
+type redisSetOptions struct {
+	existsCond  bool
+	missingCond bool
+	returnOld   bool
+	ttl         *time.Time
+}
+
+type redisSetState struct {
+	typ      redisValueType
+	oldValue []byte
+}
+
+type redisSetExecution struct {
+	state        redisSetState
+	wroteNull    bool
+	wroteOldBulk bool
+}
+
+type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
+
+var txnApplyHandlers = map[string]txnCommandHandler{
+	cmdSet:     (*txnContext).applySet,
+	cmdDel:     (*txnContext).applyDel,
+	cmdGet:     (*txnContext).applyGet,
+	cmdExists:  (*txnContext).applyExists,
+	cmdRPush:   (*txnContext).applyRPush,
+	cmdLRange:  (*txnContext).applyLRange,
+	cmdZIncrBy: (*txnContext).applyZIncrBy,
+	cmdExpire:  (*txnContext).applyExpireSeconds,
+	cmdPExpire: (*txnContext).applyExpireMilliseconds,
+}
 
 //nolint:mnd
 var argsLen = map[string]int{
@@ -451,19 +489,138 @@ func formatTraceArgs(args [][]byte) string {
 	if len(args) == 0 {
 		return "[]"
 	}
-	parts := make([]string, 0, min(len(args), 6))
+	parts := make([]string, 0, min(len(args), redisTraceArgLimit))
 	for i, arg := range args {
-		if i >= 6 {
-			parts = append(parts, "...")
+		if i >= redisTraceArgLimit {
+			parts = append(parts, redisTraceArgEllipsis)
 			break
 		}
 		s := strconv.QuoteToASCII(string(arg))
-		if len(s) > 96 {
-			s = s[:93] + "..."
+		if len(s) > redisTraceArgMaxLen {
+			s = s[:redisTraceArgTrimLen] + redisTraceArgEllipsis
 		}
 		parts = append(parts, s)
 	}
 	return "[" + strings.Join(parts, " ") + "]"
+}
+
+func parseRedisSetOptions(args [][]byte, now time.Time) (redisSetOptions, error) {
+	opts := redisSetOptions{}
+	for i := 0; i < len(args); i++ {
+		opt := strings.ToUpper(string(args[i]))
+		switch opt {
+		case "EX", "PX":
+			ttl, nextIndex, err := parseRedisSetTTL(args, i, opt, now)
+			if err != nil {
+				return redisSetOptions{}, err
+			}
+			opts.ttl = ttl
+			i = nextIndex
+		case "NX":
+			opts.missingCond = true
+		case "XX":
+			opts.existsCond = true
+		case "GET":
+			opts.returnOld = true
+		default:
+			return redisSetOptions{}, errors.New("ERR syntax error")
+		}
+	}
+	if opts.existsCond && opts.missingCond {
+		return redisSetOptions{}, errors.New("ERR syntax error")
+	}
+	return opts, nil
+}
+
+func parseRedisSetTTL(args [][]byte, index int, opt string, now time.Time) (*time.Time, int, error) {
+	if index+1 >= len(args) {
+		return nil, index, errors.New("ERR syntax error")
+	}
+	n, err := strconv.ParseInt(string(args[index+1]), 10, 64)
+	if err != nil {
+		return nil, index, errors.WithStack(err)
+	}
+	if n <= 0 {
+		return nil, index, errors.New("ERR invalid expire time in 'set' command")
+	}
+
+	expireAt := now.Add(time.Duration(n) * time.Millisecond)
+	if opt == "EX" {
+		expireAt = now.Add(time.Duration(n) * time.Second)
+	}
+	return &expireAt, index + 1, nil
+}
+
+func (o redisSetOptions) isFastPath() bool {
+	return !o.returnOld && !o.existsCond && !o.missingCond
+}
+
+func (o redisSetOptions) allows(exists bool) bool {
+	if o.existsCond && !exists {
+		return false
+	}
+	if o.missingCond && exists {
+		return false
+	}
+	return true
+}
+
+func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return redisSetState{}, err
+	}
+
+	state := redisSetState{typ: typ}
+	if !returnOld || typ != redisTypeString {
+		return state, nil
+	}
+
+	oldValue, err := r.readValueAt(key, readTS)
+	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+		return redisSetState{}, err
+	}
+	state.oldValue = oldValue
+	return state, nil
+}
+
+func (r *RedisServer) replaceWithString(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
+	if typ == redisTypeNone || typ == redisTypeString {
+		return r.saveString(ctx, key, value, ttl)
+	}
+
+	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: bytes.Clone(value)})
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
+	}
+	return r.dispatchElems(ctx, true, elems)
+}
+
+func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
+	readTS := r.readTS()
+	state, err := r.loadRedisSetState(key, readTS, opts.returnOld)
+	if err != nil {
+		return redisSetExecution{}, err
+	}
+
+	exists := state.typ != redisTypeNone
+	if !opts.allows(exists) {
+		return redisSetExecution{wroteNull: true}, nil
+	}
+	if opts.returnOld && exists && state.typ != redisTypeString {
+		return redisSetExecution{}, wrongTypeError()
+	}
+	if err := r.replaceWithString(ctx, key, value, opts.ttl, state.typ, readTS); err != nil {
+		return redisSetExecution{}, err
+	}
+	return redisSetExecution{state: state, wroteOldBulk: opts.returnOld}, nil
 }
 
 func (r *RedisServer) trackSubscription(conn redcon.Conn, channel string) {
@@ -580,59 +737,17 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
-	var (
-		existsCond  bool
-		missingCond bool
-		returnOld   bool
-		ttl         *time.Time
-	)
-
-	for i := 3; i < len(cmd.Args); i++ {
-		opt := strings.ToUpper(string(cmd.Args[i]))
-		switch opt {
-		case "EX", "PX":
-			if i+1 >= len(cmd.Args) {
-				conn.WriteError("ERR syntax error")
-				return
-			}
-			n, err := strconv.ParseInt(string(cmd.Args[i+1]), 10, 64)
-			if err != nil {
-				conn.WriteError(err.Error())
-				return
-			}
-			if n <= 0 {
-				conn.WriteError("ERR invalid expire time in 'set' command")
-				return
-			}
-			if opt == "EX" {
-				t := time.Now().Add(time.Duration(n) * time.Second)
-				ttl = &t
-			} else {
-				t := time.Now().Add(time.Duration(n) * time.Millisecond)
-				ttl = &t
-			}
-			i++
-		case "NX":
-			missingCond = true
-		case "XX":
-			existsCond = true
-		case "GET":
-			returnOld = true
-		default:
-			conn.WriteError("ERR syntax error")
-			return
-		}
-	}
-	if existsCond && missingCond {
-		conn.WriteError("ERR syntax error")
+	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
+	if err != nil {
+		conn.WriteError(err.Error())
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
-	if !returnOld && !existsCond && !missingCond {
-		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], ttl); err != nil {
+	if opts.isFastPath() {
+		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], opts.ttl); err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
@@ -640,66 +755,21 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	result, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[2], opts)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	exists := typ != redisTypeNone
-	if existsCond && !exists {
+	if result.wroteNull {
 		conn.WriteNull()
 		return
 	}
-	if missingCond && exists {
-		conn.WriteNull()
-		return
-	}
-	if returnOld && exists && typ != redisTypeString {
-		conn.WriteError(wrongTypeMessage)
-		return
-	}
-
-	var oldValue []byte
-	if returnOld && typ == redisTypeString {
-		oldValue, err = r.readValueAt(cmd.Args[1], readTS)
-		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-			conn.WriteError(err.Error())
-			return
-		}
-	}
-
-	if !returnOld && !existsCond && !missingCond && (typ == redisTypeNone || typ == redisTypeString) {
-		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], ttl); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteString("OK")
-		return
-	}
-
-	elems, _, err := r.deleteLogicalKeyElems(ctx, cmd.Args[1], readTS)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: cmd.Args[1], Value: bytes.Clone(cmd.Args[2])})
-	if ttl != nil {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(*ttl)})
-	} else {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
-	}
-	if err := r.dispatchElems(ctx, true, elems); err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	if returnOld {
-		if oldValue == nil {
+	if result.wroteOldBulk {
+		if result.state.oldValue == nil {
 			conn.WriteNull()
 			return
 		}
-		conn.WriteBulk(oldValue)
+		conn.WriteBulk(result.state.oldValue)
 		return
 	}
 	conn.WriteString("OK")
@@ -955,37 +1025,29 @@ func matchesAsteriskPattern(pattern, key []byte) bool {
 func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[string][]byte {
 	keyset := map[string][]byte{}
 	for _, kvPair := range kvs {
-		if bytes.HasPrefix(kvPair.Key, []byte("!txn|")) {
+		userKey := redisVisibleUserKey(kvPair.Key)
+		if userKey == nil || !matchesAsteriskPattern(pattern, userKey) {
 			continue
 		}
-		if store.IsListMetaKey(kvPair.Key) || store.IsListItemKey(kvPair.Key) {
-			if userKey := store.ExtractListUserKey(kvPair.Key); userKey != nil {
-				if !matchesAsteriskPattern(pattern, userKey) {
-					continue
-				}
-				keyset[string(userKey)] = userKey
-			}
-			continue
-		}
-		if userKey := extractRedisInternalUserKey(kvPair.Key); userKey != nil {
-			if !matchesAsteriskPattern(pattern, userKey) {
-				continue
-			}
-			keyset[string(userKey)] = userKey
-			continue
-		}
-		if isRedisTTLKey(kvPair.Key) {
-			continue
-		}
-		if bytes.HasPrefix(kvPair.Key, []byte("!")) {
-			continue
-		}
-		if !matchesAsteriskPattern(pattern, kvPair.Key) {
-			continue
-		}
-		keyset[string(kvPair.Key)] = kvPair.Key
+		keyset[string(userKey)] = userKey
 	}
 	return keyset
+}
+
+func redisVisibleUserKey(key []byte) []byte {
+	if bytes.HasPrefix(key, redisTxnKeyPrefix) || isRedisTTLKey(key) {
+		return nil
+	}
+	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
+		return store.ExtractListUserKey(key)
+	}
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		return userKey
+	}
+	if bytes.HasPrefix(key, []byte("!")) {
+		return nil
+	}
+	return key
 }
 
 func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
@@ -1172,52 +1234,68 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 
 func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 	k := string(key)
-	if st, ok := t.zsetStates[k]; ok && (st.dirty || st.exists) {
-		if len(st.members) == 0 {
-			return redisTypeNone, nil
-		}
-		return redisTypeZSet, nil
+	if typ, ok := t.stagedZSetType(k); ok {
+		return typ, nil
 	}
-	if st, ok := t.listStates[k]; ok {
-		if st.deleted {
-			return redisTypeNone, nil
-		}
-		if st.metaExists || len(st.appends) > 0 {
-			return redisTypeList, nil
-		}
+	if typ, ok := t.stagedListType(k); ok {
+		return typ, nil
 	}
-	if tv, ok := t.working[k]; ok {
-		if tv.deleted || tv.raw == nil {
-			return redisTypeNone, nil
-		}
-		return redisTypeString, nil
+	if typ, ok := t.stagedStringType(k); ok {
+		return typ, nil
 	}
 	return t.server.keyTypeAt(context.Background(), key, t.startTS)
 }
 
+func (t *txnContext) stagedZSetType(key string) (redisValueType, bool) {
+	st, ok := t.zsetStates[key]
+	if !ok || (!st.dirty && !st.exists) {
+		return redisTypeNone, false
+	}
+	if len(st.members) == 0 {
+		return redisTypeNone, true
+	}
+	return redisTypeZSet, true
+}
+
+func (t *txnContext) stagedListType(key string) (redisValueType, bool) {
+	st, ok := t.listStates[key]
+	if !ok {
+		return redisTypeNone, false
+	}
+	if st.deleted {
+		return redisTypeNone, true
+	}
+	if st.metaExists || len(st.appends) > 0 {
+		return redisTypeList, true
+	}
+	return redisTypeNone, false
+}
+
+func (t *txnContext) stagedStringType(key string) (redisValueType, bool) {
+	tv, ok := t.working[key]
+	if !ok {
+		return redisTypeNone, false
+	}
+	if tv.deleted || tv.raw == nil {
+		return redisTypeNone, true
+	}
+	return redisTypeString, true
+}
+
 func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
-	switch strings.ToUpper(string(cmd.Args[0])) {
-	case cmdSet:
-		return t.applySet(cmd)
-	case cmdDel:
-		return t.applyDel(cmd)
-	case cmdGet:
-		return t.applyGet(cmd)
-	case cmdExists:
-		return t.applyExists(cmd)
-	case cmdRPush:
-		return t.applyRPush(cmd)
-	case cmdLRange:
-		return t.applyLRange(cmd)
-	case cmdZIncrBy:
-		return t.applyZIncrBy(cmd)
-	case cmdExpire:
-		return t.applyExpire(cmd, time.Second)
-	case cmdPExpire:
-		return t.applyExpire(cmd, time.Millisecond)
-	default:
+	handler, ok := txnApplyHandlers[strings.ToUpper(string(cmd.Args[0]))]
+	if !ok {
 		return redisResult{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", cmd.Args[0]))
 	}
+	return handler(t, cmd)
+}
+
+func (t *txnContext) applyExpireSeconds(cmd redcon.Command) (redisResult, error) {
+	return t.applyExpire(cmd, time.Second)
+}
+
+func (t *txnContext) applyExpireMilliseconds(cmd redcon.Command) (redisResult, error) {
+	return t.applyExpire(cmd, time.Millisecond)
 }
 
 func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
@@ -1371,21 +1449,16 @@ func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisR
 	if err != nil {
 		return redisResult{}, errors.WithStack(err)
 	}
-	nxOnly := false
-	for _, arg := range cmd.Args[3:] {
-		switch strings.ToUpper(string(arg)) {
-		case "NX":
-			nxOnly = true
-		default:
-			return redisResult{}, errors.New("ERR syntax error")
-		}
+	nxOnly, err := parseExpireNXOnly(cmd.Args[3:])
+	if err != nil {
+		return redisResult{}, err
 	}
 
 	state, err := t.loadTTLState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if nxOnly && state.value != nil && state.value.After(time.Now()) {
+	if nxOnly && hasActiveTTL(state.value, time.Now()) {
 		return redisResult{typ: resultInt, integer: 0}, nil
 	}
 
@@ -1445,10 +1518,7 @@ func (t *txnContext) commit() error {
 	if err != nil {
 		return err
 	}
-	ttlElems, err := t.buildTTLElems()
-	if err != nil {
-		return err
-	}
+	ttlElems := t.buildTTLElems()
 
 	elems = append(elems, listElems...)
 	elems = append(elems, zsetElems...)
@@ -1578,7 +1648,7 @@ func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
 	return elems, nil
 }
 
-func (t *txnContext) buildTTLElems() ([]*kv.Elem[kv.OP], error) {
+func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 	keys := make([]string, 0, len(t.ttlStates))
 	for k := range t.ttlStates {
 		keys = append(keys, k)
@@ -1597,7 +1667,7 @@ func (t *txnContext) buildTTLElems() ([]*kv.Elem[kv.OP], error) {
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(k)), Value: encodeRedisTTL(*st.value)})
 	}
-	return elems, nil
+	return elems
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
@@ -1752,11 +1822,6 @@ func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uin
 	return meta, true, nil
 }
 
-func (r *RedisServer) isListKey(ctx context.Context, key []byte) (bool, error) {
-	_, exists, err := r.loadListMetaAt(ctx, key, r.readTS())
-	return exists, err
-}
-
 func (r *RedisServer) isListKeyAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
 	_, exists, err := r.loadListMetaAt(ctx, key, readTS)
 	return exists, err
@@ -1808,44 +1873,6 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 	return newMeta.Len, nil
 }
 
-func (r *RedisServer) deleteList(ctx context.Context, key []byte) error {
-	_, exists, err := r.loadListMeta(ctx, key)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return nil
-	}
-
-	start := listItemKey(key, math.MinInt64)
-	end := listItemKey(key, math.MaxInt64)
-
-	startTS := r.readTS()
-	if startTS == ^uint64(0) && r.coordinator != nil && r.coordinator.Clock() != nil {
-		startTS = r.coordinator.Clock().Next()
-	}
-
-	// Keep DEL atomic by deleting all persisted list entries and metadata in one
-	// transaction at a single snapshot timestamp. This can allocate large slices
-	// for very large lists; if the storage layer grows range-delete support, this
-	// path should move to a streaming/range tombstone strategy.
-	kvs, err := r.store.ScanAt(ctx, start, end, math.MaxInt, startTS)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	ops := make([]*kv.Elem[kv.OP], 0, len(kvs)+1)
-	for _, kvp := range kvs {
-		ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
-	}
-	// delete meta last
-	ops = append(ops, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: startTS, Elems: ops}
-	_, err = r.coordinator.Dispatch(ctx, group)
-	return errors.WithStack(err)
-}
-
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
 	if endIdx < startIdx {
 		return []string{}, nil
@@ -1875,11 +1902,10 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 	if err != nil {
 		return nil, err
 	}
-	switch typ {
-	case redisTypeNone:
+	if typ == redisTypeNone {
 		return []string{}, nil
-	case redisTypeList:
-	default:
+	}
+	if typ != redisTypeList {
 		return nil, wrongTypeError()
 	}
 	if !r.coordinator.IsLeaderForKey(key) {
@@ -1898,18 +1924,9 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return []string{}, nil
 	}
 
-	start, err := strconv.Atoi(string(startRaw))
+	s, e, err := parseRangeBounds(startRaw, endRaw, int(meta.Len))
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	end, err := strconv.Atoi(string(endRaw))
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	s, e := clampRange(start, end, int(meta.Len))
-	if e < s {
-		return []string{}, nil
+		return nil, err
 	}
 
 	return r.fetchListRange(context.Background(), key, meta, int64(s), int64(e), readTS)

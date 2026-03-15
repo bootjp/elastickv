@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"math"
 	"net"
 	"testing"
 
@@ -104,6 +105,10 @@ func (c *recordingConn) WriteInt64(num int64) {
 	c.int = num
 }
 func (c *recordingConn) WriteUint64(num uint64) {
+	if num > math.MaxInt64 {
+		c.int = math.MaxInt64
+		return
+	}
 	c.int = int64(num)
 }
 func (c *recordingConn) WriteArray(count int) {}

@@ -76,7 +76,7 @@ func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
 
 	req := &pb.Request{}
 	if err := proto.Unmarshal(data, req); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	return []*pb.Request{req}, nil
 }

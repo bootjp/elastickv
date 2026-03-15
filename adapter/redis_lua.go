@@ -2,7 +2,7 @@ package adapter
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- Redis EVALSHA specifies SHA1 script digests.
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -87,6 +87,7 @@ func (r *RedisServer) evalsha(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func luaScriptSHA(script string) string {
+	// #nosec G401 -- Redis script identity is SHA1 by protocol.
 	sum := sha1.Sum([]byte(script))
 	return hex.EncodeToString(sum[:])
 }
@@ -117,20 +118,20 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
 		scriptCtx := newLuaScriptContext(r)
-		L := newRedisLuaState()
-		defer L.Close()
-		r.initLuaGlobals(L, scriptCtx, keys, argv)
+		state := newRedisLuaState()
+		defer state.Close()
+		r.initLuaGlobals(state, scriptCtx, keys, argv)
 
-		chunk, err := L.LoadString(script)
+		chunk, err := state.LoadString(script)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
-		L.Push(chunk)
-		if err := L.PCall(0, 1, nil); err != nil {
-			return err
+		state.Push(chunk)
+		if err := state.PCall(0, 1, nil); err != nil {
+			return errors.WithStack(err)
 		}
-		result := L.Get(-1)
-		defer L.Pop(1)
+		result := state.Get(-1)
+		defer state.Pop(1)
 
 		nextReply, err := luaValueToReply(result)
 		if err != nil {
@@ -165,190 +166,230 @@ func parseRedisEvalArgs(args [][]byte) ([][]byte, [][]byte, error) {
 	return keys, argv, nil
 }
 
-func (r *RedisServer) initLuaGlobals(L *lua.LState, ctx *luaScriptContext, keys [][]byte, argv [][]byte) {
-	L.SetGlobal("KEYS", makeLuaStringArray(L, keys))
-	L.SetGlobal("ARGV", makeLuaStringArray(L, argv))
-	registerRedisModule(L, ctx)
-	registerCJSONModule(L)
-	registerCMsgpackModule(L)
+func (r *RedisServer) initLuaGlobals(state *lua.LState, ctx *luaScriptContext, keys [][]byte, argv [][]byte) {
+	state.SetGlobal("KEYS", makeLuaStringArray(state, keys))
+	state.SetGlobal("ARGV", makeLuaStringArray(state, argv))
+	registerRedisModule(state, ctx)
+	registerCJSONModule(state)
+	registerCMsgpackModule(state)
 
-	tableModule := L.GetGlobal("table")
+	tableModule := state.GetGlobal("table")
 	if tbl, ok := tableModule.(*lua.LTable); ok {
 		if unpack := tbl.RawGetString("unpack"); unpack != lua.LNil {
-			L.SetGlobal("unpack", unpack)
+			state.SetGlobal("unpack", unpack)
 		}
 	}
 }
 
 func newRedisLuaState() *lua.LState {
-	L := lua.NewState(lua.Options{SkipOpenLibs: true})
-	openLuaLib(L, lua.BaseLibName, lua.OpenBase)
-	openLuaLib(L, lua.TabLibName, lua.OpenTable)
-	openLuaLib(L, lua.StringLibName, lua.OpenString)
-	openLuaLib(L, lua.MathLibName, lua.OpenMath)
+	state := lua.NewState(lua.Options{SkipOpenLibs: true})
+	openLuaLib(state, lua.BaseLibName, lua.OpenBase)
+	openLuaLib(state, lua.TabLibName, lua.OpenTable)
+	openLuaLib(state, lua.StringLibName, lua.OpenString)
+	openLuaLib(state, lua.MathLibName, lua.OpenMath)
 
 	for _, name := range []string{"dofile", "load", "loadfile", "loadstring", "module", "require"} {
-		L.SetGlobal(name, lua.LNil)
+		state.SetGlobal(name, lua.LNil)
 	}
-	return L
+	return state
 }
 
-func openLuaLib(L *lua.LState, name string, fn lua.LGFunction) {
-	L.Push(L.NewFunction(fn))
-	L.Push(lua.LString(name))
-	L.Call(1, 0)
+func openLuaLib(state *lua.LState, name string, fn lua.LGFunction) {
+	state.Push(state.NewFunction(fn))
+	state.Push(lua.LString(name))
+	state.Call(1, 0)
 }
 
-func registerRedisModule(L *lua.LState, ctx *luaScriptContext) {
-	module := L.NewTable()
-	L.SetFuncs(module, map[string]lua.LGFunction{
-		"call": func(L *lua.LState) int {
-			return luaRedisCommand(L, ctx, true)
+func registerRedisModule(state *lua.LState, ctx *luaScriptContext) {
+	module := state.NewTable()
+	state.SetFuncs(module, map[string]lua.LGFunction{
+		"call": func(scriptState *lua.LState) int {
+			return luaRedisCommand(scriptState, ctx, true)
 		},
-		"pcall": func(L *lua.LState) int {
-			return luaRedisCommand(L, ctx, false)
+		"pcall": func(scriptState *lua.LState) int {
+			return luaRedisCommand(scriptState, ctx, false)
 		},
-		"sha1hex": func(L *lua.LState) int {
-			L.Push(lua.LString(luaScriptSHA(L.CheckString(1))))
+		"sha1hex": func(scriptState *lua.LState) int {
+			scriptState.Push(lua.LString(luaScriptSHA(scriptState.CheckString(1))))
 			return 1
 		},
-		"status_reply": func(L *lua.LState) int {
-			reply := L.NewTable()
-			reply.RawSetString(luaTypeOKKey, lua.LString(L.CheckString(1)))
-			L.Push(reply)
+		"status_reply": func(scriptState *lua.LState) int {
+			reply := scriptState.NewTable()
+			reply.RawSetString(luaTypeOKKey, lua.LString(scriptState.CheckString(1)))
+			scriptState.Push(reply)
 			return 1
 		},
-		"error_reply": func(L *lua.LState) int {
-			reply := L.NewTable()
-			reply.RawSetString(luaTypeErrKey, lua.LString(L.CheckString(1)))
-			L.Push(reply)
+		"error_reply": func(scriptState *lua.LState) int {
+			reply := scriptState.NewTable()
+			reply.RawSetString(luaTypeErrKey, lua.LString(scriptState.CheckString(1)))
+			scriptState.Push(reply)
 			return 1
 		},
 	})
-	L.SetGlobal("redis", module)
+	state.SetGlobal("redis", module)
 }
 
-func luaRedisCommand(L *lua.LState, ctx *luaScriptContext, raise bool) int {
-	if L.GetTop() == 0 {
+func luaRedisCommand(state *lua.LState, ctx *luaScriptContext, raise bool) int {
+	if state.GetTop() == 0 {
 		if raise {
-			L.RaiseError("Please specify at least one argument for this redis lib call")
+			state.RaiseError("Please specify at least one argument for this redis lib call")
 			return 0
 		}
-		L.Push(luaErrorTable(L, "Please specify at least one argument for this redis lib call"))
+		state.Push(luaErrorTable(state, "Please specify at least one argument for this redis lib call"))
 		return 1
 	}
 
-	command := strings.ToUpper(luaValueToCommandArg(L.Get(1)))
-	args := make([]string, 0, L.GetTop()-1)
-	for i := 2; i <= L.GetTop(); i++ {
-		args = append(args, luaValueToCommandArg(L.Get(i)))
+	command := strings.ToUpper(luaValueToCommandArg(state.Get(1)))
+	args := make([]string, 0, state.GetTop()-1)
+	for i := 2; i <= state.GetTop(); i++ {
+		args = append(args, luaValueToCommandArg(state.Get(i)))
 	}
 
 	reply, err := ctx.exec(command, args)
 	if err != nil {
 		if raise {
-			L.RaiseError("%s", err.Error())
+			state.RaiseError("%s", err.Error())
 			return 0
 		}
-		L.Push(luaErrorTable(L, err.Error()))
+		state.Push(luaErrorTable(state, err.Error()))
 		return 1
 	}
 
-	pushLuaReply(L, reply)
+	pushLuaReply(state, reply)
 	return 1
 }
 
-func makeLuaStringArray(L *lua.LState, values [][]byte) *lua.LTable {
-	tbl := L.NewTable()
+func makeLuaStringArray(state *lua.LState, values [][]byte) *lua.LTable {
+	tbl := state.NewTable()
 	for i, value := range values {
 		tbl.RawSetInt(i+luaTypeArrayBase, lua.LString(string(value)))
 	}
 	return tbl
 }
 
-func pushLuaReply(L *lua.LState, reply luaReply) {
-	switch reply.kind {
+type luaReplyPusher func(*lua.LState, luaReply)
+
+func pushLuaReply(state *lua.LState, reply luaReply) {
+	if push := luaReplyPusherFor(reply.kind); push != nil {
+		push(state, reply)
+		return
+	}
+
+	state.Push(lua.LNil)
+}
+
+func luaReplyPusherFor(kind luaReplyKind) luaReplyPusher {
+	switch kind {
 	case luaReplyNil:
-		L.Push(lua.LFalse)
+		return pushLuaNilReply
 	case luaReplyInt:
-		L.Push(lua.LNumber(reply.integer))
+		return pushLuaIntReply
 	case luaReplyString:
-		L.Push(lua.LString(reply.text))
-	case luaReplyStatus:
-		tbl := L.NewTable()
-		tbl.RawSetString(luaTypeOKKey, lua.LString(reply.text))
-		L.Push(tbl)
-	case luaReplyError:
-		L.Push(luaErrorTable(L, reply.text))
-	case luaReplyBool:
-		if reply.boolean {
-			L.Push(lua.LTrue)
-		} else {
-			L.Push(lua.LFalse)
-		}
+		return pushLuaStringReply
 	case luaReplyArray:
-		tbl := L.NewTable()
-		for i, item := range reply.array {
-			pushLuaReply(L, item)
-			tbl.RawSetInt(i+luaTypeArrayBase, L.Get(-1))
-			L.Pop(1)
-		}
-		L.Push(tbl)
+		return pushLuaArrayReply
+	case luaReplyStatus:
+		return pushLuaStatusReply
+	case luaReplyError:
+		return pushLuaErrorReply
+	case luaReplyBool:
+		return pushLuaBoolReply
 	default:
-		L.Push(lua.LNil)
+		return nil
 	}
 }
 
-func luaErrorTable(L *lua.LState, msg string) *lua.LTable {
-	tbl := L.NewTable()
+func pushLuaNilReply(state *lua.LState, _ luaReply) {
+	state.Push(lua.LFalse)
+}
+
+func pushLuaIntReply(state *lua.LState, reply luaReply) {
+	state.Push(lua.LNumber(reply.integer))
+}
+
+func pushLuaStringReply(state *lua.LState, reply luaReply) {
+	state.Push(lua.LString(reply.text))
+}
+
+func pushLuaStatusReply(state *lua.LState, reply luaReply) {
+	tbl := state.NewTable()
+	tbl.RawSetString(luaTypeOKKey, lua.LString(reply.text))
+	state.Push(tbl)
+}
+
+func pushLuaErrorReply(state *lua.LState, reply luaReply) {
+	state.Push(luaErrorTable(state, reply.text))
+}
+
+func pushLuaBoolReply(state *lua.LState, reply luaReply) {
+	if reply.boolean {
+		state.Push(lua.LTrue)
+		return
+	}
+
+	state.Push(lua.LFalse)
+}
+
+func pushLuaArrayReply(state *lua.LState, reply luaReply) {
+	tbl := state.NewTable()
+	for i, item := range reply.array {
+		pushLuaReply(state, item)
+		tbl.RawSetInt(i+luaTypeArrayBase, state.Get(-1))
+		state.Pop(1)
+	}
+	state.Push(tbl)
+}
+
+func luaErrorTable(state *lua.LState, msg string) *lua.LTable {
+	tbl := state.NewTable()
 	tbl.RawSetString(luaTypeErrKey, lua.LString(msg))
 	return tbl
 }
 
-func registerCJSONModule(L *lua.LState) {
-	module := L.NewTable()
-	L.SetFuncs(module, map[string]lua.LGFunction{
-		"encode": func(L *lua.LState) int {
-			goValue, err := luaToGoValue(L.Get(1))
+func registerCJSONModule(state *lua.LState) {
+	module := state.NewTable()
+	state.SetFuncs(module, map[string]lua.LGFunction{
+		"encode": func(scriptState *lua.LState) int {
+			goValue, err := luaToGoValue(scriptState.Get(1))
 			if err != nil {
-				L.RaiseError("%s", err.Error())
+				scriptState.RaiseError("%s", err.Error())
 				return 0
 			}
 			raw, err := json.Marshal(goValue)
 			if err != nil {
-				L.RaiseError("%s", err.Error())
+				scriptState.RaiseError("%s", err.Error())
 				return 0
 			}
-			L.Push(lua.LString(string(raw)))
+			scriptState.Push(lua.LString(string(raw)))
 			return 1
 		},
-		"decode": func(L *lua.LState) int {
+		"decode": func(scriptState *lua.LState) int {
 			var decoded any
-			if err := json.Unmarshal([]byte(L.CheckString(1)), &decoded); err != nil {
-				L.RaiseError("%s", err.Error())
+			if err := json.Unmarshal([]byte(scriptState.CheckString(1)), &decoded); err != nil {
+				scriptState.RaiseError("%s", err.Error())
 				return 0
 			}
-			L.Push(goToLuaValue(L, decoded))
+			scriptState.Push(goToLuaValue(scriptState, decoded))
 			return 1
 		},
 	})
-	L.SetGlobal("cjson", module)
+	state.SetGlobal("cjson", module)
 }
 
-func registerCMsgpackModule(L *lua.LState) {
-	module := L.NewTable()
-	L.SetFuncs(module, map[string]lua.LGFunction{
-		"unpack": func(L *lua.LState) int {
+func registerCMsgpackModule(state *lua.LState) {
+	module := state.NewTable()
+	state.SetFuncs(module, map[string]lua.LGFunction{
+		"unpack": func(scriptState *lua.LState) int {
 			var decoded any
-			if err := msgpack.Unmarshal([]byte(L.CheckString(1)), &decoded); err != nil {
-				L.RaiseError("%s", err.Error())
+			if err := msgpack.Unmarshal([]byte(scriptState.CheckString(1)), &decoded); err != nil {
+				scriptState.RaiseError("%s", err.Error())
 				return 0
 			}
-			L.Push(goToLuaValue(L, normalizeDecodedValue(decoded)))
+			scriptState.Push(goToLuaValue(scriptState, normalizeDecodedValue(decoded)))
 			return 1
 		},
 	})
-	L.SetGlobal("cmsgpack", module)
+	state.SetGlobal("cmsgpack", module)
 }
 
 func normalizeDecodedValue(v any) any {
@@ -382,98 +423,184 @@ func normalizeDecodedMapKey(key any) string {
 		return x
 	case []byte:
 		return string(x)
-	case int:
-		return strconv.Itoa(x)
-	case int8:
-		return strconv.FormatInt(int64(x), 10)
-	case int16:
-		return strconv.FormatInt(int64(x), 10)
-	case int32:
-		return strconv.FormatInt(int64(x), 10)
-	case int64:
-		return strconv.FormatInt(x, 10)
-	case uint:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint8:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint16:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint64:
-		return strconv.FormatUint(x, 10)
-	case float32:
-		return strconv.FormatFloat(float64(x), 'f', -1, 64)
-	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
 	case bool:
-		if x {
-			return "1"
-		}
-		return "0"
+		return boolToLuaIntString(x)
+	}
+
+	if normalized, ok := normalizeSignedMapKey(key); ok {
+		return normalized
+	}
+	if normalized, ok := normalizeUnsignedMapKey(key); ok {
+		return normalized
+	}
+	if normalized, ok := normalizeFloatMapKey(key); ok {
+		return normalized
+	}
+
+	return fmt.Sprint(key)
+}
+
+func normalizeSignedMapKey(key any) (string, bool) {
+	switch x := key.(type) {
+	case int:
+		return strconv.Itoa(x), true
+	case int8:
+		return strconv.FormatInt(int64(x), 10), true
+	case int16:
+		return strconv.FormatInt(int64(x), 10), true
+	case int32:
+		return strconv.FormatInt(int64(x), 10), true
+	case int64:
+		return strconv.FormatInt(x, 10), true
 	default:
-		return fmt.Sprint(x)
+		return "", false
 	}
 }
 
-func goToLuaValue(L *lua.LState, value any) lua.LValue {
-	switch x := value.(type) {
-	case nil:
-		return lua.LFalse
-	case bool:
-		if x {
-			return lua.LTrue
-		}
-		return lua.LFalse
-	case string:
-		return lua.LString(x)
-	case []byte:
-		return lua.LString(string(x))
-	case int:
-		return lua.LNumber(x)
-	case int8:
-		return lua.LNumber(x)
-	case int16:
-		return lua.LNumber(x)
-	case int32:
-		return lua.LNumber(x)
-	case int64:
-		return lua.LNumber(x)
+func normalizeUnsignedMapKey(key any) (string, bool) {
+	switch x := key.(type) {
 	case uint:
-		return lua.LNumber(x)
+		return strconv.FormatUint(uint64(x), 10), true
 	case uint8:
-		return lua.LNumber(x)
+		return strconv.FormatUint(uint64(x), 10), true
 	case uint16:
-		return lua.LNumber(x)
+		return strconv.FormatUint(uint64(x), 10), true
 	case uint32:
-		return lua.LNumber(x)
+		return strconv.FormatUint(uint64(x), 10), true
 	case uint64:
-		return lua.LNumber(x)
+		return strconv.FormatUint(x, 10), true
+	default:
+		return "", false
+	}
+}
+
+func normalizeFloatMapKey(key any) (string, bool) {
+	switch x := key.(type) {
 	case float32:
-		return lua.LNumber(x)
+		return strconv.FormatFloat(float64(x), 'f', -1, 64), true
 	case float64:
-		return lua.LNumber(x)
+		return strconv.FormatFloat(x, 'f', -1, 64), true
+	default:
+		return "", false
+	}
+}
+
+func boolToLuaIntString(value bool) string {
+	if value {
+		return "1"
+	}
+
+	return "0"
+}
+
+func goToLuaValue(state *lua.LState, value any) lua.LValue {
+	if scalar, ok := goToLuaScalar(value); ok {
+		return scalar
+	}
+
+	switch x := value.(type) {
 	case []any:
-		tbl := L.NewTable()
-		for i, item := range x {
-			tbl.RawSetInt(i+luaTypeArrayBase, goToLuaValue(L, item))
-		}
-		return tbl
+		return goSliceToLuaValue(state, x)
 	case map[string]any:
-		tbl := L.NewTable()
-		keys := make([]string, 0, len(x))
-		for key := range x {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			tbl.RawSetString(key, goToLuaValue(L, x[key]))
-		}
-		return tbl
+		return goMapToLuaValue(state, x)
 	default:
 		raw, _ := json.Marshal(x)
 		return lua.LString(string(raw))
 	}
+}
+
+func goToLuaScalar(value any) (lua.LValue, bool) {
+	switch x := value.(type) {
+	case nil:
+		return lua.LFalse, true
+	case bool:
+		if x {
+			return lua.LTrue, true
+		}
+		return lua.LFalse, true
+	case string:
+		return lua.LString(x), true
+	case []byte:
+		return lua.LString(string(x)), true
+	}
+
+	if numeric, ok := goToLuaSignedNumber(value); ok {
+		return numeric, true
+	}
+	if numeric, ok := goToLuaUnsignedNumber(value); ok {
+		return numeric, true
+	}
+	if numeric, ok := goToLuaFloatNumber(value); ok {
+		return numeric, true
+	}
+
+	return lua.LNil, false
+}
+
+func goToLuaSignedNumber(value any) (lua.LValue, bool) {
+	switch x := value.(type) {
+	case int:
+		return lua.LNumber(x), true
+	case int8:
+		return lua.LNumber(x), true
+	case int16:
+		return lua.LNumber(x), true
+	case int32:
+		return lua.LNumber(x), true
+	case int64:
+		return lua.LNumber(x), true
+	default:
+		return lua.LNil, false
+	}
+}
+
+func goToLuaUnsignedNumber(value any) (lua.LValue, bool) {
+	switch x := value.(type) {
+	case uint:
+		return lua.LNumber(x), true
+	case uint8:
+		return lua.LNumber(x), true
+	case uint16:
+		return lua.LNumber(x), true
+	case uint32:
+		return lua.LNumber(x), true
+	case uint64:
+		return lua.LNumber(x), true
+	default:
+		return lua.LNil, false
+	}
+}
+
+func goToLuaFloatNumber(value any) (lua.LValue, bool) {
+	switch x := value.(type) {
+	case float32:
+		return lua.LNumber(x), true
+	case float64:
+		return lua.LNumber(x), true
+	default:
+		return lua.LNil, false
+	}
+}
+
+func goSliceToLuaValue(state *lua.LState, values []any) lua.LValue {
+	tbl := state.NewTable()
+	for i, item := range values {
+		tbl.RawSetInt(i+luaTypeArrayBase, goToLuaValue(state, item))
+	}
+	return tbl
+}
+
+func goMapToLuaValue(state *lua.LState, value map[string]any) lua.LValue {
+	tbl := state.NewTable()
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		tbl.RawSetString(key, goToLuaValue(state, value[key]))
+	}
+	return tbl
 }
 
 func luaToGoValue(value lua.LValue) (any, error) {
@@ -493,7 +620,7 @@ func luaToGoValue(value lua.LValue) (any, error) {
 	case *lua.LNilType:
 		return nil, nil
 	default:
-		return nil, errors.Newf("unsupported lua value %s", value.Type().String())
+		return nil, errors.WithStack(errors.Newf("unsupported lua value %s", value.Type().String()))
 	}
 }
 
@@ -563,33 +690,6 @@ func luaValueToCommandArg(value lua.LValue) string {
 	}
 }
 
-func writeLuaValue(conn redcon.Conn, value lua.LValue) {
-	switch v := value.(type) {
-	case lua.LString:
-		conn.WriteBulkString(string(v))
-	case lua.LNumber:
-		conn.WriteInt64(int64(v))
-	case lua.LBool:
-		if bool(v) {
-			conn.WriteInt(1)
-			return
-		}
-		conn.WriteNull()
-	case *lua.LTable:
-		if errValue := v.RawGetString(luaTypeErrKey); errValue != lua.LNil {
-			conn.WriteError(luaValueToCommandArg(errValue))
-			return
-		}
-		if okValue := v.RawGetString(luaTypeOKKey); okValue != lua.LNil {
-			conn.WriteString(luaValueToCommandArg(okValue))
-			return
-		}
-		writeLuaTable(conn, v)
-	default:
-		conn.WriteNull()
-	}
-}
-
 func luaValueToReply(value lua.LValue) (luaReply, error) {
 	switch v := value.(type) {
 	case lua.LString:
@@ -599,98 +699,130 @@ func luaValueToReply(value lua.LValue) (luaReply, error) {
 	case lua.LBool:
 		return luaBoolReply(bool(v)), nil
 	case *lua.LTable:
-		if errValue := v.RawGetString(luaTypeErrKey); errValue != lua.LNil {
-			return luaErrorReply(luaValueToCommandArg(errValue)), nil
-		}
-		if okValue := v.RawGetString(luaTypeOKKey); okValue != lua.LNil {
-			return luaStatusReply(luaValueToCommandArg(okValue)), nil
-		}
-		if isLuaArray(v) {
-			values := make([]luaReply, 0, v.Len())
-			for i := luaTypeArrayBase; i <= v.Len(); i++ {
-				reply, err := luaValueToReply(v.RawGetInt(i))
-				if err != nil {
-					return luaReply{}, err
-				}
-				values = append(values, reply)
-			}
-			return luaArrayReply(values...), nil
-		}
-
-		keys := make([]string, 0)
-		values := map[string]lua.LValue{}
-		v.ForEach(func(key lua.LValue, value lua.LValue) {
-			asString := luaValueToCommandArg(key)
-			keys = append(keys, asString)
-			values[asString] = value
-		})
-		sort.Strings(keys)
-
-		flattened := make([]luaReply, 0, len(keys)*2)
-		for _, key := range keys {
-			reply, err := luaValueToReply(values[key])
-			if err != nil {
-				return luaReply{}, err
-			}
-			flattened = append(flattened, luaStringReply(key), reply)
-		}
-		return luaArrayReply(flattened...), nil
+		return luaTableToReply(v)
 	default:
 		return luaNilReply(), nil
 	}
 }
 
-func writeLuaReply(conn redcon.Conn, reply luaReply) {
-	switch reply.kind {
-	case luaReplyNil:
-		conn.WriteNull()
-	case luaReplyInt:
-		conn.WriteInt64(reply.integer)
-	case luaReplyString:
-		conn.WriteBulkString(reply.text)
-	case luaReplyStatus:
-		conn.WriteString(reply.text)
-	case luaReplyError:
-		conn.WriteError(reply.text)
-	case luaReplyBool:
-		if reply.boolean {
-			conn.WriteInt(1)
-			return
-		}
-		conn.WriteNull()
-	case luaReplyArray:
-		conn.WriteArray(len(reply.array))
-		for _, item := range reply.array {
-			writeLuaReply(conn, item)
-		}
-	default:
-		conn.WriteNull()
+func luaTableToReply(tbl *lua.LTable) (luaReply, error) {
+	if reply, ok := luaTableSpecialReply(tbl); ok {
+		return reply, nil
 	}
+	if isLuaArray(tbl) {
+		return luaArrayTableToReply(tbl)
+	}
+	return luaMapTableToReply(tbl)
 }
 
-func writeLuaTable(conn redcon.Conn, table *lua.LTable) {
-	if isLuaArray(table) {
-		length := table.Len()
-		conn.WriteArray(length)
-		for i := luaTypeArrayBase; i <= length; i++ {
-			writeLuaValue(conn, table.RawGetInt(i))
-		}
-		return
+func luaTableSpecialReply(tbl *lua.LTable) (luaReply, bool) {
+	if errValue := tbl.RawGetString(luaTypeErrKey); errValue != lua.LNil {
+		return luaErrorReply(luaValueToCommandArg(errValue)), true
 	}
+	if okValue := tbl.RawGetString(luaTypeOKKey); okValue != lua.LNil {
+		return luaStatusReply(luaValueToCommandArg(okValue)), true
+	}
+	return luaReply{}, false
+}
 
+func luaArrayTableToReply(tbl *lua.LTable) (luaReply, error) {
+	values := make([]luaReply, 0, tbl.Len())
+	for i := luaTypeArrayBase; i <= tbl.Len(); i++ {
+		reply, err := luaValueToReply(tbl.RawGetInt(i))
+		if err != nil {
+			return luaReply{}, err
+		}
+		values = append(values, reply)
+	}
+	return luaArrayReply(values...), nil
+}
+
+func luaMapTableToReply(tbl *lua.LTable) (luaReply, error) {
 	keys := make([]string, 0)
 	values := map[string]lua.LValue{}
-	table.ForEach(func(key lua.LValue, value lua.LValue) {
+	tbl.ForEach(func(key lua.LValue, value lua.LValue) {
 		asString := luaValueToCommandArg(key)
 		keys = append(keys, asString)
 		values[asString] = value
 	})
 	sort.Strings(keys)
 
-	conn.WriteArray(len(keys) * 2)
+	flattened := make([]luaReply, 0, len(keys)*redisPairWidth)
 	for _, key := range keys {
-		conn.WriteBulkString(key)
-		writeLuaValue(conn, values[key])
+		reply, err := luaValueToReply(values[key])
+		if err != nil {
+			return luaReply{}, err
+		}
+		flattened = append(flattened, luaStringReply(key), reply)
+	}
+	return luaArrayReply(flattened...), nil
+}
+
+type luaReplyWriter func(redcon.Conn, luaReply)
+
+func writeLuaReply(conn redcon.Conn, reply luaReply) {
+	if write := luaReplyWriterFor(reply.kind); write != nil {
+		write(conn, reply)
+		return
+	}
+
+	conn.WriteNull()
+}
+
+func luaReplyWriterFor(kind luaReplyKind) luaReplyWriter {
+	switch kind {
+	case luaReplyNil:
+		return writeLuaNilReply
+	case luaReplyInt:
+		return writeLuaIntReply
+	case luaReplyString:
+		return writeLuaStringReply
+	case luaReplyArray:
+		return writeLuaArrayReply
+	case luaReplyStatus:
+		return writeLuaStatusReply
+	case luaReplyError:
+		return writeLuaErrorReply
+	case luaReplyBool:
+		return writeLuaBoolReply
+	default:
+		return nil
+	}
+}
+
+func writeLuaNilReply(conn redcon.Conn, _ luaReply) {
+	conn.WriteNull()
+}
+
+func writeLuaIntReply(conn redcon.Conn, reply luaReply) {
+	conn.WriteInt64(reply.integer)
+}
+
+func writeLuaStringReply(conn redcon.Conn, reply luaReply) {
+	conn.WriteBulkString(reply.text)
+}
+
+func writeLuaStatusReply(conn redcon.Conn, reply luaReply) {
+	conn.WriteString(reply.text)
+}
+
+func writeLuaErrorReply(conn redcon.Conn, reply luaReply) {
+	conn.WriteError(reply.text)
+}
+
+func writeLuaBoolReply(conn redcon.Conn, reply luaReply) {
+	if reply.boolean {
+		conn.WriteInt(1)
+		return
+	}
+
+	conn.WriteNull()
+}
+
+func writeLuaArrayReply(conn redcon.Conn, reply luaReply) {
+	conn.WriteArray(len(reply.array))
+	for _, item := range reply.array {
+		writeLuaReply(conn, item)
 	}
 }
 

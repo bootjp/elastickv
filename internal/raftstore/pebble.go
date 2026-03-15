@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	logPrefix    byte = 'l'
-	stablePrefix byte = 's'
+	logPrefix         byte = 'l'
+	stablePrefix      byte = 's'
+	pebbleDirPerm          = 0o755
+	pebbleUint64Bytes      = 8
+	pebbleLogKeyBytes      = 1 + pebbleUint64Bytes
 )
 
 var _ raft.LogStore = (*PebbleStore)(nil)
@@ -25,7 +28,7 @@ type PebbleStore struct {
 }
 
 func NewPebbleStore(dir string) (*PebbleStore, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, pebbleDirPerm); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -139,7 +142,7 @@ func (s *PebbleStore) Get(key []byte) ([]byte, error) {
 }
 
 func (s *PebbleStore) SetUint64(key []byte, value uint64) error {
-	buf := make([]byte, 8)
+	buf := make([]byte, pebbleUint64Bytes)
 	binary.BigEndian.PutUint64(buf, value)
 	return errors.WithStack(s.Set(key, buf))
 }
@@ -149,8 +152,8 @@ func (s *PebbleStore) GetUint64(key []byte) (uint64, error) {
 	if err != nil || len(value) == 0 {
 		return 0, err
 	}
-	if len(value) != 8 {
-		return 0, errors.Newf("invalid uint64 value length: %d", len(value))
+	if len(value) != pebbleUint64Bytes {
+		return 0, errors.WithStack(errors.Newf("invalid uint64 value length: %d", len(value)))
 	}
 	return binary.BigEndian.Uint64(value), nil
 }
@@ -163,7 +166,7 @@ func (s *PebbleStore) Close() error {
 }
 
 func logKey(index uint64) []byte {
-	key := make([]byte, 9)
+	key := make([]byte, pebbleLogKeyBytes)
 	key[0] = logPrefix
 	binary.BigEndian.PutUint64(key[1:], index)
 	return key
@@ -177,7 +180,7 @@ func stableKey(key []byte) []byte {
 }
 
 func decodeLogIndex(key []byte) uint64 {
-	if len(key) != 9 || key[0] != logPrefix {
+	if len(key) != pebbleLogKeyBytes || key[0] != logPrefix {
 		return 0
 	}
 	return binary.BigEndian.Uint64(key[1:])

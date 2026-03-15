@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"math"
 	"sort"
 	"time"
 
@@ -71,29 +70,29 @@ func (r *RedisServer) logicalExistsAt(ctx context.Context, key []byte, readTS ui
 	return typ != redisTypeNone, nil
 }
 
-func (r *RedisServer) loadHashAt(ctx context.Context, key []byte, readTS uint64) (redisHashValue, bool, error) {
+func (r *RedisServer) loadHashAt(ctx context.Context, key []byte, readTS uint64) (redisHashValue, error) {
 	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisHashValue{}, false, nil
+			return redisHashValue{}, nil
 		}
-		return nil, false, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	val, err := unmarshalHashValue(raw)
-	return val, true, err
+	return val, err
 }
 
-func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, readTS uint64) (redisSetValue, bool, error) {
+func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, readTS uint64) (redisSetValue, error) {
 	storageKey := redisExactSetStorageKey(kind, key)
 	raw, err := r.store.GetAt(ctx, storageKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisSetValue{}, false, nil
+			return redisSetValue{}, nil
 		}
-		return redisSetValue{}, false, errors.WithStack(err)
+		return redisSetValue{}, errors.WithStack(err)
 	}
 	val, err := unmarshalSetValue(raw)
-	return val, true, err
+	return val, err
 }
 
 func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64) (redisZSetValue, bool, error) {
@@ -108,16 +107,16 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
-func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, bool, error) {
+func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, error) {
 	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisStreamValue{}, false, nil
+			return redisStreamValue{}, nil
 		}
-		return redisStreamValue{}, false, errors.WithStack(err)
+		return redisStreamValue{}, errors.WithStack(err)
 	}
 	val, err := unmarshalStreamValue(raw)
-	return val, true, err
+	return val, err
 }
 
 func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, elems []*kv.Elem[kv.OP]) error {
@@ -131,12 +130,9 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, elems []*kv
 	return errors.WithStack(err)
 }
 
-func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload []byte, keepTTL bool, userKey []byte) error {
+func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload []byte) error {
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: storageKey, Value: payload},
-	}
-	if !keepTTL {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
 	}
 	return r.dispatchElems(ctx, false, elems)
 }
@@ -158,7 +154,7 @@ func (r *RedisServer) saveHash(ctx context.Context, key []byte, value redisHashV
 	if err != nil {
 		return err
 	}
-	return r.saveBytes(ctx, redisHashKey(key), payload, true, key)
+	return r.saveBytes(ctx, redisHashKey(key), payload)
 }
 
 func (r *RedisServer) saveSet(ctx context.Context, kind string, key []byte, value redisSetValue) error {
@@ -166,7 +162,7 @@ func (r *RedisServer) saveSet(ctx context.Context, kind string, key []byte, valu
 	if err != nil {
 		return err
 	}
-	return r.saveBytes(ctx, redisExactSetStorageKey(kind, key), payload, true, key)
+	return r.saveBytes(ctx, redisExactSetStorageKey(kind, key), payload)
 }
 
 func (r *RedisServer) saveZSet(ctx context.Context, key []byte, value redisZSetValue) error {
@@ -174,7 +170,7 @@ func (r *RedisServer) saveZSet(ctx context.Context, key []byte, value redisZSetV
 	if err != nil {
 		return err
 	}
-	return r.saveBytes(ctx, redisZSetKey(key), payload, true, key)
+	return r.saveBytes(ctx, redisZSetKey(key), payload)
 }
 
 func (r *RedisServer) saveStream(ctx context.Context, key []byte, value redisStreamValue) error {
@@ -182,7 +178,7 @@ func (r *RedisServer) saveStream(ctx context.Context, key []byte, value redisStr
 	if err != nil {
 		return err
 	}
-	return r.saveBytes(ctx, redisStreamKey(key), payload, true, key)
+	return r.saveBytes(ctx, redisStreamKey(key), payload)
 }
 
 func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -322,38 +318,4 @@ func minRedisInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func maxRedisInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func streamBoundary(raw string, highest bool) (redisStreamID, bool, error) {
-	switch raw {
-	case "-":
-		return redisStreamID{}, false, nil
-	case "+":
-		return redisStreamID{ms: math.MaxUint64, seq: math.MaxUint64}, false, nil
-	}
-	exclusive := false
-	if len(raw) > 0 && raw[0] == '(' {
-		exclusive = true
-		raw = raw[1:]
-	}
-	id, err := parseRedisStreamID(raw)
-	if err != nil {
-		return redisStreamID{}, false, err
-	}
-	if highest && exclusive {
-		if id.seq < math.MaxUint64 {
-			id.seq++
-		} else if id.ms < math.MaxUint64 {
-			id.ms++
-			id.seq = 0
-		}
-	}
-	return id, exclusive, nil
 }

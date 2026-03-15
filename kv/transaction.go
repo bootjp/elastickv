@@ -49,9 +49,17 @@ type TransactionResponse struct {
 
 func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 	if len(reqs) == 1 {
-		return proto.Marshal(reqs[0])
+		b, err := proto.Marshal(reqs[0])
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return b, nil
 	}
-	return proto.Marshal(&pb.RaftCommand{Requests: reqs})
+	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return b, nil
 }
 
 // applyRequests submits one raft command and returns per-request FSM results.
@@ -79,11 +87,11 @@ func applyRequests(r *raft.Raft, reqs []*pb.Request) (uint64, []error, error) {
 		return af.Index(), []error{errors.WithStack(resp)}, nil
 	case *fsmApplyResponse:
 		if len(resp.results) != len(reqs) {
-			return 0, nil, errors.Newf("unexpected apply response size: got %d want %d", len(resp.results), len(reqs))
+			return 0, nil, errors.WithStack(errors.Newf("unexpected apply response size: got %d want %d", len(resp.results), len(reqs)))
 		}
 		return af.Index(), resp.results, nil
 	default:
-		return 0, nil, errors.Newf("unexpected apply response type %T", resp)
+		return 0, nil, errors.WithStack(errors.Newf("unexpected apply response type %T", resp))
 	}
 }
 
@@ -249,7 +257,7 @@ func combineApplyErrors(errs []error) error {
 		}
 		combined = errors.CombineErrors(combined, err)
 	}
-	return combined
+	return errors.WithStack(combined)
 }
 
 func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {

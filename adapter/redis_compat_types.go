@@ -24,6 +24,11 @@ const (
 	redisTTLPrefix    = "!redis|ttl|"
 )
 
+const (
+	redisUint64Bytes   = 8
+	redisStreamIDParts = 2
+)
+
 type redisValueType string
 
 const (
@@ -89,21 +94,6 @@ func redisTTLKey(userKey []byte) []byte {
 	return append([]byte(redisTTLPrefix), userKey...)
 }
 
-func redisStorageKey(valueType redisValueType, userKey []byte) []byte {
-	switch valueType {
-	case redisTypeHash:
-		return redisHashKey(userKey)
-	case redisTypeSet:
-		return redisSetKey(userKey)
-	case redisTypeZSet:
-		return redisZSetKey(userKey)
-	case redisTypeStream:
-		return redisStreamKey(userKey)
-	default:
-		return nil
-	}
-}
-
 func redisExactSetStorageKey(kind string, userKey []byte) []byte {
 	switch kind {
 	case "set":
@@ -142,7 +132,11 @@ func marshalHashValue(v redisHashValue) ([]byte, error) {
 	if v == nil {
 		v = redisHashValue{}
 	}
-	return json.Marshal(v)
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return payload, nil
 }
 
 func unmarshalHashValue(raw []byte) (redisHashValue, error) {
@@ -158,7 +152,11 @@ func unmarshalHashValue(raw []byte) (redisHashValue, error) {
 
 func marshalSetValue(v redisSetValue) ([]byte, error) {
 	sort.Strings(v.Members)
-	return json.Marshal(v)
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return payload, nil
 }
 
 func unmarshalSetValue(raw []byte) (redisSetValue, error) {
@@ -175,7 +173,11 @@ func unmarshalSetValue(raw []byte) (redisSetValue, error) {
 
 func marshalZSetValue(v redisZSetValue) ([]byte, error) {
 	sortZSetEntries(v.Entries)
-	return json.Marshal(v)
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return payload, nil
 }
 
 func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
@@ -194,7 +196,11 @@ func marshalStreamValue(v redisStreamValue) ([]byte, error) {
 	sort.SliceStable(v.Entries, func(i, j int) bool {
 		return compareRedisStreamID(v.Entries[i].ID, v.Entries[j].ID) < 0
 	})
-	return json.Marshal(v)
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return payload, nil
 }
 
 func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
@@ -212,20 +218,24 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 }
 
 func encodeRedisTTL(expireAt time.Time) []byte {
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(expireAt.UnixMilli()))
+	ms := expireAt.UnixMilli()
+	if ms < 0 {
+		ms = 0
+	}
+	buf := make([]byte, redisUint64Bytes)
+	binary.BigEndian.PutUint64(buf, uint64(ms)) // #nosec G115 -- ms is clamped to non-negative int64 range.
 	return buf
 }
 
 func decodeRedisTTL(raw []byte) (time.Time, error) {
-	if len(raw) != 8 {
+	if len(raw) != redisUint64Bytes {
 		return time.Time{}, errors.WithStack(errors.Newf("invalid ttl length %d", len(raw)))
 	}
 	ms := binary.BigEndian.Uint64(raw)
 	if ms > math.MaxInt64 {
 		ms = math.MaxInt64
 	}
-	return time.UnixMilli(int64(ms)), nil
+	return time.UnixMilli(int64(ms)), nil // #nosec G115 -- ms <= MaxInt64 is guaranteed by the check above.
 }
 
 func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
@@ -293,7 +303,7 @@ func zsetMapToEntries(in map[string]float64) []redisZSetEntry {
 
 func parseRedisStreamID(raw string) (redisStreamID, error) {
 	parts := strings.Split(raw, "-")
-	if len(parts) != 2 {
+	if len(parts) != redisStreamIDParts {
 		return redisStreamID{}, errors.WithStack(errors.Newf("invalid stream id %q", raw))
 	}
 	ms, err := strconv.ParseUint(parts[0], 10, 64)

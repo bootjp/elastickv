@@ -87,7 +87,75 @@ const (
 	zBoundNegInf = -1
 	zBoundValue  = 0
 	zBoundPosInf = 1
+
+	zsetWithScoresArgIndex = 3
+	xAddMinArgs            = 3
+	xTrimMinArgs           = 4
 )
+
+type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
+type luaRenameHandler func(*luaScriptContext, []byte, []byte) error
+
+var luaCommandHandlers = map[string]luaCommandHandler{
+	cmdDel:              (*luaScriptContext).cmdDel,
+	cmdExists:           (*luaScriptContext).cmdExists,
+	cmdGet:              (*luaScriptContext).cmdGet,
+	cmdSet:              (*luaScriptContext).cmdSet,
+	cmdIncr:             (*luaScriptContext).cmdIncr,
+	cmdPTTL:             (*luaScriptContext).cmdPTTL,
+	cmdPExpire:          (*luaScriptContext).cmdPExpire,
+	cmdType:             (*luaScriptContext).cmdType,
+	cmdRename:           (*luaScriptContext).cmdRename,
+	cmdHGet:             (*luaScriptContext).cmdHGet,
+	cmdHSet:             (*luaScriptContext).cmdHSet,
+	cmdHMGet:            (*luaScriptContext).cmdHMGet,
+	cmdHMSet:            (*luaScriptContext).cmdHMSet,
+	cmdHGetAll:          (*luaScriptContext).cmdHGetAll,
+	cmdHIncrBy:          (*luaScriptContext).cmdHIncrBy,
+	cmdHDel:             (*luaScriptContext).cmdHDel,
+	cmdHExists:          (*luaScriptContext).cmdHExists,
+	cmdHLen:             (*luaScriptContext).cmdHLen,
+	cmdLPush:            (*luaScriptContext).cmdLPush,
+	cmdRPush:            (*luaScriptContext).cmdRPush,
+	cmdLLen:             (*luaScriptContext).cmdLLen,
+	cmdLIndex:           (*luaScriptContext).cmdLIndex,
+	cmdLRange:           (*luaScriptContext).cmdLRange,
+	cmdLRem:             (*luaScriptContext).cmdLRem,
+	cmdLTrim:            (*luaScriptContext).cmdLTrim,
+	cmdLPop:             (*luaScriptContext).cmdLPop,
+	cmdRPop:             (*luaScriptContext).cmdRPop,
+	cmdRPopLPush:        (*luaScriptContext).cmdRPopLPush,
+	cmdLPos:             (*luaScriptContext).cmdLPos,
+	cmdLSet:             (*luaScriptContext).cmdLSet,
+	cmdSAdd:             (*luaScriptContext).cmdSAdd,
+	cmdSCard:            (*luaScriptContext).cmdSCard,
+	cmdSMembers:         (*luaScriptContext).cmdSMembers,
+	cmdSRem:             (*luaScriptContext).cmdSRem,
+	cmdSIsMember:        (*luaScriptContext).cmdSIsMember,
+	cmdZAdd:             (*luaScriptContext).cmdZAdd,
+	cmdZCard:            (*luaScriptContext).cmdZCard,
+	cmdZCount:           (*luaScriptContext).cmdZCount,
+	cmdZRange:           (*luaScriptContext).cmdZRange,
+	cmdZRangeByScore:    (*luaScriptContext).cmdZRangeByScoreAsc,
+	cmdZRevRange:        (*luaScriptContext).cmdZRevRange,
+	cmdZRevRangeByScore: (*luaScriptContext).cmdZRevRangeByScore,
+	cmdZScore:           (*luaScriptContext).cmdZScore,
+	cmdZRem:             (*luaScriptContext).cmdZRem,
+	cmdZPopMin:          (*luaScriptContext).cmdZPopMin,
+	cmdZRemRangeByRank:  (*luaScriptContext).cmdZRemRangeByRank,
+	cmdZRemRangeByScore: (*luaScriptContext).cmdZRemRangeByScore,
+	cmdXAdd:             (*luaScriptContext).cmdXAdd,
+	cmdXTrim:            (*luaScriptContext).cmdXTrim,
+}
+
+var luaRenameHandlers = map[redisValueType]luaRenameHandler{
+	redisTypeString: (*luaScriptContext).renameStringValue,
+	redisTypeList:   (*luaScriptContext).renameListValue,
+	redisTypeHash:   (*luaScriptContext).renameHashValue,
+	redisTypeSet:    (*luaScriptContext).renameSetValue,
+	redisTypeZSet:   (*luaScriptContext).renameZSetValue,
+	redisTypeStream: (*luaScriptContext).renameStreamValue,
+}
 
 func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 	return &luaScriptContext{
@@ -106,108 +174,11 @@ func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 }
 
 func (c *luaScriptContext) exec(command string, args []string) (luaReply, error) {
-	switch command {
-	case cmdDel:
-		return c.cmdDel(args)
-	case cmdExists:
-		return c.cmdExists(args)
-	case cmdGet:
-		return c.cmdGet(args)
-	case cmdSet:
-		return c.cmdSet(args)
-	case cmdIncr:
-		return c.cmdIncr(args)
-	case cmdPTTL:
-		return c.cmdPTTL(args)
-	case cmdPExpire:
-		return c.cmdPExpire(args)
-	case cmdType:
-		return c.cmdType(args)
-	case cmdRename:
-		return c.cmdRename(args)
-	case cmdHGet:
-		return c.cmdHGet(args)
-	case cmdHSet:
-		return c.cmdHSet(args)
-	case cmdHMGet:
-		return c.cmdHMGet(args)
-	case cmdHMSet:
-		return c.cmdHMSet(args)
-	case cmdHGetAll:
-		return c.cmdHGetAll(args)
-	case cmdHIncrBy:
-		return c.cmdHIncrBy(args)
-	case cmdHDel:
-		return c.cmdHDel(args)
-	case cmdHExists:
-		return c.cmdHExists(args)
-	case cmdHLen:
-		return c.cmdHLen(args)
-	case cmdLPush:
-		return c.cmdLPush(args)
-	case cmdRPush:
-		return c.cmdRPush(args)
-	case cmdLLen:
-		return c.cmdLLen(args)
-	case cmdLIndex:
-		return c.cmdLIndex(args)
-	case cmdLRange:
-		return c.cmdLRange(args)
-	case cmdLRem:
-		return c.cmdLRem(args)
-	case cmdLTrim:
-		return c.cmdLTrim(args)
-	case cmdLPop:
-		return c.cmdLPop(args)
-	case cmdRPop:
-		return c.cmdRPop(args)
-	case cmdRPopLPush:
-		return c.cmdRPopLPush(args)
-	case cmdLPos:
-		return c.cmdLPos(args)
-	case cmdLSet:
-		return c.cmdLSet(args)
-	case cmdSAdd:
-		return c.cmdSAdd(args)
-	case cmdSCard:
-		return c.cmdSCard(args)
-	case cmdSMembers:
-		return c.cmdSMembers(args)
-	case cmdSRem:
-		return c.cmdSRem(args)
-	case cmdSIsMember:
-		return c.cmdSIsMember(args)
-	case cmdZAdd:
-		return c.cmdZAdd(args)
-	case cmdZCard:
-		return c.cmdZCard(args)
-	case cmdZCount:
-		return c.cmdZCount(args)
-	case cmdZRange:
-		return c.cmdZRange(args)
-	case cmdZRangeByScore:
-		return c.cmdZRangeByScore(args, false)
-	case cmdZRevRange:
-		return c.cmdZRevRange(args)
-	case cmdZRevRangeByScore:
-		return c.cmdZRangeByScore(args, true)
-	case cmdZScore:
-		return c.cmdZScore(args)
-	case cmdZRem:
-		return c.cmdZRem(args)
-	case cmdZPopMin:
-		return c.cmdZPopMin(args)
-	case cmdZRemRangeByRank:
-		return c.cmdZRemRangeByRank(args)
-	case cmdZRemRangeByScore:
-		return c.cmdZRemRangeByScore(args)
-	case cmdXAdd:
-		return c.cmdXAdd(args)
-	case cmdXTrim:
-		return c.cmdXTrim(args)
-	default:
-		return luaReply{}, errors.Newf("ERR unsupported command '%s'", command)
+	if handler, ok := luaCommandHandlers[command]; ok {
+		return handler(c, args)
 	}
+
+	return luaReply{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
 }
 
 func (c *luaScriptContext) markTouched(key []byte) {
@@ -296,28 +267,65 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 	}
 }
 
-func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
+func (c *luaScriptContext) cachedType(key []byte) (redisValueType, bool) {
 	k := string(key)
-	if st, ok := c.strings[k]; ok && st.loaded && st.exists {
-		return redisTypeString, c.ensureKeyNotExpired(key)
-	}
-	if st, ok := c.lists[k]; ok && st.loaded && st.exists {
-		return redisTypeList, c.ensureKeyNotExpired(key)
-	}
-	if st, ok := c.hashes[k]; ok && st.loaded && st.exists {
-		return redisTypeHash, c.ensureKeyNotExpired(key)
-	}
-	if st, ok := c.sets[k]; ok && st.loaded && st.exists {
-		return redisTypeSet, c.ensureKeyNotExpired(key)
-	}
-	if st, ok := c.zsets[k]; ok && st.loaded && st.exists {
-		return redisTypeZSet, c.ensureKeyNotExpired(key)
-	}
-	if st, ok := c.streams[k]; ok && st.loaded && st.exists {
-		return redisTypeStream, c.ensureKeyNotExpired(key)
+	for _, candidate := range c.cachedLoadedTypes(k) {
+		if candidate.exists {
+			return candidate.typ, true
+		}
 	}
 	if c.deleted[k] {
-		return redisTypeNone, nil
+		return redisTypeNone, true
+	}
+	return redisTypeNone, false
+}
+
+func (c *luaScriptContext) cachedLoadedTypes(key string) []cachedLuaType {
+	return []cachedLuaType{
+		{typ: redisTypeString, exists: hasLoadedStringValue(c.strings[key])},
+		{typ: redisTypeList, exists: hasLoadedListValue(c.lists[key])},
+		{typ: redisTypeHash, exists: hasLoadedHashValue(c.hashes[key])},
+		{typ: redisTypeSet, exists: hasLoadedSetValue(c.sets[key])},
+		{typ: redisTypeZSet, exists: hasLoadedZSetValue(c.zsets[key])},
+		{typ: redisTypeStream, exists: hasLoadedStreamValue(c.streams[key])},
+	}
+}
+
+type cachedLuaType struct {
+	typ    redisValueType
+	exists bool
+}
+
+func hasLoadedStringValue(st *luaStringState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func hasLoadedListValue(st *luaListState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func hasLoadedHashValue(st *luaHashState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func hasLoadedSetValue(st *luaSetState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func hasLoadedZSetValue(st *luaZSetState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func hasLoadedStreamValue(st *luaStreamState) bool {
+	return st != nil && st.loaded && st.exists
+}
+
+func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
+	if typ, ok := c.cachedType(key); ok {
+		if typ != redisTypeNone {
+			return typ, c.ensureKeyNotExpired(key)
+		}
+		return typ, nil
 	}
 
 	typ, err := c.server.keyTypeAt(context.Background(), key, c.startTS)
@@ -447,7 +455,7 @@ func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.loadHashAt(context.Background(), key, c.startTS)
+	value, err := c.server.loadHashAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +491,7 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.loadSetAt(context.Background(), "set", key, c.startTS)
+	value, err := c.server.loadSetAt(context.Background(), "set", key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -556,7 +564,7 @@ func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.loadStreamAt(context.Background(), key, c.startTS)
+	value, err := c.server.loadStreamAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -580,6 +588,76 @@ func (c *luaScriptContext) markStringValue(key []byte, value []byte) {
 	s.value = append([]byte(nil), value...)
 	c.markTouched(key)
 	c.deleted[string(key)] = false
+}
+
+func (c *luaScriptContext) markListValue(key []byte, values []string) error {
+	st, err := c.listState(key)
+	if err != nil {
+		return err
+	}
+	st.loaded = true
+	st.exists = true
+	st.dirty = true
+	st.values = append([]string(nil), values...)
+	c.markTouched(key)
+	c.deleted[string(key)] = false
+	return nil
+}
+
+func (c *luaScriptContext) markHashValue(key []byte, value redisHashValue) error {
+	st, err := c.hashState(key)
+	if err != nil {
+		return err
+	}
+	st.loaded = true
+	st.exists = true
+	st.dirty = true
+	st.value = maps.Clone(value)
+	c.markTouched(key)
+	c.deleted[string(key)] = false
+	return nil
+}
+
+func (c *luaScriptContext) markSetValue(key []byte, members map[string]struct{}) error {
+	st, err := c.setState(key)
+	if err != nil {
+		return err
+	}
+	st.loaded = true
+	st.exists = true
+	st.dirty = true
+	st.members = cloneSetMembers(members)
+	c.markTouched(key)
+	c.deleted[string(key)] = false
+	return nil
+}
+
+func (c *luaScriptContext) markZSetValue(key []byte, members map[string]float64) error {
+	st, err := c.zsetState(key)
+	if err != nil {
+		return err
+	}
+	st.loaded = true
+	st.exists = true
+	st.dirty = true
+	st.members = maps.Clone(members)
+	c.markTouched(key)
+	c.deleted[string(key)] = false
+	return nil
+}
+
+func (c *luaScriptContext) markStreamValue(key []byte, value redisStreamValue) error {
+	st, err := c.streamState(key)
+	if err != nil {
+		return err
+	}
+	st.loaded = true
+	st.exists = true
+	st.dirty = true
+	st.value = cloneStreamValue(value)
+	c.markTouched(key)
+	c.deleted[string(key)] = false
+	return nil
 }
 
 func (c *luaScriptContext) cmdDel(args []string) (luaReply, error) {
@@ -625,73 +703,116 @@ func (c *luaScriptContext) cmdGet(args []string) (luaReply, error) {
 	return luaStringReply(string(st.value)), nil
 }
 
+type luaSetOptions struct {
+	expiresAt *time.Time
+	nx        bool
+	xx        bool
+	keepTTL   bool
+}
+
 func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	value := []byte(args[1])
 
-	exists, err := c.logicalExists(key)
+	exists, prevTTL, err := c.loadLuaSetContext(key)
 	if err != nil {
 		return luaReply{}, err
 	}
-	prevTTL, err := c.loadTTL(key)
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+
+	options, err := parseLuaSetOptions(args[2:])
+	if err != nil {
 		return luaReply{}, err
 	}
 
-	var (
-		expiresAt *time.Time
-		nx        bool
-		xx        bool
-		keepTTL   bool
-	)
-	for i := 2; i < len(args); i++ {
-		switch strings.ToUpper(args[i]) {
-		case "NX":
-			nx = true
-		case "XX":
-			xx = true
-		case "KEEPTTL":
-			keepTTL = true
-		case "PX", "EX":
-			if i+1 >= len(args) {
-				return luaReply{}, errors.New("ERR syntax error")
-			}
-			n, err := strconv.ParseInt(args[i+1], 10, 64)
-			if err != nil {
-				return luaReply{}, errors.WithStack(err)
-			}
-			unit := time.Millisecond
-			if strings.EqualFold(args[i], "EX") {
-				unit = time.Second
-			}
-			exp := time.Now().Add(time.Duration(n) * unit)
-			expiresAt = &exp
-			i++
-		default:
-			return luaReply{}, errors.New("ERR syntax error")
-		}
+	if err := validateLuaSetOptions(options); err != nil {
+		return luaReply{}, err
 	}
-	if nx && xx {
-		return luaReply{}, errors.New("ERR syntax error")
-	}
-	if nx && exists {
-		return luaNilReply(), nil
-	}
-	if xx && !exists {
+	if shouldSkipLuaSet(options, exists) {
 		return luaNilReply(), nil
 	}
 
 	c.deleteLogical(key)
 	c.markStringValue(key, value)
+	c.applyLuaSetTTL(key, prevTTL, options)
+	return luaStatusReply("OK"), nil
+}
+
+func (c *luaScriptContext) loadLuaSetContext(key []byte) (bool, *time.Time, error) {
+	exists, err := c.logicalExists(key)
+	if err != nil {
+		return false, nil, err
+	}
+
+	prevTTL, err := c.loadTTL(key)
+	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+		return false, nil, err
+	}
+	return exists, prevTTL, nil
+}
+
+func validateLuaSetOptions(options luaSetOptions) error {
+	if options.nx && options.xx {
+		return errors.New("ERR syntax error")
+	}
+	return nil
+}
+
+func shouldSkipLuaSet(options luaSetOptions, exists bool) bool {
+	return options.nx && exists || options.xx && !exists
+}
+
+func (c *luaScriptContext) applyLuaSetTTL(key []byte, prevTTL *time.Time, options luaSetOptions) {
 	switch {
-	case expiresAt != nil:
-		c.setTTLValue(key, expiresAt)
-	case keepTTL:
+	case options.expiresAt != nil:
+		c.setTTLValue(key, options.expiresAt)
+	case options.keepTTL:
 		c.setTTLValue(key, prevTTL)
 	default:
 		c.clearTTL(key)
 	}
-	return luaStatusReply("OK"), nil
+}
+
+func parseLuaSetOptions(args []string) (luaSetOptions, error) {
+	options := luaSetOptions{}
+	for i := 0; i < len(args); i++ {
+		switch strings.ToUpper(args[i]) {
+		case "NX":
+			options.nx = true
+		case "XX":
+			options.xx = true
+		case "KEEPTTL":
+			options.keepTTL = true
+		case "PX", "EX":
+			expiresAt, err := parseLuaSetExpiry(args[i], args, i)
+			if err != nil {
+				return luaSetOptions{}, err
+			}
+			options.expiresAt = expiresAt
+			i++
+		default:
+			return luaSetOptions{}, errors.New("ERR syntax error")
+		}
+	}
+	return options, nil
+}
+
+func parseLuaSetExpiry(unit string, args []string, index int) (*time.Time, error) {
+	if index+1 >= len(args) {
+		return nil, errors.New("ERR syntax error")
+	}
+
+	durationValue, err := strconv.ParseInt(args[index+1], 10, 64)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	durationUnit := time.Millisecond
+	if strings.EqualFold(unit, "EX") {
+		durationUnit = time.Second
+	}
+
+	expiresAt := time.Now().Add(time.Duration(durationValue) * durationUnit)
+	return &expiresAt, nil
 }
 
 func (c *luaScriptContext) cmdIncr(args []string) (luaReply, error) {
@@ -777,96 +898,12 @@ func (c *luaScriptContext) cmdRename(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 
-	switch typ {
-	case redisTypeString:
-		st, err := c.stringState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		c.markStringValue(dst, st.value)
-	case redisTypeList:
-		st, err := c.listState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		dstState, err := c.listState(dst)
-		if err != nil {
-			return luaReply{}, err
-		}
-		dstState.loaded = true
-		dstState.exists = true
-		dstState.dirty = true
-		dstState.values = append([]string(nil), st.values...)
-		c.markTouched(dst)
-		c.deleted[string(dst)] = false
-	case redisTypeHash:
-		st, err := c.hashState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		dstState, err := c.hashState(dst)
-		if err != nil {
-			return luaReply{}, err
-		}
-		dstState.loaded = true
-		dstState.exists = true
-		dstState.dirty = true
-		dstState.value = maps.Clone(st.value)
-		c.markTouched(dst)
-		c.deleted[string(dst)] = false
-	case redisTypeSet:
-		st, err := c.setState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		dstState, err := c.setState(dst)
-		if err != nil {
-			return luaReply{}, err
-		}
-		dstState.loaded = true
-		dstState.exists = true
-		dstState.dirty = true
-		dstState.members = cloneSetMembers(st.members)
-		c.markTouched(dst)
-		c.deleted[string(dst)] = false
-	case redisTypeZSet:
-		st, err := c.zsetState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		dstState, err := c.zsetState(dst)
-		if err != nil {
-			return luaReply{}, err
-		}
-		dstState.loaded = true
-		dstState.exists = true
-		dstState.dirty = true
-		dstState.members = maps.Clone(st.members)
-		c.markTouched(dst)
-		c.deleted[string(dst)] = false
-	case redisTypeStream:
-		st, err := c.streamState(src)
-		if err != nil {
-			return luaReply{}, err
-		}
-		c.deleteLogical(dst)
-		dstState, err := c.streamState(dst)
-		if err != nil {
-			return luaReply{}, err
-		}
-		dstState.loaded = true
-		dstState.exists = true
-		dstState.dirty = true
-		dstState.value = cloneStreamValue(st.value)
-		c.markTouched(dst)
-		c.deleted[string(dst)] = false
-	default:
+	handler, ok := luaRenameHandlers[typ]
+	if !ok {
 		return luaReply{}, errors.New("ERR unsupported type for RENAME")
+	}
+	if err := handler(c, src, dst); err != nil {
+		return luaReply{}, err
 	}
 
 	c.deleteLogical(src)
@@ -877,6 +914,61 @@ func (c *luaScriptContext) cmdRename(args []string) (luaReply, error) {
 		c.clearTTL(dst)
 	}
 	return luaStatusReply("OK"), nil
+}
+
+func (c *luaScriptContext) renameStringValue(src, dst []byte) error {
+	st, err := c.stringState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	c.markStringValue(dst, st.value)
+	return nil
+}
+
+func (c *luaScriptContext) renameListValue(src, dst []byte) error {
+	st, err := c.listState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	return c.markListValue(dst, st.values)
+}
+
+func (c *luaScriptContext) renameHashValue(src, dst []byte) error {
+	st, err := c.hashState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	return c.markHashValue(dst, st.value)
+}
+
+func (c *luaScriptContext) renameSetValue(src, dst []byte) error {
+	st, err := c.setState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	return c.markSetValue(dst, st.members)
+}
+
+func (c *luaScriptContext) renameZSetValue(src, dst []byte) error {
+	st, err := c.zsetState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	return c.markZSetValue(dst, st.members)
+}
+
+func (c *luaScriptContext) renameStreamValue(src, dst []byte) error {
+	st, err := c.streamState(src)
+	if err != nil {
+		return err
+	}
+	c.deleteLogical(dst)
+	return c.markStreamValue(dst, st.value)
 }
 
 func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
@@ -977,7 +1069,7 @@ func (c *luaScriptContext) cmdHGetAll(args []string) (luaReply, error) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	out := make([]luaReply, 0, len(fields)*2)
+	out := make([]luaReply, 0, len(fields)*redisPairWidth)
 	for _, field := range fields {
 		out = append(out, luaStringReply(field), luaStringReply(st.value[field]))
 	}
@@ -1192,42 +1284,7 @@ func (c *luaScriptContext) cmdLRem(args []string) (luaReply, error) {
 		return luaReply{}, errors.WithStack(err)
 	}
 	target := args[2]
-	removed := 0
-	values := append([]string(nil), st.values...)
-	switch {
-	case count == 0:
-		filtered := values[:0]
-		for _, value := range values {
-			if value == target {
-				removed++
-				continue
-			}
-			filtered = append(filtered, value)
-		}
-		values = filtered
-	case count > 0:
-		filtered := make([]string, 0, len(values))
-		for _, value := range values {
-			if value == target && removed < count {
-				removed++
-				continue
-			}
-			filtered = append(filtered, value)
-		}
-		values = filtered
-	default:
-		filtered := make([]string, 0, len(values))
-		for i := len(values) - 1; i >= 0; i-- {
-			value := values[i]
-			if value == target && removed < -count {
-				removed++
-				continue
-			}
-			filtered = append(filtered, value)
-		}
-		reverseStrings(filtered)
-		values = filtered
-	}
+	values, removed := removeListValues(st.values, target, count)
 	if removed == 0 {
 		return luaIntReply(0), nil
 	}
@@ -1240,6 +1297,59 @@ func (c *luaScriptContext) cmdLRem(args []string) (luaReply, error) {
 	}
 	c.markTouched([]byte(args[0]))
 	return luaIntReply(int64(removed)), nil
+}
+
+func removeListValues(values []string, target string, count int) ([]string, int) {
+	switch {
+	case count == 0:
+		return removeAllListValues(values, target)
+	case count > 0:
+		return removeLeadingListValues(values, target, count)
+	default:
+		return removeTrailingListValues(values, target, -count)
+	}
+}
+
+func removeAllListValues(values []string, target string) ([]string, int) {
+	filtered := append([]string(nil), values...)
+	removed := 0
+	out := filtered[:0]
+	for _, value := range filtered {
+		if value == target {
+			removed++
+			continue
+		}
+		out = append(out, value)
+	}
+	return out, removed
+}
+
+func removeLeadingListValues(values []string, target string, count int) ([]string, int) {
+	filtered := make([]string, 0, len(values))
+	removed := 0
+	for _, value := range values {
+		if value == target && removed < count {
+			removed++
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered, removed
+}
+
+func removeTrailingListValues(values []string, target string, count int) ([]string, int) {
+	filtered := make([]string, 0, len(values))
+	removed := 0
+	for i := len(values) - 1; i >= 0; i-- {
+		value := values[i]
+		if value == target && removed < count {
+			removed++
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	reverseStrings(filtered)
+	return filtered, removed
 }
 
 func (c *luaScriptContext) cmdLTrim(args []string) (luaReply, error) {
@@ -1438,25 +1548,38 @@ func (c *luaScriptContext) cmdSRem(args []string) (luaReply, error) {
 	if !st.exists {
 		return luaIntReply(0), nil
 	}
-	removed := 0
-	for _, member := range args[1:] {
-		if _, ok := st.members[member]; !ok {
-			continue
-		}
-		delete(st.members, member)
-		removed++
-	}
-	if removed > 0 {
+	removed := removeMembers(st.members, args[1:])
+	finalizeSetLikeRemoval(c, args[0], removed, len(st.members) == 0, func() {
 		st.loaded = true
 		st.dirty = true
-		if len(st.members) == 0 {
-			st.exists = false
-			c.deleted[args[0]] = true
-			c.clearTTL([]byte(args[0]))
-		}
-		c.markTouched([]byte(args[0]))
-	}
+		st.exists = len(st.members) > 0
+	})
 	return luaIntReply(int64(removed)), nil
+}
+
+func removeMembers[V any](members map[string]V, keys []string) int {
+	removed := 0
+	for _, key := range keys {
+		if _, ok := members[key]; !ok {
+			continue
+		}
+		delete(members, key)
+		removed++
+	}
+	return removed
+}
+
+func finalizeSetLikeRemoval(c *luaScriptContext, key string, removed int, empty bool, markDirty func()) {
+	if removed == 0 {
+		return
+	}
+
+	markDirty()
+	if empty {
+		c.deleted[key] = true
+		c.clearTTL([]byte(key))
+	}
+	c.markTouched([]byte(key))
 }
 
 func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
@@ -1556,6 +1679,14 @@ func (c *luaScriptContext) cmdZRevRange(args []string) (luaReply, error) {
 	return c.rangeByRank(args, true)
 }
 
+func (c *luaScriptContext) cmdZRangeByScoreAsc(args []string) (luaReply, error) {
+	return c.cmdZRangeByScore(args, false)
+}
+
+func (c *luaScriptContext) cmdZRevRangeByScore(args []string) (luaReply, error) {
+	return c.cmdZRangeByScore(args, true)
+}
+
 func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, error) {
 	st, err := c.zsetState([]byte(args[0]))
 	if err != nil {
@@ -1575,7 +1706,7 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 	if err != nil {
 		return luaReply{}, errors.WithStack(err)
 	}
-	withScores := len(args) > 3 && strings.EqualFold(args[3], "WITHSCORES")
+	withScores := len(args) > zsetWithScoresArgIndex && strings.EqualFold(args[zsetWithScoresArgIndex], "WITHSCORES")
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
@@ -1599,64 +1730,112 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaArrayReply(), nil
 	}
 
-	minRaw := args[1]
-	maxRaw := args[2]
-	if reverse {
-		maxRaw = args[1]
-		minRaw = args[2]
-	}
-	minBound, err := parseZScoreBound(minRaw)
+	options, err := parseZRangeByScoreOptions(args, reverse)
 	if err != nil {
 		return luaReply{}, err
-	}
-	maxBound, err := parseZScoreBound(maxRaw)
-	if err != nil {
-		return luaReply{}, err
-	}
-
-	withScores := false
-	offset := 0
-	limit := -1
-	for i := 3; i < len(args); i++ {
-		switch strings.ToUpper(args[i]) {
-		case "WITHSCORES":
-			withScores = true
-		case "LIMIT":
-			if i+2 >= len(args) {
-				return luaReply{}, errors.New("ERR syntax error")
-			}
-			offset, err = strconv.Atoi(args[i+1])
-			if err != nil {
-				return luaReply{}, errors.WithStack(err)
-			}
-			limit, err = strconv.Atoi(args[i+2])
-			if err != nil {
-				return luaReply{}, errors.WithStack(err)
-			}
-			i += 2
-		default:
-			return luaReply{}, errors.New("ERR syntax error")
-		}
 	}
 
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
 	}
+	selected := filterZRangeByScore(entries, options.minBound, options.maxBound)
+	selected = applyZRangeLimit(selected, options.offset, options.limit)
+	if len(selected) == 0 {
+		return luaArrayReply(), nil
+	}
+	return zsetRangeReply(selected, options.withScores), nil
+}
+
+type luaZRangeByScoreOptions struct {
+	minBound   zScoreBound
+	maxBound   zScoreBound
+	withScores bool
+	offset     int
+	limit      int
+}
+
+func parseZRangeByScoreOptions(args []string, reverse bool) (luaZRangeByScoreOptions, error) {
+	minRaw := args[1]
+	maxRaw := args[2]
+	if reverse {
+		minRaw, maxRaw = maxRaw, minRaw
+	}
+
+	minBound, err := parseZScoreBound(minRaw)
+	if err != nil {
+		return luaZRangeByScoreOptions{}, err
+	}
+	maxBound, err := parseZScoreBound(maxRaw)
+	if err != nil {
+		return luaZRangeByScoreOptions{}, err
+	}
+
+	withScores, offset, limit, err := parseZRangeByScoreTail(args[zsetWithScoresArgIndex:])
+	if err != nil {
+		return luaZRangeByScoreOptions{}, err
+	}
+
+	return luaZRangeByScoreOptions{
+		minBound:   minBound,
+		maxBound:   maxBound,
+		withScores: withScores,
+		offset:     offset,
+		limit:      limit,
+	}, nil
+}
+
+func parseZRangeByScoreTail(args []string) (bool, int, int, error) {
+	withScores := false
+	offset := 0
+	limit := -1
+	for i := 0; i < len(args); i++ {
+		switch strings.ToUpper(args[i]) {
+		case "WITHSCORES":
+			withScores = true
+		case "LIMIT":
+			if i+2 >= len(args) {
+				return false, 0, 0, errors.New("ERR syntax error")
+			}
+
+			nextOffset, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return false, 0, 0, errors.WithStack(err)
+			}
+			nextLimit, err := strconv.Atoi(args[i+2])
+			if err != nil {
+				return false, 0, 0, errors.WithStack(err)
+			}
+			offset = nextOffset
+			limit = nextLimit
+			i += 2
+		default:
+			return false, 0, 0, errors.New("ERR syntax error")
+		}
+	}
+	return withScores, offset, limit, nil
+}
+
+func filterZRangeByScore(entries []redisZSetEntry, minBound, maxBound zScoreBound) []redisZSetEntry {
 	selected := make([]redisZSetEntry, 0, len(entries))
 	for _, entry := range entries {
 		if scoreInRange(entry.Score, minBound, maxBound) {
 			selected = append(selected, entry)
 		}
 	}
-	if offset > len(selected) {
-		return luaArrayReply(), nil
+	return selected
+}
+
+func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEntry {
+	if offset >= len(entries) {
+		return nil
 	}
-	selected = selected[offset:]
-	if limit >= 0 && limit < len(selected) {
-		selected = selected[:limit]
+
+	trimmed := entries[offset:]
+	if limit >= 0 && limit < len(trimmed) {
+		return trimmed[:limit]
 	}
-	return zsetRangeReply(selected, withScores), nil
+	return trimmed
 }
 
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
@@ -1688,24 +1867,12 @@ func (c *luaScriptContext) cmdZRem(args []string) (luaReply, error) {
 	if !st.exists {
 		return luaIntReply(0), nil
 	}
-	removed := 0
-	for _, member := range args[1:] {
-		if _, ok := st.members[member]; !ok {
-			continue
-		}
-		delete(st.members, member)
-		removed++
-	}
-	if removed > 0 {
+	removed := removeMembers(st.members, args[1:])
+	finalizeSetLikeRemoval(c, args[0], removed, len(st.members) == 0, func() {
 		st.loaded = true
 		st.dirty = true
-		if len(st.members) == 0 {
-			st.exists = false
-			c.deleted[args[0]] = true
-			c.clearTTL([]byte(args[0]))
-		}
-		c.markTouched([]byte(args[0]))
-	}
+		st.exists = len(st.members) > 0
+	})
 	return luaIntReply(int64(removed)), nil
 }
 
@@ -1734,7 +1901,7 @@ func (c *luaScriptContext) cmdZPopMin(args []string) (luaReply, error) {
 	if count == 0 {
 		return luaArrayReply(), nil
 	}
-	out := make([]luaReply, 0, count*2)
+	out := make([]luaReply, 0, count*redisPairWidth)
 	for _, entry := range entries[:count] {
 		delete(st.members, entry.Member)
 		out = append(out, luaStringReply(entry.Member), luaStringReply(formatRedisFloat(entry.Score)))
@@ -1829,64 +1996,107 @@ func (c *luaScriptContext) cmdZRemRangeByScore(args []string) (luaReply, error) 
 	return luaIntReply(int64(removed)), nil
 }
 
+type luaXAddArgs struct {
+	key    []byte
+	maxLen int
+	id     string
+	fields []string
+}
+
 func (c *luaScriptContext) cmdXAdd(args []string) (luaReply, error) {
-	if len(args) < 3 {
+	if len(args) < xAddMinArgs {
 		return luaReply{}, errors.New("ERR wrong number of arguments for 'XADD' command")
 	}
-	key := []byte(args[0])
-	st, err := c.streamState(key)
+	parsed, err := parseLuaXAddArgs(args)
+	if err != nil {
+		return luaReply{}, err
+	}
+	st, err := c.streamState(parsed.key)
 	if err != nil {
 		return luaReply{}, err
 	}
 	if !st.exists {
 		st.exists = true
 	}
-	maxLen := -1
-	argIndex := 1
-	if strings.EqualFold(args[argIndex], "MAXLEN") {
-		argIndex++
-		if argIndex < len(args) && (args[argIndex] == "~" || args[argIndex] == "=") {
-			argIndex++
-		}
-		if argIndex >= len(args) {
-			return luaReply{}, errors.New("ERR syntax error")
-		}
-		maxLen, err = strconv.Atoi(args[argIndex])
-		if err != nil {
-			return luaReply{}, errors.WithStack(err)
-		}
-		argIndex++
-	}
-	if argIndex >= len(args) {
-		return luaReply{}, errors.New("ERR syntax error")
-	}
-	id := args[argIndex]
-	argIndex++
-	if (len(args)-argIndex)%2 != 0 {
-		return luaReply{}, errors.New("ERR wrong number of arguments for 'XADD' command")
-	}
+
+	id := parsed.id
 	if id == "*" {
 		id = nextLuaStreamID(st.value)
-	} else if len(st.value.Entries) > 0 && compareRedisStreamID(id, st.value.Entries[len(st.value.Entries)-1].ID) <= 0 {
+	} else if !isNextStreamID(st.value, id) {
 		return luaReply{}, errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 	}
-	fields := append([]string(nil), args[argIndex:]...)
-	st.value.Entries = append(st.value.Entries, redisStreamEntry{ID: id, Fields: fields})
+	st.value.Entries = append(st.value.Entries, redisStreamEntry{ID: id, Fields: append([]string(nil), parsed.fields...)})
 	st.loaded = true
 	st.dirty = true
-	if maxLen >= 0 && len(st.value.Entries) > maxLen {
-		st.value.Entries = append([]redisStreamEntry(nil), st.value.Entries[len(st.value.Entries)-maxLen:]...)
+	if parsed.maxLen >= 0 && len(st.value.Entries) > parsed.maxLen {
+		st.value.Entries = append([]redisStreamEntry(nil), st.value.Entries[len(st.value.Entries)-parsed.maxLen:]...)
 	}
-	c.markTouched(key)
-	c.deleted[string(key)] = false
+	c.markTouched(parsed.key)
+	c.deleted[string(parsed.key)] = false
 	return luaStringReply(id), nil
 }
 
+func parseLuaXAddArgs(args []string) (luaXAddArgs, error) {
+	parsed := luaXAddArgs{
+		key:    []byte(args[0]),
+		maxLen: -1,
+	}
+
+	argIndex, maxLen, err := parseLuaXAddMaxLen(args)
+	if err != nil {
+		return luaXAddArgs{}, err
+	}
+	parsed.maxLen = maxLen
+	if argIndex >= len(args) {
+		return luaXAddArgs{}, errors.New("ERR syntax error")
+	}
+
+	parsed.id = args[argIndex]
+	argIndex++
+	if (len(args)-argIndex)%2 != 0 {
+		return luaXAddArgs{}, errors.New("ERR wrong number of arguments for 'XADD' command")
+	}
+	parsed.fields = append([]string(nil), args[argIndex:]...)
+	return parsed, nil
+}
+
+func parseLuaXAddMaxLen(args []string) (int, int, error) {
+	argIndex := 1
+	maxLen := -1
+	if !strings.EqualFold(args[argIndex], "MAXLEN") {
+		return argIndex, maxLen, nil
+	}
+
+	argIndex++
+	if argIndex < len(args) && (args[argIndex] == "~" || args[argIndex] == "=") {
+		argIndex++
+	}
+	if argIndex >= len(args) {
+		return 0, 0, errors.New("ERR syntax error")
+	}
+
+	maxLen, err := strconv.Atoi(args[argIndex])
+	if err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	return argIndex + 1, maxLen, nil
+}
+
+func isNextStreamID(value redisStreamValue, id string) bool {
+	if len(value.Entries) == 0 {
+		return true
+	}
+	return compareRedisStreamID(id, value.Entries[len(value.Entries)-1].ID) > 0
+}
+
 func (c *luaScriptContext) cmdXTrim(args []string) (luaReply, error) {
-	if len(args) < 4 || !strings.EqualFold(args[1], "MAXLEN") {
+	if len(args) < xTrimMinArgs || !strings.EqualFold(args[1], "MAXLEN") {
 		return luaReply{}, errors.New("ERR syntax error")
 	}
-	key := []byte(args[0])
+	key, maxLen, err := parseLuaXTrimArgs(args)
+	if err != nil {
+		return luaReply{}, err
+	}
 	st, err := c.streamState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -1896,14 +2106,6 @@ func (c *luaScriptContext) cmdXTrim(args []string) (luaReply, error) {
 	}
 	if !st.exists {
 		return luaIntReply(0), nil
-	}
-	argIndex := 2
-	if args[argIndex] == "~" || args[argIndex] == "=" {
-		argIndex++
-	}
-	maxLen, err := strconv.Atoi(args[argIndex])
-	if err != nil {
-		return luaReply{}, errors.WithStack(err)
 	}
 	if maxLen >= len(st.value.Entries) {
 		return luaIntReply(0), nil
@@ -1923,6 +2125,19 @@ func (c *luaScriptContext) cmdXTrim(args []string) (luaReply, error) {
 	return luaIntReply(int64(removed)), nil
 }
 
+func parseLuaXTrimArgs(args []string) ([]byte, int, error) {
+	argIndex := 2
+	if args[argIndex] == "~" || args[argIndex] == "=" {
+		argIndex++
+	}
+
+	maxLen, err := strconv.Atoi(args[argIndex])
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	return []byte(args[0]), maxLen, nil
+}
+
 func (c *luaScriptContext) commit() error {
 	keys := make([]string, 0, len(c.touched))
 	for key := range c.touched {
@@ -1930,74 +2145,14 @@ func (c *luaScriptContext) commit() error {
 	}
 	sort.Strings(keys)
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*2)
+	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
 	ctx := context.Background()
 	for _, key := range keys {
-		deleteElems, _, err := c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
+		keyElems, err := c.commitElemsForKey(ctx, key)
 		if err != nil {
 			return err
 		}
-		elems = append(elems, deleteElems...)
-
-		finalType, err := c.finalType([]byte(key))
-		if err != nil {
-			return err
-		}
-		switch finalType {
-		case redisTypeNone:
-		case redisTypeString:
-			st := c.strings[key]
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: []byte(key), Value: append([]byte(nil), st.value...)})
-		case redisTypeList:
-			st := c.lists[key]
-			values := make([][]byte, 0, len(st.values))
-			for _, value := range st.values {
-				values = append(values, []byte(value))
-			}
-			listElems, _, err := c.server.buildRPushOps(store.ListMeta{}, []byte(key), values)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, listElems...)
-		case redisTypeHash:
-			st := c.hashes[key]
-			payload, err := marshalHashValue(st.value)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisHashKey([]byte(key)), Value: payload})
-		case redisTypeSet:
-			st := c.sets[key]
-			payload, err := marshalSetValue(redisSetValue{Members: sortedSetMembers(st.members)})
-			if err != nil {
-				return err
-			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisSetKey([]byte(key)), Value: payload})
-		case redisTypeZSet:
-			st := c.zsets[key]
-			payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
-			if err != nil {
-				return err
-			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey([]byte(key)), Value: payload})
-		case redisTypeStream:
-			st := c.streams[key]
-			payload, err := marshalStreamValue(st.value)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStreamKey([]byte(key)), Value: payload})
-		}
-
-		if finalType != redisTypeNone {
-			ttl, err := c.finalTTL([]byte(key))
-			if err != nil {
-				return err
-			}
-			if ttl != nil {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)})
-			}
-		}
+		elems = append(elems, keyElems...)
 	}
 
 	if len(elems) == 0 {
@@ -2008,28 +2163,124 @@ func (c *luaScriptContext) commit() error {
 	return c.server.dispatchElems(dispatchCtx, true, elems)
 }
 
+func (c *luaScriptContext) commitElemsForKey(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
+	deleteElems, _, err := c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
+	if err != nil {
+		return nil, err
+	}
+
+	finalType, err := c.finalType([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+
+	valueElems, err := c.valueCommitElems(key, finalType)
+	if err != nil {
+		return nil, err
+	}
+	ttlElems, err := c.ttlCommitElems(key, finalType)
+	if err != nil {
+		return nil, err
+	}
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valueElems)+len(ttlElems))
+	elems = append(elems, deleteElems...)
+	elems = append(elems, valueElems...)
+	elems = append(elems, ttlElems...)
+	return elems, nil
+}
+
+func (c *luaScriptContext) valueCommitElems(key string, finalType redisValueType) ([]*kv.Elem[kv.OP], error) {
+	switch finalType {
+	case redisTypeNone:
+		return nil, nil
+	case redisTypeString:
+		st := c.strings[key]
+		return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte(key), Value: append([]byte(nil), st.value...)}}, nil
+	case redisTypeList:
+		return c.listCommitElems(key)
+	case redisTypeHash:
+		return c.hashCommitElems(key)
+	case redisTypeSet:
+		return c.setCommitElems(key)
+	case redisTypeZSet:
+		return c.zsetCommitElems(key)
+	case redisTypeStream:
+		return c.streamCommitElems(key)
+	default:
+		return nil, errors.New("ERR unsupported final redis type")
+	}
+}
+
+func (c *luaScriptContext) listCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st := c.lists[key]
+	values := make([][]byte, 0, len(st.values))
+	for _, value := range st.values {
+		values = append(values, []byte(value))
+	}
+
+	listElems, _, err := c.server.buildRPushOps(store.ListMeta{}, []byte(key), values)
+	if err != nil {
+		return nil, err
+	}
+	return listElems, nil
+}
+
+func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st := c.hashes[key]
+	payload, err := marshalHashValue(st.value)
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisHashKey([]byte(key)), Value: payload}}, nil
+}
+
+func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st := c.sets[key]
+	payload, err := marshalSetValue(redisSetValue{Members: sortedSetMembers(st.members)})
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisSetKey([]byte(key)), Value: payload}}, nil
+}
+
+func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st := c.zsets[key]
+	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisZSetKey([]byte(key)), Value: payload}}, nil
+}
+
+func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st := c.streams[key]
+	payload, err := marshalStreamValue(st.value)
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStreamKey([]byte(key)), Value: payload}}, nil
+}
+
+func (c *luaScriptContext) ttlCommitElems(key string, finalType redisValueType) ([]*kv.Elem[kv.OP], error) {
+	if finalType == redisTypeNone {
+		return nil, nil
+	}
+
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	if ttl == nil {
+		return nil, nil
+	}
+
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)}}, nil
+}
+
 func (c *luaScriptContext) finalType(key []byte) (redisValueType, error) {
-	k := string(key)
-	if st, ok := c.strings[k]; ok && st.loaded && st.exists {
-		return redisTypeString, nil
-	}
-	if st, ok := c.lists[k]; ok && st.loaded && st.exists {
-		return redisTypeList, nil
-	}
-	if st, ok := c.hashes[k]; ok && st.loaded && st.exists {
-		return redisTypeHash, nil
-	}
-	if st, ok := c.sets[k]; ok && st.loaded && st.exists {
-		return redisTypeSet, nil
-	}
-	if st, ok := c.zsets[k]; ok && st.loaded && st.exists {
-		return redisTypeZSet, nil
-	}
-	if st, ok := c.streams[k]; ok && st.loaded && st.exists {
-		return redisTypeStream, nil
-	}
-	if c.deleted[k] {
-		return redisTypeNone, nil
+	if typ, ok := c.cachedType(key); ok {
+		return typ, nil
 	}
 	return c.server.keyTypeAt(context.Background(), key, c.startTS)
 }
