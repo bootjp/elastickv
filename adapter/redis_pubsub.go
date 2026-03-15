@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	respArrayMessage     = 3 // RESP array length for pub/sub message/subscribe/unsubscribe
-	respArrayPong        = 2 // RESP array length for PING reply
-	pubsubMinCmdArgs     = 2 // minimum args for SUBSCRIBE/UNSUBSCRIBE (command + channel)
+	respArrayMessage = 3 // RESP array length for pub/sub message/subscribe/unsubscribe
+	respArrayPong    = 2 // RESP array length for PING reply
+	pubsubMinCmdArgs = 2 // minimum args for SUBSCRIBE/UNSUBSCRIBE (command + channel)
 )
 
 // redisPubSub is a self-contained PubSub implementation that replaces
