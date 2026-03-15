@@ -312,3 +312,87 @@ func TestRedis_MisskeyFeaturedRankingTransaction(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, ttl, time.Duration(0))
 }
+
+func TestRedis_MisskeySETEX(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	// SETEX key seconds value
+	res := rdb.Do(ctx, "SETEX", "webauthn:challenge:u1", "120", "challenge-data")
+	require.NoError(t, res.Err())
+	require.Equal(t, "OK", res.Val())
+
+	// Verify value was stored
+	val, err := rdb.Get(ctx, "webauthn:challenge:u1").Result()
+	require.NoError(t, err)
+	require.Equal(t, "challenge-data", val)
+
+	// Verify TTL was set
+	ttl, err := rdb.TTL(ctx, "webauthn:challenge:u1").Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 120*time.Second)
+
+	// SETEX overwrites existing value
+	res = rdb.Do(ctx, "SETEX", "webauthn:challenge:u1", "60", "new-challenge")
+	require.NoError(t, res.Err())
+	val, err = rdb.Get(ctx, "webauthn:challenge:u1").Result()
+	require.NoError(t, err)
+	require.Equal(t, "new-challenge", val)
+}
+
+func TestRedis_MisskeyGETDEL(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	// Set a value, then GETDEL
+	require.NoError(t, rdb.Set(ctx, "webauthn:reg:u1", "reg-data", 0).Err())
+
+	val := rdb.Do(ctx, "GETDEL", "webauthn:reg:u1")
+	require.NoError(t, val.Err())
+	require.Equal(t, "reg-data", val.Val())
+
+	// Key should be deleted now
+	require.ErrorIs(t, rdb.Get(ctx, "webauthn:reg:u1").Err(), redis.Nil)
+
+	// GETDEL on non-existent key returns nil
+	val = rdb.Do(ctx, "GETDEL", "nonexistent")
+	require.ErrorIs(t, val.Err(), redis.Nil)
+}
+
+func TestRedis_MisskeySETNX(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	// SETNX on non-existent key succeeds (returns 1)
+	res := rdb.Do(ctx, "SETNX", "lock:distributed:1", "owner1")
+	require.NoError(t, res.Err())
+	require.Equal(t, int64(1), res.Val())
+
+	// Verify value was stored
+	val, err := rdb.Get(ctx, "lock:distributed:1").Result()
+	require.NoError(t, err)
+	require.Equal(t, "owner1", val)
+
+	// SETNX on existing key fails (returns 0)
+	res = rdb.Do(ctx, "SETNX", "lock:distributed:1", "owner2")
+	require.NoError(t, res.Err())
+	require.Equal(t, int64(0), res.Val())
+
+	// Value should not have changed
+	val, err = rdb.Get(ctx, "lock:distributed:1").Result()
+	require.NoError(t, err)
+	require.Equal(t, "owner1", val)
+}

@@ -71,6 +71,82 @@ func (r *RedisServer) info(conn redcon.Conn, _ redcon.Command) {
 	}, "\r\n"))
 }
 
+// SETEX key seconds value — equivalent to SET key value EX seconds
+func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
+	seconds, err := strconv.ParseInt(string(cmd.Args[2]), 10, 64)
+	if err != nil || seconds <= 0 {
+		conn.WriteError("ERR invalid expire time in 'setex' command")
+		return
+	}
+	ttl := time.Now().Add(time.Duration(seconds) * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	if err := r.saveString(ctx, cmd.Args[1], cmd.Args[3], &ttl); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	conn.WriteString("OK")
+}
+
+// GETDEL key — get the value and delete the key atomically
+func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
+	key := cmd.Args[1]
+	readTS := r.readTS()
+
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if typ == redisTypeNone {
+		conn.WriteNull()
+		return
+	}
+	if typ != redisTypeString {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+
+	v, err := r.readValueAt(key, readTS)
+	if err != nil {
+		conn.WriteNull()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	if err := r.retryRedisWrite(ctx, func() error {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, r.readTS())
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, elems)
+	}); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	conn.WriteBulk(v)
+}
+
+// SETNX key value — set if not exists, returns 1 on success, 0 on failure
+func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	opts := redisSetOptions{missingCond: true}
+	result, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[2], opts)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if result.wroteNull {
+		conn.WriteInt(0)
+		return
+	}
+	conn.WriteInt(1)
+}
+
 func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 	sub := strings.ToUpper(string(cmd.Args[1]))
 	switch sub {

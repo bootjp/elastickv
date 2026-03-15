@@ -40,6 +40,7 @@ const (
 	cmdFlushAll         = "FLUSHALL"
 	cmdFlushDB          = "FLUSHDB"
 	cmdGet              = "GET"
+	cmdGetDel           = "GETDEL"
 	cmdHDel             = "HDEL"
 	cmdHExists          = "HEXISTS"
 	cmdHGet             = "HGET"
@@ -79,6 +80,8 @@ const (
 	cmdScan             = "SCAN"
 	cmdSelect           = "SELECT"
 	cmdSet              = "SET"
+	cmdSetEx            = "SETEX"
+	cmdSetNX            = "SETNX"
 	cmdSIsMember        = "SISMEMBER"
 	cmdSMembers         = "SMEMBERS"
 	cmdSRem             = "SREM"
@@ -166,6 +169,7 @@ var argsLen = map[string]int{
 	cmdFlushAll:         1,
 	cmdFlushDB:          1,
 	cmdGet:              2,
+	cmdGetDel:           2,
 	cmdHDel:             -3,
 	cmdHExists:          3,
 	cmdHGet:             3,
@@ -205,6 +209,8 @@ var argsLen = map[string]int{
 	cmdScan:             -2,
 	cmdSelect:           2,
 	cmdSet:              -3,
+	cmdSetEx:            4,
+	cmdSetNX:            3,
 	cmdSIsMember:        3,
 	cmdSMembers:         2,
 	cmdSRem:             -3,
@@ -311,6 +317,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		cmdFlushAll:         r.flushall,
 		cmdFlushDB:          r.flushdb,
 		cmdGet:              r.get,
+		cmdGetDel:           r.getdel,
 		cmdHDel:             r.hdel,
 		cmdHExists:          r.hexists,
 		cmdHGet:             r.hget,
@@ -350,6 +357,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		cmdScan:             r.scan,
 		cmdSelect:           r.selectDB,
 		cmdSet:              r.set,
+		cmdSetEx:            r.setex,
+		cmdSetNX:            r.setnx,
 		cmdSIsMember:        r.sismember,
 		cmdSMembers:         r.smembers,
 		cmdSRem:             r.srem,

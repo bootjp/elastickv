@@ -146,6 +146,9 @@ var luaCommandHandlers = map[string]luaCommandHandler{
 	cmdZRemRangeByScore: (*luaScriptContext).cmdZRemRangeByScore,
 	cmdXAdd:             (*luaScriptContext).cmdXAdd,
 	cmdXTrim:            (*luaScriptContext).cmdXTrim,
+	cmdSetEx:            (*luaScriptContext).cmdSetEx,
+	cmdGetDel:           (*luaScriptContext).cmdGetDel,
+	cmdSetNX:            (*luaScriptContext).cmdSetNX,
 }
 
 var luaRenameHandlers = map[redisValueType]luaRenameHandler{
@@ -735,6 +738,58 @@ func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 	c.markStringValue(key, value)
 	c.applyLuaSetTTL(key, prevTTL, options)
 	return luaStatusReply("OK"), nil
+}
+
+// SETEX key seconds value
+func (c *luaScriptContext) cmdSetEx(args []string) (luaReply, error) {
+	key := []byte(args[0])
+	seconds, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || seconds <= 0 {
+		return luaReply{}, errors.New("ERR invalid expire time in 'setex' command")
+	}
+	value := []byte(args[2])
+	ttl := time.Now().Add(time.Duration(seconds) * time.Second)
+
+	c.deleteLogical(key)
+	c.markStringValue(key, value)
+	c.setTTLValue(key, &ttl)
+	return luaStatusReply("OK"), nil
+}
+
+// GETDEL key
+func (c *luaScriptContext) cmdGetDel(args []string) (luaReply, error) {
+	key := []byte(args[0])
+	st, err := c.stringState(key)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return luaNilReply(), nil
+		}
+		return luaReply{}, err
+	}
+	if !st.exists {
+		return luaNilReply(), nil
+	}
+	val := string(st.value)
+	c.deleteLogical(key)
+	return luaStringReply(val), nil
+}
+
+// SETNX key value — returns 1 if set, 0 if already exists
+func (c *luaScriptContext) cmdSetNX(args []string) (luaReply, error) {
+	key := []byte(args[0])
+	value := []byte(args[1])
+
+	exists, _, err := c.loadLuaSetContext(key)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if exists {
+		return luaIntReply(0), nil
+	}
+	c.deleteLogical(key)
+	c.markStringValue(key, value)
+	c.clearTTL(key)
+	return luaIntReply(1), nil
 }
 
 func (c *luaScriptContext) loadLuaSetContext(key []byte) (bool, *time.Time, error) {

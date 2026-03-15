@@ -512,7 +512,7 @@ func goToLuaValue(state *lua.LState, value any) lua.LValue {
 func goToLuaScalar(value any) (lua.LValue, bool) {
 	switch x := value.(type) {
 	case nil:
-		return lua.LFalse, true
+		return lua.LNil, true
 	case bool:
 		if x {
 			return lua.LTrue, true
@@ -585,7 +585,11 @@ func goToLuaFloatNumber(value any) (lua.LValue, bool) {
 func goSliceToLuaValue(state *lua.LState, values []any) lua.LValue {
 	tbl := state.NewTable()
 	for i, item := range values {
-		tbl.RawSetInt(i+luaTypeArrayBase, goToLuaValue(state, item))
+		v := goToLuaValue(state, item)
+		if v == lua.LNil {
+			continue // nil entries are not stored in Lua tables (matching Redis cmsgpack)
+		}
+		tbl.RawSetInt(i+luaTypeArrayBase, v)
 	}
 	return tbl
 }
@@ -598,7 +602,11 @@ func goMapToLuaValue(state *lua.LState, value map[string]any) lua.LValue {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		tbl.RawSetString(key, goToLuaValue(state, value[key]))
+		v := goToLuaValue(state, value[key])
+		if v == lua.LNil {
+			continue
+		}
+		tbl.RawSetString(key, v)
 	}
 	return tbl
 }
