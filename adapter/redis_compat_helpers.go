@@ -137,13 +137,6 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 	return errors.WithStack(err)
 }
 
-func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload []byte) error {
-	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: storageKey, Value: payload},
-	}
-	return r.dispatchElems(ctx, false, 0, elems)
-}
-
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: key, Value: bytes.Clone(value)},
@@ -154,38 +147,6 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	}
 	return r.dispatchElems(ctx, false, 0, elems)
-}
-
-func (r *RedisServer) saveHash(ctx context.Context, key []byte, value redisHashValue) error {
-	payload, err := marshalHashValue(value)
-	if err != nil {
-		return err
-	}
-	return r.saveBytes(ctx, redisHashKey(key), payload)
-}
-
-func (r *RedisServer) saveSet(ctx context.Context, kind string, key []byte, value redisSetValue) error {
-	payload, err := marshalSetValue(value)
-	if err != nil {
-		return err
-	}
-	return r.saveBytes(ctx, redisExactSetStorageKey(kind, key), payload)
-}
-
-func (r *RedisServer) saveZSet(ctx context.Context, key []byte, value redisZSetValue) error {
-	payload, err := marshalZSetValue(value)
-	if err != nil {
-		return err
-	}
-	return r.saveBytes(ctx, redisZSetKey(key), payload)
-}
-
-func (r *RedisServer) saveStream(ctx context.Context, key []byte, value redisStreamValue) error {
-	payload, err := marshalStreamValue(value)
-	if err != nil {
-		return err
-	}
-	return r.saveBytes(ctx, redisStreamKey(key), payload)
 }
 
 func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -246,15 +207,14 @@ func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint6
 	return r.fetchListRange(ctx, key, meta, 0, meta.Len-1, readTS)
 }
 
-func (r *RedisServer) rewriteList(ctx context.Context, key []byte, values []string) error {
-	readTS := r.readTS()
+func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uint64, values []string) error {
 	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
 
 	if len(values) == 0 {
-		return r.dispatchElems(ctx, true, 0, elems)
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}
 
 	rawValues := make([][]byte, 0, len(values))
@@ -266,7 +226,7 @@ func (r *RedisServer) rewriteList(ctx context.Context, key []byte, values []stri
 		return err
 	}
 	elems = append(elems, ops...)
-	return r.dispatchElems(ctx, true, 0, elems)
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {

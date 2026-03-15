@@ -181,6 +181,10 @@ func (t *TransactionManager) flushRawPending() {
 		batch := t.takeRawBatch()
 		if len(batch) == 0 {
 			t.mu.Lock()
+			if len(t.rawPending) > 0 {
+				t.mu.Unlock()
+				continue
+			}
 			t.rawFlushing = false
 			t.mu.Unlock()
 			return

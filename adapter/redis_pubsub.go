@@ -46,10 +46,10 @@ func newRedisPubSub() *redisPubSub {
 // commands on the detached connection.
 func (ps *redisPubSub) Subscribe(conn redcon.Conn, channel string) {
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
 	sc, isNew := ps.getOrCreate(conn)
 	ps.addEntry(sc, channel)
+	ps.mu.Unlock()
+
 	ps.writeSubscribeReply(sc, channel)
 
 	if isNew {
@@ -174,39 +174,72 @@ func (sc *pubsubConn) handleSubscribe(ps *redisPubSub, args [][]byte) {
 		sc.mu.Unlock()
 		return
 	}
+	channels := make([]string, 0, len(args)-1)
+	ps.mu.Lock()
 	for i := 1; i < len(args); i++ {
-		ps.Subscribe(sc.dconn, string(args[i]))
+		ch := string(args[i])
+		ps.addEntry(sc, ch)
+		channels = append(channels, ch)
+	}
+	ps.mu.Unlock()
+
+	for _, ch := range channels {
+		ps.writeSubscribeReply(sc, ch)
 	}
 }
 
 func (sc *pubsubConn) handleUnsubscribe(ps *redisPubSub, args [][]byte) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
 	if len(args) < pubsubMinCmdArgs {
+		// Unsubscribe all: collect channels, remove entries, capture remaining
+		// counts — all under ps.mu — then release ps.mu and write replies.
+		type unsubInfo struct {
+			channel   string
+			remaining int
+		}
+		ps.mu.Lock()
 		channels := make([]string, 0, len(sc.chans))
 		for ch := range sc.chans {
 			channels = append(channels, ch)
 		}
+		replies := make([]unsubInfo, 0, len(channels))
 		for _, ch := range channels {
 			ps.removeEntry(sc, ch)
+			replies = append(replies, unsubInfo{channel: ch, remaining: len(sc.chans)})
 		}
+		ps.mu.Unlock()
+
 		sc.mu.Lock()
-		for _, ch := range channels {
-			ps.writeUnsubscribeReply(sc, ch, len(sc.chans))
-		}
-		if len(channels) == 0 {
+		if len(replies) == 0 {
 			ps.writeUnsubscribeReply(sc, "", 0)
+		} else {
+			for _, r := range replies {
+				ps.writeUnsubscribeReply(sc, r.channel, r.remaining)
+			}
 		}
 		sc.mu.Unlock()
 		return
 	}
+
+	// Unsubscribe specific channels: remove entries and capture remaining
+	// counts under ps.mu, then release ps.mu and write replies.
+	type unsubInfo struct {
+		channel   string
+		remaining int
+	}
+	replies := make([]unsubInfo, 0, len(args)-1)
+	ps.mu.Lock()
 	for i := 1; i < len(args); i++ {
 		ch := string(args[i])
 		ps.removeEntry(sc, ch)
-		sc.mu.Lock()
-		ps.writeUnsubscribeReply(sc, ch, len(sc.chans))
-		sc.mu.Unlock()
+		replies = append(replies, unsubInfo{channel: ch, remaining: len(sc.chans)})
 	}
+	ps.mu.Unlock()
+
+	sc.mu.Lock()
+	for _, r := range replies {
+		ps.writeUnsubscribeReply(sc, r.channel, r.remaining)
+	}
+	sc.mu.Unlock()
 }
 
 func (sc *pubsubConn) handlePing(args [][]byte) {

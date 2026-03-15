@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"math/rand/v2"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -13,6 +14,7 @@ const (
 	redisTxnRetryInitialBackoff = 1 * time.Millisecond
 	redisTxnRetryMaxBackoff     = 10 * time.Millisecond
 	redisTxnRetryBackoffFactor  = 2
+	redisTxnRetryMaxAttempts    = 50
 )
 
 func isRetryableRedisTxnErr(err error) bool {
@@ -20,7 +22,9 @@ func isRetryableRedisTxnErr(err error) bool {
 }
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
+	half := delay / redisTxnRetryBackoffFactor
+	jittered := delay + time.Duration(rand.Int64N(int64(half))) //nolint:gosec // jitter for retry backoff, not security-sensitive
+	timer := time.NewTimer(jittered)
 	defer timer.Stop()
 
 	select {
@@ -41,13 +45,16 @@ func nextRedisRetryBackoff(current time.Duration) time.Duration {
 
 func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) error {
 	backoff := redisTxnRetryInitialBackoff
-	for {
+	for attempt := 0; ; attempt++ {
 		err := fn()
 		if err == nil {
 			return nil
 		}
 		if !isRetryableRedisTxnErr(err) {
 			return err
+		}
+		if attempt >= redisTxnRetryMaxAttempts {
+			return errors.Wrap(err, "redis txn retry limit exceeded")
 		}
 		if !waitRedisRetryBackoff(ctx, backoff) {
 			return err

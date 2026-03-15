@@ -428,10 +428,12 @@ func (r *RedisServer) Run() error {
 				return
 			}
 
-			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-			f(conn, cmd)
 			if r.traceCommands {
+				traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
+				f(conn, cmd)
 				r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+			} else {
+				f(conn, cmd)
 			}
 		},
 		func(conn redcon.Conn) bool {
@@ -591,43 +593,48 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 	return state, nil
 }
 
-func (r *RedisServer) replaceWithString(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
-	if typ == redisTypeNone || typ == redisTypeString {
-		return r.saveString(ctx, key, value, ttl)
+func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
+	var elems []*kv.Elem[kv.OP]
+	if typ != redisTypeNone && typ != redisTypeString {
+		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		elems = append(elems, delElems...)
 	}
-
-	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-	if err != nil {
-		return err
-	}
-
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: bytes.Clone(value)})
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	} else {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	return r.dispatchElems(ctx, true, 0, elems)
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
-	readTS := r.readTS()
-	state, err := r.loadRedisSetState(key, readTS, opts.returnOld)
-	if err != nil {
-		return redisSetExecution{}, err
-	}
+	var result redisSetExecution
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		state, err := r.loadRedisSetState(key, readTS, opts.returnOld)
+		if err != nil {
+			return err
+		}
 
-	exists := state.typ != redisTypeNone
-	if !opts.allows(exists) {
-		return redisSetExecution{wroteNull: true}, nil
-	}
-	if opts.returnOld && exists && state.typ != redisTypeString {
-		return redisSetExecution{}, wrongTypeError()
-	}
-	if err := r.replaceWithString(ctx, key, value, opts.ttl, state.typ, readTS); err != nil {
-		return redisSetExecution{}, err
-	}
-	return redisSetExecution{state: state, wroteOldBulk: opts.returnOld}, nil
+		exists := state.typ != redisTypeNone
+		if !opts.allows(exists) {
+			result = redisSetExecution{wroteNull: true}
+			return nil
+		}
+		if opts.returnOld && exists && state.typ != redisTypeString {
+			return wrongTypeError()
+		}
+		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.typ, readTS); err != nil {
+			return err
+		}
+		result = redisSetExecution{state: state, wroteOldBulk: opts.returnOld}
+		return nil
+	})
+	return result, err
 }
 
 func (r *RedisServer) Stop() {
@@ -749,13 +756,17 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
-	typ, err := r.keyType(context.Background(), cmd.Args[1])
+	key := cmd.Args[1]
+	readTS := r.readTS()
+	isLeader := r.coordinator.IsLeaderForKey(key)
+
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	if typ == redisTypeNone {
-		conn.WriteNull()
+		r.getHandleNone(conn, key, isLeader)
 		return
 	}
 	if typ != redisTypeString {
@@ -763,24 +774,41 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	key := cmd.Args[1]
-	readTS := r.readTS()
 	// When proxying reads to the leader, let the leader choose a safe snapshot.
 	// Our local store watermark may lag behind a just-committed transaction.
-	if !r.coordinator.IsLeaderForKey(key) {
-		readTS = 0
+	valueTS := readTS
+	if !isLeader {
+		valueTS = 0
 	}
-	v, err := r.readValueAt(key, readTS)
+	v, err := r.readValueAt(key, valueTS)
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrKeyNotFound):
+		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
-		default:
+		} else {
 			conn.WriteError(err.Error())
 		}
 		return
 	}
 
+	conn.WriteBulk(v)
+}
+
+// getHandleNone handles GET when the local type check returns none.
+// On followers the local MVCC may lag, so we proxy to the leader.
+func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool) {
+	if isLeader {
+		conn.WriteNull()
+		return
+	}
+	v, err := r.tryLeaderGetAt(key, 0)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			conn.WriteNull()
+		} else {
+			conn.WriteError(err.Error())
+		}
+		return
+	}
 	conn.WriteBulk(v)
 }
 
@@ -826,6 +854,15 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		}
 		if ok {
 			count++
+		} else if !r.coordinator.IsLeaderForKey(key) {
+			// Local MVCC may be stale on a follower; proxy to the leader.
+			_, err := r.tryLeaderGetAt(key, 0)
+			if err == nil {
+				count++
+			} else if !errors.Is(err, store.ErrKeyNotFound) {
+				conn.WriteError(err.Error())
+				return
+			}
 		}
 	}
 	conn.WriteInt(count)
@@ -899,28 +936,32 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 		return nil, err
 	}
 
-	// User-key scans do not naturally include internal data namespaces, so scan
-	// those separately and map them back to logical user keys.
-	metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
-	if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
-		return nil, err
-	}
-
-	itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
-	if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
-		return nil, err
-	}
-
-	for _, prefix := range []string{
-		redisHashPrefix,
-		redisSetPrefix,
-		redisHLLPrefix,
-		redisZSetPrefix,
-		redisStreamPrefix,
-	} {
-		internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
-		if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
+	// When the pattern is bounded (start != nil), user-key scans do not
+	// naturally include internal data namespaces, so scan those separately
+	// and map them back to logical user keys.  For unbounded patterns
+	// (e.g. "*"), the full-keyspace scan already covers everything.
+	if start != nil {
+		metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
+		if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
 			return nil, err
+		}
+
+		itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
+		if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
+			return nil, err
+		}
+
+		for _, prefix := range []string{
+			redisHashPrefix,
+			redisSetPrefix,
+			redisHLLPrefix,
+			redisZSetPrefix,
+			redisStreamPrefix,
+		} {
+			internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
+			if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1446,17 +1487,33 @@ func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisR
 }
 
 func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
+	// Mark the list for deletion.
 	st, err := t.loadListState(key)
 	if err != nil {
 		return redisResult{}, err
 	}
 	stageListDelete(st)
+	// Mark the string/main value for deletion.
 	tv, err := t.load(key)
 	if err != nil {
 		return redisResult{}, err
 	}
 	tv.deleted = true
 	tv.dirty = true
+	// Mark TTL for deletion.
+	ttlState, err := t.loadTTLState(key)
+	if err != nil {
+		return redisResult{}, err
+	}
+	ttlState.value = nil
+	ttlState.dirty = true
+	// Mark zset for deletion.
+	zs, err := t.loadZSetState(key)
+	if err != nil {
+		return redisResult{}, err
+	}
+	zs.members = nil
+	zs.dirty = true
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 
@@ -1795,10 +1852,6 @@ func clampRange(start, end, length int) (int, int) {
 	return start, end
 }
 
-func (r *RedisServer) loadListMeta(ctx context.Context, key []byte) (store.ListMeta, bool, error) {
-	return r.loadListMetaAt(ctx, key, r.readTS())
-}
-
 func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
 	val, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
@@ -1845,7 +1898,8 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 }
 
 func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
-	meta, _, err := r.loadListMeta(ctx, key)
+	readTS := r.readTS()
+	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
@@ -1858,11 +1912,7 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 		return newMeta.Len, nil
 	}
 
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: ops}
-	if _, err := r.coordinator.Dispatch(ctx, group); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return newMeta.Len, nil
+	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
 }
 
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
