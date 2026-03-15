@@ -2215,7 +2215,7 @@ func (c *luaScriptContext) commit() error {
 	}
 	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	return c.server.dispatchElems(dispatchCtx, true, elems)
+	return c.server.dispatchElems(dispatchCtx, true, c.startTS, elems)
 }
 
 func (c *luaScriptContext) commitElemsForKey(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {

@@ -243,9 +243,7 @@ type RedisServer struct {
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
-	pubsub          redcon.PubSub
-	pubsubMu        sync.RWMutex
-	pubsubChannels  map[string]int
+	pubsub          *redisPubSub
 	scriptMu        sync.RWMutex
 	scriptCache     map[string]string
 	traceCommands   bool
@@ -260,9 +258,8 @@ type RedisServer struct {
 }
 
 type connState struct {
-	inTxn         bool
-	queue         []redcon.Command
-	subscriptions map[string]struct{}
+	inTxn bool
+	queue []redcon.Command
 }
 
 type resultType int
@@ -297,7 +294,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		redisAddr:       redisAddr,
 		relay:           relay,
 		leaderRedis:     leaderRedis,
-		pubsubChannels:  map[string]int{},
+		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 	}
@@ -433,7 +430,9 @@ func (r *RedisServer) Run() error {
 
 			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
 			f(conn, cmd)
-			r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+			if r.traceCommands {
+				r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+			}
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
@@ -441,9 +440,8 @@ func (r *RedisServer) Run() error {
 			return true
 		},
 		func(conn redcon.Conn, err error) {
-			// This is called when the connection has been closed
-			// log.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
-			r.cleanupConnSubscriptions(conn)
+			// This is called when the connection has been closed.
+			// PubSub connections clean up their own subscriptions via bgrunner.
 		})
 
 	return errors.WithStack(err)
@@ -609,7 +607,7 @@ func (r *RedisServer) replaceWithString(ctx context.Context, key, value []byte, 
 	} else {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	return r.dispatchElems(ctx, true, elems)
+	return r.dispatchElems(ctx, true, 0, elems)
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
@@ -630,40 +628,6 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 		return redisSetExecution{}, err
 	}
 	return redisSetExecution{state: state, wroteOldBulk: opts.returnOld}, nil
-}
-
-func (r *RedisServer) trackSubscription(conn redcon.Conn, channel string) {
-	state := getConnState(conn)
-	if state.subscriptions == nil {
-		state.subscriptions = map[string]struct{}{}
-	}
-	if _, ok := state.subscriptions[channel]; ok {
-		return
-	}
-	state.subscriptions[channel] = struct{}{}
-
-	r.pubsubMu.Lock()
-	defer r.pubsubMu.Unlock()
-	r.pubsubChannels[channel]++
-}
-
-func (r *RedisServer) cleanupConnSubscriptions(conn redcon.Conn) {
-	ctx := conn.Context()
-	state, ok := ctx.(*connState)
-	if !ok || len(state.subscriptions) == 0 {
-		return
-	}
-
-	r.pubsubMu.Lock()
-	defer r.pubsubMu.Unlock()
-	for channel := range state.subscriptions {
-		if n := r.pubsubChannels[channel]; n <= 1 {
-			delete(r.pubsubChannels, channel)
-		} else {
-			r.pubsubChannels[channel] = n - 1
-		}
-	}
-	state.subscriptions = nil
 }
 
 func (r *RedisServer) Stop() {
@@ -838,7 +802,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 			}
 			elems = append(elems, keyElems...)
 		}
-		if err := r.dispatchElems(ctx, true, elems); err != nil {
+		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
 			return err
 		}
 		removed = nextRemoved
@@ -1471,9 +1435,28 @@ func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisR
 		return redisResult{typ: resultInt, integer: 0}, nil
 	}
 
+	if ttl <= 0 {
+		return t.stageKeyDeletion(cmd.Args[1])
+	}
+
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
 	state.value = &expireAt
 	state.dirty = true
+	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
+func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
+	st, err := t.loadListState(key)
+	if err != nil {
+		return redisResult{}, err
+	}
+	stageListDelete(st)
+	tv, err := t.load(key)
+	if err != nil {
+		return redisResult{}, err
+	}
+	tv.deleted = true
+	tv.dirty = true
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 

@@ -5,16 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/bootjp/elastickv/kv"
-	"github.com/tidwall/btree"
 	"github.com/tidwall/redcon"
 )
 
@@ -117,11 +113,12 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if err := r.retryRedisWrite(ctx, func() error {
-		elems, _, err := r.deleteLogicalKeyElems(ctx, key, r.readTS())
+		readTS := r.readTS()
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, elems)
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -246,7 +243,7 @@ func (r *RedisServer) deleteLogicalRedisStorage(ctx context.Context, key []byte,
 	if err != nil {
 		return err
 	}
-	return r.dispatchElems(ctx, true, filterElemsForKey(elems, storageKeys...))
+	return r.dispatchElems(ctx, true, 0, filterElemsForKey(elems, storageKeys...))
 }
 
 func parseExpireTTL(raw []byte) (int64, error) {
@@ -283,7 +280,7 @@ func (r *RedisServer) deleteExpiredKey(ctx context.Context, key []byte, readTS u
 	if err != nil {
 		return 0, err
 	}
-	if err := r.dispatchElems(ctx, true, elems); err != nil {
+	if err := r.dispatchElems(ctx, true, 0, elems); err != nil {
 		return 0, err
 	}
 	if existed {
@@ -329,7 +326,7 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 	}
 
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
-	if err := r.dispatchElems(ctx, false, []*kv.Elem[kv.OP]{
+	if err := r.dispatchElems(ctx, false, 0, []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(expireAt)},
 	}); err != nil {
 		conn.WriteError(err.Error())
@@ -410,11 +407,7 @@ func (r *RedisServer) publish(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) subscribe(conn redcon.Conn, cmd redcon.Command) {
 	for _, channel := range cmd.Args[1:] {
-		r.trackSubscription(conn, string(channel))
 		r.pubsub.Subscribe(conn, string(channel))
-		if r.traceCommands {
-			log.Printf("redis trace subscribe remote=%s channel=%q snapshot=%v", conn.RemoteAddr(), string(channel), r.pubsubChannelCounts())
-		}
 	}
 }
 
@@ -487,7 +480,7 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		if len(elems) == 0 {
 			return nil
 		}
-		return r.dispatchElems(ctx, true, elems)
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -543,34 +536,7 @@ func (r *RedisServer) writePubSubNumSub(conn redcon.Conn, args [][]byte) {
 }
 
 func (r *RedisServer) pubsubChannelCounts() map[string]int {
-	ps := reflect.ValueOf(&r.pubsub).Elem()
-	muField := ps.FieldByName("mu")
-	mu := (*sync.RWMutex)(unsafe.Pointer(muField.UnsafeAddr()))
-	mu.RLock()
-	defer mu.RUnlock()
-
-	chansField := ps.FieldByName("chans")
-	if chansField.IsNil() {
-		return map[string]int{}
-	}
-
-	treeAny := reflect.NewAt(chansField.Type(), unsafe.Pointer(chansField.UnsafeAddr())).Elem().Interface()
-	tree, ok := treeAny.(*btree.BTree)
-	if !ok || tree == nil {
-		return map[string]int{}
-	}
-	counts := map[string]int{}
-	tree.Walk(func(items []interface{}) {
-		for _, item := range items {
-			entry := reflect.ValueOf(item).Elem()
-			if entry.FieldByName("pattern").Bool() {
-				continue
-			}
-			channel := entry.FieldByName("channel").String()
-			counts[channel]++
-		}
-	})
-	return counts
+	return r.pubsub.ChannelCounts()
 }
 
 func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {
@@ -875,28 +841,32 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		return 0, errors.New("ERR wrong number of arguments for hash command")
 	}
 
-	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
-	if err != nil {
-		return 0, err
-	}
-	if typ != redisTypeNone && typ != redisTypeHash {
-		return 0, wrongTypeError()
-	}
-
-	value, err := r.loadHashAt(context.Background(), key, readTS)
-	if err != nil {
-		return 0, err
-	}
-
-	added := applyHashPairs(value, args)
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	if err := r.saveHash(ctx, key, value); err != nil {
-		return 0, err
-	}
-	return added, nil
+	var added int
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeNone && typ != redisTypeHash {
+			return wrongTypeError()
+		}
+		value, err := r.loadHashAt(context.Background(), key, readTS)
+		if err != nil {
+			return err
+		}
+		added = applyHashPairs(value, args)
+		payload, err := marshalHashValue(value)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: redisHashKey(key), Value: payload},
+		})
+	})
+	return added, err
 }
 
 func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
@@ -1070,37 +1040,40 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(err.Error())
 		return
 	}
-	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	if typ != redisTypeNone && typ != redisTypeHash {
-		conn.WriteError(wrongTypeMessage)
-		return
-	}
-
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	current := int64(0)
-	if raw, ok := value[string(cmd.Args[2])]; ok {
-		current, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			conn.WriteError("ERR hash value is not an integer")
-			return
-		}
-	}
-	current += increment
-	value[string(cmd.Args[2])] = strconv.FormatInt(current, 10)
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	if err := r.saveHash(ctx, cmd.Args[1], value); err != nil {
+	var current int64
+	if err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeNone && typ != redisTypeHash {
+			return wrongTypeError()
+		}
+		value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+		if err != nil {
+			return err
+		}
+		current = 0
+		if raw, ok := value[string(cmd.Args[2])]; ok {
+			current, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return errors.New("ERR hash value is not an integer")
+			}
+		}
+		current += increment
+		value[string(cmd.Args[2])] = strconv.FormatInt(current, 10)
+		payload, err := marshalHashValue(value)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: redisHashKey(cmd.Args[1]), Value: payload},
+		})
+	}); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -1136,7 +1109,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	if err := r.dispatchElems(ctx, false, []*kv.Elem[kv.OP]{
+	if err := r.dispatchElems(ctx, false, 0, []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: cmd.Args[1], Value: []byte(strconv.FormatInt(current, 10))},
 		{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])},
 	}); err != nil {
@@ -1460,33 +1433,56 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
-	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
-	if err != nil {
-		return nil, err
-	}
-	if typ == redisTypeNone {
-		return nil, nil
-	}
-	if typ != redisTypeZSet {
-		return nil, wrongTypeError()
-	}
-
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
-	if err != nil {
-		return nil, err
-	}
-	if len(value.Entries) == 0 {
-		return nil, nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-	if err := r.persistZSetEntries(ctx, key, readTS, remaining); err != nil {
-		return nil, err
+	var result *bzpopminResult
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		if err != nil {
+			return err
+		}
+		if typ == redisTypeNone {
+			result = nil
+			return nil
+		}
+		if typ != redisTypeZSet {
+			return wrongTypeError()
+		}
+		value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+		if err != nil {
+			return err
+		}
+		if len(value.Entries) == 0 {
+			result = nil
+			return nil
+		}
+		popped := value.Entries[0]
+		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
+		if err := r.persistBZPopMinResult(ctx, key, readTS, remaining); err != nil {
+			return err
+		}
+		result = &bzpopminResult{key: key, entry: popped}
+		return nil
+	})
+	return result, err
+}
+
+func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, remaining []redisZSetEntry) error {
+	if len(remaining) == 0 {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	return &bzpopminResult{key: key, entry: value.Entries[0]}, nil
+	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
+	if err != nil {
+		return err
+	}
+	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+	})
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
@@ -1868,7 +1864,7 @@ func parseXReadOptions(args [][]byte) (xreadOptions, error) {
 
 func parseXReadOption(opts *xreadOptions, args [][]byte, i int) (int, bool, error) {
 	switch strings.ToUpper(string(args[i])) {
-	case dynamoSelectCount:
+	case redisKeywordCount:
 		count, err := parseXReadCountArg(args, i)
 		if err != nil {
 			return 0, false, err
@@ -2080,7 +2076,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 func parseRangeStreamCount(args [][]byte) (int, error) {
 	count := -1
 	for i := 4; i < len(args); i += redisPairWidth {
-		if i+1 >= len(args) || !strings.EqualFold(string(args[i]), dynamoSelectCount) {
+		if i+1 >= len(args) || !strings.EqualFold(string(args[i]), redisKeywordCount) {
 			return 0, errors.New("ERR syntax error")
 		}
 		nextCount, err := strconv.Atoi(string(args[i+1]))

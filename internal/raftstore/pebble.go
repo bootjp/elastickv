@@ -68,7 +68,7 @@ func (s *PebbleStore) LastIndex() (uint64, error) {
 func (s *PebbleStore) GetLog(index uint64, out *raft.Log) error {
 	value, closer, err := s.db.Get(logKey(index))
 	if errors.Is(err, pebble.ErrNotFound) {
-		return errors.WithStack(raft.ErrLogNotFound)
+		return raft.ErrLogNotFound
 	}
 	if err != nil {
 		return errors.WithStack(err)

@@ -119,13 +119,20 @@ func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint6
 	return val, err
 }
 
-func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, elems []*kv.Elem[kv.OP]) error {
+func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uint64, elems []*kv.Elem[kv.OP]) error {
 	if len(elems) == 0 {
 		return nil
 	}
+	// Guard against the MaxUint64 sentinel returned by snapshotTS when no
+	// writes have been committed yet.  The coordinator cannot create a
+	// commitTS larger than MaxUint64, so let it assign its own startTS.
+	if startTS == ^uint64(0) {
+		startTS = 0
+	}
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn: isTxn,
-		Elems: elems,
+		IsTxn:   isTxn,
+		StartTS: startTS,
+		Elems:   elems,
 	})
 	return errors.WithStack(err)
 }
@@ -134,7 +141,7 @@ func (r *RedisServer) saveBytes(ctx context.Context, storageKey []byte, payload 
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: storageKey, Value: payload},
 	}
-	return r.dispatchElems(ctx, false, elems)
+	return r.dispatchElems(ctx, false, 0, elems)
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
@@ -146,7 +153,7 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 	} else {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	}
-	return r.dispatchElems(ctx, false, elems)
+	return r.dispatchElems(ctx, false, 0, elems)
 }
 
 func (r *RedisServer) saveHash(ctx context.Context, key []byte, value redisHashValue) error {
@@ -247,7 +254,7 @@ func (r *RedisServer) rewriteList(ctx context.Context, key []byte, values []stri
 	}
 
 	if len(values) == 0 {
-		return r.dispatchElems(ctx, true, elems)
+		return r.dispatchElems(ctx, true, 0, elems)
 	}
 
 	rawValues := make([][]byte, 0, len(values))
@@ -259,7 +266,7 @@ func (r *RedisServer) rewriteList(ctx context.Context, key []byte, values []stri
 		return err
 	}
 	elems = append(elems, ops...)
-	return r.dispatchElems(ctx, true, elems)
+	return r.dispatchElems(ctx, true, 0, elems)
 }
 
 func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {
