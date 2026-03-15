@@ -217,7 +217,7 @@ func readTxnField(r *bytes.Reader, n uint64, truncatedMessage string) ([]byte, e
 
 	// Guard against excessively large fields before attempting to read them.
 	if n > uint64(math.MaxInt) {
-		return nil, errors.Newf("%s: field size %d overflows int", truncatedMessage, n)
+		return nil, errors.Newf("%s: field size %d overflows int", truncatedMessage, n) //nolint:wrapcheck // creating new error, nothing to wrap
 	}
 
 	b, err := readTxnSizedBytes(r, n)
@@ -237,7 +237,7 @@ func readTxnSizedBytes(r *bytes.Reader, n uint64) ([]byte, error) {
 
 	// n has already been validated by readTxnField to be <= math.MaxInt,
 	// so this conversion is safe.
-	out := make([]byte, int(n))
+	out := make([]byte, int(n)) //nolint:gosec // n validated as <= math.MaxInt by caller
 	if _, err := io.ReadFull(r, out); err != nil {
 		return nil, errors.WithStack(err)
 	}

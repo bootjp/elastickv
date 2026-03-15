@@ -24,6 +24,7 @@ const (
 	pubsubPatternArgMin  = 3
 	pubsubFirstChannel   = 2
 	redisBusyPollBackoff = 10 * time.Millisecond
+	redisKeywordCount    = "COUNT"
 )
 
 type xreadRequest struct {
@@ -86,7 +87,7 @@ func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
 	if _, err := strconv.Atoi(string(cmd.Args[1])); err != nil {
-		conn.WriteError(err.Error())
+		conn.WriteError("ERR invalid DB index")
 		return
 	}
 	conn.WriteString("OK")
@@ -276,7 +277,7 @@ func parseScanArgs(args [][]byte) (int, []byte, int, error) {
 		switch strings.ToUpper(string(args[i])) {
 		case "MATCH":
 			pattern = args[i+1]
-		case dynamoSelectCount:
+		case redisKeywordCount:
 			count, err = strconv.Atoi(string(args[i+1]))
 			if err != nil || count <= 0 {
 				return 0, nil, 0, errors.New("ERR syntax error")

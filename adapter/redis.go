@@ -238,7 +238,7 @@ type RedisServer struct {
 	coordinator     kv.Coordinator
 	redisTranscoder *redisTranscoder
 	pubsub          redcon.PubSub
-	pubsubMu        sync.Mutex
+	pubsubMu        sync.RWMutex
 	pubsubChannels  map[string]int
 	scriptMu        sync.RWMutex
 	scriptCache     map[string]string

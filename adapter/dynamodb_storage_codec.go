@@ -118,7 +118,7 @@ func marshalStoredDynamoMessage(prefix []byte, msg gproto.Message) ([]byte, erro
 		return nil, errStoredDynamoMessageTooLarge
 	}
 
-	totalLen := int(prefixLen + bodyLen)
+	totalLen := int(prefixLen + bodyLen) //nolint:gosec // overflow checked above
 	buf := make([]byte, totalLen)
 	copy(buf, prefix)
 	copy(buf[len(prefix):], body)
