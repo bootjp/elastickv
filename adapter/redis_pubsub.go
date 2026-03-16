@@ -48,9 +48,10 @@ func (ps *redisPubSub) Subscribe(conn redcon.Conn, channel string) {
 	ps.mu.Lock()
 	sc, isNew := ps.getOrCreate(conn)
 	ps.addEntry(sc, channel)
+	count := len(sc.chans)
 	ps.mu.Unlock()
 
-	ps.writeSubscribeReply(sc, channel)
+	ps.writeSubscribeReply(sc, channel, count)
 
 	if isNew {
 		go sc.bgrunner(ps)
@@ -77,8 +78,12 @@ func (ps *redisPubSub) Publish(channel, message string) int {
 			sc.dconn.WriteBulkString("message")
 			sc.dconn.WriteBulkString(channel)
 			sc.dconn.WriteBulkString(message)
-			_ = sc.dconn.Flush()
-			sent++
+			if err := sc.dconn.Flush(); err != nil {
+				sc.closed = true
+				_ = sc.dconn.Close()
+			} else {
+				sent++
+			}
 		}
 		sc.mu.Unlock()
 	}
@@ -143,13 +148,13 @@ func (ps *redisPubSub) removeAll(sc *pubsubConn) {
 	sc.chans = nil
 }
 
-func (ps *redisPubSub) writeSubscribeReply(sc *pubsubConn, channel string) {
+func (ps *redisPubSub) writeSubscribeReply(sc *pubsubConn, channel string, count int) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.dconn.WriteArray(respArrayMessage)
 	sc.dconn.WriteBulkString("subscribe")
 	sc.dconn.WriteBulkString(channel)
-	sc.dconn.WriteInt(len(sc.chans))
+	sc.dconn.WriteInt(count)
 	_ = sc.dconn.Flush()
 }
 
@@ -174,17 +179,21 @@ func (sc *pubsubConn) handleSubscribe(ps *redisPubSub, args [][]byte) {
 		sc.mu.Unlock()
 		return
 	}
-	channels := make([]string, 0, len(args)-1)
+	type subInfo struct {
+		channel string
+		count   int
+	}
+	subs := make([]subInfo, 0, len(args)-1)
 	ps.mu.Lock()
 	for i := 1; i < len(args); i++ {
 		ch := string(args[i])
 		ps.addEntry(sc, ch)
-		channels = append(channels, ch)
+		subs = append(subs, subInfo{channel: ch, count: len(sc.chans)})
 	}
 	ps.mu.Unlock()
 
-	for _, ch := range channels {
-		ps.writeSubscribeReply(sc, ch)
+	for _, s := range subs {
+		ps.writeSubscribeReply(sc, s.channel, s.count)
 	}
 }
 

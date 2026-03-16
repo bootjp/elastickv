@@ -61,7 +61,7 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 }
 
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
-	if req == nil {
+	if req == nil || i.relay == nil {
 		return &pb.RelayPublishResponse{}, nil
 	}
 	return &pb.RelayPublishResponse{
