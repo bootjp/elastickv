@@ -134,8 +134,8 @@ func (c *recordingConn) WriteAny(v any) {
 		c.WriteNull()
 	}
 }
-func (c *recordingConn) Context() interface{} { return c.ctx }
-func (c *recordingConn) SetContext(v interface{}) {
+func (c *recordingConn) Context() any { return c.ctx }
+func (c *recordingConn) SetContext(v any) {
 	c.ctx = v
 }
 func (c *recordingConn) SetReadBuffer(bytes int) {}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -697,11 +698,9 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(err.Error())
 		return
 	}
-	for _, member := range value.Members {
-		if member == string(cmd.Args[2]) {
-			conn.WriteInt(1)
-			return
-		}
+	if slices.Contains(value.Members, string(cmd.Args[2])) {
+		conn.WriteInt(1)
+		return
 	}
 	conn.WriteInt(0)
 }
@@ -2032,7 +2031,7 @@ func splitXReadStreams(args [][]byte, streamsIndex int) ([][]byte, []string, err
 	streamCount := remaining / redisPairWidth
 	keys := make([][]byte, streamCount)
 	afterIDs := make([]string, streamCount)
-	for i := 0; i < streamCount; i++ {
+	for i := range streamCount {
 		keys[i] = args[streamsIndex+i]
 		afterIDs[i] = string(args[streamsIndex+streamCount+i])
 	}

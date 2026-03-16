@@ -138,7 +138,7 @@ func TestRedis_MisskeyAdminCompatibility(t *testing.T) {
 
 	ps := sub.Subscribe(ctx, "misskey.pubsub.one", "misskey.pubsub.two")
 	defer func() { _ = ps.Close() }()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, err = ps.ReceiveTimeout(ctx, 2*time.Second)
 		require.NoError(t, err)
 	}
@@ -268,7 +268,7 @@ func TestRedis_MisskeyDirectDataStructures(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, xrev, 1)
 	require.Equal(t, "1002-0", xrev[0].ID)
-	require.Equal(t, map[string]interface{}{"data": `{"id":"n3"}`}, xrev[0].Values)
+	require.Equal(t, map[string]any{"data": `{"id":"n3"}`}, xrev[0].Values)
 
 	xrange, err := rdb.XRange(ctx, "notificationTimeline:u1", "1001-0", "+").Result()
 	require.NoError(t, err)

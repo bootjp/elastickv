@@ -226,10 +226,7 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 }
 
 func encodeRedisTTL(expireAt time.Time) []byte {
-	ms := expireAt.UnixMilli()
-	if ms < 0 {
-		ms = 0
-	}
+	ms := max(expireAt.UnixMilli(), 0)
 	buf := make([]byte, redisUint64Bytes)
 	binary.BigEndian.PutUint64(buf, uint64(ms)) // #nosec G115 -- ms is clamped to non-negative int64 range.
 	return buf
@@ -239,10 +236,7 @@ func decodeRedisTTL(raw []byte) (time.Time, error) {
 	if len(raw) != redisUint64Bytes {
 		return time.Time{}, errors.WithStack(errors.Newf("invalid ttl length %d", len(raw)))
 	}
-	ms := binary.BigEndian.Uint64(raw)
-	if ms > math.MaxInt64 {
-		ms = math.MaxInt64
-	}
+	ms := min(binary.BigEndian.Uint64(raw), math.MaxInt64)
 	return time.UnixMilli(int64(ms)), nil // #nosec G115 -- ms <= MaxInt64 is guaranteed by the check above.
 }
 
