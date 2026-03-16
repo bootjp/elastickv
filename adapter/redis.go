@@ -811,6 +811,11 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 		conn.WriteNull()
 		return
 	}
+	// Check TTL on the leader first; if expired the key is logically gone.
+	if r.isLeaderKeyExpired(key) {
+		conn.WriteNull()
+		return
+	}
 	// Check if the key is a string on the leader.
 	v, err := r.tryLeaderGetAt(key, 0)
 	if err == nil {
@@ -827,6 +832,19 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 		return
 	}
 	conn.WriteNull()
+}
+
+// isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
+func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
+	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
+	if err != nil {
+		return false
+	}
+	ttl, err := decodeRedisTTL(raw)
+	if err != nil {
+		return false
+	}
+	return !ttl.After(time.Now())
 }
 
 // tryLeaderNonStringExists checks whether the key exists as a non-string type
@@ -858,6 +876,9 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 
 // tryLeaderLogicalExists checks whether the key exists as any type on the leader.
 func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+	if r.isLeaderKeyExpired(key) {
+		return false
+	}
 	// String type (raw user key).
 	if _, err := r.tryLeaderGetAt(key, 0); err == nil {
 		return true
@@ -1386,7 +1407,21 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
-	return t.stageKeyDeletion(cmd.Args[1])
+	var deleted int64
+	for _, key := range cmd.Args[1:] {
+		typ, err := t.stagedKeyType(key)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if typ == redisTypeNone {
+			continue
+		}
+		if _, err := t.stageKeyDeletion(key); err != nil {
+			return redisResult{}, err
+		}
+		deleted++
+	}
+	return redisResult{typ: resultInt, integer: deleted}, nil
 }
 
 func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
@@ -1409,14 +1444,17 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
-	typ, err := t.stagedKeyType(cmd.Args[1])
-	if err != nil {
-		return redisResult{}, err
+	var count int64
+	for _, key := range cmd.Args[1:] {
+		typ, err := t.stagedKeyType(key)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if typ != redisTypeNone {
+			count++
+		}
 	}
-	if typ != redisTypeNone {
-		return redisResult{typ: resultInt, integer: 1}, nil
-	}
-	return redisResult{typ: resultInt, integer: 0}, nil
+	return redisResult{typ: resultInt, integer: count}, nil
 }
 
 func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
