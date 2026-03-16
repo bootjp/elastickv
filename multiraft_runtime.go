@@ -24,11 +24,7 @@ type raftGroupRuntime struct {
 	closeStores func()
 }
 
-// raftCommitTimeout is intentionally short (1ms) to minimize latency for
-// single-node and low-latency cluster deployments. Raft.Apply still blocks
-// until the log entry is committed, so this only affects the initial timeout
-// before returning an error if the leader cannot commit in time.
-const raftCommitTimeout = 1 * time.Millisecond
+const raftCommitTimeout = 50 * time.Millisecond
 
 func (r *raftGroupRuntime) Close() {
 	if r == nil {
