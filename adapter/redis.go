@@ -1383,10 +1383,12 @@ func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
-	if isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS); err != nil {
+	typ, err := t.stagedKeyType(cmd.Args[1])
+	if err != nil {
 		return redisResult{}, err
-	} else if isList {
-		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
+	}
+	if typ != redisTypeNone && typ != redisTypeString {
+		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 
 	tv, err := t.load(cmd.Args[1])
@@ -1400,20 +1402,14 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
-	if isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS); err != nil {
-		return redisResult{}, err
-	} else if isList {
-		return redisResult{typ: resultInt, integer: 1}, nil
-	}
-
-	tv, err := t.load(cmd.Args[1])
+	typ, err := t.stagedKeyType(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if tv.deleted || tv.raw == nil {
-		return redisResult{typ: resultInt, integer: 0}, nil
+	if typ != redisTypeNone {
+		return redisResult{typ: resultInt, integer: 1}, nil
 	}
-	return redisResult{typ: resultInt, integer: 1}, nil
+	return redisResult{typ: resultInt, integer: 0}, nil
 }
 
 func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
@@ -1542,12 +1538,14 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	}
 	ttlState.value = nil
 	ttlState.dirty = true
-	// Mark zset for deletion.
+	// Mark zset for deletion. Use empty map (not nil) so that subsequent
+	// writes (e.g. ZINCRBY) in the same transaction can safely insert.
 	zs, err := t.loadZSetState(key)
 	if err != nil {
 		return redisResult{}, err
 	}
-	zs.members = nil
+	zs.members = map[string]float64{}
+	zs.exists = false
 	zs.dirty = true
 	// Mark hash, set, stream, and HLL internal keys for deletion.
 	for _, internalKey := range [][]byte{
