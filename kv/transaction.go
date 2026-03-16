@@ -16,6 +16,7 @@ type TransactionManager struct {
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
 	rawFlushing bool
+	closeCh     chan struct{}
 }
 
 type rawCommitItem struct {
@@ -34,7 +35,26 @@ var rawBatchWindow = 500 * time.Microsecond
 
 func NewTransaction(raft *raft.Raft) *TransactionManager {
 	return &TransactionManager{
-		raft: raft,
+		raft:    raft,
+		closeCh: make(chan struct{}),
+	}
+}
+
+var errShuttingDown = errors.New("transaction manager is shutting down")
+
+// Close signals the TransactionManager to stop and drains any pending raw
+// commit items, sending each an error so callers are not blocked forever.
+func (t *TransactionManager) Close() {
+	close(t.closeCh)
+
+	t.mu.Lock()
+	pending := t.rawPending
+	t.rawPending = nil
+	t.rawFlushing = false
+	t.mu.Unlock()
+
+	for _, item := range pending {
+		item.done <- rawCommitResult{err: errShuttingDown}
 	}
 }
 
@@ -175,9 +195,21 @@ func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse
 }
 
 func (t *TransactionManager) flushRawPending() {
-	time.Sleep(rawBatchWindow)
+	timer := time.NewTimer(rawBatchWindow)
+	select {
+	case <-timer.C:
+	case <-t.closeCh:
+		timer.Stop()
+		return
+	}
 
 	for {
+		select {
+		case <-t.closeCh:
+			return
+		default:
+		}
+
 		batch := t.takeRawBatch()
 		if len(batch) == 0 {
 			t.mu.Lock()

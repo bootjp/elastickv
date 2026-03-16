@@ -553,10 +553,15 @@ func parseRedisSetTTL(args [][]byte, index int, opt string, now time.Time) (*tim
 		return nil, index, errors.New("ERR invalid expire time in 'set' command")
 	}
 
-	expireAt := now.Add(time.Duration(n) * time.Millisecond)
+	unit := time.Millisecond
 	if opt == "EX" {
-		expireAt = now.Add(time.Duration(n) * time.Second)
+		unit = time.Second
 	}
+	if n > math.MaxInt64/int64(unit) {
+		return nil, index, errors.New("ERR invalid expire time in 'set' command")
+	}
+
+	expireAt := now.Add(time.Duration(n) * unit)
 	return &expireAt, index + 1, nil
 }
 
@@ -1330,21 +1335,7 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
-	// Always stage list deletion so DEL followed by RPUSH in the same MULTI
-	// reliably recreates the list from an empty state.
-	st, err := t.loadListState(cmd.Args[1])
-	if err != nil {
-		return redisResult{}, err
-	}
-	stageListDelete(st)
-
-	tv, err := t.load(cmd.Args[1])
-	if err != nil {
-		return redisResult{}, err
-	}
-	tv.deleted = true
-	tv.dirty = true
-	return redisResult{typ: resultInt, integer: 1}, nil
+	return t.stageKeyDeletion(cmd.Args[1])
 }
 
 func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
@@ -1514,6 +1505,20 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	}
 	zs.members = nil
 	zs.dirty = true
+	// Mark hash, set, stream, and HLL internal keys for deletion.
+	for _, internalKey := range [][]byte{
+		redisHashKey(key),
+		redisSetKey(key),
+		redisStreamKey(key),
+		redisHLLKey(key),
+	} {
+		iv, err := t.load(internalKey)
+		if err != nil {
+			return redisResult{}, err
+		}
+		iv.deleted = true
+		iv.dirty = true
+	}
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 

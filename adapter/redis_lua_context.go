@@ -1654,9 +1654,29 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 	return luaIntReply(0), nil
 }
 
+func parseLuaZAddArgs(args []string) (zaddFlags, []string, error) {
+	var flags zaddFlags
+	i := 1
+	for i < len(args) {
+		if !flags.applyFlag(strings.ToUpper(args[i])) {
+			break
+		}
+		i++
+	}
+	if err := flags.validate(); err != nil {
+		return zaddFlags{}, nil, err
+	}
+	remaining := args[i:]
+	if len(remaining)%2 != 0 || len(remaining) == 0 {
+		return zaddFlags{}, nil, errors.New("ERR syntax error")
+	}
+	return flags, remaining, nil
+}
+
 func (c *luaScriptContext) cmdZAdd(args []string) (luaReply, error) {
-	if (len(args)-1)%2 != 0 {
-		return luaReply{}, errors.New("ERR syntax error")
+	flags, pairs, err := parseLuaZAddArgs(args)
+	if err != nil {
+		return luaReply{}, err
 	}
 	st, err := c.zsetState([]byte(args[0]))
 	if err != nil {
@@ -1667,15 +1687,20 @@ func (c *luaScriptContext) cmdZAdd(args []string) (luaReply, error) {
 		st.members = map[string]float64{}
 	}
 	added := 0
-	for i := 1; i < len(args); i += 2 {
-		score, err := strconv.ParseFloat(args[i], 64)
+	for j := 0; j < len(pairs); j += 2 {
+		score, err := strconv.ParseFloat(pairs[j], 64)
 		if err != nil {
 			return luaReply{}, errors.WithStack(err)
 		}
-		if _, ok := st.members[args[i+1]]; !ok {
+		member := pairs[j+1]
+		oldScore, exists := st.members[member]
+		if !flags.allows(exists, oldScore, score) {
+			continue
+		}
+		if !exists {
 			added++
 		}
-		st.members[args[i+1]] = score
+		st.members[member] = score
 	}
 	st.loaded = true
 	st.dirty = true

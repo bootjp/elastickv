@@ -145,7 +145,7 @@ func (ps *redisPubSub) removeAll(sc *pubsubConn) {
 			}
 		}
 	}
-	sc.chans = nil
+	clear(sc.chans)
 }
 
 func (ps *redisPubSub) writeSubscribeReply(sc *pubsubConn, channel string, count int) {
