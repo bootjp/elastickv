@@ -830,8 +830,15 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 }
 
 // tryLeaderNonStringExists checks whether the key exists as a non-string type
-// (hash, set, zset, stream, HLL, or list) on the leader.
+// (hash, set, zset, stream, HLL, or list) on the leader. Returns false if the
+// key has an expired TTL.
 func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
+	// Check TTL first: if expired, the key is logically gone.
+	if raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0); err == nil {
+		if ttl, decErr := decodeRedisTTL(raw); decErr == nil && !ttl.After(time.Now()) {
+			return false
+		}
+	}
 	for _, internalKey := range [][]byte{
 		redisHashKey(key),
 		redisSetKey(key),
@@ -1509,6 +1516,9 @@ func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisR
 
 	if ttl <= 0 {
 		return t.stageKeyDeletion(cmd.Args[1])
+	}
+	if ttl > math.MaxInt64/int64(unit) {
+		return redisResult{}, errors.New("ERR invalid expire time in command")
 	}
 
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
