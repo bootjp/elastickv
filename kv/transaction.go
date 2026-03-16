@@ -164,7 +164,7 @@ func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse
 	t.mu.Unlock()
 
 	if shouldFlush {
-		t.flushRawPending()
+		go t.flushRawPending()
 	}
 
 	res := <-item.done
