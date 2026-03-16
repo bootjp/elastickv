@@ -5,12 +5,13 @@ that require larger refactoring to address.
 
 ## Performance
 
-### LPUSH / list mutations are O(N)
-- **Location**: `redis_compat_commands.go` (lpush, ltrim, rpush)
-- **Problem**: List modification commands read the entire list, modify in memory,
-  and rewrite the whole list. This is O(N) where N is the number of elements.
-- **Fix**: Push list manipulation down into the storage layer so individual
-  elements can be appended/removed without full rewrite.
+### LTRIM is O(N)
+- **Location**: `redis_compat_commands.go` (ltrim)
+- **Problem**: LTRIM reads the entire list, trims in memory, and rewrites.
+  This is O(N) where N is the number of elements.
+- **Fix**: Implement range deletion at the storage layer to trim without full
+  rewrite. LPUSH and RPUSH have been optimized to O(k) using store-level
+  sequence number operations.
 
 ### SCAN materializes all keys
 - **Location**: `redis_compat_commands.go` (scan)
@@ -20,10 +21,11 @@ that require larger refactoring to address.
 - **Fix**: Implement SCAN as an incremental range scan over the underlying store,
   returning the next cursor based on the last returned key.
 
-### FLUSHDB iterates all keys
+### FLUSHDB single-pass but no range deletion
 - **Location**: `redis_compat_commands.go` (flushdb)
-- **Problem**: FLUSHDB/FLUSHALL iterates through all visible keys and deletes
-  them one by one. This can be very slow for large datasets.
+- **Problem**: FLUSHDB/FLUSHALL scans the entire store and generates per-key
+  delete operations. While optimized to a single scan (no per-key existence
+  checks), it still creates individual delete mutations for each key.
 - **Fix**: Implement a range deletion capability at the storage layer.
 
 ### visibleKeys N x M per-key type checks

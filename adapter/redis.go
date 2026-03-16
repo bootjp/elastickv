@@ -2010,6 +2010,56 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
 }
 
+// buildLPushOps creates Raft operations to prepend values to the head of a list.
+// This is O(k) where k = len(values), not O(N) where N is the total list length.
+// LPUSH reverses the order of arguments: LPUSH key a b c → [c, b, a, ...existing].
+func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+	if len(values) == 0 {
+		return nil, meta, nil
+	}
+
+	n := int64(len(values))
+	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	// LPUSH reverses args, so last arg gets the lowest sequence number.
+	newHead := meta.Head - n
+	for i, v := range values {
+		// values[0]=a, values[1]=b, values[2]=c → seq ordering: c(newHead), b(newHead+1), a(newHead+2)
+		seq := newHead + n - 1 - int64(i)
+		vCopy := bytes.Clone(v)
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listItemKey(key, seq), Value: vCopy})
+	}
+
+	meta.Head = newHead
+	meta.Len += n
+	// Tail stays the same: Tail = oldHead + oldLen = newHead + newLen
+
+	b, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, meta, errors.WithStack(err)
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
+	return elems, meta, nil
+}
+
+func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
+	readTS := r.readTS()
+	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+
+	ops, newMeta, err := r.buildLPushOps(meta, key, values)
+	if err != nil {
+		return 0, err
+	}
+	if len(ops) == 0 {
+		return newMeta.Len, nil
+	}
+
+	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
+}
+
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
 	if endIdx < startIdx {
 		return []string{}, nil
@@ -2117,6 +2167,28 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 	return res, errors.WithStack(err)
 }
 
+func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
+	leader := r.coordinator.RaftLeaderForKey(key)
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
+	defer func() { _ = cli.Close() }()
+
+	args := make([]any, 0, len(values))
+	for _, v := range values {
+		args = append(args, string(v))
+	}
+
+	res, err := cli.LPush(context.Background(), string(key), args...).Result()
+	return res, errors.WithStack(err)
+}
+
 func parseInt(b []byte) (int, error) {
 	i, err := strconv.Atoi(string(b))
 	return i, errors.WithStack(err)
@@ -2175,7 +2247,10 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	return r.tryLeaderGetAt(key, readTS)
 }
 
-func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)
+type listProxyFunc func(key []byte, values [][]byte) (int64, error)
+
+func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -2191,9 +2266,9 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 
 	var length int64
 	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
-		length, err = r.listRPush(ctx, cmd.Args[1], cmd.Args[2:])
+		length, err = pushFn(ctx, cmd.Args[1], cmd.Args[2:])
 	} else {
-		length, err = r.proxyRPush(cmd.Args[1], cmd.Args[2:])
+		length, err = proxyFn(cmd.Args[1], cmd.Args[2:])
 	}
 
 	if err != nil {
@@ -2201,6 +2276,10 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt64(length)
+}
+
+func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+	r.listPushCmd(conn, cmd, r.listRPush, r.proxyRPush)
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {

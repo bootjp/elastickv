@@ -49,13 +49,13 @@ func MarshalListMeta(meta ListMeta) ([]byte, error) { return marshalListMeta(met
 func UnmarshalListMeta(b []byte) (ListMeta, error) { return unmarshalListMeta(b) }
 
 func marshalListMeta(meta ListMeta) ([]byte, error) {
-	if meta.Head < 0 || meta.Tail < 0 || meta.Len < 0 {
-		return nil, errors.WithStack(errors.Newf("list meta contains negative value: head=%d tail=%d len=%d", meta.Head, meta.Tail, meta.Len))
+	if meta.Len < 0 {
+		return nil, errors.WithStack(errors.Newf("list meta contains negative len: %d", meta.Len))
 	}
 
 	buf := make([]byte, listMetaBinarySize)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail))
+	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))  //nolint:gosec // Head can be negative after LPUSH; uint64 cast preserves bits
+	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail)) //nolint:gosec // Tail = Head + Len, may be negative
 	binary.BigEndian.PutUint64(buf[16:24], uint64(meta.Len))
 	return buf, nil
 }
@@ -65,17 +65,17 @@ func unmarshalListMeta(b []byte) (ListMeta, error) {
 		return ListMeta{}, errors.Wrap(errors.Newf("invalid list meta length: %d", len(b)), "unmarshal list meta")
 	}
 
-	head := binary.BigEndian.Uint64(b[0:8])
-	tail := binary.BigEndian.Uint64(b[8:16])
+	head := int64(binary.BigEndian.Uint64(b[0:8]))  //nolint:gosec // Head may be negative after LPUSH
+	tail := int64(binary.BigEndian.Uint64(b[8:16])) //nolint:gosec // Tail = Head + Len, may be negative
 	length := binary.BigEndian.Uint64(b[16:24])
 
-	if head > math.MaxInt64 || tail > math.MaxInt64 || length > math.MaxInt64 {
-		return ListMeta{}, errors.New("list meta value overflows int64")
+	if length > math.MaxInt64 {
+		return ListMeta{}, errors.New("list meta length overflows int64")
 	}
 
 	return ListMeta{
-		Head: int64(head),
-		Tail: int64(tail),
+		Head: head,
+		Tail: tail,
 		Len:  int64(length),
 	}, nil
 }
