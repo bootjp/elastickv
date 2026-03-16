@@ -301,12 +301,21 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	if dir == "" {
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
 	}
+	for _, legacy := range []string{"logs.dat", "stable.dat"} {
+		if _, err := os.Stat(filepath.Join(dir, legacy)); err == nil {
+			return nil, nil, nil, errors.WithStack(errors.Newf(
+				"legacy boltdb Raft storage %q found in %s; manual migration required before using Pebble-backed storage",
+				legacy, dir,
+			))
+		}
+	}
 	raftStore, err := raftstore.NewPebbleStore(filepath.Join(dir, "raft.db"))
 	if err != nil {
 		return nil, nil, nil, errors.WithStack(err)
 	}
 	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
 	if err != nil {
+		_ = raftStore.Close()
 		return nil, nil, nil, errors.WithStack(err)
 	}
 	return raftStore, raftStore, fss, nil

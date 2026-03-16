@@ -119,7 +119,7 @@ const (
 	redisTraceArgMaxLen      = 96
 	redisTraceArgEllipsis    = "..."
 	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
-	redisTraceRedactAfter    = 2 // redact arguments after command name + key
+	redisTraceRedactAfter    = 1 // redact arguments after key (command name already stripped by caller)
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
@@ -685,23 +685,44 @@ func (r *RedisServer) relayPeers() []raft.ServerAddress {
 
 func (r *RedisServer) publishCluster(ctx context.Context, channel, message []byte) int64 {
 	delivered := r.publishLocal(channel, message)
-	for _, peer := range r.relayPeers() {
-		conn, err := r.relayConnCache.ConnFor(peer)
-		if err != nil {
-			log.Printf("redis relay publish dial peer=%s err=%v", peer, err)
-			continue
+	peers := r.relayPeers()
+	if len(peers) == 0 {
+		return delivered
+	}
+
+	type peerResult struct {
+		subscribers int64
+		err         error
+	}
+	results := make(chan peerResult, len(peers))
+	overallCtx, overallCancel := context.WithTimeout(ctx, redisRelayPublishTimeout)
+	defer overallCancel()
+
+	for _, peer := range peers {
+		go func(peer raft.ServerAddress) {
+			conn, err := r.relayConnCache.ConnFor(peer)
+			if err != nil {
+				log.Printf("redis relay publish dial peer=%s err=%v", peer, err)
+				results <- peerResult{err: err}
+				return
+			}
+			resp, err := pb.NewInternalClient(conn).RelayPublish(overallCtx, &pb.RelayPublishRequest{
+				Channel: bytes.Clone(channel),
+				Message: bytes.Clone(message),
+			})
+			if err != nil {
+				log.Printf("redis relay publish peer=%s err=%v", peer, err)
+				results <- peerResult{err: err}
+				return
+			}
+			results <- peerResult{subscribers: resp.GetSubscribers()}
+		}(peer)
+	}
+
+	for range peers {
+		if res := <-results; res.err == nil {
+			delivered += res.subscribers
 		}
-		callCtx, cancel := context.WithTimeout(ctx, redisRelayPublishTimeout)
-		resp, err := pb.NewInternalClient(conn).RelayPublish(callCtx, &pb.RelayPublishRequest{
-			Channel: bytes.Clone(channel),
-			Message: bytes.Clone(message),
-		})
-		cancel()
-		if err != nil {
-			log.Printf("redis relay publish peer=%s err=%v", peer, err)
-			continue
-		}
-		delivered += resp.GetSubscribers()
 	}
 	return delivered
 }
