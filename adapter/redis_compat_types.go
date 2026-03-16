@@ -24,6 +24,14 @@ const (
 	redisTTLPrefix    = "!redis|ttl|"
 )
 
+var redisInternalPrefixes = []string{
+	redisHashPrefix,
+	redisSetPrefix,
+	redisHLLPrefix,
+	redisZSetPrefix,
+	redisStreamPrefix,
+}
+
 const (
 	redisUint64Bytes   = 8
 	redisStreamIDParts = 2

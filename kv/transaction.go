@@ -176,6 +176,12 @@ func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse
 
 	shouldFlush := false
 	t.mu.Lock()
+	select {
+	case <-t.closeCh:
+		t.mu.Unlock()
+		return nil, errShuttingDown
+	default:
+	}
 	t.rawPending = append(t.rawPending, item)
 	if !t.rawFlushing {
 		t.rawFlushing = true

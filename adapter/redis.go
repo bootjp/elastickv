@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"maps"
 	"math"
@@ -118,6 +119,7 @@ const (
 	redisTraceArgMaxLen      = 96
 	redisTraceArgEllipsis    = "..."
 	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
+	redisTraceRedactAfter    = 2 // redact arguments after command name + key
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
@@ -503,6 +505,10 @@ func formatTraceArgs(args [][]byte) string {
 		if i >= redisTraceArgLimit {
 			parts = append(parts, redisTraceArgEllipsis)
 			break
+		}
+		if i >= redisTraceRedactAfter {
+			parts = append(parts, fmt.Sprintf("<%d bytes>", len(arg)))
+			continue
 		}
 		s := strconv.QuoteToASCII(string(arg))
 		if len(s) > redisTraceArgMaxLen {
@@ -956,13 +962,7 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 			return nil, err
 		}
 
-		for _, prefix := range []string{
-			redisHashPrefix,
-			redisSetPrefix,
-			redisHLLPrefix,
-			redisZSetPrefix,
-			redisStreamPrefix,
-		} {
+		for _, prefix := range redisInternalPrefixes {
 			internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
 			if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
 				return nil, err
@@ -1223,6 +1223,19 @@ func (t *txnContext) listLength(st *listTxnState) int64 {
 func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	k := string(key)
 	if st, ok := t.zsetStates[k]; ok {
+		return st, nil
+	}
+	// Check TTL: treat expired keys as non-existent.
+	ttlSt, err := t.loadTTLState(key)
+	if err != nil {
+		return nil, err
+	}
+	if ttlSt.value != nil && !ttlSt.value.After(time.Now()) {
+		st := &zsetTxnState{
+			members: map[string]float64{},
+			exists:  false,
+		}
+		t.zsetStates[k] = st
 		return st, nil
 	}
 	value, exists, err := t.server.loadZSetAt(context.Background(), key, t.startTS)
@@ -2063,7 +2076,11 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
-	expired, err := r.hasExpiredTTLAt(context.Background(), key, readTS)
+	ttlKey := key
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		ttlKey = userKey
+	}
+	expired, err := r.hasExpiredTTLAt(context.Background(), ttlKey, readTS)
 	if err != nil {
 		return nil, err
 	}
