@@ -17,6 +17,7 @@ type TransactionManager struct {
 	rawPending  []*rawCommitItem
 	rawFlushing bool
 	closeCh     chan struct{}
+	closeOnce   sync.Once
 }
 
 type rawCommitItem struct {
@@ -45,17 +46,19 @@ var errShuttingDown = errors.New("transaction manager is shutting down")
 // Close signals the TransactionManager to stop and drains any pending raw
 // commit items, sending each an error so callers are not blocked forever.
 func (t *TransactionManager) Close() {
-	close(t.closeCh)
+	t.closeOnce.Do(func() {
+		close(t.closeCh)
 
-	t.mu.Lock()
-	pending := t.rawPending
-	t.rawPending = nil
-	t.rawFlushing = false
-	t.mu.Unlock()
+		t.mu.Lock()
+		pending := t.rawPending
+		t.rawPending = nil
+		t.rawFlushing = false
+		t.mu.Unlock()
 
-	for _, item := range pending {
-		item.done <- rawCommitResult{err: errShuttingDown}
-	}
+		for _, item := range pending {
+			item.done <- rawCommitResult{err: errShuttingDown}
+		}
+	})
 }
 
 type Transactional interface {

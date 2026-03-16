@@ -24,6 +24,10 @@ type raftGroupRuntime struct {
 	closeStores func()
 }
 
+// raftCommitTimeout is intentionally short (1ms) to minimize latency for
+// single-node and low-latency cluster deployments. Raft.Apply still blocks
+// until the log entry is committed, so this only affects the initial timeout
+// before returning an error if the leader cannot commit in time.
 const raftCommitTimeout = 1 * time.Millisecond
 
 func (r *raftGroupRuntime) Close() {
@@ -93,6 +97,16 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 	cleanup := func() {
 		closeTransportManager(&tm)
 		closeStores()
+	}
+
+	for _, legacy := range []string{"logs.dat", "stable.dat"} {
+		if _, err := os.Stat(filepath.Join(dir, legacy)); err == nil {
+			cleanup()
+			return nil, nil, nil, errors.WithStack(errors.Newf(
+				"legacy boltdb Raft storage %q found in %s; manual migration required before using Pebble-backed storage",
+				legacy, dir,
+			))
+		}
 	}
 
 	var err error

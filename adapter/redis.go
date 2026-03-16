@@ -811,16 +811,51 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 		conn.WriteNull()
 		return
 	}
+	// Check if the key is a string on the leader.
 	v, err := r.tryLeaderGetAt(key, 0)
-	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			conn.WriteNull()
-		} else {
-			conn.WriteError(err.Error())
-		}
+	if err == nil {
+		conn.WriteBulk(v)
 		return
 	}
-	conn.WriteBulk(v)
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		conn.WriteError(err.Error())
+		return
+	}
+	// String key not found — check if it exists as a non-string type.
+	if r.tryLeaderNonStringExists(key) {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+	conn.WriteNull()
+}
+
+// tryLeaderNonStringExists checks whether the key exists as a non-string type
+// (hash, set, zset, stream, HLL, or list) on the leader.
+func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
+	for _, internalKey := range [][]byte{
+		redisHashKey(key),
+		redisSetKey(key),
+		redisHLLKey(key),
+		redisZSetKey(key),
+		redisStreamKey(key),
+	} {
+		if _, err := r.tryLeaderGetAt(internalKey, 0); err == nil {
+			return true
+		}
+	}
+	if _, err := r.tryLeaderGetAt(listMetaKey(key), 0); err == nil {
+		return true
+	}
+	return false
+}
+
+// tryLeaderLogicalExists checks whether the key exists as any type on the leader.
+func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+	// String type (raw user key).
+	if _, err := r.tryLeaderGetAt(key, 0); err == nil {
+		return true
+	}
+	return r.tryLeaderNonStringExists(key)
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
@@ -867,12 +902,8 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 			count++
 		} else if !r.coordinator.IsLeaderForKey(key) {
 			// Local MVCC may be stale on a follower; proxy to the leader.
-			_, err := r.tryLeaderGetAt(key, 0)
-			if err == nil {
+			if r.tryLeaderLogicalExists(key) {
 				count++
-			} else if !errors.Is(err, store.ErrKeyNotFound) {
-				conn.WriteError(err.Error())
-				return
 			}
 		}
 	}
