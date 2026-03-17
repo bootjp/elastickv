@@ -130,7 +130,8 @@ type redisSetOptions struct {
 }
 
 type redisSetState struct {
-	typ      redisValueType
+	rawTyp   redisValueType // TTL-unaware type, for internal-key cleanup
+	typ      redisValueType // TTL-aware type, for NX/XX/GET semantics
 	oldValue []byte
 }
 
@@ -584,14 +585,18 @@ func (o redisSetOptions) allows(exists bool) bool {
 }
 
 func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
-	// Use rawKeyTypeAt (TTL-unaware) so that expired keys with lingering
-	// internal data (list/hash/set/...) are still detected for cleanup.
-	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	// rawTyp (TTL-unaware) detects lingering internal keys for cleanup.
+	rawTyp, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return redisSetState{}, err
+	}
+	// typ (TTL-aware) drives NX/XX/GET Redis semantics: expired keys are "gone".
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return redisSetState{}, err
 	}
 
-	state := redisSetState{typ: typ}
+	state := redisSetState{rawTyp: rawTyp, typ: typ}
 	if !returnOld || typ != redisTypeString {
 		return state, nil
 	}
@@ -639,7 +644,8 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 		if opts.returnOld && exists && state.typ != redisTypeString {
 			return wrongTypeError()
 		}
-		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.typ, readTS); err != nil {
+		// Use rawTyp for cleanup so expired-but-lingering internal keys are deleted.
+		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.rawTyp, readTS); err != nil {
 			return err
 		}
 		result = redisSetExecution{state: state, wroteOldBulk: opts.returnOld}
