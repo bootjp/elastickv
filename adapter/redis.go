@@ -552,7 +552,9 @@ func parseRedisSetTTL(args [][]byte, index int, opt string, now time.Time) (*tim
 	}
 	n, err := strconv.ParseInt(string(args[index+1]), 10, 64)
 	if err != nil {
-		return nil, index, errors.WithStack(err)
+		// Match Redis behavior: invalid numeric TTL value should not expose
+		// internal parsing errors, but return a stable protocol error.
+		return nil, index, errors.New("ERR value is not an integer or out of range")
 	}
 	if n <= 0 {
 		return nil, index, errors.New("ERR invalid expire time in 'set' command")
