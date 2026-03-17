@@ -23,7 +23,10 @@ func isRetryableRedisTxnErr(err error) bool {
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
 	half := delay / redisTxnRetryBackoffFactor
-	jittered := delay + time.Duration(rand.Int64N(int64(half))) //nolint:gosec // jitter for retry backoff, not security-sensitive
+	jittered := delay
+	if half > 0 {
+		jittered += time.Duration(rand.Int64N(int64(half))) //nolint:gosec // jitter for retry backoff, not security-sensitive
+	}
 	timer := time.NewTimer(jittered)
 	defer timer.Stop()
 

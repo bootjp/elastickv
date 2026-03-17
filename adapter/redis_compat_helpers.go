@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -227,6 +228,25 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	}
 	elems = append(elems, ops...)
 	return r.dispatchElems(ctx, true, readTS, elems)
+}
+
+// flushAllKeyElems scans the entire store and generates delete operations for
+// all Redis-visible keys in a single pass, avoiding the per-key existence
+// checks that visibleKeys + deleteLogicalKeyElems would perform.
+func (r *RedisServer) flushAllKeyElems(ctx context.Context, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	kvs, err := r.store.ScanAt(ctx, nil, nil, math.MaxInt, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+	for _, kvPair := range kvs {
+		// Skip transaction-internal keys.
+		if bytes.HasPrefix(kvPair.Key, redisTxnKeyPrefix) {
+			continue
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(kvPair.Key)})
+	}
+	return elems, nil
 }
 
 func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {

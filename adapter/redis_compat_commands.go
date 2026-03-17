@@ -452,22 +452,10 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		keys, err := r.visibleKeys([]byte("*"))
+		readTS := r.readTS()
+		elems, err := r.flushAllKeyElems(ctx, readTS)
 		if err != nil {
 			return err
-		}
-		if len(keys) == 0 {
-			return nil
-		}
-
-		readTS := r.readTS()
-		elems := make([]*kv.Elem[kv.OP], 0, len(keys))
-		for _, key := range keys {
-			keyElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, keyElems...)
 		}
 		if len(elems) == 0 {
 			return nil
@@ -1639,36 +1627,7 @@ func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lpush(conn redcon.Conn, cmd redcon.Command) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
-	var length int
-	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		if typ != redisTypeNone && typ != redisTypeList {
-			return wrongTypeError()
-		}
-		current, err := r.listValuesAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		prefix := make([]string, 0, len(cmd.Args)-redisPairWidth)
-		for i := len(cmd.Args) - 1; i >= 2; i-- {
-			prefix = append(prefix, string(cmd.Args[i]))
-		}
-		combined := make([]string, 0, len(prefix)+len(current))
-		combined = append(combined, prefix...)
-		combined = append(combined, current...)
-		length = len(combined)
-		return r.rewriteListTxn(ctx, cmd.Args[1], readTS, combined)
-	}); err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	conn.WriteInt(length)
+	r.listPushCmd(conn, cmd, r.listLPush, r.proxyLPush)
 }
 
 func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {

@@ -119,7 +119,7 @@ const (
 	redisTraceArgMaxLen      = 96
 	redisTraceArgEllipsis    = "..."
 	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
-	redisTraceRedactAfter    = 2 // redact arguments after command name + key
+	redisTraceRedactAfter    = 1 // redact arguments after key (command name already stripped by caller)
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
@@ -586,7 +586,9 @@ func (o redisSetOptions) allows(exists bool) bool {
 }
 
 func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	// Use rawKeyTypeAt (TTL-unaware) so that expired keys with lingering
+	// internal data (list/hash/set/...) are still detected for cleanup.
+	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return redisSetState{}, err
 	}
@@ -685,23 +687,44 @@ func (r *RedisServer) relayPeers() []raft.ServerAddress {
 
 func (r *RedisServer) publishCluster(ctx context.Context, channel, message []byte) int64 {
 	delivered := r.publishLocal(channel, message)
-	for _, peer := range r.relayPeers() {
-		conn, err := r.relayConnCache.ConnFor(peer)
-		if err != nil {
-			log.Printf("redis relay publish dial peer=%s err=%v", peer, err)
-			continue
+	peers := r.relayPeers()
+	if len(peers) == 0 {
+		return delivered
+	}
+
+	type peerResult struct {
+		subscribers int64
+		err         error
+	}
+	results := make(chan peerResult, len(peers))
+	overallCtx, overallCancel := context.WithTimeout(ctx, redisRelayPublishTimeout)
+	defer overallCancel()
+
+	for _, peer := range peers {
+		go func(peer raft.ServerAddress) {
+			conn, err := r.relayConnCache.ConnFor(peer)
+			if err != nil {
+				log.Printf("redis relay publish dial peer=%s err=%v", peer, err)
+				results <- peerResult{err: err}
+				return
+			}
+			resp, err := pb.NewInternalClient(conn).RelayPublish(overallCtx, &pb.RelayPublishRequest{
+				Channel: bytes.Clone(channel),
+				Message: bytes.Clone(message),
+			})
+			if err != nil {
+				log.Printf("redis relay publish peer=%s err=%v", peer, err)
+				results <- peerResult{err: err}
+				return
+			}
+			results <- peerResult{subscribers: resp.GetSubscribers()}
+		}(peer)
+	}
+
+	for range peers {
+		if res := <-results; res.err == nil {
+			delivered += res.subscribers
 		}
-		callCtx, cancel := context.WithTimeout(ctx, redisRelayPublishTimeout)
-		resp, err := pb.NewInternalClient(conn).RelayPublish(callCtx, &pb.RelayPublishRequest{
-			Channel: bytes.Clone(channel),
-			Message: bytes.Clone(message),
-		})
-		cancel()
-		if err != nil {
-			log.Printf("redis relay publish peer=%s err=%v", peer, err)
-			continue
-		}
-		delivered += resp.GetSubscribers()
 	}
 	return delivered
 }
@@ -727,6 +750,36 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 	conn.WriteString("PONG")
 }
 
+// trySetFastPath attempts the fast-path for SET (no NX/XX/GET flags) when the
+// key is a string or absent. Returns true if the fast-path handled the command.
+// When the key holds a non-string type, returns false so the caller can fall
+// through to executeSet which cleans up internal keys before overwriting.
+func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key, value []byte, ttl *time.Time) bool {
+	// Only use the fast path when we are the leader for this key so the local
+	// type check is authoritative. On followers, stale MVCC state could miss a
+	// non-string type, leaving orphaned internal keys after overwrite.
+	if !r.coordinator.IsLeaderForKey(key) {
+		return false
+	}
+	readTS := r.readTS()
+	// Use rawKeyTypeAt (TTL-unaware) so that expired keys whose internal data
+	// still exists are detected and routed through the full cleanup path.
+	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return true
+	}
+	if typ != redisTypeNone && typ != redisTypeString {
+		return false
+	}
+	if err := r.saveString(ctx, key, value, ttl); err != nil {
+		conn.WriteError(err.Error())
+		return true
+	}
+	conn.WriteString("OK")
+	return true
+}
+
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
@@ -737,12 +790,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
-	if opts.isFastPath() {
-		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], opts.ttl); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteString("OK")
+	if opts.isFastPath() && r.trySetFastPath(conn, ctx, cmd.Args[1], cmd.Args[2], opts.ttl) {
 		return
 	}
 
@@ -811,6 +859,11 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 		conn.WriteNull()
 		return
 	}
+	// Check TTL on the leader first; if expired the key is logically gone.
+	if r.isLeaderKeyExpired(key) {
+		conn.WriteNull()
+		return
+	}
 	// Check if the key is a string on the leader.
 	v, err := r.tryLeaderGetAt(key, 0)
 	if err == nil {
@@ -827,6 +880,19 @@ func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool)
 		return
 	}
 	conn.WriteNull()
+}
+
+// isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
+func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
+	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
+	if err != nil {
+		return false
+	}
+	ttl, err := decodeRedisTTL(raw)
+	if err != nil {
+		return false
+	}
+	return !ttl.After(time.Now())
 }
 
 // tryLeaderNonStringExists checks whether the key exists as a non-string type
@@ -858,6 +924,9 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 
 // tryLeaderLogicalExists checks whether the key exists as any type on the leader.
 func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+	if r.isLeaderKeyExpired(key) {
+		return false
+	}
 	// String type (raw user key).
 	if _, err := r.tryLeaderGetAt(key, 0); err == nil {
 		return true
@@ -866,14 +935,53 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
+	// DEL discovers internal keys via local MVCC state. On followers this state
+	// may lag, producing incomplete deletes. Check per-key leadership and proxy
+	// non-local keys to the correct leader for accurate internal-key discovery.
+	localKeys := make([][]byte, 0, len(cmd.Args)-1)
+	proxyKeys := make([][]byte, 0)
+	for _, key := range cmd.Args[1:] {
+		if r.coordinator.IsLeaderForKey(key) {
+			localKeys = append(localKeys, key)
+		} else {
+			proxyKeys = append(proxyKeys, key)
+		}
+	}
+
+	var removed int64
+
+	// Proxy non-local keys to the appropriate leader.
+	if len(proxyKeys) > 0 {
+		proxied, err := r.proxyDel(proxyKeys)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		removed += proxied
+	}
+
+	// Delete local keys directly.
+	if len(localKeys) > 0 {
+		localRemoved, err := r.delLocal(localKeys)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		removed += int64(localRemoved)
+	}
+
+	conn.WriteInt64(removed)
+}
+
+func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	removed := 0
+	var removed int
 	err := r.retryRedisWrite(ctx, func() error {
 		elems := []*kv.Elem[kv.OP]{}
 		nextRemoved := 0
 		readTS := r.readTS()
-		for _, key := range cmd.Args[1:] {
+		for _, key := range keys {
 			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 			if err != nil {
 				return err
@@ -889,11 +997,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 		removed = nextRemoved
 		return nil
 	})
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	conn.WriteInt(removed)
+	return removed, err
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
@@ -1100,9 +1204,6 @@ func redisVisibleUserKey(key []byte) []byte {
 	}
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		return userKey
-	}
-	if bytes.HasPrefix(key, []byte("!")) {
-		return nil
 	}
 	return key
 }
@@ -1386,7 +1487,21 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
-	return t.stageKeyDeletion(cmd.Args[1])
+	var deleted int64
+	for _, key := range cmd.Args[1:] {
+		typ, err := t.stagedKeyType(key)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if typ == redisTypeNone {
+			continue
+		}
+		if _, err := t.stageKeyDeletion(key); err != nil {
+			return redisResult{}, err
+		}
+		deleted++
+	}
+	return redisResult{typ: resultInt, integer: deleted}, nil
 }
 
 func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
@@ -1409,14 +1524,17 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 }
 
 func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
-	typ, err := t.stagedKeyType(cmd.Args[1])
-	if err != nil {
-		return redisResult{}, err
+	var count int64
+	for _, key := range cmd.Args[1:] {
+		typ, err := t.stagedKeyType(key)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if typ != redisTypeNone {
+			count++
+		}
 	}
-	if typ != redisTypeNone {
-		return redisResult{typ: resultInt, integer: 1}, nil
-	}
-	return redisResult{typ: resultInt, integer: 0}, nil
+	return redisResult{typ: resultInt, integer: count}, nil
 }
 
 func (t *txnContext) applyRPush(cmd redcon.Command) (redisResult, error) {
@@ -1972,6 +2090,56 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
 }
 
+// buildLPushOps creates Raft operations to prepend values to the head of a list.
+// This is O(k) where k = len(values), not O(N) where N is the total list length.
+// LPUSH reverses the order of arguments: LPUSH key a b c → [c, b, a, ...existing].
+func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+	if len(values) == 0 {
+		return nil, meta, nil
+	}
+
+	n := int64(len(values))
+	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	// LPUSH reverses args, so last arg gets the lowest sequence number.
+	newHead := meta.Head - n
+	for i, v := range values {
+		// values[0]=a, values[1]=b, values[2]=c → seq ordering: c(newHead), b(newHead+1), a(newHead+2)
+		seq := newHead + n - 1 - int64(i)
+		vCopy := bytes.Clone(v)
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listItemKey(key, seq), Value: vCopy})
+	}
+
+	meta.Head = newHead
+	meta.Len += n
+	// Tail stays the same: Tail = oldHead + oldLen = newHead + newLen
+
+	b, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, meta, errors.WithStack(err)
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
+	return elems, meta, nil
+}
+
+func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
+	readTS := r.readTS()
+	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+
+	ops, newMeta, err := r.buildLPushOps(meta, key, values)
+	if err != nil {
+		return 0, err
+	}
+	if len(ops) == 0 {
+		return newMeta.Len, nil
+	}
+
+	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
+}
+
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
 	if endIdx < startIdx {
 		return []string{}, nil
@@ -2079,6 +2247,28 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 	return res, errors.WithStack(err)
 }
 
+func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
+	leader := r.coordinator.RaftLeaderForKey(key)
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
+	defer func() { _ = cli.Close() }()
+
+	args := make([]any, 0, len(values))
+	for _, v := range values {
+		args = append(args, string(v))
+	}
+
+	res, err := cli.LPush(context.Background(), string(key), args...).Result()
+	return res, errors.WithStack(err)
+}
+
 func parseInt(b []byte) (int, error) {
 	i, err := strconv.Atoi(string(b))
 	return i, errors.WithStack(err)
@@ -2137,7 +2327,10 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	return r.tryLeaderGetAt(key, readTS)
 }
 
-func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)
+type listProxyFunc func(key []byte, values [][]byte) (int64, error)
+
+func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -2153,9 +2346,9 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 
 	var length int64
 	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
-		length, err = r.listRPush(ctx, cmd.Args[1], cmd.Args[2:])
+		length, err = pushFn(ctx, cmd.Args[1], cmd.Args[2:])
 	} else {
-		length, err = r.proxyRPush(cmd.Args[1], cmd.Args[2:])
+		length, err = proxyFn(cmd.Args[1], cmd.Args[2:])
 	}
 
 	if err != nil {
@@ -2163,6 +2356,10 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt64(length)
+}
+
+func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+	r.listPushCmd(conn, cmd, r.listRPush, r.proxyRPush)
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {

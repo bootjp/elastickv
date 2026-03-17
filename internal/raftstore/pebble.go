@@ -47,6 +47,9 @@ func (s *PebbleStore) FirstIndex() (uint64, error) {
 	defer func() { _ = iter.Close() }()
 
 	if !iter.First() {
+		if err := iter.Error(); err != nil {
+			return 0, errors.WithStack(err)
+		}
 		return 0, nil
 	}
 	return decodeLogIndex(iter.Key()), nil
@@ -60,6 +63,9 @@ func (s *PebbleStore) LastIndex() (uint64, error) {
 	defer func() { _ = iter.Close() }()
 
 	if !iter.Last() {
+		if err := iter.Error(); err != nil {
+			return 0, errors.WithStack(err)
+		}
 		return 0, nil
 	}
 	return decodeLogIndex(iter.Key()), nil
