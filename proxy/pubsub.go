@@ -184,7 +184,11 @@ func (s *pubsubSession) exitPubSubMode() {
 	}
 	s.mu.Unlock()
 	if s.fwdDone != nil {
-		<-s.fwdDone
+		select {
+		case <-s.fwdDone:
+		case <-time.After(cleanupFwdTimeout):
+			s.logger.Warn("forwardMessages did not exit within timeout during pub/sub mode exit")
+		}
 		s.fwdDone = nil
 	}
 }
@@ -362,7 +366,7 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(ch)
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()
@@ -430,7 +434,7 @@ func (s *pubsubSession) handleSubscribe(args [][]byte) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString("subscribe")
 		s.dconn.WriteBulkString(ch)
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()
@@ -456,7 +460,7 @@ func (s *pubsubSession) handlePSubscribe(args [][]byte) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString("psubscribe")
 		s.dconn.WriteBulkString(p)
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()
@@ -496,7 +500,7 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()
@@ -518,7 +522,7 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteNull()
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 		_ = s.dconn.Flush()
 		return
 	}
@@ -538,7 +542,7 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
-		s.dconn.WriteInt(s.subCount())
+		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
 }

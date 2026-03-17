@@ -263,7 +263,7 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 		} else {
 			session.patternSet[ch] = struct{}{}
 		}
-		dconn.WriteInt(session.subCount())
+		dconn.WriteInt64(int64(session.subCount()))
 	}
 	if err := dconn.Flush(); err != nil {
 		dconn.Close()
