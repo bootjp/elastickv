@@ -40,7 +40,7 @@ const (
 // When all subscriptions are removed, the session transitions to normal command mode,
 // enabling the client to execute regular Redis commands without reconnecting.
 type pubsubSession struct {
-	mu       sync.Mutex // protects session state (upstream, closed, channelSet, patternSet, txn)
+	mu       sync.Mutex // protects upstream and closed (channelSet, patternSet, txn are goroutine-confined to commandLoop)
 	writeMu  sync.Mutex // serializes writes to dconn; never held across state operations
 	dconn    redcon.DetachedConn
 	upstream *redis.PubSub // nil when not in pub/sub mode
@@ -477,7 +477,9 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 	if len(args) < pubsubMinArgs {
 		// Unsubscribe all: emit per-channel reply (matching Redis behavior).
 		if err := unsubFn(context.Background()); err != nil {
-			s.logger.Warn("upstream "+kind+" failed", "err", err)
+			s.logger.Warn("upstream "+kind+" failed, closing session", "err", err)
+			s.writeRedisError(err)
+			return
 		}
 		s.writeUnsubAll(kind, isPattern)
 		return
@@ -485,7 +487,9 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 
 	names := byteSlicesToStrings(args[1:])
 	if err := unsubFn(context.Background(), names...); err != nil {
-		s.logger.Warn("upstream "+kind+" failed", "err", err)
+		s.logger.Warn("upstream "+kind+" failed, closing session", "err", err)
+		s.writeRedisError(err)
+		return
 	}
 	// Update state then write replies.
 	s.writeMu.Lock()

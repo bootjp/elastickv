@@ -17,7 +17,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const sentryFlushTimeout = 2 * time.Second
+const (
+	sentryFlushTimeout     = 2 * time.Second
+	metricsShutdownTimeout = 5 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -102,7 +105,9 @@ func run() error {
 		metricsSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 		go func() {
 			<-ctx.Done()
-			if err := metricsSrv.Shutdown(context.Background()); err != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+			defer shutdownCancel()
+			if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 				logger.Warn("metrics server shutdown error", "err", err)
 			}
 		}()
