@@ -231,7 +231,7 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 	}
 	if err != nil {
 		upstream.Close()
-		conn.WriteError("ERR " + err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 

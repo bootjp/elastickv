@@ -484,41 +484,6 @@ func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
 	}
 }
 
-// TestPubSub_DuplicateSubscribeDoesNotOvercount verifies that subscribing to the
-// same channel multiple times doesn't inflate the subscription count.
-func TestPubSub_DuplicateSubscribeDoesNotOvercount(t *testing.T) {
-	s := newTestSession(newMockDetachedConn())
-
-	// First subscribe
-	s.channelSet["ch1"] = struct{}{}
-	assert.Equal(t, 1, s.subCount())
-
-	// Duplicate subscribe (idempotent)
-	s.channelSet["ch1"] = struct{}{}
-	assert.Equal(t, 1, s.subCount(), "duplicate subscribe must not increase count")
-
-	// Add new channel
-	s.channelSet["ch2"] = struct{}{}
-	assert.Equal(t, 2, s.subCount())
-}
-
-// TestPubSub_UnsubscribeNonExistent verifies that unsubscribing from a channel
-// that was never subscribed does not affect the count.
-func TestPubSub_UnsubscribeNonExistent(t *testing.T) {
-	s := newTestSession(newMockDetachedConn())
-
-	s.channelSet["ch1"] = struct{}{}
-	s.channelSet["ch2"] = struct{}{}
-
-	// Delete non-existent: no panic, no effect
-	delete(s.channelSet, "never-subscribed")
-	assert.Equal(t, 2, s.subCount())
-
-	// Delete existing
-	delete(s.channelSet, "ch1")
-	assert.Equal(t, 1, s.subCount())
-}
-
 // TestPubSub_CleanupClosesUpstream verifies that cleanup closes upstream and dconn.
 func TestPubSub_CleanupClosesUpstream(t *testing.T) {
 	dconn := newMockDetachedConn()

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -326,7 +327,7 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	}
 	if err != nil {
 		upstream.Close()
-		s.writeError("ERR " + err.Error())
+		s.writeRedisError(err)
 		return
 	}
 
@@ -401,6 +402,7 @@ func (s *pubsubSession) handleSubscribe(args [][]byte) {
 	channels := byteSlicesToStrings(args[1:])
 	if err := s.upstream.Subscribe(context.Background(), channels...); err != nil {
 		s.logger.Warn("upstream subscribe failed", "err", err)
+		s.writeRedisError(err)
 		return
 	}
 	s.mu.Lock()
@@ -424,6 +426,7 @@ func (s *pubsubSession) handlePSubscribe(args [][]byte) {
 	pats := byteSlicesToStrings(args[1:])
 	if err := s.upstream.PSubscribe(context.Background(), pats...); err != nil {
 		s.logger.Warn("upstream psubscribe failed", "err", err)
+		s.writeRedisError(err)
 		return
 	}
 	s.mu.Lock()
@@ -561,6 +564,17 @@ func (s *pubsubSession) writeError(msg string) {
 	defer s.mu.Unlock()
 	s.dconn.WriteError(msg)
 	_ = s.dconn.Flush()
+}
+
+// writeRedisError writes an upstream error, preserving redis.Error prefixes verbatim
+// and normalizing other errors to "ERR ..." (matching writeRedisError in proxy.go).
+func (s *pubsubSession) writeRedisError(err error) {
+	var redisErr redis.Error
+	if errors.As(err, &redisErr) {
+		s.writeError(redisErr.Error())
+		return
+	}
+	s.writeError("ERR " + err.Error())
 }
 
 func (s *pubsubSession) writeString(msg string) {
