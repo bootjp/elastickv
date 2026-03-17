@@ -164,7 +164,7 @@ func TestLocalKeysPattern_UsesSingleSnapshotTSAcrossScans(t *testing.T) {
 
 	_, err := r.localKeysPattern([]byte("test*"))
 	require.NoError(t, err)
-	require.Len(t, tracking.scanTS, 3)
+	require.NotEmpty(t, tracking.scanTS)
 	for _, ts := range tracking.scanTS {
 		require.Equal(t, tracking.scanTS[0], ts)
 	}

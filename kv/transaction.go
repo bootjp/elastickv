@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"sync"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -11,12 +12,56 @@ import (
 
 type TransactionManager struct {
 	raft *raft.Raft
+
+	mu          sync.Mutex
+	rawPending  []*rawCommitItem
+	rawFlushing bool
+	closeCh     chan struct{}
+	closeOnce   sync.Once
 }
+
+type rawCommitItem struct {
+	reqs []*pb.Request
+	done chan rawCommitResult
+}
+
+type rawCommitResult struct {
+	commitIndex uint64
+	err         error
+}
+
+const maxRawBatchRequests = 64
+const maxRawPendingItems = 4096
+
+var rawBatchWindow = 500 * time.Microsecond
+
+var errRawQueueFull = errors.New("raw commit queue is full; try again later")
 
 func NewTransaction(raft *raft.Raft) *TransactionManager {
 	return &TransactionManager{
-		raft: raft,
+		raft:    raft,
+		closeCh: make(chan struct{}),
 	}
+}
+
+var errShuttingDown = errors.New("transaction manager is shutting down")
+
+// Close signals the TransactionManager to stop and drains any pending raw
+// commit items, sending each an error so callers are not blocked forever.
+func (t *TransactionManager) Close() {
+	t.closeOnce.Do(func() {
+		close(t.closeCh)
+
+		t.mu.Lock()
+		pending := t.rawPending
+		t.rawPending = nil
+		t.rawFlushing = false
+		t.mu.Unlock()
+
+		for _, item := range pending {
+			item.done <- rawCommitResult{err: errShuttingDown}
+		}
+	})
 }
 
 type Transactional interface {
@@ -28,42 +73,83 @@ type TransactionResponse struct {
 	CommitIndex uint64
 }
 
-// applyAndBarrier submits a log entry, waits for it to be applied, and
-// surfaces both Raft transport errors and errors returned from FSM.Apply.
-// HashiCorp Raft delivers FSM errors via ApplyFuture.Response(), not Error(),
+func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
+	if len(reqs) == 1 {
+		b, err := proto.Marshal(reqs[0])
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return b, nil
+	}
+	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return b, nil
+}
+
+// applyRequests submits one raft command and returns per-request FSM results.
+// HashiCorp Raft delivers FSM responses via ApplyFuture.Response(), not Error(),
 // so we must inspect the response to avoid silently treating failed writes as
 // successes.
-func applyAndBarrier(r *raft.Raft, b []byte) (uint64, error) {
+func applyRequests(r *raft.Raft, reqs []*pb.Request) (uint64, []error, error) {
+	b, err := marshalRaftCommand(reqs)
+	if err != nil {
+		return 0, nil, errors.WithStack(err)
+	}
+
 	af := r.Apply(b, time.Second)
 	if err := af.Error(); err != nil {
-		return 0, errors.WithStack(err)
+		return 0, nil, errors.WithStack(err)
 	}
 
-	if resp := af.Response(); resp != nil {
-		if err, ok := resp.(error); ok && err != nil {
-			return 0, errors.WithStack(err)
+	switch resp := af.Response().(type) {
+	case nil:
+		return af.Index(), make([]error, len(reqs)), nil
+	case error:
+		if len(reqs) != 1 {
+			return 0, nil, errors.WithStack(resp)
 		}
+		return af.Index(), []error{errors.WithStack(resp)}, nil
+	case *fsmApplyResponse:
+		if len(resp.results) != len(reqs) {
+			return 0, nil, errors.WithStack(errors.Newf("unexpected apply response size: got %d want %d", len(resp.results), len(reqs)))
+		}
+		return af.Index(), resp.results, nil
+	default:
+		return 0, nil, errors.WithStack(errors.Newf("unexpected apply response type %T", resp))
 	}
-
-	if f := r.Barrier(time.Second); f.Error() != nil {
-		return 0, errors.WithStack(f.Error())
-	}
-
-	return af.Index(), nil
 }
 
 func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	if len(reqs) == 0 {
+		return &TransactionResponse{}, nil
+	}
+	if hasTxnRequests(reqs) {
+		return t.commitSequential(reqs)
+	}
+	return t.commitRaw(reqs)
+}
+
+func hasTxnRequests(reqs []*pb.Request) bool {
+	for _, req := range reqs {
+		if req != nil && req.IsTxn {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionResponse, error) {
 	commitIndex, err := func() (uint64, error) {
 		commitIndex := uint64(0)
 		for _, req := range reqs {
-			b, err := proto.Marshal(req)
-			if err != nil {
-				return 0, errors.WithStack(err)
-			}
-
-			idx, err := applyAndBarrier(t.raft, b)
+			idx, results, err := applyRequests(t.raft, []*pb.Request{req})
 			if err != nil {
 				return 0, err
+			}
+			if len(results) > 0 && results[0] != nil {
+				return 0, results[0]
 			}
 			commitIndex = idx
 		}
@@ -86,6 +172,144 @@ func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	return &TransactionResponse{
 		CommitIndex: commitIndex,
 	}, nil
+}
+
+func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse, error) {
+	item := &rawCommitItem{
+		reqs: reqs,
+		done: make(chan rawCommitResult, 1),
+	}
+
+	shouldFlush := false
+	t.mu.Lock()
+	select {
+	case <-t.closeCh:
+		t.mu.Unlock()
+		return nil, errShuttingDown
+	default:
+	}
+	if len(t.rawPending) >= maxRawPendingItems {
+		t.mu.Unlock()
+		return nil, errRawQueueFull
+	}
+	t.rawPending = append(t.rawPending, item)
+	if !t.rawFlushing {
+		t.rawFlushing = true
+		shouldFlush = true
+	}
+	t.mu.Unlock()
+
+	if shouldFlush {
+		go t.flushRawPending()
+	}
+
+	res := <-item.done
+	if res.err != nil {
+		return nil, res.err
+	}
+	return &TransactionResponse{CommitIndex: res.commitIndex}, nil
+}
+
+func (t *TransactionManager) flushRawPending() {
+	timer := time.NewTimer(rawBatchWindow)
+	select {
+	case <-timer.C:
+	case <-t.closeCh:
+		timer.Stop()
+		return
+	}
+
+	for {
+		select {
+		case <-t.closeCh:
+			return
+		default:
+		}
+
+		batch := t.takeRawBatch()
+		if len(batch) == 0 {
+			t.mu.Lock()
+			if len(t.rawPending) > 0 {
+				t.mu.Unlock()
+				continue
+			}
+			t.rawFlushing = false
+			t.mu.Unlock()
+			return
+		}
+
+		t.applyRawBatch(batch)
+
+		t.mu.Lock()
+		if len(t.rawPending) == 0 {
+			t.rawFlushing = false
+			t.mu.Unlock()
+			return
+		}
+		t.mu.Unlock()
+	}
+}
+
+func (t *TransactionManager) takeRawBatch() []*rawCommitItem {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.rawPending) == 0 {
+		return nil
+	}
+
+	count := 0
+	n := 0
+	for n < len(t.rawPending) {
+		next := count + len(t.rawPending[n].reqs)
+		if n > 0 && next > maxRawBatchRequests {
+			break
+		}
+		count = next
+		n++
+	}
+
+	batch := append([]*rawCommitItem(nil), t.rawPending[:n]...)
+	t.rawPending = t.rawPending[n:]
+	return batch
+}
+
+func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
+	reqs := make([]*pb.Request, 0, maxRawBatchRequests)
+	offsets := make([]int, 0, len(batch)+1)
+	for _, item := range batch {
+		offsets = append(offsets, len(reqs))
+		reqs = append(reqs, item.reqs...)
+	}
+	offsets = append(offsets, len(reqs))
+
+	idx, results, err := applyRequests(t.raft, reqs)
+	if err != nil {
+		for _, item := range batch {
+			item.done <- rawCommitResult{err: err}
+		}
+		return
+	}
+
+	for i, item := range batch {
+		itemErr := combineApplyErrors(results[offsets[i]:offsets[i+1]])
+		if itemErr != nil {
+			item.done <- rawCommitResult{err: itemErr}
+			continue
+		}
+		item.done <- rawCommitResult{commitIndex: idx}
+	}
+}
+
+func combineApplyErrors(errs []error) error {
+	var combined error
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		combined = errors.CombineErrors(combined, err)
+	}
+	return errors.WithStack(combined)
 }
 
 func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
@@ -123,14 +347,12 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 
 	var commitIndex uint64
 	for _, req := range abortReqs {
-		b, err := proto.Marshal(req)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		idx, err := applyAndBarrier(t.raft, b)
+		idx, results, err := applyRequests(t.raft, []*pb.Request{req})
 		if err != nil {
 			return nil, err
+		}
+		if len(results) > 0 && results[0] != nil {
+			return nil, results[0]
 		}
 		commitIndex = idx
 	}

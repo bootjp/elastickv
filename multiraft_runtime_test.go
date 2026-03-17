@@ -55,9 +55,7 @@ func TestNewRaftGroupBootstrap(t *testing.T) {
 	_, err = os.Stat(dir)
 	require.NoError(t, err)
 
-	_, err = os.Stat(filepath.Join(dir, "logs.dat"))
-	require.NoError(t, err)
-	_, err = os.Stat(filepath.Join(dir, "stable.dat"))
+	_, err = os.Stat(filepath.Join(dir, "raft.db"))
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {

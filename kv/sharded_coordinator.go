@@ -414,37 +414,6 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 	return route.GroupID
 }
 
-func (c *ShardedCoordinator) toRawRequest(req *Elem[OP]) *pb.Request {
-	switch req.Op {
-	case Put:
-		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
-			Mutations: []*pb.Mutation{
-				{
-					Op:    pb.Op_PUT,
-					Key:   req.Key,
-					Value: req.Value,
-				},
-			},
-		}
-	case Del:
-		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
-			Mutations: []*pb.Mutation{
-				{
-					Op:  pb.Op_DEL,
-					Key: req.Key,
-				},
-			},
-		}
-	}
-	panic("unreachable")
-}
-
 var _ Coordinator = (*ShardedCoordinator)(nil)
 
 func validateOperationGroup(reqs *OperationGroup[OP]) error {
@@ -463,15 +432,25 @@ func (c *ShardedCoordinator) requestLogs(reqs *OperationGroup[OP]) ([]*pb.Reques
 	if reqs.IsTxn {
 		return c.txnLogs(reqs)
 	}
-	return c.rawLogs(reqs), nil
+	return c.rawLogs(reqs)
 }
 
-func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) []*pb.Request {
-	logs := make([]*pb.Request, 0, len(reqs.Elems))
-	for _, req := range reqs.Elems {
-		logs = append(logs, c.toRawRequest(req))
+func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+	grouped, gids, err := c.groupMutations(reqs.Elems)
+	if err != nil {
+		return nil, err
 	}
-	return logs
+
+	logs := make([]*pb.Request, 0, len(gids))
+	for _, gid := range gids {
+		logs = append(logs, &pb.Request{
+			IsTxn:     false,
+			Phase:     pb.Phase_NONE,
+			Ts:        c.clock.Next(),
+			Mutations: grouped[gid],
+		})
+	}
+	return logs, nil
 }
 
 func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {

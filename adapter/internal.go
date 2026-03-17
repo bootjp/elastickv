@@ -10,11 +10,12 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-func NewInternal(txm kv.Transactional, r *raft.Raft, clock *kv.HLC) *Internal {
+func NewInternal(txm kv.Transactional, r *raft.Raft, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
 	return &Internal{
 		raft:               r,
 		transactionManager: txm,
 		clock:              clock,
+		relay:              relay,
 	}
 }
 
@@ -22,6 +23,7 @@ type Internal struct {
 	raft               *raft.Raft
 	transactionManager kv.Transactional
 	clock              *kv.HLC
+	relay              *RedisPubSubRelay
 
 	pb.UnimplementedInternalServer
 }
@@ -55,6 +57,15 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 	return &pb.ForwardResponse{
 		Success:     true,
 		CommitIndex: r.CommitIndex,
+	}, nil
+}
+
+func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
+	if req == nil || i.relay == nil {
+		return &pb.RelayPublishResponse{}, nil
+	}
+	return &pb.RelayPublishResponse{
+		Subscribers: i.relay.Publish(req.Channel, req.Message),
 	}, nil
 }
 

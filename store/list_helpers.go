@@ -49,13 +49,18 @@ func MarshalListMeta(meta ListMeta) ([]byte, error) { return marshalListMeta(met
 func UnmarshalListMeta(b []byte) (ListMeta, error) { return unmarshalListMeta(b) }
 
 func marshalListMeta(meta ListMeta) ([]byte, error) {
-	if meta.Head < 0 || meta.Tail < 0 || meta.Len < 0 {
-		return nil, errors.WithStack(errors.Newf("list meta contains negative value: head=%d tail=%d len=%d", meta.Head, meta.Tail, meta.Len))
+	if meta.Len < 0 {
+		return nil, errors.WithStack(errors.Newf("list meta contains negative len: %d", meta.Len))
 	}
+	// Recompute Tail from Head+Len to guarantee the invariant and detect overflow.
+	if meta.Len > 0 && meta.Head > math.MaxInt64-meta.Len {
+		return nil, errors.WithStack(errors.Newf("list meta Head+Len overflows int64: head=%d len=%d", meta.Head, meta.Len))
+	}
+	meta.Tail = meta.Head + meta.Len
 
 	buf := make([]byte, listMetaBinarySize)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail))
+	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))  //nolint:gosec // Head can be negative after LPUSH; uint64 cast preserves bits
+	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail)) //nolint:gosec // Tail = Head + Len, may be negative
 	binary.BigEndian.PutUint64(buf[16:24], uint64(meta.Len))
 	return buf, nil
 }
@@ -65,18 +70,28 @@ func unmarshalListMeta(b []byte) (ListMeta, error) {
 		return ListMeta{}, errors.Wrap(errors.Newf("invalid list meta length: %d", len(b)), "unmarshal list meta")
 	}
 
-	head := binary.BigEndian.Uint64(b[0:8])
-	tail := binary.BigEndian.Uint64(b[8:16])
+	head := int64(binary.BigEndian.Uint64(b[0:8]))  //nolint:gosec // Head may be negative after LPUSH
+	tail := int64(binary.BigEndian.Uint64(b[8:16])) //nolint:gosec // Tail = Head + Len, may be negative
 	length := binary.BigEndian.Uint64(b[16:24])
 
-	if head > math.MaxInt64 || tail > math.MaxInt64 || length > math.MaxInt64 {
-		return ListMeta{}, errors.New("list meta value overflows int64")
+	if length > math.MaxInt64 {
+		return ListMeta{}, errors.New("list meta length overflows int64")
+	}
+	iLen := int64(length)
+	// Recompute expectedTail with overflow check instead of relying on
+	// tail-head subtraction which wraps on int64 overflow.
+	if iLen > 0 && head > math.MaxInt64-iLen {
+		return ListMeta{}, errors.WithStack(errors.Newf("list meta head+len overflows int64: head=%d len=%d", head, iLen))
+	}
+	expectedTail := head + iLen
+	if tail != expectedTail {
+		return ListMeta{}, errors.WithStack(errors.Newf("list meta invariant violated: tail (%d) != head+len (%d)", tail, expectedTail))
 	}
 
 	return ListMeta{
-		Head: int64(head),
-		Tail: int64(tail),
-		Len:  int64(length),
+		Head: head,
+		Tail: tail,
+		Len:  iLen,
 	}, nil
 }
 
@@ -87,7 +102,7 @@ func encodeSortableInt64(dst []byte, seq int64) {
 	if len(dst) < sortableInt64Bytes {
 		return
 	}
-	binary.BigEndian.PutUint64(dst, uint64(seq^math.MinInt64))
+	binary.BigEndian.PutUint64(dst, uint64(seq^math.MinInt64)) //nolint:gosec // XOR trick for sortable int64 encoding
 }
 
 // IsListMetaKey Exported helpers for other packages (e.g., Redis adapter).

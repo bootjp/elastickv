@@ -164,12 +164,13 @@ func startAddVoterJoinNode(
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
 	coordinator := kv.NewCoordinator(trx, r)
+	relay := NewRedisPubSubRelay()
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
-	pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock()))
+	pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock(), relay))
 	leaderhealth.Setup(r, s, []string{"RawKV"})
 	raftadmin.Register(s, r)
 
@@ -181,7 +182,7 @@ func startAddVoterJoinNode(
 		return err
 	})
 
-	rd := NewRedisServer(lis.redis, st, coordinator, leaderRedisMap)
+	rd := NewRedisServer(lis.redis, port.redisAddress, st, coordinator, leaderRedisMap, relay)
 	workers.Go(func() error {
 		err := rd.Run()
 		if errors.Is(err, net.ErrClosed) {

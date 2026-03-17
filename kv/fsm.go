@@ -37,32 +37,84 @@ var _ raft.FSM = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
 
+type fsmApplyResponse struct {
+	results []error
+}
+
 func (f *kvFSM) Apply(l *raft.Log) any {
 	ctx := context.TODO()
 
-	r := &pb.Request{}
-	err := proto.Unmarshal(l.Data, r)
+	reqs, err := decodeRaftRequests(l.Data)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if len(reqs) == 1 {
+		return f.applyRequest(ctx, reqs[0])
+	}
+
+	resp := &fsmApplyResponse{results: make([]error, len(reqs))}
+	hasError := false
+	for i, req := range reqs {
+		err := f.applyRequestErr(ctx, req)
+		if err == nil {
+			continue
+		}
+		resp.results[i] = err
+		hasError = true
+	}
+	if hasError {
+		return resp
+	}
+	return nil
+}
+
+func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
+	cmd := &pb.RaftCommand{}
+	if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
+		return cmd.Requests, nil
+	}
+
+	req := &pb.Request{}
+	if err := proto.Unmarshal(data, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return []*pb.Request{req}, nil
+}
+
+func requestCommitTS(r *pb.Request) (uint64, error) {
+	if r == nil {
+		return 0, errors.WithStack(ErrInvalidRequest)
 	}
 
 	commitTS := r.Ts
 	if r.IsTxn && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT) {
 		meta, _, err := extractTxnMeta(r.Mutations)
 		if err != nil {
-			return errors.WithStack(err)
+			return 0, errors.WithStack(err)
 		}
 		if meta.CommitTS == 0 {
-			return errors.WithStack(ErrTxnCommitTSRequired)
+			return 0, errors.WithStack(ErrTxnCommitTSRequired)
 		}
 		commitTS = meta.CommitTS
 	}
+	return commitTS, nil
+}
 
-	err = f.handleRequest(ctx, r, commitTS)
+func (f *kvFSM) applyRequest(ctx context.Context, r *pb.Request) any {
+	if err := f.applyRequestErr(ctx, r); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
+	commitTS, err := requestCommitTS(r)
 	if err != nil {
+		return err
+	}
+	if err := f.handleRequest(ctx, r, commitTS); err != nil {
 		return errors.WithStack(err)
 	}
-
 	return nil
 }
 

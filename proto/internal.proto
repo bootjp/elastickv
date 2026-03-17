@@ -6,6 +6,7 @@ option go_package = "github.com/bootjp/elastickv/proto";
 service Internal {
   // for internal leader redirect only
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
+  rpc RelayPublish(RelayPublishRequest) returns (RelayPublishResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -34,6 +35,10 @@ message Request {
   repeated Mutation mutations = 4;
 }
 
+message RaftCommand {
+  repeated Request requests = 1;
+}
+
 message ForwardRequest {
   bool is_txn = 1;
   repeated Request requests = 2;
@@ -45,6 +50,14 @@ message ForwardResponse {
   uint64 commit_index = 2;
 }
 
+message RelayPublishRequest {
+  bytes channel = 1;
+  bytes message = 2;
+}
+
+message RelayPublishResponse {
+  int64 subscribers = 1;
+}
 
 
 
