@@ -91,7 +91,9 @@ func run() error {
 		metricsSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 		go func() {
 			<-ctx.Done()
-			metricsSrv.Close()
+			if err := metricsSrv.Shutdown(context.Background()); err != nil {
+				logger.Warn("metrics server shutdown error", "err", err)
+			}
 		}()
 		logger.Info("metrics server starting", "addr", cfg.MetricsAddr)
 		if err := metricsSrv.Serve(ln); err != nil && err != http.ErrServerClosed {

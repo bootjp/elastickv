@@ -28,6 +28,9 @@ type SentryReporter struct {
 
 // NewSentryReporter initialises Sentry. If dsn is empty, reporting is disabled.
 func NewSentryReporter(dsn string, environment string, sampleRate float64, logger *slog.Logger) *SentryReporter {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	r := &SentryReporter{
 		logger:     logger,
 		cooldown:   defaultReportCooldown,
@@ -99,6 +102,10 @@ func (r *SentryReporter) ShouldReport(fingerprint string) bool {
 			if now.Sub(t) >= r.cooldown {
 				delete(r.lastReport, k)
 			}
+		}
+		// If still at capacity after eviction, skip tracking to prevent unbounded growth.
+		if len(r.lastReport) >= maxReportEntries {
+			return true
 		}
 	}
 

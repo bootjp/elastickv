@@ -321,22 +321,13 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 	cmds = append(cmds, []interface{}{"EXEC"})
 
 	results, err := p.dual.Primary().Pipeline(ctx, cmds)
-	if err != nil {
-		// Pipeline exec error — still try to extract EXEC result
-		if len(results) > 0 {
-			lastResult := results[len(results)-1]
-			resp, rErr := lastResult.Result()
-			writeResponse(conn, resp, rErr)
-		} else {
-			writeRedisError(conn, err)
-		}
-	} else {
-		// The EXEC result is the last command
-		if len(results) > 0 {
-			lastResult := results[len(results)-1]
-			resp, rErr := lastResult.Result()
-			writeResponse(conn, resp, rErr)
-		}
+	if len(results) > 0 {
+		// Write the EXEC result (last command in the pipeline).
+		lastResult := results[len(results)-1]
+		resp, rErr := lastResult.Result()
+		writeResponse(conn, resp, rErr)
+	} else if err != nil {
+		writeRedisError(conn, err)
 	}
 
 	// Async replay to secondary (bounded)

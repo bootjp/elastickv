@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -54,7 +55,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 
 // Write sends a write command to the primary synchronously, then to the secondary asynchronously.
 func (d *DualWriter) Write(ctx context.Context, args [][]byte) (interface{}, error) {
-	cmd := string(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -83,7 +84,7 @@ func (d *DualWriter) Write(ctx context.Context, args [][]byte) (interface{}, err
 
 // Read sends a read command to the primary and optionally performs a shadow read.
 func (d *DualWriter) Read(ctx context.Context, args [][]byte) (interface{}, error) {
-	cmd := string(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -117,7 +118,7 @@ func (d *DualWriter) Read(ctx context.Context, args [][]byte) (interface{}, erro
 // Blocking forwards a blocking command to the primary only.
 // Optionally sends a short-timeout version to secondary for warmup.
 func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (interface{}, error) {
-	cmd := string(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -148,7 +149,7 @@ func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (interface{}, 
 
 // Admin forwards an admin command to the primary only.
 func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (interface{}, error) {
-	cmd := string(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -169,7 +170,7 @@ func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (interface{}, err
 
 // Script forwards EVAL/EVALSHA to the primary, and async replays to secondary.
 func (d *DualWriter) Script(ctx context.Context, args [][]byte) (interface{}, error) {
-	cmd := string(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -216,7 +217,7 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []interface{}) {
 }
 
 // goAsync launches fn in a bounded goroutine. If the semaphore is full,
-// the work is dropped and a metric is incremented rather than blocking the caller.
+// the work is dropped and a warning is logged rather than blocking the caller.
 func (d *DualWriter) goAsync(fn func()) {
 	select {
 	case d.asyncSem <- struct{}{}:

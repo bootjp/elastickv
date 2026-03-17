@@ -94,25 +94,32 @@ func (s *pubsubSession) readClientCommands() {
 		if len(cmd.Args) == 0 {
 			continue
 		}
-		switch strings.ToUpper(string(cmd.Args[0])) {
-		case cmdSubscribe:
-			s.handleSubscribe(cmd.Args)
-		case cmdUnsubscribe:
-			s.handleUnsub(cmd.Args, false)
-		case cmdPSubscribe:
-			s.handlePSubscribe(cmd.Args)
-		case cmdPUnsubscribe:
-			s.handleUnsub(cmd.Args, true)
-		case "PING":
-			s.handlePing(cmd.Args)
-		case "QUIT":
+		if !s.dispatchPubSubCommand(cmd.Args) {
 			return
-		default:
-			// In pub/sub mode, Redis only allows (P)SUBSCRIBE, (P)UNSUBSCRIBE, PING, and QUIT.
-			// Any other command must return an error to avoid clients hanging waiting for a reply.
-			s.writeError("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context")
 		}
 	}
+}
+
+// dispatchPubSubCommand handles a single command in pub/sub mode.
+// Returns false if the session should end (QUIT).
+func (s *pubsubSession) dispatchPubSubCommand(args [][]byte) bool {
+	switch strings.ToUpper(string(args[0])) {
+	case cmdSubscribe:
+		s.handleSubscribe(args)
+	case cmdUnsubscribe:
+		s.handleUnsub(args, false)
+	case cmdPSubscribe:
+		s.handlePSubscribe(args)
+	case cmdPUnsubscribe:
+		s.handleUnsub(args, true)
+	case "PING":
+		s.handlePing(args)
+	case "QUIT":
+		return false
+	default:
+		s.writeError("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context")
+	}
+	return true
 }
 
 func (s *pubsubSession) handleSubscribe(args [][]byte) {
