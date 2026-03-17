@@ -159,14 +159,15 @@ func truncateValue(v any) string {
 		return truncateString(tv.String())
 	default:
 		rv := reflect.ValueOf(v)
-		kind := rv.Kind()
-		if kind == reflect.Slice || kind == reflect.Array {
+		switch rv.Kind() { //nolint:exhaustive // only slice/array/map need special handling
+		case reflect.Slice, reflect.Array:
 			return formatSliceValue(rv, maxSentryValueLen)
-		} else if kind == reflect.Map {
+		case reflect.Map:
 			return formatMapValue(rv, maxSentryValueLen)
+		default:
+			// For non-container types, fall back to fmt and then truncate.
+			return truncateString(fmt.Sprintf("%v", v))
 		}
-		// For non-container types, fall back to fmt and then truncate.
-		return truncateString(fmt.Sprintf("%v", v))
 	}
 }
 
