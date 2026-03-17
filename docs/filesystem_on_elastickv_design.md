@@ -186,7 +186,7 @@ Result: a file is naturally concentrated on one shard-home range.
 
 ### 7.2 Route key normalization
 
-Extend shard route normalization (currently `kv.routeKey` behavior in `kv/shard_key.go` for internal key families) to treat:
+Extend the route key normalization implemented by the unexported helper `routeKey` in `kv/shard_key.go` (used for internal key families) to treat:
 
 1. `!fs|chk|<home_slot>|<inode_id>|<chunk_index>`
 2. transaction-wrapped variants (`!txn|...`)
