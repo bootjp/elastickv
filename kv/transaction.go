@@ -31,8 +31,11 @@ type rawCommitResult struct {
 }
 
 const maxRawBatchRequests = 64
+const maxRawPendingItems = 4096
 
 var rawBatchWindow = 500 * time.Microsecond
+
+var errRawQueueFull = errors.New("raw commit queue is full; try again later")
 
 func NewTransaction(raft *raft.Raft) *TransactionManager {
 	return &TransactionManager{
@@ -184,6 +187,10 @@ func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse
 		t.mu.Unlock()
 		return nil, errShuttingDown
 	default:
+	}
+	if len(t.rawPending) >= maxRawPendingItems {
+		t.mu.Unlock()
+		return nil, errRawQueueFull
 	}
 	t.rawPending = append(t.rawPending, item)
 	if !t.rawFlushing {

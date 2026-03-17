@@ -52,6 +52,12 @@ func marshalListMeta(meta ListMeta) ([]byte, error) {
 	if meta.Len < 0 {
 		return nil, errors.WithStack(errors.Newf("list meta contains negative len: %d", meta.Len))
 	}
+	// Recompute Tail from Head+Len to guarantee the invariant and detect overflow.
+	expectedTail := meta.Head + meta.Len
+	if meta.Len > 0 && ((meta.Head > 0 && expectedTail < meta.Head) || (meta.Head < 0 && meta.Len > math.MaxInt64+meta.Head)) {
+		return nil, errors.WithStack(errors.Newf("list meta Head+Len overflows int64: head=%d len=%d", meta.Head, meta.Len))
+	}
+	meta.Tail = expectedTail
 
 	buf := make([]byte, listMetaBinarySize)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))  //nolint:gosec // Head can be negative after LPUSH; uint64 cast preserves bits
@@ -72,11 +78,15 @@ func unmarshalListMeta(b []byte) (ListMeta, error) {
 	if length > math.MaxInt64 {
 		return ListMeta{}, errors.New("list meta length overflows int64")
 	}
+	iLen := int64(length)
+	if tail-head != iLen {
+		return ListMeta{}, errors.WithStack(errors.Newf("list meta invariant violated: tail-head (%d) != len (%d)", tail-head, iLen))
+	}
 
 	return ListMeta{
 		Head: head,
 		Tail: tail,
-		Len:  int64(length),
+		Len:  iLen,
 	}, nil
 }
 
