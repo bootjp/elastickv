@@ -586,7 +586,9 @@ func (o redisSetOptions) allows(exists bool) bool {
 }
 
 func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	// Use rawKeyTypeAt (TTL-unaware) so that expired keys with lingering
+	// internal data (list/hash/set/...) are still detected for cleanup.
+	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return redisSetState{}, err
 	}
@@ -760,7 +762,9 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 		return false
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	// Use rawKeyTypeAt (TTL-unaware) so that expired keys whose internal data
+	// still exists are detected and routed through the full cleanup path.
+	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return true
