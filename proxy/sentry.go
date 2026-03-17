@@ -74,9 +74,13 @@ func (r *SentryReporter) CaptureException(err error, operation string, args [][]
 	})
 }
 
-// CaptureDivergence reports a data divergence to Sentry.
+// CaptureDivergence reports a data divergence to Sentry with cooldown-based de-duplication.
 func (r *SentryReporter) CaptureDivergence(div Divergence) {
 	if !r.enabled {
+		return
+	}
+	fingerprint := fmt.Sprintf("divergence_%s_%s", div.Kind.String(), div.Command)
+	if !r.ShouldReport(fingerprint) {
 		return
 	}
 	r.hub.WithScope(func(scope *sentry.Scope) {

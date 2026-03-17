@@ -163,6 +163,10 @@ func (p *ProxyServer) handleQueuedCommand(conn redcon.Conn, state *proxyConnStat
 	case cmdMulti:
 		conn.WriteError("ERR MULTI calls can not be nested")
 	default:
+		// NOTE: Commands are queued locally and always return QUEUED without
+		// upstream validation. Real Redis validates queued commands immediately
+		// (e.g., wrong arity returns an error). Full compatibility would require
+		// pinning a dedicated upstream connection for the MULTI..EXEC lifetime.
 		state.txnQueue = append(state.txnQueue, args)
 		conn.WriteString("QUEUED")
 	}
@@ -235,24 +239,26 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 	dconn := conn.Detach()
 
 	session := &pubsubSession{
-		dconn:    dconn,
-		upstream: upstream,
-		proxy:    p,
-		logger:   p.logger,
+		dconn:      dconn,
+		upstream:   upstream,
+		proxy:      p,
+		logger:     p.logger,
+		channelSet: make(map[string]struct{}),
+		patternSet: make(map[string]struct{}),
 	}
 
 	// Write initial subscription confirmations.
 	kind := strings.ToLower(cmdName)
-	for i, ch := range channels {
+	for _, ch := range channels {
 		dconn.WriteArray(pubsubArrayReply)
 		dconn.WriteBulkString(kind)
 		dconn.WriteBulkString(ch)
 		if cmdName == cmdSubscribe {
-			session.channels = i + 1
+			session.channelSet[ch] = struct{}{}
 		} else {
-			session.patterns = i + 1
+			session.patternSet[ch] = struct{}{}
 		}
-		dconn.WriteInt(session.channels + session.patterns)
+		dconn.WriteInt(session.subCount())
 	}
 	if err := dconn.Flush(); err != nil {
 		dconn.Close()

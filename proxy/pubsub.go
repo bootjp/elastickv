@@ -41,9 +41,10 @@ type pubsubSession struct {
 	logger   *slog.Logger
 	closed   bool
 
-	// Track subscription counts for RESP replies.
-	channels int
-	patterns int
+	// Track subscribed channels/patterns in sets for idempotent subscribe/unsubscribe
+	// and correct subscription count tracking (matching Redis behavior).
+	channelSet map[string]struct{}
+	patternSet map[string]struct{}
 
 	// fwdDone is closed when the current forwardMessages goroutine exits.
 	fwdDone chan struct{}
@@ -51,6 +52,11 @@ type pubsubSession struct {
 	// Transaction state for normal command mode.
 	inTxn    bool
 	txnQueue [][][]byte
+}
+
+// subCount returns the total number of active subscriptions (channels + patterns).
+func (s *pubsubSession) subCount() int {
+	return len(s.channelSet) + len(s.patternSet)
 }
 
 // run starts the session. It blocks until the client disconnects or sends QUIT.
@@ -135,7 +141,7 @@ func (s *pubsubSession) commandLoop() {
 		name := strings.ToUpper(string(args[0]))
 
 		s.mu.Lock()
-		inPubSub := s.channels > 0 || s.patterns > 0
+		inPubSub := s.subCount() > 0
 		s.mu.Unlock()
 
 		if inPubSub {
@@ -154,7 +160,7 @@ func (s *pubsubSession) commandLoop() {
 func (s *pubsubSession) shouldExitPubSub() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.upstream != nil && s.channels == 0 && s.patterns == 0
+	return s.upstream != nil && s.subCount() == 0
 }
 
 func (s *pubsubSession) exitPubSubMode() {
@@ -333,14 +339,14 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	s.mu.Lock()
 	for _, ch := range channels {
 		if cmdName == cmdSubscribe {
-			s.channels++
+			s.channelSet[ch] = struct{}{}
 		} else {
-			s.patterns++
+			s.patternSet[ch] = struct{}{}
 		}
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(ch)
-		s.dconn.WriteInt(s.channels + s.patterns)
+		s.dconn.WriteInt(s.subCount())
 	}
 	_ = s.dconn.Flush()
 	s.mu.Unlock()
@@ -399,11 +405,12 @@ func (s *pubsubSession) handleSubscribe(args [][]byte) {
 	}
 	s.mu.Lock()
 	for _, ch := range channels {
-		s.channels++
+		// Idempotent: Redis treats re-subscribe as a no-op for counting.
+		s.channelSet[ch] = struct{}{}
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString("subscribe")
 		s.dconn.WriteBulkString(ch)
-		s.dconn.WriteInt(s.channels + s.patterns)
+		s.dconn.WriteInt(s.subCount())
 	}
 	_ = s.dconn.Flush()
 	s.mu.Unlock()
@@ -421,11 +428,12 @@ func (s *pubsubSession) handlePSubscribe(args [][]byte) {
 	}
 	s.mu.Lock()
 	for _, p := range pats {
-		s.patterns++
+		// Idempotent: Redis treats re-subscribe as a no-op for counting.
+		s.patternSet[p] = struct{}{}
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString("psubscribe")
 		s.dconn.WriteBulkString(p)
-		s.dconn.WriteInt(s.channels + s.patterns)
+		s.dconn.WriteInt(s.subCount())
 	}
 	_ = s.dconn.Flush()
 	s.mu.Unlock()
@@ -442,21 +450,12 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 	}
 
 	if len(args) < pubsubMinArgs {
-		// Unsubscribe all
+		// Unsubscribe all: emit per-channel reply (matching Redis behavior).
 		if err := unsubFn(context.Background()); err != nil {
 			s.logger.Warn("upstream "+kind+" failed", "err", err)
 		}
 		s.mu.Lock()
-		if isPattern {
-			s.patterns = 0
-		} else {
-			s.channels = 0
-		}
-		s.dconn.WriteArray(pubsubArrayReply)
-		s.dconn.WriteBulkString(kind)
-		s.dconn.WriteNull()
-		s.dconn.WriteInt(s.channels + s.patterns)
-		_ = s.dconn.Flush()
+		s.writeUnsubAll(kind, isPattern)
 		s.mu.Unlock()
 		return
 	}
@@ -468,21 +467,55 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 	s.mu.Lock()
 	for _, n := range names {
 		if isPattern {
-			if s.patterns > 0 {
-				s.patterns--
-			}
+			delete(s.patternSet, n)
 		} else {
-			if s.channels > 0 {
-				s.channels--
-			}
+			delete(s.channelSet, n)
 		}
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
-		s.dconn.WriteInt(s.channels + s.patterns)
+		s.dconn.WriteInt(s.subCount())
 	}
 	_ = s.dconn.Flush()
 	s.mu.Unlock()
+}
+
+// writeUnsubAll emits per-channel/pattern unsubscribe replies and clears the set.
+// Must be called with s.mu held.
+func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
+	set := s.channelSet
+	if isPattern {
+		set = s.patternSet
+	}
+
+	if len(set) == 0 {
+		// No subscriptions: single reply with null channel (matching Redis).
+		s.dconn.WriteArray(pubsubArrayReply)
+		s.dconn.WriteBulkString(kind)
+		s.dconn.WriteNull()
+		s.dconn.WriteInt(s.subCount())
+		_ = s.dconn.Flush()
+		return
+	}
+
+	// Collect names before clearing so we can emit per-channel replies.
+	names := make([]string, 0, len(set))
+	for n := range set {
+		names = append(names, n)
+	}
+	if isPattern {
+		s.patternSet = make(map[string]struct{})
+	} else {
+		s.channelSet = make(map[string]struct{})
+	}
+
+	for _, n := range names {
+		s.dconn.WriteArray(pubsubArrayReply)
+		s.dconn.WriteBulkString(kind)
+		s.dconn.WriteBulkString(n)
+		s.dconn.WriteInt(s.subCount())
+	}
+	_ = s.dconn.Flush()
 }
 
 // --- Ping handlers ---
