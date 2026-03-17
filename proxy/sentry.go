@@ -149,9 +149,9 @@ func truncateValue(v any) string {
 		s = tv
 	case []byte:
 		if len(tv) > maxSentryValueLen {
-			tv = tv[:maxSentryValueLen]
+			return string(tv[:maxSentryValueLen]) + "...(truncated)"
 		}
-		s = string(tv)
+		return string(tv)
 	default:
 		s = fmt.Sprintf("%v", v)
 	}

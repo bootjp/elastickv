@@ -52,7 +52,12 @@ func (m *mockDetachedConn) ReadCommand() (redcon.Command, error) {
 }
 
 func (m *mockDetachedConn) Flush() error { return nil }
-func (m *mockDetachedConn) Close() error { m.closed = true; return nil }
+func (m *mockDetachedConn) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	return nil
+}
 
 func (m *mockDetachedConn) RemoteAddr() string { return "127.0.0.1:9999" }
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
@@ -28,6 +29,10 @@ const (
 	cmdDiscard      = "DISCARD"
 	cmdPing         = "PING"
 	cmdQuit         = "QUIT"
+
+	// cleanupFwdTimeout bounds the wait for forwardMessages to exit during cleanup.
+	// If the client socket is stuck, we don't want to block indefinitely.
+	cleanupFwdTimeout = 5 * time.Second
 )
 
 // pubsubSession manages a single client's detached connection.
@@ -77,7 +82,13 @@ func (s *pubsubSession) cleanup() {
 	}
 	s.mu.Unlock()
 	if s.fwdDone != nil {
-		<-s.fwdDone
+		// Bounded wait: if forwardMessages is stuck on a slow/dead client socket,
+		// don't block cleanup indefinitely.
+		select {
+		case <-s.fwdDone:
+		case <-time.After(cleanupFwdTimeout):
+			s.logger.Warn("forwardMessages did not exit within timeout, proceeding with cleanup")
+		}
 	}
 	s.dconn.Close()
 }
