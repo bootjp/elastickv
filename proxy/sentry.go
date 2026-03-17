@@ -140,9 +140,21 @@ func cmdNameFromArgs(args [][]byte) string {
 	return unknownStr
 }
 
-// truncateValue formats a value for Sentry, truncating to avoid data leakage and oversized events.
+// truncateValue formats a value for logging/Sentry, truncating to avoid data leakage and oversized events.
+// Handles common types by slicing before formatting to avoid allocating the full string representation.
 func truncateValue(v any) string {
-	s := fmt.Sprintf("%v", v)
+	var s string
+	switch tv := v.(type) {
+	case string:
+		s = tv
+	case []byte:
+		if len(tv) > maxSentryValueLen {
+			tv = tv[:maxSentryValueLen]
+		}
+		s = string(tv)
+	default:
+		s = fmt.Sprintf("%v", v)
+	}
 	if len(s) > maxSentryValueLen {
 		return s[:maxSentryValueLen] + "...(truncated)"
 	}

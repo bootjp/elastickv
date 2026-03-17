@@ -94,7 +94,7 @@ func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, p
 		s.metrics.MigrationGaps.WithLabelValues(cmd).Inc()
 		count := s.gapCount.Add(1)
 		if count%s.gapLogSampleRate == 1 {
-			s.logger.Debug("migration gap (sampled)", "cmd", cmd, "key", extractKey(args))
+			s.logger.Debug("migration gap (sampled)", "cmd", cmd, "key", truncateValue(extractKey(args)))
 		}
 		return
 	}
