@@ -120,6 +120,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		scriptCtx := newLuaScriptContext(r)
 		state := newRedisLuaState()
 		defer state.Close()
+		state.SetContext(ctx)
 		r.initLuaGlobals(state, scriptCtx, keys, argv)
 
 		chunk, err := state.LoadString(script)

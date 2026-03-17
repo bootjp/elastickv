@@ -23,8 +23,6 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -2099,6 +2097,9 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 	}
 
 	n := int64(len(values))
+	if meta.Head < math.MinInt64+n {
+		return nil, meta, errors.WithStack(errors.New("LPUSH would underflow list Head sequence number"))
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
 	// LPUSH reverses args, so last arg gets the lowest sequence number.
 	newHead := meta.Head - n
@@ -2282,17 +2283,16 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 		return nil, ErrLeaderNotFound
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := r.relayConnCache.ConnFor(addr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisRelayPublishTimeout)
+	defer cancel()
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
+	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
