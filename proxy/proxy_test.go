@@ -196,9 +196,9 @@ func TestBytesArgsToInterfaces(t *testing.T) {
 	args := [][]byte{[]byte("SET"), []byte("key"), []byte("val")}
 	result := bytesArgsToInterfaces(args)
 	assert.Len(t, result, 3)
-	assert.Equal(t, "SET", result[0])
-	assert.Equal(t, "key", result[1])
-	assert.Equal(t, "val", result[2])
+	assert.Equal(t, []byte("SET"), result[0])
+	assert.Equal(t, []byte("key"), result[1])
+	assert.Equal(t, []byte("val"), result[2])
 }
 
 func TestResponseEqual(t *testing.T) {

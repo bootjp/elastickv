@@ -262,7 +262,11 @@ func (d *DualWriter) Secondary() Backend {
 func argsToBytes(iArgs []interface{}) [][]byte {
 	out := make([][]byte, len(iArgs))
 	for i, a := range iArgs {
-		out[i] = []byte(fmt.Sprintf("%v", a))
+		if b, ok := a.([]byte); ok {
+			out[i] = b
+		} else {
+			out[i] = []byte(fmt.Sprintf("%v", a))
+		}
 	}
 	return out
 }

@@ -133,17 +133,18 @@ func isConsistent(primaryResp, secondaryResp interface{}, primaryErr, secondaryE
 
 // responseEqual compares two go-redis response values for equality.
 func responseEqual(a, b interface{}) bool {
-	if a == nil && b == nil {
-		return true
-	}
 	if a == nil || b == nil {
-		return false
+		return a == nil && b == nil
 	}
-	switch a := a.(type) {
-	case string, int64:
-		return a == b
+	switch av := a.(type) {
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case int64:
+		bv, ok := b.(int64)
+		return ok && av == bv
 	case []interface{}:
-		return interfaceSliceEqual(a, b)
+		return interfaceSliceEqual(av, b)
 	default:
 		return reflect.DeepEqual(a, b)
 	}
@@ -208,7 +209,7 @@ func extractKey(args [][]byte) string {
 func bytesArgsToInterfaces(args [][]byte) []interface{} {
 	out := make([]interface{}, len(args))
 	for i, a := range args {
-		out[i] = string(a)
+		out[i] = a
 	}
 	return out
 }

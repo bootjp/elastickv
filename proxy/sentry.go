@@ -103,9 +103,9 @@ func (r *SentryReporter) ShouldReport(fingerprint string) bool {
 				delete(r.lastReport, k)
 			}
 		}
-		// If still at capacity after eviction, skip tracking to prevent unbounded growth.
+		// If still at capacity after eviction, drop report to prevent unbounded growth and Sentry flooding.
 		if len(r.lastReport) >= maxReportEntries {
-			return true
+			return false
 		}
 	}
 
