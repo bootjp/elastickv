@@ -54,7 +54,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 }
 
 // Write sends a write command to the primary synchronously, then to the secondary asynchronously.
-func (d *DualWriter) Write(ctx context.Context, args [][]byte) (interface{}, error) {
+func (d *DualWriter) Write(ctx context.Context, args [][]byte) (any, error) {
 	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
@@ -83,7 +83,7 @@ func (d *DualWriter) Write(ctx context.Context, args [][]byte) (interface{}, err
 }
 
 // Read sends a read command to the primary and optionally performs a shadow read.
-func (d *DualWriter) Read(ctx context.Context, args [][]byte) (interface{}, error) {
+func (d *DualWriter) Read(ctx context.Context, args [][]byte) (any, error) {
 	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
@@ -117,7 +117,7 @@ func (d *DualWriter) Read(ctx context.Context, args [][]byte) (interface{}, erro
 
 // Blocking forwards a blocking command to the primary only.
 // Optionally sends a short-timeout version to secondary for warmup.
-func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (interface{}, error) {
+func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (any, error) {
 	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
@@ -148,7 +148,7 @@ func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (interface{}, 
 }
 
 // Admin forwards an admin command to the primary only.
-func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (interface{}, error) {
+func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (any, error) {
 	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
@@ -169,7 +169,7 @@ func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (interface{}, err
 }
 
 // Script forwards EVAL/EVALSHA to the primary, and async replays to secondary.
-func (d *DualWriter) Script(ctx context.Context, args [][]byte) (interface{}, error) {
+func (d *DualWriter) Script(ctx context.Context, args [][]byte) (any, error) {
 	cmd := strings.ToUpper(string(args[0]))
 	iArgs := bytesArgsToInterfaces(args)
 
@@ -194,7 +194,7 @@ func (d *DualWriter) Script(ctx context.Context, args [][]byte) (interface{}, er
 	return resp, nil
 }
 
-func (d *DualWriter) writeSecondary(cmd string, iArgs []interface{}) {
+func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 	defer cancel()
 
@@ -259,13 +259,13 @@ func (d *DualWriter) Secondary() Backend {
 	return d.secondary
 }
 
-func argsToBytes(iArgs []interface{}) [][]byte {
+func argsToBytes(iArgs []any) [][]byte {
 	out := make([][]byte, len(iArgs))
 	for i, a := range iArgs {
 		if b, ok := a.([]byte); ok {
 			out[i] = b
 		} else {
-			out[i] = []byte(fmt.Sprintf("%v", a))
+			out[i] = fmt.Appendf(nil, "%v", a)
 		}
 	}
 	return out

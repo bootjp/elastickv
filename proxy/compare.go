@@ -44,8 +44,8 @@ type Divergence struct {
 	Command    string
 	Key        string
 	Kind       DivergenceKind
-	Primary    interface{}
-	Secondary  interface{}
+	Primary    any
+	Secondary  any
 	DetectedAt time.Time
 }
 
@@ -75,7 +75,7 @@ func NewShadowReader(secondary Backend, metrics *ProxyMetrics, sentryReporter *S
 }
 
 // Compare issues the same read to the secondary and checks for divergence.
-func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, primaryResp interface{}, primaryErr error) {
+func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, primaryResp any, primaryErr error) {
 	sCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
@@ -118,7 +118,7 @@ func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, p
 }
 
 // isConsistent checks whether primary and secondary responses agree.
-func isConsistent(primaryResp, secondaryResp interface{}, primaryErr, secondaryErr error) bool {
+func isConsistent(primaryResp, secondaryResp any, primaryErr, secondaryErr error) bool {
 	// Both are redis.Nil → consistent (key missing on both)
 	if isNilError(primaryErr) && isNilError(secondaryErr) {
 		return true
@@ -132,7 +132,7 @@ func isConsistent(primaryResp, secondaryResp interface{}, primaryErr, secondaryE
 }
 
 // responseEqual compares two go-redis response values for equality.
-func responseEqual(a, b interface{}) bool {
+func responseEqual(a, b any) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
@@ -143,7 +143,7 @@ func responseEqual(a, b interface{}) bool {
 	case int64:
 		bv, ok := b.(int64)
 		return ok && av == bv
-	case []interface{}:
+	case []any:
 		return interfaceSliceEqual(av, b)
 	default:
 		return reflect.DeepEqual(a, b)
@@ -151,8 +151,8 @@ func responseEqual(a, b interface{}) bool {
 }
 
 // interfaceSliceEqual compares two []interface{} slices element-by-element.
-func interfaceSliceEqual(av []interface{}, b interface{}) bool {
-	bv, ok := b.([]interface{})
+func interfaceSliceEqual(av []any, b any) bool {
+	bv, ok := b.([]any)
 	if !ok || len(av) != len(bv) {
 		return false
 	}
@@ -165,7 +165,7 @@ func interfaceSliceEqual(av []interface{}, b interface{}) bool {
 }
 
 // classifyDivergence determines the kind based on primary/secondary values.
-func classifyDivergence(primaryResp interface{}, primaryErr error, secondaryResp interface{}, secondaryErr error) DivergenceKind {
+func classifyDivergence(primaryResp any, primaryErr error, secondaryResp any, secondaryErr error) DivergenceKind {
 	primaryNil := isNilResp(primaryResp, primaryErr)
 	secondaryNil := isNilResp(secondaryResp, secondaryErr)
 
@@ -185,14 +185,14 @@ func isNilError(err error) bool {
 
 // isNilResp checks if a response represents "no data" (nil response or redis.Nil error).
 // Empty string is NOT nil — it is a valid value.
-func isNilResp(resp interface{}, err error) bool {
+func isNilResp(resp any, err error) bool {
 	if errors.Is(err, redis.Nil) {
 		return true
 	}
 	return resp == nil
 }
 
-func formatResp(resp interface{}, err error) interface{} {
+func formatResp(resp any, err error) any {
 	if err != nil {
 		return fmt.Sprintf("error: %v", err)
 	}
@@ -206,8 +206,8 @@ func extractKey(args [][]byte) string {
 	return ""
 }
 
-func bytesArgsToInterfaces(args [][]byte) []interface{} {
-	out := make([]interface{}, len(args))
+func bytesArgsToInterfaces(args [][]byte) []any {
+	out := make([]any, len(args))
 	for i, a := range args {
 		out[i] = a
 	}

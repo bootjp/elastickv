@@ -254,7 +254,7 @@ func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
 	cat := ClassifyCommand(name, args[1:])
 	ctx := context.Background()
 
-	var resp interface{}
+	var resp any
 	var err error
 
 	switch cat {
@@ -334,12 +334,12 @@ func (s *pubsubSession) execTxn() {
 	s.txnQueue = nil
 
 	ctx := context.Background()
-	cmds := make([][]interface{}, 0, len(queue)+txnCommandsOverhead)
-	cmds = append(cmds, []interface{}{"MULTI"})
+	cmds := make([][]any, 0, len(queue)+txnCommandsOverhead)
+	cmds = append(cmds, []any{"MULTI"})
 	for _, args := range queue {
 		cmds = append(cmds, bytesArgsToInterfaces(args))
 	}
-	cmds = append(cmds, []interface{}{"EXEC"})
+	cmds = append(cmds, []any{"EXEC"})
 
 	results, err := s.proxy.dual.Primary().Pipeline(ctx, cmds)
 

@@ -327,12 +327,12 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 	ctx := context.Background()
 
 	// Build pipeline: MULTI + queued commands + EXEC
-	cmds := make([][]interface{}, 0, len(queue)+txnCommandsOverhead)
-	cmds = append(cmds, []interface{}{"MULTI"})
+	cmds := make([][]any, 0, len(queue)+txnCommandsOverhead)
+	cmds = append(cmds, []any{"MULTI"})
 	for _, args := range queue {
 		cmds = append(cmds, bytesArgsToInterfaces(args))
 	}
-	cmds = append(cmds, []interface{}{"EXEC"})
+	cmds = append(cmds, []any{"EXEC"})
 
 	results, err := p.dual.Primary().Pipeline(ctx, cmds)
 	if len(results) > 0 {
@@ -366,7 +366,7 @@ func (p *ProxyServer) discardTxn(conn redcon.Conn, state *proxyConnState) {
 
 // writeResponse handles the common pattern of writing a go-redis response,
 // correctly handling redis.Nil and upstream errors.
-func writeResponse(w respWriter, resp interface{}, err error) {
+func writeResponse(w respWriter, resp any, err error) {
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			w.WriteNull()
@@ -387,7 +387,7 @@ func writeRedisError(w respWriter, err error) {
 }
 
 // writeRedisValue writes a go-redis response value to a respWriter.
-func writeRedisValue(w respWriter, val interface{}) {
+func writeRedisValue(w respWriter, val any) {
 	if val == nil {
 		w.WriteNull()
 		return
@@ -401,7 +401,7 @@ func writeRedisValue(w respWriter, val interface{}) {
 		}
 	case int64:
 		w.WriteInt64(v)
-	case []interface{}:
+	case []any:
 		w.WriteArray(len(v))
 		for _, item := range v {
 			writeRedisValue(w, item)

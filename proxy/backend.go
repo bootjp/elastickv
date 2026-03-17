@@ -18,9 +18,9 @@ const (
 // Backend abstracts a Redis-protocol endpoint (real Redis or ElasticKV).
 type Backend interface {
 	// Do sends a single command and returns its result.
-	Do(ctx context.Context, args ...interface{}) *redis.Cmd
+	Do(ctx context.Context, args ...any) *redis.Cmd
 	// Pipeline sends multiple commands in a pipeline.
-	Pipeline(ctx context.Context, cmds [][]interface{}) ([]*redis.Cmd, error)
+	Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error)
 	// Close releases the underlying connection.
 	Close() error
 	// Name identifies this backend for logging and metrics.
@@ -76,11 +76,11 @@ func NewRedisBackendWithOptions(addr string, name string, opts BackendOptions) *
 	}
 }
 
-func (b *RedisBackend) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	return b.client.Do(ctx, args...)
 }
 
-func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]interface{}) ([]*redis.Cmd, error) {
+func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	pipe := b.client.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {

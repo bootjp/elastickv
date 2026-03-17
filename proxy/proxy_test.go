@@ -21,16 +21,16 @@ var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 type mockBackend struct {
 	name   string
-	doFunc func(ctx context.Context, args ...interface{}) *redis.Cmd
+	doFunc func(ctx context.Context, args ...any) *redis.Cmd
 	mu     sync.Mutex
-	calls  [][]interface{}
+	calls  [][]any
 }
 
 func newMockBackend(name string) *mockBackend {
 	return &mockBackend{name: name}
 }
 
-func (b *mockBackend) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+func (b *mockBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	b.mu.Lock()
 	b.calls = append(b.calls, args)
 	b.mu.Unlock()
@@ -42,7 +42,7 @@ func (b *mockBackend) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
 	return cmd
 }
 
-func (b *mockBackend) Pipeline(ctx context.Context, cmds [][]interface{}) ([]*redis.Cmd, error) {
+func (b *mockBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {
 		results[i] = b.Do(ctx, args...)
@@ -60,8 +60,8 @@ func (b *mockBackend) CallCount() int {
 }
 
 // Helper to create a doFunc that returns a specific value.
-func makeCmd(val interface{}, err error) func(ctx context.Context, args ...interface{}) *redis.Cmd {
-	return func(ctx context.Context, args ...interface{}) *redis.Cmd {
+func makeCmd(val any, err error) func(ctx context.Context, args ...any) *redis.Cmd {
+	return func(ctx context.Context, args ...any) *redis.Cmd {
 		cmd := redis.NewCmd(ctx, args...)
 		if err != nil {
 			cmd.SetErr(err)
@@ -204,7 +204,7 @@ func TestBytesArgsToInterfaces(t *testing.T) {
 func TestResponseEqual(t *testing.T) {
 	tests := []struct {
 		name string
-		a, b interface{}
+		a, b any
 		want bool
 	}{
 		{"nil nil", nil, nil, true},
@@ -215,13 +215,13 @@ func TestResponseEqual(t *testing.T) {
 		{"empty string equals empty string", "", "", true},
 		{"same int64", int64(42), int64(42), true},
 		{"diff int64", int64(42), int64(43), false},
-		{"same array", []interface{}{"a", "b"}, []interface{}{"a", "b"}, true},
-		{"diff array values", []interface{}{"a", "b"}, []interface{}{"a", "c"}, false},
-		{"diff array length", []interface{}{"a"}, []interface{}{"a", "b"}, false},
-		{"empty arrays", []interface{}{}, []interface{}{}, true},
+		{"same array", []any{"a", "b"}, []any{"a", "b"}, true},
+		{"diff array values", []any{"a", "b"}, []any{"a", "c"}, false},
+		{"diff array length", []any{"a"}, []any{"a", "b"}, false},
+		{"empty arrays", []any{}, []any{}, true},
 		{"same bytes", []byte("data"), []byte("data"), true},
 		{"diff bytes", []byte("data"), []byte("other"), false},
-		{"nested array", []interface{}{[]interface{}{"x"}}, []interface{}{[]interface{}{"x"}}, true},
+		{"nested array", []any{[]any{"x"}}, []any{[]any{"x"}}, true},
 		{"type mismatch string vs int", "42", int64(42), false},
 	}
 
@@ -235,7 +235,7 @@ func TestResponseEqual(t *testing.T) {
 func TestClassifyDivergence(t *testing.T) {
 	tests := []struct {
 		name                       string
-		primaryResp, secondaryResp interface{}
+		primaryResp, secondaryResp any
 		primaryErr, secondaryErr   error
 		want                       DivergenceKind
 	}{
