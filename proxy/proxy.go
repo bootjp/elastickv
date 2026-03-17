@@ -283,6 +283,13 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {
 		return
 	}
 
+	// SELECT and AUTH are handled at the connection-pool level via config.
+	// Silently accept them so clients don't break.
+	if name == "SELECT" || name == "AUTH" {
+		conn.WriteString("OK")
+		return
+	}
+
 	resp, err := p.dual.Admin(context.Background(), args)
 	writeResponse(conn, resp, err)
 }

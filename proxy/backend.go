@@ -29,6 +29,8 @@ type Backend interface {
 
 // BackendOptions configures the underlying go-redis connection pool.
 type BackendOptions struct {
+	DB           int
+	Password     string
 	PoolSize     int
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
@@ -67,6 +69,8 @@ func NewRedisBackendWithOptions(addr string, name string, opts BackendOptions) *
 	return &RedisBackend{
 		client: redis.NewClient(&redis.Options{
 			Addr:         addr,
+			DB:           opts.DB,
+			Password:     opts.Password,
 			PoolSize:     opts.PoolSize,
 			DialTimeout:  opts.DialTimeout,
 			ReadTimeout:  opts.ReadTimeout,

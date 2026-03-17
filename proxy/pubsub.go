@@ -263,6 +263,12 @@ func (s *pubsubSession) handleTxnInSession(name string, args [][]byte) bool {
 
 // dispatchRegularCommand sends a non-transaction, non-special command to the backend.
 func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
+	// SELECT and AUTH are handled at the connection-pool level; accept silently.
+	if name == "SELECT" || name == "AUTH" {
+		s.writeString("OK")
+		return
+	}
+
 	cat := ClassifyCommand(name, args[1:])
 	ctx := context.Background()
 

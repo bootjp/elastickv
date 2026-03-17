@@ -49,16 +49,20 @@ func (m ProxyMode) String() string {
 
 // ProxyConfig holds all configuration for the dual-write proxy.
 type ProxyConfig struct {
-	ListenAddr       string
-	PrimaryAddr      string
-	SecondaryAddr    string
-	Mode             ProxyMode
-	SecondaryTimeout time.Duration
-	ShadowTimeout    time.Duration
-	SentryDSN        string
-	SentryEnv        string
-	SentrySampleRate float64
-	MetricsAddr      string
+	ListenAddr        string
+	PrimaryAddr       string
+	PrimaryDB         int
+	PrimaryPassword   string
+	SecondaryAddr     string
+	SecondaryDB       int
+	SecondaryPassword string
+	Mode              ProxyMode
+	SecondaryTimeout  time.Duration
+	ShadowTimeout     time.Duration
+	SentryDSN         string
+	SentryEnv         string
+	SentrySampleRate  float64
+	MetricsAddr       string
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.

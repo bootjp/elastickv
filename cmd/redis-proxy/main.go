@@ -32,7 +32,11 @@ func run() error {
 
 	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "Proxy listen address")
 	flag.StringVar(&cfg.PrimaryAddr, "primary", cfg.PrimaryAddr, "Primary (Redis) address")
+	flag.IntVar(&cfg.PrimaryDB, "primary-db", cfg.PrimaryDB, "Primary Redis DB number")
+	flag.StringVar(&cfg.PrimaryPassword, "primary-password", cfg.PrimaryPassword, "Primary Redis password")
 	flag.StringVar(&cfg.SecondaryAddr, "secondary", cfg.SecondaryAddr, "Secondary (ElasticKV) address")
+	flag.IntVar(&cfg.SecondaryDB, "secondary-db", cfg.SecondaryDB, "Secondary Redis DB number")
+	flag.StringVar(&cfg.SecondaryPassword, "secondary-password", cfg.SecondaryPassword, "Secondary Redis password")
 	flag.StringVar(&modeStr, "mode", "dual-write", "Proxy mode: redis-only, dual-write, dual-write-shadow, elastickv-primary, elastickv-only")
 	flag.DurationVar(&cfg.SecondaryTimeout, "secondary-timeout", cfg.SecondaryTimeout, "Secondary write timeout")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", cfg.ShadowTimeout, "Shadow read timeout")
@@ -59,14 +63,21 @@ func run() error {
 	metrics := proxy.NewProxyMetrics(reg)
 
 	// Backends
+	primaryOpts := proxy.DefaultBackendOptions()
+	primaryOpts.DB = cfg.PrimaryDB
+	primaryOpts.Password = cfg.PrimaryPassword
+	secondaryOpts := proxy.DefaultBackendOptions()
+	secondaryOpts.DB = cfg.SecondaryDB
+	secondaryOpts.Password = cfg.SecondaryPassword
+
 	var primary, secondary proxy.Backend
 	switch cfg.Mode {
 	case proxy.ModeElasticKVPrimary, proxy.ModeElasticKVOnly:
-		primary = proxy.NewRedisBackend(cfg.SecondaryAddr, "elastickv")
-		secondary = proxy.NewRedisBackend(cfg.PrimaryAddr, "redis")
+		primary = proxy.NewRedisBackendWithOptions(cfg.SecondaryAddr, "elastickv", secondaryOpts)
+		secondary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
 	case proxy.ModeRedisOnly, proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
-		primary = proxy.NewRedisBackend(cfg.PrimaryAddr, "redis")
-		secondary = proxy.NewRedisBackend(cfg.SecondaryAddr, "elastickv")
+		primary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
+		secondary = proxy.NewRedisBackendWithOptions(cfg.SecondaryAddr, "elastickv", secondaryOpts)
 	}
 	defer primary.Close()
 	defer secondary.Close()
