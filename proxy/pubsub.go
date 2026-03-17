@@ -178,6 +178,7 @@ func (s *pubsubSession) dispatchPubSubCommand(args [][]byte) bool {
 	case cmdPing:
 		s.handlePubSubPing(args)
 	case cmdQuit:
+		s.writeString("OK")
 		return false
 	default:
 		s.writeError("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context")
