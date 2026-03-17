@@ -378,12 +378,16 @@ func writeResponse(w respWriter, resp any, err error) {
 	writeRedisValue(w, resp)
 }
 
-// writeRedisError writes an upstream error without double-prefixing.
-// Redis errors already contain their prefix (e.g. "ERR ...", "WRONGTYPE ...").
+// writeRedisError writes an upstream error to the client.
+// go-redis redis.Error values already carry the Redis prefix (e.g. "ERR ...", "WRONGTYPE ...").
+// Other errors (timeouts, dial failures) are normalized to "ERR ..." to produce valid RESP.
 func writeRedisError(w respWriter, err error) {
-	msg := err.Error()
-	// go-redis errors are already formatted with prefix; pass through as-is.
-	w.WriteError(msg)
+	var redisErr redis.Error
+	if errors.As(err, &redisErr) {
+		w.WriteError(redisErr.Error())
+		return
+	}
+	w.WriteError("ERR " + err.Error())
 }
 
 // writeRedisValue writes a go-redis response value to a respWriter.

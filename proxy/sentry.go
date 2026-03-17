@@ -11,6 +11,9 @@ import (
 
 const (
 	defaultReportCooldown = 60 * time.Second
+	// maxSentryValueLen limits the length of values attached to Sentry events
+	// to prevent data leakage and oversized events.
+	maxSentryValueLen = 256
 	// maxReportEntries caps the lastReport map to prevent unbounded growth.
 	maxReportEntries = 10000
 )
@@ -80,8 +83,8 @@ func (r *SentryReporter) CaptureDivergence(div Divergence) {
 		scope.SetTag("command", div.Command)
 		scope.SetTag("key", div.Key)
 		scope.SetTag("kind", div.Kind.String())
-		scope.SetExtra("primary", fmt.Sprintf("%v", div.Primary))
-		scope.SetExtra("secondary", fmt.Sprintf("%v", div.Secondary))
+		scope.SetExtra("primary", truncateValue(div.Primary))
+		scope.SetExtra("secondary", truncateValue(div.Secondary))
 		scope.SetFingerprint([]string{"divergence", div.Kind.String(), div.Command})
 		scope.SetLevel(sentry.LevelWarning)
 		r.hub.CaptureMessage(fmt.Sprintf("data divergence: %s %s (%s)", div.Kind, div.Command, div.Key))
@@ -128,4 +131,13 @@ func cmdNameFromArgs(args [][]byte) string {
 		return string(args[0])
 	}
 	return unknownStr
+}
+
+// truncateValue formats a value for Sentry, truncating to avoid data leakage and oversized events.
+func truncateValue(v any) string {
+	s := fmt.Sprintf("%v", v)
+	if len(s) > maxSentryValueLen {
+		return s[:maxSentryValueLen] + "...(truncated)"
+	}
+	return s
 }

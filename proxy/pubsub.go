@@ -75,17 +75,24 @@ func (s *pubsubSession) cleanup() {
 }
 
 func (s *pubsubSession) startForwarding() {
+	// Capture upstream under lock to avoid race with exitPubSubMode.
+	s.mu.Lock()
+	upstream := s.upstream
+	s.mu.Unlock()
+	if upstream == nil {
+		return
+	}
+	ch := upstream.Channel()
 	s.fwdDone = make(chan struct{})
 	go func() {
 		defer close(s.fwdDone)
-		s.forwardMessages()
+		s.forwardMessages(ch)
 	}()
 }
 
 // forwardMessages reads from the upstream go-redis PubSub channel and writes
 // messages to the detached client connection.
-func (s *pubsubSession) forwardMessages() {
-	ch := s.upstream.Channel()
+func (s *pubsubSession) forwardMessages(ch <-chan *redis.Message) {
 	for msg := range ch {
 		s.mu.Lock()
 		if s.closed {
@@ -198,6 +205,10 @@ func (s *pubsubSession) dispatchNormalCommand(name string, args [][]byte) bool {
 		return true
 	}
 	if name == cmdSubscribe || name == cmdPSubscribe {
+		if s.inTxn {
+			s.writeError("ERR Command not allowed inside a transaction")
+			return true
+		}
 		s.reenterPubSub(name, args)
 		return true
 	}
