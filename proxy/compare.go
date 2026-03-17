@@ -110,9 +110,9 @@ func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, p
 
 	s.metrics.Divergences.WithLabelValues(cmd, kind.String()).Inc()
 	s.logger.Warn("response divergence detected",
-		"cmd", div.Command, "key", div.Key, "kind", div.Kind.String(),
-		"primary", fmt.Sprintf("%v", div.Primary),
-		"secondary", fmt.Sprintf("%v", div.Secondary),
+		"cmd", div.Command, "key", truncateValue(div.Key), "kind", div.Kind.String(),
+		"primary", truncateValue(div.Primary),
+		"secondary", truncateValue(div.Secondary),
 	)
 	s.sentry.CaptureDivergence(div)
 }

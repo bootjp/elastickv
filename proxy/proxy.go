@@ -88,6 +88,11 @@ func (p *ProxyServer) ListenAndServe(ctx context.Context) error {
 	)
 
 	if err = srv.Serve(ln); err != nil {
+		// During graceful shutdown, srv.Close() causes Serve to return
+		// a listener-closed error. Treat this as a normal exit.
+		if ctx.Err() != nil {
+			return nil //nolint:nilerr // intentional: suppress expected listener-closed error during graceful shutdown
+		}
 		return fmt.Errorf("proxy serve: %w", err)
 	}
 	return nil
