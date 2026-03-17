@@ -227,19 +227,17 @@ func (s *pubsubSession) dispatchNormalCommand(name string, args [][]byte) bool {
 		s.handleNormalPing(args)
 		return true
 	}
+	// Let the transaction handler process or queue commands first, so that
+	// behavior during MULTI is consistent with the main ProxyServer handler.
+	if s.handleTxnInSession(name, args) {
+		return true
+	}
 	if name == cmdSubscribe || name == cmdPSubscribe {
-		if s.inTxn {
-			s.writeError("ERR Command not allowed inside a transaction")
-			return true
-		}
 		s.reenterPubSub(name, args)
 		return true
 	}
 	if name == cmdUnsubscribe || name == cmdPUnsubscribe {
 		s.handleUnsubNoSession(name)
-		return true
-	}
-	if s.handleTxnInSession(name, args) {
 		return true
 	}
 	s.dispatchRegularCommand(name, args)
