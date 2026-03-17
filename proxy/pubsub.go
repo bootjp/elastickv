@@ -83,11 +83,14 @@ func (s *pubsubSession) cleanup() {
 	s.mu.Unlock()
 	if s.fwdDone != nil {
 		// Bounded wait: if forwardMessages is stuck on a slow/dead client socket,
-		// don't block cleanup indefinitely.
+		// close dconn to unblock it, then wait for completion.
 		select {
 		case <-s.fwdDone:
 		case <-time.After(cleanupFwdTimeout):
-			s.logger.Warn("forwardMessages did not exit within timeout, proceeding with cleanup")
+			s.logger.Warn("forwardMessages did not exit within timeout, closing dconn to unblock")
+			s.dconn.Close()
+			<-s.fwdDone
+			return // dconn already closed
 		}
 	}
 	s.dconn.Close()
@@ -187,7 +190,9 @@ func (s *pubsubSession) exitPubSubMode() {
 		select {
 		case <-s.fwdDone:
 		case <-time.After(cleanupFwdTimeout):
-			s.logger.Warn("forwardMessages did not exit within timeout during pub/sub mode exit")
+			s.logger.Warn("forwardMessages did not exit within timeout, closing dconn to unblock")
+			s.dconn.Close()
+			<-s.fwdDone
 		}
 		s.fwdDone = nil
 	}
