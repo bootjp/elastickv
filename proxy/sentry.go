@@ -85,18 +85,21 @@ func (r *SentryReporter) CaptureDivergence(div Divergence) {
 	}
 	r.hub.WithScope(func(scope *sentry.Scope) {
 		scope.SetTag("command", div.Command)
-		scope.SetTag("key", div.Key)
 		scope.SetTag("kind", div.Kind.String())
+		// Omit raw key from Sentry tags to avoid leaking sensitive data;
+		// only send a truncated form as an extra for debugging.
+		scope.SetExtra("key", truncateValue(div.Key))
 		scope.SetExtra("primary", truncateValue(div.Primary))
 		scope.SetExtra("secondary", truncateValue(div.Secondary))
 		scope.SetFingerprint([]string{"divergence", div.Kind.String(), div.Command})
 		scope.SetLevel(sentry.LevelWarning)
-		r.hub.CaptureMessage(fmt.Sprintf("data divergence: %s %s (%s)", div.Kind, div.Command, div.Key))
+		r.hub.CaptureMessage(fmt.Sprintf("data divergence: %s %s", div.Kind, div.Command))
 	})
 }
 
 // ShouldReport checks if this fingerprint has been reported recently (cooldown-based).
-// Periodically evicts expired entries to prevent unbounded map growth.
+// Evicts expired entries when the map reaches maxReportEntries to bound memory usage.
+// Returns false (drops the report) if the map is still at capacity after eviction.
 func (r *SentryReporter) ShouldReport(fingerprint string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

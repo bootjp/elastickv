@@ -11,12 +11,17 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+// Tagged types to distinguish RESP wire types in mock writes.
+type respInt struct{ V int }     // WriteInt
+type respInt64 struct{ V int64 } // WriteInt64
+type respArray struct{ N int }   // WriteArray
+
 // mockDetachedConn implements redcon.DetachedConn for unit testing.
 type mockDetachedConn struct {
 	mu       sync.Mutex
 	commands []redcon.Command // queued commands to return from ReadCommand
 	cmdIdx   int
-	writes   []any // recorded writes: string for WriteString/WriteError/WriteBulkString, int for WriteInt/WriteArray, nil for WriteNull
+	writes   []any // recorded writes: string for WriteString/WriteError/WriteBulkString, respInt/respInt64/respArray for typed ints, nil for WriteNull
 	closed   bool
 	readErr  error // error to return from ReadCommand when commands exhausted
 }
@@ -74,12 +79,12 @@ func (m *mockDetachedConn) WriteBulkString(bulk string) {
 func (m *mockDetachedConn) WriteInt(num int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.writes = append(m.writes, num)
+	m.writes = append(m.writes, respInt{num})
 }
 func (m *mockDetachedConn) WriteInt64(num int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.writes = append(m.writes, int(num))
+	m.writes = append(m.writes, respInt64{num})
 }
 func (m *mockDetachedConn) WriteUint64(_ uint64) {
 	// Not used in pubsub tests.
@@ -87,7 +92,7 @@ func (m *mockDetachedConn) WriteUint64(_ uint64) {
 func (m *mockDetachedConn) WriteArray(count int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.writes = append(m.writes, count)
+	m.writes = append(m.writes, respArray{count})
 }
 func (m *mockDetachedConn) WriteNull() {
 	m.mu.Lock()
@@ -201,7 +206,7 @@ func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
 	// Count array headers (each reply starts with WriteArray(3))
 	arrCount := 0
 	for _, w := range writes {
-		if n, ok := w.(int); ok && n == 3 {
+		if a, ok := w.(respArray); ok && a.N == 3 {
 			arrCount++
 		}
 	}
@@ -250,7 +255,7 @@ func TestPubSub_WriteUnsubAll_Patterns(t *testing.T) {
 	// Should have 1 reply (one pattern)
 	arrCount := 0
 	for _, w := range writes {
-		if n, ok := w.(int); ok && n == 3 {
+		if a, ok := w.(respArray); ok && a.N == 3 {
 			arrCount++
 		}
 	}
@@ -341,7 +346,7 @@ func TestPubSub_HandlePubSubPing(t *testing.T) {
 
 	writes := dconn.getWrites()
 	// ["pong", ""]
-	assert.Contains(t, writes, 2) // WriteArray(2)
+	assert.Contains(t, writes, respArray{2}) // WriteArray(2)
 	assert.Contains(t, writes, "BULKSTR:pong")
 	assert.Contains(t, writes, "BULKSTR:") // empty string
 }
@@ -372,7 +377,7 @@ func TestPubSub_HandleUnsubNoSession(t *testing.T) {
 		}
 	}
 	assert.True(t, hasNull)
-	assert.Contains(t, writes, 0) // WriteInt64(0)
+	assert.Contains(t, writes, respInt64{0}) // WriteInt64(0)
 }
 
 func TestPubSub_SubscribeInTxnRejected(t *testing.T) {
