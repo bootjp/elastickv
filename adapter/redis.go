@@ -753,6 +753,12 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 // When the key holds a non-string type, returns false so the caller can fall
 // through to executeSet which cleans up internal keys before overwriting.
 func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key, value []byte, ttl *time.Time) bool {
+	// Only use the fast path when we are the leader for this key so the local
+	// type check is authoritative. On followers, stale MVCC state could miss a
+	// non-string type, leaving orphaned internal keys after overwrite.
+	if !r.coordinator.IsLeaderForKey(key) {
+		return false
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
