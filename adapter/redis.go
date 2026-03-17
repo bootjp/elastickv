@@ -23,8 +23,6 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -132,7 +130,8 @@ type redisSetOptions struct {
 }
 
 type redisSetState struct {
-	typ      redisValueType
+	rawTyp   redisValueType // TTL-unaware type, for internal-key cleanup
+	typ      redisValueType // TTL-aware type, for NX/XX/GET semantics
 	oldValue []byte
 }
 
@@ -586,14 +585,18 @@ func (o redisSetOptions) allows(exists bool) bool {
 }
 
 func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
-	// Use rawKeyTypeAt (TTL-unaware) so that expired keys with lingering
-	// internal data (list/hash/set/...) are still detected for cleanup.
-	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	// rawTyp (TTL-unaware) detects lingering internal keys for cleanup.
+	rawTyp, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return redisSetState{}, err
+	}
+	// typ (TTL-aware) drives NX/XX/GET Redis semantics: expired keys are "gone".
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return redisSetState{}, err
 	}
 
-	state := redisSetState{typ: typ}
+	state := redisSetState{rawTyp: rawTyp, typ: typ}
 	if !returnOld || typ != redisTypeString {
 		return state, nil
 	}
@@ -641,7 +644,8 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 		if opts.returnOld && exists && state.typ != redisTypeString {
 			return wrongTypeError()
 		}
-		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.typ, readTS); err != nil {
+		// Use rawTyp for cleanup so expired-but-lingering internal keys are deleted.
+		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.rawTyp, readTS); err != nil {
 			return err
 		}
 		result = redisSetExecution{state: state, wroteOldBulk: opts.returnOld}
@@ -2099,6 +2103,9 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 	}
 
 	n := int64(len(values))
+	if meta.Head < math.MinInt64+n {
+		return nil, meta, errors.WithStack(errors.New("LPUSH would underflow list Head sequence number"))
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
 	// LPUSH reverses args, so last arg gets the lowest sequence number.
 	newHead := meta.Head - n
@@ -2282,17 +2289,16 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 		return nil, ErrLeaderNotFound
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	)
+	conn, err := r.relayConnCache.ConnFor(addr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisRelayPublishTimeout)
+	defer cancel()
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(context.Background(), &pb.RawGetRequest{Key: key, Ts: ts})
+	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

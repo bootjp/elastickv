@@ -8,6 +8,8 @@ import (
 
 const redisInternalRoutePrefix = "!redis|"
 
+var redisInternalRoutePrefixBytes = []byte(redisInternalRoutePrefix)
+
 // routeKey normalizes internal keys (e.g., list metadata/items) to the logical
 // user key used for shard routing.
 func routeKey(key []byte) []byte {
@@ -31,7 +33,7 @@ func routeKey(key []byte) []byte {
 }
 
 func redisRouteKey(key []byte) []byte {
-	if !bytes.HasPrefix(key, []byte(redisInternalRoutePrefix)) {
+	if !bytes.HasPrefix(key, redisInternalRoutePrefixBytes) {
 		return nil
 	}
 	rest := key[len(redisInternalRoutePrefix):]

@@ -264,25 +264,22 @@ func (sc *pubsubConn) handlePing(args [][]byte) {
 	_ = sc.dconn.Flush()
 }
 
+func (sc *pubsubConn) rejectCommand(name []byte) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed {
+		return
+	}
+	sc.dconn.WriteError(fmt.Sprintf(
+		"ERR Can't execute '%s': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+		string(name),
+	))
+	_ = sc.dconn.Flush()
+}
+
 // bgrunner reads commands from the detached connection (subscribe, unsubscribe).
 func (sc *pubsubConn) bgrunner(ps *redisPubSub) {
-	defer func() {
-		ps.mu.Lock()
-		ps.removeAll(sc)
-		for conn, s := range ps.conns {
-			if s == sc {
-				delete(ps.conns, conn)
-				break
-			}
-		}
-		ps.mu.Unlock()
-
-		sc.mu.Lock()
-		sc.closed = true
-		sc.mu.Unlock()
-		sc.dconn.Close()
-		close(sc.closeCh)
-	}()
+	defer sc.cleanup(ps)
 
 	for {
 		cmd, err := sc.dconn.ReadCommand()
@@ -292,15 +289,44 @@ func (sc *pubsubConn) bgrunner(ps *redisPubSub) {
 		if len(cmd.Args) == 0 {
 			continue
 		}
-		switch strings.ToLower(string(cmd.Args[0])) {
-		case "subscribe":
-			sc.handleSubscribe(ps, cmd.Args)
-		case "unsubscribe":
-			sc.handleUnsubscribe(ps, cmd.Args)
-		case "ping":
-			sc.handlePing(cmd.Args)
-		case "quit":
+		if quit := sc.dispatchCommand(ps, cmd.Args); quit {
 			return
 		}
 	}
+}
+
+// dispatchCommand routes a single command on the detached connection.
+// It returns true if the connection should be closed (quit).
+func (sc *pubsubConn) dispatchCommand(ps *redisPubSub, args [][]byte) bool {
+	switch strings.ToLower(string(args[0])) {
+	case "subscribe":
+		sc.handleSubscribe(ps, args)
+	case "unsubscribe":
+		sc.handleUnsubscribe(ps, args)
+	case "ping":
+		sc.handlePing(args)
+	case "quit":
+		return true
+	default:
+		sc.rejectCommand(args[0])
+	}
+	return false
+}
+
+func (sc *pubsubConn) cleanup(ps *redisPubSub) {
+	ps.mu.Lock()
+	ps.removeAll(sc)
+	for conn, s := range ps.conns {
+		if s == sc {
+			delete(ps.conns, conn)
+			break
+		}
+	}
+	ps.mu.Unlock()
+
+	sc.mu.Lock()
+	sc.closed = true
+	sc.mu.Unlock()
+	sc.dconn.Close()
+	close(sc.closeCh)
 }

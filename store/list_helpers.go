@@ -78,8 +78,14 @@ func unmarshalListMeta(b []byte) (ListMeta, error) {
 		return ListMeta{}, errors.New("list meta length overflows int64")
 	}
 	iLen := int64(length)
-	if tail-head != iLen {
-		return ListMeta{}, errors.WithStack(errors.Newf("list meta invariant violated: tail-head (%d) != len (%d)", tail-head, iLen))
+	// Recompute expectedTail with overflow check instead of relying on
+	// tail-head subtraction which wraps on int64 overflow.
+	if iLen > 0 && head > math.MaxInt64-iLen {
+		return ListMeta{}, errors.WithStack(errors.Newf("list meta head+len overflows int64: head=%d len=%d", head, iLen))
+	}
+	expectedTail := head + iLen
+	if tail != expectedTail {
+		return ListMeta{}, errors.WithStack(errors.Newf("list meta invariant violated: tail (%d) != head+len (%d)", tail, expectedTail))
 	}
 
 	return ListMeta{
