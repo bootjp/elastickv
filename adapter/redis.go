@@ -748,6 +748,28 @@ func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
 	conn.WriteString("PONG")
 }
 
+// trySetFastPath attempts the fast-path for SET (no NX/XX/GET flags) when the
+// key is a string or absent. Returns true if the fast-path handled the command.
+// When the key holds a non-string type, returns false so the caller can fall
+// through to executeSet which cleans up internal keys before overwriting.
+func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key, value []byte, ttl *time.Time) bool {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return true
+	}
+	if typ != redisTypeNone && typ != redisTypeString {
+		return false
+	}
+	if err := r.saveString(ctx, key, value, ttl); err != nil {
+		conn.WriteError(err.Error())
+		return true
+	}
+	conn.WriteString("OK")
+	return true
+}
+
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
@@ -758,12 +780,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
-	if opts.isFastPath() {
-		if err := r.saveString(ctx, cmd.Args[1], cmd.Args[2], opts.ttl); err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteString("OK")
+	if opts.isFastPath() && r.trySetFastPath(conn, ctx, cmd.Args[1], cmd.Args[2], opts.ttl) {
 		return
 	}
 
@@ -1155,9 +1172,6 @@ func redisVisibleUserKey(key []byte) []byte {
 	}
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		return userKey
-	}
-	if bytes.HasPrefix(key, []byte("!")) {
-		return nil
 	}
 	return key
 }
