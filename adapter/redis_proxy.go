@@ -24,6 +24,27 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 	return int(res), errors.WithStack(err)
 }
 
+func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
+	defer func() { _ = cli.Close() }()
+
+	strKeys := make([]string, len(keys))
+	for i, k := range keys {
+		strKeys[i] = string(k)
+	}
+	res, err := cli.Del(context.Background(), strKeys...).Result()
+	return res, errors.WithStack(err)
+}
+
 func (r *RedisServer) proxyFlushDatabase(all bool) error {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {

@@ -908,6 +908,19 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
+	// DEL discovers internal keys (list items, hash/set/zset/stream namespaces)
+	// via local MVCC state. On followers this state may lag, producing incomplete
+	// deletes and orphaned data. Proxy to the leader to ensure correct discovery.
+	if !r.coordinator.IsLeader() {
+		removed, err := r.proxyDel(cmd.Args[1:])
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt64(removed)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	removed := 0
