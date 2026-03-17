@@ -3,6 +3,8 @@ package proxy
 import (
 	"fmt"
 	"log/slog"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -143,20 +145,106 @@ func cmdNameFromArgs(args [][]byte) string {
 // truncateValue formats a value for logging/Sentry, truncating to avoid data leakage and oversized events.
 // Handles common types by slicing before formatting to avoid allocating the full string representation.
 func truncateValue(v any) string {
-	var s string
 	switch tv := v.(type) {
 	case string:
-		s = tv
+		return truncateString(tv)
 	case []byte:
+		// Avoid converting an arbitrarily large byte slice into a full string.
 		if len(tv) > maxSentryValueLen {
 			return string(tv[:maxSentryValueLen]) + "...(truncated)"
 		}
 		return string(tv)
+	case fmt.Stringer:
+		// Respect custom String implementations but still apply length limits.
+		return truncateString(tv.String())
 	default:
-		s = fmt.Sprintf("%v", v)
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Slice, reflect.Array:
+			return formatSliceValue(rv, maxSentryValueLen)
+		case reflect.Map:
+			return formatMapValue(rv, maxSentryValueLen)
+		default:
+			// For non-container types, fall back to fmt and then truncate.
+			return truncateString(fmt.Sprintf("%v", v))
+		}
 	}
+}
+
+// truncateString enforces maxSentryValueLen on an already-built string.
+func truncateString(s string) string {
 	if len(s) > maxSentryValueLen {
 		return s[:maxSentryValueLen] + "...(truncated)"
 	}
 	return s
+}
+
+// formatSliceValue formats a slice/array value without allocating an unbounded string.
+// It stops once approximately maxLen bytes have been written and appends a truncation marker.
+func formatSliceValue(rv reflect.Value, maxLen int) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < rv.Len(); i++ {
+		if b.Len() >= maxLen {
+			b.WriteString("...(truncated)]")
+			return b.String()
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		elemStr := truncateValue(rv.Index(i).Interface())
+		if b.Len()+len(elemStr) > maxLen {
+			// Write as much as fits, then mark as truncated.
+			remaining := maxLen - b.Len()
+			if remaining > 0 {
+				if remaining < len(elemStr) {
+					b.WriteString(elemStr[:remaining])
+				} else {
+					b.WriteString(elemStr)
+				}
+			}
+			b.WriteString("...(truncated)]")
+			return b.String()
+		}
+		b.WriteString(elemStr)
+	}
+	b.WriteByte(']')
+	return truncateString(b.String())
+}
+
+// formatMapValue formats a map value without allocating an unbounded string.
+// It stops once approximately maxLen bytes have been written and appends a truncation marker.
+func formatMapValue(rv reflect.Value, maxLen int) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	iter := rv.MapRange()
+	first := true
+	for iter.Next() {
+		if b.Len() >= maxLen {
+			b.WriteString("...(truncated)}")
+			return b.String()
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		keyStr := truncateValue(iter.Key().Interface())
+		valStr := truncateValue(iter.Value().Interface())
+		entry := fmt.Sprintf("%s: %s", keyStr, valStr)
+		if b.Len()+len(entry) > maxLen {
+			remaining := maxLen - b.Len()
+			if remaining > 0 {
+				if remaining < len(entry) {
+					b.WriteString(entry[:remaining])
+				} else {
+					b.WriteString(entry)
+				}
+			}
+			b.WriteString("...(truncated)}")
+			return b.String()
+		}
+		b.WriteString(entry)
+	}
+	b.WriteByte('}')
+	return truncateString(b.String())
 }
