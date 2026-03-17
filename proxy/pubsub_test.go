@@ -385,7 +385,7 @@ func TestPubSub_HandleUnsubNoSession(t *testing.T) {
 	assert.Contains(t, writes, respInt64{0}) // WriteInt64(0)
 }
 
-func TestPubSub_SubscribeInTxnRejected(t *testing.T) {
+func TestPubSub_SubscribeInTxnQueued(t *testing.T) {
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 	s.inTxn = true
@@ -396,11 +396,12 @@ func TestPubSub_SubscribeInTxnRejected(t *testing.T) {
 	writes := dconn.getWrites()
 	found := false
 	for _, w := range writes {
-		if str, ok := w.(string); ok && str == "ERR:ERR Command not allowed inside a transaction" {
+		if str, ok := w.(string); ok && str == "STR:QUEUED" {
 			found = true
 		}
 	}
-	assert.True(t, found, "SUBSCRIBE during MULTI should be rejected")
+	assert.True(t, found, "SUBSCRIBE during MULTI should be queued")
+	assert.Len(t, s.txnQueue, 1, "SUBSCRIBE should be added to txn queue")
 }
 
 func TestPubSub_HandleTxnInSession_MultiExecDiscard(t *testing.T) {

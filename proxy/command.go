@@ -9,7 +9,7 @@ const (
 	CmdRead     CommandCategory = iota // GET, HGET, LRANGE, ZRANGE, etc.
 	CmdWrite                           // SET, DEL, HSET, LPUSH, ZADD, etc.
 	CmdBlocking                        // BZPOPMIN, XREAD (with BLOCK)
-	CmdPubSub                          // SUBSCRIBE, PUBSUB
+	CmdPubSub                          // SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBSUB (note: PUBLISH is CmdWrite)
 	CmdAdmin                           // PING, INFO, CLIENT, SELECT, QUIT, DBSIZE, SCAN, AUTH
 	CmdTxn                             // MULTI, EXEC, DISCARD
 	CmdScript                          // EVAL, EVALSHA
