@@ -15,6 +15,19 @@ import (
 // txnCommandsOverhead is the number of extra commands (MULTI + EXEC) wrapping queued commands.
 const txnCommandsOverhead = 2
 
+// respWriter is the subset of redcon.Conn and redcon.DetachedConn used for writing RESP responses.
+// Both connection types satisfy this interface, enabling shared response-writing logic
+// between the main event loop and detached pub/sub sessions.
+type respWriter interface {
+	WriteError(msg string)
+	WriteString(msg string)
+	WriteBulk(b []byte)
+	WriteBulkString(msg string)
+	WriteInt64(num int64)
+	WriteArray(count int)
+	WriteNull()
+}
+
 // proxyConnState tracks per-connection state (transactions, PubSub).
 type proxyConnState struct {
 	inTxn    bool
@@ -143,11 +156,11 @@ func (p *ProxyServer) dispatchCommand(conn redcon.Conn, state *proxyConnState, n
 
 func (p *ProxyServer) handleQueuedCommand(conn redcon.Conn, state *proxyConnState, name string, args [][]byte) {
 	switch name {
-	case "EXEC":
+	case cmdExec:
 		p.execTxn(conn, state)
-	case "DISCARD":
+	case cmdDiscard:
 		p.discardTxn(conn, state)
-	case "MULTI":
+	case cmdMulti:
 		conn.WriteError("ERR MULTI calls can not be nested")
 	default:
 		state.txnQueue = append(state.txnQueue, args)
@@ -224,6 +237,7 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 	session := &pubsubSession{
 		dconn:    dconn,
 		upstream: upstream,
+		proxy:    p,
 		logger:   p.logger,
 	}
 
@@ -253,7 +267,7 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {
 	name := strings.ToUpper(string(args[0]))
 
 	// Handle PING locally for speed.
-	if name == "PING" {
+	if name == cmdPing {
 		if len(args) > 1 {
 			conn.WriteBulk(args[1])
 		} else {
@@ -263,7 +277,7 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {
 	}
 
 	// Handle QUIT locally.
-	if name == "QUIT" {
+	if name == cmdQuit {
 		conn.WriteString("OK")
 		conn.Close()
 		return
@@ -282,7 +296,7 @@ func (p *ProxyServer) handleScript(conn redcon.Conn, args [][]byte) {
 
 func (p *ProxyServer) handleTxnCommand(conn redcon.Conn, state *proxyConnState, name string) {
 	switch name {
-	case "MULTI":
+	case cmdMulti:
 		if state.inTxn {
 			conn.WriteError("ERR MULTI calls can not be nested")
 			return
@@ -290,13 +304,13 @@ func (p *ProxyServer) handleTxnCommand(conn redcon.Conn, state *proxyConnState, 
 		state.inTxn = true
 		state.txnQueue = nil
 		conn.WriteString("OK")
-	case "EXEC":
+	case cmdExec:
 		if !state.inTxn {
 			conn.WriteError("ERR EXEC without MULTI")
 			return
 		}
 		p.execTxn(conn, state)
-	case "DISCARD":
+	case cmdDiscard:
 		if !state.inTxn {
 			conn.WriteError("ERR DISCARD without MULTI")
 			return
@@ -350,57 +364,54 @@ func (p *ProxyServer) discardTxn(conn redcon.Conn, state *proxyConnState) {
 	conn.WriteString("OK")
 }
 
-// writeResponse handles the common pattern of writing a go-redis response
-// to a redcon connection, correctly handling redis.Nil and upstream errors.
-func writeResponse(conn redcon.Conn, resp interface{}, err error) {
+// writeResponse handles the common pattern of writing a go-redis response,
+// correctly handling redis.Nil and upstream errors.
+func writeResponse(w respWriter, resp interface{}, err error) {
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			conn.WriteNull()
+			w.WriteNull()
 			return
 		}
-		writeRedisError(conn, err)
+		writeRedisError(w, err)
 		return
 	}
-	writeRedisValue(conn, resp)
+	writeRedisValue(w, resp)
 }
 
 // writeRedisError writes an upstream error without double-prefixing.
 // Redis errors already contain their prefix (e.g. "ERR ...", "WRONGTYPE ...").
-func writeRedisError(conn redcon.Conn, err error) {
+func writeRedisError(w respWriter, err error) {
 	msg := err.Error()
 	// go-redis errors are already formatted with prefix; pass through as-is.
-	conn.WriteError(msg)
+	w.WriteError(msg)
 }
 
-// writeRedisValue writes a go-redis response value to a redcon connection.
-func writeRedisValue(conn redcon.Conn, val interface{}) {
+// writeRedisValue writes a go-redis response value to a respWriter.
+func writeRedisValue(w respWriter, val interface{}) {
 	if val == nil {
-		conn.WriteNull()
+		w.WriteNull()
 		return
 	}
 	switch v := val.(type) {
 	case string:
-		// go-redis flattens Status and Bulk strings into Go strings.
-		// Use WriteString (status reply) for known status responses,
-		// WriteBulkString (bulk reply) for data values.
 		if isStatusResponse(v) {
-			conn.WriteString(v)
+			w.WriteString(v)
 		} else {
-			conn.WriteBulkString(v)
+			w.WriteBulkString(v)
 		}
 	case int64:
-		conn.WriteInt64(v)
+		w.WriteInt64(v)
 	case []interface{}:
-		conn.WriteArray(len(v))
+		w.WriteArray(len(v))
 		for _, item := range v {
-			writeRedisValue(conn, item)
+			writeRedisValue(w, item)
 		}
 	case []byte:
-		conn.WriteBulk(v)
+		w.WriteBulk(v)
 	case redis.Error:
-		conn.WriteError(v.Error())
+		w.WriteError(v.Error())
 	default:
-		conn.WriteBulkString(fmt.Sprintf("%v", v))
+		w.WriteBulkString(fmt.Sprintf("%v", v))
 	}
 }
 
