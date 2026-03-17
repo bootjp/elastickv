@@ -24,25 +24,35 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 	return int(res), errors.WithStack(err)
 }
 
+// proxyDel routes DEL keys to the correct leader per key (via RaftLeaderForKey)
+// so that internal-key discovery always runs on the key's leader, even in
+// sharded/multi-raft mode.
 func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
-	leader := r.coordinator.RaftLeader()
-	if leader == "" {
-		return 0, ErrLeaderNotFound
-	}
-	leaderAddr, ok := r.leaderRedis[leader]
-	if !ok || leaderAddr == "" {
-		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	// Group keys by leader Redis address.
+	byAddr := make(map[string][]string)
+	for _, k := range keys {
+		leader := r.coordinator.RaftLeaderForKey(k)
+		if leader == "" {
+			return 0, ErrLeaderNotFound
+		}
+		addr, ok := r.leaderRedis[leader]
+		if !ok || addr == "" {
+			return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		}
+		byAddr[addr] = append(byAddr[addr], string(k))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
-
-	strKeys := make([]string, len(keys))
-	for i, k := range keys {
-		strKeys[i] = string(k)
+	var total int64
+	for addr, strKeys := range byAddr {
+		cli := redis.NewClient(&redis.Options{Addr: addr})
+		res, err := cli.Del(context.Background(), strKeys...).Result()
+		_ = cli.Close()
+		if err != nil {
+			return total, errors.WithStack(err)
+		}
+		total += res
 	}
-	res, err := cli.Del(context.Background(), strKeys...).Result()
-	return res, errors.WithStack(err)
+	return total, nil
 }
 
 func (r *RedisServer) proxyFlushDatabase(all bool) error {

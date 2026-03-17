@@ -925,27 +925,53 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
-	// DEL discovers internal keys (list items, hash/set/zset/stream namespaces)
-	// via local MVCC state. On followers this state may lag, producing incomplete
-	// deletes and orphaned data. Proxy to the leader to ensure correct discovery.
-	if !r.coordinator.IsLeader() {
-		removed, err := r.proxyDel(cmd.Args[1:])
+	// DEL discovers internal keys via local MVCC state. On followers this state
+	// may lag, producing incomplete deletes. Check per-key leadership and proxy
+	// non-local keys to the correct leader for accurate internal-key discovery.
+	localKeys := make([][]byte, 0, len(cmd.Args)-1)
+	proxyKeys := make([][]byte, 0)
+	for _, key := range cmd.Args[1:] {
+		if r.coordinator.IsLeaderForKey(key) {
+			localKeys = append(localKeys, key)
+		} else {
+			proxyKeys = append(proxyKeys, key)
+		}
+	}
+
+	var removed int64
+
+	// Proxy non-local keys to the appropriate leader.
+	if len(proxyKeys) > 0 {
+		proxied, err := r.proxyDel(proxyKeys)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
-		conn.WriteInt64(removed)
-		return
+		removed += proxied
 	}
 
+	// Delete local keys directly.
+	if len(localKeys) > 0 {
+		localRemoved, err := r.delLocal(localKeys)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		removed += int64(localRemoved)
+	}
+
+	conn.WriteInt64(removed)
+}
+
+func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	removed := 0
+	var removed int
 	err := r.retryRedisWrite(ctx, func() error {
 		elems := []*kv.Elem[kv.OP]{}
 		nextRemoved := 0
 		readTS := r.readTS()
-		for _, key := range cmd.Args[1:] {
+		for _, key := range keys {
 			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 			if err != nil {
 				return err
@@ -961,11 +987,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 		removed = nextRemoved
 		return nil
 	})
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	conn.WriteInt(removed)
+	return removed, err
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
