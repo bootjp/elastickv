@@ -107,6 +107,10 @@ func (s *pubsubSession) readClientCommands() {
 			s.handlePing(cmd.Args)
 		case "QUIT":
 			return
+		default:
+			// In pub/sub mode, Redis only allows (P)SUBSCRIBE, (P)UNSUBSCRIBE, PING, and QUIT.
+			// Any other command must return an error to avoid clients hanging waiting for a reply.
+			s.writeError("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context")
 		}
 	}
 }
