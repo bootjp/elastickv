@@ -369,12 +369,13 @@ func (s *pubsubSession) execTxn() {
 	results, err := s.proxy.dual.Primary().Pipeline(ctx, cmds)
 
 	s.mu.Lock()
-	if len(results) > 0 {
+	if err != nil {
+		// Pipeline-level error (connection/transport failure) takes precedence.
+		writeRedisError(s.dconn, err)
+	} else if len(results) > 0 {
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
 		writeResponse(s.dconn, resp, rErr)
-	} else if err != nil {
-		writeRedisError(s.dconn, err)
 	}
 	_ = s.dconn.Flush()
 	s.mu.Unlock()

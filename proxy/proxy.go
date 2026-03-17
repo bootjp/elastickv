@@ -348,13 +348,14 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 	cmds = append(cmds, []any{"EXEC"})
 
 	results, err := p.dual.Primary().Pipeline(ctx, cmds)
-	if len(results) > 0 {
+	if err != nil {
+		// Pipeline-level error (connection/transport failure) takes precedence.
+		writeRedisError(conn, err)
+	} else if len(results) > 0 {
 		// Write the EXEC result (last command in the pipeline).
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
 		writeResponse(conn, resp, rErr)
-	} else if err != nil {
-		writeRedisError(conn, err)
 	}
 
 	// Async replay to secondary (bounded)
