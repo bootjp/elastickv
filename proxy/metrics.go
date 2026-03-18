@@ -15,6 +15,9 @@ type ProxyMetrics struct {
 	MigrationGaps        *prometheus.CounterVec
 
 	ActiveConnections prometheus.Gauge
+
+	PubSubShadowDivergences *prometheus.CounterVec
+	PubSubShadowErrors      prometheus.Counter
 }
 
 // NewProxyMetrics creates and registers all proxy metrics.
@@ -69,6 +72,17 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 			Name:      "active_connections",
 			Help:      "Current number of active client connections.",
 		}),
+
+		PubSubShadowDivergences: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "proxy",
+			Name:      "pubsub_shadow_divergences_total",
+			Help:      "Total pub/sub message mismatches detected by shadow subscribe.",
+		}, []string{"channel", "kind"}),
+		PubSubShadowErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "proxy",
+			Name:      "pubsub_shadow_errors_total",
+			Help:      "Total errors from shadow pub/sub operations.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -81,6 +95,8 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		m.Divergences,
 		m.MigrationGaps,
 		m.ActiveConnections,
+		m.PubSubShadowDivergences,
+		m.PubSubShadowErrors,
 	)
 
 	return m

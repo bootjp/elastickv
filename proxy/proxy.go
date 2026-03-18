@@ -252,6 +252,8 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 		patternSet: make(map[string]struct{}),
 	}
 
+	session.shadow = p.createShadowPubSub(cmdName, channels)
+
 	// Write initial subscription confirmations.
 	kind := strings.ToLower(cmdName)
 	for _, ch := range channels {
@@ -268,10 +270,37 @@ func (p *ProxyServer) startPubSubSession(conn redcon.Conn, cmdName string, args 
 	if err := dconn.Flush(); err != nil {
 		dconn.Close()
 		upstream.Close()
+		if session.shadow != nil {
+			session.shadow.Close()
+		}
 		return
 	}
 
 	go session.run()
+}
+
+// createShadowPubSub creates a shadow pub/sub for secondary comparison if in shadow mode.
+// Returns nil if shadow mode is not active or the shadow subscribe fails.
+func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *shadowPubSub {
+	shadowBackend := p.dual.ShadowPubSubBackend()
+	if shadowBackend == nil {
+		return nil
+	}
+	shadow := newShadowPubSub(shadowBackend, p.metrics, p.sentry, p.logger, p.cfg.PubSubCompareWindow)
+	var err error
+	if cmdName == cmdSubscribe {
+		err = shadow.Subscribe(context.Background(), channels...)
+	} else {
+		err = shadow.PSubscribe(context.Background(), channels...)
+	}
+	if err != nil {
+		p.logger.Warn("shadow pubsub subscribe failed", "err", err)
+		p.metrics.PubSubShadowErrors.Inc()
+		shadow.Close()
+		return nil
+	}
+	shadow.Start()
+	return shadow
 }
 
 func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {

@@ -3,8 +3,10 @@ package proxy
 import "time"
 
 const (
-	defaultSecondaryTimeout = 5 * time.Second
-	defaultShadowTimeout    = 3 * time.Second
+	defaultSecondaryTimeout    = 5 * time.Second
+	defaultShadowTimeout       = 3 * time.Second
+	defaultPubSubCompareWindow = 2 * time.Second
+	defaultPubSubSweepInterval = 500 * time.Millisecond
 )
 
 // ProxyMode controls which backends receive reads and writes.
@@ -49,32 +51,34 @@ func (m ProxyMode) String() string {
 
 // ProxyConfig holds all configuration for the dual-write proxy.
 type ProxyConfig struct {
-	ListenAddr        string
-	PrimaryAddr       string
-	PrimaryDB         int
-	PrimaryPassword   string
-	SecondaryAddr     string
-	SecondaryDB       int
-	SecondaryPassword string
-	Mode              ProxyMode
-	SecondaryTimeout  time.Duration
-	ShadowTimeout     time.Duration
-	SentryDSN         string
-	SentryEnv         string
-	SentrySampleRate  float64
-	MetricsAddr       string
+	ListenAddr          string
+	PrimaryAddr         string
+	PrimaryDB           int
+	PrimaryPassword     string
+	SecondaryAddr       string
+	SecondaryDB         int
+	SecondaryPassword   string
+	Mode                ProxyMode
+	SecondaryTimeout    time.Duration
+	ShadowTimeout       time.Duration
+	SentryDSN           string
+	SentryEnv           string
+	SentrySampleRate    float64
+	MetricsAddr         string
+	PubSubCompareWindow time.Duration
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.
 func DefaultConfig() ProxyConfig {
 	return ProxyConfig{
-		ListenAddr:       ":6479",
-		PrimaryAddr:      "localhost:6379",
-		SecondaryAddr:    "localhost:6380",
-		Mode:             ModeDualWrite,
-		SecondaryTimeout: defaultSecondaryTimeout,
-		ShadowTimeout:    defaultShadowTimeout,
-		SentrySampleRate: 1.0,
-		MetricsAddr:      ":9191",
+		ListenAddr:          ":6479",
+		PrimaryAddr:         "localhost:6379",
+		SecondaryAddr:       "localhost:6380",
+		Mode:                ModeDualWrite,
+		SecondaryTimeout:    defaultSecondaryTimeout,
+		ShadowTimeout:       defaultShadowTimeout,
+		SentrySampleRate:    1.0,
+		MetricsAddr:         ":9191",
+		PubSubCompareWindow: defaultPubSubCompareWindow,
 	}
 }

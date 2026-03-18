@@ -254,6 +254,18 @@ func (d *DualWriter) PubSubBackend() PubSubBackend {
 	return nil
 }
 
+// ShadowPubSubBackend returns the secondary backend as a PubSubBackend
+// when shadow mode is active, or nil otherwise.
+func (d *DualWriter) ShadowPubSubBackend() PubSubBackend {
+	if d.shadow == nil {
+		return nil
+	}
+	if ps, ok := d.secondary.(PubSubBackend); ok {
+		return ps
+	}
+	return nil
+}
+
 // Secondary returns the secondary backend.
 func (d *DualWriter) Secondary() Backend {
 	return d.secondary

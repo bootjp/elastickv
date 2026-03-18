@@ -56,6 +56,9 @@ type pubsubSession struct {
 	// fwdDone is closed when the current forwardMessages goroutine exits.
 	fwdDone chan struct{}
 
+	// Shadow pub/sub for secondary comparison (nil when not in shadow mode).
+	shadow *shadowPubSub
+
 	// Transaction state for normal command mode.
 	inTxn    bool
 	txnQueue [][][]byte
@@ -81,6 +84,10 @@ func (s *pubsubSession) cleanup() {
 		s.upstream = nil
 	}
 	s.mu.Unlock()
+	if s.shadow != nil {
+		s.shadow.Close()
+		s.shadow = nil
+	}
 	if s.fwdDone != nil {
 		// Bounded wait: if forwardMessages is stuck on a slow/dead client socket,
 		// close dconn to unblock it, then wait for completion.
@@ -140,6 +147,10 @@ func (s *pubsubSession) forwardMessages(ch <-chan *redis.Message) {
 		if err != nil {
 			return
 		}
+		// Record for shadow comparison (outside writeMu to avoid nested locking).
+		if s.shadow != nil {
+			s.shadow.RecordPrimary(msg)
+		}
 	}
 }
 
@@ -186,6 +197,10 @@ func (s *pubsubSession) exitPubSubMode() {
 		s.upstream = nil
 	}
 	s.mu.Unlock()
+	if s.shadow != nil {
+		s.shadow.Close()
+		s.shadow = nil
+	}
 	if s.fwdDone != nil {
 		select {
 		case <-s.fwdDone:
@@ -355,6 +370,8 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	s.mu.Unlock()
 	s.startForwarding()
 
+	s.shadow = s.proxy.createShadowPubSub(cmdName, channels)
+
 	// Update state (sets only accessed from commandLoop goroutine).
 	kind := strings.ToLower(cmdName)
 	for _, ch := range channels {
@@ -418,51 +435,49 @@ func (s *pubsubSession) execTxn() {
 // --- Subscription handlers ---
 
 func (s *pubsubSession) handleSubscribe(args [][]byte) {
-	if len(args) < pubsubMinArgs {
-		s.writeError("ERR wrong number of arguments for 'subscribe'")
-		return
-	}
-	channels := byteSlicesToStrings(args[1:])
-	if err := s.upstream.Subscribe(context.Background(), channels...); err != nil {
-		s.logger.Warn("upstream subscribe failed", "err", err)
-		s.writeRedisError(err)
-		return
-	}
-	// Update state (channelSet is only accessed from commandLoop goroutine).
-	for _, ch := range channels {
-		s.channelSet[ch] = struct{}{}
-	}
-	s.writeMu.Lock()
-	for _, ch := range channels {
-		s.dconn.WriteArray(pubsubArrayReply)
-		s.dconn.WriteBulkString("subscribe")
-		s.dconn.WriteBulkString(ch)
-		s.dconn.WriteInt64(int64(s.subCount()))
-	}
-	_ = s.dconn.Flush()
-	s.writeMu.Unlock()
+	s.handleSub(args, false)
 }
 
 func (s *pubsubSession) handlePSubscribe(args [][]byte) {
+	s.handleSub(args, true)
+}
+
+// handleSub is the shared implementation for SUBSCRIBE and PSUBSCRIBE.
+func (s *pubsubSession) handleSub(args [][]byte, isPattern bool) {
+	kind := "subscribe"
+	if isPattern {
+		kind = "psubscribe"
+	}
 	if len(args) < pubsubMinArgs {
-		s.writeError("ERR wrong number of arguments for 'psubscribe'")
+		s.writeError(fmt.Sprintf("ERR wrong number of arguments for '%s'", kind))
 		return
 	}
-	pats := byteSlicesToStrings(args[1:])
-	if err := s.upstream.PSubscribe(context.Background(), pats...); err != nil {
-		s.logger.Warn("upstream psubscribe failed", "err", err)
+	names := byteSlicesToStrings(args[1:])
+	var err error
+	if isPattern {
+		err = s.upstream.PSubscribe(context.Background(), names...)
+	} else {
+		err = s.upstream.Subscribe(context.Background(), names...)
+	}
+	if err != nil {
+		s.logger.Warn("upstream "+kind+" failed", "err", err)
 		s.writeRedisError(err)
 		return
 	}
-	// Update state (patternSet is only accessed from commandLoop goroutine).
-	for _, p := range pats {
-		s.patternSet[p] = struct{}{}
+	s.mirrorSub(names, isPattern)
+	// Update state (goroutine-confined to commandLoop).
+	for _, n := range names {
+		if isPattern {
+			s.patternSet[n] = struct{}{}
+		} else {
+			s.channelSet[n] = struct{}{}
+		}
 	}
 	s.writeMu.Lock()
-	for _, p := range pats {
+	for _, n := range names {
 		s.dconn.WriteArray(pubsubArrayReply)
-		s.dconn.WriteBulkString("psubscribe")
-		s.dconn.WriteBulkString(p)
+		s.dconn.WriteBulkString(kind)
+		s.dconn.WriteBulkString(n)
 		s.dconn.WriteInt64(int64(s.subCount()))
 	}
 	_ = s.dconn.Flush()
@@ -486,6 +501,9 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 			s.writeRedisError(err)
 			return
 		}
+		if s.shadow != nil {
+			s.mirrorUnsubAll(isPattern)
+		}
 		s.writeUnsubAll(kind, isPattern)
 		return
 	}
@@ -495,6 +513,9 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 		s.logger.Warn("upstream "+kind+" failed, closing session", "err", err)
 		s.writeRedisError(err)
 		return
+	}
+	if s.shadow != nil {
+		s.mirrorUnsub(names, isPattern)
 	}
 	// Update state (goroutine-confined) and pre-compute counts before taking writeMu.
 	counts := make([]int, len(names))
@@ -597,6 +618,54 @@ func (s *pubsubSession) handleUnsubNoSession(cmdName string) {
 	s.dconn.WriteNull()
 	s.dconn.WriteInt64(0)
 	_ = s.dconn.Flush()
+}
+
+// --- Shadow mirror helpers ---
+
+func (s *pubsubSession) mirrorSub(names []string, isPattern bool) {
+	if s.shadow == nil {
+		return
+	}
+	var err error
+	if isPattern {
+		err = s.shadow.PSubscribe(context.Background(), names...)
+	} else {
+		err = s.shadow.Subscribe(context.Background(), names...)
+	}
+	if err != nil {
+		kind := "subscribe"
+		if isPattern {
+			kind = "psubscribe"
+		}
+		s.logger.Warn("shadow "+kind+" failed", "err", err)
+		s.proxy.metrics.PubSubShadowErrors.Inc()
+	}
+}
+
+func (s *pubsubSession) mirrorUnsubAll(isPattern bool) {
+	var err error
+	if isPattern {
+		err = s.shadow.PUnsubscribe(context.Background())
+	} else {
+		err = s.shadow.Unsubscribe(context.Background())
+	}
+	if err != nil {
+		s.logger.Warn("shadow unsubscribe-all failed", "err", err)
+		s.proxy.metrics.PubSubShadowErrors.Inc()
+	}
+}
+
+func (s *pubsubSession) mirrorUnsub(names []string, isPattern bool) {
+	var err error
+	if isPattern {
+		err = s.shadow.PUnsubscribe(context.Background(), names...)
+	} else {
+		err = s.shadow.Unsubscribe(context.Background(), names...)
+	}
+	if err != nil {
+		s.logger.Warn("shadow unsubscribe failed", "err", err)
+		s.proxy.metrics.PubSubShadowErrors.Inc()
+	}
 }
 
 // --- Helpers ---
