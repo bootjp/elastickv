@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -92,6 +93,13 @@ func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd
 	}
 	_, err := pipe.Exec(ctx)
 	if err != nil {
+		// go-redis pipelines return redis.Error for Redis reply errors (e.g., EXECABORT).
+		// Return results with nil error so callers can read per-command results (especially EXEC).
+		// Only propagate true transport/context errors.
+		var redisErr redis.Error
+		if errors.As(err, &redisErr) || errors.Is(err, redis.Nil) {
+			return results, nil
+		}
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil

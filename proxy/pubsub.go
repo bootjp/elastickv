@@ -496,18 +496,22 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 		s.writeRedisError(err)
 		return
 	}
-	// Update state then write replies.
-	s.writeMu.Lock()
-	for _, n := range names {
+	// Update state (goroutine-confined) and pre-compute counts before taking writeMu.
+	counts := make([]int, len(names))
+	for i, n := range names {
 		if isPattern {
 			delete(s.patternSet, n)
 		} else {
 			delete(s.channelSet, n)
 		}
+		counts[i] = s.subCount()
+	}
+	s.writeMu.Lock()
+	for i, n := range names {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
-		s.dconn.WriteInt64(int64(s.subCount()))
+		s.dconn.WriteInt64(int64(counts[i]))
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()
@@ -521,37 +525,42 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		set = s.patternSet
 	}
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
 	if len(set) == 0 {
 		// No subscriptions: single reply with null channel (matching Redis).
+		s.writeMu.Lock()
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteNull()
 		s.dconn.WriteInt64(int64(s.subCount()))
 		_ = s.dconn.Flush()
+		s.writeMu.Unlock()
 		return
 	}
 
-	// Collect names, then remove one-by-one to decrement count per reply.
+	// Collect names and pre-compute decreasing counts (state is goroutine-confined).
 	names := make([]string, 0, len(set))
 	for n := range set {
 		names = append(names, n)
 	}
-
-	for _, n := range names {
+	counts := make([]int, len(names))
+	for i, n := range names {
 		if isPattern {
 			delete(s.patternSet, n)
 		} else {
 			delete(s.channelSet, n)
 		}
+		counts[i] = s.subCount()
+	}
+
+	s.writeMu.Lock()
+	for i, n := range names {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
-		s.dconn.WriteInt64(int64(s.subCount()))
+		s.dconn.WriteInt64(int64(counts[i]))
 	}
 	_ = s.dconn.Flush()
+	s.writeMu.Unlock()
 }
 
 // --- Ping handlers ---
