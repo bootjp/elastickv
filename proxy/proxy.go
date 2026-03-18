@@ -287,7 +287,6 @@ func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *sha
 		return nil
 	}
 	shadow := newShadowPubSub(shadowBackend, p.metrics, p.sentry, p.logger, p.cfg.PubSubCompareWindow)
-	shadow.Start()
 	var err error
 	if cmdName == cmdSubscribe {
 		err = shadow.Subscribe(context.Background(), channels...)
@@ -300,6 +299,7 @@ func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *sha
 		shadow.Close()
 		return nil
 	}
+	shadow.Start()
 	return shadow
 }
 
