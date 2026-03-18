@@ -212,12 +212,27 @@ func (sp *shadowPubSub) reportDivergence(channel, payload string, kind Divergenc
 		"payload", truncateValue(payload),
 		"kind", kind.String(),
 	)
+
+	var primary any
+	var secondary any
+	switch kind {
+	case DivExtraData:
+		// Message exists on secondary but not on primary.
+		primary = nil
+		secondary = payload
+	default:
+		// Default: message exists on primary but not on secondary (or other kinds
+		// that follow the same primary/secondary semantics).
+		primary = payload
+		secondary = nil
+	}
+
 	sp.sentry.CaptureDivergence(Divergence{
 		Command:    "SUBSCRIBE",
 		Key:        channel,
 		Kind:       kind,
-		Primary:    payload,
-		Secondary:  nil,
+		Primary:    primary,
+		Secondary:  secondary,
 		DetectedAt: time.Now(),
 	})
 }
