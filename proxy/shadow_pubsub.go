@@ -158,15 +158,27 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 
 // sweepExpired reports primary messages that were not matched within the window.
 func (sp *shadowPubSub) sweepExpired() {
+	// Collect divergences while holding the lock, then report them after releasing it
+	// to avoid doing potentially blocking I/O (logging/Sentry) under sp.mu.
+	type divergenceEvent struct {
+		channel string
+		payload string
+		kind    DivergenceKind
+	}
+	var divergences []divergenceEvent
+
 	sp.mu.Lock()
-	defer sp.mu.Unlock()
 
 	now := time.Now()
 	for key, entries := range sp.pending {
 		var remaining []pendingMsg
 		for _, e := range entries {
 			if now.Sub(e.timestamp) >= sp.window {
-				sp.reportDivergenceLocked(e.channel, e.payload, DivDataMismatch)
+				divergences = append(divergences, divergenceEvent{
+					channel: e.channel,
+					payload: e.payload,
+					kind:    DivDataMismatch,
+				})
 			} else {
 				remaining = append(remaining, e)
 			}
@@ -176,6 +188,12 @@ func (sp *shadowPubSub) sweepExpired() {
 		} else {
 			sp.pending[key] = remaining
 		}
+	}
+
+	sp.mu.Unlock()
+
+	for _, d := range divergences {
+		sp.reportDivergence(d.channel, d.payload, d.kind)
 	}
 }
 
@@ -197,7 +215,7 @@ func (sp *shadowPubSub) reportDivergence(channel, payload string, kind Divergenc
 }
 
 // reportDivergenceLocked is the same as reportDivergence but assumes mu is held.
-// It releases the lock briefly for the report to avoid holding it during I/O.
+// It does not release the lock; callers must ensure it's safe to perform logging/Sentry under sp.mu.
 func (sp *shadowPubSub) reportDivergenceLocked(channel, payload string, kind DivergenceKind) {
 	// Metrics and logging are goroutine-safe; safe to call under lock.
 	sp.metrics.PubSubShadowDivergences.WithLabelValues(channel, kind.String()).Inc()
