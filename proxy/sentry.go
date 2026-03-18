@@ -145,6 +145,10 @@ func cmdNameFromArgs(args [][]byte) string {
 // truncateValue formats a value for logging/Sentry, truncating to avoid data leakage and oversized events.
 // Handles common types by slicing before formatting to avoid allocating the full string representation.
 func truncateValue(v any) string {
+	if v == nil {
+		return "<nil>"
+	}
+
 	switch tv := v.(type) {
 	case string:
 		return truncateString(tv)
