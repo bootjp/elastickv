@@ -35,6 +35,7 @@ type shadowPubSub struct {
 	mu      sync.Mutex
 	pending map[msgKey][]pendingMsg // primary messages awaiting secondary match
 	closed  bool
+	started bool
 	done    chan struct{}
 }
 
@@ -53,6 +54,9 @@ func newShadowPubSub(backend PubSubBackend, metrics *ProxyMetrics, sentry *Sentr
 // Start begins reading from the secondary and comparing messages.
 // Must be called after initial subscribe.
 func (sp *shadowPubSub) Start() {
+	sp.mu.Lock()
+	sp.started = true
+	sp.mu.Unlock()
 	ch := sp.secondary.Channel()
 	go func() {
 		defer close(sp.done)
@@ -108,12 +112,16 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 }
 
 // Close stops the shadow comparison and closes the secondary pub/sub.
+// Safe to call even if Start was never called.
 func (sp *shadowPubSub) Close() {
 	sp.mu.Lock()
 	sp.closed = true
+	started := sp.started
 	sp.mu.Unlock()
 	sp.secondary.Close()
-	<-sp.done
+	if started {
+		<-sp.done
+	}
 }
 
 // compareLoop reads from the secondary channel and matches messages.
@@ -198,26 +206,6 @@ func (sp *shadowPubSub) sweepExpired() {
 }
 
 func (sp *shadowPubSub) reportDivergence(channel, payload string, kind DivergenceKind) {
-	sp.metrics.PubSubShadowDivergences.WithLabelValues(channel, kind.String()).Inc()
-	sp.logger.Warn("pubsub shadow divergence",
-		"channel", truncateValue(channel),
-		"payload", truncateValue(payload),
-		"kind", kind.String(),
-	)
-	sp.sentry.CaptureDivergence(Divergence{
-		Command:    "SUBSCRIBE",
-		Key:        channel,
-		Kind:       kind,
-		Primary:    payload,
-		Secondary:  nil,
-		DetectedAt: time.Now(),
-	})
-}
-
-// reportDivergenceLocked is the same as reportDivergence but assumes mu is held.
-// It does not release the lock; callers must ensure it's safe to perform logging/Sentry under sp.mu.
-func (sp *shadowPubSub) reportDivergenceLocked(channel, payload string, kind DivergenceKind) {
-	// Metrics and logging are goroutine-safe; safe to call under lock.
 	sp.metrics.PubSubShadowDivergences.WithLabelValues(channel, kind.String()).Inc()
 	sp.logger.Warn("pubsub shadow divergence",
 		"channel", truncateValue(channel),

@@ -84,10 +84,6 @@ func (s *pubsubSession) cleanup() {
 		s.upstream = nil
 	}
 	s.mu.Unlock()
-	if s.shadow != nil {
-		s.shadow.Close()
-		s.shadow = nil
-	}
 	if s.fwdDone != nil {
 		// Bounded wait: if forwardMessages is stuck on a slow/dead client socket,
 		// close dconn to unblock it, then wait for completion.
@@ -97,9 +93,12 @@ func (s *pubsubSession) cleanup() {
 			s.logger.Warn("forwardMessages did not exit within timeout, closing dconn to unblock")
 			s.dconn.Close()
 			<-s.fwdDone
+			s.closeShadow()
 			return // dconn already closed
 		}
 	}
+	// Close shadow after forwardMessages exits (it calls RecordPrimary).
+	s.closeShadow()
 	s.dconn.Close()
 }
 
@@ -148,8 +147,12 @@ func (s *pubsubSession) forwardMessages(ch <-chan *redis.Message) {
 			return
 		}
 		// Record for shadow comparison (outside writeMu to avoid nested locking).
-		if s.shadow != nil {
-			s.shadow.RecordPrimary(msg)
+		// Capture shadow under mu since cleanup/exitPubSubMode can nil it concurrently.
+		s.mu.Lock()
+		shadow := s.shadow
+		s.mu.Unlock()
+		if shadow != nil {
+			shadow.RecordPrimary(msg)
 		}
 	}
 }
@@ -197,10 +200,6 @@ func (s *pubsubSession) exitPubSubMode() {
 		s.upstream = nil
 	}
 	s.mu.Unlock()
-	if s.shadow != nil {
-		s.shadow.Close()
-		s.shadow = nil
-	}
 	if s.fwdDone != nil {
 		select {
 		case <-s.fwdDone:
@@ -211,6 +210,8 @@ func (s *pubsubSession) exitPubSubMode() {
 		}
 		s.fwdDone = nil
 	}
+	// Close shadow after forwardMessages exits (it calls RecordPrimary).
+	s.closeShadow()
 }
 
 // dispatchPubSubCommand handles a single command in pub/sub mode.
@@ -618,6 +619,16 @@ func (s *pubsubSession) handleUnsubNoSession(cmdName string) {
 	s.dconn.WriteNull()
 	s.dconn.WriteInt64(0)
 	_ = s.dconn.Flush()
+}
+
+func (s *pubsubSession) closeShadow() {
+	s.mu.Lock()
+	shadow := s.shadow
+	s.shadow = nil
+	s.mu.Unlock()
+	if shadow != nil {
+		shadow.Close()
+	}
 }
 
 // --- Shadow mirror helpers ---
