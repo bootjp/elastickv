@@ -366,15 +366,13 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 		return
 	}
 
+	shadow := s.proxy.createShadowPubSub(cmdName, channels)
+
 	s.mu.Lock()
 	s.upstream = upstream
-	s.mu.Unlock()
-	s.startForwarding()
-
-	shadow := s.proxy.createShadowPubSub(cmdName, channels)
-	s.mu.Lock()
 	s.shadow = shadow
 	s.mu.Unlock()
+	s.startForwarding()
 
 	// Update state (sets only accessed from commandLoop goroutine).
 	kind := strings.ToLower(cmdName)
