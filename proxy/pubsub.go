@@ -453,7 +453,7 @@ func (s *pubsubSession) handleSub(args [][]byte, isPattern bool) {
 		kind = "psubscribe"
 	}
 	if len(args) < pubsubMinArgs {
-		s.writeError(fmt.Sprintf("ERR wrong number of arguments for '%s'", kind))
+		s.writeError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", kind))
 		return
 	}
 	names := byteSlicesToStrings(args[1:])
