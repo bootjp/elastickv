@@ -11,16 +11,26 @@ import (
 )
 
 // msgKey is used as a map key for matching primary and secondary messages.
+// Includes Pattern to correctly distinguish pmessage deliveries.
 type msgKey struct {
+	Pattern string
 	Channel string
 	Payload string
 }
 
 // pendingMsg records a message awaiting its counterpart from the other source.
 type pendingMsg struct {
+	pattern   string
 	channel   string
 	payload   string
 	timestamp time.Time
+}
+
+// divergenceEvent holds divergence info collected under lock for deferred reporting.
+type divergenceEvent struct {
+	channel string
+	payload string
+	kind    DivergenceKind
 }
 
 // shadowPubSub subscribes to the secondary backend for the same channels
@@ -103,8 +113,9 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 	if sp.closed {
 		return
 	}
-	key := msgKey{Channel: msg.Channel, Payload: msg.Payload}
+	key := msgKeyFromMessage(msg)
 	sp.pending[key] = append(sp.pending[key], pendingMsg{
+		pattern:   msg.Pattern,
 		channel:   msg.Channel,
 		payload:   msg.Payload,
 		timestamp: time.Now(),
@@ -133,8 +144,8 @@ func (sp *shadowPubSub) compareLoop(ch <-chan *redis.Message) {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				// Channel closed — secondary connection terminated.
-				sp.sweepExpired()
+				// Channel closed — flush all remaining pending as divergences.
+				sp.sweepAll()
 				return
 			}
 			sp.matchSecondary(msg)
@@ -145,11 +156,11 @@ func (sp *shadowPubSub) compareLoop(ch <-chan *redis.Message) {
 }
 
 // matchSecondary tries to match a secondary message against a pending primary message.
+// Collects divergence info under lock and reports after releasing it.
 func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 	sp.mu.Lock()
-	defer sp.mu.Unlock()
 
-	key := msgKey{Channel: msg.Channel, Payload: msg.Payload}
+	key := msgKeyFromMessage(msg)
 	if entries, ok := sp.pending[key]; ok && len(entries) > 0 {
 		// Match found — remove the oldest pending primary message.
 		if len(entries) == 1 {
@@ -157,8 +168,11 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 		} else {
 			sp.pending[key] = entries[1:]
 		}
+		sp.mu.Unlock()
 		return
 	}
+
+	sp.mu.Unlock()
 
 	// No matching primary message — extra on secondary.
 	sp.reportDivergence(msg.Channel, msg.Payload, DivExtraData)
@@ -166,17 +180,9 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 
 // sweepExpired reports primary messages that were not matched within the window.
 func (sp *shadowPubSub) sweepExpired() {
-	// Collect divergences while holding the lock, then report them after releasing it
-	// to avoid doing potentially blocking I/O (logging/Sentry) under sp.mu.
-	type divergenceEvent struct {
-		channel string
-		payload string
-		kind    DivergenceKind
-	}
 	var divergences []divergenceEvent
 
 	sp.mu.Lock()
-
 	now := time.Now()
 	for key, entries := range sp.pending {
 		var remaining []pendingMsg
@@ -197,7 +203,28 @@ func (sp *shadowPubSub) sweepExpired() {
 			sp.pending[key] = remaining
 		}
 	}
+	sp.mu.Unlock()
 
+	for _, d := range divergences {
+		sp.reportDivergence(d.channel, d.payload, d.kind)
+	}
+}
+
+// sweepAll reports all remaining pending messages as divergences (used on shutdown).
+func (sp *shadowPubSub) sweepAll() {
+	var divergences []divergenceEvent
+
+	sp.mu.Lock()
+	for key, entries := range sp.pending {
+		for _, e := range entries {
+			divergences = append(divergences, divergenceEvent{
+				channel: e.channel,
+				payload: e.payload,
+				kind:    DivDataMismatch,
+			})
+		}
+		delete(sp.pending, key)
+	}
 	sp.mu.Unlock()
 
 	for _, d := range divergences {
@@ -213,20 +240,15 @@ func (sp *shadowPubSub) reportDivergence(channel, payload string, kind Divergenc
 		"kind", kind.String(),
 	)
 
-	var primary any
-	var secondary any
-	switch kind {
+	var primary, secondary any
+	switch kind { //nolint:exhaustive // only two kinds apply to pub/sub shadow
 	case DivExtraData:
-		// Message exists on secondary but not on primary.
 		primary = nil
 		secondary = payload
 	default:
-		// Default: message exists on primary but not on secondary (or other kinds
-		// that follow the same primary/secondary semantics).
 		primary = payload
 		secondary = nil
 	}
-
 	sp.sentry.CaptureDivergence(Divergence{
 		Command:    "SUBSCRIBE",
 		Key:        channel,
@@ -235,4 +257,12 @@ func (sp *shadowPubSub) reportDivergence(channel, payload string, kind Divergenc
 		Secondary:  secondary,
 		DetectedAt: time.Now(),
 	})
+}
+
+func msgKeyFromMessage(msg *redis.Message) msgKey {
+	return msgKey{
+		Pattern: msg.Pattern,
+		Channel: msg.Channel,
+		Payload: msg.Payload,
+	}
 }
