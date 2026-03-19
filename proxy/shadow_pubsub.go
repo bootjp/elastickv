@@ -169,7 +169,11 @@ func (sp *shadowPubSub) compareLoop(ch <-chan *redis.Message) {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				// Channel closed — flush all remaining pending as divergences.
+				// Channel closed — mark as closed so RecordPrimary becomes a no-op,
+				// then flush all remaining pending as divergences.
+				sp.mu.Lock()
+				sp.closed = true
+				sp.mu.Unlock()
 				sp.sweepAll()
 				return
 			}
@@ -291,7 +295,7 @@ func sweepExpiredSecondaries(now time.Time, window time.Duration, secBuf map[msg
 		var remaining []secondaryPending
 		for _, sec := range secs {
 			if now.Sub(sec.timestamp) >= window {
-				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, kind: DivExtraData})
+				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, kind: DivExtraData, isPattern: key.Pattern != ""})
 			} else {
 				remaining = append(remaining, sec)
 			}
@@ -330,9 +334,10 @@ func (sp *shadowPubSub) sweepAll() {
 		for key, secs := range perInstance {
 			for _, sec := range secs {
 				divergences = append(divergences, divergenceEvent{
-					channel: sec.channel,
-					payload: sec.payload,
-					kind:    DivExtraData,
+					channel:   sec.channel,
+					payload:   sec.payload,
+					kind:      DivExtraData,
+					isPattern: key.Pattern != "",
 				})
 			}
 			delete(perInstance, key)

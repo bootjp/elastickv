@@ -141,6 +141,7 @@ func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
 
 	sp.mu.Lock()
 	assert.Equal(t, 0, len(sp.pending), "should sweep on exit")
+	assert.True(t, sp.closed, "should mark closed on channel close to prevent RecordPrimary leak")
 	sp.mu.Unlock()
 }
 
