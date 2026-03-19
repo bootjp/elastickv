@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -32,6 +33,9 @@ type DualWriter struct {
 	writeSem  chan struct{} // bounds concurrent secondary write goroutines
 	shadowSem chan struct{} // bounds concurrent shadow read goroutines
 	wg        sync.WaitGroup
+
+	// closing is set to 1 when Close has begun; accessed atomically.
+	closing int32
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -61,6 +65,8 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 // Close waits for all in-flight async goroutines to finish.
 // Should be called during graceful shutdown.
 func (d *DualWriter) Close() {
+	// Mark as closing so no new async goroutines are scheduled.
+	atomic.StoreInt32(&d.closing, 1)
 	d.wg.Wait()
 }
 
@@ -83,7 +89,7 @@ func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any,
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	// Secondary: async fire-and-forget (bounded)
-	if d.hasSecondaryWrite() {
+	if d.hasSecondaryWrite() && atomic.LoadInt32(&d.closing) == 0 {
 		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
