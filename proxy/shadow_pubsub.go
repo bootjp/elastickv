@@ -64,11 +64,12 @@ type shadowPubSub struct {
 	window    time.Duration
 	nowFunc   func() time.Time // injectable clock; defaults to time.Now
 
-	mu      sync.Mutex
-	pending map[msgKey][]pendingMsg // primary messages awaiting secondary match
-	closed  bool
-	started bool
-	done    chan struct{}
+	mu        sync.Mutex
+	pending   map[msgKey][]pendingMsg // primary messages awaiting secondary match
+	closed    bool
+	started   bool
+	startOnce sync.Once
+	done      chan struct{}
 }
 
 func newShadowPubSub(backend PubSubBackend, metrics *ProxyMetrics, sentry *SentryReporter, logger *slog.Logger, window time.Duration) *shadowPubSub {
@@ -85,16 +86,19 @@ func newShadowPubSub(backend PubSubBackend, metrics *ProxyMetrics, sentry *Sentr
 }
 
 // Start begins reading from the secondary and comparing messages.
-// Must be called after initial subscribe.
+// Must be called after initial subscribe. Safe to call multiple times;
+// only the first call launches the compare loop.
 func (sp *shadowPubSub) Start() {
-	sp.mu.Lock()
-	sp.started = true
-	sp.mu.Unlock()
-	ch := sp.secondary.Channel()
-	go func() {
-		defer close(sp.done)
-		sp.compareLoop(ch)
-	}()
+	sp.startOnce.Do(func() {
+		sp.mu.Lock()
+		sp.started = true
+		sp.mu.Unlock()
+		ch := sp.secondary.Channel()
+		go func() {
+			defer close(sp.done)
+			sp.compareLoop(ch)
+		}()
+	})
 }
 
 // Subscribe mirrors a SUBSCRIBE to the secondary.

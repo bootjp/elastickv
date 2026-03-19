@@ -352,9 +352,9 @@ func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
 	assert.Equal(t, "OK", resp)
 	assert.Equal(t, 1, primary.CallCount())
 
-	// Wait for async secondary write
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, 1, secondary.CallCount())
+	// Wait for async secondary write deterministically.
+	assert.Eventually(t, func() bool { return secondary.CallCount() == 1 },
+		time.Second, time.Millisecond, "secondary should be called once")
 }
 
 func TestDualWriter_Write_PrimaryFail(t *testing.T) {
@@ -368,8 +368,8 @@ func TestDualWriter_Write_PrimaryFail(t *testing.T) {
 	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "connection refused")
-	// Secondary should NOT be called when primary fails
-	time.Sleep(50 * time.Millisecond)
+	// Secondary should NOT be called when primary fails; drain async work.
+	d.Close()
 	assert.Equal(t, 0, secondary.CallCount())
 }
 
@@ -386,7 +386,7 @@ func TestDualWriter_Write_SecondaryFail_ClientSucceeds(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "OK", resp)
 
-	time.Sleep(50 * time.Millisecond)
+	d.Close()
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 }
 
@@ -404,8 +404,8 @@ func TestDualWriter_Write_RedisNil(t *testing.T) {
 	assert.ErrorIs(t, err, redis.Nil)
 	assert.Nil(t, resp)
 	// Should still send to secondary
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, 1, secondary.CallCount())
+	assert.Eventually(t, func() bool { return secondary.CallCount() == 1 },
+		time.Second, time.Millisecond, "secondary should be called for redis.Nil")
 }
 
 func TestDualWriter_Write_RedisOnlyMode(t *testing.T) {
@@ -418,7 +418,7 @@ func TestDualWriter_Write_RedisOnlyMode(t *testing.T) {
 
 	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
-	time.Sleep(50 * time.Millisecond)
+	d.Close()
 	assert.Equal(t, 0, secondary.CallCount(), "secondary should not be called in redis-only mode")
 }
 
@@ -432,7 +432,7 @@ func TestDualWriter_Write_ElasticKVOnlyMode(t *testing.T) {
 
 	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
-	time.Sleep(50 * time.Millisecond)
+	d.Close()
 	assert.Equal(t, 0, secondary.CallCount(), "secondary should not be called in elastickv-only mode")
 }
 
@@ -450,9 +450,9 @@ func TestDualWriter_Read_WithShadow(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "hello", resp)
 
-	// Wait for shadow read
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, 1, secondary.CallCount(), "shadow read should be issued")
+	// Wait for shadow read deterministically.
+	assert.Eventually(t, func() bool { return secondary.CallCount() == 1 },
+		time.Second, time.Millisecond, "shadow read should be issued")
 }
 
 func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
@@ -466,7 +466,7 @@ func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
 
 	_, err := d.Read(context.Background(), "GET", [][]byte{[]byte("GET"), []byte("k")})
 	assert.NoError(t, err)
-	time.Sleep(50 * time.Millisecond)
+	d.Close()
 	assert.Equal(t, 0, secondary.CallCount(), "no shadow in dual-write mode")
 }
 

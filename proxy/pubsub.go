@@ -388,7 +388,6 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	s.upstream = upstream
 	s.shadow = shadow
 	s.mu.Unlock()
-	s.startForwarding()
 
 	// Update state (sets only accessed from commandLoop goroutine).
 	kind := strings.ToLower(cmdName)
@@ -399,6 +398,9 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 			s.patternSet[ch] = struct{}{}
 		}
 	}
+
+	// Write subscription confirmations before starting forwarding so that
+	// clients receive acknowledgements before any pub/sub messages.
 	s.writeMu.Lock()
 	for _, ch := range channels {
 		s.dconn.WriteArray(pubsubArrayReply)
@@ -408,6 +410,8 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	}
 	s.flushOrClose()
 	s.writeMu.Unlock()
+
+	s.startForwarding()
 }
 
 func (s *pubsubSession) execTxn() {
