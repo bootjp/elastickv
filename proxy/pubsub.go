@@ -353,7 +353,7 @@ func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
 
 	s.writeMu.Lock()
 	writeResponse(s.dconn, resp, err)
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 }
 
@@ -406,7 +406,7 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 		s.dconn.WriteBulkString(ch)
 		s.dconn.WriteInt64(int64(s.subCount()))
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 }
 
@@ -437,7 +437,7 @@ func (s *pubsubSession) execTxn() {
 	default:
 		s.dconn.WriteError("ERR empty transaction response")
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 
 	if s.proxy.dual.hasSecondaryWrite() {
@@ -501,7 +501,7 @@ func (s *pubsubSession) handleSub(args [][]byte, isPattern bool) {
 		s.dconn.WriteBulkString(n)
 		s.dconn.WriteInt64(int64(s.subCount()))
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 }
 
@@ -555,7 +555,7 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 		s.dconn.WriteBulkString(n)
 		s.dconn.WriteInt64(int64(counts[i]))
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 }
 
@@ -574,7 +574,7 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteNull()
 		s.dconn.WriteInt64(int64(s.subCount()))
-		_ = s.dconn.Flush()
+		s.flushOrClose()
 		s.writeMu.Unlock()
 		return
 	}
@@ -601,7 +601,7 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		s.dconn.WriteBulkString(n)
 		s.dconn.WriteInt64(int64(counts[i]))
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 	s.writeMu.Unlock()
 }
 
@@ -617,7 +617,7 @@ func (s *pubsubSession) handlePubSubPing(args [][]byte) {
 	} else {
 		s.dconn.WriteBulkString("")
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 }
 
 func (s *pubsubSession) handleNormalPing(args [][]byte) {
@@ -628,7 +628,7 @@ func (s *pubsubSession) handleNormalPing(args [][]byte) {
 	} else {
 		s.dconn.WriteString("PONG")
 	}
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 }
 
 func (s *pubsubSession) handleUnsubNoSession(cmdName string) {
@@ -638,7 +638,7 @@ func (s *pubsubSession) handleUnsubNoSession(cmdName string) {
 	s.dconn.WriteBulkString(strings.ToLower(cmdName))
 	s.dconn.WriteNull()
 	s.dconn.WriteInt64(0)
-	_ = s.dconn.Flush()
+	s.flushOrClose()
 }
 
 func (s *pubsubSession) closeShadow() {
@@ -701,14 +701,21 @@ func (s *pubsubSession) mirrorUnsub(names []string, isPattern bool) {
 
 // --- Helpers ---
 
+// flushOrClose flushes the detached connection. On error it closes the
+// connection so that commandLoop will observe a read failure and shut down.
+// Caller must hold s.writeMu.
+func (s *pubsubSession) flushOrClose() {
+	if err := s.dconn.Flush(); err != nil {
+		s.logger.Warn("failed to flush to client; closing connection", "err", err)
+		_ = s.dconn.Close()
+	}
+}
+
 func (s *pubsubSession) writeError(msg string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.dconn.WriteError(msg)
-	if err := s.dconn.Flush(); err != nil {
-		s.logger.Warn("failed to flush error to client; closing connection", "err", err)
-		_ = s.dconn.Close()
-	}
+	s.flushOrClose()
 }
 
 // writeRedisError writes an upstream error, preserving redis.Error prefixes verbatim
@@ -726,10 +733,7 @@ func (s *pubsubSession) writeString(msg string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.dconn.WriteString(msg)
-	if err := s.dconn.Flush(); err != nil {
-		s.logger.Warn("failed to flush string to client; closing connection", "err", err)
-		_ = s.dconn.Close()
-	}
+	s.flushOrClose()
 }
 
 func byteSlicesToStrings(bs [][]byte) []string {

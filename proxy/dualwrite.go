@@ -89,7 +89,7 @@ func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any,
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	// Secondary: async fire-and-forget (bounded)
-	if d.hasSecondaryWrite() && atomic.LoadInt32(&d.closing) == 0 {
+	if d.hasSecondaryWrite() {
 		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
@@ -234,9 +234,11 @@ func (d *DualWriter) goAsync(fn func()) {
 }
 
 // goAsyncWithSem launches fn in a bounded goroutine using the given semaphore.
-// If the semaphore is full, the work is dropped, a metric is incremented,
-// and a warning is logged rather than blocking the caller.
+// If the DualWriter is closing or the semaphore is full, the work is dropped.
 func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
+	if atomic.LoadInt32(&d.closing) != 0 {
+		return
+	}
 	select {
 	case sem <- struct{}{}:
 		d.wg.Add(1)
