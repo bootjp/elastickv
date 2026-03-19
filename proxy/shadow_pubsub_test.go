@@ -3,6 +3,7 @@ package proxy
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,12 +23,37 @@ func counterValue(c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
+// testClock provides a deterministic clock for tests, avoiding time.Sleep flakiness.
+type testClock struct {
+	v atomic.Value // stores time.Time
+}
+
+func newTestClock() *testClock {
+	c := &testClock{}
+	c.v.Store(time.Now())
+	return c
+}
+
+func (c *testClock) Now() time.Time {
+	v, ok := c.v.Load().(time.Time)
+	if !ok {
+		return time.Time{}
+	}
+	return v
+}
+func (c *testClock) Advance(d time.Duration) { c.v.Store(c.Now().Add(d)) }
+
 func newTestShadowPubSub(window time.Duration) *shadowPubSub {
+	return newTestShadowPubSubWithClock(window, time.Now)
+}
+
+func newTestShadowPubSubWithClock(window time.Duration, nowFunc func() time.Time) *shadowPubSub {
 	return &shadowPubSub{
 		metrics: newTestMetrics(),
 		sentry:  newTestSentry(),
 		logger:  slog.Default(),
 		window:  window,
+		nowFunc: nowFunc,
 		pending: make(map[msgKey][]pendingMsg),
 		done:    make(chan struct{}),
 	}
@@ -46,10 +72,11 @@ func TestShadowPubSub_MatchedMessage(t *testing.T) {
 }
 
 func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
-	sp := newTestShadowPubSub(10 * time.Millisecond)
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "hello"})
-	time.Sleep(20 * time.Millisecond)
+	clock.Advance(20 * time.Millisecond)
 	sp.sweepExpired()
 
 	sp.mu.Lock()
@@ -62,13 +89,18 @@ func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
 }
 
 func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
-	sp := newTestShadowPubSub(10 * time.Millisecond)
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
+	defer func() {
+		unmatchedSecondaries.Lock()
+		delete(unmatchedSecondaries.data, sp)
+		unmatchedSecondaries.Unlock()
+	}()
 
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "extra"})
 
-	// matchSecondary now buffers unmatched secondaries; wait for the
-	// comparison window to expire and sweep to trigger divergence reporting.
-	time.Sleep(20 * time.Millisecond)
+	// Advance the clock past the comparison window and sweep.
+	clock.Advance(20 * time.Millisecond)
 	sp.sweepExpired()
 
 	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
@@ -123,10 +155,11 @@ func TestShadowPubSub_RecordAfterClose(t *testing.T) {
 }
 
 func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
-	sp := newTestShadowPubSub(10 * time.Millisecond)
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "orphan"})
-	time.Sleep(20 * time.Millisecond)
+	clock.Advance(20 * time.Millisecond)
 
 	ch := make(chan *redis.Message)
 	var wg sync.WaitGroup
@@ -176,9 +209,8 @@ func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
 }
 
 func TestShadowPubSub_CloseCleanupUnmatchedSecondaries(t *testing.T) {
+	// Close() now tolerates nil secondary, so no mock client is needed.
 	sp := newTestShadowPubSub(1 * time.Second)
-	// Set a mock secondary to prevent nil dereference in Close().
-	sp.secondary = redis.NewClient(&redis.Options{Addr: "localhost:0"}).Subscribe(t.Context())
 
 	// Buffer a secondary message.
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "leaked"})
@@ -203,6 +235,7 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 
 	ch := make(chan *redis.Message, 1)
 	ch <- &redis.Message{Channel: "ch1", Payload: "msg1"}
+	close(ch)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -211,9 +244,6 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 		sp.compareLoop(ch)
 	}()
 
-	// Give time for the message to be processed, then close.
-	time.Sleep(10 * time.Millisecond)
-	close(ch)
 	wg.Wait()
 
 	sp.mu.Lock()

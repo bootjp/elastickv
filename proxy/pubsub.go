@@ -154,6 +154,12 @@ func (s *pubsubSession) forwardMessages(ch <-chan *redis.Message) {
 		err := s.dconn.Flush()
 		s.writeMu.Unlock()
 		if err != nil {
+			// Mark closed and close dconn to unblock commandLoop, preventing
+			// goroutine/resource leaks (aligned with adapter/redis_pubsub.go).
+			s.mu.Lock()
+			s.closed = true
+			s.mu.Unlock()
+			_ = s.dconn.Close()
 			return
 		}
 		// Record for shadow comparison (outside writeMu to avoid nested locking).

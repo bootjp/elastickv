@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -152,20 +153,21 @@ func TestIntegration_DualWrite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "dual-value", val)
 
-	// Wait a bit for async secondary write
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify data exists on secondary directly
+	// Poll secondary until async write propagates (avoids flaky fixed sleeps).
 	secondaryClient := redis.NewClient(&redis.Options{Addr: secondaryAddr})
 	defer secondaryClient.Close()
 
-	sVal, err := secondaryClient.Get(ctx, key).Result()
-	require.NoError(t, err)
-	assert.Equal(t, "dual-value", sVal)
+	require.Eventually(t, func() bool {
+		sVal, sErr := secondaryClient.Get(ctx, key).Result()
+		return sErr == nil && sVal == "dual-value"
+	}, 5*time.Second, 50*time.Millisecond, "secondary should have the value")
 
-	// Clean up
+	// Clean up — poll until key is gone on secondary.
 	client.Del(ctx, key)
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, sErr := secondaryClient.Get(ctx, key).Result()
+		return errors.Is(sErr, redis.Nil)
+	}, 5*time.Second, 50*time.Millisecond, "secondary should have key deleted")
 }
 
 func TestIntegration_HashCommands(t *testing.T) {

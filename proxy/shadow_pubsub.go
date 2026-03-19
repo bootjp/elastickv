@@ -62,6 +62,7 @@ type shadowPubSub struct {
 	sentry    *SentryReporter
 	logger    *slog.Logger
 	window    time.Duration
+	nowFunc   func() time.Time // injectable clock; defaults to time.Now
 
 	mu      sync.Mutex
 	pending map[msgKey][]pendingMsg // primary messages awaiting secondary match
@@ -77,6 +78,7 @@ func newShadowPubSub(backend PubSubBackend, metrics *ProxyMetrics, sentry *Sentr
 		sentry:    sentry,
 		logger:    logger,
 		window:    window,
+		nowFunc:   time.Now,
 		pending:   make(map[msgKey][]pendingMsg),
 		done:      make(chan struct{}),
 	}
@@ -139,7 +141,7 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 		pattern:   msg.Pattern,
 		channel:   msg.Channel,
 		payload:   msg.Payload,
-		timestamp: time.Now(),
+		timestamp: sp.nowFunc(),
 	})
 }
 
@@ -150,7 +152,9 @@ func (sp *shadowPubSub) Close() {
 	sp.closed = true
 	started := sp.started
 	sp.mu.Unlock()
-	sp.secondary.Close()
+	if sp.secondary != nil {
+		sp.secondary.Close()
+	}
 	if started {
 		<-sp.done
 	}
@@ -205,7 +209,7 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 
 	// No matching primary message at this moment. Buffer the secondary and only
 	// report DivExtraData if it remains unmatched after the comparison window.
-	now := time.Now()
+	now := sp.nowFunc()
 	unmatchedSecondaries.Lock()
 	defer unmatchedSecondaries.Unlock()
 
@@ -227,13 +231,15 @@ func (sp *shadowPubSub) sweepExpired() {
 	var divergences []divergenceEvent
 
 	sp.mu.Lock()
-	now := time.Now()
+	now := sp.nowFunc()
 
 	unmatchedSecondaries.Lock()
 	perInstance := sp.getOrCreateSecondaryBuffer()
 
-	divergences = sp.reconcilePrimaries(now, perInstance, divergences)
+	// Expire old buffered secondaries first so they cannot be consumed as a
+	// "match" during reconciliation (prevents bypassing the comparison window).
 	divergences = sweepExpiredSecondaries(now, sp.window, perInstance, divergences)
+	divergences = sp.reconcilePrimaries(now, perInstance, divergences)
 
 	if len(perInstance) == 0 {
 		delete(unmatchedSecondaries.data, sp)
