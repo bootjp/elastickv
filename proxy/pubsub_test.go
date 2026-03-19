@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/redcon"
@@ -527,4 +528,117 @@ func TestPubSub_CommandLoop_EOF(t *testing.T) {
 
 	s := newTestSession(dconn)
 	s.commandLoop() // should return without panic
+}
+
+// ========== T3: forwardMessages message/pmessage branch test ==========
+
+func TestPubSub_ForwardMessages_MessageBranch(t *testing.T) {
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+
+	ch := make(chan *redis.Message, 2)
+
+	// Regular message (no pattern)
+	ch <- &redis.Message{Channel: "ch1", Payload: "hello"}
+	// Pattern message
+	ch <- &redis.Message{Pattern: "h*", Channel: "hello-world", Payload: "data"}
+	close(ch)
+
+	s.forwardMessages(ch)
+
+	writes := dconn.getWrites()
+
+	// First message: ["message", "ch1", "hello"]
+	// Expect: WriteArray(3), WriteBulkString("message"), WriteBulkString("ch1"), WriteBulkString("hello")
+	assert.Contains(t, writes, respArray{pubsubArrayMessage}) // WriteArray(3)
+	assert.Contains(t, writes, "BULKSTR:message")
+	assert.Contains(t, writes, "BULKSTR:ch1")
+	assert.Contains(t, writes, "BULKSTR:hello")
+
+	// Second message: ["pmessage", "h*", "hello-world", "data"]
+	// Expect: WriteArray(4), WriteBulkString("pmessage"), WriteBulkString("h*"), WriteBulkString("hello-world"), WriteBulkString("data")
+	assert.Contains(t, writes, respArray{pubsubArrayPMessage}) // WriteArray(4)
+	assert.Contains(t, writes, "BULKSTR:pmessage")
+	assert.Contains(t, writes, "BULKSTR:h*")
+	assert.Contains(t, writes, "BULKSTR:hello-world")
+	assert.Contains(t, writes, "BULKSTR:data")
+}
+
+func TestPubSub_ForwardMessages_ClosedSession(t *testing.T) {
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+
+	// Mark session as closed before sending message.
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+
+	ch := make(chan *redis.Message, 1)
+	ch <- &redis.Message{Channel: "ch1", Payload: "should-not-write"}
+	close(ch)
+
+	s.forwardMessages(ch)
+
+	writes := dconn.getWrites()
+	assert.Empty(t, writes, "should not write to dconn when session is closed")
+}
+
+func TestPubSub_ForwardMessages_EmptyChannel(t *testing.T) {
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+
+	ch := make(chan *redis.Message)
+	close(ch)
+
+	s.forwardMessages(ch)
+
+	writes := dconn.getWrites()
+	assert.Empty(t, writes, "no messages should produce no writes")
+}
+
+// ========== T4: reenterPubSub test ==========
+
+func TestPubSub_ReenterPubSub_TooFewArgs(t *testing.T) {
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+
+	// Only command name, no channels
+	s.reenterPubSub("SUBSCRIBE", [][]byte{[]byte("SUBSCRIBE")})
+
+	writes := dconn.getWrites()
+	found := false
+	for _, w := range writes {
+		if str, ok := w.(string); ok && str == "ERR:ERR wrong number of arguments for 'subscribe' command" {
+			found = true
+		}
+	}
+	assert.True(t, found, "should error on missing channel args")
+}
+
+func TestPubSub_ReenterPubSub_NilBackend(t *testing.T) {
+	dconn := newMockDetachedConn()
+	reg := prometheus.NewRegistry()
+	metrics := NewProxyMetrics(reg)
+	cfg := DefaultConfig()
+
+	// DualWriter with no PubSubBackend
+	primary := newMockBackend("primary")
+	secondary := newMockBackend("secondary")
+	dual := NewDualWriter(primary, secondary, cfg, metrics, NewSentryReporter("", "", 0, testLogger), testLogger)
+
+	srv := NewProxyServer(cfg, dual, metrics, NewSentryReporter("", "", 0, testLogger), testLogger)
+
+	s := newTestSession(dconn)
+	s.proxy = srv
+
+	s.reenterPubSub("SUBSCRIBE", [][]byte{[]byte("SUBSCRIBE"), []byte("ch1")})
+
+	writes := dconn.getWrites()
+	found := false
+	for _, w := range writes {
+		if str, ok := w.(string); ok && str == "ERR:ERR PubSub not supported by backend" {
+			found = true
+		}
+	}
+	assert.True(t, found, "should error when PubSubBackend is nil")
 }

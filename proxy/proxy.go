@@ -145,17 +145,17 @@ func (p *ProxyServer) dispatchCommand(conn redcon.Conn, state *proxyConnState, n
 	case CmdTxn:
 		p.handleTxnCommand(conn, state, name)
 	case CmdWrite:
-		p.handleWrite(conn, args)
+		p.handleWrite(conn, name, args)
 	case CmdRead:
-		p.handleRead(conn, args)
+		p.handleRead(conn, name, args)
 	case CmdBlocking:
-		p.handleBlocking(conn, args)
+		p.handleBlocking(conn, name, args)
 	case CmdPubSub:
-		p.handlePubSub(conn, args)
+		p.handlePubSub(conn, name, args)
 	case CmdAdmin:
-		p.handleAdmin(conn, args)
+		p.handleAdmin(conn, name, args)
 	case CmdScript:
-		p.handleScript(conn, args)
+		p.handleScript(conn, name, args)
 	}
 }
 
@@ -177,37 +177,46 @@ func (p *ProxyServer) handleQueuedCommand(conn redcon.Conn, state *proxyConnStat
 	}
 }
 
-func (p *ProxyServer) handleWrite(conn redcon.Conn, args [][]byte) {
-	resp, err := p.dual.Write(context.Background(), args)
+func (p *ProxyServer) handleWrite(conn redcon.Conn, cmd string, args [][]byte) {
+	resp, err := p.dual.Write(context.Background(), cmd, args)
 	writeResponse(conn, resp, err)
 }
 
-func (p *ProxyServer) handleRead(conn redcon.Conn, args [][]byte) {
-	resp, err := p.dual.Read(context.Background(), args)
+func (p *ProxyServer) handleRead(conn redcon.Conn, cmd string, args [][]byte) {
+	resp, err := p.dual.Read(context.Background(), cmd, args)
 	writeResponse(conn, resp, err)
 }
 
-func (p *ProxyServer) handleBlocking(conn redcon.Conn, args [][]byte) {
+func (p *ProxyServer) handleBlocking(conn redcon.Conn, cmd string, args [][]byte) {
 	// Use shutdownCtx so blocking commands are interrupted on graceful shutdown.
-	resp, err := p.dual.Blocking(p.shutdownCtx, args)
+	resp, err := p.dual.Blocking(p.shutdownCtx, cmd, args)
 	writeResponse(conn, resp, err)
 }
 
-func (p *ProxyServer) handlePubSub(conn redcon.Conn, args [][]byte) {
-	name := strings.ToUpper(string(args[0]))
+func (p *ProxyServer) handlePubSub(conn redcon.Conn, name string, args [][]byte) {
 
 	switch name {
 	case cmdSubscribe, cmdPSubscribe:
 		p.startPubSubSession(conn, name, args)
 	case cmdUnsubscribe, cmdPUnsubscribe:
-		// No active session; return empty confirmation.
-		conn.WriteArray(pubsubArrayReply)
-		conn.WriteBulkString(strings.ToLower(name))
-		conn.WriteNull()
-		conn.WriteInt64(0)
+		// No active session; emit one reply per argument, or a single null reply if none.
+		kind := strings.ToLower(name)
+		if len(args) > 1 {
+			for _, ch := range args[1:] {
+				conn.WriteArray(pubsubArrayReply)
+				conn.WriteBulkString(kind)
+				conn.WriteBulkString(string(ch))
+				conn.WriteInt64(0)
+			}
+		} else {
+			conn.WriteArray(pubsubArrayReply)
+			conn.WriteBulkString(kind)
+			conn.WriteNull()
+			conn.WriteInt64(0)
+		}
 	default:
 		// PUBSUB CHANNELS / NUMSUB etc.
-		resp, err := p.dual.Admin(context.Background(), args)
+		resp, err := p.dual.Admin(context.Background(), name, args)
 		writeResponse(conn, resp, err)
 	}
 }
@@ -303,8 +312,7 @@ func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *sha
 	return shadow
 }
 
-func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {
-	name := strings.ToUpper(string(args[0]))
+func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) {
 
 	// Handle PING locally for speed.
 	if name == cmdPing {
@@ -323,19 +331,37 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, args [][]byte) {
 		return
 	}
 
-	// SELECT and AUTH are handled at the connection-pool level via config.
-	// Silently accept them so clients don't break.
-	if name == "SELECT" || name == "AUTH" {
+	// SELECT: accept only the configured DB; reject others since the proxy
+	// uses a shared connection pool and cannot maintain per-client DB state.
+	if name == "SELECT" {
+		if len(args) > 1 && string(args[1]) != "0" && string(args[1]) != fmt.Sprintf("%d", p.cfg.PrimaryDB) {
+			conn.WriteError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", string(args[1]), p.cfg.PrimaryDB))
+			return
+		}
 		conn.WriteString("OK")
 		return
 	}
 
-	resp, err := p.dual.Admin(context.Background(), args)
+	// AUTH is handled at the connection-pool level via config.
+	// Silently accept so clients don't break.
+	if name == "AUTH" {
+		conn.WriteString("OK")
+		return
+	}
+
+	// HELLO: reject to prevent RESP3 protocol upgrade, which the proxy
+	// (redcon, RESP2 only) cannot support.
+	if name == "HELLO" {
+		conn.WriteError("ERR proxy does not support HELLO (RESP2 only)")
+		return
+	}
+
+	resp, err := p.dual.Admin(context.Background(), name, args)
 	writeResponse(conn, resp, err)
 }
 
-func (p *ProxyServer) handleScript(conn redcon.Conn, args [][]byte) {
-	resp, err := p.dual.Script(context.Background(), args)
+func (p *ProxyServer) handleScript(conn redcon.Conn, name string, args [][]byte) {
+	resp, err := p.dual.Script(context.Background(), name, args)
 	writeResponse(conn, resp, err)
 }
 
@@ -382,14 +408,17 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 	cmds = append(cmds, []any{"EXEC"})
 
 	results, err := p.dual.Primary().Pipeline(ctx, cmds)
-	if err != nil {
+	switch {
+	case err != nil:
 		// Pipeline-level error (connection/transport failure) takes precedence.
 		writeRedisError(conn, err)
-	} else if len(results) > 0 {
+	case len(results) > 0:
 		// Write the EXEC result (last command in the pipeline).
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
 		writeResponse(conn, resp, rErr)
+	default:
+		conn.WriteError("ERR empty transaction response")
 	}
 
 	// Async replay to secondary (bounded)

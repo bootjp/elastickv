@@ -16,6 +16,8 @@ type ProxyMetrics struct {
 
 	ActiveConnections prometheus.Gauge
 
+	AsyncDrops prometheus.Counter
+
 	PubSubShadowDivergences *prometheus.CounterVec
 	PubSubShadowErrors      prometheus.Counter
 }
@@ -67,6 +69,12 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 			Help:      "Expected divergences due to missing data on secondary (pre-migration).",
 		}, []string{"command"}),
 
+		AsyncDrops: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "proxy",
+			Name:      "async_drops_total",
+			Help:      "Total async operations dropped due to semaphore backpressure.",
+		}),
+
 		ActiveConnections: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "proxy",
 			Name:      "active_connections",
@@ -77,7 +85,7 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 			Namespace: "proxy",
 			Name:      "pubsub_shadow_divergences_total",
 			Help:      "Total pub/sub message mismatches detected by shadow subscribe.",
-		}, []string{"channel", "kind"}),
+		}, []string{"kind"}),
 		PubSubShadowErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "proxy",
 			Name:      "pubsub_shadow_errors_total",
@@ -94,6 +102,7 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		m.ShadowReadErrors,
 		m.Divergences,
 		m.MigrationGaps,
+		m.AsyncDrops,
 		m.ActiveConnections,
 		m.PubSubShadowDivergences,
 		m.PubSubShadowErrors,

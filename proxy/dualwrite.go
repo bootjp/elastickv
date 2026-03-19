@@ -5,15 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// maxAsyncGoroutines limits concurrent fire-and-forget goroutines to prevent
-// goroutine explosion when the secondary backend is slow or down.
-const maxAsyncGoroutines = 4096
+const (
+	// maxWriteGoroutines limits concurrent secondary write goroutines.
+	maxWriteGoroutines = 4096
+	// maxShadowGoroutines limits concurrent shadow read goroutines separately
+	// so that secondary write failures cannot starve shadow reads.
+	maxShadowGoroutines = 1024
+)
 
 // DualWriter routes commands to primary and secondary backends based on mode.
 type DualWriter struct {
@@ -25,9 +29,9 @@ type DualWriter struct {
 	sentry    *SentryReporter
 	logger    *slog.Logger
 
-	// asyncSem bounds the number of concurrent async goroutines
-	// (secondary writes + shadow reads).
-	asyncSem chan struct{}
+	writeSem  chan struct{} // bounds concurrent secondary write goroutines
+	shadowSem chan struct{} // bounds concurrent shadow read goroutines
+	wg        sync.WaitGroup
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -39,7 +43,8 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		metrics:   metrics,
 		sentry:    sentryReporter,
 		logger:    logger,
-		asyncSem:  make(chan struct{}, maxAsyncGoroutines),
+		writeSem:  make(chan struct{}, maxWriteGoroutines),
+		shadowSem: make(chan struct{}, maxShadowGoroutines),
 	}
 
 	if cfg.Mode == ModeDualWriteShadow || cfg.Mode == ModeElasticKVPrimary {
@@ -53,9 +58,15 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 	return d
 }
 
+// Close waits for all in-flight async goroutines to finish.
+// Should be called during graceful shutdown.
+func (d *DualWriter) Close() {
+	d.wg.Wait()
+}
+
 // Write sends a write command to the primary synchronously, then to the secondary asynchronously.
-func (d *DualWriter) Write(ctx context.Context, args [][]byte) (any, error) {
-	cmd := strings.ToUpper(string(args[0]))
+// cmd must be the pre-uppercased command name.
+func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -73,18 +84,15 @@ func (d *DualWriter) Write(ctx context.Context, args [][]byte) (any, error) {
 
 	// Secondary: async fire-and-forget (bounded)
 	if d.hasSecondaryWrite() {
-		d.goAsync(func() { d.writeSecondary(cmd, iArgs) })
+		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
-	if err != nil {
-		return resp, fmt.Errorf("primary write %s: %w", cmd, err)
-	}
-	return resp, nil
+	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 // Read sends a read command to the primary and optionally performs a shadow read.
-func (d *DualWriter) Read(ctx context.Context, args [][]byte) (any, error) {
-	cmd := strings.ToUpper(string(args[0]))
+// cmd must be the pre-uppercased command name.
+func (d *DualWriter) Read(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -99,26 +107,23 @@ func (d *DualWriter) Read(ctx context.Context, args [][]byte) (any, error) {
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	// Shadow read (bounded)
+	// Shadow read (bounded, separate semaphore from writes)
 	if d.shadow != nil {
 		shadowArgs := args
 		shadowResp := resp
 		shadowErr := err
-		d.goAsync(func() {
-			d.shadow.Compare(context.Background(), cmd, shadowArgs, shadowResp, shadowErr)
+		d.goShadow(func() {
+			d.shadow.Compare(ctx, cmd, shadowArgs, shadowResp, shadowErr)
 		})
 	}
 
-	if err != nil {
-		return resp, fmt.Errorf("primary read %s: %w", cmd, err)
-	}
-	return resp, nil
+	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 // Blocking forwards a blocking command to the primary only.
 // Optionally sends a short-timeout version to secondary for warmup.
-func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (any, error) {
-	cmd := strings.ToUpper(string(args[0]))
+// cmd must be the pre-uppercased command name.
+func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -134,22 +139,19 @@ func (d *DualWriter) Blocking(ctx context.Context, args [][]byte) (any, error) {
 
 	// Warmup: send to secondary with short timeout (fire-and-forget, bounded)
 	if d.hasSecondaryWrite() {
-		d.goAsync(func() {
+		d.goWrite(func() {
 			sCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			d.secondary.Do(sCtx, iArgs...)
 		})
 	}
 
-	if err != nil {
-		return resp, fmt.Errorf("primary blocking %s: %w", cmd, err)
-	}
-	return resp, nil
+	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 // Admin forwards an admin command to the primary only.
-func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (any, error) {
-	cmd := strings.ToUpper(string(args[0]))
+// cmd must be the pre-uppercased command name.
+func (d *DualWriter) Admin(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -162,15 +164,12 @@ func (d *DualWriter) Admin(ctx context.Context, args [][]byte) (any, error) {
 		return nil, fmt.Errorf("primary admin %s: %w", cmd, err)
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
-	if err != nil {
-		return resp, fmt.Errorf("primary admin %s: %w", cmd, err)
-	}
-	return resp, nil
+	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 // Script forwards EVAL/EVALSHA to the primary, and async replays to secondary.
-func (d *DualWriter) Script(ctx context.Context, args [][]byte) (any, error) {
-	cmd := strings.ToUpper(string(args[0]))
+// cmd must be the pre-uppercased command name.
+func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
 
 	start := time.Now()
@@ -185,13 +184,10 @@ func (d *DualWriter) Script(ctx context.Context, args [][]byte) (any, error) {
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	if d.hasSecondaryWrite() {
-		d.goAsync(func() { d.writeSecondary(cmd, iArgs) })
+		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
-	if err != nil {
-		return resp, fmt.Errorf("primary script %s: %w", cmd, err)
-	}
-	return resp, nil
+	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
@@ -216,17 +212,37 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
 }
 
-// goAsync launches fn in a bounded goroutine. If the semaphore is full,
-// the work is dropped and a warning is logged rather than blocking the caller.
+// goWrite launches fn in a bounded write goroutine.
+func (d *DualWriter) goWrite(fn func()) {
+	d.goAsyncWithSem(d.writeSem, fn)
+}
+
+// goShadow launches fn in a bounded shadow-read goroutine.
+func (d *DualWriter) goShadow(fn func()) {
+	d.goAsyncWithSem(d.shadowSem, fn)
+}
+
+// goAsync launches fn using the write semaphore (for backward compat with txn replay).
 func (d *DualWriter) goAsync(fn func()) {
+	d.goWrite(fn)
+}
+
+// goAsyncWithSem launches fn in a bounded goroutine using the given semaphore.
+// If the semaphore is full, the work is dropped, a metric is incremented,
+// and a warning is logged rather than blocking the caller.
+func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
 	select {
-	case d.asyncSem <- struct{}{}:
+	case sem <- struct{}{}:
+		d.wg.Add(1)
 		go func() {
-			defer func() { <-d.asyncSem }()
+			defer func() {
+				<-sem
+				d.wg.Done()
+			}()
 			fn()
 		}()
 	default:
-		// Semaphore full — drop async work to protect the proxy.
+		d.metrics.AsyncDrops.Inc()
 		d.logger.Warn("async goroutine limit reached, dropping secondary operation")
 	}
 }

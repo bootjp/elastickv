@@ -305,7 +305,7 @@ func (sp *shadowPubSub) sweepAll() {
 }
 
 func (sp *shadowPubSub) reportDivergence(channel, payload string, kind DivergenceKind) {
-	sp.metrics.PubSubShadowDivergences.WithLabelValues(channel, kind.String()).Inc()
+	sp.metrics.PubSubShadowDivergences.WithLabelValues(kind.String()).Inc()
 	sp.logger.Warn("pubsub shadow divergence",
 		"channel", truncateValue(channel),
 		"payload", truncateValue(payload),

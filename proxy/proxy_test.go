@@ -333,7 +333,7 @@ func TestHasSecondaryWrite(t *testing.T) {
 		{ModeElasticKVPrimary, true},
 		{ModeElasticKVOnly, false},
 	} {
-		d := &DualWriter{cfg: ProxyConfig{Mode: tc.mode}, asyncSem: make(chan struct{}, 1)}
+		d := &DualWriter{cfg: ProxyConfig{Mode: tc.mode}, writeSem: make(chan struct{}, 1), shadowSem: make(chan struct{}, 1)}
 		assert.Equal(t, tc.expected, d.hasSecondaryWrite(), "mode=%s", tc.mode)
 	}
 }
@@ -347,7 +347,7 @@ func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
 
-	resp, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	resp, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
 	assert.Equal(t, "OK", resp)
 	assert.Equal(t, 1, primary.CallCount())
@@ -365,7 +365,7 @@ func TestDualWriter_Write_PrimaryFail(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
 
-	_, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "connection refused")
 	// Secondary should NOT be called when primary fails
@@ -382,7 +382,7 @@ func TestDualWriter_Write_SecondaryFail_ClientSucceeds(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
 
-	resp, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	resp, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
 	assert.Equal(t, "OK", resp)
 
@@ -400,7 +400,7 @@ func TestDualWriter_Write_RedisNil(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
 
-	resp, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v"), []byte("NX")})
+	resp, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v"), []byte("NX")})
 	assert.ErrorIs(t, err, redis.Nil)
 	assert.Nil(t, resp)
 	// Should still send to secondary
@@ -416,7 +416,7 @@ func TestDualWriter_Write_RedisOnlyMode(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly}, metrics, newTestSentry(), testLogger)
 
-	_, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 0, secondary.CallCount(), "secondary should not be called in redis-only mode")
@@ -430,7 +430,7 @@ func TestDualWriter_Write_ElasticKVOnlyMode(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeElasticKVOnly}, metrics, newTestSentry(), testLogger)
 
-	_, err := d.Write(context.Background(), [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	_, err := d.Write(context.Background(), "SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
 	assert.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 0, secondary.CallCount(), "secondary should not be called in elastickv-only mode")
@@ -446,7 +446,7 @@ func TestDualWriter_Read_WithShadow(t *testing.T) {
 	cfg := ProxyConfig{Mode: ModeDualWriteShadow, ShadowTimeout: time.Second, SecondaryTimeout: time.Second}
 	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
 
-	resp, err := d.Read(context.Background(), [][]byte{[]byte("GET"), []byte("k")})
+	resp, err := d.Read(context.Background(), "GET", [][]byte{[]byte("GET"), []byte("k")})
 	assert.NoError(t, err)
 	assert.Equal(t, "hello", resp)
 
@@ -464,7 +464,7 @@ func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
 	cfg := ProxyConfig{Mode: ModeDualWrite, ShadowTimeout: time.Second}
 	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
 
-	_, err := d.Read(context.Background(), [][]byte{[]byte("GET"), []byte("k")})
+	_, err := d.Read(context.Background(), "GET", [][]byte{[]byte("GET"), []byte("k")})
 	assert.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 0, secondary.CallCount(), "no shadow in dual-write mode")
@@ -479,9 +479,9 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
 	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
 
-	// Fill the semaphore with blocking goroutines
+	// Fill the write semaphore with blocking goroutines
 	blocker := make(chan struct{})
-	for range maxAsyncGoroutines {
+	for range maxWriteGoroutines {
 		d.goAsync(func() {
 			<-blocker
 		})
@@ -501,7 +501,11 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 		t.Fatal("goAsync blocked when semaphore was full")
 	}
 
+	// Verify drop metric was incremented
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+
 	close(blocker) // unblock all
+	d.Close()      // wait for all goroutines to finish
 }
 
 // ========== ShadowReader tests ==========
@@ -619,4 +623,175 @@ func TestDefaultBackendOptions(t *testing.T) {
 	opts := DefaultBackendOptions()
 	assert.Equal(t, 128, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
+}
+
+// ========== Pipeline error handling tests ==========
+
+func TestPipeline_TransportError(t *testing.T) {
+	b := newMockBackend("test")
+	b.doFunc = makeCmd(nil, errors.New("connection refused"))
+
+	// mockBackend.Pipeline doesn't simulate pipe.Exec; test RedisBackend via unit behaviour.
+	// Here we verify the mock-based pipeline returns results.
+	results, err := b.Pipeline(context.Background(), [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}})
+	assert.NoError(t, err) // mock always returns nil error
+	assert.Len(t, results, 3)
+}
+
+// ========== writeRedisValue tests ==========
+
+// testRedisErr satisfies the redis.Error interface for testing.
+type testRedisErr string
+
+func (e testRedisErr) Error() string { return string(e) }
+func (e testRedisErr) RedisError()   {}
+
+type mockRespWriter struct {
+	writes []any
+}
+
+func (m *mockRespWriter) WriteError(msg string)      { m.writes = append(m.writes, "ERR:"+msg) }
+func (m *mockRespWriter) WriteString(msg string)     { m.writes = append(m.writes, "STR:"+msg) }
+func (m *mockRespWriter) WriteBulk(b []byte)         { m.writes = append(m.writes, "BULK:"+string(b)) }
+func (m *mockRespWriter) WriteBulkString(msg string) { m.writes = append(m.writes, "BULKSTR:"+msg) }
+func (m *mockRespWriter) WriteInt64(num int64)       { m.writes = append(m.writes, num) }
+func (m *mockRespWriter) WriteArray(count int)       { m.writes = append(m.writes, count) }
+func (m *mockRespWriter) WriteNull()                 { m.writes = append(m.writes, nil) }
+
+func TestWriteRedisValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		val    any
+		expect []any
+	}{
+		{"nil", nil, []any{nil}},
+		{"status OK", "OK", []any{"STR:OK"}},
+		{"status QUEUED", "QUEUED", []any{"STR:QUEUED"}},
+		{"status PONG", "PONG", []any{"STR:PONG"}},
+		{"bulk string", "hello", []any{"BULKSTR:hello"}},
+		{"int64", int64(42), []any{int64(42)}},
+		{"bytes", []byte("data"), []any{"BULK:data"}},
+		{"array", []any{"a", int64(1)}, []any{2, "BULKSTR:a", int64(1)}},
+		{"nested array", []any{[]any{"x"}}, []any{1, 1, "BULKSTR:x"}},
+		{"redis error", testRedisErr("WRONGTYPE bad"), []any{"ERR:WRONGTYPE bad"}},
+		{"default type", float64(3.14), []any{"BULKSTR:3.14"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &mockRespWriter{}
+			writeRedisValue(w, tt.val)
+			assert.Equal(t, tt.expect, w.writes)
+		})
+	}
+}
+
+func TestWriteRedisError(t *testing.T) {
+	t.Run("redis.Error passthrough", func(t *testing.T) {
+		w := &mockRespWriter{}
+		writeRedisError(w, testRedisErr("WRONGTYPE Operation against a key"))
+		assert.Equal(t, []any{"ERR:WRONGTYPE Operation against a key"}, w.writes)
+	})
+
+	t.Run("generic error gets ERR prefix", func(t *testing.T) {
+		w := &mockRespWriter{}
+		writeRedisError(w, errors.New("connection refused"))
+		assert.Equal(t, []any{"ERR:ERR connection refused"}, w.writes)
+	})
+}
+
+func TestWriteResponse(t *testing.T) {
+	t.Run("nil error with value", func(t *testing.T) {
+		w := &mockRespWriter{}
+		writeResponse(w, "hello", nil)
+		assert.Equal(t, []any{"BULKSTR:hello"}, w.writes)
+	})
+
+	t.Run("redis.Nil", func(t *testing.T) {
+		w := &mockRespWriter{}
+		writeResponse(w, nil, redis.Nil)
+		assert.Equal(t, []any{nil}, w.writes)
+	})
+
+	t.Run("real error", func(t *testing.T) {
+		w := &mockRespWriter{}
+		writeResponse(w, nil, errors.New("timeout"))
+		assert.Equal(t, []any{"ERR:ERR timeout"}, w.writes)
+	})
+}
+
+// ========== truncateValue tests ==========
+
+type testStringer struct{ s string }
+
+func (ts testStringer) String() string { return ts.s }
+
+func TestTruncateValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  any
+		expect string
+	}{
+		{"nil", nil, "<nil>"},
+		{"short string", "hello", "hello"},
+		{"short bytes", []byte("abc"), "abc"},
+		{"fmt.Stringer", testStringer{"ok"}, "ok"},
+		{"int", 42, "42"},
+		{"slice", []int{1, 2, 3}, "[1, 2, 3]"},
+		{"map", map[string]int{"a": 1}, "{a: 1}"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := truncateValue(tt.input)
+			assert.Equal(t, tt.expect, result)
+		})
+	}
+
+	// Long string truncation
+	long := make([]byte, 300)
+	for i := range long {
+		long[i] = 'a'
+	}
+	result := truncateValue(string(long))
+	assert.Contains(t, result, "...(truncated)")
+	assert.LessOrEqual(t, len(result), 300)
+
+	// Long []byte truncation
+	result = truncateValue(long)
+	assert.Contains(t, result, "...(truncated)")
+}
+
+// ========== Additional command table tests ==========
+
+func TestClassifyCommand_NewCommands(t *testing.T) {
+	reads := []string{"MGET", "GETRANGE", "STRLEN", "SRANDMEMBER", "SDIFF", "SINTER", "SUNION", "XINFO", "GEODIST", "GEOSEARCH", "OBJECT", "RANDOMKEY", "TOUCH"}
+	for _, cmd := range reads {
+		assert.Equal(t, CmdRead, ClassifyCommand(cmd, nil), "expected %s to be CmdRead", cmd)
+	}
+
+	writes := []string{"MSET", "MSETNX", "APPEND", "INCRBY", "DECR", "SETRANGE", "SPOP", "SMOVE", "PERSIST", "EXPIREAT", "GEOADD", "UNLINK", "COPY", "ZPOPMAX", "RESTORE"}
+	for _, cmd := range writes {
+		assert.Equal(t, CmdWrite, ClassifyCommand(cmd, nil), "expected %s to be CmdWrite", cmd)
+	}
+
+	blocking := []string{"BLPOP", "BRPOP", "BZPOPMAX", "BLMOVE"}
+	for _, cmd := range blocking {
+		assert.Equal(t, CmdBlocking, ClassifyCommand(cmd, nil), "expected %s to be CmdBlocking", cmd)
+	}
+
+	// XREADGROUP with BLOCK
+	assert.Equal(t, CmdBlocking, ClassifyCommand("XREADGROUP", [][]byte{[]byte("GROUP"), []byte("g"), []byte("c"), []byte("BLOCK"), []byte("0"), []byte("STREAMS"), []byte("s1"), []byte(">")}))
+	// XREADGROUP without BLOCK
+	assert.Equal(t, CmdRead, ClassifyCommand("XREADGROUP", [][]byte{[]byte("GROUP"), []byte("g"), []byte("c"), []byte("STREAMS"), []byte("s1"), []byte(">")}))
+
+	admins := []string{"WATCH", "UNWATCH", "HELLO", "TIME", "SLOWLOG", "ACL"}
+	for _, cmd := range admins {
+		assert.Equal(t, CmdAdmin, ClassifyCommand(cmd, nil), "expected %s to be CmdAdmin", cmd)
+	}
+
+	pubsubs := []string{"SSUBSCRIBE", "SUNSUBSCRIBE"}
+	for _, cmd := range pubsubs {
+		assert.Equal(t, CmdPubSub, ClassifyCommand(cmd, nil), "expected %s to be CmdPubSub", cmd)
+	}
 }

@@ -319,17 +319,17 @@ func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
 
 	switch cat {
 	case CmdWrite:
-		resp, err = s.proxy.dual.Write(ctx, args)
+		resp, err = s.proxy.dual.Write(ctx, name, args)
 	case CmdRead:
-		resp, err = s.proxy.dual.Read(ctx, args)
+		resp, err = s.proxy.dual.Read(ctx, name, args)
 	case CmdBlocking:
-		resp, err = s.proxy.dual.Blocking(s.proxy.shutdownCtx, args)
+		resp, err = s.proxy.dual.Blocking(s.proxy.shutdownCtx, name, args)
 	case CmdPubSub:
-		resp, err = s.proxy.dual.Admin(ctx, args)
+		resp, err = s.proxy.dual.Admin(ctx, name, args)
 	case CmdAdmin:
-		resp, err = s.proxy.dual.Admin(ctx, args)
+		resp, err = s.proxy.dual.Admin(ctx, name, args)
 	case CmdScript:
-		resp, err = s.proxy.dual.Script(ctx, args)
+		resp, err = s.proxy.dual.Script(ctx, name, args)
 	case CmdTxn:
 		// Handled by handleTxnInSession; should not reach here.
 		return
@@ -410,13 +410,16 @@ func (s *pubsubSession) execTxn() {
 	results, err := s.proxy.dual.Primary().Pipeline(ctx, cmds)
 
 	s.writeMu.Lock()
-	if err != nil {
+	switch {
+	case err != nil:
 		// Pipeline-level error (connection/transport failure) takes precedence.
 		writeRedisError(s.dconn, err)
-	} else if len(results) > 0 {
+	case len(results) > 0:
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
 		writeResponse(s.dconn, resp, rErr)
+	default:
+		s.dconn.WriteError("ERR empty transaction response")
 	}
 	_ = s.dconn.Flush()
 	s.writeMu.Unlock()

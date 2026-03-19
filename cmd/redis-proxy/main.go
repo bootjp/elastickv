@@ -86,6 +86,7 @@ func run() error {
 	defer secondary.Close()
 
 	dual := proxy.NewDualWriter(primary, secondary, cfg, metrics, sentryReporter, logger)
+	defer dual.Close() // wait for in-flight async goroutines
 	srv := proxy.NewProxyServer(cfg, dual, metrics, sentryReporter, logger)
 
 	// Context for graceful shutdown

@@ -57,7 +57,7 @@ func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
 	sp.mu.Unlock()
 	assert.Equal(t, 0, remaining, "expired message should be removed")
 
-	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("ch1", "data_mismatch"))
+	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("data_mismatch"))
 	assert.Equal(t, float64(1), val)
 }
 
@@ -66,7 +66,7 @@ func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
 
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "extra"})
 
-	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("ch1", "extra_data"))
+	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
 	assert.Equal(t, float64(1), val)
 }
 
