@@ -389,20 +389,16 @@ func (s *pubsubSession) reenterPubSub(cmdName string, args [][]byte) {
 	s.shadow = shadow
 	s.mu.Unlock()
 
-	// Update state (sets only accessed from commandLoop goroutine).
+	// Update state and write confirmations together so the per-reply count
+	// increments as each channel is added (matching Redis behaviour).
 	kind := strings.ToLower(cmdName)
+	s.writeMu.Lock()
 	for _, ch := range channels {
 		if cmdName == cmdSubscribe {
 			s.channelSet[ch] = struct{}{}
 		} else {
 			s.patternSet[ch] = struct{}{}
 		}
-	}
-
-	// Write subscription confirmations before starting forwarding so that
-	// clients receive acknowledgements before any pub/sub messages.
-	s.writeMu.Lock()
-	for _, ch := range channels {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(ch)
@@ -490,16 +486,15 @@ func (s *pubsubSession) handleSub(args [][]byte, isPattern bool) {
 		return
 	}
 	s.mirrorSub(names, isPattern)
-	// Update state (goroutine-confined to commandLoop).
+	// Update state and write confirmations together so the per-reply count
+	// increments as each name is added (matching Redis behaviour).
+	s.writeMu.Lock()
 	for _, n := range names {
 		if isPattern {
 			s.patternSet[n] = struct{}{}
 		} else {
 			s.channelSet[n] = struct{}{}
 		}
-	}
-	s.writeMu.Lock()
-	for _, n := range names {
 		s.dconn.WriteArray(pubsubArrayReply)
 		s.dconn.WriteBulkString(kind)
 		s.dconn.WriteBulkString(n)
