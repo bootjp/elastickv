@@ -144,6 +144,57 @@ func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
 	sp.mu.Unlock()
 }
 
+func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
+	sp := newTestShadowPubSub(10 * time.Millisecond)
+	defer func() {
+		// Clean up without calling Close (test has no real secondary connection).
+		unmatchedSecondaries.Lock()
+		delete(unmatchedSecondaries.data, sp)
+		unmatchedSecondaries.Unlock()
+	}()
+
+	// Two identical secondary messages arrive before any primary.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "dup"})
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "dup"})
+
+	unmatchedSecondaries.Lock()
+	key := msgKey{Channel: "ch1", Payload: "dup"}
+	secs := unmatchedSecondaries.data[sp][key]
+	assert.Len(t, secs, 2, "both duplicate secondaries should be buffered")
+	unmatchedSecondaries.Unlock()
+
+	// Now one primary arrives — should consume one buffered secondary.
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "dup"})
+	sp.sweepExpired() // reconcile
+
+	unmatchedSecondaries.Lock()
+	secs = unmatchedSecondaries.data[sp][key]
+	unmatchedSecondaries.Unlock()
+	// One secondary remains buffered (only one primary consumed one).
+	assert.Len(t, secs, 1, "one duplicate should remain after matching one primary")
+}
+
+func TestShadowPubSub_CloseCleanupUnmatchedSecondaries(t *testing.T) {
+	sp := newTestShadowPubSub(1 * time.Second)
+	// Set a mock secondary to prevent nil dereference in Close().
+	sp.secondary = redis.NewClient(&redis.Options{Addr: "localhost:0"}).Subscribe(t.Context())
+
+	// Buffer a secondary message.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "leaked"})
+
+	unmatchedSecondaries.Lock()
+	_, exists := unmatchedSecondaries.data[sp]
+	unmatchedSecondaries.Unlock()
+	assert.True(t, exists, "secondary should be buffered before Close")
+
+	sp.Close()
+
+	unmatchedSecondaries.Lock()
+	_, exists = unmatchedSecondaries.data[sp]
+	unmatchedSecondaries.Unlock()
+	assert.False(t, exists, "Close should clean up unmatchedSecondaries entry")
+}
+
 func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 	sp := newTestShadowPubSub(1 * time.Second)
 

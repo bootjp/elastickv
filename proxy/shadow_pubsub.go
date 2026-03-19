@@ -30,11 +30,12 @@ type secondaryPending struct {
 // instance. This allows us to avoid reporting DivExtraData immediately when a
 // secondary arrives before the corresponding primary (e.g. due to network
 // jitter) and instead only report once the comparison window has elapsed.
+// Each key maps to a slice to handle duplicate secondary messages correctly.
 var unmatchedSecondaries = struct {
 	sync.Mutex
-	data map[*shadowPubSub]map[msgKey]secondaryPending
+	data map[*shadowPubSub]map[msgKey][]secondaryPending
 }{
-	data: make(map[*shadowPubSub]map[msgKey]secondaryPending),
+	data: make(map[*shadowPubSub]map[msgKey][]secondaryPending),
 }
 
 // pendingMsg records a message awaiting its counterpart from the other source.
@@ -47,9 +48,10 @@ type pendingMsg struct {
 
 // divergenceEvent holds divergence info collected under lock for deferred reporting.
 type divergenceEvent struct {
-	channel string
-	payload string
-	kind    DivergenceKind
+	channel   string
+	payload   string
+	kind      DivergenceKind
+	isPattern bool // true if this originated from a PSUBSCRIBE
 }
 
 // shadowPubSub subscribes to the secondary backend for the same channels
@@ -152,6 +154,10 @@ func (sp *shadowPubSub) Close() {
 	if started {
 		<-sp.done
 	}
+	// Clean up buffered unmatched secondaries to prevent memory leak.
+	unmatchedSecondaries.Lock()
+	delete(unmatchedSecondaries.data, sp)
+	unmatchedSecondaries.Unlock()
 }
 
 // compareLoop reads from the secondary channel and matches messages.
@@ -201,15 +207,15 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 
 	perInstance, ok := unmatchedSecondaries.data[sp]
 	if !ok {
-		perInstance = make(map[msgKey]secondaryPending)
+		perInstance = make(map[msgKey][]secondaryPending)
 		unmatchedSecondaries.data[sp] = perInstance
 	}
 
-	perInstance[key] = secondaryPending{
+	perInstance[key] = append(perInstance[key], secondaryPending{
 		timestamp: now,
 		channel:   msg.Channel,
 		payload:   msg.Payload,
-	}
+	})
 }
 
 // sweepExpired reports primary messages that were not matched within the window.
@@ -219,32 +225,53 @@ func (sp *shadowPubSub) sweepExpired() {
 	sp.mu.Lock()
 	now := time.Now()
 
-	// Lock the unmatched secondary buffer while we reconcile primaries and
-	// secondaries and age out any expired entries.
 	unmatchedSecondaries.Lock()
-	perInstance, ok := unmatchedSecondaries.data[sp]
-	if !ok {
-		perInstance = make(map[msgKey]secondaryPending)
-		unmatchedSecondaries.data[sp] = perInstance
+	perInstance := sp.getOrCreateSecondaryBuffer()
+
+	divergences = sp.reconcilePrimaries(now, perInstance, divergences)
+	divergences = sweepExpiredSecondaries(now, sp.window, perInstance, divergences)
+
+	if len(perInstance) == 0 {
+		delete(unmatchedSecondaries.data, sp)
 	}
 
-	// First, reconcile pending primaries against buffered secondaries. If a
-	// primary has a matching buffered secondary within the window, treat them
-	// as matched and drop both without reporting a divergence.
+	unmatchedSecondaries.Unlock()
+	sp.mu.Unlock()
+
+	for _, d := range divergences {
+		sp.reportDivergence(d)
+	}
+}
+
+// getOrCreateSecondaryBuffer returns the per-instance unmatched secondary buffer.
+// Caller must hold unmatchedSecondaries.Lock().
+func (sp *shadowPubSub) getOrCreateSecondaryBuffer() map[msgKey][]secondaryPending {
+	perInstance, ok := unmatchedSecondaries.data[sp]
+	if !ok {
+		perInstance = make(map[msgKey][]secondaryPending)
+		unmatchedSecondaries.data[sp] = perInstance
+	}
+	return perInstance
+}
+
+// reconcilePrimaries matches pending primaries against buffered secondaries,
+// reporting expired unmatched primaries as divergences.
+// Caller must hold sp.mu and unmatchedSecondaries.Lock().
+func (sp *shadowPubSub) reconcilePrimaries(now time.Time, secBuf map[msgKey][]secondaryPending, out []divergenceEvent) []divergenceEvent {
 	for key, entries := range sp.pending {
 		var remaining []pendingMsg
 		for _, e := range entries {
-			if sec, ok := perInstance[key]; ok && now.Sub(sec.timestamp) < sp.window {
-				// Matched with a buffered secondary; drop both.
-				delete(perInstance, key)
+			if secs := secBuf[key]; len(secs) > 0 {
+				// Matched — consume the oldest buffered secondary.
+				if len(secs) == 1 {
+					delete(secBuf, key)
+				} else {
+					secBuf[key] = secs[1:]
+				}
 				continue
 			}
 			if now.Sub(e.timestamp) >= sp.window {
-				divergences = append(divergences, divergenceEvent{
-					channel: e.channel,
-					payload: e.payload,
-					kind:    DivDataMismatch,
-				})
+				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, kind: DivDataMismatch, isPattern: e.pattern != ""})
 			} else {
 				remaining = append(remaining, e)
 			}
@@ -255,31 +282,27 @@ func (sp *shadowPubSub) sweepExpired() {
 			sp.pending[key] = remaining
 		}
 	}
+	return out
+}
 
-	// Next, age out any remaining buffered secondaries that have exceeded the
-	// comparison window and report them as extra_data divergences.
-	for key, sec := range perInstance {
-		if now.Sub(sec.timestamp) >= sp.window {
-			divergences = append(divergences, divergenceEvent{
-				channel: sec.channel,
-				payload: sec.payload,
-				kind:    DivExtraData,
-			})
-			delete(perInstance, key)
+// sweepExpiredSecondaries ages out buffered secondaries past the window.
+func sweepExpiredSecondaries(now time.Time, window time.Duration, secBuf map[msgKey][]secondaryPending, out []divergenceEvent) []divergenceEvent {
+	for key, secs := range secBuf {
+		var remaining []secondaryPending
+		for _, sec := range secs {
+			if now.Sub(sec.timestamp) >= window {
+				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, kind: DivExtraData})
+			} else {
+				remaining = append(remaining, sec)
+			}
+		}
+		if len(remaining) == 0 {
+			delete(secBuf, key)
+		} else {
+			secBuf[key] = remaining
 		}
 	}
-
-	// Clean up empty per-instance maps.
-	if len(perInstance) == 0 {
-		delete(unmatchedSecondaries.data, sp)
-	}
-
-	unmatchedSecondaries.Unlock()
-	sp.mu.Unlock()
-
-	for _, d := range divergences {
-		sp.reportDivergence(d.channel, d.payload, d.kind)
-	}
+	return out
 }
 
 // sweepAll reports all remaining pending messages as divergences (used on shutdown).
@@ -290,9 +313,10 @@ func (sp *shadowPubSub) sweepAll() {
 	for key, entries := range sp.pending {
 		for _, e := range entries {
 			divergences = append(divergences, divergenceEvent{
-				channel: e.channel,
-				payload: e.payload,
-				kind:    DivDataMismatch,
+				channel:   e.channel,
+				payload:   e.payload,
+				kind:      DivDataMismatch,
+				isPattern: e.pattern != "",
 			})
 		}
 		delete(sp.pending, key)
@@ -300,31 +324,36 @@ func (sp *shadowPubSub) sweepAll() {
 	sp.mu.Unlock()
 
 	for _, d := range divergences {
-		sp.reportDivergence(d.channel, d.payload, d.kind)
+		sp.reportDivergence(d)
 	}
 }
 
-func (sp *shadowPubSub) reportDivergence(channel, payload string, kind DivergenceKind) {
-	sp.metrics.PubSubShadowDivergences.WithLabelValues(kind.String()).Inc()
+func (sp *shadowPubSub) reportDivergence(d divergenceEvent) {
+	sp.metrics.PubSubShadowDivergences.WithLabelValues(d.kind.String()).Inc()
 	sp.logger.Warn("pubsub shadow divergence",
-		"channel", truncateValue(channel),
-		"payload", truncateValue(payload),
-		"kind", kind.String(),
+		"channel", truncateValue(d.channel),
+		"payload", truncateValue(d.payload),
+		"kind", d.kind.String(),
 	)
 
+	cmd := "SUBSCRIBE"
+	if d.isPattern {
+		cmd = "PSUBSCRIBE"
+	}
+
 	var primary, secondary any
-	switch kind { //nolint:exhaustive // only two kinds apply to pub/sub shadow
+	switch d.kind { //nolint:exhaustive // only two kinds apply to pub/sub shadow
 	case DivExtraData:
 		primary = nil
-		secondary = payload
+		secondary = d.payload
 	default:
-		primary = payload
+		primary = d.payload
 		secondary = nil
 	}
 	sp.sentry.CaptureDivergence(Divergence{
-		Command:    "SUBSCRIBE",
-		Key:        channel,
-		Kind:       kind,
+		Command:    cmd,
+		Key:        d.channel,
+		Kind:       d.kind,
 		Primary:    primary,
 		Secondary:  secondary,
 		DetectedAt: time.Now(),

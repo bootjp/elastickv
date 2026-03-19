@@ -221,14 +221,14 @@ var commandTable = map[string]CommandCategory{
 	"DISCARD": CmdTxn,
 
 	// ---- Script commands ----
-	"EVAL":      CmdScript,
-	"EVALSHA":   CmdScript,
-	"EVALRO":    CmdScript,
-	"EVALSHAro": CmdScript,
-	"SCRIPT":    CmdScript,
-	"FUNCTION":  CmdScript,
-	"FCALL":     CmdScript,
-	"FCALL_RO":  CmdScript,
+	"EVAL":       CmdScript,
+	"EVALSHA":    CmdScript,
+	"EVAL_RO":    CmdScript,
+	"EVALSHA_RO": CmdScript,
+	"SCRIPT":     CmdScript,
+	"FUNCTION":   CmdScript,
+	"FCALL":      CmdScript,
+	"FCALL_RO":   CmdScript,
 }
 
 // ClassifyCommand returns the category for a Redis command name.
