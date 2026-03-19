@@ -62,9 +62,14 @@ func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
 }
 
 func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
-	sp := newTestShadowPubSub(100 * time.Millisecond)
+	sp := newTestShadowPubSub(10 * time.Millisecond)
 
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "extra"})
+
+	// matchSecondary now buffers unmatched secondaries; wait for the
+	// comparison window to expire and sweep to trigger divergence reporting.
+	time.Sleep(20 * time.Millisecond)
+	sp.sweepExpired()
 
 	val := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
 	assert.Equal(t, float64(1), val)
