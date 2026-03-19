@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -32,10 +31,10 @@ type DualWriter struct {
 
 	writeSem  chan struct{} // bounds concurrent secondary write goroutines
 	shadowSem chan struct{} // bounds concurrent shadow read goroutines
-	wg        sync.WaitGroup
 
-	// closing is set to 1 when Close has begun; accessed atomically.
-	closing int32
+	wg     sync.WaitGroup
+	mu     sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
+	closed bool
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -65,8 +64,11 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 // Close waits for all in-flight async goroutines to finish.
 // Should be called during graceful shutdown.
 func (d *DualWriter) Close() {
-	// Mark as closing so no new async goroutines are scheduled.
-	atomic.StoreInt32(&d.closing, 1)
+	// Set closed under the mutex so that no concurrent goAsyncWithSem call
+	// can slip a wg.Add(1) in after wg.Wait() starts (which would panic).
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
 	d.wg.Wait()
 }
 
@@ -236,12 +238,17 @@ func (d *DualWriter) goAsync(fn func()) {
 // goAsyncWithSem launches fn in a bounded goroutine using the given semaphore.
 // If the DualWriter is closing or the semaphore is full, the work is dropped.
 func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
-	if atomic.LoadInt32(&d.closing) != 0 {
+	// Hold mu while checking closed and calling wg.Add so that Close() cannot
+	// start wg.Wait() between the closed-check and the wg.Add(1) call.
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
 		return
 	}
 	select {
 	case sem <- struct{}{}:
 		d.wg.Add(1)
+		d.mu.Unlock()
 		go func() {
 			defer func() {
 				<-sem
@@ -250,6 +257,7 @@ func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
 			fn()
 		}()
 	default:
+		d.mu.Unlock()
 		d.metrics.AsyncDrops.Inc()
 		d.logger.Warn("async goroutine limit reached, dropping secondary operation")
 	}

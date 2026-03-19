@@ -508,6 +508,33 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	d.Close()      // wait for all goroutines to finish
 }
 
+// TestDualWriter_Close_NoWaitGroupRace verifies that concurrent calls to
+// goAsync and Close do not trigger a "WaitGroup misuse: Add called
+// concurrently with Wait" panic under the race detector.
+func TestDualWriter_Close_NoWaitGroupRace(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	// Hammer goAsync from multiple goroutines while Close races against them.
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.goAsync(func() {})
+		}()
+	}
+	// Close concurrently — must not panic with "Add called concurrently with Wait".
+	d.Close()
+	wg.Wait()
+}
+
 // ========== ShadowReader tests ==========
 
 func TestShadowReader_Compare_Equal(t *testing.T) {
