@@ -86,13 +86,13 @@ func (s *pubsubSession) cleanup() {
 	s.mu.Unlock()
 	if s.fwdDone != nil {
 		// Bounded wait: if forwardMessages is stuck on a slow/dead client socket,
-		// close dconn to unblock it, then wait for completion.
-		select {
-		case <-s.fwdDone:
-		case <-time.After(cleanupFwdTimeout):
+		// close dconn to unblock it, then wait with a second bounded timeout.
+		if !s.waitFwdDone() {
 			s.logger.Warn("forwardMessages did not exit within timeout, closing dconn to unblock")
 			s.dconn.Close()
-			<-s.fwdDone
+			if !s.waitFwdDone() {
+				s.logger.Error("forwardMessages still stuck after dconn.Close, abandoning")
+			}
 			s.closeShadow()
 			return // dconn already closed
 		}
@@ -100,6 +100,16 @@ func (s *pubsubSession) cleanup() {
 	// Close shadow after forwardMessages exits (it calls RecordPrimary).
 	s.closeShadow()
 	s.dconn.Close()
+}
+
+// waitFwdDone waits for fwdDone with a bounded timeout, returning true if it completed.
+func (s *pubsubSession) waitFwdDone() bool {
+	select {
+	case <-s.fwdDone:
+		return true
+	case <-time.After(cleanupFwdTimeout):
+		return false
+	}
 }
 
 func (s *pubsubSession) startForwarding() {
@@ -201,12 +211,12 @@ func (s *pubsubSession) exitPubSubMode() {
 	}
 	s.mu.Unlock()
 	if s.fwdDone != nil {
-		select {
-		case <-s.fwdDone:
-		case <-time.After(cleanupFwdTimeout):
+		if !s.waitFwdDone() {
 			s.logger.Warn("forwardMessages did not exit within timeout, closing dconn to unblock")
 			s.dconn.Close()
-			<-s.fwdDone
+			if !s.waitFwdDone() {
+				s.logger.Error("forwardMessages still stuck after dconn.Close, abandoning")
+			}
 		}
 		s.fwdDone = nil
 	}

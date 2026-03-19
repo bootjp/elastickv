@@ -305,7 +305,8 @@ func sweepExpiredSecondaries(now time.Time, window time.Duration, secBuf map[msg
 	return out
 }
 
-// sweepAll reports all remaining pending messages as divergences (used on shutdown).
+// sweepAll reports all remaining pending primaries and buffered secondaries
+// as divergences (used on shutdown / channel close).
 func (sp *shadowPubSub) sweepAll() {
 	var divergences []divergenceEvent
 
@@ -322,6 +323,23 @@ func (sp *shadowPubSub) sweepAll() {
 		delete(sp.pending, key)
 	}
 	sp.mu.Unlock()
+
+	// Also drain any buffered unmatched secondaries for this instance.
+	unmatchedSecondaries.Lock()
+	if perInstance, ok := unmatchedSecondaries.data[sp]; ok {
+		for key, secs := range perInstance {
+			for _, sec := range secs {
+				divergences = append(divergences, divergenceEvent{
+					channel: sec.channel,
+					payload: sec.payload,
+					kind:    DivExtraData,
+				})
+			}
+			delete(perInstance, key)
+		}
+		delete(unmatchedSecondaries.data, sp)
+	}
+	unmatchedSecondaries.Unlock()
 
 	for _, d := range divergences {
 		sp.reportDivergence(d)
