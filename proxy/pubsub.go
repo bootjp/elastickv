@@ -705,7 +705,10 @@ func (s *pubsubSession) writeError(msg string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.dconn.WriteError(msg)
-	_ = s.dconn.Flush()
+	if err := s.dconn.Flush(); err != nil {
+		s.logger.Warn("failed to flush error to client; closing connection", "err", err)
+		_ = s.dconn.Close()
+	}
 }
 
 // writeRedisError writes an upstream error, preserving redis.Error prefixes verbatim
@@ -723,7 +726,10 @@ func (s *pubsubSession) writeString(msg string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.dconn.WriteString(msg)
-	_ = s.dconn.Flush()
+	if err := s.dconn.Flush(); err != nil {
+		s.logger.Warn("failed to flush string to client; closing connection", "err", err)
+		_ = s.dconn.Close()
+	}
 }
 
 func byteSlicesToStrings(bs [][]byte) []string {
