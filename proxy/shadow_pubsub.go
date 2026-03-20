@@ -148,30 +148,10 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 	now := sp.nowFunc()
 
 	// Attempt immediate reconciliation with any buffered unmatched secondary.
-	unmatchedSecondaries.Lock()
-	if secBySP, ok := unmatchedSecondaries.data[sp]; ok {
-		if secs, ok := secBySP[key]; ok && len(secs) > 0 {
-			for i, sec := range secs {
-				dt := now.Sub(sec.timestamp)
-				if dt <= sp.window && dt >= -sp.window {
-					// Consume this secondary — remove it from the slice.
-					secs = append(secs[:i], secs[i+1:]...)
-					if len(secs) == 0 {
-						delete(secBySP, key)
-						if len(secBySP) == 0 {
-							delete(unmatchedSecondaries.data, sp)
-						}
-					} else {
-						secBySP[key] = secs
-					}
-					unmatchedSecondaries.Unlock()
-					// Primary and secondary matched; no need to queue.
-					return
-				}
-			}
-		}
+	if sp.reconcileWithBufferedSecondary(key, now) {
+		// Primary and secondary matched; no need to queue.
+		return
 	}
-	unmatchedSecondaries.Unlock()
 
 	// No suitable secondary was buffered; queue this primary for later comparison.
 	sp.pending[key] = append(sp.pending[key], pendingMsg{
@@ -180,6 +160,41 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 		payload:   msg.Payload,
 		timestamp: now,
 	})
+}
+
+// reconcileWithBufferedSecondary checks whether an unmatched secondary message
+// exists for the given key and is still within the comparison window. If one is
+// found it is consumed and true is returned. Caller must hold sp.mu.
+func (sp *shadowPubSub) reconcileWithBufferedSecondary(key msgKey, now time.Time) bool {
+	unmatchedSecondaries.Lock()
+	defer unmatchedSecondaries.Unlock()
+
+	secBySP, ok := unmatchedSecondaries.data[sp]
+	if !ok {
+		return false
+	}
+	secs, ok := secBySP[key]
+	if !ok || len(secs) == 0 {
+		return false
+	}
+	for i, sec := range secs {
+		dt := now.Sub(sec.timestamp)
+		if dt > sp.window || dt < -sp.window {
+			continue
+		}
+		// Consume this secondary — remove it from the slice.
+		secs = append(secs[:i], secs[i+1:]...)
+		if len(secs) == 0 {
+			delete(secBySP, key)
+			if len(secBySP) == 0 {
+				delete(unmatchedSecondaries.data, sp)
+			}
+		} else {
+			secBySP[key] = secs
+		}
+		return true
+	}
+	return false
 }
 
 // Close stops the shadow comparison and closes the secondary pub/sub.
