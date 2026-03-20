@@ -333,8 +333,14 @@ func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bo
 	if name != "SELECT" {
 		return false
 	}
-	if len(args) > 1 && string(args[1]) != "0" && string(args[1]) != fmt.Sprintf("%d", s.proxy.cfg.PrimaryDB) {
-		s.writeError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", string(args[1]), s.proxy.cfg.PrimaryDB))
+	// Enforce Redis arity: SELECT requires exactly one DB index argument.
+	if len(args) != 2 {
+		s.writeError("ERR wrong number of arguments for 'select' command")
+		return true
+	}
+	dbStr := string(args[1])
+	if dbStr != fmt.Sprintf("%d", s.proxy.cfg.PrimaryDB) {
+		s.writeError(fmt.Sprintf("ERR proxy configured for DB %d, but SELECT %s requested", s.proxy.cfg.PrimaryDB, dbStr))
 		return true
 	}
 	s.writeString("OK")
