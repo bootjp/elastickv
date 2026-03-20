@@ -354,7 +354,8 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return adapter.NewRedisServer(l, redisAddr, st, coordinator, leaderRedis, relay), nil
+	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
+	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay), nil
 }
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {

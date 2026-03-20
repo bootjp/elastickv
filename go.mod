@@ -17,6 +17,7 @@ require (
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/emirpasic/gods v1.18.1
+	github.com/getsentry/sentry-go v0.27.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/pkg/errors v0.9.1
@@ -58,7 +59,6 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/fatih/color v1.15.0 // indirect
-	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.5-0.20231225225746-43d5d4cd4e0e // indirect

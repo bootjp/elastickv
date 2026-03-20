@@ -182,7 +182,7 @@ func startAddVoterJoinNode(
 		return err
 	})
 
-	rd := NewRedisServer(lis.redis, port.redisAddress, st, coordinator, leaderRedisMap, relay)
+	rd := NewRedisServer(lis.redis, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay)
 	workers.Go(func() error {
 		err := rd.Run()
 		if errors.Is(err, net.ErrClosed) {
