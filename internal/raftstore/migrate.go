@@ -57,6 +57,8 @@ func prepareMigrationPaths(logsPath, stablePath, destDir string) (string, error)
 		return "", errors.New("destination dir is required")
 	}
 
+	destDir = filepath.Clean(destDir)
+
 	if err := requireExistingFile(logsPath); err != nil {
 		return "", err
 	}
