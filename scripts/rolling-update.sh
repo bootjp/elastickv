@@ -343,6 +343,9 @@ case "$(uname -m)" in
 esac
 
 chmod +x "$RAFTADMIN_REMOTE_BIN"
+
+# Clean up architecture-specific helper binaries after installing the final binary.
+rm -f "${RAFTADMIN_REMOTE_BIN}-amd64" "${RAFTADMIN_REMOTE_BIN}-arm64"
 REMOTE_HELPER
 }
 
@@ -360,24 +363,25 @@ update_one_node() {
   copy_raftadmin_to_remote "$node_id" "$ssh_target"
 
   ssh "${SSH_BASE_OPTS[@]}" "$ssh_target" \
-    IMAGE="$IMAGE" \
-    RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
-    CONTAINER_NAME="$CONTAINER_NAME" \
-    DATA_DIR="$DATA_DIR" \
-    SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
-    RAFT_PORT="$RAFT_PORT" \
-    REDIS_PORT="$REDIS_PORT" \
-    DYNAMO_PORT="$DYNAMO_PORT" \
-    HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
-    LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
-    LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
-    RAFTADMIN_RPC_TIMEOUT_SECONDS="$RAFTADMIN_RPC_TIMEOUT_SECONDS" \
-    NODE_ID="$node_id" \
-    NODE_HOST="$node_host" \
-    ALL_NODE_IDS_CSV="$all_node_ids_csv" \
-    ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
-    RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
-    'bash -s' <<'REMOTE'
+    env \
+      IMAGE="$IMAGE" \
+      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
+      CONTAINER_NAME="$CONTAINER_NAME" \
+      DATA_DIR="$DATA_DIR" \
+      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
+      RAFT_PORT="$RAFT_PORT" \
+      REDIS_PORT="$REDIS_PORT" \
+      DYNAMO_PORT="$DYNAMO_PORT" \
+      HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
+      LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
+      LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
+      RAFTADMIN_RPC_TIMEOUT_SECONDS="$RAFTADMIN_RPC_TIMEOUT_SECONDS" \
+      NODE_ID="$node_id" \
+      NODE_HOST="$node_host" \
+      ALL_NODE_IDS_CSV="$all_node_ids_csv" \
+      ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
+      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
+      bash -s <<'REMOTE'
 set -euo pipefail
 
 IFS=, read -r -a ALL_NODE_IDS <<< "$ALL_NODE_IDS_CSV"
@@ -616,6 +620,13 @@ run_container() {
     --raftRedisMap "$RAFT_TO_REDIS_MAP" >/dev/null
 }
 
+require_passwordless_sudo() {
+  if ! sudo -n true 2>/dev/null; then
+    echo "error: passwordless sudo is required on this host; configure NOPASSWD sudo for the remote user" >&2
+    exit 1
+  fi
+}
+
 archive_legacy_dir() {
   local dir="$1"
   local ts backup_dir moved
@@ -624,10 +635,10 @@ archive_legacy_dir() {
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_dir="${dir%/}/legacy-boltdb-${ts}"
 
-  sudo mkdir -p "$backup_dir"
+  sudo -n mkdir -p "$backup_dir"
   for name in logs.dat stable.dat; do
-    if sudo test -e "$dir/$name"; then
-      sudo mv "$dir/$name" "$backup_dir/$name"
+    if sudo -n test -e "$dir/$name"; then
+      sudo -n mv "$dir/$name" "$backup_dir/$name"
       moved=1
     fi
   done
@@ -637,7 +648,7 @@ archive_legacy_dir() {
     return 0
   fi
 
-  sudo rmdir "$backup_dir" 2>/dev/null || true
+  sudo -n rmdir "$backup_dir" 2>/dev/null || true
   return 1
 }
 
@@ -645,9 +656,9 @@ archive_default_legacy_dir() {
   local node_data_dir
 
   node_data_dir="${DATA_DIR%/}/${NODE_ID}"
-  if sudo test -d "$node_data_dir"; then
+  if sudo -n test -d "$node_data_dir"; then
     archive_legacy_dir "$node_data_dir" || true
-    sudo rm -rf "${node_data_dir}/raft.db.migrating" 2>/dev/null || true
+    sudo -n rm -rf "${node_data_dir}/raft.db.migrating" 2>/dev/null || true
   fi
 }
 
@@ -659,7 +670,7 @@ archive_legacy_dirs_from_logs() {
   while IFS= read -r dir; do
     [[ -n "$dir" ]] || continue
     archive_legacy_dir "$dir" || true
-    sudo rm -rf "${dir}/raft.db.migrating" 2>/dev/null || true
+    sudo -n rm -rf "${dir}/raft.db.migrating" 2>/dev/null || true
     found=1
   done < <(
     printf '%s\n' "$logs" |
@@ -683,7 +694,8 @@ if [[ "$new_image_id" == "$running_image_id" && "$running_status" == "running" ]
   echo "container is running but gRPC is not reachable; recreating"
 fi
 
-sudo mkdir -p "$DATA_DIR"
+require_passwordless_sudo
+sudo -n mkdir -p "$DATA_DIR"
 if [[ "$running_status" == "running" ]]; then
   ensure_not_leader_before_restart
 fi
