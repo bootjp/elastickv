@@ -478,6 +478,114 @@ func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
 	assert.Equal(t, 0, secondary.CallCount(), "no shadow in dual-write mode")
 }
 
+type timeoutCapturingBackend struct {
+	name        string
+	timeout     time.Duration
+	args        []any
+	doCalls     int
+	doWithCalls int
+	returnValue any
+	returnErr   error
+}
+
+func (b *timeoutCapturingBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
+	b.doCalls++
+	b.args = append([]any(nil), args...)
+	cmd := redis.NewCmd(ctx, args...)
+	if b.returnErr != nil {
+		cmd.SetErr(b.returnErr)
+		return cmd
+	}
+	cmd.SetVal(b.returnValue)
+	return cmd
+}
+
+func (b *timeoutCapturingBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	b.doWithCalls++
+	b.timeout = timeout
+	b.args = append([]any(nil), args...)
+	cmd := redis.NewCmd(ctx, args...)
+	if b.returnErr != nil {
+		cmd.SetErr(b.returnErr)
+		return cmd
+	}
+	cmd.SetVal(b.returnValue)
+	return cmd
+}
+
+func (b *timeoutCapturingBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	results := make([]*redis.Cmd, len(cmds))
+	for i, args := range cmds {
+		results[i] = b.Do(ctx, args...)
+	}
+	return results, nil
+}
+
+func (b *timeoutCapturingBackend) Close() error { return nil }
+func (b *timeoutCapturingBackend) Name() string { return b.name }
+
+func TestBlockingCommandTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      string
+		args     [][]byte
+		expected time.Duration
+	}{
+		{
+			name:     "BZPOPMIN seconds",
+			cmd:      "BZPOPMIN",
+			args:     [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")},
+			expected: 5 * time.Second,
+		},
+		{
+			name:     "BLMOVE float seconds",
+			cmd:      "BLMOVE",
+			args:     [][]byte{[]byte("BLMOVE"), []byte("src"), []byte("dst"), []byte("LEFT"), []byte("RIGHT"), []byte("2.5")},
+			expected: 2500 * time.Millisecond,
+		},
+		{
+			name:     "XREAD block milliseconds",
+			cmd:      "XREAD",
+			args:     [][]byte{[]byte("XREAD"), []byte("BLOCK"), []byte("1500"), []byte("STREAMS"), []byte("jobs"), []byte("0")},
+			expected: 1500 * time.Millisecond,
+		},
+		{
+			name:     "XREADGROUP block zero",
+			cmd:      "XREADGROUP",
+			args:     [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("c"), []byte("BLOCK"), []byte("0"), []byte("STREAMS"), []byte("jobs"), []byte(">")},
+			expected: 0,
+		},
+		{
+			name:     "missing block falls back to zero",
+			cmd:      "XREAD",
+			args:     [][]byte{[]byte("XREAD"), []byte("STREAMS"), []byte("jobs"), []byte("0")},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, blockingCommandTimeout(tt.cmd, tt.args))
+		})
+	}
+}
+
+func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
+	primary := &timeoutCapturingBackend{name: "primary", returnValue: "OK"}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly}, metrics, newTestSentry(), testLogger)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, "OK", resp)
+	assert.Equal(t, 0, primary.doCalls)
+	assert.Equal(t, 1, primary.doWithCalls)
+	assert.Equal(t, 5*time.Second, primary.timeout)
+	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
+}
+
 func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)

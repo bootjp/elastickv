@@ -85,6 +85,13 @@ func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	return b.client.Do(ctx, args...)
 }
 
+// DoWithTimeout executes a command using a per-call socket timeout override.
+// This is used for blocking commands whose wait time exceeds the backend's
+// default read timeout.
+func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	return b.client.WithTimeout(timeout).Do(ctx, args...)
+}
+
 func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	pipe := b.client.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))

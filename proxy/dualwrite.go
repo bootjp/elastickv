@@ -133,9 +133,15 @@ func (d *DualWriter) Read(ctx context.Context, cmd string, args [][]byte) (any, 
 // cmd must be the pre-uppercased command name.
 func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
+	timeout := blockingCommandTimeout(cmd, args)
 
 	start := time.Now()
-	result := d.primary.Do(ctx, iArgs...)
+	var result *redis.Cmd
+	if blockingBackend, ok := d.primary.(blockingTimeoutBackend); ok {
+		result = blockingBackend.DoWithTimeout(ctx, timeout, iArgs...)
+	} else {
+		result = d.primary.Do(ctx, iArgs...)
+	}
 	resp, err := result.Result()
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
