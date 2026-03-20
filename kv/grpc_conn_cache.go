@@ -3,11 +3,11 @@ package kv
 import (
 	"sync"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // GRPCConnCache reuses gRPC connections per address. gRPC itself handles
@@ -75,9 +75,9 @@ func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, erro
 		return conn, nil
 	}
 
-	conn, err := grpc.NewClient(string(addr),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	conn, err := grpc.NewClient(
+		string(addr),
+		append(internalutil.GRPCDialOptions(), grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))...,
 	)
 	if err != nil {
 		return nil, errors.WithStack(err)

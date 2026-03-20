@@ -30,7 +30,6 @@ import (
 	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -206,7 +205,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	}
 
 	// Connect to leader
-	conn, err := grpc.NewClient(leader.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(leader.address, internalutil.GRPCDialOptions()...)
 	if err != nil {
 		return fmt.Errorf("failed to dial leader: %w", err)
 	}
@@ -322,7 +321,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 }
 
 func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) (*grpc.Server, *adapter.GRPCServer) {
-	s := grpc.NewServer()
+	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 	trx := kv.NewTransaction(r)
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
@@ -381,9 +380,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	})
 
 	// Transport
-	tm := transport.New(raft.ServerAddress(cfg.address), []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	})
+	tm := transport.New(raft.ServerAddress(cfg.address), internalutil.GRPCDialOptions())
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {

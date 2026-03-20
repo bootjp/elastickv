@@ -7,12 +7,11 @@ import (
 	"time"
 
 	transport "github.com/Jille/raft-grpc-transport"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type raftGroupRuntime struct {
@@ -117,9 +116,7 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 		return nil, nil, nil, errors.WithStack(err)
 	}
 
-	tm = transport.New(raft.ServerAddress(group.address), []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	})
+	tm = transport.New(raft.ServerAddress(group.address), internalutil.GRPCDialOptions())
 
 	r, err := raft.NewRaft(c, fsm, raftStore, raftStore, fss, tm.Transport())
 	if err != nil {

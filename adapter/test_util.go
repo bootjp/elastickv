@@ -13,6 +13,7 @@ import (
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/Jille/raftadmin"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -23,7 +24,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func shutdown(nodes []Node) {
@@ -350,7 +350,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		r, tm, err := newRaft(strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg, electionTimeout)
 		assert.NoError(t, err)
 
-		s := grpc.NewServer()
+		s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 		trx := kv.NewTransaction(r)
 		coordinator := kv.NewCoordinator(trx, r)
 		relay := NewRedisPubSubRelay()
@@ -416,9 +416,7 @@ func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg ra
 		Level: hclog.LevelFromString("WARN"),
 	})
 
-	tm := transport.New(raft.ServerAddress(myAddress), []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	})
+	tm := transport.New(raft.ServerAddress(myAddress), internalutil.GRPCDialOptions())
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
