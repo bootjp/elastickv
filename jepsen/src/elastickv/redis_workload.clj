@@ -175,6 +175,13 @@
     :parse-fn #(Integer/parseInt %)]
    ["-h" "--help"]])
 
+(defn fail-on-invalid!
+  "Raises when Jepsen completed analysis and found the history invalid."
+  [result]
+  (when (false? (:valid? result))
+    (throw (ex-info "Jepsen analysis invalid" {:result result})))
+  result)
+
 (defn -main
   [& args]
   (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
@@ -211,5 +218,5 @@
       (seq errors) (binding [*out* *err*]
                      (println "Error parsing options:" (str/join "; " errors)))
       (:local options) (binding [control/*dummy* true]
-                         (jepsen/run! (elastickv-redis-test options)))
-      :else (jepsen/run! (elastickv-redis-test options)))))
+                         (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))
+      :else (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))))
