@@ -720,12 +720,17 @@ func (s *pubsubSession) mirrorUnsub(names []string, isPattern bool) {
 // --- Helpers ---
 
 // flushOrClose flushes the detached connection. On error it closes the
-// connection so that commandLoop will observe a read failure and shut down.
-// Caller must hold s.writeMu.
+// connection and marks the session as closed so that background forwarding
+// loops exit promptly. Caller must hold s.writeMu.
 func (s *pubsubSession) flushOrClose() {
 	if err := s.dconn.Flush(); err != nil {
 		s.logger.Warn("failed to flush to client; closing connection", "err", err)
 		_ = s.dconn.Close()
+
+		// Mark the session as closed so background forwarding loops can exit promptly.
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
 	}
 }
 

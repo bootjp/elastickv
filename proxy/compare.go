@@ -43,6 +43,7 @@ func (k DivergenceKind) String() string {
 type Divergence struct {
 	Command    string
 	Key        string
+	Pattern    string // non-empty for PSUBSCRIBE/pmessage divergences
 	Kind       DivergenceKind
 	Primary    any
 	Secondary  any
