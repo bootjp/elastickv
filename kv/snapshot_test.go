@@ -58,6 +58,7 @@ func TestSnapshot(t *testing.T) {
 	var buf bytes.Buffer
 	_, err = kvFSMSnap.snapshot.WriteTo(&buf)
 	assert.NoError(t, err)
+	kvFSMSnap.Release()
 	err = fsm2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes())))
 	assert.NoError(t, err)
 

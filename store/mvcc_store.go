@@ -26,8 +26,11 @@ type VersionedValue struct {
 }
 
 const (
-	checksumSize        = 4
-	mvccSnapshotVersion = uint32(1)
+	checksumSize              = 4
+	mvccSnapshotVersion       = uint32(1)
+	maxSnapshotKeySize        = 1 << 20        // 1 MiB per key
+	maxSnapshotVersionCount   = 1 << 20        // 1M versions per key
+	maxSnapshotValueSize      = 64 << 20       // 64 MiB per value
 )
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
@@ -606,7 +609,8 @@ func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
 
 func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
 	hash := crc32.NewIEEE()
-	w := io.MultiWriter(f, hash)
+	bw := bufio.NewWriter(f)
+	w := io.MultiWriter(bw, hash)
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -630,6 +634,9 @@ func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
 		if err := writeMVCCSnapshotEntry(w, key, versions); err != nil {
 			return 0, err
 		}
+	}
+	if err := bw.Flush(); err != nil {
+		return 0, errors.WithStack(err)
 	}
 	return hash.Sum32(), nil
 }
@@ -788,6 +795,9 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		}
 		return nil, nil, false, errors.WithStack(err)
 	}
+	if keyLen > maxSnapshotKeySize {
+		return nil, nil, false, errors.Newf("mvcc snapshot key too large: %d > %d", keyLen, maxSnapshotKeySize)
+	}
 
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r, key); err != nil {
@@ -797,6 +807,9 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 	var versionCount uint64
 	if err := binary.Read(r, binary.LittleEndian, &versionCount); err != nil {
 		return nil, nil, false, errors.WithStack(err)
+	}
+	if versionCount > maxSnapshotVersionCount {
+		return nil, nil, false, errors.Newf("mvcc snapshot version count too large: %d > %d", versionCount, maxSnapshotVersionCount)
 	}
 	versions := make([]VersionedValue, 0, versionCount)
 	for i := uint64(0); i < versionCount; i++ {
@@ -828,6 +841,9 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	var valueLen uint64
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
+	}
+	if valueLen > maxSnapshotValueSize {
+		return VersionedValue{}, errors.Newf("mvcc snapshot value too large: %d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {
