@@ -370,7 +370,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, srv.Serve(lis))
 		}(s, grpcSock)
 
-		rd := NewRedisServer(redisSock, port.redisAddress, st, coordinator, leaderRedisMap, relay)
+		rd := NewRedisServer(redisSock, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)

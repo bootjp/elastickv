@@ -42,13 +42,14 @@ func newTestShadowPubSub(window time.Duration) *shadowPubSub {
 
 func newTestShadowPubSubWithClock(window time.Duration, nowFunc func() time.Time) *shadowPubSub {
 	return &shadowPubSub{
-		metrics: newTestMetrics(),
-		sentry:  newTestSentry(),
-		logger:  testLogger,
-		window:  window,
-		nowFunc: nowFunc,
-		pending: make(map[msgKey][]pendingMsg),
-		done:    make(chan struct{}),
+		metrics:              newTestMetrics(),
+		sentry:               newTestSentry(),
+		logger:               testLogger,
+		window:               window,
+		nowFunc:              nowFunc,
+		pending:              make(map[msgKey][]pendingMsg),
+		unmatchedSecondaries: make(map[msgKey][]secondaryPending),
+		done:                 make(chan struct{}),
 	}
 }
 
@@ -84,11 +85,6 @@ func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
 func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
-	defer func() {
-		unmatchedSecondaries.Lock()
-		delete(unmatchedSecondaries.data, sp)
-		unmatchedSecondaries.Unlock()
-	}()
 
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "extra"})
 
@@ -172,53 +168,52 @@ func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
 }
 
 func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
-	sp := newTestShadowPubSub(10 * time.Millisecond)
-	defer func() {
-		// Clean up without calling Close (test has no real secondary connection).
-		unmatchedSecondaries.Lock()
-		delete(unmatchedSecondaries.data, sp)
-		unmatchedSecondaries.Unlock()
-	}()
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
 
 	// Two identical secondary messages arrive before any primary.
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "dup"})
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "dup"})
 
-	unmatchedSecondaries.Lock()
 	key := msgKey{Channel: "ch1", Payload: "dup"}
-	secs := unmatchedSecondaries.data[sp][key]
+	sp.mu.Lock()
+	secs := sp.unmatchedSecondaries[key]
 	assert.Len(t, secs, 2, "both duplicate secondaries should be buffered")
-	unmatchedSecondaries.Unlock()
+	sp.mu.Unlock()
 
 	// Now one primary arrives — should consume one buffered secondary.
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "dup"})
 	sp.sweepExpired() // reconcile
 
-	unmatchedSecondaries.Lock()
-	secs = unmatchedSecondaries.data[sp][key]
-	unmatchedSecondaries.Unlock()
+	sp.mu.Lock()
+	secs = sp.unmatchedSecondaries[key]
+	sp.mu.Unlock()
 	// One secondary remains buffered (only one primary consumed one).
 	assert.Len(t, secs, 1, "one duplicate should remain after matching one primary")
 }
 
 func TestShadowPubSub_CloseCleanupUnmatchedSecondaries(t *testing.T) {
-	// Close() now tolerates nil secondary, so no mock client is needed.
+	// Verify that sweepAll (called when the compare loop exits on Close) drains
+	// the per-struct unmatchedSecondaries buffer and reports DivExtraData.
 	sp := newTestShadowPubSub(1 * time.Second)
 
 	// Buffer a secondary message.
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "leaked"})
 
-	unmatchedSecondaries.Lock()
-	_, exists := unmatchedSecondaries.data[sp]
-	unmatchedSecondaries.Unlock()
-	assert.True(t, exists, "secondary should be buffered before Close")
+	sp.mu.Lock()
+	_, buffered := sp.unmatchedSecondaries[msgKey{Channel: "ch1", Payload: "leaked"}]
+	sp.mu.Unlock()
+	assert.True(t, buffered, "secondary should be buffered before sweep")
 
-	sp.Close()
+	// sweepAll drains the buffer and reports the unmatched secondary as DivExtraData.
+	sp.sweepAll()
 
-	unmatchedSecondaries.Lock()
-	_, exists = unmatchedSecondaries.data[sp]
-	unmatchedSecondaries.Unlock()
-	assert.False(t, exists, "Close should clean up unmatchedSecondaries entry")
+	sp.mu.Lock()
+	assert.Empty(t, sp.unmatchedSecondaries, "sweepAll should drain unmatchedSecondaries")
+	sp.mu.Unlock()
+
+	extra := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
+	assert.Equal(t, float64(1), extra, "buffered secondary should be reported as extra_data by sweepAll")
 }
 
 func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
@@ -252,19 +247,14 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 func TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile(t *testing.T) {
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
-	defer func() {
-		unmatchedSecondaries.Lock()
-		delete(unmatchedSecondaries.data, sp)
-		unmatchedSecondaries.Unlock()
-	}()
 
-	// Secondary arrives first — it should be buffered in unmatchedSecondaries.
+	// Secondary arrives first — it should be buffered in sp.unmatchedSecondaries.
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "early"})
 
 	key := msgKey{Channel: "ch1", Payload: "early"}
-	unmatchedSecondaries.Lock()
-	secs := unmatchedSecondaries.data[sp][key]
-	unmatchedSecondaries.Unlock()
+	sp.mu.Lock()
+	secs := sp.unmatchedSecondaries[key]
+	sp.mu.Unlock()
 	assert.Len(t, secs, 1, "secondary should be buffered before primary arrives")
 
 	// Primary arrives within the window — RecordPrimary should immediately consume
@@ -277,9 +267,9 @@ func TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile(t *testing.T) {
 	sp.mu.Unlock()
 
 	// The buffered secondary entry must have been consumed.
-	unmatchedSecondaries.Lock()
-	secs = unmatchedSecondaries.data[sp][key]
-	unmatchedSecondaries.Unlock()
+	sp.mu.Lock()
+	secs = sp.unmatchedSecondaries[key]
+	sp.mu.Unlock()
 	assert.Empty(t, secs, "buffered secondary should be consumed immediately by RecordPrimary")
 
 	// Advance past the window and sweep — no divergences should be reported.
@@ -322,11 +312,6 @@ func TestShadowPubSub_SecondaryWithinWindowMatches(t *testing.T) {
 func TestShadowPubSub_ExpiredPrimaryThenLateSecondary(t *testing.T) {
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
-	defer func() {
-		unmatchedSecondaries.Lock()
-		delete(unmatchedSecondaries.data, sp)
-		unmatchedSecondaries.Unlock()
-	}()
 
 	// Record the primary message.
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "late"})
@@ -353,4 +338,106 @@ func TestShadowPubSub_ExpiredPrimaryThenLateSecondary(t *testing.T) {
 
 	extra = counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
 	assert.Equal(t, float64(1), extra, "late secondary must eventually be reported as extra_data")
+}
+
+// TestShadowPubSub_MatchSecondarySkipsExpiredHead verifies that matchSecondary
+// correctly skips an already-expired first entry and matches the secondary against
+// a still-in-window second entry (matchIdx at position 1).
+func TestShadowPubSub_MatchSecondarySkipsExpiredHead(t *testing.T) {
+	clock := newTestClock()
+	window := 50 * time.Millisecond
+	sp := newTestShadowPubSubWithClock(window, clock.Now)
+
+	key := msgKey{Channel: "ch1", Payload: "val"}
+
+	// Record the first primary — then advance past the window.
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "val"})
+	clock.Advance(100 * time.Millisecond) // first entry is now expired
+
+	// Record a second primary within the new "now" window.
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "val"})
+
+	// Secondary arrives: should match the second (non-expired) entry, NOT the
+	// expired first one.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "val"})
+
+	sp.mu.Lock()
+	entries := sp.pending[key]
+	sp.mu.Unlock()
+	// Only the expired first entry should remain; the second was consumed.
+	assert.Len(t, entries, 1, "only the expired head entry should remain after matching the in-window second entry")
+}
+
+// TestShadowPubSub_MatchSecondaryMiddleEntry verifies that matchSecondary removes
+// a middle entry (matchIdx neither 0 nor last) and leaves the others intact.
+func TestShadowPubSub_MatchSecondaryMiddleEntry(t *testing.T) {
+	clock := newTestClock()
+	window := 50 * time.Millisecond
+	sp := newTestShadowPubSubWithClock(window, clock.Now)
+
+	key := msgKey{Channel: "ch1", Payload: "val"}
+
+	// Arrange three entries under the same key:
+	//   - index 0: expired (outside window)
+	//   - index 1: in-window (the one we expect to match and remove — the middle)
+	//   - index 2: in-window (should remain after removal)
+	sp.mu.Lock()
+	now := clock.Now()
+	expiredTs := now.Add(-100 * time.Millisecond)
+	middleTs := now.Add(-10 * time.Millisecond)
+	lastTs := now
+	sp.pending[key] = []pendingMsg{
+		{channel: "ch1", payload: "val", timestamp: expiredTs}, // expired (index 0)
+		{channel: "ch1", payload: "val", timestamp: middleTs},  // in-window (index 1 — middle)
+		{channel: "ch1", payload: "val", timestamp: lastTs},    // in-window (index 2 — tail)
+	}
+	sp.mu.Unlock()
+
+	// Secondary should match the first in-window entry (index 1), exercising
+	// the "remove from middle of slice" path in matchSecondary.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "val"})
+
+	sp.mu.Lock()
+	entries := sp.pending[key]
+	sp.mu.Unlock()
+
+	// The expired head (index 0) and the tail (index 2) should remain, while
+	// the middle entry (middleTs) should have been removed.
+	assert.Len(t, entries, 2, "expected middle entry to be removed, leaving 2 entries")
+	assert.WithinDuration(t, expiredTs, entries[0].timestamp, time.Millisecond,
+		"first remaining entry should be the expired head")
+	assert.WithinDuration(t, lastTs, entries[1].timestamp, time.Millisecond,
+		"second remaining entry should be the original tail (last) entry")
+}
+
+// TestShadowPubSub_MatchSecondaryLastEntry verifies that matchSecondary can match
+// and remove the last entry in a multi-entry slice (matchIdx == len-1) while
+// leaving the earlier expired entries for the sweep.
+func TestShadowPubSub_MatchSecondaryLastEntry(t *testing.T) {
+	clock := newTestClock()
+	window := 50 * time.Millisecond
+	sp := newTestShadowPubSubWithClock(window, clock.Now)
+
+	key := msgKey{Channel: "ch1", Payload: "val"}
+	now := clock.Now()
+
+	// Insert two entries: the first is expired, the second is in-window.
+	sp.mu.Lock()
+	sp.pending[key] = []pendingMsg{
+		{channel: "ch1", payload: "val", timestamp: now.Add(-100 * time.Millisecond)}, // expired (index 0)
+		{channel: "ch1", payload: "val", timestamp: now},                              // in-window (index 1, the "last")
+	}
+	sp.mu.Unlock()
+
+	// Secondary should match the last (in-window) entry.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "val"})
+
+	sp.mu.Lock()
+	entries := sp.pending[key]
+	sp.mu.Unlock()
+
+	// Only the expired first entry should remain.
+	assert.Len(t, entries, 1, "only the expired first entry should remain after matching the last in-window entry")
+	assert.WithinDuration(t, now.Add(-100*time.Millisecond), entries[0].timestamp, time.Millisecond,
+		"remaining entry should be the expired head")
 }
