@@ -7,19 +7,13 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 )
 
 func counterValue(c prometheus.Counter) float64 {
-	m := &dto.Metric{}
-	pm, ok := c.(prometheus.Metric)
-	if !ok {
-		return 0
-	}
-	_ = pm.Write(m)
-	return m.GetCounter().GetValue()
+	return testutil.ToFloat64(c)
 }
 
 // testClock provides a deterministic clock for tests, avoiding time.Sleep flakiness.
@@ -248,4 +242,65 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 	sp.mu.Lock()
 	assert.Equal(t, 0, len(sp.pending), "message should be matched via compareLoop")
 	sp.mu.Unlock()
+}
+
+// TestShadowPubSub_SecondaryWithinWindowMatches verifies that a secondary
+// arriving before the comparison window properly matches its primary and
+// prevents a divergence from being reported during reconciliation.
+func TestShadowPubSub_SecondaryWithinWindowMatches(t *testing.T) {
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(50*time.Millisecond, clock.Now)
+
+	// Record the primary and buffer the secondary immediately (within window).
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "match-me"})
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "match-me"})
+
+	// Advance past window and sweep — the primary was already consumed, so no divergence.
+	clock.Advance(100 * time.Millisecond)
+	sp.sweepExpired()
+
+	mismatch := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("data_mismatch"))
+	assert.Equal(t, float64(0), mismatch, "within-window secondary match must suppress data_mismatch")
+
+	extra := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
+	assert.Equal(t, float64(0), extra, "within-window secondary match must suppress extra_data")
+}
+
+// arriving after the comparison window does not suppress the already-expired
+// primary divergence. Both a DivDataMismatch (primary) and eventually a
+// DivExtraData (secondary) should be reported.
+func TestShadowPubSub_ExpiredPrimaryThenLateSecondary(t *testing.T) {
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
+	defer func() {
+		unmatchedSecondaries.Lock()
+		delete(unmatchedSecondaries.data, sp)
+		unmatchedSecondaries.Unlock()
+	}()
+
+	// Record the primary message.
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "late"})
+
+	// Advance past the comparison window so the primary is expired.
+	clock.Advance(20 * time.Millisecond)
+
+	// The secondary arrives after the window — it should be buffered (no primary to match).
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "late"})
+
+	// Sweep: expired primary should be reported as DivDataMismatch.
+	// The late secondary is buffered and not yet old enough to report on its own.
+	sp.sweepExpired()
+
+	mismatch := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("data_mismatch"))
+	assert.Equal(t, float64(1), mismatch, "expired primary must be reported as data_mismatch")
+
+	extra := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
+	assert.Equal(t, float64(0), extra, "secondary should not yet be reported as extra_data")
+
+	// Advance again so the buffered secondary is also past the window.
+	clock.Advance(20 * time.Millisecond)
+	sp.sweepExpired()
+
+	extra = counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
+	assert.Equal(t, float64(1), extra, "late secondary must eventually be reported as extra_data")
 }

@@ -273,8 +273,14 @@ func (sp *shadowPubSub) reconcilePrimaries(now time.Time, secBuf map[msgKey][]se
 	for key, entries := range sp.pending {
 		var remaining []pendingMsg
 		for _, e := range entries {
+			if now.Sub(e.timestamp) >= sp.window {
+				// Primary has expired — report as divergence regardless of any buffered
+				// secondaries. A late secondary must not suppress a window violation.
+				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, kind: DivDataMismatch, isPattern: e.pattern != ""})
+				continue
+			}
 			if secs := secBuf[key]; len(secs) > 0 {
-				// Matched — consume the oldest buffered secondary.
+				// Match found within window — consume the oldest buffered secondary.
 				if len(secs) == 1 {
 					delete(secBuf, key)
 				} else {
@@ -282,11 +288,7 @@ func (sp *shadowPubSub) reconcilePrimaries(now time.Time, secBuf map[msgKey][]se
 				}
 				continue
 			}
-			if now.Sub(e.timestamp) >= sp.window {
-				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, kind: DivDataMismatch, isPattern: e.pattern != ""})
-			} else {
-				remaining = append(remaining, e)
-			}
+			remaining = append(remaining, e)
 		}
 		if len(remaining) == 0 {
 			delete(sp.pending, key)

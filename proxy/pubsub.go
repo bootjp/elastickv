@@ -319,11 +319,30 @@ func (s *pubsubSession) handleTxnInSession(name string, args [][]byte) bool {
 	return false
 }
 
+// handleProxySpecialCommand handles AUTH and SELECT at the proxy level
+// (not forwarded to a backend). Returns true if the command was handled.
+func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bool {
+	// AUTH is handled at the connection-pool level; accept silently.
+	if name == "AUTH" {
+		s.writeString("OK")
+		return true
+	}
+	// Mirror ProxyServer's SELECT handling: accept only the configured DB to
+	// avoid per-connection DB state with pooled connections.
+	if name != "SELECT" {
+		return false
+	}
+	if len(args) > 1 && string(args[1]) != "0" && string(args[1]) != fmt.Sprintf("%d", s.proxy.cfg.PrimaryDB) {
+		s.writeError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", string(args[1]), s.proxy.cfg.PrimaryDB))
+		return true
+	}
+	s.writeString("OK")
+	return true
+}
+
 // dispatchRegularCommand sends a non-transaction, non-special command to the backend.
 func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
-	// SELECT and AUTH are handled at the connection-pool level; accept silently.
-	if name == "SELECT" || name == "AUTH" {
-		s.writeString("OK")
+	if s.handleProxySpecialCommand(name, args) {
 		return
 	}
 
