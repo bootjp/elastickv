@@ -485,6 +485,9 @@ func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
 		t.Run(cmd, func(t *testing.T) {
 			dconn := newMockDetachedConn()
 			s := newTestSession(dconn)
+			// handleProxySpecialCommand accesses s.proxy.cfg for SELECT; provide a
+			// minimal ProxyServer so the SELECT path does not panic.
+			s.proxy = &ProxyServer{cfg: ProxyConfig{PrimaryDB: 0}}
 
 			s.dispatchRegularCommand(cmd, [][]byte{[]byte(cmd), []byte("0")})
 
