@@ -228,18 +228,33 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 	key := msgKeyFromMessage(msg)
 	now := sp.nowFunc()
 	if entries, ok := sp.pending[key]; ok && len(entries) > 0 {
-		oldest := entries[0]
-		if now.Sub(oldest.timestamp) <= sp.window {
-			// Match found within window — remove the oldest pending primary message.
-			if len(entries) == 1 {
+		// Find the oldest non-expired pending primary within the comparison window.
+		// Entries are appended in arrival order, so the first non-expired one is
+		// the correct match. Older expired entries are left for the sweep to report.
+		matchIdx := -1
+		for i, e := range entries {
+			if now.Sub(e.timestamp) <= sp.window {
+				matchIdx = i
+				break
+			}
+		}
+		if matchIdx >= 0 {
+			// Match found within window — remove the matched entry while leaving
+			// older expired entries to be swept/reported as divergences.
+			switch {
+			case len(entries) == 1:
 				delete(sp.pending, key)
-			} else {
+			case matchIdx == 0:
 				sp.pending[key] = entries[1:]
+			case matchIdx == len(entries)-1:
+				sp.pending[key] = entries[:matchIdx]
+			default:
+				sp.pending[key] = append(entries[:matchIdx:matchIdx], entries[matchIdx+1:]...)
 			}
 			return
 		}
-		// The oldest pending primary is already past the window. Let the periodic
-		// sweep report it as DivDataMismatch; fall through to buffer this secondary
+		// All pending primaries for this key are past the window. Let the periodic
+		// sweep report them as DivDataMismatch; fall through to buffer this secondary
 		// so it can be reported as DivExtraData if it also remains unmatched.
 	}
 
@@ -278,7 +293,7 @@ func (sp *shadowPubSub) reconcilePrimaries(now time.Time, secBuf map[msgKey][]se
 	for key, entries := range sp.pending {
 		var remaining []pendingMsg
 		for _, e := range entries {
-			if now.Sub(e.timestamp) >= sp.window {
+			if now.Sub(e.timestamp) > sp.window {
 				// Primary has expired — report as divergence regardless of any buffered
 				// secondaries. A late secondary must not suppress a window violation.
 				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, pattern: e.pattern, kind: DivDataMismatch, isPattern: e.pattern != ""})
@@ -309,7 +324,7 @@ func sweepExpiredSecondaries(now time.Time, window time.Duration, secBuf map[msg
 	for key, secs := range secBuf {
 		var remaining []secondaryPending
 		for _, sec := range secs {
-			if now.Sub(sec.timestamp) >= window {
+			if now.Sub(sec.timestamp) > window {
 				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, pattern: key.Pattern, kind: DivExtraData, isPattern: key.Pattern != ""})
 			} else {
 				remaining = append(remaining, sec)
