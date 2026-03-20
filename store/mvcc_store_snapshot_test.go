@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -19,9 +18,9 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
+	defer snap.Close()
 
-	raw, err := io.ReadAll(snap)
-	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
 
 	// Mutate source after snapshot so restore must reflect snapshot point-in-time.
 	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
@@ -48,9 +47,9 @@ func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 
 	snap, err := st.Snapshot()
 	require.NoError(t, err)
+	defer snap.Close()
 
-	raw, err := io.ReadAll(snap)
-	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
 	require.NotEmpty(t, raw)
 	raw[len(raw)-1] ^= 0xFF
 
@@ -80,4 +79,13 @@ func TestMVCCStore_ApplyMutations_UnknownOp(t *testing.T) {
 		{Op: OpType(99), Key: []byte("k"), Value: []byte("v")},
 	}, 10, 20)
 	require.ErrorIs(t, err, ErrUnknownOp)
+}
+
+func snapshotBytes(t *testing.T, snap Snapshot) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	_, err := snap.WriteTo(&buf)
+	require.NoError(t, err)
+	return buf.Bytes()
 }

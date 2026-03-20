@@ -615,75 +615,14 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	return nil
 }
 
-func (s *pebbleStore) Snapshot() (io.ReadWriter, error) {
-	// Pebble Snapshots are point-in-time views.
-	// But `Snapshot()` interface here implies "serialize state to io.ReadWriter" for Raft snapshotting.
-	// We need to dump the *current visible state* or *all state*.
-	// Usually Raft snapshots include everything needed to restore the FSM.
-	// So we should dump ALL keys in the DB.
-
+func (s *pebbleStore) Snapshot() (Snapshot, error) {
 	snap := s.db.NewSnapshot()
-	defer snap.Close()
-
-	iter, err := snap.NewIter(nil)
-
+	lastCommitTS, err := readPebbleSnapshotLastCommitTS(snap)
 	if err != nil {
-
-		return nil, errors.WithStack(err)
-
-	}
-
-	defer iter.Close()
-
-	buf := &bytes.Buffer{}
-
-	// Format: [LastCommitTS] [KeyLen] [Key] [ValLen] [Val] ...
-
-	// We need to persist s.lastCommitTS too.
-
-	if err := binary.Write(buf, binary.LittleEndian, s.LastCommitTS()); err != nil {
-
-		return nil, errors.WithStack(err)
-
-	}
-
-	if err := s.writeSnapshotEntries(snap, buf); err != nil {
+		snap.Close()
 		return nil, err
 	}
-	return buf, nil
-}
-
-func (s *pebbleStore) writeSnapshotEntries(snap *pebble.Snapshot, w io.Writer) error {
-	iter, err := snap.NewIter(nil)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer iter.Close()
-
-	// Iterate all raw keys
-	for iter.First(); iter.Valid(); iter.Next() {
-		// We store Raw Key and Raw Value
-		k := iter.Key()
-		v := iter.Value()
-
-		// Let's just write Key, Value length-prefixed.
-		kLen := uint64(len(k))
-		vLen := uint64(len(v))
-
-		if err := binary.Write(w, binary.LittleEndian, kLen); err != nil {
-			return errors.WithStack(err)
-		}
-		if _, err := w.Write(k); err != nil {
-			return errors.WithStack(err)
-		}
-		if err := binary.Write(w, binary.LittleEndian, vLen); err != nil {
-			return errors.WithStack(err)
-		}
-		if _, err := w.Write(v); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	return nil
+	return newPebbleSnapshot(snap, lastCommitTS), nil
 }
 
 func (s *pebbleStore) restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {

@@ -55,6 +55,13 @@ type RetentionController interface {
 	SetMinRetainedTS(ts uint64)
 }
 
+// Snapshot streams a consistent point-in-time store image to a writer.
+// Implementations may back this with a temp file or an engine-native snapshot.
+type Snapshot interface {
+	io.WriterTo
+	io.Closer
+}
+
 // MVCCStore extends Store with multi-version concurrency control helpers.
 // The interface is timestamp-explicit; callers must supply the snapshot or
 // commit timestamp for every operation.
@@ -86,7 +93,7 @@ type MVCCStore interface {
 	LastCommitTS() uint64
 	// Compact removes versions older than minTS that are no longer needed.
 	Compact(ctx context.Context, minTS uint64) error
-	Snapshot() (io.ReadWriter, error)
+	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error
 }
