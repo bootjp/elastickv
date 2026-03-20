@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -597,11 +598,13 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		return
 	}
 
-	// Collect names and pre-compute decreasing counts (state is goroutine-confined).
+	// Collect names, sort for deterministic reply ordering, and pre-compute
+	// decreasing counts (state is goroutine-confined).
 	names := make([]string, 0, len(set))
 	for n := range set {
 		names = append(names, n)
 	}
+	sort.Strings(names)
 	counts := make([]int, len(names))
 	for i, n := range names {
 		if isPattern {
