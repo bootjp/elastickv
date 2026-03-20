@@ -78,6 +78,32 @@ To start the server, use the following command:
 go run cmd/server/demo.go
 ```
 
+### Migrating Legacy BoltDB Raft Storage
+
+Recent versions store Raft logs and stable state in Pebble (`raft.db`) instead of
+the legacy BoltDB files (`logs.dat` and `stable.dat`). If startup fails with:
+
+```text
+legacy boltdb Raft storage "logs.dat" found in ...
+```
+
+stop the node and run the offline migrator against the directory shown in the
+error:
+
+```bash
+go run ./cmd/raft-migrate --dir /var/lib/elastickv/n1
+mv /var/lib/elastickv/n1/logs.dat /var/lib/elastickv/n1/logs.dat.bak
+mv /var/lib/elastickv/n1/stable.dat /var/lib/elastickv/n1/stable.dat.bak
+```
+
+For multi-group layouts, pass the exact group directory from the error message
+(for example `/var/lib/elastickv/n1/group-1`).
+
+After that, start Elastickv normally. The migrator leaves the legacy files in
+place as a backup, but they must be moved or removed before startup because the
+server intentionally refuses to run while `logs.dat` or `stable.dat` are still
+present.
+
 To expose metrics on a dedicated port:
 ```bash
 go run . \
