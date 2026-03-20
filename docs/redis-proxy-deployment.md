@@ -179,13 +179,16 @@ spec:
               memory: 512Mi
 ```
 
-> **Note:** The distroless base image does not include `redis-cli`. If you want to use the `exec`-based probes above, build a redis-proxy image that includes `redis-cli` (or another ping tool) in the same container. Otherwise, prefer a `tcpSocket` probe (as below) or an HTTP health endpoint.
+> **Note:** The distroless base image does not include `redis-cli`. If you want to use the `exec`-based probe below, build a redis-proxy image that includes `redis-cli` (or another ping tool) in the same container. Otherwise, prefer the `tcpSocket` probes shown in the Deployment spec above or an HTTP health endpoint.
 
 ```yaml
-# Alternative: TCP socket probe (no redis-cli needed)
+# Alternative: exec-based probe (requires redis-cli in the image)
 livenessProbe:
-  tcpSocket:
-    port: 6479
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - 'redis-cli -p 6479 PING || exit 1'
   initialDelaySeconds: 5
   periodSeconds: 10
 ```
