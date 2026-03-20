@@ -253,7 +253,7 @@ groups:
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
 | Async write goroutine limit | 4096 | Max concurrent secondary writes |
-| Shadow read goroutine limit | 4096 | Max concurrent shadow comparisons |
+| Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |
 | PubSub compare window | 2s | Message matching window |
 | PubSub sweep interval | 500ms | Expired message scan interval |
 
