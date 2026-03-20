@@ -795,7 +795,7 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		return nil, nil, false, errors.WithStack(err)
 	}
 	if keyLen > maxSnapshotKeySize {
-		return nil, nil, false, errors.Newf("mvcc snapshot key too large: %d > %d", keyLen, maxSnapshotKeySize)
+		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotKeySize)
 	}
 
 	key := make([]byte, keyLen)
@@ -808,7 +808,7 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		return nil, nil, false, errors.WithStack(err)
 	}
 	if versionCount > maxSnapshotVersionCount {
-		return nil, nil, false, errors.Newf("mvcc snapshot version count too large: %d > %d", versionCount, maxSnapshotVersionCount)
+		return nil, nil, false, errors.Wrapf(ErrSnapshotVersionCountTooLarge, "%d > %d", versionCount, maxSnapshotVersionCount)
 	}
 	versions := make([]VersionedValue, 0, versionCount)
 	for i := uint64(0); i < versionCount; i++ {

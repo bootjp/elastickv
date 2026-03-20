@@ -14,6 +14,8 @@ var ErrInvalidChecksum = errors.New("invalid checksum")
 var ErrWriteConflict = errors.New("write conflict")
 var ErrExpired = errors.New("expired")
 var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
+var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
+var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
 
 type KVPair struct {
 	Key   []byte
