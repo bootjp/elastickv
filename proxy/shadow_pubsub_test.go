@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,7 +50,7 @@ func newTestShadowPubSubWithClock(window time.Duration, nowFunc func() time.Time
 	return &shadowPubSub{
 		metrics: newTestMetrics(),
 		sentry:  newTestSentry(),
-		logger:  slog.Default(),
+		logger:  testLogger,
 		window:  window,
 		nowFunc: nowFunc,
 		pending: make(map[msgKey][]pendingMsg),

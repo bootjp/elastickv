@@ -198,22 +198,28 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 	sp.mu.Lock()
 
 	key := msgKeyFromMessage(msg)
+	now := sp.nowFunc()
 	if entries, ok := sp.pending[key]; ok && len(entries) > 0 {
-		// Match found — remove the oldest pending primary message.
-		if len(entries) == 1 {
-			delete(sp.pending, key)
-		} else {
-			sp.pending[key] = entries[1:]
+		oldest := entries[0]
+		if now.Sub(oldest.timestamp) < sp.window {
+			// Match found within window — remove the oldest pending primary message.
+			if len(entries) == 1 {
+				delete(sp.pending, key)
+			} else {
+				sp.pending[key] = entries[1:]
+			}
+			sp.mu.Unlock()
+			return
 		}
-		sp.mu.Unlock()
-		return
+		// The oldest pending primary is already past the window. Let the periodic
+		// sweep report it as DivDataMismatch; fall through to buffer this secondary
+		// so it can be reported as DivExtraData if it also remains unmatched.
 	}
 
 	sp.mu.Unlock()
 
-	// No matching primary message at this moment. Buffer the secondary and only
+	// No matching primary message within the window. Buffer the secondary and only
 	// report DivExtraData if it remains unmatched after the comparison window.
-	now := sp.nowFunc()
 	unmatchedSecondaries.Lock()
 	defer unmatchedSecondaries.Unlock()
 
@@ -238,11 +244,14 @@ func (sp *shadowPubSub) sweepExpired() {
 	now := sp.nowFunc()
 
 	unmatchedSecondaries.Lock()
-	perInstance := sp.getOrCreateSecondaryBuffer()
+	// Fetch without creating to avoid unnecessary allocation on every tick for idle instances.
+	perInstance := unmatchedSecondaries.data[sp]
 
 	// Expire old buffered secondaries first so they cannot be consumed as a
 	// "match" during reconciliation (prevents bypassing the comparison window).
-	divergences = sweepExpiredSecondaries(now, sp.window, perInstance, divergences)
+	if perInstance != nil {
+		divergences = sweepExpiredSecondaries(now, sp.window, perInstance, divergences)
+	}
 	divergences = sp.reconcilePrimaries(now, perInstance, divergences)
 
 	if len(perInstance) == 0 {
@@ -255,17 +264,6 @@ func (sp *shadowPubSub) sweepExpired() {
 	for _, d := range divergences {
 		sp.reportDivergence(d)
 	}
-}
-
-// getOrCreateSecondaryBuffer returns the per-instance unmatched secondary buffer.
-// Caller must hold unmatchedSecondaries.Lock().
-func (sp *shadowPubSub) getOrCreateSecondaryBuffer() map[msgKey][]secondaryPending {
-	perInstance, ok := unmatchedSecondaries.data[sp]
-	if !ok {
-		perInstance = make(map[msgKey][]secondaryPending)
-		unmatchedSecondaries.data[sp] = perInstance
-	}
-	return perInstance
 }
 
 // reconcilePrimaries matches pending primaries against buffered secondaries,
