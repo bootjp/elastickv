@@ -266,7 +266,6 @@ func TestShadowPubSub_SecondaryWithinWindowMatches(t *testing.T) {
 	assert.Equal(t, float64(0), extra, "within-window secondary match must suppress extra_data")
 }
 
-
 // arriving after the comparison window does not suppress the already-expired
 // primary divergence. Both a DivDataMismatch (primary) and eventually a
 // DivExtraData (secondary) should be reported.
