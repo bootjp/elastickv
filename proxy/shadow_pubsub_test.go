@@ -168,7 +168,8 @@ func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
 }
 
 func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
-	sp := newTestShadowPubSub(10 * time.Millisecond)
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
 
 	// Two identical secondary messages arrive before any primary.
 	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "dup"})
