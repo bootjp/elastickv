@@ -160,13 +160,13 @@ spec:
             - containerPort: 9191
               name: metrics
           livenessProbe:
-            exec:
-              command: ["redis-cli", "-p", "6479", "PING"]
+            tcpSocket:
+              port: 6479
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            exec:
-              command: ["redis-cli", "-p", "6479", "PING"]
+            tcpSocket:
+              port: 6479
             initialDelaySeconds: 3
             periodSeconds: 5
           resources:
