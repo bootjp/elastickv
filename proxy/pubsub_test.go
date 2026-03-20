@@ -198,9 +198,7 @@ func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
 	s.channelSet["ch2"] = struct{}{}
 	s.patternSet["pat1"] = struct{}{}
 
-	s.mu.Lock()
 	s.writeUnsubAll("unsubscribe", false)
-	s.mu.Unlock()
 
 	writes := dconn.getWrites()
 
@@ -487,6 +485,9 @@ func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
 		t.Run(cmd, func(t *testing.T) {
 			dconn := newMockDetachedConn()
 			s := newTestSession(dconn)
+			// handleProxySpecialCommand accesses s.proxy.cfg for SELECT; provide a
+			// minimal ProxyServer so the SELECT path does not panic.
+			s.proxy = &ProxyServer{cfg: ProxyConfig{PrimaryDB: 0}}
 
 			s.dispatchRegularCommand(cmd, [][]byte{[]byte(cmd), []byte("0")})
 
