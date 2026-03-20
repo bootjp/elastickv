@@ -26,6 +26,7 @@ type SentryReporter struct {
 	hub      *sentry.Hub
 	logger   *slog.Logger
 	cooldown time.Duration
+	nowFunc  func() time.Time // injectable clock; defaults to time.Now
 
 	mu         sync.Mutex
 	lastReport map[string]time.Time // fingerprint → last report time
@@ -39,6 +40,7 @@ func NewSentryReporter(dsn string, environment string, sampleRate float64, logge
 	r := &SentryReporter{
 		logger:     logger,
 		cooldown:   defaultReportCooldown,
+		nowFunc:    time.Now,
 		lastReport: make(map[string]time.Time),
 	}
 	if dsn == "" {
@@ -105,11 +107,15 @@ func (r *SentryReporter) CaptureDivergence(div Divergence) {
 // ShouldReport checks if this fingerprint has been reported recently (cooldown-based).
 // Evicts expired entries when the map reaches maxReportEntries to bound memory usage.
 // Returns false (drops the report) if the map is still at capacity after eviction.
+// Returns false immediately if Sentry reporting is disabled.
 func (r *SentryReporter) ShouldReport(fingerprint string) bool {
+	if !r.enabled {
+		return false
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now()
+	now := r.nowFunc()
 
 	// Evict expired entries if map grows too large
 	if len(r.lastReport) >= maxReportEntries {
