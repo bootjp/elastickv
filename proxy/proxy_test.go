@@ -291,31 +291,39 @@ func TestSentryReporterDisabled(t *testing.T) {
 	r.CaptureException(nil, "test", nil)
 	r.CaptureDivergence(Divergence{})
 	r.Flush(0)
+	// ShouldReport always returns false when disabled (no side-effects on lastReport).
+	assert.False(t, r.ShouldReport("any-fingerprint"))
+	assert.Empty(t, r.lastReport, "disabled reporter must not modify lastReport")
 }
 
 func TestShouldReportCooldown(t *testing.T) {
+	now := time.Now()
 	r := &SentryReporter{
+		enabled:    true,
 		lastReport: make(map[string]time.Time),
 		cooldown:   50 * time.Millisecond,
+		nowFunc:    func() time.Time { return now },
 	}
 
 	assert.True(t, r.ShouldReport("fp1"))
 	assert.False(t, r.ShouldReport("fp1")) // within cooldown
 
-	time.Sleep(60 * time.Millisecond)
+	now = now.Add(60 * time.Millisecond) // advance past cooldown
 	assert.True(t, r.ShouldReport("fp1")) // cooldown elapsed
 }
 
 func TestShouldReportEvictsExpired(t *testing.T) {
+	now := time.Now()
 	r := &SentryReporter{
+		enabled:    true,
 		lastReport: make(map[string]time.Time),
 		cooldown:   1 * time.Millisecond,
+		nowFunc:    func() time.Time { return now },
 	}
-	// Fill to maxReportEntries
+	// Fill to maxReportEntries — all entries already expired
 	for i := range maxReportEntries {
-		r.lastReport[string(rune(i))] = time.Now().Add(-time.Hour)
+		r.lastReport[string(rune(i))] = now.Add(-time.Hour)
 	}
-	time.Sleep(2 * time.Millisecond)
 	assert.True(t, r.ShouldReport("new-fp"))
 	assert.Less(t, len(r.lastReport), maxReportEntries)
 }
