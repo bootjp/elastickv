@@ -308,7 +308,7 @@ func TestShouldReportCooldown(t *testing.T) {
 	assert.True(t, r.ShouldReport("fp1"))
 	assert.False(t, r.ShouldReport("fp1")) // within cooldown
 
-	now = now.Add(60 * time.Millisecond) // advance past cooldown
+	now = now.Add(60 * time.Millisecond)  // advance past cooldown
 	assert.True(t, r.ShouldReport("fp1")) // cooldown elapsed
 }
 
