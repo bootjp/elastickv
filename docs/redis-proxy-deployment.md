@@ -68,6 +68,7 @@ Monitor metrics at each stage and roll back to the previous mode if issues arise
 
 ```bash
 docker run --rm \
+  -p 6379:6379 \
   ghcr.io/bootjp/elastickv/redis-proxy:latest \
   -listen :6379 \
   -primary redis.internal:6379 \
