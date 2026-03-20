@@ -70,26 +70,33 @@ func writePebbleSnapshotEntries(snap *pebble.Snapshot, w io.Writer) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		k := iter.Key()
 		v := iter.Value()
 
 		if err := binary.Write(w, binary.LittleEndian, uint64(len(k))); err != nil {
+			_ = iter.Close()
 			return errors.WithStack(err)
 		}
 		if _, err := w.Write(k); err != nil {
+			_ = iter.Close()
 			return errors.WithStack(err)
 		}
 		if err := binary.Write(w, binary.LittleEndian, uint64(len(v))); err != nil {
+			_ = iter.Close()
 			return errors.WithStack(err)
 		}
 		if _, err := w.Write(v); err != nil {
+			_ = iter.Close()
 			return errors.WithStack(err)
 		}
 	}
-	return nil
+	if err := iter.Error(); err != nil {
+		_ = iter.Close()
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(iter.Close())
 }
 
 type countingWriter struct {
