@@ -134,6 +134,9 @@ func (sp *shadowPubSub) PUnsubscribe(ctx context.Context, patterns ...string) er
 }
 
 // RecordPrimary records a message received from the primary for comparison.
+// It first attempts to immediately reconcile with any buffered unmatched secondary
+// that arrived earlier (within the comparison window). This avoids falsely reporting
+// a data_mismatch when PubSubCompareWindow is smaller than the sweep interval.
 func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
@@ -141,11 +144,40 @@ func (sp *shadowPubSub) RecordPrimary(msg *redis.Message) {
 		return
 	}
 	key := msgKeyFromMessage(msg)
+	now := sp.nowFunc()
+
+	// Attempt immediate reconciliation with any buffered unmatched secondary.
+	unmatchedSecondaries.Lock()
+	if secBySP, ok := unmatchedSecondaries.data[sp]; ok {
+		if secs, ok := secBySP[key]; ok && len(secs) > 0 {
+			for i, sec := range secs {
+				dt := now.Sub(sec.timestamp)
+				if dt <= sp.window && dt >= -sp.window {
+					// Consume this secondary — remove it from the slice.
+					secs = append(secs[:i], secs[i+1:]...)
+					if len(secs) == 0 {
+						delete(secBySP, key)
+						if len(secBySP) == 0 {
+							delete(unmatchedSecondaries.data, sp)
+						}
+					} else {
+						secBySP[key] = secs
+					}
+					unmatchedSecondaries.Unlock()
+					// Primary and secondary matched; no need to queue.
+					return
+				}
+			}
+		}
+	}
+	unmatchedSecondaries.Unlock()
+
+	// No suitable secondary was buffered; queue this primary for later comparison.
 	sp.pending[key] = append(sp.pending[key], pendingMsg{
 		pattern:   msg.Pattern,
 		channel:   msg.Channel,
 		payload:   msg.Payload,
-		timestamp: sp.nowFunc(),
+		timestamp: now,
 	})
 }
 

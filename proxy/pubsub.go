@@ -536,7 +536,7 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 	if len(args) < pubsubMinArgs {
 		// Unsubscribe all: emit per-channel reply (matching Redis behavior).
 		if err := unsubFn(context.Background()); err != nil {
-			s.logger.Warn("upstream "+kind+" failed, closing session", "err", err)
+			s.logger.Warn("upstream "+kind+" failed", "err", err)
 			s.writeRedisError(err)
 			return
 		}
@@ -549,7 +549,7 @@ func (s *pubsubSession) handleUnsub(args [][]byte, isPattern bool) {
 
 	names := byteSlicesToStrings(args[1:])
 	if err := unsubFn(context.Background(), names...); err != nil {
-		s.logger.Warn("upstream "+kind+" failed, closing session", "err", err)
+		s.logger.Warn("upstream "+kind+" failed", "err", err)
 		s.writeRedisError(err)
 		return
 	}
