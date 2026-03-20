@@ -375,33 +375,39 @@ func TestShadowPubSub_MatchSecondaryMiddleEntry(t *testing.T) {
 	window := 50 * time.Millisecond
 	sp := newTestShadowPubSubWithClock(window, clock.Now)
 
-	keyA := msgKey{Channel: "ch1", Payload: "a"}
-	keyB := msgKey{Channel: "ch1", Payload: "b"}
-	keyC := msgKey{Channel: "ch1", Payload: "c"}
+	key := msgKey{Channel: "ch1", Payload: "val"}
 
-	// Force three separate keys by inserting directly into pending so we can
-	// control the per-key entry list structure.
+	// Arrange three entries under the same key:
+	//   - index 0: expired (outside window)
+	//   - index 1: in-window (the one we expect to match and remove — the middle)
+	//   - index 2: in-window (should remain after removal)
 	sp.mu.Lock()
 	now := clock.Now()
-	// Arrange: expired, in-window, in-window entries for the same channel but
-	// different payloads so they live under separate keys.
-	sp.pending[keyA] = []pendingMsg{{channel: "ch1", payload: "a", timestamp: now.Add(-100 * time.Millisecond)}} // expired
-	sp.pending[keyB] = []pendingMsg{{channel: "ch1", payload: "b", timestamp: now}}                              // in-window
-	sp.pending[keyC] = []pendingMsg{{channel: "ch1", payload: "c", timestamp: now}}                              // in-window
+	expiredTs := now.Add(-100 * time.Millisecond)
+	middleTs := now.Add(-10 * time.Millisecond)
+	lastTs := now
+	sp.pending[key] = []pendingMsg{
+		{channel: "ch1", payload: "val", timestamp: expiredTs}, // expired (index 0)
+		{channel: "ch1", payload: "val", timestamp: middleTs},  // in-window (index 1 — middle)
+		{channel: "ch1", payload: "val", timestamp: lastTs},    // in-window (index 2 — tail)
+	}
 	sp.mu.Unlock()
 
-	// Match "b" (in-window, but keyA is already expired separately under its own key).
-	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "b"})
+	// Secondary should match the first in-window entry (index 1), exercising
+	// the "remove from middle of slice" path in matchSecondary.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "val"})
 
 	sp.mu.Lock()
-	_, aExists := sp.pending[keyA]
-	_, bExists := sp.pending[keyB]
-	_, cExists := sp.pending[keyC]
+	entries := sp.pending[key]
 	sp.mu.Unlock()
 
-	assert.True(t, aExists, "expired keyA entry should still be in pending for sweep")
-	assert.False(t, bExists, "matched keyB entry should have been removed")
-	assert.True(t, cExists, "unrelated keyC entry should be untouched")
+	// The expired head (index 0) and the tail (index 2) should remain, while
+	// the middle entry (middleTs) should have been removed.
+	assert.Len(t, entries, 2, "expected middle entry to be removed, leaving 2 entries")
+	assert.WithinDuration(t, expiredTs, entries[0].timestamp, time.Millisecond,
+		"first remaining entry should be the expired head")
+	assert.WithinDuration(t, lastTs, entries[1].timestamp, time.Millisecond,
+		"second remaining entry should be the original tail (last) entry")
 }
 
 // TestShadowPubSub_MatchSecondaryLastEntry verifies that matchSecondary can match
