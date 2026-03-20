@@ -287,7 +287,7 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 
 func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) error {
 	for _, rt := range runtimes {
-		gs := grpc.NewServer()
+		gs := grpc.NewServer(internalutil.GRPCServerOptions()...)
 		trx := kv.NewTransaction(rt.raft)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)

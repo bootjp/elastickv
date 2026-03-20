@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -478,6 +479,114 @@ func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
 	assert.Equal(t, 0, secondary.CallCount(), "no shadow in dual-write mode")
 }
 
+type timeoutCapturingBackend struct {
+	name        string
+	timeout     time.Duration
+	args        []any
+	doCalls     int
+	doWithCalls int
+	returnValue any
+	returnErr   error
+}
+
+func (b *timeoutCapturingBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
+	b.doCalls++
+	b.args = append([]any(nil), args...)
+	cmd := redis.NewCmd(ctx, args...)
+	if b.returnErr != nil {
+		cmd.SetErr(b.returnErr)
+		return cmd
+	}
+	cmd.SetVal(b.returnValue)
+	return cmd
+}
+
+func (b *timeoutCapturingBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	b.doWithCalls++
+	b.timeout = timeout
+	b.args = append([]any(nil), args...)
+	cmd := redis.NewCmd(ctx, args...)
+	if b.returnErr != nil {
+		cmd.SetErr(b.returnErr)
+		return cmd
+	}
+	cmd.SetVal(b.returnValue)
+	return cmd
+}
+
+func (b *timeoutCapturingBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	results := make([]*redis.Cmd, len(cmds))
+	for i, args := range cmds {
+		results[i] = b.Do(ctx, args...)
+	}
+	return results, nil
+}
+
+func (b *timeoutCapturingBackend) Close() error { return nil }
+func (b *timeoutCapturingBackend) Name() string { return b.name }
+
+func TestBlockingCommandTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      string
+		args     [][]byte
+		expected time.Duration
+	}{
+		{
+			name:     "BZPOPMIN seconds",
+			cmd:      "BZPOPMIN",
+			args:     [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")},
+			expected: 5 * time.Second,
+		},
+		{
+			name:     "BLMOVE float seconds",
+			cmd:      "BLMOVE",
+			args:     [][]byte{[]byte("BLMOVE"), []byte("src"), []byte("dst"), []byte("LEFT"), []byte("RIGHT"), []byte("2.5")},
+			expected: 2500 * time.Millisecond,
+		},
+		{
+			name:     "XREAD block milliseconds",
+			cmd:      "XREAD",
+			args:     [][]byte{[]byte("XREAD"), []byte("BLOCK"), []byte("1500"), []byte("STREAMS"), []byte("jobs"), []byte("0")},
+			expected: 1500 * time.Millisecond,
+		},
+		{
+			name:     "XREADGROUP block zero",
+			cmd:      "XREADGROUP",
+			args:     [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("c"), []byte("BLOCK"), []byte("0"), []byte("STREAMS"), []byte("jobs"), []byte(">")},
+			expected: 0,
+		},
+		{
+			name:     "missing block falls back to zero",
+			cmd:      "XREAD",
+			args:     [][]byte{[]byte("XREAD"), []byte("STREAMS"), []byte("jobs"), []byte("0")},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, blockingCommandTimeout(tt.cmd, tt.args))
+		})
+	}
+}
+
+func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
+	primary := &timeoutCapturingBackend{name: "primary", returnValue: "OK"}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly}, metrics, newTestSentry(), testLogger)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, "OK", resp)
+	assert.Equal(t, 0, primary.doCalls)
+	assert.Equal(t, 1, primary.doWithCalls)
+	assert.Equal(t, 5*time.Second, primary.timeout)
+	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
+}
+
 func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -660,6 +769,15 @@ func TestDefaultBackendOptions(t *testing.T) {
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 }
 
+func TestNewRedisBackend_UsesRESP2(t *testing.T) {
+	backend := NewRedisBackend("127.0.0.1:6379", "test")
+	t.Cleanup(func() {
+		assert.NoError(t, backend.Close())
+	})
+
+	assert.Equal(t, respProtocolV2, backend.client.Options().Protocol)
+}
+
 // ========== Pipeline error handling tests ==========
 
 func TestPipeline_TransportError(t *testing.T) {
@@ -671,6 +789,146 @@ func TestPipeline_TransportError(t *testing.T) {
 	results, err := b.Pipeline(context.Background(), [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}})
 	assert.NoError(t, err) // mock always returns nil error
 	assert.Len(t, results, 3)
+}
+
+func TestDualWriter_Script_CachesEvalForEvalSHAFallback(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	script := "return ARGV[1]"
+	sha := scriptSHA(script)
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		switch calls {
+		case 1:
+			assert.Equal(t, []byte("EVALSHA"), args[0])
+			assert.Equal(t, []byte(sha), args[1])
+			cmd.SetErr(testRedisErr("NOSCRIPT No matching script. Please use EVAL."))
+		case 2:
+			assert.Equal(t, []byte("EVAL"), args[0])
+			assert.Equal(t, []byte(script), args[1])
+			cmd.SetVal("OK")
+		default:
+			t.Fatalf("unexpected secondary call %d", calls)
+		}
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	_, err := d.Script(context.Background(), "EVAL", [][]byte{[]byte("EVAL"), []byte(script), []byte("0"), []byte("value")})
+	assert.NoError(t, err)
+
+	d.cfg.Mode = ModeDualWrite
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte(sha), []byte("0"), []byte("value")})
+
+	assert.Equal(t, 2, calls)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestDualWriter_Script_EvalSHARO_FallsBackToEvalRO(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	script := "return KEYS[1]"
+	sha := scriptSHA(script)
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		switch calls {
+		case 1:
+			assert.Equal(t, []byte("EVALSHA_RO"), args[0])
+			cmd.SetErr(testRedisErr("NOSCRIPT No matching script. Please use EVAL."))
+		case 2:
+			// Must fall back to EVAL_RO, not EVAL, to preserve read-only semantics.
+			assert.Equal(t, []byte("EVAL_RO"), args[0])
+			assert.Equal(t, []byte(script), args[1])
+			cmd.SetVal("mykey")
+		default:
+			t.Fatalf("unexpected secondary call %d", calls)
+		}
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Register the script body via EVAL_RO so the proxy can fall back.
+	_, err := d.Script(context.Background(), "EVAL_RO", [][]byte{[]byte("EVAL_RO"), []byte(script), []byte("1"), []byte("mykey")})
+	assert.NoError(t, err)
+
+	d.cfg.Mode = ModeDualWrite
+	d.writeSecondary("EVALSHA_RO", []any{[]byte("EVALSHA_RO"), []byte(sha), []byte("1"), []byte("mykey")})
+
+	assert.Equal(t, 2, calls)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestDualWriter_Script_NoRememberOnPrimaryError(t *testing.T) {
+	// Verify that a failed SCRIPT FLUSH on the primary does NOT clear the proxy
+	// script cache, so that subsequent EVALSHA → EVAL fallbacks still work.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd(nil, testRedisErr("ERR flush failed"))
+
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Seed the script cache directly.
+	script := "return 1"
+	d.storeScript(script)
+	sha := scriptSHA(script)
+	_, cached := d.lookupScript(sha)
+	assert.True(t, cached, "script should be cached before flush attempt")
+
+	// Attempt SCRIPT FLUSH — primary returns an error so the cache must be untouched.
+	_, err := d.Script(context.Background(), "SCRIPT", [][]byte{[]byte("SCRIPT"), []byte("FLUSH")})
+	assert.Error(t, err)
+
+	_, stillCached := d.lookupScript(sha)
+	assert.True(t, stillCached, "cache must not be cleared when primary SCRIPT FLUSH fails")
+}
+
+func TestDualWriter_ScriptCache_BoundedEviction(t *testing.T) {
+	// Fill the cache beyond maxScriptCacheSize and verify it stays bounded.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Insert maxScriptCacheSize+10 unique scripts.
+	total := maxScriptCacheSize + 10
+	for i := range total {
+		d.storeScript(fmt.Sprintf("return %d", i))
+	}
+
+	d.scriptMu.RLock()
+	size := len(d.scripts)
+	d.scriptMu.RUnlock()
+
+	assert.Equal(t, maxScriptCacheSize, size, "cache must not exceed maxScriptCacheSize")
+
+	// The first 10 scripts (insertion order) must have been evicted.
+	for i := range 10 {
+		sha := scriptSHA(fmt.Sprintf("return %d", i))
+		_, ok := d.lookupScript(sha)
+		assert.False(t, ok, "script %d should have been evicted", i)
+	}
+	// The last maxScriptCacheSize scripts must still be present.
+	for i := 10; i < total; i++ {
+		sha := scriptSHA(fmt.Sprintf("return %d", i))
+		_, ok := d.lookupScript(sha)
+		assert.True(t, ok, "script %d should still be cached", i)
+	}
 }
 
 // ========== writeRedisValue tests ==========

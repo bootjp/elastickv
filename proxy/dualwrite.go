@@ -32,9 +32,13 @@ type DualWriter struct {
 	writeSem  chan struct{} // bounds concurrent secondary write goroutines
 	shadowSem chan struct{} // bounds concurrent shadow read goroutines
 
-	wg     sync.WaitGroup
-	mu     sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
-	closed bool
+	wg       sync.WaitGroup
+	mu       sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
+	closed   bool
+	scriptMu sync.RWMutex
+	scripts  map[string]string
+	// scriptOrder tracks insertion order for FIFO eviction of the bounded script cache.
+	scriptOrder []string
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -48,6 +52,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		logger:    logger,
 		writeSem:  make(chan struct{}, maxWriteGoroutines),
 		shadowSem: make(chan struct{}, maxShadowGoroutines),
+		scripts:   make(map[string]string),
 	}
 
 	if cfg.Mode == ModeDualWriteShadow || cfg.Mode == ModeElasticKVPrimary {
@@ -133,9 +138,15 @@ func (d *DualWriter) Read(ctx context.Context, cmd string, args [][]byte) (any, 
 // cmd must be the pre-uppercased command name.
 func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
+	timeout := blockingCommandTimeout(cmd, args)
 
 	start := time.Now()
-	result := d.primary.Do(ctx, iArgs...)
+	var result *redis.Cmd
+	if blockingBackend, ok := d.primary.(blockingTimeoutBackend); ok {
+		result = blockingBackend.DoWithTimeout(ctx, timeout, iArgs...)
+	} else {
+		result = d.primary.Do(ctx, iArgs...)
+	}
 	resp, err := result.Result()
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
@@ -190,6 +201,7 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 		return nil, fmt.Errorf("primary script %s: %w", cmd, err)
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
+	d.rememberScript(cmd, args)
 
 	if d.hasSecondaryWrite() {
 		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
@@ -205,6 +217,12 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	start := time.Now()
 	result := d.secondary.Do(sCtx, iArgs...)
 	_, sErr := result.Result()
+	if isNoScriptError(sErr) {
+		if fallbackArgs, ok := d.evalFallbackArgs(cmd, iArgs); ok {
+			result = d.secondary.Do(sCtx, fallbackArgs...)
+			_, sErr = result.Result()
+		}
+	}
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(time.Since(start).Seconds())
 
 	if sErr != nil && !errors.Is(sErr, redis.Nil) {
