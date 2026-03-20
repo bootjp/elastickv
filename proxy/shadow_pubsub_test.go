@@ -244,6 +244,55 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 	sp.mu.Unlock()
 }
 
+// TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile verifies that when a
+// secondary message arrives before its matching primary, RecordPrimary immediately
+// consumes the buffered secondary without needing a sweep cycle, and no divergence
+// is reported. This tests the fix for false DivDataMismatch reports when
+// PubSubCompareWindow is smaller than the sweep interval.
+func TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile(t *testing.T) {
+	clock := newTestClock()
+	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
+	defer func() {
+		unmatchedSecondaries.Lock()
+		delete(unmatchedSecondaries.data, sp)
+		unmatchedSecondaries.Unlock()
+	}()
+
+	// Secondary arrives first — it should be buffered in unmatchedSecondaries.
+	sp.matchSecondary(&redis.Message{Channel: "ch1", Payload: "early"})
+
+	key := msgKey{Channel: "ch1", Payload: "early"}
+	unmatchedSecondaries.Lock()
+	secs := unmatchedSecondaries.data[sp][key]
+	unmatchedSecondaries.Unlock()
+	assert.Len(t, secs, 1, "secondary should be buffered before primary arrives")
+
+	// Primary arrives within the window — RecordPrimary should immediately consume
+	// the buffered secondary and NOT add to sp.pending.
+	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "early"})
+
+	// Primary must NOT have been added to pending (immediate reconciliation occurred).
+	sp.mu.Lock()
+	assert.Equal(t, 0, len(sp.pending), "primary should be matched immediately without queuing into pending")
+	sp.mu.Unlock()
+
+	// The buffered secondary entry must have been consumed.
+	unmatchedSecondaries.Lock()
+	secs = unmatchedSecondaries.data[sp][key]
+	unmatchedSecondaries.Unlock()
+	assert.Empty(t, secs, "buffered secondary should be consumed immediately by RecordPrimary")
+
+	// Advance past the window and sweep — no divergences should be reported.
+	clock.Advance(2 * time.Second)
+	sp.sweepExpired()
+
+	mismatch := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("data_mismatch"))
+	assert.Equal(t, float64(0), mismatch, "no data_mismatch should be reported when secondary was buffered and primary arrived within window")
+
+	extra := counterValue(sp.metrics.PubSubShadowDivergences.WithLabelValues("extra_data"))
+	assert.Equal(t, float64(0), extra, "no extra_data should be reported when secondary was matched by RecordPrimary")
+}
+
 // TestShadowPubSub_SecondaryWithinWindowMatches verifies that a secondary
 // arriving before the comparison window properly matches its primary and
 // prevents a divergence from being reported during reconciliation.
