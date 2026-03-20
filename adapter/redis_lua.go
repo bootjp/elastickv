@@ -118,6 +118,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
 		scriptCtx := newLuaScriptContext(r)
+		defer scriptCtx.Close()
 		state := newRedisLuaState()
 		defer state.Close()
 		state.SetContext(ctx)
@@ -847,6 +848,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 	var reply luaReply
 	err := r.retryRedisWrite(ctx, func() error {
 		scriptCtx := newLuaScriptContext(r)
+		defer scriptCtx.Close()
 		nextReply, err := scriptCtx.exec(command, stringArgs)
 		if err != nil {
 			return err

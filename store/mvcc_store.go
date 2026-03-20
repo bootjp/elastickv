@@ -30,8 +30,9 @@ const (
 
 // mvccSnapshot is used solely for gob snapshot serialization.
 type mvccSnapshot struct {
-	LastCommitTS uint64
-	Entries      []mvccSnapshotEntry
+	LastCommitTS  uint64
+	MinRetainedTS uint64
+	Entries       []mvccSnapshotEntry
 }
 
 // mvccSnapshotEntry is used solely for gob snapshot serialization.
@@ -68,10 +69,11 @@ func withinBoundsKey(k, start, end []byte) bool {
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
 // deterministic iteration order and range scans.
 type mvccStore struct {
-	tree         *treemap.Map // key []byte -> []VersionedValue
-	mtx          sync.RWMutex
-	log          *slog.Logger
-	lastCommitTS uint64
+	tree          *treemap.Map // key []byte -> []VersionedValue
+	mtx           sync.RWMutex
+	log           *slog.Logger
+	lastCommitTS  uint64
+	minRetainedTS uint64
 }
 
 // LastCommitTS exposes the latest commit timestamp for read snapshot selection.
@@ -80,6 +82,20 @@ func (s *mvccStore) LastCommitTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return s.lastCommitTS
+}
+
+func (s *mvccStore) MinRetainedTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.minRetainedTS
+}
+
+func (s *mvccStore) SetMinRetainedTS(ts uint64) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if ts > s.minRetainedTS {
+		s.minRetainedTS = ts
+	}
 }
 
 // MVCCStoreOption configures the MVCCStore.
@@ -107,6 +123,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 }
 
 var _ MVCCStore = (*mvccStore)(nil)
+var _ RetentionController = (*mvccStore)(nil)
 
 // ---- helpers guarded by caller locks ----
 
@@ -230,11 +247,18 @@ func (s *mvccStore) latestVersionLocked(key []byte) (VersionedValue, bool) {
 	return vs[len(vs)-1], true
 }
 
+func readTSCompacted(ts, minRetainedTS uint64) bool {
+	return minRetainedTS != 0 && ts != 0 && ts != ^uint64(0) && ts < minRetainedTS
+}
+
 // ---- MVCCStore methods ----
 
 func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	v, ok := s.tree.Get(key)
 	if !ok {
@@ -251,6 +275,9 @@ func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, e
 func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return false, ErrReadTSCompacted
+	}
 
 	v, ok := s.tree.Get(key)
 	if !ok {
@@ -270,6 +297,9 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	if limit <= 0 {
 		return []*KVPair{}, nil
@@ -311,6 +341,9 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	if limit <= 0 {
 		return []*KVPair{}, nil
@@ -488,8 +521,9 @@ func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
 	})
 
 	snapshot := mvccSnapshot{
-		LastCommitTS: s.lastCommitTS,
-		Entries:      entries,
+		LastCommitTS:  s.lastCommitTS,
+		MinRetainedTS: s.minRetainedTS,
+		Entries:       entries,
 	}
 
 	buf := &bytes.Buffer{}
@@ -529,6 +563,7 @@ func (s *mvccStore) Restore(r io.Reader) error {
 
 	s.tree.Clear()
 	s.lastCommitTS = snapshot.LastCommitTS
+	s.minRetainedTS = snapshot.MinRetainedTS
 	for _, entry := range snapshot.Entries {
 		versions := append([]VersionedValue(nil), entry.Versions...)
 		s.tree.Put(bytes.Clone(entry.Key), versions)
@@ -595,6 +630,9 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 
 	for k, v := range updates {
 		s.tree.Put([]byte(k), v)
+	}
+	if minTS > s.minRetainedTS {
+		s.minRetainedTS = minTS
 	}
 
 	s.log.InfoContext(ctx, "compact",

@@ -39,11 +39,11 @@ func TestMVCCStore_Compact(t *testing.T) {
 	// v40 > 15 -> skip
 	// v30 > 15 -> skip
 	// v20 > 15 -> skip
-	// No version <= 15 found -> ErrKeyNotFound
+	// No version <= 15 found -> ErrReadTSCompacted
 	// This is the expected behavior of Compaction: you cannot query older than minTS.
 
 	_, err = s.GetAt(ctx, key, 15)
-	assert.Equal(t, ErrKeyNotFound, err, "Should not find version older than compacted minTS")
+	assert.Equal(t, ErrReadTSCompacted, err, "Should not find version older than compacted minTS")
 
 	// Query at 25 should return v20
 	val, err = s.GetAt(ctx, key, 25)
@@ -71,9 +71,9 @@ func TestMVCCStore_Compact_Delete(t *testing.T) {
 	err := s.Compact(ctx, 25)
 	require.NoError(t, err)
 
-	// Query at 15 -> Not found (compacted)
+	// Query at 15 -> ErrReadTSCompacted
 	_, err = s.GetAt(ctx, key, 15)
-	assert.Equal(t, ErrKeyNotFound, err)
+	assert.Equal(t, ErrReadTSCompacted, err)
 
 	// Query at 25 -> Not found (Tombstone at 20)
 	exists, err := s.ExistsAt(ctx, key, 25)
