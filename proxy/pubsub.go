@@ -41,7 +41,7 @@ const (
 // enabling the client to execute regular Redis commands without reconnecting.
 type pubsubSession struct {
 	mu       sync.Mutex // protects upstream, closed, and shadow; channelSet/patternSet/txn are goroutine-confined to commandLoop
-	writeMu  sync.Mutex // serializes writes to dconn; never held across state operations
+	writeMu  sync.Mutex // serializes writes to dconn; may be held while acquiring mu (lock ordering: writeMu then mu)
 	dconn    redcon.DetachedConn
 	upstream *redis.PubSub // nil when not in pub/sub mode
 	proxy    *ProxyServer
