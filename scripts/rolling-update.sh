@@ -343,6 +343,9 @@ case "$(uname -m)" in
 esac
 
 chmod +x "$RAFTADMIN_REMOTE_BIN"
+
+# Clean up architecture-specific helper binaries after installing the final binary.
+rm -f "${RAFTADMIN_REMOTE_BIN}-amd64" "${RAFTADMIN_REMOTE_BIN}-arm64"
 REMOTE_HELPER
 }
 
