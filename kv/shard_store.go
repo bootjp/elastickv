@@ -1094,7 +1094,7 @@ func (s *ShardStore) Compact(ctx context.Context, minTS uint64) error {
 	return nil
 }
 
-func (s *ShardStore) Snapshot() (io.ReadWriter, error) {
+func (s *ShardStore) Snapshot() (store.Snapshot, error) {
 	return nil, store.ErrNotSupported
 }
 

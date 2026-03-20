@@ -37,9 +37,14 @@ func TestMVCCStore_SnapshotRestorePreservesMinRetainedTS(t *testing.T) {
 
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
+	defer snap.Close()
+
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
 
 	dst := NewMVCCStore()
-	require.NoError(t, dst.Restore(snap))
+	require.NoError(t, dst.Restore(bytes.NewReader(buf.Bytes())))
 
 	_, err = dst.GetAt(ctx, []byte("k"), 10)
 	require.ErrorIs(t, err, ErrReadTSCompacted)
