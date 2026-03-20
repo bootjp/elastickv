@@ -73,7 +73,7 @@ func TestMVCCStore_Compact_Delete(t *testing.T) {
 
 	// Query at 15 -> ErrReadTSCompacted
 	_, err = s.GetAt(ctx, key, 15)
-	assert.Equal(t, ErrReadTSCompacted, err)
+	assert.ErrorIs(t, err, ErrReadTSCompacted)
 
 	// Query at 25 -> Not found (Tombstone at 20)
 	exists, err := s.ExistsAt(ctx, key, 25)
