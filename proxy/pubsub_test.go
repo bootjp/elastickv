@@ -198,9 +198,7 @@ func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
 	s.channelSet["ch2"] = struct{}{}
 	s.patternSet["pat1"] = struct{}{}
 
-	s.mu.Lock()
 	s.writeUnsubAll("unsubscribe", false)
-	s.mu.Unlock()
 
 	writes := dconn.getWrites()
 
