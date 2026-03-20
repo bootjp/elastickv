@@ -14,6 +14,7 @@ const (
 	defaultDialTimeout  = 5 * time.Second
 	defaultReadTimeout  = 3 * time.Second
 	defaultWriteTimeout = 3 * time.Second
+	respProtocolV2      = 2
 )
 
 // Backend abstracts a Redis-protocol endpoint (real Redis or ElasticKV).
@@ -72,6 +73,7 @@ func NewRedisBackendWithOptions(addr string, name string, opts BackendOptions) *
 			Addr:         addr,
 			DB:           opts.DB,
 			Password:     opts.Password,
+			Protocol:     respProtocolV2,
 			PoolSize:     opts.PoolSize,
 			DialTimeout:  opts.DialTimeout,
 			ReadTimeout:  opts.ReadTimeout,

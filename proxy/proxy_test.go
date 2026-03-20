@@ -768,6 +768,15 @@ func TestDefaultBackendOptions(t *testing.T) {
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 }
 
+func TestNewRedisBackend_UsesRESP2(t *testing.T) {
+	backend := NewRedisBackend("127.0.0.1:6379", "test")
+	t.Cleanup(func() {
+		assert.NoError(t, backend.Close())
+	})
+
+	assert.Equal(t, respProtocolV2, backend.client.Options().Protocol)
+}
+
 // ========== Pipeline error handling tests ==========
 
 func TestPipeline_TransportError(t *testing.T) {
@@ -779,6 +788,45 @@ func TestPipeline_TransportError(t *testing.T) {
 	results, err := b.Pipeline(context.Background(), [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}})
 	assert.NoError(t, err) // mock always returns nil error
 	assert.Len(t, results, 3)
+}
+
+func TestDualWriter_Script_CachesEvalForEvalSHAFallback(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	script := "return ARGV[1]"
+	sha := scriptSHA(script)
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		switch calls {
+		case 1:
+			assert.Equal(t, []byte("EVALSHA"), args[0])
+			assert.Equal(t, []byte(sha), args[1])
+			cmd.SetErr(testRedisErr("NOSCRIPT No matching script. Please use EVAL."))
+		case 2:
+			assert.Equal(t, []byte("EVAL"), args[0])
+			assert.Equal(t, []byte(script), args[1])
+			cmd.SetVal("OK")
+		default:
+			t.Fatalf("unexpected secondary call %d", calls)
+		}
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	_, err := d.Script(context.Background(), "EVAL", [][]byte{[]byte("EVAL"), []byte(script), []byte("0"), []byte("value")})
+	assert.NoError(t, err)
+
+	d.cfg.Mode = ModeDualWrite
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte(sha), []byte("0"), []byte("value")})
+
+	assert.Equal(t, 2, calls)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 }
 
 // ========== writeRedisValue tests ==========
