@@ -386,8 +386,8 @@ func TestShadowPubSub_MatchSecondaryMiddleEntry(t *testing.T) {
 	// Arrange: expired, in-window, in-window entries for the same channel but
 	// different payloads so they live under separate keys.
 	sp.pending[keyA] = []pendingMsg{{channel: "ch1", payload: "a", timestamp: now.Add(-100 * time.Millisecond)}} // expired
-	sp.pending[keyB] = []pendingMsg{{channel: "ch1", payload: "b", timestamp: now}}                             // in-window
-	sp.pending[keyC] = []pendingMsg{{channel: "ch1", payload: "c", timestamp: now}}                             // in-window
+	sp.pending[keyB] = []pendingMsg{{channel: "ch1", payload: "b", timestamp: now}}                              // in-window
+	sp.pending[keyC] = []pendingMsg{{channel: "ch1", payload: "c", timestamp: now}}                              // in-window
 	sp.mu.Unlock()
 
 	// Match "b" (in-window, but keyA is already expired separately under its own key).
@@ -419,7 +419,7 @@ func TestShadowPubSub_MatchSecondaryLastEntry(t *testing.T) {
 	sp.mu.Lock()
 	sp.pending[key] = []pendingMsg{
 		{channel: "ch1", payload: "val", timestamp: now.Add(-100 * time.Millisecond)}, // expired (index 0)
-		{channel: "ch1", payload: "val", timestamp: now},                               // in-window (index 1, the "last")
+		{channel: "ch1", payload: "val", timestamp: now},                              // in-window (index 1, the "last")
 	}
 	sp.mu.Unlock()
 
