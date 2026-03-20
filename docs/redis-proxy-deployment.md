@@ -4,7 +4,7 @@ redis-proxy is a Redis-protocol reverse proxy that enables gradual migration fro
 
 ## Docker Image
 
-Pre-built images are published to GitHub Container Registry on every push to `main`:
+Pre-built images are published to GitHub Container Registry when relevant files change on `main` (see path filters in the workflow):
 
 ```
 ghcr.io/bootjp/elastickv/redis-proxy:latest
