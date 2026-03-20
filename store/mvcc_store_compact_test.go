@@ -43,7 +43,7 @@ func TestMVCCStore_Compact(t *testing.T) {
 	// This is the expected behavior of Compaction: you cannot query older than minTS.
 
 	_, err = s.GetAt(ctx, key, 15)
-	assert.Equal(t, ErrReadTSCompacted, err, "Should not find version older than compacted minTS")
+	assert.ErrorIs(t, err, ErrReadTSCompacted, "Should not find version older than compacted minTS")
 
 	// Query at 25 should return v20
 	val, err = s.GetAt(ctx, key, 25)
