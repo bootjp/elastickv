@@ -13,6 +13,7 @@ var ErrNotSupported = errors.New("not supported")
 var ErrInvalidChecksum = errors.New("invalid checksum")
 var ErrWriteConflict = errors.New("write conflict")
 var ErrExpired = errors.New("expired")
+var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
 
 type KVPair struct {
 	Key   []byte
@@ -44,6 +45,14 @@ func boundedScanResultCapacity(limit int) int {
 // HybridClock provides monotonically increasing timestamps (HLC).
 type HybridClock interface {
 	Now() uint64
+}
+
+// RetentionController exposes the minimum timestamp still retained by a store
+// after MVCC compaction. Reads older than this watermark may fail with
+// ErrReadTSCompacted.
+type RetentionController interface {
+	MinRetainedTS() uint64
+	SetMinRetainedTS(ts uint64)
 }
 
 // MVCCStore extends Store with multi-version concurrency control helpers.

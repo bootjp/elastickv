@@ -12,6 +12,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var _ pb.RawKVServer = (*GRPCServer)(nil)
@@ -89,6 +91,9 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
 	}
+	if errors.Is(err, store.ErrReadTSCompacted) {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
+	}
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -135,6 +140,9 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		res, err = r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrReadTSCompacted) {
+			return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
+		}
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
 	}
 
