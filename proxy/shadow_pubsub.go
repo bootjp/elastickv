@@ -50,6 +50,7 @@ type pendingMsg struct {
 type divergenceEvent struct {
 	channel   string
 	payload   string
+	pattern   string // non-empty for PSUBSCRIBE/pmessage deliveries
 	kind      DivergenceKind
 	isPattern bool // true if this originated from a PSUBSCRIBE
 }
@@ -233,7 +234,7 @@ func (sp *shadowPubSub) matchSecondary(msg *redis.Message) {
 	now := sp.nowFunc()
 	if entries, ok := sp.pending[key]; ok && len(entries) > 0 {
 		oldest := entries[0]
-		if now.Sub(oldest.timestamp) < sp.window {
+		if now.Sub(oldest.timestamp) <= sp.window {
 			// Match found within window — remove the oldest pending primary message.
 			if len(entries) == 1 {
 				delete(sp.pending, key)
@@ -308,7 +309,7 @@ func (sp *shadowPubSub) reconcilePrimaries(now time.Time, secBuf map[msgKey][]se
 			if now.Sub(e.timestamp) >= sp.window {
 				// Primary has expired — report as divergence regardless of any buffered
 				// secondaries. A late secondary must not suppress a window violation.
-				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, kind: DivDataMismatch, isPattern: e.pattern != ""})
+				out = append(out, divergenceEvent{channel: e.channel, payload: e.payload, pattern: e.pattern, kind: DivDataMismatch, isPattern: e.pattern != ""})
 				continue
 			}
 			if secs := secBuf[key]; len(secs) > 0 {
@@ -337,7 +338,7 @@ func sweepExpiredSecondaries(now time.Time, window time.Duration, secBuf map[msg
 		var remaining []secondaryPending
 		for _, sec := range secs {
 			if now.Sub(sec.timestamp) >= window {
-				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, kind: DivExtraData, isPattern: key.Pattern != ""})
+				out = append(out, divergenceEvent{channel: sec.channel, payload: sec.payload, pattern: key.Pattern, kind: DivExtraData, isPattern: key.Pattern != ""})
 			} else {
 				remaining = append(remaining, sec)
 			}
@@ -362,6 +363,7 @@ func (sp *shadowPubSub) sweepAll() {
 			divergences = append(divergences, divergenceEvent{
 				channel:   e.channel,
 				payload:   e.payload,
+				pattern:   e.pattern,
 				kind:      DivDataMismatch,
 				isPattern: e.pattern != "",
 			})
@@ -378,6 +380,7 @@ func (sp *shadowPubSub) sweepAll() {
 				divergences = append(divergences, divergenceEvent{
 					channel:   sec.channel,
 					payload:   sec.payload,
+					pattern:   key.Pattern,
 					kind:      DivExtraData,
 					isPattern: key.Pattern != "",
 				})
@@ -395,11 +398,15 @@ func (sp *shadowPubSub) sweepAll() {
 
 func (sp *shadowPubSub) reportDivergence(d divergenceEvent) {
 	sp.metrics.PubSubShadowDivergences.WithLabelValues(d.kind.String()).Inc()
-	sp.logger.Warn("pubsub shadow divergence",
+	logAttrs := []any{
 		"channel", truncateValue(d.channel),
 		"payload", truncateValue(d.payload),
 		"kind", d.kind.String(),
-	)
+	}
+	if d.pattern != "" {
+		logAttrs = append(logAttrs, "pattern", truncateValue(d.pattern))
+	}
+	sp.logger.Warn("pubsub shadow divergence", logAttrs...)
 
 	cmd := "SUBSCRIBE"
 	if d.isPattern {
@@ -418,6 +425,7 @@ func (sp *shadowPubSub) reportDivergence(d divergenceEvent) {
 	sp.sentry.CaptureDivergence(Divergence{
 		Command:    cmd,
 		Key:        d.channel,
+		Pattern:    d.pattern,
 		Kind:       d.kind,
 		Primary:    primary,
 		Secondary:  secondary,

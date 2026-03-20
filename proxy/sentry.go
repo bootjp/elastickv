@@ -91,6 +91,9 @@ func (r *SentryReporter) CaptureDivergence(div Divergence) {
 		// Omit raw key from Sentry tags to avoid leaking sensitive data;
 		// only send a truncated form as an extra for debugging.
 		scope.SetExtra("key", truncateValue(div.Key))
+		if div.Pattern != "" {
+			scope.SetExtra("pattern", truncateValue(div.Pattern))
+		}
 		scope.SetExtra("primary", truncateValue(div.Primary))
 		scope.SetExtra("secondary", truncateValue(div.Secondary))
 		scope.SetFingerprint([]string{"divergence", div.Kind.String(), div.Command})
