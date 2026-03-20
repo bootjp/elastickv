@@ -334,8 +334,17 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 	// SELECT: accept only the configured DB; reject others since the proxy
 	// uses a shared connection pool and cannot maintain per-client DB state.
 	if name == "SELECT" {
-		if len(args) > 1 && string(args[1]) != "0" && string(args[1]) != fmt.Sprintf("%d", p.cfg.PrimaryDB) {
-			conn.WriteError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", string(args[1]), p.cfg.PrimaryDB))
+		// Redis arity: SELECT <db>. Require exactly one DB argument.
+		if len(args) != 2 {
+			conn.WriteError("ERR wrong number of arguments for 'select' command")
+			return
+		}
+
+		requestedDB := string(args[1])
+		configuredDB := fmt.Sprintf("%d", p.cfg.PrimaryDB)
+
+		if requestedDB != configuredDB {
+			conn.WriteError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", requestedDB, p.cfg.PrimaryDB))
 			return
 		}
 		conn.WriteString("OK")
