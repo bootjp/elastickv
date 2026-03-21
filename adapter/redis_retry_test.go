@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
@@ -228,4 +229,39 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	value, err := srv.readValueAt([]byte("retry:lua"), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), value)
+}
+
+func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {
+	t.Parallel()
+
+	internalKey := store.ListItemKey([]byte("retry:list"), 1)
+	err := errors.Wrapf(kv.ErrTxnLocked, "key: %s", string(internalKey))
+
+	normalized := normalizeRetryableRedisTxnErr(err)
+
+	require.ErrorIs(t, normalized, kv.ErrTxnLocked)
+	require.ErrorContains(t, normalized, "key: retry:list")
+	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
+}
+
+func TestNormalizeRetryableRedisTxnErrTxnTTLKey(t *testing.T) {
+	t.Parallel()
+
+	internalKey := append([]byte("!txn|cmt|"), redisTTLKey([]byte("retry:ttl"))...)
+	internalKey = append(internalKey, make([]byte, 8)...)
+	err := errors.Wrapf(store.ErrWriteConflict, "key: %s", string(internalKey))
+
+	normalized := normalizeRetryableRedisTxnErr(err)
+
+	require.ErrorIs(t, normalized, store.ErrWriteConflict)
+	require.ErrorContains(t, normalized, "key: retry:ttl")
+	require.NotContains(t, normalized.Error(), "!txn|cmt|")
+	require.NotContains(t, normalized.Error(), redisTTLPrefix)
+}
+
+func TestRetryPolicyForRedisTxnErr(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(store.ErrWriteConflict))
+	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrTxnLocked))
 }
