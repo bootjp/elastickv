@@ -87,7 +87,7 @@ func requestCommitTS(r *pb.Request) (uint64, error) {
 	}
 
 	commitTS := r.Ts
-	if r.IsTxn && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT) {
+	if r.IsTxn && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT || r.Phase == pb.Phase_NONE) {
 		meta, _, err := extractTxnMeta(r.Mutations)
 		if err != nil {
 			return 0, errors.WithStack(err)
@@ -177,8 +177,7 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 	case pb.Phase_ABORT:
 		return f.handleAbortRequest(ctx, r, commitTS)
 	case pb.Phase_NONE:
-		// not reached
-		return errors.WithStack(ErrUnknownRequestType)
+		return f.handleOnePhaseTxnRequest(ctx, r, commitTS)
 	default:
 		return errors.WithStack(ErrUnknownRequestType)
 	}
@@ -266,6 +265,37 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return nil
 }
 
+func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	meta, muts, err := extractTxnMeta(r.Mutations)
+	if err != nil {
+		return err
+	}
+	if len(meta.PrimaryKey) == 0 {
+		return errors.WithStack(ErrTxnPrimaryKeyRequired)
+	}
+	if len(muts) == 0 {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	startTS := r.Ts
+	if commitTS <= startTS {
+		return errors.WithStack(ErrTxnCommitTSRequired)
+	}
+
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return err
+	}
+	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
+		return errors.WithStack(err)
+	}
+
+	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
+	if err != nil {
+		return err
+	}
+	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, startTS, commitTS))
+}
+
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
@@ -339,6 +369,22 @@ func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutat
 			return nil, err
 		}
 		storeMuts = append(storeMuts, preparedMuts...)
+	}
+	return storeMuts, nil
+}
+
+func (f *kvFSM) buildOnePhaseStoreMutations(ctx context.Context, muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
+	for _, mut := range muts {
+		if isTxnInternalKey(mut.Key) {
+			return nil, errors.WithStack(ErrInvalidRequest)
+		}
+		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, 0); err != nil {
+			return nil, err
+		}
+	}
+	storeMuts, err := toStoreMutations(muts)
+	if err != nil {
+		return nil, errors.WithStack(err)
 	}
 	return storeMuts, nil
 }

@@ -159,8 +159,10 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 
 	if err != nil {
 		// Only attempt transactional cleanup for transactional batches. Raw request
-		// batches may partially succeed across shards by design.
-		if len(reqs) > 0 && reqs[0] != nil && reqs[0].IsTxn {
+		// batches may partially succeed across shards by design. One-phase
+		// transactional requests do not leave intents behind, so they do not need
+		// abort cleanup on failure.
+		if needsTxnCleanup(reqs) {
 			_, _err := t.Abort(reqs)
 			if _err != nil {
 				return nil, errors.WithStack(errors.CombineErrors(err, _err))
@@ -172,6 +174,15 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 	return &TransactionResponse{
 		CommitIndex: commitIndex,
 	}, nil
+}
+
+func needsTxnCleanup(reqs []*pb.Request) bool {
+	for _, req := range reqs {
+		if req != nil && req.IsTxn && req.Phase != pb.Phase_NONE {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse, error) {
@@ -315,34 +326,9 @@ func combineApplyErrors(errs []error) error {
 func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 	var abortReqs []*pb.Request
 	for _, req := range reqs {
-		if req == nil || !req.IsTxn {
-			continue
+		if abortReq := abortRequestFor(req); abortReq != nil {
+			abortReqs = append(abortReqs, abortReq)
 		}
-		meta, muts, err := extractTxnMeta(req.Mutations)
-		if err != nil {
-			// Best-effort cleanup; skip requests we can't interpret.
-			continue
-		}
-		startTS := req.Ts
-		abortTS := abortTSFrom(startTS, startTS)
-		if abortTS <= startTS {
-			// Overflow: can't choose an abort timestamp strictly greater than startTS.
-			continue
-		}
-		meta.CommitTS = abortTS
-
-		abortReqs = append(abortReqs, &pb.Request{
-			IsTxn: true,
-			Phase: pb.Phase_ABORT,
-			Ts:    startTS,
-			Mutations: append([]*pb.Mutation{
-				{
-					Op:    pb.Op_PUT,
-					Key:   []byte(txnMetaPrefix),
-					Value: EncodeTxnMeta(meta),
-				},
-			}, muts...),
-		})
 	}
 
 	var commitIndex uint64
@@ -360,6 +346,37 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 	return &TransactionResponse{
 		CommitIndex: commitIndex,
 	}, nil
+}
+
+func abortRequestFor(req *pb.Request) *pb.Request {
+	if req == nil || !req.IsTxn || req.Phase == pb.Phase_NONE {
+		return nil
+	}
+	meta, muts, err := extractTxnMeta(req.Mutations)
+	if err != nil {
+		// Best-effort cleanup; skip requests we can't interpret.
+		return nil
+	}
+	startTS := req.Ts
+	abortTS := abortTSFrom(startTS, startTS)
+	if abortTS <= startTS {
+		// Overflow: can't choose an abort timestamp strictly greater than startTS.
+		return nil
+	}
+	meta.CommitTS = abortTS
+
+	return &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_ABORT,
+		Ts:    startTS,
+		Mutations: append([]*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(meta),
+			},
+		}, muts...),
+	}
 }
 
 func extractTxnMeta(muts []*pb.Mutation) (TxnMeta, []*pb.Mutation, error) {
