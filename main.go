@@ -39,6 +39,8 @@ var (
 	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
 	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
 	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	pprofAddr            = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	pprofToken           = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftId               = flag.String("raftId", "", "Node id used by Raft")
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -133,6 +135,8 @@ func run() error {
 		dynamoAddress:   *dynamoAddr,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
+		pprofAddress:    *pprofAddr,
+		pprofToken:      *pprofToken,
 		metricsRegistry: metricsRegistry,
 	}
 	if err := runner.start(); err != nil {
@@ -415,6 +419,27 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	return nil
 }
 
+func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
+	pprofAddr = strings.TrimSpace(pprofAddr)
+	if pprofAddr == "" {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(pprofAddr); err != nil {
+		return errors.Wrapf(err, "invalid pprofAddress %q; expected host:port", pprofAddr)
+	}
+	if monitoring.AddressRequiresToken(pprofAddr) && strings.TrimSpace(pprofToken) == "" {
+		return errors.New("pprofToken is required when pprofAddress is not loopback")
+	}
+	pprofL, err := lc.Listen(ctx, "tcp", pprofAddr)
+	if err != nil {
+		return errors.Wrapf(err, "failed to listen on %s", pprofAddr)
+	}
+	pprofServer := monitoring.NewPprofServer(pprofToken)
+	eg.Go(monitoring.PprofShutdownTask(ctx, pprofServer, pprofAddr))
+	eg.Go(monitoring.PprofServeTask(pprofServer, pprofL, pprofAddr))
+	return nil
+}
+
 func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
 	metricsAddr = strings.TrimSpace(metricsAddr)
 	if metricsAddr == "" || handler == nil {
@@ -423,7 +448,7 @@ func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.
 	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
 		return errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
 	}
-	if monitoring.MetricsAddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
+	if monitoring.AddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
 		return errors.New("metricsToken is required when metricsAddress is not loopback")
 	}
 	metricsL, err := lc.Listen(ctx, "tcp", metricsAddr)
@@ -516,6 +541,8 @@ type runtimeServerRunner struct {
 	dynamoAddress   string
 	metricsAddress  string
 	metricsToken    string
+	pprofAddress    string
+	pprofToken      string
 	metricsRegistry *monitoring.Registry
 }
 
@@ -530,6 +557,9 @@ func (r runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startPprofServer(r.ctx, r.lc, r.eg, r.pprofAddress, r.pprofToken); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	return nil

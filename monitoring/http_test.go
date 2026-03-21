@@ -9,13 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMetricsAddressRequiresToken(t *testing.T) {
-	require.False(t, MetricsAddressRequiresToken("localhost:9090"))
-	require.False(t, MetricsAddressRequiresToken("127.0.0.1:9090"))
-	require.False(t, MetricsAddressRequiresToken("[::1]:9090"))
-	require.True(t, MetricsAddressRequiresToken(":9090"))
-	require.True(t, MetricsAddressRequiresToken("0.0.0.0:9090"))
-	require.True(t, MetricsAddressRequiresToken("10.0.0.1:9090"))
+func TestAddressRequiresToken(t *testing.T) {
+	require.False(t, AddressRequiresToken("localhost:9090"))
+	require.False(t, AddressRequiresToken("127.0.0.1:9090"))
+	require.False(t, AddressRequiresToken("[::1]:9090"))
+	require.True(t, AddressRequiresToken(":9090"))
+	require.True(t, AddressRequiresToken("0.0.0.0:9090"))
+	require.True(t, AddressRequiresToken("10.0.0.1:9090"))
 }
 
 func TestProtectHandlerRequiresBearerToken(t *testing.T) {

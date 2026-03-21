@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"math/rand/v2"
 	"time"
@@ -13,12 +14,40 @@ import (
 const (
 	redisTxnRetryInitialBackoff = 1 * time.Millisecond
 	redisTxnRetryMaxBackoff     = 10 * time.Millisecond
+	redisTxnLockInitialBackoff  = 5 * time.Millisecond
+	redisTxnLockMaxBackoff      = 50 * time.Millisecond
 	redisTxnRetryBackoffFactor  = 2
 	redisTxnRetryMaxAttempts    = 50
 )
 
+type redisTxnRetryPolicy struct {
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+	maxAttempts    int
+}
+
+var (
+	redisWriteConflictRetryPolicy = redisTxnRetryPolicy{
+		initialBackoff: redisTxnRetryInitialBackoff,
+		maxBackoff:     redisTxnRetryMaxBackoff,
+		maxAttempts:    redisTxnRetryMaxAttempts,
+	}
+	redisTxnLockedRetryPolicy = redisTxnRetryPolicy{
+		initialBackoff: redisTxnLockInitialBackoff,
+		maxBackoff:     redisTxnLockMaxBackoff,
+		maxAttempts:    redisTxnRetryMaxAttempts,
+	}
+)
+
 func isRetryableRedisTxnErr(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+}
+
+func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
+	if errors.Is(err, kv.ErrTxnLocked) {
+		return redisTxnLockedRetryPolicy
+	}
+	return redisWriteConflictRetryPolicy
 }
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
@@ -38,16 +67,17 @@ func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func nextRedisRetryBackoff(current time.Duration) time.Duration {
+func nextRedisRetryBackoff(current time.Duration, maxBackoff time.Duration) time.Duration {
 	next := current * redisTxnRetryBackoffFactor
-	if next > redisTxnRetryMaxBackoff {
-		return redisTxnRetryMaxBackoff
+	if next > maxBackoff {
+		return maxBackoff
 	}
 	return next
 }
 
 func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) error {
-	backoff := redisTxnRetryInitialBackoff
+	backoff := redisWriteConflictRetryPolicy.initialBackoff
+	policy := redisWriteConflictRetryPolicy
 	for attempt := 0; ; attempt++ {
 		err := fn()
 		if err == nil {
@@ -56,12 +86,56 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if !isRetryableRedisTxnErr(err) {
 			return err
 		}
-		if attempt >= redisTxnRetryMaxAttempts {
+
+		err = normalizeRetryableRedisTxnErr(err)
+		nextPolicy := retryPolicyForRedisTxnErr(err)
+		if attempt == 0 || nextPolicy != policy {
+			backoff = nextPolicy.initialBackoff
+			policy = nextPolicy
+		}
+		if attempt >= policy.maxAttempts {
 			return errors.Wrap(err, "redis txn retry limit exceeded")
 		}
 		if !waitRedisRetryBackoff(ctx, backoff) {
 			return err
 		}
-		backoff = nextRedisRetryBackoff(backoff)
+		backoff = nextRedisRetryBackoff(backoff, policy.maxBackoff)
 	}
+}
+
+func normalizeRetryableRedisTxnErr(err error) error {
+	if key, detail, ok := kv.TxnLockedDetails(err); ok {
+		logicalKey := normalizeRetryableRedisTxnKey(key)
+		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
+			return err
+		}
+		if detail != "" {
+			return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
+		}
+		return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+	}
+	if key, ok := store.WriteConflictKey(err); ok {
+		logicalKey := normalizeRetryableRedisTxnKey(key)
+		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
+			return err
+		}
+		return errors.WithStack(store.NewWriteConflictError(logicalKey))
+	}
+	return err
+}
+
+func normalizeRetryableRedisTxnKey(key []byte) []byte {
+	if userKey := kv.ExtractTxnUserKey(key); userKey != nil {
+		key = userKey
+	}
+	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
+		return store.ExtractListUserKey(key)
+	}
+	if bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
+		return bytes.TrimPrefix(key, []byte(redisTTLPrefix))
+	}
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		return userKey
+	}
+	return key
 }

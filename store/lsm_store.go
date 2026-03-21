@@ -560,7 +560,7 @@ func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMut
 			return err
 		}
 		if exists && ts > startTS {
-			return errors.Wrapf(ErrWriteConflict, "key: %s", string(mut.Key))
+			return NewWriteConflictError(mut.Key)
 		}
 	}
 	return nil
