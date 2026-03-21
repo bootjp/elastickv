@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"math"
 	"sort"
 	"strconv"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	json "github.com/goccy/go-json"
 )
 
 const (
@@ -33,8 +33,7 @@ var redisInternalPrefixes = []string{
 }
 
 const (
-	redisUint64Bytes   = 8
-	redisStreamIDParts = 2
+	redisUint64Bytes = 8
 )
 
 type redisValueType string
@@ -67,6 +66,9 @@ type redisZSetValue struct {
 type redisStreamEntry struct {
 	ID     string   `json:"id"`
 	Fields []string `json:"fields,omitempty"`
+
+	parsedID      redisStreamID
+	parsedIDValid bool
 }
 
 type redisStreamValue struct {
@@ -201,9 +203,7 @@ func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
 }
 
 func marshalStreamValue(v redisStreamValue) ([]byte, error) {
-	sort.SliceStable(v.Entries, func(i, j int) bool {
-		return compareRedisStreamID(v.Entries[i].ID, v.Entries[j].ID) < 0
-	})
+	// Stream mutations preserve ID order, so avoid resorting on every save.
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -219,10 +219,32 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return redisStreamValue{}, errors.WithStack(err)
 	}
-	sort.SliceStable(out.Entries, func(i, j int) bool {
-		return compareRedisStreamID(out.Entries[i].ID, out.Entries[j].ID) < 0
-	})
+	// Persisted stream payloads are already ordered; cache parsed IDs for reads.
+	out.cacheParsedIDs()
 	return out, nil
+}
+
+func newRedisStreamEntry(id string, fields []string) redisStreamEntry {
+	entry := redisStreamEntry{ID: id, Fields: fields}
+	entry.cacheParsedID()
+	return entry
+}
+
+func (e *redisStreamEntry) cacheParsedID() {
+	e.parsedID, e.parsedIDValid = tryParseRedisStreamID(e.ID)
+}
+
+func (e redisStreamEntry) compareID(raw string, parsed redisStreamID, parsedValid bool) int {
+	if !e.parsedIDValid {
+		return compareRedisStreamID(e.ID, raw)
+	}
+	return compareParsedRedisStreamID(e.ID, e.parsedID, true, raw, parsed, parsedValid)
+}
+
+func (v *redisStreamValue) cacheParsedIDs() {
+	for i := range v.Entries {
+		v.Entries[i].cacheParsedID()
+	}
 }
 
 func encodeRedisTTL(expireAt time.Time) []byte {
@@ -304,15 +326,15 @@ func zsetMapToEntries(in map[string]float64) []redisZSetEntry {
 }
 
 func parseRedisStreamID(raw string) (redisStreamID, error) {
-	parts := strings.Split(raw, "-")
-	if len(parts) != redisStreamIDParts {
+	sep := strings.IndexByte(raw, '-')
+	if sep <= 0 || sep >= len(raw)-1 || strings.IndexByte(raw[sep+1:], '-') >= 0 {
 		return redisStreamID{}, errors.WithStack(errors.Newf("invalid stream id %q", raw))
 	}
-	ms, err := strconv.ParseUint(parts[0], 10, 64)
+	ms, err := strconv.ParseUint(raw[:sep], 10, 64)
 	if err != nil {
 		return redisStreamID{}, errors.WithStack(err)
 	}
-	seq, err := strconv.ParseUint(parts[1], 10, 64)
+	seq, err := strconv.ParseUint(raw[sep+1:], 10, 64)
 	if err != nil {
 		return redisStreamID{}, errors.WithStack(err)
 	}
@@ -320,25 +342,31 @@ func parseRedisStreamID(raw string) (redisStreamID, error) {
 }
 
 func compareRedisStreamID(left, right string) int {
-	lid, lerr := parseRedisStreamID(left)
-	rid, rerr := parseRedisStreamID(right)
-	switch {
-	case lerr != nil && rerr != nil:
-		return strings.Compare(left, right)
-	case lerr != nil:
-		return -1
-	case rerr != nil:
-		return 1
-	}
+	lid, lok := tryParseRedisStreamID(left)
+	rid, rok := tryParseRedisStreamID(right)
+	return compareParsedRedisStreamID(left, lid, lok, right, rid, rok)
+}
 
+func tryParseRedisStreamID(raw string) (redisStreamID, bool) {
+	id, err := parseRedisStreamID(raw)
+	return id, err == nil
+}
+
+func compareParsedRedisStreamID(leftRaw string, left redisStreamID, leftValid bool, rightRaw string, right redisStreamID, rightValid bool) int {
 	switch {
-	case lid.ms < rid.ms:
+	case !leftValid && !rightValid:
+		return strings.Compare(leftRaw, rightRaw)
+	case !leftValid:
 		return -1
-	case lid.ms > rid.ms:
+	case !rightValid:
 		return 1
-	case lid.seq < rid.seq:
+	case left.ms < right.ms:
 		return -1
-	case lid.seq > rid.seq:
+	case left.ms > right.ms:
+		return 1
+	case left.seq < right.seq:
+		return -1
+	case left.seq > right.seq:
 		return 1
 	default:
 		return 0

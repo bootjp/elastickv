@@ -2,13 +2,13 @@ package adapter
 
 import (
 	"bytes"
-	"encoding/json"
 	"maps"
 	"reflect"
 	"strings"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	json "github.com/goccy/go-json"
 	gproto "google.golang.org/protobuf/proto"
 )
 

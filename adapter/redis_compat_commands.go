@@ -1758,18 +1758,34 @@ func parseXAddRequest(args [][]byte) (xaddRequest, error) {
 
 func nextXAddID(stream redisStreamValue, requested string) (string, error) {
 	if requested != "*" {
-		if len(stream.Entries) > 0 && compareRedisStreamID(requested, stream.Entries[len(stream.Entries)-1].ID) <= 0 {
+		requestedID, requestedValid := tryParseRedisStreamID(requested)
+		if len(stream.Entries) > 0 && compareParsedRedisStreamID(
+			requested,
+			requestedID,
+			requestedValid,
+			stream.Entries[len(stream.Entries)-1].ID,
+			stream.Entries[len(stream.Entries)-1].parsedID,
+			stream.Entries[len(stream.Entries)-1].parsedIDValid,
+		) <= 0 {
 			return "", errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 		}
 		return requested, nil
 	}
 
 	nextID := strconv.FormatInt(time.Now().UnixMilli(), 10) + "-0"
-	if len(stream.Entries) == 0 || compareRedisStreamID(nextID, stream.Entries[len(stream.Entries)-1].ID) > 0 {
+	nextParsedID, nextParsedValid := tryParseRedisStreamID(nextID)
+	if len(stream.Entries) == 0 || compareParsedRedisStreamID(
+		nextID,
+		nextParsedID,
+		nextParsedValid,
+		stream.Entries[len(stream.Entries)-1].ID,
+		stream.Entries[len(stream.Entries)-1].parsedID,
+		stream.Entries[len(stream.Entries)-1].parsedIDValid,
+	) > 0 {
 		return nextID, nil
 	}
 
-	last, _ := parseRedisStreamID(stream.Entries[len(stream.Entries)-1].ID)
+	last := stream.Entries[len(stream.Entries)-1].parsedID
 	return strconv.FormatUint(last.ms, 10) + "-" + strconv.FormatUint(last.seq+1, 10), nil
 }
 
@@ -1813,7 +1829,7 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", err
 	}
 
-	stream.Entries = append(stream.Entries, redisStreamEntry{ID: id, Fields: req.fields})
+	stream.Entries = append(stream.Entries, newRedisStreamEntry(id, req.fields))
 	if req.maxLen > 0 && len(stream.Entries) > req.maxLen {
 		stream.Entries = append([]redisStreamEntry(nil), stream.Entries[len(stream.Entries)-req.maxLen:]...)
 	}
@@ -2042,17 +2058,18 @@ func (r *RedisServer) resolveXReadAfterIDs(req *xreadRequest) error {
 }
 
 func selectXReadEntries(entries []redisStreamEntry, afterID string, count int) []redisStreamEntry {
-	selected := make([]redisStreamEntry, 0, len(entries))
-	for _, entry := range entries {
-		if compareRedisStreamID(entry.ID, afterID) <= 0 {
-			continue
-		}
-		selected = append(selected, entry)
-		if count > 0 && len(selected) >= count {
-			break
-		}
+	afterParsedID, afterParsedValid := tryParseRedisStreamID(afterID)
+	start := sort.Search(len(entries), func(i int) bool {
+		return entries[i].compareID(afterID, afterParsedID, afterParsedValid) > 0
+	})
+	if start >= len(entries) {
+		return nil
 	}
-	return selected
+	end := len(entries)
+	if count > 0 && start+count < end {
+		end = start + count
+	}
+	return entries[start:end]
 }
 
 func (r *RedisServer) xreadOnce(req xreadRequest) ([]xreadResult, error) {

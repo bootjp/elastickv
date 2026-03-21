@@ -2,10 +2,10 @@ package adapter
 
 import (
 	"bytes"
-	"encoding/json"
 	"slices"
 
 	"github.com/cockroachdb/errors"
+	json "github.com/goccy/go-json"
 )
 
 type attributeValue struct {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"hash/fnv"
 	"io"
 	"log/slog"
@@ -24,6 +23,7 @@ import (
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	json "github.com/goccy/go-json"
 )
 
 const (

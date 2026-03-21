@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/sha1" // #nosec G505 -- Redis EVALSHA specifies SHA1 script digests.
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	json "github.com/goccy/go-json"
 	"github.com/tidwall/redcon"
 	"github.com/vmihailenco/msgpack/v5"
 	lua "github.com/yuin/gopher-lua"
