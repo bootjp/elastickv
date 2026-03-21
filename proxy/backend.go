@@ -14,6 +14,7 @@ const (
 	defaultDialTimeout  = 5 * time.Second
 	defaultReadTimeout  = 3 * time.Second
 	defaultWriteTimeout = 3 * time.Second
+	blockingReadGrace   = 10 * time.Second
 	respProtocolV2      = 2
 )
 
@@ -91,7 +92,14 @@ func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 // This is used for blocking commands whose wait time exceeds the backend's
 // default read timeout.
 func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	return b.client.WithTimeout(timeout).Do(ctx, args...)
+	return b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+}
+
+func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
+	if timeout == 0 {
+		return 0
+	}
+	return timeout + blockingReadGrace
 }
 
 func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
