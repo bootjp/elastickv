@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -833,6 +834,107 @@ func TestDualWriter_Script_CachesEvalForEvalSHAFallback(t *testing.T) {
 
 	assert.Equal(t, 2, calls)
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestDualWriter_Script_EvalSHARO_FallsBackToEvalRO(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	script := "return KEYS[1]"
+	sha := scriptSHA(script)
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		switch calls {
+		case 1:
+			assert.Equal(t, []byte("EVALSHA_RO"), args[0])
+			cmd.SetErr(testRedisErr("NOSCRIPT No matching script. Please use EVAL."))
+		case 2:
+			// Must fall back to EVAL_RO, not EVAL, to preserve read-only semantics.
+			assert.Equal(t, []byte("EVAL_RO"), args[0])
+			assert.Equal(t, []byte(script), args[1])
+			cmd.SetVal("mykey")
+		default:
+			t.Fatalf("unexpected secondary call %d", calls)
+		}
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Register the script body via EVAL_RO so the proxy can fall back.
+	_, err := d.Script(context.Background(), "EVAL_RO", [][]byte{[]byte("EVAL_RO"), []byte(script), []byte("1"), []byte("mykey")})
+	assert.NoError(t, err)
+
+	d.cfg.Mode = ModeDualWrite
+	d.writeSecondary("EVALSHA_RO", []any{[]byte("EVALSHA_RO"), []byte(sha), []byte("1"), []byte("mykey")})
+
+	assert.Equal(t, 2, calls)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestDualWriter_Script_NoRememberOnPrimaryError(t *testing.T) {
+	// Verify that a failed SCRIPT FLUSH on the primary does NOT clear the proxy
+	// script cache, so that subsequent EVALSHA → EVAL fallbacks still work.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd(nil, testRedisErr("ERR flush failed"))
+
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Seed the script cache directly.
+	script := "return 1"
+	d.storeScript(script)
+	sha := scriptSHA(script)
+	_, cached := d.lookupScript(sha)
+	assert.True(t, cached, "script should be cached before flush attempt")
+
+	// Attempt SCRIPT FLUSH — primary returns an error so the cache must be untouched.
+	_, err := d.Script(context.Background(), "SCRIPT", [][]byte{[]byte("SCRIPT"), []byte("FLUSH")})
+	assert.Error(t, err)
+
+	_, stillCached := d.lookupScript(sha)
+	assert.True(t, stillCached, "cache must not be cleared when primary SCRIPT FLUSH fails")
+}
+
+func TestDualWriter_ScriptCache_BoundedEviction(t *testing.T) {
+	// Fill the cache beyond maxScriptCacheSize and verify it stays bounded.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	// Insert maxScriptCacheSize+10 unique scripts.
+	total := maxScriptCacheSize + 10
+	for i := range total {
+		d.storeScript(fmt.Sprintf("return %d", i))
+	}
+
+	d.scriptMu.RLock()
+	size := len(d.scripts)
+	d.scriptMu.RUnlock()
+
+	assert.Equal(t, maxScriptCacheSize, size, "cache must not exceed maxScriptCacheSize")
+
+	// The first 10 scripts (insertion order) must have been evicted.
+	for i := range 10 {
+		sha := scriptSHA(fmt.Sprintf("return %d", i))
+		_, ok := d.lookupScript(sha)
+		assert.False(t, ok, "script %d should have been evicted", i)
+	}
+	// The last maxScriptCacheSize scripts must still be present.
+	for i := 10; i < total; i++ {
+		sha := scriptSHA(fmt.Sprintf("return %d", i))
+		_, ok := d.lookupScript(sha)
+		assert.True(t, ok, "script %d should still be cached", i)
+	}
 }
 
 // ========== writeRedisValue tests ==========

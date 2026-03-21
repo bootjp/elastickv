@@ -83,6 +83,7 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	clock := kv.NewHLC()
+	readTracker := kv.NewActiveTimestampTracker()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -104,9 +105,17 @@ func run() error {
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
+		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
 	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
+	compactor := kv.NewFSMCompactor(
+		fsmCompactionRuntimes(runtimes),
+		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+	)
+	eg.Go(func() error {
+		return compactor.Run(runCtx)
+	})
 
 	runner := runtimeServerRunner{
 		ctx:             runCtx,
@@ -120,6 +129,7 @@ func run() error {
 		redisAddress:    *redisAddr,
 		leaderRedis:     cfg.leaderRedis,
 		pubsubRelay:     adapter.NewRedisPubSubRelay(),
+		readTracker:     readTracker,
 		dynamoAddress:   *dynamoAddr,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
@@ -285,9 +295,24 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 	return out
 }
 
+func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime {
+	out := make([]kv.FSMCompactRuntime, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.raft == nil || runtime.store == nil {
+			continue
+		}
+		out = append(out, kv.FSMCompactRuntime{
+			GroupID: runtime.spec.id,
+			Raft:    runtime.raft,
+			Store:   runtime.store,
+		})
+	}
+	return out
+}
+
 func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) error {
 	for _, rt := range runtimes {
-		gs := grpc.NewServer()
+		gs := grpc.NewServer(internalutil.GRPCServerOptions()...)
 		trx := kv.NewTransaction(rt.raft)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
@@ -333,12 +358,12 @@ func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay) error {
+func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker) error {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay)
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker))
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})
@@ -487,6 +512,7 @@ type runtimeServerRunner struct {
 	redisAddress    string
 	leaderRedis     map[raft.ServerAddress]string
 	pubsubRelay     *adapter.RedisPubSubRelay
+	readTracker     *kv.ActiveTimestampTracker
 	dynamoAddress   string
 	metricsAddress  string
 	metricsToken    string
@@ -494,7 +520,7 @@ type runtimeServerRunner struct {
 }
 
 func (r runtimeServerRunner) start() error {
-	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay); err != nil {
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer, r.pubsubRelay); err != nil {

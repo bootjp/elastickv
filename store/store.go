@@ -13,6 +13,9 @@ var ErrNotSupported = errors.New("not supported")
 var ErrInvalidChecksum = errors.New("invalid checksum")
 var ErrWriteConflict = errors.New("write conflict")
 var ErrExpired = errors.New("expired")
+var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
+var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
+var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
 
 type KVPair struct {
 	Key   []byte
@@ -46,6 +49,21 @@ type HybridClock interface {
 	Now() uint64
 }
 
+// RetentionController exposes the minimum timestamp still retained by a store
+// after MVCC compaction. Reads older than this watermark may fail with
+// ErrReadTSCompacted.
+type RetentionController interface {
+	MinRetainedTS() uint64
+	SetMinRetainedTS(ts uint64)
+}
+
+// Snapshot streams a consistent point-in-time store image to a writer.
+// Implementations may back this with a temp file or an engine-native snapshot.
+type Snapshot interface {
+	io.WriterTo
+	io.Closer
+}
+
 // MVCCStore extends Store with multi-version concurrency control helpers.
 // The interface is timestamp-explicit; callers must supply the snapshot or
 // commit timestamp for every operation.
@@ -77,7 +95,7 @@ type MVCCStore interface {
 	LastCommitTS() uint64
 	// Compact removes versions older than minTS that are no longer needed.
 	Compact(ctx context.Context, minTS uint64) error
-	Snapshot() (io.ReadWriter, error)
+	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error
 }

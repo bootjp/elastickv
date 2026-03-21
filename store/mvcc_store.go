@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -25,13 +26,20 @@ type VersionedValue struct {
 }
 
 const (
-	checksumSize = 4
+	checksumSize            = 4
+	mvccSnapshotVersion     = uint32(1)
+	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
+	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
 )
 
-// mvccSnapshot is used solely for gob snapshot serialization.
+var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
+
+// mvccSnapshot is retained for backward compatibility with older gob-backed
+// snapshots that were materialized fully in memory.
 type mvccSnapshot struct {
-	LastCommitTS uint64
-	Entries      []mvccSnapshotEntry
+	LastCommitTS  uint64
+	MinRetainedTS uint64
+	Entries       []mvccSnapshotEntry
 }
 
 // mvccSnapshotEntry is used solely for gob snapshot serialization.
@@ -68,10 +76,11 @@ func withinBoundsKey(k, start, end []byte) bool {
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
 // deterministic iteration order and range scans.
 type mvccStore struct {
-	tree         *treemap.Map // key []byte -> []VersionedValue
-	mtx          sync.RWMutex
-	log          *slog.Logger
-	lastCommitTS uint64
+	tree          *treemap.Map // key []byte -> []VersionedValue
+	mtx           sync.RWMutex
+	log           *slog.Logger
+	lastCommitTS  uint64
+	minRetainedTS uint64
 }
 
 // LastCommitTS exposes the latest commit timestamp for read snapshot selection.
@@ -80,6 +89,20 @@ func (s *mvccStore) LastCommitTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return s.lastCommitTS
+}
+
+func (s *mvccStore) MinRetainedTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.minRetainedTS
+}
+
+func (s *mvccStore) SetMinRetainedTS(ts uint64) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if ts > s.minRetainedTS {
+		s.minRetainedTS = ts
+	}
 }
 
 // MVCCStoreOption configures the MVCCStore.
@@ -107,6 +130,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 }
 
 var _ MVCCStore = (*mvccStore)(nil)
+var _ RetentionController = (*mvccStore)(nil)
 
 // ---- helpers guarded by caller locks ----
 
@@ -230,11 +254,18 @@ func (s *mvccStore) latestVersionLocked(key []byte) (VersionedValue, bool) {
 	return vs[len(vs)-1], true
 }
 
+func readTSCompacted(ts, minRetainedTS uint64) bool {
+	return minRetainedTS != 0 && ts != 0 && ts != ^uint64(0) && ts < minRetainedTS
+}
+
 // ---- MVCCStore methods ----
 
 func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	v, ok := s.tree.Get(key)
 	if !ok {
@@ -251,6 +282,9 @@ func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, e
 func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return false, ErrReadTSCompacted
+	}
 
 	v, ok := s.tree.Get(key)
 	if !ok {
@@ -270,6 +304,9 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	if limit <= 0 {
 		return []*KVPair{}, nil
@@ -311,6 +348,9 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
 
 	if limit <= 0 {
 		return []*KVPair{}, nil
@@ -467,45 +507,42 @@ func (s *mvccStore) Scan(_ context.Context, start []byte, end []byte, limit int)
 	return s.ScanAt(context.Background(), start, end, limit, s.readTS())
 }
 
-func (s *mvccStore) Snapshot() (io.ReadWriter, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	entries := make([]mvccSnapshotEntry, 0, s.tree.Size())
-	s.tree.Each(func(key any, value any) {
-		k, ok := key.([]byte)
-		if !ok {
-			return
-		}
-		versions, ok := value.([]VersionedValue)
-		if !ok {
-			return
-		}
-		entries = append(entries, mvccSnapshotEntry{
-			Key:      bytes.Clone(k),
-			Versions: append([]VersionedValue(nil), versions...),
-		})
-	})
-
-	snapshot := mvccSnapshot{
-		LastCommitTS: s.lastCommitTS,
-		Entries:      entries,
-	}
-
-	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(snapshot); err != nil {
+func (s *mvccStore) Snapshot() (Snapshot, error) {
+	f, err := os.CreateTemp("", "elastickv-mvcc-snapshot-*")
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-
-	sum := crc32.ChecksumIEEE(buf.Bytes())
-	if err := binary.Write(buf, binary.LittleEndian, sum); err != nil {
-		return nil, errors.WithStack(err)
+	path := f.Name()
+	if err := s.writeSnapshotFile(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, err
 	}
-
-	return buf, nil
+	return newFileSnapshot(f, path), nil
 }
 
 func (s *mvccStore) Restore(r io.Reader) error {
+	br := bufio.NewReader(r)
+	if streaming, err := isStreamingMVCCSnapshot(br); err != nil {
+		return errors.WithStack(err)
+	} else if streaming {
+		return s.restoreStreamingSnapshot(br)
+	}
+	return s.restoreLegacySnapshot(br)
+}
+
+func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
+	header, err := r.Peek(len(mvccSnapshotMagic))
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	return bytes.Equal(header, mvccSnapshotMagic[:]), nil
+}
+
+func (s *mvccStore) restoreLegacySnapshot(r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return errors.WithStack(err)
@@ -529,12 +566,292 @@ func (s *mvccStore) Restore(r io.Reader) error {
 
 	s.tree.Clear()
 	s.lastCommitTS = snapshot.LastCommitTS
+	s.minRetainedTS = snapshot.MinRetainedTS
 	for _, entry := range snapshot.Entries {
 		versions := append([]VersionedValue(nil), entry.Versions...)
 		s.tree.Put(bytes.Clone(entry.Key), versions)
 	}
 
 	return nil
+}
+
+func (s *mvccStore) writeSnapshotFile(f *os.File) error {
+	checksumOffset, err := writeMVCCSnapshotHeader(f)
+	if err != nil {
+		return err
+	}
+
+	sum, err := s.writeSnapshotBody(f)
+	if err != nil {
+		return err
+	}
+
+	return finalizeMVCCSnapshotFile(f, checksumOffset, sum)
+}
+
+func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
+	if _, err := f.Write(mvccSnapshotMagic[:]); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, mvccSnapshotVersion); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	checksumOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint32(0)); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return checksumOffset, nil
+}
+
+func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
+	hash := crc32.NewIEEE()
+	bw := bufio.NewWriter(f)
+	w := io.MultiWriter(bw, hash)
+
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	if err := binary.Write(w, binary.LittleEndian, s.lastCommitTS); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, s.minRetainedTS); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	iter := s.tree.Iterator()
+	for iter.Next() {
+		key, ok := iter.Key().([]byte)
+		if !ok {
+			continue
+		}
+		versions, ok := iter.Value().([]VersionedValue)
+		if !ok {
+			continue
+		}
+		if err := writeMVCCSnapshotEntry(w, key, versions); err != nil {
+			return 0, err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return hash.Sum32(), nil
+}
+
+func finalizeMVCCSnapshotFile(f *os.File, checksumOffset int64, sum uint32) error {
+	if _, err := f.Seek(checksumOffset, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, sum); err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func writeMVCCSnapshotEntry(w io.Writer, key []byte, versions []VersionedValue) error {
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(key))); err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := w.Write(key); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(versions))); err != nil {
+		return errors.WithStack(err)
+	}
+	for _, version := range versions {
+		if err := writeMVCCSnapshotVersion(w, version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeMVCCSnapshotVersion(w io.Writer, version VersionedValue) error {
+	if err := binary.Write(w, binary.LittleEndian, version.TS); err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := w.Write([]byte{mvccSnapshotTombstoneByte(version.Tombstone)}); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, version.ExpireAt); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(version.Value))); err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := w.Write(version.Value); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func mvccSnapshotTombstoneByte(tombstone bool) byte {
+	if tombstone {
+		return 1
+	}
+	return 0
+}
+
+func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
+	expected, err := readMVCCSnapshotHeader(r)
+	if err != nil {
+		return err
+	}
+
+	tree, lastCommitTS, minRetainedTS, actual, err := restoreStreamingMVCCSnapshotBody(r)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return errors.WithStack(ErrInvalidChecksum)
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.tree = tree
+	s.lastCommitTS = lastCommitTS
+	s.minRetainedTS = minRetainedTS
+	return nil
+}
+
+func readMVCCSnapshotHeader(r io.Reader) (uint32, error) {
+	var magic [8]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if magic != mvccSnapshotMagic {
+		return 0, errors.WithStack(ErrInvalidChecksum)
+	}
+
+	var version uint32
+	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if version != mvccSnapshotVersion {
+		return 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
+	}
+
+	var expected uint32
+	if err := binary.Read(r, binary.LittleEndian, &expected); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return expected, nil
+}
+
+func restoreStreamingMVCCSnapshotBody(r io.Reader) (*treemap.Map, uint64, uint64, uint32, error) {
+	hash := crc32.NewIEEE()
+	body := io.TeeReader(r, hash)
+
+	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+
+	tree, err := readMVCCSnapshotTree(body)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+
+	return tree, lastCommitTS, minRetainedTS, hash.Sum32(), nil
+}
+
+func readMVCCSnapshotMetadata(r io.Reader) (uint64, uint64, error) {
+	var lastCommitTS uint64
+	if err := binary.Read(r, binary.LittleEndian, &lastCommitTS); err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	var minRetainedTS uint64
+	if err := binary.Read(r, binary.LittleEndian, &minRetainedTS); err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	return lastCommitTS, minRetainedTS, nil
+}
+
+func readMVCCSnapshotTree(r io.Reader) (*treemap.Map, error) {
+	tree := treemap.NewWith(byteSliceComparator)
+	for {
+		key, versions, eof, err := readMVCCSnapshotEntry(r)
+		if err != nil {
+			return nil, err
+		}
+		if eof {
+			return tree, nil
+		}
+		tree.Put(key, versions)
+	}
+}
+
+func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) {
+	var keyLen uint64
+	if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil, true, nil
+		}
+		return nil, nil, false, errors.WithStack(err)
+	}
+	if keyLen > maxSnapshotKeySize {
+		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotKeySize)
+	}
+
+	key := make([]byte, keyLen)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+
+	var versionCount uint64
+	if err := binary.Read(r, binary.LittleEndian, &versionCount); err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+	if versionCount > maxSnapshotVersionCount {
+		return nil, nil, false, errors.Wrapf(ErrSnapshotVersionCountTooLarge, "%d > %d", versionCount, maxSnapshotVersionCount)
+	}
+	versions := make([]VersionedValue, 0, versionCount)
+	for i := uint64(0); i < versionCount; i++ {
+		version, err := readMVCCSnapshotVersion(r)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		versions = append(versions, version)
+	}
+	return key, versions, false, nil
+}
+
+func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
+	var ts uint64
+	if err := binary.Read(r, binary.LittleEndian, &ts); err != nil {
+		return VersionedValue{}, errors.WithStack(err)
+	}
+
+	var tombstone [1]byte
+	if _, err := io.ReadFull(r, tombstone[:]); err != nil {
+		return VersionedValue{}, errors.WithStack(err)
+	}
+
+	var expireAt uint64
+	if err := binary.Read(r, binary.LittleEndian, &expireAt); err != nil {
+		return VersionedValue{}, errors.WithStack(err)
+	}
+
+	var valueLen uint64
+	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
+		return VersionedValue{}, errors.WithStack(err)
+	}
+	value := make([]byte, valueLen)
+	if _, err := io.ReadFull(r, value); err != nil {
+		return VersionedValue{}, errors.WithStack(err)
+	}
+
+	return VersionedValue{
+		TS:        ts,
+		Value:     value,
+		Tombstone: tombstone[0] != 0,
+		ExpireAt:  expireAt,
+	}, nil
 }
 
 func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
@@ -595,6 +912,9 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 
 	for k, v := range updates {
 		s.tree.Put([]byte(k), v)
+	}
+	if minTS > s.minRetainedTS {
+		s.minRetainedTS = minTS
 	}
 
 	s.log.InfoContext(ctx, "compact",

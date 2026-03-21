@@ -243,6 +243,7 @@ type RedisServer struct {
 	listen          net.Listener
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
+	readTracker     *kv.ActiveTimestampTracker
 	redisTranscoder *redisTranscoder
 	pubsub          *redisPubSub
 	scriptMu        sync.RWMutex
@@ -256,6 +257,14 @@ type RedisServer struct {
 	leaderRedis map[raft.ServerAddress]string
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
+}
+
+type RedisServerOption func(*RedisServer)
+
+func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisServerOption {
+	return func(r *RedisServer) {
+		r.readTracker = tracker
+	}
 }
 
 type connState struct {
@@ -283,7 +292,7 @@ type redisResult struct {
 	err     error
 }
 
-func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *RedisPubSubRelay) *RedisServer {
+func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *RedisPubSubRelay, opts ...RedisServerOption) *RedisServer {
 	if relay == nil {
 		relay = NewRedisPubSubRelay()
 	}
@@ -383,6 +392,11 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		cmdZRevRangeByScore: r.zrevrangebyscore,
 		cmdZScore:           r.zscore,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
 
 	return r
 }
@@ -400,6 +414,13 @@ func getConnState(conn redcon.Conn) *connState {
 
 func (r *RedisServer) readTS() uint64 {
 	return snapshotTS(r.coordinator.Clock(), r.store)
+}
+
+func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
+	if r == nil || r.readTracker == nil {
+		return nil
+	}
+	return r.readTracker.Pin(ts)
 }
 
 func (r *RedisServer) Run() error {
@@ -1905,6 +1926,8 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	if err != nil {
 		return nil, err
 	}
+	readPin := r.pinReadTS(startTS)
+	defer readPin.Release()
 
 	ctx := &txnContext{
 		server:     r,
