@@ -188,6 +188,34 @@ Each manifest part entry should include:
 
 The chunk keys remain immutable. The manifest is the only key that makes an upload visible to readers.
 
+### 5.4 ETag computation
+
+ETags must match the format used by Amazon S3 so that clients and SDKs can use them for integrity checks and conditional requests.
+
+**Single-part uploads (`PutObject`):**
+
+The ETag is the lowercase hex-encoded MD5 hash of the complete object body:
+
+```
+ETag = hex(md5(object_body))
+```
+
+Example: `"d41d8cd98f00b204e9800998ecf8427e"` (MD5 of empty body).
+
+**Multipart uploads (`CompleteMultipartUpload`):**
+
+The ETag is the lowercase hex-encoded MD5 hash of the binary concatenation of the MD5 hash of each part (in part-number order), followed by a hyphen and the total number of parts:
+
+```
+ETag = hex(md5(md5_bytes(part_1) || md5_bytes(part_2) || ... || md5_bytes(part_N))) + "-N"
+```
+
+where `md5_bytes(part_i)` is the raw 16-byte MD5 digest of part `i`'s body and `N` is the number of parts.
+
+Example with 3 parts: `"abc123...-3"`.
+
+Per-part ETags stored in each part descriptor must use the single-part format (MD5 of the part body). `CompleteMultipartUpload` validates that the caller-supplied per-part ETags match the stored part descriptors before committing the manifest.
+
 ## 6. Routing Model
 
 ### 6.1 Logical route key
@@ -250,7 +278,7 @@ Detailed steps:
 2. Resolve leader for the logical object key.
 3. If local node is not the verified leader, reverse-proxy the HTTP request.
 4. Stream the body into chunk writes under a fresh hidden `upload_id`.
-5. Compute `ETag`, length, and header-derived metadata while streaming.
+5. Compute `ETag` (hex-encoded MD5 of the full object body), length, and header-derived metadata while streaming.
 6. Finalize with a small OCC transaction that writes the new manifest and optional GC marker for the previous `upload_id`.
 7. Return success only after the manifest commit is durable.
 
