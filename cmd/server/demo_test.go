@@ -27,3 +27,18 @@ func TestSetupMetricsHTTPServerRejectsInvalidAddressBeforeTokenCheck(t *testing.
 	require.Nil(t, listener)
 	require.Nil(t, server)
 }
+
+func TestSetupPprofHTTPServerAllowsBlankAddress(t *testing.T) {
+	listener, server, err := setupPprofHTTPServer(context.Background(), net.ListenConfig{}, "", "")
+	require.NoError(t, err)
+	require.Nil(t, listener)
+	require.Nil(t, server)
+}
+
+func TestSetupPprofHTTPServerRejectsInvalidAddressBeforeTokenCheck(t *testing.T) {
+	listener, server, err := setupPprofHTTPServer(context.Background(), net.ListenConfig{}, "localhost", "")
+	require.ErrorContains(t, err, `invalid pprofAddress "localhost"`)
+	require.Nil(t, listener)
+	require.Nil(t, server)
+}
+

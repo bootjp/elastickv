@@ -38,6 +38,8 @@ var (
 	dynamoAddress  = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
 	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
 	metricsToken   = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	pprofAddress   = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	pprofToken     = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftID         = flag.String("raftId", "", "Raft ID")
 	raftDataDir    = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
 	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
@@ -67,6 +69,8 @@ type config struct {
 	dynamoAddress  string
 	metricsAddress string
 	metricsToken   string
+	pprofAddress   string
+	pprofToken     string
 	raftID         string
 	raftDataDir    string
 	raftBootstrap  bool
@@ -86,6 +90,8 @@ func main() {
 			dynamoAddress:  *dynamoAddress,
 			metricsAddress: *metricsAddress,
 			metricsToken:   *metricsToken,
+			pprofAddress:   *pprofAddress,
+			pprofToken:     *pprofToken,
 			raftID:         *raftID,
 			raftDataDir:    *raftDataDir,
 			raftBootstrap:  *raftBootstrap,
@@ -106,6 +112,7 @@ func main() {
 				dynamoAddress:  "127.0.0.1:63801",
 				metricsAddress: "0.0.0.0:9091",
 				metricsToken:   demoMetricsToken,
+				pprofAddress:   "127.0.0.1:6061",
 				raftID:         "n1",
 				raftDataDir:    "", // In-memory
 				raftBootstrap:  true,
@@ -116,6 +123,7 @@ func main() {
 				dynamoAddress:  "127.0.0.1:63802",
 				metricsAddress: "0.0.0.0:9092",
 				metricsToken:   demoMetricsToken,
+				pprofAddress:   "127.0.0.1:6062",
 				raftID:         "n2",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -126,6 +134,7 @@ func main() {
 				dynamoAddress:  "127.0.0.1:63803",
 				metricsAddress: "0.0.0.0:9093",
 				metricsToken:   demoMetricsToken,
+				pprofAddress:   "127.0.0.1:6063",
 				raftID:         "n3",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -452,6 +461,15 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 			_ = metricsL.Close()
 		})
 	}
+	pprofL, ps, err := setupPprofHTTPServer(ctx, lc, cfg.pprofAddress, cfg.pprofToken)
+	if err != nil {
+		return err
+	}
+	if pprofL != nil {
+		cleanup.Add(func() {
+			_ = pprofL.Close()
+		})
+	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(func() error { return compactor.Run(ctx) })
@@ -463,6 +481,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
 	eg.Go(monitoring.MetricsShutdownTask(ctx, ms, cfg.metricsAddress))
 	eg.Go(monitoring.MetricsServeTask(ms, metricsL, cfg.metricsAddress))
+	eg.Go(monitoring.PprofShutdownTask(ctx, ps, cfg.pprofAddress))
+	eg.Go(monitoring.PprofServeTask(ps, pprofL, cfg.pprofAddress))
 
 	cleanup.Release()
 	return nil
@@ -476,7 +496,7 @@ func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAdd
 	if _, _, err := net.SplitHostPort(metricsAddress); err != nil {
 		return nil, nil, errors.Wrapf(err, "invalid metricsAddress %q", metricsAddress)
 	}
-	if monitoring.MetricsAddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
+	if monitoring.AddressRequiresToken(metricsAddress) && strings.TrimSpace(metricsToken) == "" {
 		return nil, nil, errors.New("metricsToken is required when metricsAddress is not loopback")
 	}
 	metricsL, err := lc.Listen(ctx, "tcp", metricsAddress)
@@ -485,6 +505,25 @@ func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAdd
 	}
 	ms := monitoring.NewMetricsServer(handler, metricsToken)
 	return metricsL, ms, nil
+}
+
+func setupPprofHTTPServer(ctx context.Context, lc net.ListenConfig, pprofAddress string, pprofToken string) (net.Listener, *http.Server, error) {
+	pprofAddress = strings.TrimSpace(pprofAddress)
+	if pprofAddress == "" {
+		return nil, nil, nil
+	}
+	if _, _, err := net.SplitHostPort(pprofAddress); err != nil {
+		return nil, nil, errors.Wrapf(err, "invalid pprofAddress %q", pprofAddress)
+	}
+	if monitoring.AddressRequiresToken(pprofAddress) && strings.TrimSpace(pprofToken) == "" {
+		return nil, nil, errors.New("pprofToken is required when pprofAddress is not loopback")
+	}
+	pprofL, err := lc.Listen(ctx, "tcp", pprofAddress)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	ps := monitoring.NewPprofServer(pprofToken)
+	return pprofL, ps, nil
 }
 
 func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
