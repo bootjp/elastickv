@@ -240,7 +240,7 @@ must all normalize to the same logical route key.
 
 Two existing core paths need to be generalized for S3:
 
-1. `kv/routeKey` must recognize S3 internal prefixes, similar to how it already normalizes Redis internal keys and list keys.
+1. The `routeKey(...)` function must recognize S3 internal prefixes, similar to how it already normalizes Redis internal keys and list keys.
 2. `kv/ShardStore.routesForScan` must gain an S3-aware internal scan mapping so `ListObjectsV2` can scan object manifests across shards using logical object ranges instead of raw `!s3|...` key order.
 
 Without these changes, object metadata writes may be routed correctly while object listings still scan the wrong shard ranges.
