@@ -20,6 +20,7 @@ const (
 	pubsubArrayReply    = 3 // ["subscribe"/"unsubscribe", channel, count]
 	pubsubArrayPong     = 2 // ["pong", data]
 	pubsubMinArgs       = 2 // command + at least one channel
+	selectArgCount      = 2 // command name + db index argument
 
 	cmdSubscribe    = "SUBSCRIBE"
 	cmdUnsubscribe  = "UNSUBSCRIBE"
@@ -334,7 +335,7 @@ func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bo
 		return false
 	}
 	// Enforce Redis arity: SELECT requires exactly one DB index argument.
-	if len(args) != 2 {
+	if len(args) != selectArgCount {
 		s.writeError("ERR wrong number of arguments for 'select' command")
 		return true
 	}

@@ -506,11 +506,11 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 			// Defensive check: While uint64 overflow is not expected in normal operation,
 			// this handles the edge case where startTS==^uint64(0) or a bug causes overflow.
 			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
-			return errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+			return NewTxnLockedErrorWithDetail(key, "timestamp overflow")
 		}
 		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusPending:
-		return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+		return NewTxnLockedError(key)
 	default:
 		return errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(key))
 	}
@@ -669,13 +669,13 @@ func (s *ShardStore) cachedLockTxnStatus(ctx context.Context, plan *scanLockPlan
 func lockResolutionForStatus(state lockTxnStatus, lock txnLock, key []byte, cleanupNow uint64) (pb.Phase, uint64, error) {
 	switch state.status {
 	case txnStatusPending:
-		return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+		return pb.Phase_NONE, 0, NewTxnLockedError(key)
 	case txnStatusCommitted:
 		return pb.Phase_COMMIT, state.commitTS, nil
 	case txnStatusRolledBack:
 		abortTS := cleanupTSWithNow(lock.StartTS, cleanupNow)
 		if abortTS <= lock.StartTS {
-			return pb.Phase_NONE, 0, errors.Wrapf(ErrTxnLocked, "key: %s (timestamp overflow)", string(key))
+			return pb.Phase_NONE, 0, NewTxnLockedErrorWithDetail(key, "timestamp overflow")
 		}
 		return pb.Phase_ABORT, abortTS, nil
 	default:

@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"maps"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,8 +19,9 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
-	touched map[string]struct{}
-	deleted map[string]bool
+	touched     map[string]struct{}
+	deleted     map[string]bool
+	everDeleted map[string]bool
 
 	strings map[string]*luaStringState
 	lists   map[string]*luaListState
@@ -38,10 +40,16 @@ type luaStringState struct {
 }
 
 type luaListState struct {
-	loaded bool
-	exists bool
-	dirty  bool
-	values []string
+	loaded       bool
+	exists       bool
+	dirty        bool
+	materialized bool
+	meta         store.ListMeta
+	leftTrim     int64
+	rightTrim    int64
+	leftValues   []string
+	rightValues  []string
+	values       []string
 }
 
 type luaHashState struct {
@@ -76,6 +84,24 @@ type luaTTLState struct {
 	loaded bool
 	dirty  bool
 	value  *time.Time
+}
+
+func (s *luaListState) currentLen() int64 {
+	if !s.exists {
+		return 0
+	}
+	if s.materialized {
+		return int64(len(s.values))
+	}
+	return int64(len(s.leftValues)) + s.remainingOriginalLen() + int64(len(s.rightValues))
+}
+
+func (s *luaListState) remainingOriginalLen() int64 {
+	remaining := s.meta.Len - s.leftTrim - s.rightTrim
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 type zScoreBound struct {
@@ -164,18 +190,19 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 	startTS := server.readTS()
 	return &luaScriptContext{
-		server:  server,
-		startTS: startTS,
-		readPin: server.pinReadTS(startTS),
-		touched: map[string]struct{}{},
-		deleted: map[string]bool{},
-		strings: map[string]*luaStringState{},
-		lists:   map[string]*luaListState{},
-		hashes:  map[string]*luaHashState{},
-		sets:    map[string]*luaSetState{},
-		zsets:   map[string]*luaZSetState{},
-		streams: map[string]*luaStreamState{},
-		ttls:    map[string]*luaTTLState{},
+		server:      server,
+		startTS:     startTS,
+		readPin:     server.pinReadTS(startTS),
+		touched:     map[string]struct{}{},
+		deleted:     map[string]bool{},
+		everDeleted: map[string]bool{},
+		strings:     map[string]*luaStringState{},
+		lists:       map[string]*luaListState{},
+		hashes:      map[string]*luaHashState{},
+		sets:        map[string]*luaSetState{},
+		zsets:       map[string]*luaZSetState{},
+		streams:     map[string]*luaStreamState{},
+		ttls:        map[string]*luaTTLState{},
 	}
 }
 
@@ -240,6 +267,7 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 	k := string(key)
 	c.markTouched(key)
 	c.deleted[k] = true
+	c.everDeleted[k] = true
 	c.clearTTL(key)
 
 	if st, ok := c.strings[k]; ok {
@@ -252,6 +280,12 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 		st.loaded = true
 		st.exists = false
 		st.dirty = true
+		st.materialized = false
+		st.meta = store.ListMeta{}
+		st.leftTrim = 0
+		st.rightTrim = 0
+		st.leftValues = nil
+		st.rightValues = nil
 		st.values = nil
 	}
 	if st, ok := c.hashes[k]; ok {
@@ -432,14 +466,65 @@ func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
 		return nil, wrongTypeError()
 	}
 
-	values, err := c.server.listValuesAt(context.Background(), key, c.startTS)
+	meta, exists, err := c.server.loadListMetaAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
 	st.loaded = true
-	st.exists = true
-	st.values = append([]string(nil), values...)
+	st.exists = exists
+	st.meta = meta
 	return st, nil
+}
+
+func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
+	if st.materialized {
+		return nil
+	}
+	if !st.exists {
+		st.materialized = true
+		st.values = nil
+		return nil
+	}
+
+	length := st.currentLen()
+	maxInt64 := int64(math.MaxInt)
+	if length > maxInt64 {
+		length = maxInt64
+	}
+	values := make([]string, 0, int(length))
+	values = append(values, st.leftValues...)
+	if remaining := st.remainingOriginalLen(); remaining > 0 {
+		start := st.leftTrim
+		end := st.meta.Len - st.rightTrim - 1
+		fetched, err := c.server.fetchListRange(context.Background(), key, st.meta, start, end, c.startTS)
+		if err != nil {
+			return err
+		}
+		values = append(values, fetched...)
+	}
+	values = append(values, st.rightValues...)
+
+	st.materialized = true
+	st.leftTrim = 0
+	st.rightTrim = 0
+	st.leftValues = nil
+	st.rightValues = nil
+	st.values = values
+	return nil
+}
+
+func (c *luaScriptContext) materializedListForRead(key string) (*luaListState, bool, error) {
+	st, err := c.listState([]byte(key))
+	if err != nil {
+		return nil, false, err
+	}
+	if !st.exists || st.currentLen() == 0 {
+		return st, false, nil
+	}
+	if err := c.materializeList([]byte(key), st); err != nil {
+		return nil, false, err
+	}
+	return st, len(st.values) > 0, nil
 }
 
 func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
@@ -611,6 +696,12 @@ func (c *luaScriptContext) markListValue(key []byte, values []string) error {
 	st.loaded = true
 	st.exists = true
 	st.dirty = true
+	st.materialized = true
+	st.meta = store.ListMeta{}
+	st.leftTrim = 0
+	st.rightTrim = 0
+	st.leftValues = nil
+	st.rightValues = nil
 	st.values = append([]string(nil), values...)
 	c.markTouched(key)
 	c.deleted[string(key)] = false
@@ -996,6 +1087,9 @@ func (c *luaScriptContext) renameListValue(src, dst []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := c.materializeList(src, st); err != nil {
+		return err
+	}
 	c.deleteLogical(dst)
 	return c.markListValue(dst, st.values)
 }
@@ -1249,20 +1343,37 @@ func (c *luaScriptContext) pushList(args []string, left bool) (luaReply, error) 
 	}
 	if !st.exists {
 		st.exists = true
-		st.values = []string{}
+		st.materialized = false
+		st.meta = store.ListMeta{}
+		st.leftTrim = 0
+		st.rightTrim = 0
+		st.leftValues = nil
+		st.rightValues = nil
+		st.values = nil
 	}
-	for _, value := range args[1:] {
-		if left {
-			st.values = append([]string{value}, st.values...)
-		} else {
-			st.values = append(st.values, value)
+	switch {
+	case st.materialized:
+		for _, value := range args[1:] {
+			if left {
+				st.values = append([]string{value}, st.values...)
+			} else {
+				st.values = append(st.values, value)
+			}
 		}
+	case left:
+		prepended := make([]string, 0, len(args)-1+len(st.leftValues))
+		for i := len(args) - 1; i >= 1; i-- {
+			prepended = append(prepended, args[i])
+		}
+		st.leftValues = append(prepended, st.leftValues...)
+	default:
+		st.rightValues = append(st.rightValues, args[1:]...)
 	}
 	st.loaded = true
 	st.dirty = true
 	c.markTouched([]byte(args[0]))
 	c.deleted[args[0]] = false
-	return luaIntReply(int64(len(st.values))), nil
+	return luaIntReply(st.currentLen()), nil
 }
 
 func (c *luaScriptContext) cmdLLen(args []string) (luaReply, error) {
@@ -1276,18 +1387,15 @@ func (c *luaScriptContext) cmdLLen(args []string) (luaReply, error) {
 	if !st.exists {
 		return luaIntReply(0), nil
 	}
-	return luaIntReply(int64(len(st.values))), nil
+	return luaIntReply(st.currentLen()), nil
 }
 
 func (c *luaScriptContext) cmdLIndex(args []string) (luaReply, error) {
-	st, err := c.listState([]byte(args[0]))
+	st, ok, err := c.materializedListForRead(args[0])
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return luaNilReply(), nil
-		}
 		return luaReply{}, err
 	}
-	if !st.exists || len(st.values) == 0 {
+	if !ok {
 		return luaNilReply(), nil
 	}
 	index, err := strconv.Atoi(args[1])
@@ -1304,14 +1412,11 @@ func (c *luaScriptContext) cmdLIndex(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdLRange(args []string) (luaReply, error) {
-	st, err := c.listState([]byte(args[0]))
+	st, ok, err := c.materializedListForRead(args[0])
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return luaArrayReply(), nil
-		}
 		return luaReply{}, err
 	}
-	if !st.exists || len(st.values) == 0 {
+	if !ok {
 		return luaArrayReply(), nil
 	}
 	start, err := strconv.Atoi(args[1])
@@ -1341,7 +1446,13 @@ func (c *luaScriptContext) cmdLRem(args []string) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
-	if !st.exists || len(st.values) == 0 {
+	if !st.exists || st.currentLen() == 0 {
+		return luaIntReply(0), nil
+	}
+	if err := c.materializeList([]byte(args[0]), st); err != nil {
+		return luaReply{}, err
+	}
+	if len(st.values) == 0 {
 		return luaIntReply(0), nil
 	}
 	count, err := strconv.Atoi(args[1])
@@ -1425,7 +1536,13 @@ func (c *luaScriptContext) cmdLTrim(args []string) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
-	if !st.exists || len(st.values) == 0 {
+	if !st.exists || st.currentLen() == 0 {
+		return luaStatusReply("OK"), nil
+	}
+	if err := c.materializeList([]byte(args[0]), st); err != nil {
+		return luaReply{}, err
+	}
+	if len(st.values) == 0 {
 		return luaStatusReply("OK"), nil
 	}
 	start, err := strconv.Atoi(args[1])
@@ -1468,25 +1585,93 @@ func (c *luaScriptContext) popList(key string, left bool) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
-	if !st.exists || len(st.values) == 0 {
+	if !st.exists || st.currentLen() == 0 {
 		return luaNilReply(), nil
 	}
 	var value string
-	if left {
-		value = st.values[0]
-		st.values = st.values[1:]
+	if st.materialized {
+		if left {
+			value = st.values[0]
+			st.values = st.values[1:]
+		} else {
+			value = st.values[len(st.values)-1]
+			st.values = st.values[:len(st.values)-1]
+		}
 	} else {
-		value = st.values[len(st.values)-1]
-		st.values = st.values[:len(st.values)-1]
+		value, err = c.popLazyListValue([]byte(key), st, left)
+		if err != nil {
+			return luaReply{}, err
+		}
 	}
 	st.dirty = true
-	if len(st.values) == 0 {
+	if st.currentLen() == 0 {
 		st.exists = false
+		st.materialized = false
+		st.meta = store.ListMeta{}
+		st.leftTrim = 0
+		st.rightTrim = 0
+		st.leftValues = nil
+		st.rightValues = nil
+		st.values = nil
 		c.deleted[key] = true
 		c.clearTTL([]byte(key))
 	}
 	c.markTouched([]byte(key))
 	return luaStringReply(value), nil
+}
+
+func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, error) {
+	if left {
+		return c.popLazyListLeft(key, st)
+	}
+	return c.popLazyListRight(key, st)
+}
+
+func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string, error) {
+	if len(st.leftValues) > 0 {
+		value := st.leftValues[0]
+		st.leftValues = st.leftValues[1:]
+		return value, nil
+	}
+	if remaining := st.remainingOriginalLen(); remaining > 0 {
+		values, err := c.server.fetchListRange(context.Background(), key, st.meta, st.leftTrim, st.leftTrim, c.startTS)
+		if err != nil {
+			return "", err
+		}
+		if len(values) == 0 {
+			return "", errors.WithStack(store.ErrKeyNotFound)
+		}
+		st.leftTrim++
+		return values[0], nil
+	}
+	value := st.rightValues[0]
+	st.rightValues = st.rightValues[1:]
+	return value, nil
+}
+
+func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (string, error) {
+	if len(st.rightValues) > 0 {
+		last := len(st.rightValues) - 1
+		value := st.rightValues[last]
+		st.rightValues = st.rightValues[:last]
+		return value, nil
+	}
+	if remaining := st.remainingOriginalLen(); remaining > 0 {
+		index := st.meta.Len - st.rightTrim - 1
+		values, err := c.server.fetchListRange(context.Background(), key, st.meta, index, index, c.startTS)
+		if err != nil {
+			return "", err
+		}
+		if len(values) == 0 {
+			return "", errors.WithStack(store.ErrKeyNotFound)
+		}
+		st.rightTrim++
+		return values[0], nil
+	}
+	last := len(st.leftValues) - 1
+	value := st.leftValues[last]
+	st.leftValues = st.leftValues[:last]
+	return value, nil
 }
 
 func (c *luaScriptContext) cmdRPopLPush(args []string) (luaReply, error) {
@@ -1511,6 +1696,9 @@ func (c *luaScriptContext) cmdLPos(args []string) (luaReply, error) {
 	if !st.exists {
 		return luaNilReply(), nil
 	}
+	if err := c.materializeList([]byte(args[0]), st); err != nil {
+		return luaReply{}, err
+	}
 	for i, value := range st.values {
 		if value == args[1] {
 			return luaIntReply(int64(i)), nil
@@ -1522,6 +1710,9 @@ func (c *luaScriptContext) cmdLPos(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdLSet(args []string) (luaReply, error) {
 	st, err := c.listState([]byte(args[0]))
 	if err != nil {
+		return luaReply{}, err
+	}
+	if err := c.materializeList([]byte(args[0]), st); err != nil {
 		return luaReply{}, err
 	}
 	if !st.exists || len(st.values) == 0 {
@@ -2228,6 +2419,11 @@ func parseLuaXTrimArgs(args []string) ([]byte, int, error) {
 	return []byte(args[0]), maxLen, nil
 }
 
+type luaCommitPlan struct {
+	preserveExisting bool
+	elems            []*kv.Elem[kv.OP]
+}
+
 func (c *luaScriptContext) commit() error {
 	keys := make([]string, 0, len(c.touched))
 	for key := range c.touched {
@@ -2254,56 +2450,98 @@ func (c *luaScriptContext) commit() error {
 }
 
 func (c *luaScriptContext) commitElemsForKey(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
-	deleteElems, _, err := c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
-	if err != nil {
-		return nil, err
-	}
-
 	finalType, err := c.finalType([]byte(key))
 	if err != nil {
 		return nil, err
 	}
 
-	valueElems, err := c.valueCommitElems(key, finalType)
-	if err != nil {
-		return nil, err
-	}
-	ttlElems, err := c.ttlCommitElems(key, finalType)
+	valuePlan, err := c.valueCommitPlan(key, finalType)
 	if err != nil {
 		return nil, err
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valueElems)+len(ttlElems))
+	var deleteElems []*kv.Elem[kv.OP]
+	if !valuePlan.preserveExisting {
+		deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ttlElems, err := c.ttlCommitElems(key, finalType, valuePlan.preserveExisting)
+	if err != nil {
+		return nil, err
+	}
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems)+len(ttlElems))
 	elems = append(elems, deleteElems...)
-	elems = append(elems, valueElems...)
+	elems = append(elems, valuePlan.elems...)
 	elems = append(elems, ttlElems...)
 	return elems, nil
 }
 
-func (c *luaScriptContext) valueCommitElems(key string, finalType redisValueType) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType) (luaCommitPlan, error) {
 	switch finalType {
 	case redisTypeNone:
-		return nil, nil
+		return luaCommitPlan{}, nil
 	case redisTypeString:
-		st := c.strings[key]
-		return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte(key), Value: append([]byte(nil), st.value...)}}, nil
+		elems, err := c.stringCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	case redisTypeList:
-		return c.listCommitElems(key)
+		return c.listCommitPlan(key)
 	case redisTypeHash:
-		return c.hashCommitElems(key)
+		elems, err := c.hashCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	case redisTypeSet:
-		return c.setCommitElems(key)
+		elems, err := c.setCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	case redisTypeZSet:
-		return c.zsetCommitElems(key)
+		elems, err := c.zsetCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	case redisTypeStream:
-		return c.streamCommitElems(key)
+		elems, err := c.streamCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	default:
-		return nil, errors.New("ERR unsupported final redis type")
+		return luaCommitPlan{}, errors.New("ERR unsupported final redis type")
 	}
 }
 
-func (c *luaScriptContext) listCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st, err := c.stringState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte(key), Value: append([]byte(nil), st.value...)}}, nil
+}
+
+func (c *luaScriptContext) listCommitPlan(key string) (luaCommitPlan, error) {
 	st := c.lists[key]
+	if st == nil || !st.dirty {
+		return luaCommitPlan{preserveExisting: true}, nil
+	}
+	if st.materialized {
+		elems, err := c.listCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
+	}
+	// If the key was deleted earlier in this script and later recreated as a
+	// list, we must perform a full rewrite (preserveExisting=false) so that
+	// deleteLogicalKeyElems is called and any orphaned storage items from the
+	// previous incarnation of the key are cleaned up before writing the delta.
+	if c.everDeleted[key] {
+		elems, err := c.listCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
+	}
+	elems, err := c.listDeltaCommitElems(key, st)
+	return luaCommitPlan{preserveExisting: true, elems: elems}, err
+}
+
+func (c *luaScriptContext) listCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	st, err := c.listState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	if err := c.materializeList([]byte(key), st); err != nil {
+		return nil, err
+	}
 	values := make([][]byte, 0, len(st.values))
 	for _, value := range st.values {
 		values = append(values, []byte(value))
@@ -2316,8 +2554,72 @@ func (c *luaScriptContext) listCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	return listElems, nil
 }
 
+func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState) ([]*kv.Elem[kv.OP], error) {
+	if !st.exists || st.currentLen() == 0 {
+		return nil, nil
+	}
+
+	newHead, rightStart, err := validateListDeltaRanges(st)
+	if err != nil {
+		return nil, err
+	}
+	newMeta := store.ListMeta{
+		Head: newHead,
+		Len:  st.currentLen(),
+		Tail: newHead + st.currentLen(),
+	}
+	metaBytes, err := store.MarshalListMeta(newMeta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	elems := make([]*kv.Elem[kv.OP], 0, int(st.leftTrim+st.rightTrim)+len(st.leftValues)+len(st.rightValues)+1)
+	elems = appendListTrimDeletes(elems, []byte(key), st)
+	elems = appendListPuts(elems, []byte(key), st.leftValues, newHead)
+	elems = appendListPuts(elems, []byte(key), st.rightValues, rightStart)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey([]byte(key)), Value: metaBytes})
+	return elems, nil
+}
+
+func validateListDeltaRanges(st *luaListState) (int64, int64, error) {
+	remainingHead := st.meta.Head + st.leftTrim
+	if remainingHead < math.MinInt64+int64(len(st.leftValues)) {
+		return 0, 0, errors.WithStack(errors.New("LPUSH would underflow list Head sequence number"))
+	}
+	newHead := remainingHead - int64(len(st.leftValues))
+	rightStart := st.meta.Tail - st.rightTrim
+	if len(st.rightValues) > 0 && rightStart > math.MaxInt64-int64(len(st.rightValues)) {
+		return 0, 0, errors.WithStack(errors.New("RPUSH would overflow list Tail sequence number"))
+	}
+	return newHead, rightStart, nil
+}
+
+func appendListTrimDeletes(elems []*kv.Elem[kv.OP], key []byte, st *luaListState) []*kv.Elem[kv.OP] {
+	for seq := st.meta.Head; seq < st.meta.Head+st.leftTrim; seq++ {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+	}
+	for seq := st.meta.Tail - st.rightTrim; seq < st.meta.Tail; seq++ {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+	}
+	return elems
+}
+
+func appendListPuts(elems []*kv.Elem[kv.OP], key []byte, values []string, startSeq int64) []*kv.Elem[kv.OP] {
+	for i, value := range values {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   listItemKey(key, startSeq+int64(i)),
+			Value: []byte(value),
+		})
+	}
+	return elems
+}
+
 func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
-	st := c.hashes[key]
+	st, err := c.hashState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	payload, err := marshalHashValue(st.value)
 	if err != nil {
 		return nil, err
@@ -2326,7 +2628,10 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 }
 
 func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
-	st := c.sets[key]
+	st, err := c.setState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	payload, err := marshalSetValue(redisSetValue{Members: sortedSetMembers(st.members)})
 	if err != nil {
 		return nil, err
@@ -2335,7 +2640,10 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 }
 
 func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
-	st := c.zsets[key]
+	st, err := c.zsetState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
 	if err != nil {
 		return nil, err
@@ -2344,7 +2652,10 @@ func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error
 }
 
 func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
-	st := c.streams[key]
+	st, err := c.streamState([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	payload, err := marshalStreamValue(st.value)
 	if err != nil {
 		return nil, err
@@ -2352,9 +2663,14 @@ func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStreamKey([]byte(key)), Value: payload}}, nil
 }
 
-func (c *luaScriptContext) ttlCommitElems(key string, finalType redisValueType) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) ttlCommitElems(key string, finalType redisValueType, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
 	if finalType == redisTypeNone {
 		return nil, nil
+	}
+	if preserveExisting {
+		if st := c.ttls[key]; st == nil || !st.dirty {
+			return nil, nil
+		}
 	}
 
 	ttl, err := c.finalTTL([]byte(key))
@@ -2362,6 +2678,9 @@ func (c *luaScriptContext) ttlCommitElems(key string, finalType redisValueType) 
 		return nil, err
 	}
 	if ttl == nil {
+		if preserveExisting {
+			return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey([]byte(key))}}, nil
+		}
 		return nil, nil
 	}
 

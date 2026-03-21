@@ -84,3 +84,14 @@ func txnRouteKey(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 }
+
+// ExtractTxnUserKey returns the logical user key embedded in a transaction-
+// internal key such as !txn|lock|, !txn|cmt|, or !txn|meta|. It returns nil
+// when the key does not use a transaction-internal namespace or is malformed.
+func ExtractTxnUserKey(key []byte) []byte {
+	userKey, ok := txnRouteKey(key)
+	if !ok {
+		return nil
+	}
+	return userKey
+}
