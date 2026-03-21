@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -110,4 +111,95 @@ func TestRedis_LuaReplyHelpers(t *testing.T) {
 
 	_, err = rdb.Eval(ctx, `return redis.error_reply("boom")`, nil).Result()
 	require.ErrorContains(t, err, "boom")
+}
+
+func TestRedis_LuaRPopLPushBullMQLikeLists(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.RPush(ctx, "bull:test:wait", "job-1", "job-2", "job-3").Err())
+	require.NoError(t, rdb.LPush(ctx, "bull:test:active", "job-0").Err())
+
+	result, err := rdb.Eval(ctx, `
+local moved = redis.call("RPOPLPUSH", KEYS[1], KEYS[2])
+return {moved, redis.call("LLEN", KEYS[1]), redis.call("LLEN", KEYS[2])}
+`, []string{"bull:test:wait", "bull:test:active"}).Result()
+	require.NoError(t, err)
+
+	values, ok := result.([]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"job-3", int64(2), int64(2)}, values)
+
+	waiting, err := rdb.LRange(ctx, "bull:test:wait", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-1", "job-2"}, waiting)
+
+	active, err := rdb.LRange(ctx, "bull:test:active", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-3", "job-0"}, active)
+}
+
+func TestRedis_LuaRPopLPushPreservesTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.RPush(ctx, "bull:test:rotate", "job-1", "job-2", "job-3").Err())
+	require.NoError(t, rdb.PExpire(ctx, "bull:test:rotate", time.Minute).Err())
+
+	result, err := rdb.Eval(ctx, `
+local moved = redis.call("RPOPLPUSH", KEYS[1], KEYS[1])
+return {moved, redis.call("LLEN", KEYS[1])}
+`, []string{"bull:test:rotate"}).Result()
+	require.NoError(t, err)
+
+	values, ok := result.([]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"job-3", int64(3)}, values)
+
+	rotated, err := rdb.LRange(ctx, "bull:test:rotate", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-3", "job-1", "job-2"}, rotated)
+
+	ttl, err := rdb.PTTL(ctx, "bull:test:rotate").Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+}
+
+func TestRedis_LuaDelAndRecreateListNoOrphan(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// Pre-populate a list so there are existing storage items.
+	require.NoError(t, rdb.RPush(ctx, "mylist", "a", "b", "c").Err())
+
+	// In a single Lua script: DEL the key, then recreate it as a list.
+	// After the script, only the new items should be visible; the old
+	// [a, b, c] items must not be orphaned/leaked in storage.
+	result, err := rdb.Eval(ctx, `
+redis.call("DEL", KEYS[1])
+redis.call("RPUSH", KEYS[1], "d")
+return redis.call("LRANGE", KEYS[1], 0, -1)
+`, []string{"mylist"}).Result()
+	require.NoError(t, err)
+
+	values, ok := result.([]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"d"}, values, "list should contain only the newly pushed item")
+
+	// Verify via a plain LRANGE that the old items are gone.
+	final, err := rdb.LRange(ctx, "mylist", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"d"}, final)
 }
