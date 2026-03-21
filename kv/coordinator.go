@@ -116,9 +116,9 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateR
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
-	logs := txnRequests(startTS, commitTS, defaultTxnLockTTLms, primary, reqs)
-
-	r, err := c.transactionManager.Commit(logs)
+	r, err := c.transactionManager.Commit([]*pb.Request{
+		onePhaseTxnRequest(startTS, commitTS, primary, reqs),
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -209,7 +209,9 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if len(primary) == 0 {
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 		}
-		requests = txnRequests(reqs.StartTS, 0, defaultTxnLockTTLms, primary, reqs.Elems)
+		requests = []*pb.Request{
+			onePhaseTxnRequest(reqs.StartTS, 0, primary, reqs.Elems),
+		}
 	} else {
 		for _, req := range reqs.Elems {
 			requests = append(requests, c.toRawRequest(req))
@@ -261,33 +263,17 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func txnRequests(startTS, commitTS, lockTTLms uint64, primaryKey []byte, reqs []*Elem[OP]) []*pb.Request {
-	meta := &pb.Mutation{
-		Op:    pb.Op_PUT,
-		Key:   []byte(txnMetaPrefix),
-		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: lockTTLms, CommitTS: 0}),
-	}
-
-	prepareMuts := make([]*pb.Mutation, 0, len(reqs)+1)
-	prepareMuts = append(prepareMuts, meta)
+func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP]) *pb.Request {
+	muts := make([]*pb.Mutation, 0, len(reqs)+1)
+	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
 	for _, req := range reqs {
-		prepareMuts = append(prepareMuts, elemToMutation(req))
+		muts = append(muts, elemToMutation(req))
 	}
-
-	commitMeta := &pb.Mutation{
-		Op:    pb.Op_PUT,
-		Key:   []byte(txnMetaPrefix),
-		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS}),
-	}
-	commitMuts := make([]*pb.Mutation, 0, len(reqs)+1)
-	commitMuts = append(commitMuts, commitMeta)
-	for _, req := range reqs {
-		commitMuts = append(commitMuts, &pb.Mutation{Op: pb.Op_PUT, Key: req.Key})
-	}
-
-	return []*pb.Request{
-		{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: prepareMuts},
-		{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: commitMuts},
+	return &pb.Request{
+		IsTxn:     true,
+		Phase:     pb.Phase_NONE,
+		Ts:        startTS,
+		Mutations: muts,
 	}
 }
 

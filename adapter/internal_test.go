@@ -103,6 +103,37 @@ func TestFillForwardedTxnCommitTS_PreservesExistingCommitTS(t *testing.T) {
 	require.Equal(t, uint64(42), meta.CommitTS)
 }
 
+func TestFillForwardedTxnCommitTS_AssignsCommitTSForOnePhaseTxn(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	startTS := uint64(10)
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_NONE,
+			Mutations: []*pb.Mutation{
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte(kv.TxnMetaPrefix),
+					Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 0}),
+				},
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte("k"),
+					Value: []byte("v"),
+				},
+			},
+		},
+	}
+
+	require.NoError(t, i.fillForwardedTxnCommitTS(reqs, startTS))
+
+	meta, err := kv.DecodeTxnMeta(reqs[0].Mutations[0].Value)
+	require.NoError(t, err)
+	require.Equal(t, startTS+1, meta.CommitTS)
+}
+
 func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	t.Parallel()
 

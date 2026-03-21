@@ -130,10 +130,10 @@ func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
 }
 
 func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, bool) {
-	if r == nil {
+	if r == nil || !r.IsTxn {
 		return nil, false
 	}
-	if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_ABORT {
+	if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_ABORT && r.Phase != pb.Phase_NONE {
 		return nil, false
 	}
 	if len(r.Mutations) == 0 || r.Mutations[0] == nil {

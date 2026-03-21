@@ -143,3 +143,38 @@ func TestPrepareClampsHugeLockTTL(t *testing.T) {
 	maxDelta := maxTxnLockTTLms << hlcLogicalBits
 	require.LessOrEqual(t, lock.TTLExpireAt-now, maxDelta)
 }
+
+func TestOnePhaseTxnCommitsWithoutTxnArtifacts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(15)
+	commitTS := uint64(25)
+	key := []byte("k")
+	req := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}
+
+	require.NoError(t, applyFSMRequest(t, fsm, req))
+
+	value, err := st.GetAt(ctx, key, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), value)
+
+	_, err = st.GetAt(ctx, txnLockKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnIntentKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnCommitKey(key, startTS), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
