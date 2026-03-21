@@ -285,9 +285,6 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
-		return errors.WithStack(err)
-	}
 
 	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
 	if err != nil {

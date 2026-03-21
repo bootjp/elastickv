@@ -71,3 +71,35 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), v)
 }
+
+func TestOnePhaseTxnDetectsWriteConflict(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v1"), 100, 0))
+
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	// One-phase txn with startTS < latest commit (100) should be rejected.
+	req := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("k"), CommitTS: 110})},
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v2")},
+		},
+	}
+	data, err := proto.Marshal(req)
+	require.NoError(t, err)
+
+	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	err, ok = resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+
+	// Ensure the original value is unchanged.
+	v, err := st.GetAt(ctx, []byte("k"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), v)
+}
