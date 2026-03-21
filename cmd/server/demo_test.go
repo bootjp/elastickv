@@ -41,4 +41,3 @@ func TestSetupPprofHTTPServerRejectsInvalidAddressBeforeTokenCheck(t *testing.T)
 	require.Nil(t, listener)
 	require.Nil(t, server)
 }
-

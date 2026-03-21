@@ -452,23 +452,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 	)
 	cleanup.Add(ds.Stop)
-	metricsL, ms, err := setupMetricsHTTPServer(ctx, lc, cfg.metricsAddress, cfg.metricsToken, metricsRegistry.Handler())
+	metricsL, ms, pprofL, ps, err := setupObservabilityServers(ctx, lc, &cleanup, cfg, metricsRegistry.Handler())
 	if err != nil {
 		return err
-	}
-	if metricsL != nil {
-		cleanup.Add(func() {
-			_ = metricsL.Close()
-		})
-	}
-	pprofL, ps, err := setupPprofHTTPServer(ctx, lc, cfg.pprofAddress, cfg.pprofToken)
-	if err != nil {
-		return err
-	}
-	if pprofL != nil {
-		cleanup.Add(func() {
-			_ = pprofL.Close()
-		})
 	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
@@ -486,6 +472,24 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	cleanup.Release()
 	return nil
+}
+
+func setupObservabilityServers(ctx context.Context, lc net.ListenConfig, cleanup *internalutil.CleanupStack, cfg config, metricsHandler http.Handler) (metricsL net.Listener, ms *http.Server, pprofL net.Listener, ps *http.Server, err error) {
+	metricsL, ms, err = setupMetricsHTTPServer(ctx, lc, cfg.metricsAddress, cfg.metricsToken, metricsHandler)
+	if err != nil {
+		return
+	}
+	if metricsL != nil {
+		cleanup.Add(func() { _ = metricsL.Close() })
+	}
+	pprofL, ps, err = setupPprofHTTPServer(ctx, lc, cfg.pprofAddress, cfg.pprofToken)
+	if err != nil {
+		return
+	}
+	if pprofL != nil {
+		cleanup.Add(func() { _ = pprofL.Close() })
+	}
+	return
 }
 
 func setupMetricsHTTPServer(ctx context.Context, lc net.ListenConfig, metricsAddress string, metricsToken string, handler http.Handler) (net.Listener, *http.Server, error) {
