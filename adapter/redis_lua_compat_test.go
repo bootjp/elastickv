@@ -174,32 +174,32 @@ return {moved, redis.call("LLEN", KEYS[1])}
 }
 
 func TestRedis_LuaDelAndRecreateListNoOrphan(t *testing.T) {
-nodes, _, _ := createNode(t, 3)
-defer shutdown(nodes)
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
 
-ctx := context.Background()
-rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
 
-// Pre-populate a list so there are existing storage items.
-require.NoError(t, rdb.RPush(ctx, "mylist", "a", "b", "c").Err())
+	// Pre-populate a list so there are existing storage items.
+	require.NoError(t, rdb.RPush(ctx, "mylist", "a", "b", "c").Err())
 
-// In a single Lua script: DEL the key, then recreate it as a list.
-// After the script, only the new items should be visible; the old
-// [a, b, c] items must not be orphaned/leaked in storage.
-result, err := rdb.Eval(ctx, `
+	// In a single Lua script: DEL the key, then recreate it as a list.
+	// After the script, only the new items should be visible; the old
+	// [a, b, c] items must not be orphaned/leaked in storage.
+	result, err := rdb.Eval(ctx, `
 redis.call("DEL", KEYS[1])
 redis.call("RPUSH", KEYS[1], "d")
 return redis.call("LRANGE", KEYS[1], 0, -1)
 `, []string{"mylist"}).Result()
-require.NoError(t, err)
+	require.NoError(t, err)
 
-values, ok := result.([]any)
-require.True(t, ok)
-require.Equal(t, []any{"d"}, values, "list should contain only the newly pushed item")
+	values, ok := result.([]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"d"}, values, "list should contain only the newly pushed item")
 
-// Verify via a plain LRANGE that the old items are gone.
-final, err := rdb.LRange(ctx, "mylist", 0, -1).Result()
-require.NoError(t, err)
-require.Equal(t, []string{"d"}, final)
+	// Verify via a plain LRANGE that the old items are gone.
+	final, err := rdb.LRange(ctx, "mylist", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"d"}, final)
 }
