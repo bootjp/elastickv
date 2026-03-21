@@ -19,8 +19,9 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
-	touched map[string]struct{}
-	deleted map[string]bool
+	touched     map[string]struct{}
+	deleted     map[string]bool
+	everDeleted map[string]bool
 
 	strings map[string]*luaStringState
 	lists   map[string]*luaListState
@@ -189,18 +190,19 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 	startTS := server.readTS()
 	return &luaScriptContext{
-		server:  server,
-		startTS: startTS,
-		readPin: server.pinReadTS(startTS),
-		touched: map[string]struct{}{},
-		deleted: map[string]bool{},
-		strings: map[string]*luaStringState{},
-		lists:   map[string]*luaListState{},
-		hashes:  map[string]*luaHashState{},
-		sets:    map[string]*luaSetState{},
-		zsets:   map[string]*luaZSetState{},
-		streams: map[string]*luaStreamState{},
-		ttls:    map[string]*luaTTLState{},
+		server:      server,
+		startTS:     startTS,
+		readPin:     server.pinReadTS(startTS),
+		touched:     map[string]struct{}{},
+		deleted:     map[string]bool{},
+		everDeleted: map[string]bool{},
+		strings:     map[string]*luaStringState{},
+		lists:       map[string]*luaListState{},
+		hashes:      map[string]*luaHashState{},
+		sets:        map[string]*luaSetState{},
+		zsets:       map[string]*luaZSetState{},
+		streams:     map[string]*luaStreamState{},
+		ttls:        map[string]*luaTTLState{},
 	}
 }
 
@@ -265,6 +267,7 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 	k := string(key)
 	c.markTouched(key)
 	c.deleted[k] = true
+	c.everDeleted[k] = true
 	c.clearTTL(key)
 
 	if st, ok := c.strings[k]; ok {
@@ -2514,6 +2517,14 @@ func (c *luaScriptContext) listCommitPlan(key string) (luaCommitPlan, error) {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
 	if st.materialized {
+		elems, err := c.listCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
+	}
+	// If the key was deleted earlier in this script and later recreated as a
+	// list, we must perform a full rewrite (preserveExisting=false) so that
+	// deleteLogicalKeyElems is called and any orphaned storage items from the
+	// previous incarnation of the key are cleaned up before writing the delta.
+	if c.everDeleted[key] {
 		elems, err := c.listCommitElems(key)
 		return luaCommitPlan{elems: elems}, err
 	}
