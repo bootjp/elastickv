@@ -34,20 +34,35 @@ type RaftRuntime struct {
 	Raft    *raft.Raft
 }
 
+// RaftMetrics holds all Prometheus gauge vectors for a single Raft group.
+// Fields are populated by observeRuntime from raft.Raft.Stats().
 type RaftMetrics struct {
-	localState          *prometheus.GaugeVec
-	leaderIdentity      *prometheus.GaugeVec
-	memberPresent       *prometheus.GaugeVec
-	memberIsLeader      *prometheus.GaugeVec
-	memberCount         *prometheus.GaugeVec
-	commitIndex         *prometheus.GaugeVec
-	appliedIndex        *prometheus.GaugeVec
-	lastContact         *prometheus.GaugeVec
-	term                *prometheus.GaugeVec
-	lastLogIndex        *prometheus.GaugeVec
-	lastSnapshotIndex   *prometheus.GaugeVec
-	fsmPending          *prometheus.GaugeVec
-	numPeers            *prometheus.GaugeVec
+	// localState reports the current state (follower/candidate/leader/shutdown/unknown).
+	localState *prometheus.GaugeVec
+	// leaderIdentity tracks the current leader's ID and address as observed by this node.
+	leaderIdentity *prometheus.GaugeVec
+	// memberPresent lists all known configuration members for the group.
+	memberPresent *prometheus.GaugeVec
+	// memberIsLeader indicates whether a given member is the current leader.
+	memberIsLeader *prometheus.GaugeVec
+	// memberCount is the number of configuration members currently known.
+	memberCount *prometheus.GaugeVec
+	// commitIndex is the latest committed log index.
+	commitIndex *prometheus.GaugeVec
+	// appliedIndex is the latest applied log index.
+	appliedIndex *prometheus.GaugeVec
+	// lastContact is the time in seconds since the last observed leader contact.
+	lastContact *prometheus.GaugeVec
+	// term is the current Raft term; increments on each leader election.
+	term *prometheus.GaugeVec
+	// lastLogIndex is the index of the last log entry written to stable storage.
+	lastLogIndex *prometheus.GaugeVec
+	// lastSnapshotIndex is the index covered by the most recent snapshot.
+	lastSnapshotIndex *prometheus.GaugeVec
+	// fsmPending is the number of commands queued to the FSM but not yet applied.
+	fsmPending *prometheus.GaugeVec
+	// numPeers is the number of other voting servers in the cluster, excluding this node.
+	numPeers *prometheus.GaugeVec
 }
 
 func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
