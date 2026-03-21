@@ -47,3 +47,42 @@ func TestParseLastContactSeconds(t *testing.T) {
 	require.Equal(t, 0.25, parseLastContactSeconds("250ms"))
 	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("invalid"))
 }
+
+func TestRaftMetricsNewFields(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	m := registry.raft
+
+	// Populate the new metrics directly to verify they are registered and exported.
+	m.term.WithLabelValues("1").Set(5)
+	m.lastLogIndex.WithLabelValues("1").Set(42)
+	m.lastSnapshotIndex.WithLabelValues("1").Set(10)
+	m.fsmPending.WithLabelValues("1").Set(3)
+	m.numPeers.WithLabelValues("1").Set(2)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_raft_term Current Raft term for each group.
+# TYPE elastickv_raft_term gauge
+elastickv_raft_term{group="1",node_address="10.0.0.1:50051",node_id="n1"} 5
+# HELP elastickv_raft_last_log_index Index of the last log entry written for each group.
+# TYPE elastickv_raft_last_log_index gauge
+elastickv_raft_last_log_index{group="1",node_address="10.0.0.1:50051",node_id="n1"} 42
+# HELP elastickv_raft_last_snapshot_index Index of the most recent snapshot for each group.
+# TYPE elastickv_raft_last_snapshot_index gauge
+elastickv_raft_last_snapshot_index{group="1",node_address="10.0.0.1:50051",node_id="n1"} 10
+# HELP elastickv_raft_fsm_pending Number of commands queued to the FSM but not yet applied for each group.
+# TYPE elastickv_raft_fsm_pending gauge
+elastickv_raft_fsm_pending{group="1",node_address="10.0.0.1:50051",node_id="n1"} 3
+# HELP elastickv_raft_num_peers Number of other voting servers in the cluster for each group, not including this node.
+# TYPE elastickv_raft_num_peers gauge
+elastickv_raft_num_peers{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
+`),
+		"elastickv_raft_term",
+		"elastickv_raft_last_log_index",
+		"elastickv_raft_last_snapshot_index",
+		"elastickv_raft_fsm_pending",
+		"elastickv_raft_num_peers",
+	)
+	require.NoError(t, err)
+}
