@@ -3,11 +3,11 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
+	json "github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 

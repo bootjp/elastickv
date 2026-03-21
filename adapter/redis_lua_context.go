@@ -2301,7 +2301,7 @@ func (c *luaScriptContext) cmdXAdd(args []string) (luaReply, error) {
 	} else if !isNextStreamID(st.value, id) {
 		return luaReply{}, errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 	}
-	st.value.Entries = append(st.value.Entries, redisStreamEntry{ID: id, Fields: append([]string(nil), parsed.fields...)})
+	st.value.Entries = append(st.value.Entries, newRedisStreamEntry(id, append([]string(nil), parsed.fields...)))
 	st.loaded = true
 	st.dirty = true
 	if parsed.maxLen >= 0 && len(st.value.Entries) > parsed.maxLen {
@@ -2782,8 +2782,10 @@ func cloneStreamValue(in redisStreamValue) redisStreamValue {
 	out := redisStreamValue{Entries: make([]redisStreamEntry, 0, len(in.Entries))}
 	for _, entry := range in.Entries {
 		out.Entries = append(out.Entries, redisStreamEntry{
-			ID:     entry.ID,
-			Fields: append([]string(nil), entry.Fields...),
+			ID:            entry.ID,
+			Fields:        append([]string(nil), entry.Fields...),
+			parsedID:      entry.parsedID,
+			parsedIDValid: entry.parsedIDValid,
 		})
 	}
 	return out
@@ -2794,13 +2796,14 @@ func nextLuaStreamID(stream redisStreamValue) string {
 	if len(stream.Entries) == 0 {
 		return nowID
 	}
-	lastID := stream.Entries[len(stream.Entries)-1].ID
+	lastEntry := stream.Entries[len(stream.Entries)-1]
+	lastID := lastEntry.ID
 	if compareRedisStreamID(nowID, lastID) > 0 {
 		return nowID
 	}
-	last, err := parseRedisStreamID(lastID)
-	if err != nil {
+	if !lastEntry.parsedIDValid {
 		return nowID
 	}
+	last := lastEntry.parsedID
 	return strconv.FormatUint(last.ms, 10) + "-" + strconv.FormatUint(last.seq+1, 10)
 }

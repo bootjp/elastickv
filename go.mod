@@ -18,6 +18,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/emirpasic/gods v1.18.1
 	github.com/getsentry/sentry-go v0.43.0
+	github.com/goccy/go-json v0.10.6
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-msgpack/v2 v2.1.5
 	github.com/hashicorp/raft v1.7.3

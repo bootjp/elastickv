@@ -2,13 +2,13 @@ package adapter
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	json "github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
