@@ -55,19 +55,17 @@ func unmarshalSetValue(raw []byte) (redisSetValue, error) {
 	if len(raw) == 0 {
 		return redisSetValue{}, nil
 	}
+	var out redisSetValue
 	if hasStoredRedisPrefix(raw, storedRedisSetProtoPrefix) {
 		msg := &pb.RedisSetValue{}
 		if err := gproto.Unmarshal(raw[len(storedRedisSetProtoPrefix):], msg); err != nil {
 			return redisSetValue{}, errors.WithStack(err)
 		}
-		out := redisSetValueFromProto(msg)
-		sortStrings(out.Members)
-		return out, nil
-	}
-
-	var out redisSetValue
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return redisSetValue{}, errors.WithStack(err)
+		out = redisSetValueFromProto(msg)
+	} else {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return redisSetValue{}, errors.WithStack(err)
+		}
 	}
 	sortStrings(out.Members)
 	return out, nil
@@ -82,19 +80,17 @@ func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
 	if len(raw) == 0 {
 		return redisZSetValue{}, nil
 	}
+	var out redisZSetValue
 	if hasStoredRedisPrefix(raw, storedRedisZSetProtoPrefix) {
 		msg := &pb.RedisZSetValue{}
 		if err := gproto.Unmarshal(raw[len(storedRedisZSetProtoPrefix):], msg); err != nil {
 			return redisZSetValue{}, errors.WithStack(err)
 		}
-		out := redisZSetValueFromProto(msg)
-		sortZSetEntries(out.Entries)
-		return out, nil
-	}
-
-	var out redisZSetValue
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return redisZSetValue{}, errors.WithStack(err)
+		out = redisZSetValueFromProto(msg)
+	} else {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return redisZSetValue{}, errors.WithStack(err)
+		}
 	}
 	sortZSetEntries(out.Entries)
 	return out, nil
