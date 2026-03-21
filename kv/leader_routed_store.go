@@ -243,7 +243,7 @@ func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {
 	return errors.WithStack(s.local.Compact(ctx, minTS))
 }
 
-func (s *LeaderRoutedStore) Snapshot() (io.ReadWriter, error) {
+func (s *LeaderRoutedStore) Snapshot() (store.Snapshot, error) {
 	if s == nil || s.local == nil {
 		return nil, errors.WithStack(store.ErrNotSupported)
 	}

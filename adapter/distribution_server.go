@@ -21,6 +21,7 @@ type DistributionServer struct {
 	engine      *distribution.Engine
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
+	readTracker *kv.ActiveTimestampTracker
 	reloadRetry struct {
 		attempts int
 		interval time.Duration
@@ -36,6 +37,12 @@ type DistributionServerOption func(*DistributionServer)
 func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.coordinator = coordinator
+	}
+}
+
+func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.readTracker = tracker
 	}
 }
 
@@ -140,6 +147,8 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
+	readPin := s.pinReadTS(snapshot.ReadTS)
+	defer readPin.Release()
 	if err := validateExpectedCatalogVersion(snapshot.Version, req.GetExpectedCatalogVersion()); err != nil {
 		return nil, err
 	}
@@ -173,6 +182,13 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		Left:           toProtoRouteDescriptor(left),
 		Right:          toProtoRouteDescriptor(right),
 	}, nil
+}
+
+func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
+	if s == nil || s.readTracker == nil {
+		return nil
+	}
+	return s.readTracker.Pin(ts)
 }
 
 func (s *DistributionServer) verifyCatalogLeader() error {

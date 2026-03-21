@@ -11,7 +11,7 @@ ghcr.io/bootjp/elastickv/redis-proxy:latest
 ghcr.io/bootjp/elastickv/redis-proxy:sha-<commit>
 ```
 
-The CI workflow (`.github/workflows/redis-proxy-docker.yml`) builds the image automatically when files under `cmd/redis-proxy/`, `proxy/`, or `Dockerfile.redis-proxy` change.
+The CI workflow (`.github/workflows/redis-proxy-docker.yml`) builds the image automatically when files under `cmd/redis-proxy/`, `proxy/`, `Dockerfile.redis-proxy`, `go.mod`, `go.sum`, or the workflow file itself change.
 
 ### Building locally
 

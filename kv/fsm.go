@@ -153,13 +153,13 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
-	buf, err := f.store.Snapshot()
+	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
 	return &kvFSMSnapshot{
-		buf,
+		snapshot: snapshot,
 	}, nil
 }
 

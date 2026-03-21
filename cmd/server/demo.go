@@ -30,7 +30,6 @@ import (
 	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -206,7 +205,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	}
 
 	// Connect to leader
-	conn, err := grpc.NewClient(leader.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(leader.address, internalutil.GRPCDialOptions()...)
 	if err != nil {
 		return fmt.Errorf("failed to dial leader: %w", err)
 	}
@@ -322,7 +321,7 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 }
 
 func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) (*grpc.Server, *adapter.GRPCServer) {
-	s := grpc.NewServer()
+	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 	trx := kv.NewTransaction(r)
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
@@ -336,7 +335,7 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 	return s, gs
 }
 
-func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay) (*adapter.RedisServer, error) {
+func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker) (*adapter.RedisServer, error) {
 	leaderRedis := make(map[raft.ServerAddress]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
@@ -355,7 +354,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 		return nil, errors.WithStack(err)
 	}
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
-	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay), nil
+	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker)), nil
 }
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
@@ -370,6 +369,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSM(st)
+	readTracker := kv.NewActiveTimestampTracker()
 
 	// Config
 	c := raft.DefaultConfig()
@@ -381,9 +381,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	})
 
 	// Transport
-	tm := transport.New(raft.ServerAddress(cfg.address), []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	})
+	tm := transport.New(raft.ServerAddress(cfg.address), internalutil.GRPCDialOptions())
 
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
@@ -405,9 +403,18 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		distEngine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinator),
+		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
+	compactor := kv.NewFSMCompactor(
+		[]kv.FSMCompactRuntime{{
+			GroupID: 1,
+			Raft:    r,
+			Store:   st,
+		}},
+		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+	)
 	relay := adapter.NewRedisPubSubRelay()
 
 	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer, relay)
@@ -420,7 +427,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		_ = grpcSock.Close()
 	})
 
-	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay)
+	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay, readTracker)
 	if err != nil {
 		return err
 	}
@@ -447,6 +454,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
+	eg.Go(func() error { return compactor.Run(ctx) })
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
 	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
 	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))

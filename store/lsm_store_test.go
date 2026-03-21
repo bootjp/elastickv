@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -199,6 +200,11 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	// Snapshot
 	buf, err := s.Snapshot()
 	require.NoError(t, err)
+	defer buf.Close()
+
+	var raw bytes.Buffer
+	_, err = buf.WriteTo(&raw)
+	require.NoError(t, err)
 
 	s.Close()
 
@@ -211,7 +217,7 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	require.NoError(t, err)
 	defer s2.Close()
 
-	err = s2.Restore(buf)
+	err = s2.Restore(bytes.NewReader(raw.Bytes()))
 	require.NoError(t, err)
 
 	val, err := s2.GetAt(ctx, []byte("k1"), 100)

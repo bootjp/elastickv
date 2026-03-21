@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +42,7 @@ const (
 // enabling the client to execute regular Redis commands without reconnecting.
 type pubsubSession struct {
 	mu       sync.Mutex // protects upstream, closed, and shadow; channelSet/patternSet/txn are goroutine-confined to commandLoop
-	writeMu  sync.Mutex // serializes writes to dconn; never held across state operations
+	writeMu  sync.Mutex // serializes writes to dconn; may be held while acquiring mu (lock ordering: writeMu then mu)
 	dconn    redcon.DetachedConn
 	upstream *redis.PubSub // nil when not in pub/sub mode
 	proxy    *ProxyServer
@@ -332,8 +333,14 @@ func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bo
 	if name != "SELECT" {
 		return false
 	}
-	if len(args) > 1 && string(args[1]) != "0" && string(args[1]) != fmt.Sprintf("%d", s.proxy.cfg.PrimaryDB) {
-		s.writeError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", string(args[1]), s.proxy.cfg.PrimaryDB))
+	// Enforce Redis arity: SELECT requires exactly one DB index argument.
+	if len(args) != 2 {
+		s.writeError("ERR wrong number of arguments for 'select' command")
+		return true
+	}
+	dbStr := string(args[1])
+	if dbStr != fmt.Sprintf("%d", s.proxy.cfg.PrimaryDB) {
+		s.writeError(fmt.Sprintf("ERR proxy configured for DB %d, but SELECT %s requested", s.proxy.cfg.PrimaryDB, dbStr))
 		return true
 	}
 	s.writeString("OK")
@@ -597,11 +604,13 @@ func (s *pubsubSession) writeUnsubAll(kind string, isPattern bool) {
 		return
 	}
 
-	// Collect names and pre-compute decreasing counts (state is goroutine-confined).
+	// Collect names, sort for deterministic reply ordering, and pre-compute
+	// decreasing counts (state is goroutine-confined).
 	names := make([]string, 0, len(set))
 	for n := range set {
 		names = append(names, n)
 	}
+	sort.Strings(names)
 	counts := make([]int, len(names))
 	for i, n := range names {
 		if isPattern {
