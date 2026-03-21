@@ -36,7 +36,7 @@ func WriteConflictKey(err error) ([]byte, bool) {
 }
 
 func (e *WriteConflictError) Error() string {
-	return fmt.Sprintf("key: %s: %s", string(e.key), ErrWriteConflict)
+	return fmt.Sprintf("key: %s: %v", string(e.key), ErrWriteConflict)
 }
 
 func (e *WriteConflictError) Unwrap() error {

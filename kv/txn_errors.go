@@ -39,9 +39,9 @@ func TxnLockedDetails(err error) ([]byte, string, bool) {
 
 func (e *TxnLockedError) Error() string {
 	if e.detail != "" {
-		return fmt.Sprintf("key: %s (%s): %s", string(e.key), e.detail, ErrTxnLocked)
+		return fmt.Sprintf("key: %s (%s): %v", string(e.key), e.detail, ErrTxnLocked)
 	}
-	return fmt.Sprintf("key: %s: %s", string(e.key), ErrTxnLocked)
+	return fmt.Sprintf("key: %s: %v", string(e.key), ErrTxnLocked)
 }
 
 func (e *TxnLockedError) Unwrap() error {

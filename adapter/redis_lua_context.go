@@ -486,7 +486,12 @@ func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
 		return nil
 	}
 
-	values := make([]string, 0, st.currentLen())
+	length := st.currentLen()
+	maxInt64 := int64(math.MaxInt)
+	if length > maxInt64 {
+		length = maxInt64
+	}
+	values := make([]string, 0, int(length))
 	values = append(values, st.leftValues...)
 	if remaining := st.remainingOriginalLen(); remaining > 0 {
 		start := st.leftTrim

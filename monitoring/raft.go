@@ -34,15 +34,35 @@ type RaftRuntime struct {
 	Raft    *raft.Raft
 }
 
+// RaftMetrics holds all Prometheus gauge vectors for a single Raft group.
+// Fields are populated by observeRuntime from raft.Raft.Stats().
 type RaftMetrics struct {
-	localState     *prometheus.GaugeVec
+	// localState reports the current state (follower/candidate/leader/shutdown/unknown).
+	localState *prometheus.GaugeVec
+	// leaderIdentity tracks the current leader's ID and address as observed by this node.
 	leaderIdentity *prometheus.GaugeVec
-	memberPresent  *prometheus.GaugeVec
+	// memberPresent lists all known configuration members for the group.
+	memberPresent *prometheus.GaugeVec
+	// memberIsLeader indicates whether a given member is the current leader.
 	memberIsLeader *prometheus.GaugeVec
-	memberCount    *prometheus.GaugeVec
-	commitIndex    *prometheus.GaugeVec
-	appliedIndex   *prometheus.GaugeVec
-	lastContact    *prometheus.GaugeVec
+	// memberCount is the number of configuration members currently known.
+	memberCount *prometheus.GaugeVec
+	// commitIndex is the latest committed log index.
+	commitIndex *prometheus.GaugeVec
+	// appliedIndex is the latest applied log index.
+	appliedIndex *prometheus.GaugeVec
+	// lastContact is the time in seconds since the last observed leader contact.
+	lastContact *prometheus.GaugeVec
+	// term is the current Raft term; increments on each leader election.
+	term *prometheus.GaugeVec
+	// lastLogIndex is the index of the last log entry written to stable storage.
+	lastLogIndex *prometheus.GaugeVec
+	// lastSnapshotIndex is the index covered by the most recent snapshot.
+	lastSnapshotIndex *prometheus.GaugeVec
+	// fsmPending is the number of commands queued to the FSM but not yet applied.
+	fsmPending *prometheus.GaugeVec
+	// numPeers is the number of other voting servers in the cluster, excluding this node.
+	numPeers *prometheus.GaugeVec
 }
 
 func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
@@ -103,6 +123,41 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 			},
 			[]string{"group"},
 		),
+		term: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_term",
+				Help: "Current Raft term for each group.",
+			},
+			[]string{"group"},
+		),
+		lastLogIndex: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_last_log_index",
+				Help: "Index of the last log entry written for each group.",
+			},
+			[]string{"group"},
+		),
+		lastSnapshotIndex: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_last_snapshot_index",
+				Help: "Index of the most recent snapshot for each group.",
+			},
+			[]string{"group"},
+		),
+		fsmPending: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_fsm_pending",
+				Help: "Number of commands queued to the FSM but not yet applied for each group.",
+			},
+			[]string{"group"},
+		),
+		numPeers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_num_peers",
+				Help: "Number of other voting servers in the cluster for each group, not including this node.",
+			},
+			[]string{"group"},
+		),
 	}
 
 	registerer.MustRegister(
@@ -114,6 +169,11 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 		m.commitIndex,
 		m.appliedIndex,
 		m.lastContact,
+		m.term,
+		m.lastLogIndex,
+		m.lastSnapshotIndex,
+		m.fsmPending,
+		m.numPeers,
 	)
 
 	return m
@@ -189,6 +249,11 @@ func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
 	o.metrics.commitIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["commit_index"])))
 	o.metrics.appliedIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["applied_index"])))
 	o.metrics.lastContact.WithLabelValues(group).Set(parseLastContactSeconds(stats["last_contact"]))
+	o.metrics.term.WithLabelValues(group).Set(float64(parseUintMetric(stats["term"])))
+	o.metrics.lastLogIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_log_index"])))
+	o.metrics.lastSnapshotIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_snapshot_index"])))
+	o.metrics.fsmPending.WithLabelValues(group).Set(float64(parseUintMetric(stats["fsm_pending"])))
+	o.metrics.numPeers.WithLabelValues(group).Set(float64(parseUintMetric(stats["num_peers"])))
 
 	leaderAddr, leaderID := runtime.Raft.LeaderWithID()
 	o.setLeaderMetric(group, string(leaderID), string(leaderAddr))
