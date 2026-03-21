@@ -777,6 +777,12 @@ func TestNewRedisBackend_UsesRESP2(t *testing.T) {
 	assert.Equal(t, respProtocolV2, backend.client.Options().Protocol)
 }
 
+func TestEffectiveBlockingReadTimeout(t *testing.T) {
+	assert.Equal(t, time.Duration(0), effectiveBlockingReadTimeout(0))
+	assert.Equal(t, 20*time.Second, effectiveBlockingReadTimeout(10*time.Second))
+	assert.Equal(t, 11*time.Second, effectiveBlockingReadTimeout(time.Second))
+}
+
 // ========== Pipeline error handling tests ==========
 
 func TestPipeline_TransportError(t *testing.T) {
