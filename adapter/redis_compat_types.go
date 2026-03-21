@@ -12,7 +12,6 @@ import (
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	json "github.com/goccy/go-json"
 )
 
 const (
@@ -136,92 +135,6 @@ func extractRedisInternalUserKey(key []byte) []byte {
 	default:
 		return nil
 	}
-}
-
-func marshalHashValue(v redisHashValue) ([]byte, error) {
-	if v == nil {
-		v = redisHashValue{}
-	}
-	payload, err := json.Marshal(v)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return payload, nil
-}
-
-func unmarshalHashValue(raw []byte) (redisHashValue, error) {
-	if len(raw) == 0 {
-		return redisHashValue{}, nil
-	}
-	out := redisHashValue{}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return out, nil
-}
-
-func marshalSetValue(v redisSetValue) ([]byte, error) {
-	sort.Strings(v.Members)
-	payload, err := json.Marshal(v)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return payload, nil
-}
-
-func unmarshalSetValue(raw []byte) (redisSetValue, error) {
-	if len(raw) == 0 {
-		return redisSetValue{}, nil
-	}
-	var out redisSetValue
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return redisSetValue{}, errors.WithStack(err)
-	}
-	sort.Strings(out.Members)
-	return out, nil
-}
-
-func marshalZSetValue(v redisZSetValue) ([]byte, error) {
-	sortZSetEntries(v.Entries)
-	payload, err := json.Marshal(v)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return payload, nil
-}
-
-func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
-	if len(raw) == 0 {
-		return redisZSetValue{}, nil
-	}
-	var out redisZSetValue
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return redisZSetValue{}, errors.WithStack(err)
-	}
-	sortZSetEntries(out.Entries)
-	return out, nil
-}
-
-func marshalStreamValue(v redisStreamValue) ([]byte, error) {
-	// Stream mutations preserve ID order, so avoid resorting on every save.
-	payload, err := json.Marshal(v)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return payload, nil
-}
-
-func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
-	if len(raw) == 0 {
-		return redisStreamValue{}, nil
-	}
-	var out redisStreamValue
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return redisStreamValue{}, errors.WithStack(err)
-	}
-	// Persisted stream payloads are already ordered; cache parsed IDs for reads.
-	out.cacheParsedIDs()
-	return out, nil
 }
 
 func newRedisStreamEntry(id string, fields []string) redisStreamEntry {
