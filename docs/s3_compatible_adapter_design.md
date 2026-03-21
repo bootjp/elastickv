@@ -143,14 +143,24 @@ Object data should be split between a small manifest and many immutable blob chu
 
 Suggested keys:
 
-1. `!s3|obj|head|<bucket-enc><gen><object-enc>` -> current object manifest
-2. `!s3|upload|meta|<bucket-enc><gen><object-enc><upload-id>` -> multipart upload metadata
-3. `!s3|upload|part|<bucket-enc><gen><object-enc><upload-id><part-no>` -> uploaded part descriptor
-4. `!s3|blob|<bucket-enc><gen><object-enc><upload-id><part-no><chunk-no>` -> immutable chunk bytes
-5. `!s3|gc|upload|<bucket-enc><gen><object-enc><upload-id>` -> async cleanup marker
+1. `!s3|obj|head|<bucket-esc><gen-u64><object-esc>` -> current object manifest
+2. `!s3|upload|meta|<bucket-esc><gen-u64><object-esc><upload-id-esc>` -> multipart upload metadata
+3. `!s3|upload|part|<bucket-esc><gen-u64><object-esc><upload-id-esc><part-no-u64>` -> uploaded part descriptor
+4. `!s3|blob|<bucket-esc><gen-u64><object-esc><upload-id-esc><part-no-u64><chunk-no-u64>` -> immutable chunk bytes
+5. `!s3|gc|upload|<bucket-esc><gen-u64><object-esc><upload-id-esc>` -> async cleanup marker
 
-Segment encoding should be prefix-safe and byte-sortable. The repository already has an ordered escaping pattern in the DynamoDB adapter; the S3 adapter should use the same style instead of relying on raw separators.
+Segment encoding:
 
+- All string segments (`<bucket-esc>`, `<object-esc>`, `<upload-id-esc>`) MUST use the same prefix-safe, byte-ordered escaping scheme as the DynamoDB adapter’s key encoder. Concretely, each string segment is escaped so that a reserved terminator byte (e.g. `0x00`) never appears in the payload, and the segment is terminated by that byte. This makes each string segment self-delimiting while preserving lexicographic order over the original strings.
+- All numeric segments (`<gen-u64>`, `<part-no-u64>`, `<chunk-no-u64>`) MUST be encoded as fixed-width 8-byte big-endian unsigned integers (ordered uint64) written directly after the preceding segment, with no additional separator bytes.
+- The layout is therefore:
+  - `obj|head`: `prefix | bucket-esc | gen-u64 | object-esc`
+  - `upload|meta`: `prefix | bucket-esc | gen-u64 | object-esc | upload-id-esc`
+  - `upload|part`: `prefix | bucket-esc | gen-u64 | object-esc | upload-id-esc | part-no-u64`
+  - `blob`: `prefix | bucket-esc | gen-u64 | object-esc | upload-id-esc | part-no-u64 | chunk-no-u64`
+  - `gc|upload`: `prefix | bucket-esc | gen-u64 | object-esc | upload-id-esc`
+
+Parsing proceeds by decoding each escaped string segment until its terminator byte, then reading the next fixed 8 bytes for any numeric segment in that position. Because escaped segments are prefix-free and numeric segments are fixed-width big-endian, these keys are unambiguous to parse and preserve the intended byte-sort order over bucket, generation, object name, upload id, part number, and chunk number.
 ### 5.3 Manifest format
 
 The current object manifest should remain small and should be optimized for `HEAD`, `GET`, and `LIST`.
