@@ -32,3 +32,5 @@ gen: check-tools
 	    distribution.proto
 	protoc --go_out=. --go_opt=paths=source_relative \
 	    dynamodb_internal.proto
+	protoc --go_out=. --go_opt=paths=source_relative \
+	    redis_internal.proto

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+// redis_internal.proto defines Redis adapter payloads stored inside the KV engine.
+
+message RedisHashValue {
+  map<string, string> entries = 1;
+}
+
+message RedisSetValue {
+  repeated string members = 1;
+}
+
+message RedisZSetEntry {
+  string member = 1;
+  double score = 2;
+}
+
+message RedisZSetValue {
+  repeated RedisZSetEntry entries = 1;
+}
+
+message RedisStreamEntry {
+  string id = 1;
+  repeated string fields = 2;
+}
+
+message RedisStreamValue {
+  repeated RedisStreamEntry entries = 1;
+}

@@ -3,8 +3,6 @@ package adapter
 import (
 	"strconv"
 	"testing"
-
-	json "github.com/goccy/go-json"
 )
 
 func benchmarkRedisStreamValue(entryCount int) redisStreamValue {
@@ -20,7 +18,7 @@ func benchmarkRedisStreamValue(entryCount int) redisStreamValue {
 }
 
 func BenchmarkUnmarshalStreamValue(b *testing.B) {
-	payload, err := json.Marshal(benchmarkRedisStreamValue(2048))
+	payload, err := marshalStreamValue(benchmarkRedisStreamValue(2048))
 	if err != nil {
 		b.Fatal(err)
 	}
