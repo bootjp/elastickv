@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -53,7 +55,11 @@ func TestSnapshot(t *testing.T) {
 	assert.True(t, ok)
 	assert.NoError(t, err)
 
-	err = fsm2.Restore(kvFSMSnap)
+	var buf bytes.Buffer
+	_, err = kvFSMSnap.snapshot.WriteTo(&buf)
+	assert.NoError(t, err)
+	kvFSMSnap.Release()
+	err = fsm2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes())))
 	assert.NoError(t, err)
 
 	v, err = store2.GetAt(ctx, []byte("hoge"), ^uint64(0))

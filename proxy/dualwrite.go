@@ -37,6 +37,8 @@ type DualWriter struct {
 	closed   bool
 	scriptMu sync.RWMutex
 	scripts  map[string]string
+	// scriptOrder tracks insertion order for FIFO eviction of the bounded script cache.
+	scriptOrder []string
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -193,13 +195,13 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	result := d.primary.Do(ctx, iArgs...)
 	resp, err := result.Result()
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
-	d.rememberScript(cmd, args)
 
 	if err != nil && !errors.Is(err, redis.Nil) {
 		d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "error").Inc()
 		return nil, fmt.Errorf("primary script %s: %w", cmd, err)
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
+	d.rememberScript(cmd, args)
 
 	if d.hasSecondaryWrite() {
 		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })

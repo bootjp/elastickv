@@ -153,13 +153,13 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
-	buf, err := f.store.Snapshot()
+	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
 	return &kvFSMSnapshot{
-		buf,
+		snapshot: snapshot,
 	}, nil
 }
 
@@ -284,9 +284,6 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
-	}
-	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
-		return errors.WithStack(err)
 	}
 
 	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)

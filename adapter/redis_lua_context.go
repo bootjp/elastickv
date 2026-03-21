@@ -17,6 +17,7 @@ import (
 type luaScriptContext struct {
 	server  *RedisServer
 	startTS uint64
+	readPin *kv.ActiveTimestampToken
 
 	touched map[string]struct{}
 	deleted map[string]bool
@@ -186,9 +187,11 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 }
 
 func newLuaScriptContext(server *RedisServer) *luaScriptContext {
+	startTS := server.readTS()
 	return &luaScriptContext{
 		server:  server,
-		startTS: server.readTS(),
+		startTS: startTS,
+		readPin: server.pinReadTS(startTS),
 		touched: map[string]struct{}{},
 		deleted: map[string]bool{},
 		strings: map[string]*luaStringState{},
@@ -199,6 +202,13 @@ func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 		streams: map[string]*luaStreamState{},
 		ttls:    map[string]*luaTTLState{},
 	}
+}
+
+func (c *luaScriptContext) Close() {
+	if c == nil || c.readPin == nil {
+		return
+	}
+	c.readPin.Release()
 }
 
 func (c *luaScriptContext) exec(command string, args []string) (luaReply, error) {
