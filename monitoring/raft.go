@@ -35,14 +35,19 @@ type RaftRuntime struct {
 }
 
 type RaftMetrics struct {
-	localState     *prometheus.GaugeVec
-	leaderIdentity *prometheus.GaugeVec
-	memberPresent  *prometheus.GaugeVec
-	memberIsLeader *prometheus.GaugeVec
-	memberCount    *prometheus.GaugeVec
-	commitIndex    *prometheus.GaugeVec
-	appliedIndex   *prometheus.GaugeVec
-	lastContact    *prometheus.GaugeVec
+	localState          *prometheus.GaugeVec
+	leaderIdentity      *prometheus.GaugeVec
+	memberPresent       *prometheus.GaugeVec
+	memberIsLeader      *prometheus.GaugeVec
+	memberCount         *prometheus.GaugeVec
+	commitIndex         *prometheus.GaugeVec
+	appliedIndex        *prometheus.GaugeVec
+	lastContact         *prometheus.GaugeVec
+	term                *prometheus.GaugeVec
+	lastLogIndex        *prometheus.GaugeVec
+	lastSnapshotIndex   *prometheus.GaugeVec
+	fsmPending          *prometheus.GaugeVec
+	numPeers            *prometheus.GaugeVec
 }
 
 func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
@@ -103,6 +108,41 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 			},
 			[]string{"group"},
 		),
+		term: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_term",
+				Help: "Current Raft term for each group.",
+			},
+			[]string{"group"},
+		),
+		lastLogIndex: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_last_log_index",
+				Help: "Index of the last log entry written for each group.",
+			},
+			[]string{"group"},
+		),
+		lastSnapshotIndex: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_last_snapshot_index",
+				Help: "Index of the most recent snapshot for each group.",
+			},
+			[]string{"group"},
+		),
+		fsmPending: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_fsm_pending",
+				Help: "Number of commands queued to the FSM but not yet applied for each group.",
+			},
+			[]string{"group"},
+		),
+		numPeers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_raft_num_peers",
+				Help: "Number of other voting servers in the cluster for each group, not including this node.",
+			},
+			[]string{"group"},
+		),
 	}
 
 	registerer.MustRegister(
@@ -114,6 +154,11 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 		m.commitIndex,
 		m.appliedIndex,
 		m.lastContact,
+		m.term,
+		m.lastLogIndex,
+		m.lastSnapshotIndex,
+		m.fsmPending,
+		m.numPeers,
 	)
 
 	return m
@@ -189,6 +234,11 @@ func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
 	o.metrics.commitIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["commit_index"])))
 	o.metrics.appliedIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["applied_index"])))
 	o.metrics.lastContact.WithLabelValues(group).Set(parseLastContactSeconds(stats["last_contact"]))
+	o.metrics.term.WithLabelValues(group).Set(float64(parseUintMetric(stats["term"])))
+	o.metrics.lastLogIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_log_index"])))
+	o.metrics.lastSnapshotIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_snapshot_index"])))
+	o.metrics.fsmPending.WithLabelValues(group).Set(float64(parseUintMetric(stats["fsm_pending"])))
+	o.metrics.numPeers.WithLabelValues(group).Set(float64(parseUintMetric(stats["num_peers"])))
 
 	leaderAddr, leaderID := runtime.Raft.LeaderWithID()
 	o.setLeaderMetric(group, string(leaderID), string(leaderAddr))
