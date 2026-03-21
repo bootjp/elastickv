@@ -511,9 +511,6 @@ func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
 func (c *luaScriptContext) materializedListForRead(key string) (*luaListState, bool, error) {
 	st, err := c.listState([]byte(key))
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, false, nil
-		}
 		return nil, false, err
 	}
 	if !st.exists || st.currentLen() == 0 {

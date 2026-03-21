@@ -235,7 +235,7 @@ func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {
 	t.Parallel()
 
 	internalKey := store.ListItemKey([]byte("retry:list"), 1)
-	err := errors.Wrapf(kv.ErrTxnLocked, "key: %s", string(internalKey))
+	err := kv.NewTxnLockedError(internalKey)
 
 	normalized := normalizeRetryableRedisTxnErr(err)
 
@@ -249,7 +249,7 @@ func TestNormalizeRetryableRedisTxnErrTxnTTLKey(t *testing.T) {
 
 	internalKey := append([]byte("!txn|cmt|"), redisTTLKey([]byte("retry:ttl"))...)
 	internalKey = append(internalKey, make([]byte, 8)...)
-	err := errors.Wrapf(store.ErrWriteConflict, "key: %s", string(internalKey))
+	err := store.NewWriteConflictError(internalKey)
 
 	normalized := normalizeRetryableRedisTxnErr(err)
 
@@ -257,6 +257,20 @@ func TestNormalizeRetryableRedisTxnErrTxnTTLKey(t *testing.T) {
 	require.ErrorContains(t, normalized, "key: retry:ttl")
 	require.NotContains(t, normalized.Error(), "!txn|cmt|")
 	require.NotContains(t, normalized.Error(), redisTTLPrefix)
+}
+
+func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {
+	t.Parallel()
+
+	internalKey := store.ListItemKey([]byte("retry:list"), 2)
+	err := errors.WithStack(kv.NewTxnLockedErrorWithDetail(internalKey, "timestamp overflow"))
+
+	normalized := normalizeRetryableRedisTxnErr(err)
+
+	require.ErrorIs(t, normalized, kv.ErrTxnLocked)
+	require.ErrorContains(t, normalized, "key: retry:list")
+	require.ErrorContains(t, normalized, "timestamp overflow")
+	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
 }
 
 func TestRetryPolicyForRedisTxnErr(t *testing.T) {

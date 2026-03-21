@@ -197,7 +197,7 @@ func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, star
 			return errors.WithStack(err)
 		}
 		if exists && latest > startTS {
-			return errors.Wrapf(store.ErrWriteConflict, "key: %s", string(mut.Key))
+			return errors.WithStack(store.NewWriteConflictError(mut.Key))
 		}
 	}
 	return nil
@@ -543,7 +543,7 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 		return nil, nil
 	}
 	if lock.StartTS != startTS {
-		return nil, errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+		return nil, NewTxnLockedError(key)
 	}
 	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
 		return nil, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
@@ -605,7 +605,7 @@ func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key []byte, star
 	if startTS != 0 && lock.StartTS == startTS {
 		return nil
 	}
-	return errors.Wrapf(ErrTxnLocked, "key: %s", string(key))
+	return NewTxnLockedError(key)
 }
 
 func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {

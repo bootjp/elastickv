@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -105,46 +104,24 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 }
 
 func normalizeRetryableRedisTxnErr(err error) error {
-	key, ok := extractRetryableRedisTxnKey(err.Error())
-	if !ok {
-		return err
-	}
-	logicalKey := normalizeRetryableRedisTxnKey(key)
-	if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
-		return err
-	}
-
-	switch {
-	case errors.Is(err, kv.ErrTxnLocked):
-		return errors.Wrapf(kv.ErrTxnLocked, "key: %s", string(logicalKey))
-	case errors.Is(err, store.ErrWriteConflict):
-		return errors.Wrapf(store.ErrWriteConflict, "key: %s", string(logicalKey))
-	default:
-		return err
-	}
-}
-
-func extractRetryableRedisTxnKey(msg string) ([]byte, bool) {
-	const marker = "key: "
-	idx := strings.Index(msg, marker)
-	if idx < 0 {
-		return nil, false
-	}
-	start := idx + len(marker)
-	end := len(msg)
-	for _, suffix := range []string{
-		": txn locked",
-		": write conflict",
-		" (timestamp overflow)",
-	} {
-		if pos := strings.Index(msg[start:], suffix); pos >= 0 && start+pos < end {
-			end = start + pos
+	if key, detail, ok := kv.TxnLockedDetails(err); ok {
+		logicalKey := normalizeRetryableRedisTxnKey(key)
+		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
+			return err
 		}
+		if detail != "" {
+			return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
+		}
+		return errors.WithStack(kv.NewTxnLockedError(logicalKey))
 	}
-	if start >= end {
-		return nil, false
+	if key, ok := store.WriteConflictKey(err); ok {
+		logicalKey := normalizeRetryableRedisTxnKey(key)
+		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
+			return err
+		}
+		return errors.WithStack(store.NewWriteConflictError(logicalKey))
 	}
-	return []byte(msg[start:end]), true
+	return err
 }
 
 func normalizeRetryableRedisTxnKey(key []byte) []byte {

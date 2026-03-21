@@ -447,7 +447,7 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 
 	for _, mut := range mutations {
 		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
-			return errors.Wrapf(ErrWriteConflict, "key: %s", string(mut.Key))
+			return NewWriteConflictError(mut.Key)
 		}
 	}
 

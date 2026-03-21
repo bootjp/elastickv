@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/cockroachdb/errors"
@@ -16,6 +18,30 @@ var ErrExpired = errors.New("expired")
 var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
 var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
+
+type WriteConflictError struct {
+	key []byte
+}
+
+func NewWriteConflictError(key []byte) error {
+	return &WriteConflictError{key: bytes.Clone(key)}
+}
+
+func WriteConflictKey(err error) ([]byte, bool) {
+	var conflictErr *WriteConflictError
+	if !errors.As(err, &conflictErr) {
+		return nil, false
+	}
+	return bytes.Clone(conflictErr.key), true
+}
+
+func (e *WriteConflictError) Error() string {
+	return fmt.Sprintf("key: %s: %s", string(e.key), ErrWriteConflict)
+}
+
+func (e *WriteConflictError) Unwrap() error {
+	return ErrWriteConflict
+}
 
 type KVPair struct {
 	Key   []byte
