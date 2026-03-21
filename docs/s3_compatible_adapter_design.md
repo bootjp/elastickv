@@ -151,7 +151,7 @@ Suggested keys:
 
 Segment encoding:
 
-- All string segments (`<bucket-esc>`, `<object-esc>`, `<upload-id-esc>`) MUST use the same prefix-safe, byte-ordered escaping scheme as the DynamoDB adapter’s key encoder. Concretely, each string segment is escaped so that a reserved terminator byte (e.g. `0x00`) never appears in the payload, and the segment is terminated by that byte. This makes each string segment self-delimiting while preserving lexicographic order over the original strings.
+- All string segments (`<bucket-esc>`, `<object-esc>`, `<upload-id-esc>`) MUST use the same prefix-safe, byte-ordered escaping scheme as the DynamoDB adapter’s key encoder (`encodeDynamoKeySegment`). Concretely: the escape byte is `0x00`; any raw `0x00` byte in the segment payload is encoded as the two-byte sequence `0x00 0xFF`; the segment is terminated by the two-byte sequence `0x00 0x01`. This makes each string segment self-delimiting while preserving lexicographic order over the original strings.
 - All numeric segments (`<gen-u64>`, `<part-no-u64>`, `<chunk-no-u64>`) MUST be encoded as fixed-width 8-byte big-endian unsigned integers (ordered uint64) written directly after the preceding segment, with no additional separator bytes.
 - The layout is therefore:
   - `obj|head`: `prefix | bucket-esc | gen-u64 | object-esc`
@@ -223,7 +223,7 @@ Per-part ETags stored in each part descriptor must use the single-part format (M
 All object-scoped internal keys must route as if they belong to the logical object key:
 
 ```text
-!s3route|<bucket-enc><gen><object-enc>
+!s3route|<bucket-esc><gen-u64><object-esc>
 ```
 
 That means:
