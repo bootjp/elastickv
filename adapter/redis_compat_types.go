@@ -231,14 +231,7 @@ func newRedisStreamEntry(id string, fields []string) redisStreamEntry {
 }
 
 func (e *redisStreamEntry) cacheParsedID() {
-	parsed, err := parseRedisStreamID(e.ID)
-	if err != nil {
-		e.parsedID = redisStreamID{}
-		e.parsedIDValid = false
-		return
-	}
-	e.parsedID = parsed
-	e.parsedIDValid = true
+	e.parsedID, e.parsedIDValid = tryParseRedisStreamID(e.ID)
 }
 
 func (e redisStreamEntry) compareID(raw string, parsed redisStreamID, parsedValid bool) int {
