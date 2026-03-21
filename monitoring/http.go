@@ -18,8 +18,9 @@ const (
 	metricsShutdownTimeout   = 5 * time.Second
 )
 
-// MetricsAddressRequiresToken reports whether the metrics endpoint is exposed beyond loopback.
-func MetricsAddressRequiresToken(addr string) bool {
+// AddressRequiresToken reports whether the address is exposed beyond loopback
+// and therefore requires bearer-token protection.
+func AddressRequiresToken(addr string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
 		return true
