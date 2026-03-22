@@ -358,6 +358,19 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	return raftStore, raftStore, fss, nil
 }
 
+// setupStores creates both the Raft log/stable/snapshot stores and the FSM MVCCStore.
+func setupStores(raftDataDir string, cleanup *internalutil.CleanupStack) (raft.LogStore, raft.StableStore, raft.SnapshotStore, store.MVCCStore, error) {
+	ldb, sdb, fss, err := setupStorage(raftDataDir)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	st, err := setupFSMStore(raftDataDir, cleanup)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return ldb, sdb, fss, st, nil
+}
+
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
 // When raftDataDir is non-empty the store is persisted under that directory;
 // otherwise a temporary directory is used and registered for cleanup on exit.
@@ -480,13 +493,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
-	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
-	if err != nil {
-		return err
-	}
-
-	var st store.MVCCStore
-	st, err = setupFSMStore(cfg.raftDataDir, &cleanup)
+	ldb, sdb, fss, st, err := setupStores(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
 	}
