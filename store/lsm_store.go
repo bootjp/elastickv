@@ -1056,22 +1056,20 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 	for {
 		n, readErr := r.Read(buf)
 		if n > 0 {
-			// Append the new chunk to the rolling tail. Since tail is at most
+			// Extend tail with the new chunk. Since tail is at most
 			// checksumSize bytes (4), this incurs minimal copy overhead.
-			data := append(tail, buf[:n]...)
-			if len(data) > checksumSize {
-				toProcessLen := len(data) - checksumSize
-				toProcess := data[:toProcessLen]
+			tail = append(tail, buf[:n]...)
+			if len(tail) > checksumSize {
+				toProcessLen := len(tail) - checksumSize
+				toProcess := tail[:toProcessLen]
 				if _, err := tmpFile.Write(toProcess); err != nil {
 					closeTmp()
 					return errors.WithStack(err)
 				}
 				_, _ = hasher.Write(toProcess)
-				// Keep only the potential CRC32 trailer in a fresh slice to
-				// avoid aliasing the write buffer on subsequent iterations.
-				tail = append([]byte(nil), data[toProcessLen:]...)
-			} else {
-				tail = data
+				// Retain only the potential CRC32 trailer bytes; copy to a
+				// fresh backing array to avoid aliasing the previous slice.
+				tail = append([]byte(nil), tail[toProcessLen:]...)
 			}
 		}
 		if readErr == io.EOF {
