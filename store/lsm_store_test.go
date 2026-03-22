@@ -289,7 +289,8 @@ func TestPebbleStore_RestoreFromLegacyGob(t *testing.T) {
 	require.NoError(t, src.PutAt(ctx, []byte("a"), []byte("1"), 5, 0))
 	require.NoError(t, src.PutAt(ctx, []byte("b"), []byte("2"), 10, 0))
 
-	srcImpl := src.(*mvccStore)
+	srcImpl, ok := src.(*mvccStore)
+	require.True(t, ok, "expected *mvccStore")
 	var buf bytes.Buffer
 	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
 
