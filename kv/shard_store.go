@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -122,6 +123,9 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 }
 
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
+		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
+	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
 	if userKey := store.ExtractListUserKey(start); userKey != nil {

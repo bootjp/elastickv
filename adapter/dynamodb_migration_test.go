@@ -28,24 +28,55 @@ func (c *localAdapterCoordinator) Dispatch(ctx context.Context, req *kv.Operatio
 	if req == nil {
 		return &kv.CoordinateResponse{}, nil
 	}
-	commitTS := c.Clock().Next()
-	if req.IsTxn && commitTS <= req.StartTS {
-		c.Clock().Observe(req.StartTS)
-		commitTS = c.Clock().Next()
+	commitTS, err := c.commitTSForRequest(req)
+	if err != nil {
+		return nil, err
 	}
-	for _, elem := range req.Elems {
-		switch elem.Op {
-		case kv.Put:
-			if err := c.store.PutAt(ctx, elem.Key, elem.Value, commitTS, 0); err != nil {
-				return nil, err
-			}
-		case kv.Del:
-			if err := c.store.DeleteAt(ctx, elem.Key, commitTS); err != nil {
-				return nil, err
-			}
-		}
+	if err := c.applyElems(ctx, req.Elems, commitTS); err != nil {
+		return nil, err
 	}
 	return &kv.CoordinateResponse{}, nil
+}
+
+func (c *localAdapterCoordinator) commitTSForRequest(req *kv.OperationGroup[kv.OP]) (uint64, error) {
+	if req == nil {
+		return 0, nil
+	}
+	commitTS := req.CommitTS
+	if commitTS == 0 {
+		commitTS = c.Clock().Next()
+		if req.IsTxn && commitTS <= req.StartTS {
+			c.Clock().Observe(req.StartTS)
+			commitTS = c.Clock().Next()
+		}
+	}
+	if req.IsTxn && commitTS <= req.StartTS {
+		return 0, kv.ErrTxnCommitTSRequired
+	}
+	return commitTS, nil
+}
+
+func (c *localAdapterCoordinator) applyElems(ctx context.Context, elems []*kv.Elem[kv.OP], commitTS uint64) error {
+	for _, elem := range elems {
+		if err := c.applyElem(ctx, elem, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *localAdapterCoordinator) applyElem(ctx context.Context, elem *kv.Elem[kv.OP], commitTS uint64) error {
+	if elem == nil {
+		return nil
+	}
+	switch elem.Op {
+	case kv.Put:
+		return c.store.PutAt(ctx, elem.Key, elem.Value, commitTS, 0)
+	case kv.Del:
+		return c.store.DeleteAt(ctx, elem.Key, commitTS)
+	default:
+		return nil
+	}
 }
 
 func newLegacyMigrationTestServer(

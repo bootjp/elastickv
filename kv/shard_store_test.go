@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -68,6 +69,63 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k0, kvs[0].Key)
 	require.Equal(t, k1, kvs[1].Key)
 	require.Equal(t, k2, kvs[2].Key)
+}
+
+func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	k1 := s3keys.ObjectManifestKey("bucket-a", 1, "alpha")
+	k2 := s3keys.ObjectManifestKey("bucket-a", 1, "zeta")
+	require.NoError(t, st.PutAt(ctx, k1, []byte("m1"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, k2, []byte("m2"), 2, 0))
+
+	start := s3keys.ObjectManifestPrefixForBucket("bucket-a", 1)
+	kvs, err := st.ScanAt(ctx, start, prefixScanEnd(start), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, k1, kvs[0].Key)
+	require.Equal(t, k2, kvs[1].Key)
+}
+
+func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	k0 := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
+	k1 := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-1")
+	require.NoError(t, st.PutAt(ctx, k0, []byte("m0"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, k1, []byte("m1"), 2, 0))
+
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	end := prefixScanEnd(start)
+	kvs, err := st.ScanAt(ctx, start, end, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, k0, kvs[0].Key)
+	require.Equal(t, k1, kvs[1].Key)
 }
 
 func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {

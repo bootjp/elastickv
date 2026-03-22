@@ -23,4 +23,7 @@ type OperationGroup[T OP] struct {
 	// StartTS is a logical timestamp captured at transaction begin.
 	// It is ignored for non-transactional groups.
 	StartTS uint64
+	// CommitTS optionally pins the transaction commit timestamp.
+	// Coordinators choose one automatically when this is zero.
+	CommitTS uint64
 }

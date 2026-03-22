@@ -61,7 +61,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.StartTS)
+		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS)
 	}
 
 	return c.dispatchRaw(reqs.Elems)
@@ -101,16 +101,18 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
 	primary := primaryKeyForElems(reqs)
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	commitTS := c.clock.Next()
-	if commitTS <= startTS {
-		c.clock.Observe(startTS)
+	if commitTS == 0 {
 		commitTS = c.clock.Next()
+		if commitTS <= startTS {
+			c.clock.Observe(startTS)
+			commitTS = c.clock.Next()
+		}
 	}
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
@@ -210,7 +212,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 		}
 		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, 0, primary, reqs.Elems),
+			onePhaseTxnRequest(reqs.StartTS, reqs.CommitTS, primary, reqs.Elems),
 		}
 	} else {
 		for _, req := range reqs.Elems {
