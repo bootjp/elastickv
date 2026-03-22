@@ -459,7 +459,12 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	st := store.NewMVCCStore()
+	var st store.MVCCStore
+	st, err = setupFSMStore(cfg.raftDataDir, &cleanup)
+	if err != nil {
+		return err
+	}
+	cleanup.Add(func() { st.Close() })
 	fsm := kv.NewKvFSM(st)
 	readTracker := kv.NewActiveTimestampTracker()
 
