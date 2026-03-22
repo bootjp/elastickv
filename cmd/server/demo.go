@@ -378,6 +378,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	var st store.MVCCStore
 	if cfg.raftDataDir != "" {
+		if mkdirErr := os.MkdirAll(cfg.raftDataDir, 0o755); mkdirErr != nil {
+			return errors.WithStack(mkdirErr)
+		}
 		st, err = store.NewPebbleStore(filepath.Join(cfg.raftDataDir, "fsm.db"))
 		if err != nil {
 			return errors.WithStack(err)
