@@ -45,6 +45,8 @@ const (
 	s3TxnRetryBackoffFactor  = 2
 	s3TxnRetryMaxAttempts    = 8
 
+	s3ManifestCleanupWorkers = 16
+
 	s3PathSplitParts   = 2
 	s3GenerationBytes  = 8
 	s3HLCPhysicalShift = 16
@@ -60,6 +62,7 @@ type S3Server struct {
 	staticCreds map[string]string
 	readTracker *kv.ActiveTimestampTracker
 	httpServer  *http.Server
+	cleanupSem  chan struct{}
 }
 
 type s3BucketMeta struct {
@@ -175,6 +178,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		store:       st,
 		coordinator: coordinate,
 		leaderS3:    cloneLeaderAddrMap(leaderS3),
+		cleanupSem:  make(chan struct{}, s3ManifestCleanupWorkers),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -923,7 +927,15 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	if manifest == nil {
 		return
 	}
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// All cleanup workers are busy; skip this cleanup to avoid unbounded goroutine growth.
+		// Orphaned blobs from skipped cleanups may persist until explicitly overwritten or deleted.
+		return
+	}
 	go func() {
+		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
 		s.cleanupManifestBlobs(ctx, bucket, generation, objectKey, manifest)
@@ -939,25 +951,41 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 		if len(pending) == 0 {
 			return
 		}
-		_, _ = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending})
+		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+			slog.ErrorContext(ctx, "cleanupManifestBlobs: coordinator dispatch failed",
+				"bucket", bucket,
+				"generation", generation,
+				"object_key", objectKey,
+				"upload_id", manifest.UploadID,
+				"err", err,
+			)
+		}
 		pending = pending[:0]
 	}
 	for _, part := range manifest.Parts {
-		for chunkNo := range part.ChunkSizes {
-			chunkIndex, err := uint64FromInt(chunkNo)
-			if err != nil {
-				return
-			}
-			pending = append(pending, &kv.Elem[kv.OP]{
-				Op:  kv.Del,
-				Key: s3keys.BlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex),
-			})
-			if len(pending) >= s3ChunkBatchOps {
-				flush()
-			}
+		var ok bool
+		if pending, ok = s.appendPartBlobKeys(pending, bucket, generation, objectKey, manifest.UploadID, part, flush); !ok {
+			return
 		}
 	}
 	flush()
+}
+
+func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) ([]*kv.Elem[kv.OP], bool) {
+	for chunkNo := range part.ChunkSizes {
+		chunkIndex, err := uint64FromInt(chunkNo)
+		if err != nil {
+			return pending, false
+		}
+		pending = append(pending, &kv.Elem[kv.OP]{
+			Op:  kv.Del,
+			Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex),
+		})
+		if len(pending) >= s3ChunkBatchOps {
+			flush()
+		}
+	}
+	return pending, true
 }
 
 //nolint:cyclop // Proxying depends on root, bucket, and object-level leadership decisions.
@@ -1359,22 +1387,24 @@ func nextS3RetryBackoff(current time.Duration) time.Duration {
 
 func (s *S3Server) retryS3Mutation(ctx context.Context, fn func() error) error {
 	backoff := s3TxnRetryInitialBackoff
-	for attempt := 0; ; attempt++ {
-		err := fn()
-		if err == nil {
+	var lastErr error
+	for attempt := range s3TxnRetryMaxAttempts {
+		lastErr = fn()
+		if lastErr == nil {
 			return nil
 		}
-		if !isRetryableS3MutationErr(err) {
-			return errors.WithStack(err)
+		if !isRetryableS3MutationErr(lastErr) {
+			return errors.WithStack(lastErr)
 		}
-		if attempt >= s3TxnRetryMaxAttempts {
-			return errors.WithStack(err)
+		if attempt == s3TxnRetryMaxAttempts-1 {
+			break
 		}
 		if !waitS3RetryBackoff(ctx, backoff) {
-			return errors.WithStack(err)
+			break
 		}
 		backoff = nextS3RetryBackoff(backoff)
 	}
+	return errors.WithStack(lastErr)
 }
 
 func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key string) {
