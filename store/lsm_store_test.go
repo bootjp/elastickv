@@ -315,3 +315,98 @@ func TestPebbleStore_RestoreFromLegacyGob(t *testing.T) {
 
 	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
 }
+
+// TestPebbleStore_Restore_EmptySnapshot verifies that restoring from an
+// empty reader clears the DB and resets lastCommitTS to zero.
+func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("", "pebble-restore-empty-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Pre-populate so we can verify the restore clears the data.
+	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v"), 42, 0))
+	require.Equal(t, uint64(42), s.LastCommitTS())
+
+	// Restore from empty reader.
+	require.NoError(t, s.Restore(bytes.NewReader(nil)))
+
+	// DB should be empty and lastCommitTS reset to zero.
+	_, err = s.GetAt(ctx, []byte("k"), 42)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
+	assert.Equal(t, uint64(0), s.LastCommitTS())
+}
+
+// TestPebbleStore_Restore_TruncatedHeader verifies that a partial magic
+// header (fewer than 8 bytes) is rejected as a corrupted snapshot.
+func TestPebbleStore_Restore_TruncatedHeader(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-restore-trunc-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// 4 bytes is a partial magic header (less than the 8-byte magic).
+	err = s.Restore(bytes.NewReader([]byte{0x01, 0x02, 0x03, 0x04}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "truncated snapshot")
+}
+
+// TestPebbleStore_Restore_LegacyGobCRCFailure verifies that a gob-encoded
+// snapshot with an invalid CRC32 trailer is rejected.
+func TestPebbleStore_Restore_LegacyGobCRCFailure(t *testing.T) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("", "pebble-restore-crc-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Build a valid legacy gob snapshot, then corrupt the CRC trailer.
+	src := NewMVCCStore()
+	require.NoError(t, src.PutAt(ctx, []byte("k"), []byte("v"), 5, 0))
+	srcImpl, ok := src.(*mvccStore)
+	require.True(t, ok)
+	var buf bytes.Buffer
+	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
+
+	// Flip the last 4 bytes (the CRC) to corrupt the checksum.
+	data := buf.Bytes()
+	for i := len(data) - 4; i < len(data); i++ {
+		data[i] ^= 0xFF
+	}
+
+	err = s.Restore(bytes.NewReader(data))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidChecksum)
+}
+
+// TestPebbleStore_Restore_PebbleMagicMismatch verifies that a stream
+// dispatched as native Pebble but containing a wrong magic header is rejected.
+func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-restore-magic-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Call restorePebbleNative directly with a bad magic value to test the
+	// explicit in-function magic check.
+	badMagic := [8]byte{'B', 'A', 'D', 'M', 'A', 'G', 'I', 'C'}
+	ps := s.(*pebbleStore)
+	err = ps.restorePebbleNative(bytes.NewReader(badMagic[:]))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid pebble snapshot magic header")
+}

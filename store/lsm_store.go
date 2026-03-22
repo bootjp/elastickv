@@ -672,7 +672,7 @@ func (s *pebbleStore) restoreBatchLoop(r io.Reader) error {
 		}
 
 		batchCnt++
-		if batchCnt > snapshotBatchSize {
+		if batchCnt >= snapshotBatchSize {
 			if err := batch.Commit(pebble.NoSync); err != nil {
 				_ = batch.Close()
 				return errors.WithStack(err)
@@ -755,10 +755,17 @@ func (s *pebbleStore) reopenFreshDB() error {
 
 // restorePebbleNative restores from the current Pebble snapshot format
 // (magic "EKVPBBL1" + lastCommitTS + raw key-value entries).
+//
+// Note: The pebbleSnapshotMagic header has been present in every Pebble
+// snapshot since the Pebble store was first introduced. There is no previous
+// Pebble snapshot format without this magic header.
 func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return errors.WithStack(err)
+	}
+	if !bytes.Equal(magic[:], pebbleSnapshotMagic[:]) {
+		return errors.New("invalid pebble snapshot magic header")
 	}
 
 	var ts uint64
