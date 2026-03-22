@@ -51,6 +51,16 @@ func WithPebbleLogger(l *slog.Logger) PebbleStoreOption {
 	}
 }
 
+// defaultPebbleOptions returns the standard Pebble options used throughout
+// the store (including restores) to ensure consistent behaviour between a
+// freshly opened and a restored/swapped-in database.
+func defaultPebbleOptions() *pebble.Options {
+	opts := &pebble.Options{FS: vfs.Default}
+	// Enable automatic compactions and apply all other Pebble defaults.
+	opts.EnsureDefaults()
+	return opts
+}
+
 // NewPebbleStore creates a new Pebble-backed MVCC store.
 func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	s := &pebbleStore{
@@ -63,13 +73,7 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		opt(s)
 	}
 
-	pebbleOpts := &pebble.Options{
-		FS: vfs.Default,
-	}
-	// Enable automatic compactions
-	pebbleOpts.EnsureDefaults()
-
-	db, err := pebble.Open(dir, pebbleOpts)
+	db, err := pebble.Open(dir, defaultPebbleOptions())
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -745,7 +749,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 	if err := os.MkdirAll(s.dir, dirPerms); err != nil {
 		return errors.WithStack(err)
 	}
-	db, err := pebble.Open(s.dir, &pebble.Options{FS: vfs.Default})
+	db, err := pebble.Open(s.dir, defaultPebbleOptions())
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -806,7 +810,7 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return errors.WithStack(err)
 	}
-	tmpDB, err := pebble.Open(tmpDir, &pebble.Options{FS: vfs.Default})
+	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -879,7 +883,7 @@ func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
 			}
 		}
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(pebble.Sync); err != nil {
 		_ = batch.Close()
 		return errors.WithStack(err)
 	}
@@ -900,7 +904,7 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 		_ = os.RemoveAll(tmpDir)
 		return errors.WithStack(err)
 	}
-	newDB, err := pebble.Open(s.dir, &pebble.Options{FS: vfs.Default})
+	newDB, err := pebble.Open(s.dir, defaultPebbleOptions())
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -915,7 +919,7 @@ func (s *pebbleStore) restoreLegacyGobToTempDB(entries []mvccSnapshotEntry, last
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return errors.WithStack(err)
 	}
-	tmpDB, err := pebble.Open(tmpDir, &pebble.Options{FS: vfs.Default})
+	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -956,28 +960,40 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 		return errors.WithStack(err)
 	}
 	tmpPath := tmpFile.Name()
-	defer func() {
+	// closeTmp closes and removes the temp spool file. It is called explicitly
+	// before restoreLegacyGobToTempDB (which calls swapInTempDB and removes
+	// s.dir) to avoid holding an open handle inside a directory that is about
+	// to be deleted – which would fail on Windows and leave inconsistent state
+	// on Unix.
+	closeTmp := func() {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpPath)
-	}()
+	}
 
 	if _, err := io.Copy(tmpFile, r); err != nil {
+		closeTmp()
 		return errors.WithStack(err)
 	}
 
 	payloadSize, err := verifyCRC32Trailer(tmpFile)
 	if err != nil {
+		closeTmp()
 		return err
 	}
 
 	// Decode the gob payload.
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		closeTmp()
 		return errors.WithStack(err)
 	}
 	var snapshot mvccSnapshot
 	if err := gob.NewDecoder(io.LimitReader(tmpFile, payloadSize)).Decode(&snapshot); err != nil {
+		closeTmp()
 		return errors.WithStack(err)
 	}
+
+	// Close and remove the spool file before swapInTempDB removes s.dir.
+	closeTmp()
 
 	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS); err != nil {
 		return err
