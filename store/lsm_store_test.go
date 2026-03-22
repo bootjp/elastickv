@@ -405,7 +405,8 @@ func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
 	// Call restorePebbleNative directly with a bad magic value to test the
 	// explicit in-function magic check.
 	badMagic := [8]byte{'B', 'A', 'D', 'M', 'A', 'G', 'I', 'C'}
-	ps := s.(*pebbleStore)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok, "expected *pebbleStore")
 	err = ps.restorePebbleNative(bytes.NewReader(badMagic[:]))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid pebble snapshot magic header")
