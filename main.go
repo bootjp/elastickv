@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -250,7 +251,11 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
-		st := store.NewMVCCStore()
+		dir := groupDataDir(raftDir, raftID, g.id, multi)
+		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"))
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
+		}
 		fsm := kv.NewKvFSM(st)
 		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, fsm)
 		if err != nil {

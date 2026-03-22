@@ -9,6 +9,8 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
+var pebbleSnapshotMagic = [8]byte{'E', 'K', 'V', 'P', 'B', 'B', 'L', '1'}
+
 type pebbleSnapshot struct {
 	snapshot     *pebble.Snapshot
 	lastCommitTS uint64
@@ -43,6 +45,9 @@ func (s *pebbleSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return 0, errors.New("snapshot is not available")
 	}
 	cw := &countingWriter{w: w}
+	if _, err := cw.Write(pebbleSnapshotMagic[:]); err != nil {
+		return cw.n, errors.WithStack(err)
+	}
 	if err := binary.Write(cw, binary.LittleEndian, s.lastCommitTS); err != nil {
 		return cw.n, errors.WithStack(err)
 	}

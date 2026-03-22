@@ -376,7 +376,24 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	st := store.NewMVCCStore()
+	var st store.MVCCStore
+	if cfg.raftDataDir != "" {
+		st, err = store.NewPebbleStore(filepath.Join(cfg.raftDataDir, "fsm.db"))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+	} else {
+		fsmDir, tmpErr := os.MkdirTemp("", "elastickv-fsm-*")
+		if tmpErr != nil {
+			return errors.WithStack(tmpErr)
+		}
+		cleanup.Add(func() { os.RemoveAll(fsmDir) })
+		st, err = store.NewPebbleStore(fsmDir)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	cleanup.Add(func() { st.Close() })
 	fsm := kv.NewKvFSM(st)
 	readTracker := kv.NewActiveTimestampTracker()
 

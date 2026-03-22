@@ -226,3 +226,91 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 
 	assert.Equal(t, uint64(100), s2.LastCommitTS()) // aligned 100 -> 100 (if started from 0)
 }
+
+// TestPebbleStore_RestoreFromStreamingMVCC verifies that a pebbleStore can
+// restore from a snapshot created by the in-memory mvccStore (streaming
+// "EKVMVCC2" format). This is the migration path when upgrading from the
+// in-memory FSM to the Pebble-backed FSM.
+func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
+	ctx := context.Background()
+
+	// Build a snapshot using the in-memory mvccStore.
+	src := NewMVCCStore()
+	require.NoError(t, src.PutAt(ctx, []byte("key1"), []byte("val1"), 10, 0))
+	require.NoError(t, src.PutAt(ctx, []byte("key1"), []byte("val1-updated"), 20, 0))
+	require.NoError(t, src.DeleteAt(ctx, []byte("key2"), 15))
+	require.NoError(t, src.PutWithTTLAt(ctx, []byte("key3"), []byte("val3"), 30, 9999))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	// Restore into a fresh pebbleStore.
+	dir, err := os.MkdirTemp("", "pebble-migrate-streaming-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dst, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	require.NoError(t, dst.Restore(bytes.NewReader(buf.Bytes())))
+
+	// Verify data was migrated correctly.
+	val, err := dst.GetAt(ctx, []byte("key1"), 20)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1-updated"), val)
+
+	val, err = dst.GetAt(ctx, []byte("key1"), 10)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val)
+
+	_, err = dst.GetAt(ctx, []byte("key2"), 15)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
+
+	val, err = dst.GetAt(ctx, []byte("key3"), 30)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val3"), val)
+
+	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
+}
+
+// TestPebbleStore_RestoreFromLegacyGob verifies that a pebbleStore can
+// restore from the oldest gob-based mvccStore snapshot format.
+func TestPebbleStore_RestoreFromLegacyGob(t *testing.T) {
+	ctx := context.Background()
+
+	// Build a legacy gob snapshot manually.
+	src := NewMVCCStore()
+	require.NoError(t, src.PutAt(ctx, []byte("a"), []byte("1"), 5, 0))
+	require.NoError(t, src.PutAt(ctx, []byte("b"), []byte("2"), 10, 0))
+
+	srcImpl := src.(*mvccStore)
+	var buf bytes.Buffer
+	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
+
+	// Restore into pebbleStore.
+	dir, err := os.MkdirTemp("", "pebble-migrate-gob-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dst, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	require.NoError(t, dst.Restore(bytes.NewReader(buf.Bytes())))
+
+	val, err := dst.GetAt(ctx, []byte("a"), 5)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("1"), val)
+
+	val, err = dst.GetAt(ctx, []byte("b"), 10)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("2"), val)
+
+	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
+}
