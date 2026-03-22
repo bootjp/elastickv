@@ -20,12 +20,11 @@ import (
 )
 
 const (
-	timestampSize        = 8
-	valueHeaderSize      = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchSize    = 1000
-	dirPerms             = 0755
-	metaLastCommitTS     = "_meta_last_commit_ts"
-	maxSnapshotValueSize = 64 << 20 // 64 MiB per encoded value
+	timestampSize     = 8
+	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
+	snapshotBatchSize = 1000
+	dirPerms          = 0755
+	metaLastCommitTS  = "_meta_last_commit_ts"
 )
 
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
@@ -638,9 +637,6 @@ func (s *pebbleStore) restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, e
 		}
 		return false, errors.WithStack(err)
 	}
-	if kLen > maxSnapshotKeySize {
-		return false, errors.Newf("snapshot key length %d exceeds limit %d", kLen, maxSnapshotKeySize)
-	}
 	key := make([]byte, kLen)
 	if _, err := io.ReadFull(r, key); err != nil {
 		return false, errors.WithStack(err)
@@ -649,9 +645,6 @@ func (s *pebbleStore) restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, e
 	var vLen uint64
 	if err := binary.Read(r, binary.LittleEndian, &vLen); err != nil {
 		return false, errors.WithStack(err)
-	}
-	if vLen > maxSnapshotValueSize {
-		return false, errors.Newf("snapshot value length %d exceeds limit %d", vLen, maxSnapshotValueSize)
 	}
 	val := make([]byte, vLen)
 	if _, err := io.ReadFull(r, val); err != nil {
@@ -702,22 +695,7 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 	br := bufio.NewReader(r)
 	header, err := br.Peek(len(pebbleSnapshotMagic))
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			// Treat as empty only when no bytes are available at all.
-			if len(header) == 0 {
-				// DB has been cleared by reopenFreshDB; reset and persist metadata.
-				s.lastCommitTS = 0
-				var tsBuf [timestampSize]byte
-				binary.LittleEndian.PutUint64(tsBuf[:], 0)
-				if setErr := s.db.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); setErr != nil {
-					return errors.WithStack(setErr)
-				}
-				return nil
-			}
-			// Non-empty partial header means a truncated/corrupt snapshot.
-			return errors.New("truncated snapshot: partial magic header")
-		}
-		return errors.WithStack(err)
+		return s.handleRestorePeekError(err, header)
 	}
 
 	switch {
@@ -728,6 +706,25 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 	default:
 		return s.restoreFromLegacyGob(br)
 	}
+}
+
+// handleRestorePeekError processes the error from the initial Peek in Restore.
+// It distinguishes a truly empty snapshot (no bytes at all) from a truncated one.
+func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
+	if !errors.Is(err, io.EOF) {
+		return errors.WithStack(err)
+	}
+	if len(header) != 0 {
+		// Partial header means a truncated/corrupt snapshot.
+		return errors.New("truncated snapshot: partial magic header")
+	}
+	// Truly empty snapshot: DB was cleared by reopenFreshDB; reset and persist metadata.
+	s.lastCommitTS = 0
+	var tsBuf [timestampSize]byte
+	if setErr := s.db.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); setErr != nil {
+		return errors.WithStack(setErr)
+	}
+	return nil
 }
 
 func (s *pebbleStore) reopenFreshDB() error {
@@ -802,45 +799,10 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 		_ = os.RemoveAll(tmpDir)
 	}
 
-	batch := tmpDB.NewBatch()
-	batchCnt := 0
-	for {
-		key, versions, eof, err := readMVCCSnapshotEntry(body)
-		if err != nil {
-			_ = batch.Close()
-			cleanupTmp()
-			return err
-		}
-		if eof {
-			break
-		}
-		for _, v := range versions {
-			pKey := encodeKey(key, v.TS)
-			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
-			if err := batch.Set(pKey, pVal, nil); err != nil {
-				_ = batch.Close()
-				cleanupTmp()
-				return errors.WithStack(err)
-			}
-			batchCnt++
-			if batchCnt >= snapshotBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
-					_ = batch.Close()
-					cleanupTmp()
-					return errors.WithStack(err)
-				}
-				_ = batch.Close()
-				batch = tmpDB.NewBatch()
-				batchCnt = 0
-			}
-		}
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		_ = batch.Close()
+	if err := writeMVCCEntriesToDB(body, tmpDB); err != nil {
 		cleanupTmp()
-		return errors.WithStack(err)
+		return err
 	}
-	_ = batch.Close()
 
 	// Verify checksum before committing the restore.
 	if hash.Sum32() != expectedChecksum {
@@ -861,7 +823,58 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 		_ = os.RemoveAll(tmpDir)
 		return errors.WithStack(err)
 	}
-	// Close the current (empty) DB opened by reopenFreshDB and replace it.
+	if err := s.swapInTempDB(tmpDir); err != nil {
+		return err
+	}
+	s.lastCommitTS = lastCommitTS
+	return nil
+}
+
+// writeMVCCEntriesToDB reads MVCC snapshot entries from body and writes them
+// into the given Pebble database using batched commits.
+func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
+	batch := db.NewBatch()
+	batchCnt := 0
+	for {
+		key, versions, eof, err := readMVCCSnapshotEntry(body)
+		if err != nil {
+			_ = batch.Close()
+			return err
+		}
+		if eof {
+			break
+		}
+		for _, v := range versions {
+			pKey := encodeKey(key, v.TS)
+			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
+			if err := batch.Set(pKey, pVal, nil); err != nil {
+				_ = batch.Close()
+				return errors.WithStack(err)
+			}
+			batchCnt++
+			if batchCnt >= snapshotBatchSize {
+				if err := batch.Commit(pebble.NoSync); err != nil {
+					_ = batch.Close()
+					return errors.WithStack(err)
+				}
+				_ = batch.Close()
+				batch = db.NewBatch()
+				batchCnt = 0
+			}
+		}
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		_ = batch.Close()
+		return errors.WithStack(err)
+	}
+	_ = batch.Close()
+	return nil
+}
+
+// swapInTempDB closes the current DB, removes its directory, and renames tmpDir
+// to s.dir, then reopens the DB. The caller is responsible for closing tmpDB
+// before calling this.
+func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	_ = s.db.Close()
 	if err := os.RemoveAll(s.dir); err != nil {
 		_ = os.RemoveAll(tmpDir)
@@ -876,7 +889,6 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 		return errors.WithStack(err)
 	}
 	s.db = newDB
-	s.lastCommitTS = lastCommitTS
 	return nil
 }
 
@@ -902,34 +914,9 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 		return errors.WithStack(err)
 	}
 
-	size, err := tmpFile.Seek(0, io.SeekEnd)
+	payloadSize, err := verifyCRC32Trailer(tmpFile)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	if size < checksumSize {
-		return errors.WithStack(ErrInvalidChecksum)
-	}
-	payloadSize := size - checksumSize
-
-	// Read the stored checksum from the last 4 bytes.
-	if _, err := tmpFile.Seek(-checksumSize, io.SeekEnd); err != nil {
-		return errors.WithStack(err)
-	}
-	var storedChecksum uint32
-	if err := binary.Read(tmpFile, binary.LittleEndian, &storedChecksum); err != nil {
-		return errors.WithStack(err)
-	}
-
-	// Verify checksum by streaming through the payload only.
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		return errors.WithStack(err)
-	}
-	hasher := crc32.NewIEEE()
-	if _, err := io.Copy(hasher, io.LimitReader(tmpFile, payloadSize)); err != nil {
-		return errors.WithStack(err)
-	}
-	if hasher.Sum32() != storedChecksum {
-		return errors.WithStack(ErrInvalidChecksum)
+		return err
 	}
 
 	// Decode the gob payload.
@@ -945,10 +932,48 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 	if err := s.saveLastCommitTS(snapshot.LastCommitTS); err != nil {
 		return err
 	}
+	return writeGobEntriesToDB(snapshot.Entries, s.db)
+}
 
-	batch := s.db.NewBatch()
+// verifyCRC32Trailer verifies the CRC32 checksum appended at the end of f.
+// On success it returns the payload size (file size minus the checksum trailer).
+func verifyCRC32Trailer(f *os.File) (int64, error) {
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if size < checksumSize {
+		return 0, errors.WithStack(ErrInvalidChecksum)
+	}
+	payloadSize := size - checksumSize
+
+	if _, err := f.Seek(-checksumSize, io.SeekEnd); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	var storedChecksum uint32
+	if err := binary.Read(f, binary.LittleEndian, &storedChecksum); err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	hasher := crc32.NewIEEE()
+	if _, err := io.Copy(hasher, io.LimitReader(f, payloadSize)); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if hasher.Sum32() != storedChecksum {
+		return 0, errors.WithStack(ErrInvalidChecksum)
+	}
+	return payloadSize, nil
+}
+
+// writeGobEntriesToDB writes the decoded gob snapshot entries into db using
+// batched commits.
+func writeGobEntriesToDB(entries []mvccSnapshotEntry, db *pebble.DB) error {
+	batch := db.NewBatch()
 	batchCnt := 0
-	for _, entry := range snapshot.Entries {
+	for _, entry := range entries {
 		for _, v := range entry.Versions {
 			pKey := encodeKey(entry.Key, v.TS)
 			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
@@ -963,12 +988,12 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 					return errors.WithStack(err)
 				}
 				_ = batch.Close()
-				batch = s.db.NewBatch()
+				batch = db.NewBatch()
 				batchCnt = 0
 			}
 		}
 	}
-	err = batch.Commit(pebble.Sync)
+	err := batch.Commit(pebble.Sync)
 	_ = batch.Close()
 	return errors.WithStack(err)
 }

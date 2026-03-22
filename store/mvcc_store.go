@@ -854,7 +854,6 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	}, nil
 }
 
-
 func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
 	if len(versions) == 0 {
 		return versions, false
