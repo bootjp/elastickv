@@ -15,25 +15,29 @@
       }
     ]
   },
+  "description": "DynamoDB request activity with leader-scoped Raft membership context for elastickv.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": null,
   "links": [],
   "panels": [
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -53,6 +57,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -60,11 +65,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
           "instant": false,
@@ -77,18 +88,22 @@
       "type": "stat"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "orange",
@@ -116,6 +131,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -123,11 +139,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
           "instant": false,
@@ -140,18 +162,22 @@
       "type": "stat"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "orange",
@@ -179,6 +205,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -186,11 +213,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\"}[5m])))",
           "instant": false,
@@ -203,18 +236,22 @@
       "type": "stat"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -234,6 +271,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -241,11 +279,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum(elastickv_dynamodb_inflight_requests{job=\"elastickv\"})",
           "instant": false,
@@ -258,11 +302,61 @@
       "type": "stat"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
           },
           "unit": "reqps"
         },
@@ -283,13 +377,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "{{operation}}",
@@ -301,11 +400,61 @@
       "type": "timeseries"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
           },
           "unit": "reqps"
         },
@@ -326,13 +475,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum by (outcome) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
           "legendFormat": "{{outcome}}",
@@ -344,11 +498,61 @@
       "type": "timeseries"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
           },
           "unit": "ops"
         },
@@ -369,13 +573,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "returned {{table}}",
@@ -383,7 +592,10 @@
           "refId": "A"
         },
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "scanned {{table}}",
@@ -391,7 +603,10 @@
           "refId": "B"
         },
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "written {{table}}",
@@ -403,11 +618,61 @@
       "type": "timeseries"
     },
     {
-      "datasource": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": null
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
           },
           "unit": "short"
         },
@@ -428,13 +693,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
+      "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "max by (group, node_id) (elastickv_raft_commit_index{job=\"elastickv\"})",
           "legendFormat": "commit g{{group}} {{node_id}}",
@@ -442,7 +712,10 @@
           "refId": "A"
         },
         {
-          "datasource": null,
+          "datasource": {
+            "type": "prometheus",
+            "uid": null
+          },
           "editorMode": "code",
           "expr": "max by (group, node_id) (elastickv_raft_applied_index{job=\"elastickv\"})",
           "legendFormat": "applied g{{group}} {{node_id}}",
@@ -528,8 +801,8 @@
             },
             "indexByName": {
               "group": 0,
-              "leader_id": 1,
-              "leader_address": 2
+              "leader_address": 2,
+              "leader_id": 1
             },
             "renameByName": {
               "group": "Raft Group",
@@ -616,8 +889,8 @@
             },
             "indexByName": {
               "group": 0,
-              "member_id": 1,
               "member_address": 2,
+              "member_id": 1,
               "suffrage": 3
             },
             "renameByName": {
@@ -715,11 +988,11 @@
               "Time": true
             },
             "indexByName": {
-              "group": 0,
-              "member_id": 1,
-              "member_address": 2,
               "Value": 3,
-              "Value #A": 3
+              "Value #A": 3,
+              "group": 0,
+              "member_address": 2,
+              "member_id": 1
             },
             "renameByName": {
               "Value": "Leader Flag",
@@ -734,13 +1007,14 @@
       "type": "table"
     }
   ],
+  "preload": false,
   "refresh": "10s",
   "schemaVersion": 41,
-  "style": "dark",
   "tags": [
+    "dynamodb",
     "elastickv",
     "raft",
-    "dynamodb"
+    "summary"
   ],
   "templating": {
     "list": []
@@ -751,8 +1025,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Elastickv Cluster Overview",
-  "uid": "elastickv-cluster",
-  "version": 1,
-  "weekStart": ""
+  "title": "Elastickv DynamoDB Summary",
+  "uid": "elastickv-dynamodb-summary",
+  "version": 6
 }

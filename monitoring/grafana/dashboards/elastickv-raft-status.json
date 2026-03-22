@@ -35,10 +35,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -80,14 +77,12 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_term{job=\"elastickv\"})",
-          "instant": true,
+          "expr": "max by (group) (elastickv_raft_term{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
+          "instant": false,
           "legendFormat": "{{group}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -95,10 +90,7 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -140,25 +132,20 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_num_peers{job=\"elastickv\"})",
-          "instant": true,
+          "expr": "clamp_min(count by (group) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\",suffrage=\"voter\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1)) - 1, 0)",
+          "instant": false,
           "legendFormat": "{{group}}",
+          "range": true,
           "refId": "A"
         }
       ],
-      "title": "Voting Peers",
+      "title": "Other Voting Peers",
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -200,25 +187,20 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_members{job=\"elastickv\"})",
-          "instant": true,
+          "expr": "count by (group) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
+          "instant": false,
           "legendFormat": "{{group}}",
+          "range": true,
           "refId": "A"
         }
       ],
-      "title": "Member Count",
+      "title": "Config Members",
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -268,18 +250,16 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_fsm_pending{job=\"elastickv\"})",
-          "instant": true,
+          "expr": "max by (group) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\"})",
+          "instant": false,
           "legendFormat": "{{group}}",
+          "range": true,
           "refId": "A"
         }
       ],
-      "title": "FSM Pending",
+      "title": "Max FSM Pending",
       "type": "stat"
     },
     {
@@ -295,10 +275,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -323,32 +300,51 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\"})",
+          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
           "format": "table",
           "instant": true,
-          "legendFormat": "{{group}}",
+          "legendFormat": "group {{group}} leader {{leader_id}}",
           "refId": "A"
         }
       ],
       "title": "Current Leader per Group",
       "transformations": [
         {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
           "id": "merge",
           "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Metric": true,
+              "Time": true,
+              "Value": true,
+              "Value #A": true
+            },
+            "indexByName": {
+              "group": 0,
+              "leader_id": 1,
+              "leader_address": 2
+            },
+            "renameByName": {
+              "group": "Raft Group",
+              "leader_address": "Leader Address",
+              "leader_id": "Leader ID"
+            }
+          }
         }
       ],
       "type": "table"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -373,32 +369,53 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, state) (elastickv_raft_local_state{job=\"elastickv\"})",
+          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"} == 1)",
           "format": "table",
           "instant": true,
-          "legendFormat": "{{group}} - {{state}}",
+          "legendFormat": "group {{group}} node {{node_id}} {{state}}",
           "refId": "A"
         }
       ],
       "title": "Node Local State",
       "transformations": [
         {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
           "id": "merge",
           "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Metric": true,
+              "Time": true,
+              "Value": true,
+              "Value #A": true
+            },
+            "indexByName": {
+              "group": 0,
+              "node_id": 1,
+              "node_address": 2,
+              "state": 3
+            },
+            "renameByName": {
+              "group": "Raft Group",
+              "node_address": "Node Address",
+              "node_id": "Node ID",
+              "state": "Local State"
+            }
+          }
         }
       ],
       "type": "table"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -423,23 +440,47 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\"})",
+          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
           "format": "table",
           "instant": true,
-          "legendFormat": "{{group}} - {{member_id}}",
+          "legendFormat": "group {{group}} member {{member_id}}",
           "refId": "A"
         }
       ],
       "title": "Cluster Members",
       "transformations": [
         {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
           "id": "merge",
           "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Metric": true,
+              "Time": true,
+              "Value": true,
+              "Value #A": true
+            },
+            "indexByName": {
+              "group": 0,
+              "member_id": 1,
+              "member_address": 2,
+              "suffrage": 3
+            },
+            "renameByName": {
+              "group": "Raft Group",
+              "member_address": "Member Address",
+              "member_id": "Member ID",
+              "suffrage": "Suffrage"
+            }
+          }
         }
       ],
       "type": "table"
@@ -457,10 +498,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -491,48 +529,36 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "last log - {{group}}",
           "range": true,
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_commit_index{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "commit - {{group}}",
           "range": true,
           "refId": "B"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_applied_index{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "applied - {{group}}",
           "range": true,
           "refId": "C"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_snapshot_index{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "snapshot - {{group}}",
           "range": true,
@@ -555,10 +581,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -589,12 +612,9 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\"}) - max by (group) (elastickv_raft_applied_index{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\"}) - max by (group) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "lag - {{group}}",
           "range": true,
@@ -605,10 +625,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -639,12 +656,9 @@
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
+          "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\"})",
+          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\"})",
           "instant": false,
           "legendFormat": "{{group}}",
           "range": true,
@@ -665,10 +679,7 @@
     "list": [
       {
         "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "prometheus"
-        },
+        "datasource": null,
         "definition": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
         "hide": 0,
         "includeAll": true,
