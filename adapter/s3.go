@@ -194,6 +194,12 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 }
 
 func (s *S3Server) Run() error {
+	if s.httpServer == nil {
+		return errors.New("s3 server httpServer is nil")
+	}
+	if s.listen == nil {
+		return errors.New("s3 server listener is nil")
+	}
 	if err := s.httpServer.Serve(s.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}

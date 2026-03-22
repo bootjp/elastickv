@@ -113,6 +113,10 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint
 			c.clock.Observe(startTS)
 			commitTS = c.clock.Next()
 		}
+	} else {
+		// Observe the caller-provided commitTS so the HLC never issues
+		// a smaller timestamp in subsequent calls, preserving monotonicity.
+		c.clock.Observe(commitTS)
 	}
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
