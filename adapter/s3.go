@@ -746,7 +746,24 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 
 //nolint:cyclop,gocognit,gocyclo,nestif // ListObjectsV2 combines token validation, shard-stable snapshotting, and delimiter pagination rules.
 func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
+	query := r.URL.Query()
+	prefix := query.Get("prefix")
+	delimiter := query.Get("delimiter")
+	maxKeys := parseS3MaxKeys(query.Get("max-keys"))
+
+	// Parse the continuation token first so we can select the final readTS before loading metadata.
+	// This ensures meta is always loaded at the same snapshot used for the scan.
+	token, err := decodeS3ContinuationToken(query.Get("continuation-token"))
+	if err != nil {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "invalid continuation token", bucket, "")
+		return
+	}
+
 	readTS := s.readTS()
+	if token != nil && token.ReadTS != 0 {
+		readTS = token.ReadTS
+	}
+
 	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
@@ -757,22 +774,10 @@ func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket 
 		return
 	}
 
-	query := r.URL.Query()
-	prefix := query.Get("prefix")
-	delimiter := query.Get("delimiter")
-	maxKeys := parseS3MaxKeys(query.Get("max-keys"))
-	token, err := decodeS3ContinuationToken(query.Get("continuation-token"))
-	if err != nil {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "invalid continuation token", bucket, "")
-		return
-	}
 	if token != nil {
 		if token.Bucket != bucket || token.Generation != meta.Generation || token.Prefix != prefix || token.Delimiter != delimiter {
 			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token does not match request", bucket, "")
 			return
-		}
-		if token.ReadTS != 0 {
-			readTS = token.ReadTS
 		}
 	}
 	readPin := s.pinReadTS(readTS)
