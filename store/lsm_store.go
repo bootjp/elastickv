@@ -662,10 +662,6 @@ func restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {
 	return false, nil
 }
 
-func (s *pebbleStore) restoreBatchLoop(r io.Reader) error {
-	return restoreBatchLoopInto(r, s.db)
-}
-
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
 // them into db using batched commits. It is used for both the direct and the
 // temp-dir atomic native Pebble restore paths.
@@ -807,50 +803,22 @@ func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
 // temp directory into s.dir after a full successful read, preserving the
 // existing DB on any failure.
 func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
-	var magic [8]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return errors.WithStack(err)
+	magic, ts, err := readPebbleNativeHeader(r)
+	if err != nil {
+		return err
 	}
 	if !bytes.Equal(magic[:], pebbleSnapshotMagic[:]) {
 		return errors.New("invalid pebble snapshot magic header")
 	}
 
-	var ts uint64
-	if err := binary.Read(r, binary.LittleEndian, &ts); err != nil {
-		return errors.WithStack(err)
-	}
-
-	tmpDir, err := os.MkdirTemp(filepath.Dir(filepath.Clean(s.dir)), filepath.Base(filepath.Clean(s.dir))+"-pebble-native-*")
+	tmpDir, err := makeSiblingTempDir(s.dir, "pebble-native")
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	// MkdirTemp creates an empty directory; remove it so pebble.Open can
-	// initialise a fresh database at the same path.
-	if err := os.Remove(tmpDir); err != nil {
-		return errors.WithStack(err)
-	}
-	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	if err := restoreBatchLoopInto(r, tmpDB); err != nil {
-		_ = tmpDB.Close()
-		_ = os.RemoveAll(tmpDir)
 		return err
 	}
 
-	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], ts)
-	if err := tmpDB.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); err != nil {
-		_ = tmpDB.Close()
+	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
-	}
-
-	if err := tmpDB.Close(); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		return err
 	}
 
 	if err := s.swapInTempDB(tmpDir); err != nil {
@@ -858,6 +826,58 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 	}
 	s.lastCommitTS = ts
 	return nil
+}
+
+// readPebbleNativeHeader reads the 8-byte magic and 8-byte lastCommitTS from r.
+func readPebbleNativeHeader(r io.Reader) ([8]byte, uint64, error) {
+	var magic [8]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return magic, 0, errors.WithStack(err)
+	}
+	var ts uint64
+	if err := binary.Read(r, binary.LittleEndian, &ts); err != nil {
+		return magic, 0, errors.WithStack(err)
+	}
+	return magic, ts, nil
+}
+
+// makeSiblingTempDir creates a temp directory next to dir (same parent) with
+// the given tag in its name. MkdirTemp leaves an empty directory; we remove
+// it so that pebble.Open can create its own directory structure at that path.
+func makeSiblingTempDir(dir, tag string) (string, error) {
+	clean := filepath.Clean(dir)
+	tmpDir, err := os.MkdirTemp(filepath.Dir(clean), filepath.Base(clean)+"-"+tag+"-*")
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	if err := os.Remove(tmpDir); err != nil {
+		return "", errors.WithStack(err)
+	}
+	return tmpDir, nil
+}
+
+// writeNativeSnapshotToTempDir writes batch-loop entries from r into a fresh
+// Pebble database at tmpDir, persists ts as the lastCommitTS meta-key, then
+// closes the database.
+func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
+	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := restoreBatchLoopInto(r, tmpDB); err != nil {
+		_ = tmpDB.Close()
+		return err
+	}
+
+	var tsBuf [timestampSize]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], ts)
+	if err := tmpDB.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); err != nil {
+		_ = tmpDB.Close()
+		return errors.WithStack(err)
+	}
+
+	return errors.WithStack(tmpDB.Close())
 }
 
 // restoreFromStreamingMVCC restores from the in-memory MVCCStore streaming
@@ -1034,46 +1054,69 @@ func (s *pebbleStore) restoreLegacyGobToTempDB(entries []mvccSnapshotEntry, last
 // written into a temporary Pebble directory and only swapped into place after
 // decoding succeeds, preserving the existing store on failure.
 func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
-	// Spool gob payload to a temp file inside s.dir to keep restore I/O on
-	// the same filesystem as the store and avoid cross-device surprises.
-	tmpFile, err := os.CreateTemp(s.dir, "ekv-legacy-gob-*.tmp")
+	snapshot, err := spoolAndDecodeGobSnapshot(r, s.dir)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
+	}
+	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS); err != nil {
+		return err
+	}
+	s.lastCommitTS = snapshot.LastCommitTS
+	return nil
+}
+
+// spoolAndDecodeGobSnapshot streams r into a spool file co-located with dir,
+// verifies the CRC32 trailer, then gob-decodes the payload and returns the
+// snapshot. The spool file is always cleaned up before returning.
+func spoolAndDecodeGobSnapshot(r io.Reader, dir string) (mvccSnapshot, error) {
+	tmpFile, err := os.CreateTemp(dir, "ekv-legacy-gob-*.tmp")
+	if err != nil {
+		return mvccSnapshot{}, errors.WithStack(err)
 	}
 	tmpPath := tmpFile.Name()
-	// closeTmp closes and removes the temp spool file. It is called explicitly
-	// before restoreLegacyGobToTempDB (which calls swapInTempDB and removes
-	// s.dir) to avoid holding an open handle inside a directory that is about
-	// to be deleted – which would fail on Windows and leave inconsistent state
-	// on Unix.
 	closeTmp := func() {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpPath)
 	}
 
-	// Stream r into tmpFile while computing CRC32 over the gob payload.
-	// The last checksumSize bytes are the CRC32 trailer (LittleEndian uint32);
-	// we keep them in a rolling tail buffer so that only the payload is written
-	// to tmpFile and hashed. This avoids reading the file twice.
+	if err := spoolGobPayload(r, tmpFile); err != nil {
+		closeTmp()
+		return mvccSnapshot{}, err
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		closeTmp()
+		return mvccSnapshot{}, errors.WithStack(err)
+	}
+	var snapshot mvccSnapshot
+	if err := gob.NewDecoder(tmpFile).Decode(&snapshot); err != nil {
+		closeTmp()
+		return mvccSnapshot{}, errors.WithStack(err)
+	}
+	// Close and remove the spool file before swapInTempDB removes dir.
+	closeTmp()
+	return snapshot, nil
+}
+
+// spoolGobPayload streams r into dst, stripping the final checksumSize-byte
+// CRC32 trailer. The payload bytes are written to dst and hashed; the trailer
+// is verified but not written. Returns ErrInvalidChecksum on mismatch or a
+// truncated stream.
+func spoolGobPayload(r io.Reader, dst io.Writer) error {
 	hasher := crc32.NewIEEE()
 	buf := make([]byte, spoolBufSize)
 	var tail []byte
 	for {
 		n, readErr := r.Read(buf)
 		if n > 0 {
-			// Extend tail with the new chunk. Since tail is at most
-			// checksumSize bytes (4), this incurs minimal copy overhead.
 			tail = append(tail, buf[:n]...)
 			if len(tail) > checksumSize {
 				toProcessLen := len(tail) - checksumSize
 				toProcess := tail[:toProcessLen]
-				if _, err := tmpFile.Write(toProcess); err != nil {
-					closeTmp()
+				if _, err := dst.Write(toProcess); err != nil {
 					return errors.WithStack(err)
 				}
 				_, _ = hasher.Write(toProcess)
-				// Retain only the potential CRC32 trailer bytes; copy to a
-				// fresh backing array to avoid aliasing the previous slice.
 				tail = append([]byte(nil), tail[toProcessLen:]...)
 			}
 		}
@@ -1081,40 +1124,15 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 			break
 		}
 		if readErr != nil {
-			closeTmp()
 			return errors.WithStack(readErr)
 		}
 	}
-
-	// After EOF, tail must be exactly the 4-byte CRC32 trailer.
 	if len(tail) != checksumSize {
-		closeTmp()
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-	storedChecksum := binary.LittleEndian.Uint32(tail)
-	if hasher.Sum32() != storedChecksum {
-		closeTmp()
+	if hasher.Sum32() != binary.LittleEndian.Uint32(tail) {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-
-	// Decode the gob payload from the spool file (CRC trailer not present).
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		closeTmp()
-		return errors.WithStack(err)
-	}
-	var snapshot mvccSnapshot
-	if err := gob.NewDecoder(tmpFile).Decode(&snapshot); err != nil {
-		closeTmp()
-		return errors.WithStack(err)
-	}
-
-	// Close and remove the spool file before swapInTempDB removes s.dir.
-	closeTmp()
-
-	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS); err != nil {
-		return err
-	}
-	s.lastCommitTS = snapshot.LastCommitTS
 	return nil
 }
 
