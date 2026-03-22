@@ -11,6 +11,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -37,6 +38,7 @@ const (
 	s3MaxKeys                = 1000
 	s3ListPageSize           = 256
 	s3ManifestCleanupTimeout = 2 * time.Minute
+	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -475,6 +477,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !strings.EqualFold(expectedPayloadSHA, s3UnsignedPayload)
+	r.Body = http.MaxBytesReader(w, r.Body, s3MaxObjectSizeBytes)
 	part := s3ObjectPart{PartNo: 1}
 	sizeBytes := int64(0)
 	chunkNo := uint64(0)
@@ -545,6 +548,11 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		if readErr != nil {
 			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(readErr, &maxBytesErr) {
+				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "object exceeds maximum allowed size", bucket, objectKey)
+				return
+			}
 			writeS3InternalError(w, readErr)
 			return
 		}
@@ -1153,11 +1161,10 @@ func writeS3Error(w http.ResponseWriter, status int, code string, message string
 }
 
 func writeS3InternalError(w http.ResponseWriter, err error) {
-	message := "internal error"
 	if err != nil {
-		message = err.Error()
+		slog.Error("s3 internal error", "error", err)
 	}
-	writeS3Error(w, http.StatusInternalServerError, "InternalError", message, "", "")
+	writeS3Error(w, http.StatusInternalServerError, "InternalError", "internal error", "", "")
 }
 
 func writeS3ObjectHeaders(h http.Header, manifest *s3ObjectManifest) {
