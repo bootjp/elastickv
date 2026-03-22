@@ -411,3 +411,43 @@ func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid pebble snapshot magic header")
 }
+
+// TestPebbleStore_Restore_NativePebbleAtomic verifies that when a native
+// Pebble snapshot restore fails midway (truncated data), the existing DB
+// contents are preserved and not wiped.
+func TestPebbleStore_Restore_NativePebbleAtomic(t *testing.T) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("", "pebble-atomic-restore-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Pre-populate with known data.
+	require.NoError(t, s.PutAt(ctx, []byte("existing"), []byte("value"), 10, 0))
+	require.Equal(t, uint64(10), s.LastCommitTS())
+
+	// Build a valid snapshot then truncate it to simulate corruption.
+	snap, err := s.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	var raw bytes.Buffer
+	_, err = snap.WriteTo(&raw)
+	require.NoError(t, err)
+
+	// Truncate: keep magic (8) + lastCommitTS (8) but include only a partial
+	// entry framing (3 bytes of what would be an 8-byte key-length field).
+	truncated := raw.Bytes()[:16+3] // partial key-length field (8 bytes expected)
+
+	// Restore from truncated snapshot should fail.
+	err = s.Restore(bytes.NewReader(truncated))
+	require.Error(t, err)
+
+	// The original data should still be accessible.
+	val, getErr := s.GetAt(ctx, []byte("existing"), 10)
+	require.NoError(t, getErr)
+	assert.Equal(t, []byte("value"), val)
+}
