@@ -33,7 +33,7 @@ const (
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
-	dirPerm                    = 0o755
+	dirPerm                    = raftDirPerm
 )
 
 var (
