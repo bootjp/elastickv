@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,7 @@ const (
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
+	dirPerm                    = raftDirPerm
 )
 
 var (
@@ -250,7 +253,14 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
-		st := store.NewMVCCStore()
+		dir := groupDataDir(raftDir, raftID, g.id, multi)
+		if err := os.MkdirAll(dir, dirPerm); err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", g.id)
+		}
+		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"))
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
+		}
 		fsm := kv.NewKvFSM(st)
 		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, fsm)
 		if err != nil {
