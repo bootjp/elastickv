@@ -49,6 +49,8 @@ func (c *localAdapterCoordinator) commitTSForRequest(req *kv.OperationGroup[kv.O
 			c.Clock().Observe(req.StartTS)
 			commitTS = c.Clock().Next()
 		}
+	} else {
+		c.Clock().Observe(commitTS)
 	}
 	if req.IsTxn && commitTS <= req.StartTS {
 		return 0, kv.ErrTxnCommitTSRequired
