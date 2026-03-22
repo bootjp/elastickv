@@ -100,6 +100,10 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 
 	if commitTS == 0 {
 		commitTS = c.nextTxnTSAfter(startTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
 	}
 	if commitTS == 0 || commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
@@ -468,6 +472,10 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	commitTS := reqs.CommitTS
 	if commitTS == 0 {
 		commitTS = c.nextTxnTSAfter(reqs.StartTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
 	}
 	if commitTS == 0 || commitTS <= reqs.StartTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)

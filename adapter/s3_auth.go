@@ -186,7 +186,12 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 			Message: "failed to verify request signature",
 		}
 	}
-	if subtle.ConstantTimeCompare([]byte(authHeader), []byte(expectedAuth)) != 1 {
+	// Compare only the Signature component to avoid false rejections caused by
+	// equivalent Authorization headers that differ in whitespace or parameter
+	// ordering (but carry the same cryptographic signature).
+	gotSig := extractS3Signature(authHeader)
+	expectedSig := extractS3Signature(expectedAuth)
+	if gotSig == "" || subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectedSig)) != 1 {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
 			Code:    "SignatureDoesNotMatch",
@@ -257,4 +262,20 @@ func parseS3AuthorizationHeader(raw string) (s3AuthorizationHeader, error) {
 
 func normalizeS3PayloadHash(raw string) string {
 	return strings.TrimSpace(raw)
+}
+
+// extractS3Signature returns the hex signature value from a SigV4
+// Authorization header (the "Signature=<hex>" component).
+func extractS3Signature(auth string) string {
+	_, params, ok := strings.Cut(auth, " ")
+	if !ok {
+		return ""
+	}
+	for _, param := range strings.Split(params, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+		if ok && key == "Signature" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

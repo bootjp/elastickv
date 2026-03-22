@@ -211,8 +211,16 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if len(primary) == 0 {
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 		}
+		// When StartTS is absent (leader will assign it), also clear CommitTS
+		// so the leader assigns both timestamps consistently. A caller-provided
+		// CommitTS without a StartTS would produce an invalid txn where
+		// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
+		commitTS := reqs.CommitTS
+		if reqs.StartTS == 0 {
+			commitTS = 0
+		}
 		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, reqs.CommitTS, primary, reqs.Elems),
+			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems),
 		}
 	} else {
 		for _, req := range reqs.Elems {
