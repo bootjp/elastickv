@@ -33,6 +33,7 @@ const (
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
+	dirPerm                    = 0o755
 )
 
 var (
@@ -253,7 +254,7 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
 		dir := groupDataDir(raftDir, raftID, g.id, multi)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, dirPerm); err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", g.id)
 		}
 		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"))

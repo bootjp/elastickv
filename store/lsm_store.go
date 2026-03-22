@@ -901,6 +901,38 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	return nil
 }
 
+// restoreLegacyGobToTempDB writes the decoded gob snapshot into a temporary
+// Pebble directory sibling to s.dir and atomically swaps it into place.
+func (s *pebbleStore) restoreLegacyGobToTempDB(entries []mvccSnapshotEntry, lastCommitTS uint64) error {
+	tmpDir := filepath.Clean(s.dir) + ".legacy-tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return errors.WithStack(err)
+	}
+	tmpDB, err := pebble.Open(tmpDir, &pebble.Options{FS: vfs.Default})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := writeGobEntriesToDB(entries, tmpDB); err != nil {
+		_ = tmpDB.Close()
+		_ = os.RemoveAll(tmpDir)
+		return err
+	}
+
+	var tsBuf [timestampSize]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], lastCommitTS)
+	if err := tmpDB.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); err != nil {
+		_ = tmpDB.Close()
+		_ = os.RemoveAll(tmpDir)
+		return errors.WithStack(err)
+	}
+
+	if err := tmpDB.Close(); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return errors.WithStack(err)
+	}
+	return s.swapInTempDB(tmpDir)
+}
+
 // restoreFromLegacyGob restores from the legacy gob-encoded MVCCStore
 // snapshot format (gob payload + CRC32 trailer).
 //
@@ -940,36 +972,7 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 		return errors.WithStack(err)
 	}
 
-	// Write entries into a temporary Pebble directory so that the real store
-	// is only replaced after decoding succeeds, preserving the existing store
-	// on failure.
-	tmpDir := filepath.Clean(s.dir) + ".legacy-tmp"
-	if err := os.RemoveAll(tmpDir); err != nil {
-		return errors.WithStack(err)
-	}
-	tmpDB, err := pebble.Open(tmpDir, &pebble.Options{FS: vfs.Default})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if err := writeGobEntriesToDB(snapshot.Entries, tmpDB); err != nil {
-		_ = tmpDB.Close()
-		_ = os.RemoveAll(tmpDir)
-		return err
-	}
-
-	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], snapshot.LastCommitTS)
-	if err := tmpDB.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); err != nil {
-		_ = tmpDB.Close()
-		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
-	}
-
-	if err := tmpDB.Close(); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
-	}
-	if err := s.swapInTempDB(tmpDir); err != nil {
+	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS); err != nil {
 		return err
 	}
 	s.lastCommitTS = snapshot.LastCommitTS
