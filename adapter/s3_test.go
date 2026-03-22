@@ -38,49 +38,49 @@ func TestS3Server_BucketAndObjectLifecycle(t *testing.T) {
 	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/bucket-a", nil)
+	req := newS3TestRequest(http.MethodPut, "/bucket-a", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	payload := "hello world"
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/bucket-a/dir/file.txt", strings.NewReader(payload))
+	req = newS3TestRequest(http.MethodPut, "/bucket-a/dir/file.txt", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "text/plain")
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, `"`+md5Hex(payload)+`"`, rec.Header().Get("ETag"))
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodHead, "/bucket-a", nil)
+	req = newS3TestRequest(http.MethodHead, "/bucket-a", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodHead, "/bucket-a/dir/file.txt", nil)
+	req = newS3TestRequest(http.MethodHead, "/bucket-a/dir/file.txt", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "11", rec.Header().Get("Content-Length"))
 	require.Equal(t, `"`+md5Hex(payload)+`"`, rec.Header().Get("ETag"))
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil)
+	req = newS3TestRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, payload, rec.Body.String())
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/bucket-a?list-type=2", nil)
+	req = newS3TestRequest(http.MethodGet, "/bucket-a?list-type=2", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Contains(t, rec.Body.String(), "<Key>dir/file.txt</Key>")
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/bucket-a/dir/file.txt", nil)
+	req = newS3TestRequest(http.MethodDelete, "/bucket-a/dir/file.txt", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/bucket-a", nil)
+	req = newS3TestRequest(http.MethodDelete, "/bucket-a", nil)
 	server.handle(rec, req)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
@@ -101,7 +101,7 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := newS3TestRequest(http.MethodGet, "/", nil)
 	server.handle(rec, req)
 
 	require.True(t, proxied)
@@ -123,7 +123,7 @@ func TestS3Server_RejectsUnsignedRequestWhenCredentialsConfigured(t *testing.T) 
 	)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := newS3TestRequest(http.MethodGet, "/", nil)
 	server.handle(rec, req)
 
 	require.Equal(t, http.StatusForbidden, rec.Code)
@@ -143,7 +143,7 @@ func TestS3Server_AcceptsSigV4SignedRequests(t *testing.T) {
 		WithS3Region(testS3Region),
 		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
 	)
-	signingTime := time.Date(2026, 3, 22, 12, 0, 0, 0, time.UTC)
+	signingTime := currentS3SigningTime()
 
 	rec := httptest.NewRecorder()
 	req := newSignedS3Request(t, "/bucket-a", "", signingTime)
@@ -170,7 +170,7 @@ func TestS3Server_RejectsPayloadHashMismatch(t *testing.T) {
 		WithS3Region(testS3Region),
 		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
 	)
-	signingTime := time.Date(2026, 3, 22, 12, 0, 0, 0, time.UTC)
+	signingTime := currentS3SigningTime()
 
 	rec := httptest.NewRecorder()
 	req := newSignedS3Request(t, "/bucket-a", "", signingTime)
@@ -185,6 +185,28 @@ func TestS3Server_RejectsPayloadHashMismatch(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "<Code>XAmzContentSHA256Mismatch</Code>")
+}
+
+func TestS3Server_RejectsSigV4RequestWithExcessiveClockSkew(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil,
+		"",
+		st,
+		newLocalAdapterCoordinator(st),
+		nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	rec := httptest.NewRecorder()
+	req := newSignedS3Request(t, "/bucket-a", "", time.Now().UTC().Add(-s3RequestTimeMaxSkew-time.Hour))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>RequestTimeTooSkewed</Code>")
 }
 
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
@@ -210,7 +232,7 @@ func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
 	)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := newS3TestRequest(http.MethodGet, "/", nil)
 	server.handle(rec, req)
 
 	require.True(t, proxied)
@@ -255,7 +277,7 @@ func TestS3Server_ProxiesObjectRequestsUsingObjectRouteLeader(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil)
+	req := newS3TestRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil)
 	server.handle(rec, req)
 
 	require.True(t, proxied)
@@ -270,17 +292,17 @@ func TestS3Server_ListObjectsV2DelimiterContinuationAvoidsDuplicateCommonPrefixe
 	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
 
 	rec := httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a", nil))
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	for _, objectKey := range []string{"dir-a/one.txt", "dir-a/two.txt", "dir-b/three.txt"} {
 		rec = httptest.NewRecorder()
-		server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a/"+objectKey, strings.NewReader(objectKey)))
+		server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/"+objectKey, strings.NewReader(objectKey)))
 		require.Equal(t, http.StatusOK, rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodGet, "/bucket-a?list-type=2&delimiter=%2F&max-keys=1", nil))
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a?list-type=2&delimiter=%2F&max-keys=1", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	firstPage := decodeListBucketResult(t, rec.Body.Bytes())
@@ -289,7 +311,7 @@ func TestS3Server_ListObjectsV2DelimiterContinuationAvoidsDuplicateCommonPrefixe
 	require.NotEmpty(t, firstPage.NextContinuationToken)
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodGet, "/bucket-a?list-type=2&delimiter=%2F&max-keys=1&continuation-token="+firstPage.NextContinuationToken, nil))
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a?list-type=2&delimiter=%2F&max-keys=1&continuation-token="+firstPage.NextContinuationToken, nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	secondPage := decodeListBucketResult(t, rec.Body.Bytes())
@@ -308,11 +330,11 @@ func TestS3Server_PutObjectConflictsWhenBucketDeletedDuringFinalize(t *testing.T
 	server := NewS3Server(nil, "", st, coord, nil)
 
 	rec := httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a", nil))
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a/object.txt", strings.NewReader("payload")))
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object.txt", strings.NewReader("payload")))
 	require.Equal(t, http.StatusConflict, rec.Code)
 	require.Contains(t, rec.Body.String(), "<Code>OperationAborted</Code>")
 
@@ -355,20 +377,20 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	server := NewS3Server(nil, "", shardStore, coord, nil)
 
 	rec := httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a", nil))
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodPut, "/bucket-a/dir/file.txt", strings.NewReader("payload")))
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/dir/file.txt", strings.NewReader("payload")))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil))
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/dir/file.txt", nil))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "payload", rec.Body.String())
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, httptest.NewRequest(http.MethodGet, "/bucket-a?list-type=2", nil))
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a?list-type=2", nil))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Contains(t, rec.Body.String(), "<Key>dir/file.txt</Key>")
 
@@ -528,6 +550,14 @@ func sha256Hex(v string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func newS3TestRequest(method string, target string, body io.Reader) *http.Request {
+	return httptest.NewRequestWithContext(context.Background(), method, target, body)
+}
+
+func currentS3SigningTime() time.Time {
+	return time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+}
+
 func newSignedS3Request(
 	t *testing.T,
 	target string,
@@ -536,7 +566,7 @@ func newSignedS3Request(
 ) *http.Request {
 	t.Helper()
 
-	req := httptest.NewRequest(http.MethodPut, target, strings.NewReader(body))
+	req := newS3TestRequest(http.MethodPut, target, strings.NewReader(body))
 	payloadHash := sha256Hex(body)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 

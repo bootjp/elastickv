@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	s3SigV4Algorithm   = "AWS4-HMAC-SHA256"
-	s3UnsignedPayload  = "UNSIGNED-PAYLOAD"
-	s3EmptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	s3DateHeaderFormat = "20060102T150405Z"
+	s3SigV4Algorithm     = "AWS4-HMAC-SHA256"
+	s3UnsignedPayload    = "UNSIGNED-PAYLOAD"
+	s3EmptyPayloadHash   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	s3DateHeaderFormat   = "20060102T150405Z"
+	s3RequestTimeMaxSkew = 15 * time.Minute
 )
 
 type S3ServerOption func(*S3Server)
@@ -163,6 +164,17 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 			Status:  http.StatusForbidden,
 			Code:    "AuthorizationHeaderMalformed",
 			Message: "credential scope date does not match x-amz-date",
+		}
+	}
+	skew := time.Now().UTC().Sub(signingTime.UTC())
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > s3RequestTimeMaxSkew {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "RequestTimeTooSkewed",
+			Message: "The difference between the request time and the server's time is too large",
 		}
 	}
 

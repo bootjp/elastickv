@@ -29,13 +29,14 @@ import (
 )
 
 const (
-	s3HealthPath    = "/healthz"
-	s3ChunkSize     = 1 << 20
-	s3ChunkBatchOps = 16
-	s3XMLNamespace  = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion = "us-east-1"
-	s3MaxKeys       = 1000
-	s3ListPageSize  = 256
+	s3HealthPath             = "/healthz"
+	s3ChunkSize              = 1 << 20
+	s3ChunkBatchOps          = 16
+	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion          = "us-east-1"
+	s3MaxKeys                = 1000
+	s3ListPageSize           = 256
+	s3ManifestCleanupTimeout = 2 * time.Minute
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -661,6 +662,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 				writeS3InternalError(w, err)
 				return
 			}
+			//nolint:gosec // G705: S3 serves stored object bytes verbatim by design.
 			if _, err := w.Write(chunk); err != nil {
 				return
 			}
@@ -788,7 +790,7 @@ func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket 
 
 	for result.KeyCount < maxKeys {
 		pageLimit := s3ListPageSize
-		if remaining := maxKeys - result.KeyCount; remaining > pageLimit {
+		if remaining := maxKeys - result.KeyCount; remaining < pageLimit {
 			pageLimit = remaining
 		}
 		page, err := s.store.ScanAt(r.Context(), cursor, end, pageLimit, readTS)
@@ -907,7 +909,11 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	if manifest == nil {
 		return
 	}
-	go s.cleanupManifestBlobs(context.Background(), bucket, generation, objectKey, manifest)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
+		defer cancel()
+		s.cleanupManifestBlobs(ctx, bucket, generation, objectKey, manifest)
+	}()
 }
 
 func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest) {
@@ -1256,7 +1262,7 @@ func hlcToTime(ts uint64) time.Time {
 	if millis > math.MaxInt64 {
 		millis = math.MaxInt64
 	}
-	return time.UnixMilli(int64(millis)).UTC() //nolint:gosec // millis is clamped to MaxInt64 above.
+	return time.UnixMilli(int64(millis)).UTC() //nolint:gosec // G115: millis is clamped to MaxInt64 above.
 }
 
 func (s *S3Server) readTS() uint64 {
