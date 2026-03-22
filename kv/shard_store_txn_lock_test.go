@@ -78,6 +78,74 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
 }
 
+func TestShardStoreGetAt_ReturnsTxnLockedForPendingCrossShardTxn(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	st1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	defer stop1()
+
+	st2 := store.NewMVCCStore()
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(st2))
+	defer stop2()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		2: {Raft: r2, Store: st2, Txn: NewLeaderProxy(r2)},
+	}
+	shardStore := NewShardStore(engine, groups)
+
+	startTS := uint64(1)
+	primaryKey := []byte("b")
+	secondaryKey := []byte("x")
+
+	prepareMeta := func() *pb.Mutation {
+		return &pb.Mutation{
+			Op:    pb.Op_PUT,
+			Key:   []byte(txnMetaPrefix),
+			Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0}),
+		}
+	}
+
+	preparePrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			prepareMeta(),
+			{Op: pb.Op_PUT, Key: primaryKey, Value: []byte("v1")},
+		},
+	}
+	prepareSecondary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			prepareMeta(),
+			{Op: pb.Op_PUT, Key: secondaryKey, Value: []byte("v2")},
+		},
+	}
+
+	_, err := groups[1].Txn.Commit([]*pb.Request{preparePrimary})
+	require.NoError(t, err)
+	_, err = groups[2].Txn.Commit([]*pb.Request{prepareSecondary})
+	require.NoError(t, err)
+
+	_, err = shardStore.GetAt(ctx, primaryKey, ^uint64(0))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked for primary key, got %v", err)
+
+	_, err = shardStore.GetAt(ctx, secondaryKey, ^uint64(0))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked for secondary key, got %v", err)
+}
+
 func TestShardStoreGetAt_ResolvesCommittedSecondaryLock(t *testing.T) {
 	t.Parallel()
 
@@ -155,6 +223,93 @@ func TestShardStoreGetAt_ResolvesCommittedSecondaryLock(t *testing.T) {
 	v, err := shardStore.GetAt(ctx, secondaryKey, commitTS)
 	require.NoError(t, err)
 	require.Equal(t, "v2", string(v))
+}
+
+func TestShardStoreScanAt_ResolvesCommittedCrossShardTxn(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	st1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	defer stop1()
+
+	st2 := store.NewMVCCStore()
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(st2))
+	defer stop2()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		2: {Raft: r2, Store: st2, Txn: NewLeaderProxy(r2)},
+	}
+	shardStore := NewShardStore(engine, groups)
+
+	startTS := uint64(2)
+	commitTS := uint64(3)
+	primaryKey := []byte("b")
+	secondaryKey := []byte("x")
+
+	prepareMeta := func() *pb.Mutation {
+		return &pb.Mutation{
+			Op:    pb.Op_PUT,
+			Key:   []byte(txnMetaPrefix),
+			Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0}),
+		}
+	}
+
+	preparePrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			prepareMeta(),
+			{Op: pb.Op_PUT, Key: primaryKey, Value: []byte("v1")},
+		},
+	}
+	prepareSecondary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			prepareMeta(),
+			{Op: pb.Op_PUT, Key: secondaryKey, Value: []byte("v2")},
+		},
+	}
+
+	_, err := groups[1].Txn.Commit([]*pb.Request{preparePrimary})
+	require.NoError(t, err)
+	_, err = groups[2].Txn.Commit([]*pb.Request{prepareSecondary})
+	require.NoError(t, err)
+
+	commitPrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
+		},
+	}
+	_, err = groups[1].Txn.Commit([]*pb.Request{commitPrimary})
+	require.NoError(t, err)
+
+	kvs, err := shardStore.ScanAt(ctx, []byte("a"), []byte("z"), 100, commitTS)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+
+	got := map[string]string{}
+	for _, kvp := range kvs {
+		got[string(kvp.Key)] = string(kvp.Value)
+	}
+	require.Equal(t, "v1", got[string(primaryKey)])
+	require.Equal(t, "v2", got[string(secondaryKey)])
+
+	_, err = st2.GetAt(ctx, txnLockKey(secondaryKey), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestShardStoreScanAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
