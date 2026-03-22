@@ -700,6 +700,9 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 }
 
 func (s *pebbleStore) Restore(r io.Reader) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	br := bufio.NewReader(r)
 	header, err := br.Peek(len(pebbleSnapshotMagic))
 	if err != nil {
@@ -719,11 +722,11 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 	default:
 		// Legacy gob format: restoreFromLegacyGob performs an atomic
 		// temp-dir swap similarly.
-		// NOTE: Older "pre-magic" Pebble snapshots do not exist — the
-		// pebbleSnapshotMagic header has been present since the Pebble store
-		// was introduced. An unrecognised stream is treated as legacy gob and
-		// will produce a decode error with a clear message if the stream is
-		// neither gob nor a valid Pebble snapshot.
+		// NOTE: Streams without a recognised magic header are assumed to be
+		// in the legacy gob format. Snapshots produced by older Pebble
+		// implementations that did not include a magic prefix are therefore
+		// not supported by this dispatcher and will typically surface as a
+		// gob decode error rather than being restored successfully.
 		return s.restoreFromLegacyGob(br)
 	}
 }
@@ -752,7 +755,9 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 
 func (s *pebbleStore) reopenFreshDB() error {
 	if s.db != nil {
-		_ = s.db.Close()
+		if err := s.db.Close(); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	if err := os.RemoveAll(s.dir); err != nil {
 		return errors.WithStack(err)
@@ -772,11 +777,11 @@ func (s *pebbleStore) reopenFreshDB() error {
 // (magic "EKVPBBL1" + lastCommitTS + raw key-value entries) into s.db directly.
 //
 // Format history / compatibility:
-//   - The pebbleSnapshotMagic header was introduced with this "native" Pebble
-//     snapshot format when the Pebble store was first added. There are no
-//     pre-magic Pebble snapshots. A stream dispatched to this function MUST
-//     start with the magic; otherwise "invalid pebble snapshot magic header"
-//     is returned.
+//   - The pebbleSnapshotMagic header ("EKVPBBL1") was introduced along with
+//     this snapshot format. Older Pebble snapshots that pre-date this header
+//     (i.e. those that started directly with lastCommitTS) are not handled
+//     here. A stream dispatched to this function MUST start with the magic;
+//     otherwise "invalid pebble snapshot magic header" is returned.
 func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
