@@ -9,6 +9,19 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
+// pebbleSnapshotMagic is the 8-byte header that identifies a native Pebble
+// snapshot stream (format: magic + lastCommitTS + key-value entries).
+//
+// Format history / compatibility:
+//
+//	This magic prefix was introduced when the pebbleSnapshotMagic format was
+//	first defined. Snapshots written by an older Pebble-backed store that pre-
+//	dates this header (i.e. starting directly with lastCommitTS) do not contain
+//	the magic bytes and cannot be restored via the native Pebble path; they
+//	will fall through to the legacy-gob restore path and surface as a gob
+//	decode error.
+var pebbleSnapshotMagic = [8]byte{'E', 'K', 'V', 'P', 'B', 'B', 'L', '1'}
+
 type pebbleSnapshot struct {
 	snapshot     *pebble.Snapshot
 	lastCommitTS uint64
@@ -43,6 +56,9 @@ func (s *pebbleSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return 0, errors.New("snapshot is not available")
 	}
 	cw := &countingWriter{w: w}
+	if _, err := cw.Write(pebbleSnapshotMagic[:]); err != nil {
+		return cw.n, errors.WithStack(err)
+	}
 	if err := binary.Write(cw, binary.LittleEndian, s.lastCommitTS); err != nil {
 		return cw.n, errors.WithStack(err)
 	}
