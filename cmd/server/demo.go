@@ -366,6 +366,32 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker)), nil
 }
 
+// setupFSMStore creates and returns the MVCCStore for the Raft FSM.
+// When raftDataDir is non-empty the store is persisted under that directory;
+// otherwise a temporary directory is used and registered for cleanup on exit.
+func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (store.MVCCStore, error) {
+	if raftDataDir != "" {
+		if err := os.MkdirAll(raftDataDir, defaultFileMode); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		st, err := store.NewPebbleStore(filepath.Join(raftDataDir, "fsm.db"))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return st, nil
+	}
+	fsmDir, err := os.MkdirTemp("", "elastickv-fsm-*")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	cleanup.Add(func() { os.RemoveAll(fsmDir) })
+	st, err := store.NewPebbleStore(fsmDir)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return st, nil
+}
+
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 	cleanup := internalutil.CleanupStack{}
@@ -377,21 +403,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 
 	var st store.MVCCStore
-	if cfg.raftDataDir != "" {
-		st, err = store.NewPebbleStore(filepath.Join(cfg.raftDataDir, "fsm.db"))
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	} else {
-		fsmDir, tmpErr := os.MkdirTemp("", "elastickv-fsm-*")
-		if tmpErr != nil {
-			return errors.WithStack(tmpErr)
-		}
-		cleanup.Add(func() { os.RemoveAll(fsmDir) })
-		st, err = store.NewPebbleStore(fsmDir)
-		if err != nil {
-			return errors.WithStack(err)
-		}
+	st, err = setupFSMStore(cfg.raftDataDir, &cleanup)
+	if err != nil {
+		return err
 	}
 	cleanup.Add(func() { st.Close() })
 	fsm := kv.NewKvFSM(st)

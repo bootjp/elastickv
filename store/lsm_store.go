@@ -688,10 +688,6 @@ func (s *pebbleStore) restoreBatchLoop(r io.Reader) error {
 }
 
 func (s *pebbleStore) Restore(r io.Reader) error {
-	if err := s.reopenFreshDB(); err != nil {
-		return err
-	}
-
 	br := bufio.NewReader(r)
 	header, err := br.Peek(len(pebbleSnapshotMagic))
 	if err != nil {
@@ -700,10 +696,19 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 
 	switch {
 	case bytes.Equal(header, pebbleSnapshotMagic[:]):
+		// Native Pebble format: clear the existing DB first, then stream in.
+		if err := s.reopenFreshDB(); err != nil {
+			return err
+		}
 		return s.restorePebbleNative(br)
 	case bytes.Equal(header, mvccSnapshotMagic[:]):
+		// Streaming MVCC format: restoreFromStreamingMVCC performs an atomic
+		// temp-dir swap, so the existing DB is preserved until checksum
+		// verification succeeds.
 		return s.restoreFromStreamingMVCC(br)
 	default:
+		// Legacy gob format: restoreFromLegacyGob performs an atomic
+		// temp-dir swap similarly.
 		return s.restoreFromLegacyGob(br)
 	}
 }
@@ -718,7 +723,10 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 		// Partial header means a truncated/corrupt snapshot.
 		return errors.New("truncated snapshot: partial magic header")
 	}
-	// Truly empty snapshot: DB was cleared by reopenFreshDB; reset and persist metadata.
+	// Truly empty snapshot: clear DB and reset metadata.
+	if err := s.reopenFreshDB(); err != nil {
+		return err
+	}
 	s.lastCommitTS = 0
 	var tsBuf [timestampSize]byte
 	if setErr := s.db.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); setErr != nil {
@@ -769,7 +777,8 @@ func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
 // Pebble's key encoding (userKey + inverted TS) and value encoding.
 //
 // Entries are written to a temporary Pebble directory and only swapped into
-// place after the CRC32 checksum is verified, keeping the restore atomic.
+// place after the CRC32 checksum is verified, preserving the existing store
+// on failure.
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 	expectedChecksum, err := readMVCCSnapshotHeader(r)
 	if err != nil {
@@ -892,15 +901,50 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	return nil
 }
 
+// restoreLegacyGobToTempDB writes the decoded gob snapshot into a temporary
+// Pebble directory sibling to s.dir and atomically swaps it into place.
+func (s *pebbleStore) restoreLegacyGobToTempDB(entries []mvccSnapshotEntry, lastCommitTS uint64) error {
+	tmpDir := filepath.Clean(s.dir) + ".legacy-tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return errors.WithStack(err)
+	}
+	tmpDB, err := pebble.Open(tmpDir, &pebble.Options{FS: vfs.Default})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := writeGobEntriesToDB(entries, tmpDB); err != nil {
+		_ = tmpDB.Close()
+		_ = os.RemoveAll(tmpDir)
+		return err
+	}
+
+	var tsBuf [timestampSize]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], lastCommitTS)
+	if err := tmpDB.Set(metaLastCommitTSBytes, tsBuf[:], pebble.Sync); err != nil {
+		_ = tmpDB.Close()
+		_ = os.RemoveAll(tmpDir)
+		return errors.WithStack(err)
+	}
+
+	if err := tmpDB.Close(); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return errors.WithStack(err)
+	}
+	return s.swapInTempDB(tmpDir)
+}
+
 // restoreFromLegacyGob restores from the legacy gob-encoded MVCCStore
 // snapshot format (gob payload + CRC32 trailer).
 //
-// The snapshot is spooled to a temporary file to avoid loading the entire
-// payload into memory with io.ReadAll before CRC verification.
+// The snapshot is spooled to a temporary file co-located with s.dir to avoid
+// loading the entire payload into memory and to keep I/O on the same
+// filesystem. Entries are written into a temporary Pebble directory and only
+// swapped into place after decoding succeeds, preserving the existing store
+// on failure.
 func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
-	// Spool to a temp file so we can stream through it twice without keeping
-	// the raw bytes and decoded struct both in memory simultaneously.
-	tmpFile, err := os.CreateTemp("", "ekv-legacy-gob-*.tmp")
+	// Spool to a temp file inside s.dir to keep restore I/O on the same
+	// filesystem as the store and avoid cross-device surprises.
+	tmpFile, err := os.CreateTemp(s.dir, "ekv-legacy-gob-*.tmp")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -928,11 +972,11 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 		return errors.WithStack(err)
 	}
 
-	s.lastCommitTS = snapshot.LastCommitTS
-	if err := s.saveLastCommitTS(snapshot.LastCommitTS); err != nil {
+	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS); err != nil {
 		return err
 	}
-	return writeGobEntriesToDB(snapshot.Entries, s.db)
+	s.lastCommitTS = snapshot.LastCommitTS
+	return nil
 }
 
 // verifyCRC32Trailer verifies the CRC32 checksum appended at the end of f.
