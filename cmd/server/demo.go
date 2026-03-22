@@ -411,14 +411,18 @@ func setupS3(
 	if !pathStyleOnly {
 		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
+	if coordinator == nil {
+		return nil, errors.New("coordinator must not be nil")
+	}
 	leaderS3 := make(map[raft.ServerAddress]string)
 	if raftS3MapStr != "" {
 		parts := strings.SplitSeq(raftS3MapStr, ",")
 		for part := range parts {
-			kv := strings.Split(part, "=")
-			if len(kv) == kvParts {
-				leaderS3[raft.ServerAddress(kv[0])] = kv[1]
+			kv := strings.SplitN(strings.TrimSpace(part), "=", kvParts)
+			if len(kv) != kvParts {
+				return nil, fmt.Errorf("invalid raft-s3 map entry %q: expected format addr=s3addr", part)
 			}
+			leaderS3[raft.ServerAddress(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
 		}
 	}
 	leaderS3[raft.ServerAddress(addr)] = s3Addr
