@@ -963,21 +963,29 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 		pending = pending[:0]
 	}
 	for _, part := range manifest.Parts {
-		for chunkNo := range part.ChunkSizes {
-			chunkIndex, err := uint64FromInt(chunkNo)
-			if err != nil {
-				return
-			}
-			pending = append(pending, &kv.Elem[kv.OP]{
-				Op:  kv.Del,
-				Key: s3keys.BlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex),
-			})
-			if len(pending) >= s3ChunkBatchOps {
-				flush()
-			}
+		var ok bool
+		if pending, ok = s.appendPartBlobKeys(pending, bucket, generation, objectKey, manifest.UploadID, part, flush); !ok {
+			return
 		}
 	}
 	flush()
+}
+
+func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) ([]*kv.Elem[kv.OP], bool) {
+	for chunkNo := range part.ChunkSizes {
+		chunkIndex, err := uint64FromInt(chunkNo)
+		if err != nil {
+			return pending, false
+		}
+		pending = append(pending, &kv.Elem[kv.OP]{
+			Op:  kv.Del,
+			Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex),
+		})
+		if len(pending) >= s3ChunkBatchOps {
+			flush()
+		}
+	}
+	return pending, true
 }
 
 //nolint:cyclop // Proxying depends on root, bucket, and object-level leadership decisions.
