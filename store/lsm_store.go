@@ -27,6 +27,13 @@ const (
 	dirPerms                = 0755
 	metaLastCommitTS        = "_meta_last_commit_ts"
 	spoolBufSize            = 32 * 1024 // buffer size for streaming I/O during restore
+
+	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
+	// which are the user key concatenated with the 8-byte inverted timestamp.
+	// Using maxSnapshotKeySize+timestampSize (instead of just maxSnapshotKeySize)
+	// avoids rejecting keys that are valid at the user-key level but slightly
+	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
+	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
 )
 
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
@@ -663,7 +670,7 @@ func (s *pebbleStore) Snapshot() (Snapshot, error) {
 // from r. The key bytes are stored in *keyBuf (grown as needed to avoid per-entry
 // allocations). Returns (kLen, vLen, eof=true, nil) on clean EOF at the key-length field.
 func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, err error) {
-	kLen, err = readRestoreFieldLen(r, "snapshot key", maxSnapshotKeySize)
+	kLen, err = readRestoreFieldLen(r, "snapshot key", maxPebbleEncodedKeySize)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return 0, 0, true, nil
