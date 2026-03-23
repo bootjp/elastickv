@@ -18,7 +18,15 @@ var ErrExpired = errors.New("expired")
 var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
 var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
-var ErrSnapshotValueTooLarge = errors.New("snapshot value too large")
+var ErrValueTooLarge = errors.New("value too large")
+
+// validateValueSize returns ErrValueTooLarge when the value exceeds maxSnapshotValueSize.
+func validateValueSize(value []byte) error {
+	if len(value) > maxSnapshotValueSize {
+		return errors.Wrapf(ErrValueTooLarge, "value length %d > %d", len(value), maxSnapshotValueSize)
+	}
+	return nil
+}
 
 type WriteConflictError struct {
 	key []byte

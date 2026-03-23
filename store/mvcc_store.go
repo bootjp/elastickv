@@ -204,6 +204,9 @@ func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []Version
 }
 
 func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if err := validateValueSize(value); err != nil {
+		return err
+	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -457,6 +460,9 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	for _, mut := range mutations {
 		switch mut.Op {
 		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
 			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
 		case OpTypeDelete:
 			s.deleteVersionLocked(mut.Key, commitTS)
@@ -843,7 +849,7 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 		return VersionedValue{}, errors.WithStack(err)
 	}
 	if valueLen > maxSnapshotValueSize {
-		return VersionedValue{}, errors.Wrapf(ErrSnapshotValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
+		return VersionedValue{}, errors.Wrapf(ErrValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {

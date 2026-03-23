@@ -529,5 +529,53 @@ func TestPebbleStore_PutAt_ValueTooLarge(t *testing.T) {
 	oversized := make([]byte, maxSnapshotValueSize+1)
 	err = s.PutAt(ctx, []byte("k"), oversized, 1, 0)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrSnapshotValueTooLarge)
+	assert.ErrorIs(t, err, ErrValueTooLarge)
+}
+
+// TestPebbleStore_ApplyMutations_ValueTooLarge verifies that ApplyMutations
+// rejects Put mutations with values exceeding maxSnapshotValueSize.
+func TestPebbleStore_ApplyMutations_ValueTooLarge(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-apply-value-limit-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s.Close()) }()
+
+	ctx := context.Background()
+	oversized := make([]byte, maxSnapshotValueSize+1)
+	err = s.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
+	}, 0, 1)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValueTooLarge)
+}
+
+// TestMVCCStore_PutAt_ValueTooLarge verifies that the in-memory mvccStore
+// also rejects oversized values.
+func TestMVCCStore_PutAt_ValueTooLarge(t *testing.T) {
+	s := NewMVCCStore()
+	defer s.Close()
+
+	ctx := context.Background()
+	oversized := make([]byte, maxSnapshotValueSize+1)
+	err := s.PutAt(ctx, []byte("k"), oversized, 1, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValueTooLarge)
+}
+
+// TestMVCCStore_ApplyMutations_ValueTooLarge verifies that the in-memory
+// mvccStore rejects oversized Put mutations.
+func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
+	s := NewMVCCStore()
+	defer s.Close()
+
+	ctx := context.Background()
+	oversized := make([]byte, maxSnapshotValueSize+1)
+	err := s.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
+	}, 0, 1)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValueTooLarge)
 }

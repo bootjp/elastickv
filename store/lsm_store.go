@@ -517,8 +517,8 @@ func (s *pebbleStore) ReverseScanAt(ctx context.Context, start []byte, end []byt
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	if len(value) > maxSnapshotValueSize {
-		return errors.Wrapf(ErrSnapshotValueTooLarge, "value length %d > %d", len(value), maxSnapshotValueSize)
+	if err := validateValueSize(value); err != nil {
+		return err
 	}
 	commitTS = s.alignCommitTS(commitTS)
 
@@ -604,6 +604,9 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 
 		switch mut.Op {
 		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
 			v = encodeValue(mut.Value, false, mut.ExpireAt)
 		case OpTypeDelete:
 			v = encodeValue(nil, true, 0)
