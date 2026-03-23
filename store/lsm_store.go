@@ -23,7 +23,8 @@ const (
 	timestampSize           = 8
 	valueHeaderSize         = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchCountLimit = 1000
-	snapshotBatchByteLimit  = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
+	snapshotBatchByteLimit  = 8 << 20        // 8 MiB; balances restore write amplification vs peak memory usage
+	maxSnapshotValueSize    = 512 * 1024 * 1024 // 512 MiB; prevents OOM from malformed snapshots
 	dirPerms                = 0755
 	metaLastCommitTS        = "_meta_last_commit_ts"
 	spoolBufSize            = 32 * 1024 // buffer size for streaming I/O during restore
@@ -657,7 +658,7 @@ func (s *pebbleStore) Snapshot() (Snapshot, error) {
 // from r. The key bytes are stored in *keyBuf (grown as needed to avoid per-entry
 // allocations). Returns (kLen, vLen, eof=true, nil) on clean EOF at the key-length field.
 func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, err error) {
-	kLen, err = readRestoreFieldLen(r, "snapshot key")
+	kLen, err = readRestoreFieldLen(r, "snapshot key", maxSnapshotKeySize)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return 0, 0, true, nil
@@ -670,23 +671,23 @@ func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, er
 	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
 		return 0, 0, false, errors.WithStack(err)
 	}
-	vLen, err = readRestoreFieldLen(r, "snapshot value")
+	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize)
 	if err != nil {
 		return 0, 0, false, err
 	}
 	return kLen, vLen, false, nil
 }
 
-func readRestoreFieldLen(r io.Reader, field string) (int, error) {
+func readRestoreFieldLen(r io.Reader, field string, maxSize int) (int, error) {
 	var raw uint64
 	if err := binary.Read(r, binary.LittleEndian, &raw); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	return restoreFieldLenInt(raw, field)
+	return restoreFieldLenInt(raw, field, maxSize)
 }
 
-func restoreFieldLenInt(raw uint64, field string) (int, error) {
-	if raw > uint64(math.MaxInt) {
+func restoreFieldLenInt(raw uint64, field string, maxSize int) (int, error) {
+	if raw > uint64(math.MaxInt) || int(raw) > maxSize {
 		return 0, errors.WithStack(errors.Newf("%s length %d exceeds supported size", field, raw))
 	}
 	return int(raw), nil

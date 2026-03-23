@@ -194,7 +194,7 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
+	defer func() { assert.NoError(t, s.Close()) }()
 
 	ctx := context.Background()
 	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 100, 0))
@@ -202,7 +202,7 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	// Snapshot
 	buf, err := s.Snapshot()
 	require.NoError(t, err)
-	defer func() { require.NoError(t, buf.Close()) }()
+	defer func() { assert.NoError(t, buf.Close()) }()
 
 	var raw bytes.Buffer
 	_, err = buf.WriteTo(&raw)
@@ -234,10 +234,10 @@ func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
 
 	db, err := pebble.Open(dir, defaultPebbleOptions())
 	require.NoError(t, err)
-	defer func() { require.NoError(t, db.Close()) }()
+	defer func() { assert.NoError(t, db.Close()) }()
 
 	batch := db.NewBatch()
-	defer func() { require.NoError(t, batch.Close()) }()
+	defer func() { assert.NoError(t, batch.Close()) }()
 
 	deferred := batch.SetDeferred(1, snapshotBatchByteLimit)
 	deferred.Key[0] = 'k'
@@ -254,7 +254,7 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
+	defer func() { assert.NoError(t, s.Close()) }()
 
 	ctx := context.Background()
 	largeValue := bytes.Repeat([]byte("x"), snapshotBatchByteLimit/2+1024)
@@ -263,7 +263,7 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 
 	snap, err := s.Snapshot()
 	require.NoError(t, err)
-	defer func() { require.NoError(t, snap.Close()) }()
+	defer func() { assert.NoError(t, snap.Close()) }()
 
 	var raw bytes.Buffer
 	_, err = snap.WriteTo(&raw)
