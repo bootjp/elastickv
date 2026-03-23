@@ -190,7 +190,9 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 			s.leaderS3 = map[raft.ServerAddress]string{}
 		}
 		if leader := s.coordinatorLeaderAddress(); leader != "" {
-			s.leaderS3[leader] = s.s3Addr
+			if _, exists := s.leaderS3[leader]; !exists {
+				s.leaderS3[leader] = s.s3Addr
+			}
 		}
 	}
 	mux := http.NewServeMux()
@@ -1317,7 +1319,7 @@ func (s *S3Server) readTS() uint64 {
 
 func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	if s == nil || s.readTracker == nil {
-		return nil
+		return &kv.ActiveTimestampToken{}
 	}
 	return s.readTracker.Pin(ts)
 }
