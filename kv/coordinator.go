@@ -57,7 +57,12 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		// Leader-only timestamp issuance to avoid divergence across shards.
+		// When the leader assigns StartTS, also clear any caller-provided
+		// CommitTS so dispatchTxn generates both timestamps consistently.
+		// A caller-supplied CommitTS without a matching StartTS could produce
+		// CommitTS <= StartTS (an invalid transaction).
 		reqs.StartTS = c.nextStartTS()
+		reqs.CommitTS = 0
 	}
 
 	if reqs.IsTxn {

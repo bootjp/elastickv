@@ -70,6 +70,11 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 			return nil, err
 		}
 		reqs.StartTS = startTS
+		// When the coordinator assigns StartTS, also clear any caller-provided
+		// CommitTS so dispatchTxn generates both timestamps consistently.
+		// A caller-supplied CommitTS without a matching StartTS could produce
+		// CommitTS <= StartTS (an invalid transaction).
+		reqs.CommitTS = 0
 	}
 
 	if reqs.IsTxn {
