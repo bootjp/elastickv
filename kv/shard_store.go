@@ -184,6 +184,7 @@ func (s *ShardStore) reverseScanRoutesAt(
 	clampToRoutes bool,
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
+	seenGroups := make(map[uint64]struct{})
 	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
 		scanStart := start
@@ -204,6 +205,12 @@ func (s *ShardStore) reverseScanRoutesAt(
 			// shards), keys from different routes may interleave in descending order.
 			// Fetch up to limit from every route and merge+sort descending so the
 			// result honours the ReverseScanAt contract.
+			// De-duplicate by GroupID: after a range split both halves share the same
+			// GroupID (same backing shard store), so only scan each group once.
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
 			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, true)
 			if err != nil {
 				return nil, err
@@ -361,12 +368,12 @@ func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, li
 		return out
 	}
 	out = append(out, kvs...)
-	if len(out) <= limit {
-		return out
-	}
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) > 0
 	})
+	if len(out) <= limit {
+		return out
+	}
 	clear(out[limit:])
 	return out[:limit]
 }
