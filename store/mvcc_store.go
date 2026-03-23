@@ -28,9 +28,9 @@ type VersionedValue struct {
 const (
 	checksumSize            = 4
 	mvccSnapshotVersion     = uint32(1)
-	maxSnapshotKeySize      = 1 << 20        // 1 MiB per key
-	maxSnapshotVersionCount = 1 << 20        // 1M versions per key
-	maxSnapshotValueSize    = 256 << 20      // 256 MiB per value; prevents OOM from malformed snapshots
+	maxSnapshotKeySize      = 1 << 20   // 1 MiB per key
+	maxSnapshotVersionCount = 1 << 20   // 1M versions per key
+	maxSnapshotValueSize    = 256 << 20 // 256 MiB per value; prevents OOM from malformed snapshots
 )
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
