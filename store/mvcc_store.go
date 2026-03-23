@@ -28,10 +28,15 @@ type VersionedValue struct {
 const (
 	checksumSize            = 4
 	mvccSnapshotVersion     = uint32(1)
-	maxSnapshotKeySize      = 1 << 20   // 1 MiB per key
-	maxSnapshotVersionCount = 1 << 20   // 1M versions per key
-	maxSnapshotValueSize    = 256 << 20 // 256 MiB per value; prevents OOM from malformed snapshots
+	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
+	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
 )
+
+// maxSnapshotValueSize caps the allowed size of a single value during snapshot
+// restore and write paths to prevent OOM from malformed or adversarial snapshots.
+// Declared as a var so tests can temporarily lower the limit without allocating
+// hundreds of MiB.
+var maxSnapshotValueSize = 256 << 20 // 256 MiB
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
 
@@ -848,7 +853,7 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
 	}
-	if valueLen > maxSnapshotValueSize {
+	if valueLen > uint64(maxSnapshotValueSize) {
 		return VersionedValue{}, errors.Wrapf(ErrValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)

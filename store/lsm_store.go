@@ -683,7 +683,7 @@ func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, er
 	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
 		return 0, 0, false, errors.WithStack(err)
 	}
-	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize)
+	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize+valueHeaderSize)
 	if err != nil {
 		return 0, 0, false, err
 	}
@@ -700,7 +700,14 @@ func readRestoreFieldLen(r io.Reader, field string, maxSize int) (int, error) {
 
 func restoreFieldLenInt(raw uint64, field string, maxSize int) (int, error) {
 	if raw > uint64(math.MaxInt) || int(raw) > maxSize {
-		return 0, errors.WithStack(errors.Newf("%s length %d > %d", field, raw, maxSize))
+		switch field {
+		case "snapshot key":
+			return 0, errors.WithStack(errors.Wrapf(ErrSnapshotKeyTooLarge, "length %d > %d", raw, maxSize))
+		case "snapshot value":
+			return 0, errors.WithStack(errors.Wrapf(ErrValueTooLarge, "length %d > %d", raw, maxSize))
+		default:
+			return 0, errors.WithStack(errors.Newf("%s length %d > %d", field, raw, maxSize))
+		}
 	}
 	return int(raw), nil
 }
