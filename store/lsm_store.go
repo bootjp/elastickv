@@ -665,11 +665,7 @@ func restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {
 	if _, err := io.ReadFull(r, key); err != nil {
 		return false, errors.WithStack(err)
 	}
-	var vLen uint64
-	if err := binary.Read(r, binary.LittleEndian, &vLen); err != nil {
-		return false, errors.WithStack(err)
-	}
-	vLenInt, err := restoreFieldLenInt(vLen, "snapshot value")
+	vLenInt, err := readRestoreFieldLen(r, "snapshot value")
 	if err != nil {
 		return false, err
 	}
