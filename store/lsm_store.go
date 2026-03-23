@@ -707,7 +707,7 @@ func commitSnapshotBatch(batch *pebble.Batch, opts *pebble.WriteOptions) error {
 	defer func() {
 		_ = batch.Close()
 	}()
-	if batch.Empty() && opts != pebble.Sync {
+	if batch.Empty() && (opts == nil || !opts.Sync) {
 		return nil
 	}
 	return errors.WithStack(batch.Commit(opts))
