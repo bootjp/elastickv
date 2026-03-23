@@ -1182,9 +1182,10 @@ func spoolGobPayload(r io.Reader, dst io.Writer) error {
 }
 
 // writeGobEntriesToDB writes the decoded gob snapshot entries into db using
-// batched commits. NOTE: this function mutates entries in-place by nilling out
-// each version's Value, Key, and Versions fields after encoding to reduce peak
-// memory usage. Callers must not reuse entries after this call.
+// batched commits. NOTE: this function mutates entries in-place by clearing
+// each version's Value and then nilling the entry's Key and Versions slice
+// after encoding to reduce peak memory usage. Callers must not reuse entries
+// after this call.
 func writeGobEntriesToDB(entries []mvccSnapshotEntry, db *pebble.DB) error {
 	batch := db.NewBatch()
 	for i := range entries {
