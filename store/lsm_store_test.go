@@ -579,3 +579,44 @@ func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrValueTooLarge)
 }
+
+// TestPebbleStore_SnapshotRestore_MaxSizeKey verifies that a key of exactly
+// maxSnapshotKeySize bytes survives a Snapshot()+Restore() round-trip.
+// The encoded on-disk Pebble key is maxSnapshotKeySize+timestampSize bytes;
+// previously the restore path used maxSnapshotKeySize as the limit and would
+// reject this key.
+func TestPebbleStore_SnapshotRestore_MaxSizeKey(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-maxkey-snap-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s.Close()) }()
+
+	ctx := context.Background()
+	bigKey := bytes.Repeat([]byte("k"), maxSnapshotKeySize)
+	require.NoError(t, s.PutAt(ctx, bigKey, []byte("val"), 1, 0))
+
+	snap, err := s.Snapshot()
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, snap.Close()) }()
+
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	dir2, err := os.MkdirTemp("", "pebble-maxkey-restore-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir2)
+
+	s2, err := NewPebbleStore(dir2)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s2.Close()) }()
+
+	require.NoError(t, s2.Restore(bytes.NewReader(buf.Bytes())))
+
+	got, err := s2.GetAt(ctx, bigKey, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val"), got)
+}
