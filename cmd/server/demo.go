@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -36,6 +37,10 @@ var (
 	address        = flag.String("address", ":50051", "gRPC/Raft address")
 	redisAddress   = flag.String("redisAddress", ":6379", "Redis address")
 	dynamoAddress  = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
+	s3Address      = flag.String("s3Address", ":9000", "S3-compatible API address")
+	s3Region       = flag.String("s3Region", "us-east-1", "S3 signing region")
+	s3CredsFile    = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
+	s3PathStyle    = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
 	metricsToken   = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddress   = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
@@ -44,6 +49,7 @@ var (
 	raftDataDir    = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")
 	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
 	raftRedisMap   = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	raftS3Map      = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 )
 
 const (
@@ -67,6 +73,10 @@ type config struct {
 	address        string
 	redisAddress   string
 	dynamoAddress  string
+	s3Address      string
+	s3Region       string
+	s3CredsFile    string
+	s3PathStyle    bool
 	metricsAddress string
 	metricsToken   string
 	pprofAddress   string
@@ -75,6 +85,7 @@ type config struct {
 	raftDataDir    string
 	raftBootstrap  bool
 	raftRedisMap   string
+	raftS3Map      string
 }
 
 func main() {
@@ -88,6 +99,10 @@ func main() {
 			address:        *address,
 			redisAddress:   *redisAddress,
 			dynamoAddress:  *dynamoAddress,
+			s3Address:      *s3Address,
+			s3Region:       *s3Region,
+			s3CredsFile:    *s3CredsFile,
+			s3PathStyle:    *s3PathStyle,
 			metricsAddress: *metricsAddress,
 			metricsToken:   *metricsToken,
 			pprofAddress:   *pprofAddress,
@@ -96,6 +111,7 @@ func main() {
 			raftDataDir:    *raftDataDir,
 			raftBootstrap:  *raftBootstrap,
 			raftRedisMap:   *raftRedisMap,
+			raftS3Map:      *raftS3Map,
 		}
 		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
@@ -110,6 +126,9 @@ func main() {
 				address:        "127.0.0.1:50051",
 				redisAddress:   "127.0.0.1:63791",
 				dynamoAddress:  "127.0.0.1:63801",
+				s3Address:      "127.0.0.1:63901",
+				s3Region:       "us-east-1",
+				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9091",
 				metricsToken:   demoMetricsToken,
 				pprofAddress:   "127.0.0.1:6061",
@@ -121,6 +140,9 @@ func main() {
 				address:        "127.0.0.1:50052",
 				redisAddress:   "127.0.0.1:63792",
 				dynamoAddress:  "127.0.0.1:63802",
+				s3Address:      "127.0.0.1:63902",
+				s3Region:       "us-east-1",
+				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9092",
 				metricsToken:   demoMetricsToken,
 				pprofAddress:   "127.0.0.1:6062",
@@ -132,6 +154,9 @@ func main() {
 				address:        "127.0.0.1:50053",
 				redisAddress:   "127.0.0.1:63793",
 				dynamoAddress:  "127.0.0.1:63803",
+				s3Address:      "127.0.0.1:63903",
+				s3Region:       "us-east-1",
+				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9093",
 				metricsToken:   demoMetricsToken,
 				pprofAddress:   "127.0.0.1:6063",
@@ -141,15 +166,19 @@ func main() {
 			},
 		}
 
-		// Build raftRedisMap string
-		var mapParts []string
+		// Build raftRedisMap/raftS3Map strings.
+		var redisMapParts []string
+		var s3MapParts []string
 		for _, n := range nodes {
-			mapParts = append(mapParts, n.address+"="+n.redisAddress)
+			redisMapParts = append(redisMapParts, n.address+"="+n.redisAddress)
+			s3MapParts = append(s3MapParts, n.address+"="+n.s3Address)
 		}
-		raftRedisMapStr := strings.Join(mapParts, ",")
+		raftRedisMapStr := strings.Join(redisMapParts, ",")
+		raftS3MapStr := strings.Join(s3MapParts, ",")
 
 		for _, n := range nodes {
 			n.raftRedisMap = raftRedisMapStr
+			n.raftS3Map = raftS3MapStr
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
@@ -329,6 +358,45 @@ func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotSto
 	return raftStore, raftStore, fss, nil
 }
 
+// setupStores creates both the Raft log/stable/snapshot stores and the FSM MVCCStore.
+func setupStores(raftDataDir string, cleanup *internalutil.CleanupStack) (raft.LogStore, raft.StableStore, raft.SnapshotStore, store.MVCCStore, error) {
+	ldb, sdb, fss, err := setupStorage(raftDataDir)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	st, err := setupFSMStore(raftDataDir, cleanup)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return ldb, sdb, fss, st, nil
+}
+
+// setupFSMStore creates and returns the MVCCStore for the Raft FSM.
+// When raftDataDir is non-empty the store is persisted under that directory;
+// otherwise a temporary directory is used and registered for cleanup on exit.
+func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (store.MVCCStore, error) {
+	if raftDataDir != "" {
+		if err := os.MkdirAll(raftDataDir, defaultFileMode); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		st, err := store.NewPebbleStore(filepath.Join(raftDataDir, "fsm.db"))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return st, nil
+	}
+	fsmDir, err := os.MkdirTemp("", "elastickv-fsm-*")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	cleanup.Add(func() { os.RemoveAll(fsmDir) })
+	st, err := store.NewPebbleStore(fsmDir)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return st, nil
+}
+
 func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 	trx := kv.NewTransaction(r)
@@ -366,30 +434,63 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker)), nil
 }
 
-// setupFSMStore creates and returns the MVCCStore for the Raft FSM.
-// When raftDataDir is non-empty the store is persisted under that directory;
-// otherwise a temporary directory is used and registered for cleanup on exit.
-func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (store.MVCCStore, error) {
-	if raftDataDir != "" {
-		if err := os.MkdirAll(raftDataDir, defaultFileMode); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		st, err := store.NewPebbleStore(filepath.Join(raftDataDir, "fsm.db"))
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return st, nil
+func setupS3(
+	ctx context.Context,
+	lc net.ListenConfig,
+	st store.MVCCStore,
+	coordinator *kv.Coordinate,
+	addr string,
+	s3Addr string,
+	raftS3MapStr string,
+	region string,
+	credentialsFile string,
+	pathStyleOnly bool,
+	readTracker *kv.ActiveTimestampTracker,
+) (*adapter.S3Server, error) {
+	if !pathStyleOnly {
+		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
-	fsmDir, err := os.MkdirTemp("", "elastickv-fsm-*")
+	if coordinator == nil {
+		return nil, errors.New("coordinator must not be nil")
+	}
+	leaderS3 := make(map[raft.ServerAddress]string)
+	if raftS3MapStr != "" {
+		parts := strings.SplitSeq(raftS3MapStr, ",")
+		for part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", kvParts)
+			if len(kv) != kvParts {
+				slog.Warn("ignoring invalid raft-s3 map entry; expected format addr=s3addr", "entry", part)
+				continue
+			}
+			leaderS3[raft.ServerAddress(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
+		}
+	}
+	leaderS3[raft.ServerAddress(addr)] = s3Addr
+
+	l, err := lc.Listen(ctx, "tcp", s3Addr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	cleanup.Add(func() { os.RemoveAll(fsmDir) })
-	st, err := store.NewPebbleStore(fsmDir)
+	staticCreds, err := loadS3StaticCredentials(credentialsFile)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		_ = l.Close()
+		return nil, err
 	}
-	return st, nil
+	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
+	return adapter.NewS3Server(
+		l,
+		s3Addr,
+		routedStore,
+		coordinator,
+		leaderS3,
+		adapter.WithS3Region(region),
+		adapter.WithS3StaticCredentials(staticCreds),
+		adapter.WithS3ActiveTimestampTracker(readTracker),
+	), nil
 }
 
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
@@ -397,13 +498,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
-	ldb, sdb, fss, err := setupStorage(cfg.raftDataDir)
-	if err != nil {
-		return err
-	}
-
-	var st store.MVCCStore
-	st, err = setupFSMStore(cfg.raftDataDir, &cleanup)
+	ldb, sdb, fss, st, err := setupStores(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
 	}
@@ -472,6 +567,11 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 	cleanup.Add(rd.Stop)
+	s3s, err := setupS3(ctx, lc, st, coordinator, cfg.address, cfg.s3Address, cfg.raftS3Map, cfg.s3Region, cfg.s3CredsFile, cfg.s3PathStyle, readTracker)
+	if err != nil {
+		return err
+	}
+	cleanup.Add(s3s.Stop)
 	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
 	if err != nil {
 		return errors.WithStack(err)
@@ -494,6 +594,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
 	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))
 	eg.Go(redisServeTask(rd, cfg.redisAddress))
+	eg.Go(s3ShutdownTask(ctx, s3s, cfg.s3Address))
+	eg.Go(s3ServeTask(s3s, cfg.s3Address))
 	eg.Go(dynamoShutdownTask(ctx, ds, cfg.dynamoAddress))
 	eg.Go(dynamoServeTask(ds, cfg.dynamoAddress))
 	eg.Go(monitoring.MetricsShutdownTask(ctx, ms, cfg.metricsAddress))
@@ -655,4 +757,58 @@ func dynamoServeTask(dynamoServer *adapter.DynamoDBServer, address string) func(
 		}
 		return errors.WithStack(err)
 	}
+}
+
+func s3ShutdownTask(ctx context.Context, s3Server *adapter.S3Server, address string) func() error {
+	return func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down S3 server", "address", address, "reason", ctx.Err())
+		s3Server.Stop()
+		return nil
+	}
+}
+
+func s3ServeTask(s3Server *adapter.S3Server, address string) func() error {
+	return func() error {
+		slog.Info("Starting S3 server", "address", address)
+		err := s3Server.Run()
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+}
+
+type s3CredentialFile struct {
+	Credentials []s3CredentialEntry `json:"credentials"`
+}
+
+type s3CredentialEntry struct {
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+}
+
+func loadS3StaticCredentials(path string) (map[string]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	file := s3CredentialFile{}
+	if err := json.Unmarshal(body, &file); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	out := make(map[string]string, len(file.Credentials))
+	for _, cred := range file.Credentials {
+		accessKeyID := strings.TrimSpace(cred.AccessKeyID)
+		secretAccessKey := strings.TrimSpace(cred.SecretAccessKey)
+		if accessKeyID == "" || secretAccessKey == "" {
+			return nil, errors.New("s3 credentials file contains an empty access key or secret key")
+		}
+		out[accessKeyID] = secretAccessKey
+	}
+	return out, nil
 }

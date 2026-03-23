@@ -57,11 +57,16 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		// Leader-only timestamp issuance to avoid divergence across shards.
+		// When the leader assigns StartTS, also clear any caller-provided
+		// CommitTS so dispatchTxn generates both timestamps consistently.
+		// A caller-supplied CommitTS without a matching StartTS could produce
+		// CommitTS <= StartTS (an invalid transaction).
 		reqs.StartTS = c.nextStartTS()
+		reqs.CommitTS = 0
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.StartTS)
+		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS)
 	}
 
 	return c.dispatchRaw(reqs.Elems)
@@ -101,16 +106,22 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
 	primary := primaryKeyForElems(reqs)
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	commitTS := c.clock.Next()
-	if commitTS <= startTS {
-		c.clock.Observe(startTS)
+	if commitTS == 0 {
 		commitTS = c.clock.Next()
+		if commitTS <= startTS {
+			c.clock.Observe(startTS)
+			commitTS = c.clock.Next()
+		}
+	} else {
+		// Observe the caller-provided commitTS so the HLC never issues
+		// a smaller timestamp in subsequent calls, preserving monotonicity.
+		c.clock.Observe(commitTS)
 	}
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
@@ -209,8 +220,16 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if len(primary) == 0 {
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 		}
+		// When StartTS is absent (leader will assign it), also clear CommitTS
+		// so the leader assigns both timestamps consistently. A caller-provided
+		// CommitTS without a StartTS would produce an invalid txn where
+		// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
+		commitTS := reqs.CommitTS
+		if reqs.StartTS == 0 {
+			commitTS = 0
+		}
 		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, 0, primary, reqs.Elems),
+			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems),
 		}
 	} else {
 		for _, req := range reqs.Elems {

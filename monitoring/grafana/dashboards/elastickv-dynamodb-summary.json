@@ -22,10 +22,7 @@
   "links": [],
   "panels": [
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -72,10 +69,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
           "instant": false,
@@ -88,10 +82,7 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -146,10 +137,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
           "instant": false,
@@ -162,10 +150,7 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -220,10 +205,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\"}[5m])))",
           "instant": false,
@@ -236,10 +218,7 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -286,10 +265,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum(elastickv_dynamodb_inflight_requests{job=\"elastickv\"})",
           "instant": false,
@@ -302,10 +278,7 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -385,10 +358,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "{{operation}}",
@@ -400,10 +370,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -483,10 +450,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum by (outcome) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
           "legendFormat": "{{outcome}}",
@@ -498,10 +462,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -581,10 +542,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "returned {{table}}",
@@ -592,10 +550,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "scanned {{table}}",
@@ -603,10 +558,7 @@
           "refId": "B"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=\"elastickv\"}[5m]))",
           "legendFormat": "written {{table}}",
@@ -618,10 +570,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": null
-      },
+      "datasource": null,
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -701,10 +650,7 @@
       "pluginVersion": "12.1.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "max by (group, node_id) (elastickv_raft_commit_index{job=\"elastickv\"})",
           "legendFormat": "commit g{{group}} {{node_id}}",
@@ -712,10 +658,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": null
-          },
+          "datasource": null,
           "editorMode": "code",
           "expr": "max by (group, node_id) (elastickv_raft_applied_index{job=\"elastickv\"})",
           "legendFormat": "applied g{{group}} {{node_id}}",

@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -122,6 +123,9 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 }
 
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
+		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
+	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
 	if userKey := store.ExtractListUserKey(start); userKey != nil {
@@ -180,19 +184,39 @@ func (s *ShardStore) reverseScanRoutesAt(
 	clampToRoutes bool,
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
-	for i := len(routes) - 1; i >= 0 && len(out) < limit; i-- {
+	seenGroups := make(map[uint64]struct{})
+	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
+			if len(out) >= limit {
+				break
+			}
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
+			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, kvs...)
+		} else {
+			// When clampToRoutes is false (e.g. S3 manifest scans spanning multiple
+			// shards), keys from different routes may interleave in descending order.
+			// Fetch up to limit from every route and merge+sort descending so the
+			// result honours the ReverseScanAt contract.
+			// De-duplicate by GroupID: after a range split both halves share the same
+			// GroupID (same backing shard store), so only scan each group once.
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
+			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, true)
+			if err != nil {
+				return nil, err
+			}
+			out = mergeAndTrimReverseScanResults(out, kvs, limit)
 		}
-		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, kvs...)
 	}
 	return out, nil
 }
@@ -335,6 +359,21 @@ func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
+	clear(out[limit:])
+	return out[:limit]
+}
+
+func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
+	if len(kvs) == 0 {
+		return out
+	}
+	out = append(out, kvs...)
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) > 0
+	})
+	if len(out) <= limit {
+		return out
+	}
 	clear(out[limit:])
 	return out[:limit]
 }
