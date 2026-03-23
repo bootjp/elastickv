@@ -724,6 +724,18 @@ func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version Versioned
 	return errors.WithStack(deferred.Finish())
 }
 
+// writeRestoreEntry writes one key-value entry from the stream into batch,
+// reading the value bytes directly into the deferred write buffer. keyBuf must
+// already contain kLen key bytes.
+func writeRestoreEntry(r io.Reader, batch *pebble.Batch, keyBuf []byte, kLen, vLen int) error {
+	deferred := batch.SetDeferred(kLen, vLen)
+	copy(deferred.Key, keyBuf[:kLen])
+	if _, err := io.ReadFull(r, deferred.Value); err != nil {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(deferred.Finish())
+}
+
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
 // them into db using batched commits. It is used for both the direct and the
 // temp-dir atomic native Pebble restore paths.
@@ -749,15 +761,9 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 			}
 		}
 
-		deferred := batch.SetDeferred(kLen, vLen)
-		copy(deferred.Key, keyBuf[:kLen])
-		if _, err := io.ReadFull(r, deferred.Value); err != nil {
+		if err := writeRestoreEntry(r, batch, keyBuf, kLen, vLen); err != nil {
 			_ = batch.Close()
-			return errors.WithStack(err)
-		}
-		if err := deferred.Finish(); err != nil {
-			_ = batch.Close()
-			return errors.WithStack(err)
+			return err
 		}
 
 		if snapshotBatchShouldFlush(batch) {
