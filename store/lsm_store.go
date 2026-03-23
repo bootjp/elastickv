@@ -653,32 +653,28 @@ func (s *pebbleStore) Snapshot() (Snapshot, error) {
 	return newPebbleSnapshot(snap, lastCommitTS), nil
 }
 
-func restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {
-	kLen, err := readRestoreFieldLen(r, "snapshot key")
+// readRestoreEntry reads one entry's key-length, key bytes, and value-length
+// from r. The key bytes are stored in *keyBuf (grown as needed to avoid per-entry
+// allocations). Returns (kLen, vLen, eof=true, nil) on clean EOF at the key-length field.
+func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, err error) {
+	kLen, err = readRestoreFieldLen(r, "snapshot key")
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return true, nil
+			return 0, 0, true, nil
 		}
-		return false, err
+		return 0, 0, false, err
 	}
-	key := make([]byte, kLen)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return false, errors.WithStack(err)
+	if cap(*keyBuf) < kLen {
+		*keyBuf = make([]byte, kLen)
 	}
-	vLenInt, err := readRestoreFieldLen(r, "snapshot value")
+	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
+		return 0, 0, false, errors.WithStack(err)
+	}
+	vLen, err = readRestoreFieldLen(r, "snapshot value")
 	if err != nil {
-		return false, err
+		return 0, 0, false, err
 	}
-
-	deferred := batch.SetDeferred(kLen, vLenInt)
-	copy(deferred.Key, key)
-	if _, err := io.ReadFull(r, deferred.Value); err != nil {
-		return false, errors.WithStack(err)
-	}
-	if err := deferred.Finish(); err != nil {
-		return false, errors.WithStack(err)
-	}
-	return false, nil
+	return kLen, vLen, false, nil
 }
 
 func readRestoreFieldLen(r io.Reader, field string) (int, error) {
@@ -733,15 +729,35 @@ func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version Versioned
 // temp-dir atomic native Pebble restore paths.
 func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	batch := db.NewBatch()
+	var keyBuf []byte // reused across entries to reduce per-entry allocations
 
 	for {
-		eof, err := restoreOneEntry(r, batch)
+		kLen, vLen, eof, err := readRestoreEntry(r, &keyBuf)
 		if err != nil {
 			_ = batch.Close()
 			return err
 		}
 		if eof {
 			break
+		}
+
+		// Flush before adding when the batch is non-empty and the anticipated
+		// entry size would push the batch over the byte limit.
+		if !batch.Empty() && batch.Len()+kLen+vLen >= snapshotBatchByteLimit {
+			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
+				return err
+			}
+		}
+
+		deferred := batch.SetDeferred(kLen, vLen)
+		copy(deferred.Key, keyBuf[:kLen])
+		if _, err := io.ReadFull(r, deferred.Value); err != nil {
+			_ = batch.Close()
+			return errors.WithStack(err)
+		}
+		if err := deferred.Finish(); err != nil {
+			_ = batch.Close()
+			return errors.WithStack(err)
 		}
 
 		if snapshotBatchShouldFlush(batch) {

@@ -194,6 +194,7 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
 
 	ctx := context.Background()
 	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 100, 0))
@@ -201,13 +202,11 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	// Snapshot
 	buf, err := s.Snapshot()
 	require.NoError(t, err)
+	defer func() { require.NoError(t, buf.Close()) }()
 
 	var raw bytes.Buffer
 	_, err = buf.WriteTo(&raw)
 	require.NoError(t, err)
-	require.NoError(t, buf.Close())
-
-	require.NoError(t, s.Close())
 
 	// Restore to new dir
 	dir2, err := os.MkdirTemp("", "pebble-restore-test")
@@ -255,6 +254,7 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
 
 	ctx := context.Background()
 	largeValue := bytes.Repeat([]byte("x"), snapshotBatchByteLimit/2+1024)
@@ -263,13 +263,11 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 
 	snap, err := s.Snapshot()
 	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
 
 	var raw bytes.Buffer
 	_, err = snap.WriteTo(&raw)
 	require.NoError(t, err)
-	require.NoError(t, snap.Close())
-
-	require.NoError(t, s.Close())
 
 	dir2, err := os.MkdirTemp("", "pebble-large-restore-test")
 	require.NoError(t, err)
