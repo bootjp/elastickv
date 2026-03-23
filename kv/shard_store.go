@@ -184,19 +184,32 @@ func (s *ShardStore) reverseScanRoutesAt(
 	clampToRoutes bool,
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
-	for i := len(routes) - 1; i >= 0 && len(out) < limit; i-- {
+	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
+			if len(out) >= limit {
+				break
+			}
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
+			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, kvs...)
+		} else {
+			// When clampToRoutes is false (e.g. S3 manifest scans spanning multiple
+			// shards), keys from different routes may interleave in descending order.
+			// Fetch up to limit from every route and merge+sort descending so the
+			// result honours the ReverseScanAt contract.
+			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, true)
+			if err != nil {
+				return nil, err
+			}
+			out = mergeAndTrimReverseScanResults(out, kvs, limit)
 		}
-		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, kvs...)
 	}
 	return out, nil
 }
@@ -338,6 +351,21 @@ func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	clear(out[limit:])
+	return out[:limit]
+}
+
+func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
+	if len(kvs) == 0 {
+		return out
+	}
+	out = append(out, kvs...)
+	if len(out) <= limit {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) > 0
 	})
 	clear(out[limit:])
 	return out[:limit]
