@@ -456,7 +456,7 @@ func setupS3(
 	leaderS3 := make(map[raft.ServerAddress]string)
 	if raftS3MapStr != "" {
 		parts := strings.SplitSeq(raftS3MapStr, ",")
-		for _, part := range parts {
+		for part := range parts {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
