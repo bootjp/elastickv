@@ -23,7 +23,7 @@ const (
 	timestampSize           = 8
 	valueHeaderSize         = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchCountLimit = 1000
-	snapshotBatchByteLimit  = 8 << 20
+	snapshotBatchByteLimit  = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
 	dirPerms                = 0755
 	metaLastCommitTS        = "_meta_last_commit_ts"
 	spoolBufSize            = 32 * 1024 // buffer size for streaming I/O during restore
@@ -690,7 +690,7 @@ func readRestoreFieldLen(r io.Reader, field string) (int, error) {
 }
 
 func restoreFieldLenInt(raw uint64, field string) (int, error) {
-	if raw > uint64(^uint(0)>>1) {
+	if raw > uint64(math.MaxInt) {
 		return 0, errors.WithStack(errors.Newf("%s length %d exceeds supported size", field, raw))
 	}
 	return int(raw), nil
@@ -707,7 +707,7 @@ func commitSnapshotBatch(batch *pebble.Batch, opts *pebble.WriteOptions) error {
 	defer func() {
 		_ = batch.Close()
 	}()
-	if batch.Empty() {
+	if batch.Empty() && opts != pebble.Sync {
 		return nil
 	}
 	return errors.WithStack(batch.Commit(opts))
@@ -1182,7 +1182,9 @@ func spoolGobPayload(r io.Reader, dst io.Writer) error {
 }
 
 // writeGobEntriesToDB writes the decoded gob snapshot entries into db using
-// batched commits.
+// batched commits. NOTE: this function mutates entries in-place by nilling out
+// each version's Value, Key, and Versions fields after encoding to reduce peak
+// memory usage. Callers must not reuse entries after this call.
 func writeGobEntriesToDB(entries []mvccSnapshotEntry, db *pebble.DB) error {
 	batch := db.NewBatch()
 	for i := range entries {
