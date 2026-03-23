@@ -32,8 +32,9 @@ const (
 	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
 )
 
-// maxSnapshotValueSize caps the allowed size of a single value during snapshot
-// restore and write paths to prevent OOM from malformed or adversarial snapshots.
+// maxSnapshotValueSize caps the allowed size of a single value during streaming
+// snapshot restore and write paths to prevent OOM from malformed or adversarial
+// snapshots. It does not apply to legacy gob-backed snapshot restore.
 // Declared as a var so tests can temporarily lower the limit without allocating
 // hundreds of MiB.
 var maxSnapshotValueSize = 256 << 20 // 256 MiB
