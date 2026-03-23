@@ -18,6 +18,7 @@ var ErrExpired = errors.New("expired")
 var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
 var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
+var ErrSnapshotValueTooLarge = errors.New("snapshot value too large")
 
 type WriteConflictError struct {
 	key []byte

@@ -23,8 +23,7 @@ const (
 	timestampSize           = 8
 	valueHeaderSize         = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchCountLimit = 1000
-	snapshotBatchByteLimit  = 8 << 20           // 8 MiB; balances restore write amplification vs peak memory usage
-	maxSnapshotValueSize    = 512 * 1024 * 1024 // 512 MiB; prevents OOM from malformed snapshots
+	snapshotBatchByteLimit  = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
 	dirPerms                = 0755
 	metaLastCommitTS        = "_meta_last_commit_ts"
 	spoolBufSize            = 32 * 1024 // buffer size for streaming I/O during restore
@@ -518,6 +517,9 @@ func (s *pebbleStore) ReverseScanAt(ctx context.Context, start []byte, end []byt
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if len(value) > maxSnapshotValueSize {
+		return errors.Wrapf(ErrSnapshotValueTooLarge, "value length %d > %d", len(value), maxSnapshotValueSize)
+	}
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
@@ -688,7 +690,7 @@ func readRestoreFieldLen(r io.Reader, field string, maxSize int) (int, error) {
 
 func restoreFieldLenInt(raw uint64, field string, maxSize int) (int, error) {
 	if raw > uint64(math.MaxInt) || int(raw) > maxSize {
-		return 0, errors.WithStack(errors.Newf("%s length %d exceeds supported size", field, raw))
+		return 0, errors.WithStack(errors.Newf("%s length %d > %d", field, raw, maxSize))
 	}
 	return int(raw), nil
 }

@@ -28,8 +28,9 @@ type VersionedValue struct {
 const (
 	checksumSize            = 4
 	mvccSnapshotVersion     = uint32(1)
-	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
-	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
+	maxSnapshotKeySize      = 1 << 20        // 1 MiB per key
+	maxSnapshotVersionCount = 1 << 20        // 1M versions per key
+	maxSnapshotValueSize    = 256 << 20      // 256 MiB per value; prevents OOM from malformed snapshots
 )
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
@@ -840,6 +841,9 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	var valueLen uint64
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
+	}
+	if valueLen > maxSnapshotValueSize {
+		return VersionedValue{}, errors.Wrapf(ErrSnapshotValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {

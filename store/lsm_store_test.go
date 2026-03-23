@@ -512,3 +512,22 @@ func TestPebbleStore_Restore_NativePebbleAtomic(t *testing.T) {
 	require.NoError(t, getErr)
 	assert.Equal(t, []byte("value"), val)
 }
+
+// TestPebbleStore_PutAt_ValueTooLarge verifies that PutAt rejects values
+// exceeding maxSnapshotValueSize (256 MiB) to ensure write and restore are
+// consistent.
+func TestPebbleStore_PutAt_ValueTooLarge(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-value-limit-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s.Close()) }()
+
+	ctx := context.Background()
+	oversized := make([]byte, maxSnapshotValueSize+1)
+	err = s.PutAt(ctx, []byte("k"), oversized, 1, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSnapshotValueTooLarge)
+}
