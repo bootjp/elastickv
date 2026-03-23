@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -200,13 +201,13 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	// Snapshot
 	buf, err := s.Snapshot()
 	require.NoError(t, err)
-	defer buf.Close()
 
 	var raw bytes.Buffer
 	_, err = buf.WriteTo(&raw)
 	require.NoError(t, err)
+	require.NoError(t, buf.Close())
 
-	s.Close()
+	require.NoError(t, s.Close())
 
 	// Restore to new dir
 	dir2, err := os.MkdirTemp("", "pebble-restore-test")
@@ -225,6 +226,68 @@ func TestPebbleStore_SnapshotRestore(t *testing.T) {
 	assert.Equal(t, []byte("v1"), val)
 
 	assert.Equal(t, uint64(100), s2.LastCommitTS()) // aligned 100 -> 100 (if started from 0)
+}
+
+func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-batch-flush-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	db, err := pebble.Open(dir, defaultPebbleOptions())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	batch := db.NewBatch()
+	defer func() { require.NoError(t, batch.Close()) }()
+
+	deferred := batch.SetDeferred(1, snapshotBatchByteLimit)
+	deferred.Key[0] = 'k'
+	deferred.Value[0] = 0
+	require.NoError(t, deferred.Finish())
+
+	assert.True(t, snapshotBatchShouldFlush(batch))
+}
+
+func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-large-snap-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	largeValue := bytes.Repeat([]byte("x"), snapshotBatchByteLimit/2+1024)
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), largeValue, 100, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), largeValue, 200, 0))
+
+	snap, err := s.Snapshot()
+	require.NoError(t, err)
+
+	var raw bytes.Buffer
+	_, err = snap.WriteTo(&raw)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+
+	require.NoError(t, s.Close())
+
+	dir2, err := os.MkdirTemp("", "pebble-large-restore-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir2)
+
+	s2, err := NewPebbleStore(dir2)
+	require.NoError(t, err)
+	defer s2.Close()
+
+	require.NoError(t, s2.Restore(bytes.NewReader(raw.Bytes())))
+
+	val, err := s2.GetAt(ctx, []byte("k1"), 100)
+	require.NoError(t, err)
+	assert.Equal(t, largeValue, val)
+
+	val, err = s2.GetAt(ctx, []byte("k2"), 200)
+	require.NoError(t, err)
+	assert.Equal(t, largeValue, val)
 }
 
 // TestPebbleStore_RestoreFromStreamingMVCC verifies that a pebbleStore can
