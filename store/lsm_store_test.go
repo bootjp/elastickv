@@ -514,9 +514,12 @@ func TestPebbleStore_Restore_NativePebbleAtomic(t *testing.T) {
 }
 
 // TestPebbleStore_PutAt_ValueTooLarge verifies that PutAt rejects values
-// exceeding maxSnapshotValueSize (256 MiB) to ensure write and restore are
-// consistent.
+// exceeding maxSnapshotValueSize to ensure write and restore are consistent.
 func TestPebbleStore_PutAt_ValueTooLarge(t *testing.T) {
+	orig := maxSnapshotValueSize
+	maxSnapshotValueSize = 100
+	t.Cleanup(func() { maxSnapshotValueSize = orig })
+
 	dir, err := os.MkdirTemp("", "pebble-value-limit-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -535,6 +538,10 @@ func TestPebbleStore_PutAt_ValueTooLarge(t *testing.T) {
 // TestPebbleStore_ApplyMutations_ValueTooLarge verifies that ApplyMutations
 // rejects Put mutations with values exceeding maxSnapshotValueSize.
 func TestPebbleStore_ApplyMutations_ValueTooLarge(t *testing.T) {
+	orig := maxSnapshotValueSize
+	maxSnapshotValueSize = 100
+	t.Cleanup(func() { maxSnapshotValueSize = orig })
+
 	dir, err := os.MkdirTemp("", "pebble-apply-value-limit-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -555,6 +562,10 @@ func TestPebbleStore_ApplyMutations_ValueTooLarge(t *testing.T) {
 // TestMVCCStore_PutAt_ValueTooLarge verifies that the in-memory mvccStore
 // also rejects oversized values.
 func TestMVCCStore_PutAt_ValueTooLarge(t *testing.T) {
+	orig := maxSnapshotValueSize
+	maxSnapshotValueSize = 100
+	t.Cleanup(func() { maxSnapshotValueSize = orig })
+
 	s := NewMVCCStore()
 	defer s.Close()
 
@@ -568,6 +579,10 @@ func TestMVCCStore_PutAt_ValueTooLarge(t *testing.T) {
 // TestMVCCStore_ApplyMutations_ValueTooLarge verifies that the in-memory
 // mvccStore rejects oversized Put mutations.
 func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
+	orig := maxSnapshotValueSize
+	maxSnapshotValueSize = 100
+	t.Cleanup(func() { maxSnapshotValueSize = orig })
+
 	s := NewMVCCStore()
 	defer s.Close()
 
