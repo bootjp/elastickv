@@ -28,8 +28,9 @@ type VersionedValue struct {
 const (
 	checksumSize            = 4
 	mvccSnapshotVersion     = uint32(1)
-	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
-	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
+	maxSnapshotKeySize      = 1 << 20   // 1 MiB per key
+	maxSnapshotVersionCount = 1 << 20   // 1M versions per key
+	maxSnapshotValueSize    = 256 << 20 // 256 MiB per value; prevents OOM from malformed snapshots
 )
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
@@ -203,6 +204,9 @@ func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []Version
 }
 
 func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if err := validateValueSize(value); err != nil {
+		return err
+	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -456,6 +460,9 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	for _, mut := range mutations {
 		switch mut.Op {
 		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
 			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
 		case OpTypeDelete:
 			s.deleteVersionLocked(mut.Key, commitTS)
@@ -840,6 +847,9 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	var valueLen uint64
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
+	}
+	if valueLen > maxSnapshotValueSize {
+		return VersionedValue{}, errors.Wrapf(ErrValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {
