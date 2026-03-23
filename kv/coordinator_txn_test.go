@@ -36,7 +36,7 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, startTS)
+	}, startTS, 0)
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -52,7 +52,7 @@ func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: nil, Value: []byte("v")},
-	}, 1)
+	}, 1, 0)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -70,7 +70,7 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("b"), Value: []byte("v1")},
 		{Op: Del, Key: []byte("x")},
-	}, startTS)
+	}, startTS, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, tx.commits)
 	require.Len(t, tx.reqs, 1)
@@ -92,4 +92,27 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("b"), meta.PrimaryKey)
 	require.Greater(t, meta.CommitTS, startTS)
+}
+
+func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
+	t.Parallel()
+
+	tx := &stubTransactional{}
+	c := &Coordinate{
+		transactionManager: tx,
+		clock:              NewHLC(),
+	}
+
+	startTS := uint64(10)
+	commitTS := uint64(25)
+	_, err := c.dispatchTxn([]*Elem[OP]{
+		{Op: Put, Key: []byte("k"), Value: []byte("v")},
+	}, startTS, commitTS)
+	require.NoError(t, err)
+	require.Len(t, tx.reqs, 1)
+	require.Len(t, tx.reqs[0], 1)
+
+	meta, err := DecodeTxnMeta(tx.reqs[0][0].Mutations[0].Value)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, meta.CommitTS)
 }

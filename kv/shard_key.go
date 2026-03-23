@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 )
 
@@ -20,11 +21,17 @@ func routeKey(key []byte) []byte {
 		return user
 	}
 	if embedded, ok := txnRouteKey(key); ok {
+		if user := s3keys.ExtractRouteKey(embedded); user != nil {
+			return user
+		}
 		// Transaction internal keys embed the logical key after the prefix.
 		if user := store.ExtractListUserKey(embedded); user != nil {
 			return user
 		}
 		return embedded
+	}
+	if user := s3keys.ExtractRouteKey(key); user != nil {
+		return user
 	}
 	if user := store.ExtractListUserKey(key); user != nil {
 		return user

@@ -166,6 +166,41 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
 }
 
+func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	startTS := uint64(10)
+	commitTS := uint64(25)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 2)
+	require.Len(t, g2Txn.requests, 2)
+
+	commitMeta1 := requestTxnMeta(t, g1Txn.requests[1])
+	commitMeta2 := requestTxnMeta(t, g2Txn.requests[1])
+	require.Equal(t, commitTS, commitMeta1.CommitTS)
+	require.Equal(t, commitTS, commitMeta2.CommitTS)
+}
+
 func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {
 	t.Parallel()
 
