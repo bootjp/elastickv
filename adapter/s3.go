@@ -1244,7 +1244,7 @@ func decodeS3ContinuationToken(raw string) (*s3ContinuationToken, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
 	}
-	data, err := base64.StdEncoding.DecodeString(raw)
+	data, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1268,7 +1268,7 @@ func encodeS3ContinuationToken(bucket string, generation uint64, prefix string, 
 	if err != nil {
 		return ""
 	}
-	return base64.StdEncoding.EncodeToString(data)
+	return base64.RawURLEncoding.EncodeToString(data)
 }
 
 func parseS3MaxKeys(raw string) int {
