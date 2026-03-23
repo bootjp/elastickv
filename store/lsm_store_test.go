@@ -275,7 +275,7 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 
 	s2, err := NewPebbleStore(dir2)
 	require.NoError(t, err)
-	defer s2.Close()
+	defer func() { assert.NoError(t, s2.Close()) }()
 
 	require.NoError(t, s2.Restore(bytes.NewReader(raw.Bytes())))
 
