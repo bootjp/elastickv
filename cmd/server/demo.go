@@ -456,10 +456,15 @@ func setupS3(
 	leaderS3 := make(map[raft.ServerAddress]string)
 	if raftS3MapStr != "" {
 		parts := strings.SplitSeq(raftS3MapStr, ",")
-		for part := range parts {
-			kv := strings.SplitN(strings.TrimSpace(part), "=", kvParts)
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", kvParts)
 			if len(kv) != kvParts {
-				return nil, fmt.Errorf("invalid raft-s3 map entry %q: expected format addr=s3addr", part)
+				slog.Warn("ignoring invalid raft-s3 map entry; expected format addr=s3addr", "entry", part)
+				continue
 			}
 			leaderS3[raft.ServerAddress(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
 		}
