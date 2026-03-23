@@ -70,10 +70,15 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 			return nil, err
 		}
 		reqs.StartTS = startTS
+		// When the coordinator assigns StartTS, also clear any caller-provided
+		// CommitTS so dispatchTxn generates both timestamps consistently.
+		// A caller-supplied CommitTS without a matching StartTS could produce
+		// CommitTS <= StartTS (an invalid transaction).
+		reqs.CommitTS = 0
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.StartTS, reqs.Elems)
+		return c.dispatchTxn(reqs.StartTS, reqs.CommitTS, reqs.Elems)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -88,7 +93,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(startTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
 	grouped, gids, err := c.groupMutations(elems)
 	if err != nil {
 		return nil, err
@@ -98,7 +103,13 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, elems []*Elem[OP]) (*Co
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	commitTS := c.nextTxnTSAfter(startTS)
+	if commitTS == 0 {
+		commitTS = c.nextTxnTSAfter(startTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
+	}
 	if commitTS == 0 || commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
@@ -463,7 +474,14 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	commitTS := c.nextTxnTSAfter(reqs.StartTS)
+	commitTS := reqs.CommitTS
+	if commitTS == 0 {
+		commitTS = c.nextTxnTSAfter(reqs.StartTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
+	}
 	if commitTS == 0 || commitTS <= reqs.StartTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
