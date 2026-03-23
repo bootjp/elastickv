@@ -23,7 +23,7 @@ const (
 	timestampSize           = 8
 	valueHeaderSize         = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchCountLimit = 1000
-	snapshotBatchByteLimit  = 8 << 20        // 8 MiB; balances restore write amplification vs peak memory usage
+	snapshotBatchByteLimit  = 8 << 20           // 8 MiB; balances restore write amplification vs peak memory usage
 	maxSnapshotValueSize    = 512 * 1024 * 1024 // 512 MiB; prevents OOM from malformed snapshots
 	dirPerms                = 0755
 	metaLastCommitTS        = "_meta_last_commit_ts"
