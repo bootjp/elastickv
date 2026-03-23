@@ -20,12 +20,20 @@ import (
 )
 
 const (
-	timestampSize     = 8
-	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchSize = 1000
-	dirPerms          = 0755
-	metaLastCommitTS  = "_meta_last_commit_ts"
-	spoolBufSize      = 32 * 1024 // buffer size for streaming I/O during restore
+	timestampSize           = 8
+	valueHeaderSize         = 9 // 1 byte tombstone + 8 bytes expireAt
+	snapshotBatchCountLimit = 1000
+	snapshotBatchByteLimit  = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
+	dirPerms                = 0755
+	metaLastCommitTS        = "_meta_last_commit_ts"
+	spoolBufSize            = 32 * 1024 // buffer size for streaming I/O during restore
+
+	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
+	// which are the user key concatenated with the 8-byte inverted timestamp.
+	// Using maxSnapshotKeySize+timestampSize (instead of just maxSnapshotKeySize)
+	// avoids rejecting keys that are valid at the user-key level but slightly
+	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
+	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
 )
 
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
@@ -106,11 +114,19 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 // Key = [UserKeyBytes] [8-byte Inverted Timestamp]
 
 func encodeKey(key []byte, ts uint64) []byte {
-	k := make([]byte, len(key)+timestampSize)
-	copy(k, key)
-	// Invert TS for descending order (newer first)
-	binary.BigEndian.PutUint64(k[len(key):], ^ts)
+	k := make([]byte, encodedKeyLen(key))
+	fillEncodedKey(k, key, ts)
 	return k
+}
+
+func encodedKeyLen(key []byte) int {
+	return len(key) + timestampSize
+}
+
+func fillEncodedKey(dst []byte, key []byte, ts uint64) {
+	copy(dst, key)
+	// Invert TS for descending order (newer first)
+	binary.BigEndian.PutUint64(dst[len(key):], ^ts)
 }
 
 func decodeKey(k []byte) ([]byte, uint64) {
@@ -133,13 +149,23 @@ type storedValue struct {
 
 func encodeValue(val []byte, tombstone bool, expireAt uint64) []byte {
 	// Format: [Tombstone(1)] [ExpireAt(8)] [Value(...)]
-	buf := make([]byte, valueHeaderSize+len(val))
-	if tombstone {
-		buf[0] = 1
-	}
-	binary.LittleEndian.PutUint64(buf[1:], expireAt)
-	copy(buf[valueHeaderSize:], val)
+	buf := make([]byte, encodedValueLen(len(val)))
+	fillEncodedValue(buf, val, tombstone, expireAt)
 	return buf
+}
+
+func encodedValueLen(valueLen int) int {
+	return valueHeaderSize + valueLen
+}
+
+func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64) {
+	if tombstone {
+		dst[0] = 1
+	} else {
+		dst[0] = 0
+	}
+	binary.LittleEndian.PutUint64(dst[1:], expireAt)
+	copy(dst[valueHeaderSize:], val)
 }
 
 func decodeValue(data []byte) (storedValue, error) {
@@ -498,6 +524,9 @@ func (s *pebbleStore) ReverseScanAt(ctx context.Context, start []byte, end []byt
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if err := validateValueSize(value); err != nil {
+		return err
+	}
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
@@ -582,6 +611,9 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 
 		switch mut.Op {
 		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
 			v = encodeValue(mut.Value, false, mut.ExpireAt)
 		case OpTypeDelete:
 			v = encodeValue(nil, true, 0)
@@ -634,32 +666,94 @@ func (s *pebbleStore) Snapshot() (Snapshot, error) {
 	return newPebbleSnapshot(snap, lastCommitTS), nil
 }
 
-func restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {
-	var kLen uint64
-	if err := binary.Read(r, binary.LittleEndian, &kLen); err != nil {
+// readRestoreEntry reads one entry's key-length, key bytes, and value-length
+// from r. The key bytes are stored in *keyBuf (grown as needed to avoid per-entry
+// allocations). Returns (kLen, vLen, eof=true, nil) on clean EOF at the key-length field.
+func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, err error) {
+	kLen, err = readRestoreFieldLen(r, "snapshot key", maxPebbleEncodedKeySize)
+	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return true, nil
+			return 0, 0, true, nil
 		}
-		return false, errors.WithStack(err)
+		return 0, 0, false, err
 	}
-	key := make([]byte, kLen)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return false, errors.WithStack(err)
+	if cap(*keyBuf) < kLen {
+		*keyBuf = make([]byte, kLen)
 	}
+	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
+		return 0, 0, false, errors.WithStack(err)
+	}
+	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize+valueHeaderSize)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return kLen, vLen, false, nil
+}
 
-	var vLen uint64
-	if err := binary.Read(r, binary.LittleEndian, &vLen); err != nil {
-		return false, errors.WithStack(err)
+func readRestoreFieldLen(r io.Reader, field string, maxSize int) (int, error) {
+	var raw uint64
+	if err := binary.Read(r, binary.LittleEndian, &raw); err != nil {
+		return 0, errors.WithStack(err)
 	}
-	val := make([]byte, vLen)
-	if _, err := io.ReadFull(r, val); err != nil {
-		return false, errors.WithStack(err)
-	}
+	return restoreFieldLenInt(raw, field, maxSize)
+}
 
-	if err := batch.Set(key, val, nil); err != nil {
-		return false, errors.WithStack(err)
+func restoreFieldLenInt(raw uint64, field string, maxSize int) (int, error) {
+	if raw > uint64(math.MaxInt) || int(raw) > maxSize {
+		switch field {
+		case "snapshot key":
+			return 0, errors.WithStack(errors.Wrapf(ErrSnapshotKeyTooLarge, "length %d > %d", raw, maxSize))
+		case "snapshot value":
+			return 0, errors.WithStack(errors.Wrapf(ErrValueTooLarge, "length %d > %d", raw, maxSize))
+		default:
+			return 0, errors.WithStack(errors.Newf("%s length %d > %d", field, raw, maxSize))
+		}
 	}
-	return false, nil
+	return int(raw), nil
+}
+
+func snapshotBatchShouldFlush(batch *pebble.Batch) bool {
+	return batch.Count() >= snapshotBatchCountLimit || batch.Len() >= snapshotBatchByteLimit
+}
+
+func commitSnapshotBatch(batch *pebble.Batch, opts *pebble.WriteOptions) error {
+	if batch == nil {
+		return nil
+	}
+	defer func() {
+		_ = batch.Close()
+	}()
+	if batch.Empty() && (opts == nil || !opts.Sync) {
+		return nil
+	}
+	return errors.WithStack(batch.Commit(opts))
+}
+
+func flushSnapshotBatch(db *pebble.DB, batch **pebble.Batch, opts *pebble.WriteOptions) error {
+	if err := commitSnapshotBatch(*batch, opts); err != nil {
+		return err
+	}
+	*batch = db.NewBatch()
+	return nil
+}
+
+func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version VersionedValue) error {
+	deferred := batch.SetDeferred(encodedKeyLen(key), encodedValueLen(len(version.Value)))
+	fillEncodedKey(deferred.Key, key, version.TS)
+	fillEncodedValue(deferred.Value, version.Value, version.Tombstone, version.ExpireAt)
+	return errors.WithStack(deferred.Finish())
+}
+
+// writeRestoreEntry writes one key-value entry from the stream into batch,
+// reading the value bytes directly into the deferred write buffer. keyBuf must
+// already contain kLen key bytes.
+func writeRestoreEntry(r io.Reader, batch *pebble.Batch, keyBuf []byte, kLen, vLen int) error {
+	deferred := batch.SetDeferred(kLen, vLen)
+	copy(deferred.Key, keyBuf[:kLen])
+	if _, err := io.ReadFull(r, deferred.Value); err != nil {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(deferred.Finish())
 }
 
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
@@ -667,10 +761,10 @@ func restoreOneEntry(r io.Reader, batch *pebble.Batch) (bool, error) {
 // temp-dir atomic native Pebble restore paths.
 func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	batch := db.NewBatch()
-	batchCnt := 0
+	var keyBuf []byte // reused across entries to reduce per-entry allocations
 
 	for {
-		eof, err := restoreOneEntry(r, batch)
+		kLen, vLen, eof, err := readRestoreEntry(r, &keyBuf)
 		if err != nil {
 			_ = batch.Close()
 			return err
@@ -679,20 +773,26 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 			break
 		}
 
-		batchCnt++
-		if batchCnt >= snapshotBatchSize {
-			if err := batch.Commit(pebble.NoSync); err != nil {
-				_ = batch.Close()
-				return errors.WithStack(err)
+		// Flush before adding when the batch is non-empty and the anticipated
+		// entry size would push the batch over the byte limit.
+		if !batch.Empty() && batch.Len()+kLen+vLen >= snapshotBatchByteLimit {
+			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
+				return err
 			}
+		}
+
+		if err := writeRestoreEntry(r, batch, keyBuf, kLen, vLen); err != nil {
 			_ = batch.Close()
-			batch = db.NewBatch()
-			batchCnt = 0
+			return err
+		}
+
+		if snapshotBatchShouldFlush(batch) {
+			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
+				return err
+			}
 		}
 	}
-	err := batch.Commit(pebble.Sync)
-	_ = batch.Close()
-	return errors.WithStack(err)
+	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
 func (s *pebbleStore) Restore(r io.Reader) error {
@@ -951,7 +1051,6 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 // into the given Pebble database using batched commits.
 func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
 	batch := db.NewBatch()
-	batchCnt := 0
 	for {
 		key, versions, eof, err := readMVCCSnapshotEntry(body)
 		if err != nil {
@@ -962,30 +1061,18 @@ func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
 			break
 		}
 		for _, v := range versions {
-			pKey := encodeKey(key, v.TS)
-			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
-			if err := batch.Set(pKey, pVal, nil); err != nil {
+			if err := setEncodedVersionInBatch(batch, key, v); err != nil {
 				_ = batch.Close()
-				return errors.WithStack(err)
+				return err
 			}
-			batchCnt++
-			if batchCnt >= snapshotBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
-					_ = batch.Close()
-					return errors.WithStack(err)
+			if snapshotBatchShouldFlush(batch) {
+				if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
+					return err
 				}
-				_ = batch.Close()
-				batch = db.NewBatch()
-				batchCnt = 0
 			}
 		}
 	}
-	if err := batch.Commit(pebble.Sync); err != nil {
-		_ = batch.Close()
-		return errors.WithStack(err)
-	}
-	_ = batch.Close()
-	return nil
+	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
 // swapInTempDB closes the current DB, removes its directory, and renames tmpDir
@@ -1137,33 +1224,31 @@ func spoolGobPayload(r io.Reader, dst io.Writer) error {
 }
 
 // writeGobEntriesToDB writes the decoded gob snapshot entries into db using
-// batched commits.
+// batched commits. NOTE: this function mutates entries in-place by clearing
+// each version's Value and then nilling the entry's Key and Versions slice
+// after encoding to reduce peak memory usage. Callers must not reuse entries
+// after this call.
 func writeGobEntriesToDB(entries []mvccSnapshotEntry, db *pebble.DB) error {
 	batch := db.NewBatch()
-	batchCnt := 0
-	for _, entry := range entries {
-		for _, v := range entry.Versions {
-			pKey := encodeKey(entry.Key, v.TS)
-			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
-			if err := batch.Set(pKey, pVal, nil); err != nil {
+	for i := range entries {
+		entry := &entries[i]
+		for j := range entry.Versions {
+			version := entry.Versions[j]
+			if err := setEncodedVersionInBatch(batch, entry.Key, version); err != nil {
 				_ = batch.Close()
-				return errors.WithStack(err)
+				return err
 			}
-			batchCnt++
-			if batchCnt >= snapshotBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
-					_ = batch.Close()
-					return errors.WithStack(err)
+			entry.Versions[j].Value = nil
+			if snapshotBatchShouldFlush(batch) {
+				if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
+					return err
 				}
-				_ = batch.Close()
-				batch = db.NewBatch()
-				batchCnt = 0
 			}
 		}
+		entry.Key = nil
+		entry.Versions = nil
 	}
-	err := batch.Commit(pebble.Sync)
-	_ = batch.Close()
-	return errors.WithStack(err)
+	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
 func (s *pebbleStore) Close() error {

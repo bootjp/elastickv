@@ -32,6 +32,13 @@ const (
 	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
 )
 
+// maxSnapshotValueSize caps the allowed size of a single value during streaming
+// snapshot restore and write paths to prevent OOM from malformed or adversarial
+// snapshots. It does not apply to legacy gob-backed snapshot restore.
+// Declared as a var so tests can temporarily lower the limit without allocating
+// hundreds of MiB.
+var maxSnapshotValueSize = 256 << 20 // 256 MiB
+
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
 
 // mvccSnapshot is retained for backward compatibility with older gob-backed
@@ -203,6 +210,9 @@ func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []Version
 }
 
 func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if err := validateValueSize(value); err != nil {
+		return err
+	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -456,6 +466,9 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	for _, mut := range mutations {
 		switch mut.Op {
 		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
 			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
 		case OpTypeDelete:
 			s.deleteVersionLocked(mut.Key, commitTS)
@@ -840,6 +853,9 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	var valueLen uint64
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
+	}
+	if valueLen > uint64(maxSnapshotValueSize) {
+		return VersionedValue{}, errors.Wrapf(ErrValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {
