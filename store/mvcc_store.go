@@ -854,10 +854,11 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	if err := binary.Read(r, binary.LittleEndian, &valueLen); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
 	}
-	if valueLen > uint64(maxSnapshotValueSize) {
-		return VersionedValue{}, errors.Wrapf(ErrValueTooLarge, "%d > %d", valueLen, maxSnapshotValueSize)
+	decodedValueLen, err := restoreFieldLenInt(valueLen, "snapshot value", maxSnapshotValueSize)
+	if err != nil {
+		return VersionedValue{}, err
 	}
-	value := make([]byte, valueLen)
+	value := make([]byte, decodedValueLen)
 	if _, err := io.ReadFull(r, value); err != nil {
 		return VersionedValue{}, errors.WithStack(err)
 	}

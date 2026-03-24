@@ -187,38 +187,57 @@ func (s *ShardStore) reverseScanRoutesAt(
 	seenGroups := make(map[uint64]struct{})
 	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
-		scanStart := start
-		scanEnd := end
 		if clampToRoutes {
-			if len(out) >= limit {
+			kvs, done, err := s.clampedReverseScanRouteAt(ctx, route, start, end, limit, len(out), ts)
+			if err != nil {
+				return nil, err
+			}
+			if done {
 				break
 			}
-			scanStart = clampScanStart(start, route.Start)
-			scanEnd = clampScanEnd(end, route.End)
-			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, true)
-			if err != nil {
-				return nil, err
-			}
 			out = append(out, kvs...)
-		} else {
-			// When clampToRoutes is false (e.g. S3 manifest scans spanning multiple
-			// shards), keys from different routes may interleave in descending order.
-			// Fetch up to limit from every route and merge+sort descending so the
-			// result honours the ReverseScanAt contract.
-			// De-duplicate by GroupID: after a range split both halves share the same
-			// GroupID (same backing shard store), so only scan each group once.
-			if _, seen := seenGroups[route.GroupID]; seen {
-				continue
-			}
-			seenGroups[route.GroupID] = struct{}{}
-			kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, true)
-			if err != nil {
-				return nil, err
-			}
-			out = mergeAndTrimReverseScanResults(out, kvs, limit)
+			continue
 		}
+
+		// When clampToRoutes is false (e.g. S3 manifest scans spanning multiple
+		// shards), keys from different routes may interleave in descending order.
+		// Fetch up to limit from every route and merge+sort descending so the
+		// result honours the ReverseScanAt contract.
+		// De-duplicate by GroupID: after a range split both halves share the same
+		// GroupID (same backing shard store), so only scan each group once.
+		if _, seen := seenGroups[route.GroupID]; seen {
+			continue
+		}
+		seenGroups[route.GroupID] = struct{}{}
+		kvs, err := s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true)
+		if err != nil {
+			return nil, err
+		}
+		out = mergeAndTrimReverseScanResults(out, kvs, limit)
 	}
 	return out, nil
+}
+
+func (s *ShardStore) clampedReverseScanRouteAt(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	currentLen int,
+	ts uint64,
+) ([]*store.KVPair, bool, error) {
+	if currentLen >= limit {
+		return nil, true, nil
+	}
+
+	scanStart := clampScanStart(start, route.Start)
+	scanEnd := clampScanEnd(end, route.End)
+	kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-currentLen, ts, true)
+	if err != nil {
+		return nil, false, err
+	}
+	return kvs, false, nil
 }
 
 func (s *ShardStore) scanRouteAtDirection(
