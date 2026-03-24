@@ -29,16 +29,15 @@ type TxnMeta struct {
 }
 
 func EncodeTxnMeta(m TxnMeta) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(txnMetaVersion)
-	_ = binary.Write(&buf, binary.BigEndian, m.LockTTLms)
-	_ = binary.Write(&buf, binary.BigEndian, m.CommitTS)
-	primaryLen := uint64(len(m.PrimaryKey))
-	_ = binary.Write(&buf, binary.BigEndian, primaryLen)
-	if primaryLen > 0 {
-		buf.Write(m.PrimaryKey)
-	}
-	return buf.Bytes()
+	// version(1) + LockTTLms(8) + CommitTS(8) + primaryLen(8) + primaryKey
+	size := 1 + 8 + 8 + 8 + len(m.PrimaryKey)
+	b := make([]byte, size)
+	b[0] = txnMetaVersion
+	binary.BigEndian.PutUint64(b[1:], m.LockTTLms)
+	binary.BigEndian.PutUint64(b[9:], m.CommitTS)
+	binary.BigEndian.PutUint64(b[17:], uint64(len(m.PrimaryKey)))
+	copy(b[25:], m.PrimaryKey)
+	return b
 }
 
 func DecodeTxnMeta(b []byte) (TxnMeta, error) {
@@ -79,21 +78,20 @@ type txnLock struct {
 }
 
 func encodeTxnLock(l txnLock) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(txnLockVersion)
-	_ = binary.Write(&buf, binary.BigEndian, l.StartTS)
-	_ = binary.Write(&buf, binary.BigEndian, l.TTLExpireAt)
+	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey
+	size := 1 + 8 + 8 + 1 + 8 + len(l.PrimaryKey)
+	b := make([]byte, size)
+	b[0] = txnLockVersion
+	binary.BigEndian.PutUint64(b[1:], l.StartTS)
+	binary.BigEndian.PutUint64(b[9:], l.TTLExpireAt)
 	var flags byte
 	if l.IsPrimaryKey {
 		flags |= txnLockFlagPrimary
 	}
-	buf.WriteByte(flags)
-	primaryLen := uint64(len(l.PrimaryKey))
-	_ = binary.Write(&buf, binary.BigEndian, primaryLen)
-	if primaryLen > 0 {
-		buf.Write(l.PrimaryKey)
-	}
-	return buf.Bytes()
+	b[17] = flags
+	binary.BigEndian.PutUint64(b[18:], uint64(len(l.PrimaryKey)))
+	copy(b[26:], l.PrimaryKey)
+	return b
 }
 
 func decodeTxnLock(b []byte) (txnLock, error) {
@@ -144,16 +142,15 @@ const (
 )
 
 func encodeTxnIntent(i txnIntent) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(txnIntentVersion)
-	_ = binary.Write(&buf, binary.BigEndian, i.StartTS)
-	buf.WriteByte(i.Op)
-	valLen := uint64(len(i.Value))
-	_ = binary.Write(&buf, binary.BigEndian, valLen)
-	if valLen > 0 {
-		buf.Write(i.Value)
-	}
-	return buf.Bytes()
+	// version(1) + StartTS(8) + Op(1) + valLen(8) + value
+	size := 1 + 8 + 1 + 8 + len(i.Value)
+	b := make([]byte, size)
+	b[0] = txnIntentVersion
+	binary.BigEndian.PutUint64(b[1:], i.StartTS)
+	b[9] = i.Op
+	binary.BigEndian.PutUint64(b[10:], uint64(len(i.Value)))
+	copy(b[18:], i.Value)
+	return b
 }
 
 func decodeTxnIntent(b []byte) (txnIntent, error) {

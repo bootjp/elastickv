@@ -669,6 +669,12 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 			continue
 		}
 
+		// Skip transaction internal keys — their lifecycle is managed by
+		// lock resolution, not MVCC compaction.
+		if bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
+			continue
+		}
+
 		// Detect user-key boundary.
 		if !bytes.Equal(userKey, prevUserKey) {
 			prevUserKey = append(prevUserKey[:0], userKey...)

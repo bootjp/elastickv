@@ -11,11 +11,12 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. `saveLastCommitTS` changed to `pebble.Sync`; `ApplyMutations` writes `lastCommitTS` atomically in the same `WriteBatch`.
 
-### 1.2 [Critical] Batch Apply in FSM allows partial application without rollback
+### 1.2 [Low — downgraded] Batch Apply in FSM allows partial application without rollback
 
 - **File:** `kv/fsm.go:44-69`
-- **Problem:** When a `RaftCommand` contains multiple requests, each is applied individually. If request N fails, requests 1..N-1 are already persisted with no rollback. The client receives an error but has no visibility into which writes succeeded.
-- **Fix:** Apply all requests in a single atomic store batch. On any error, discard the entire batch.
+- **Problem:** When a `RaftCommand` contains multiple requests, each is applied individually. If request N fails, requests 1..N-1 are already persisted with no rollback.
+- **Analysis:** Downgraded from Critical. Batch items are independent raw writes from different clients. `applyRawBatch` returns per-item errors via `fsmApplyResponse`, so each caller receives their correct result. Partial success is by design for the raw batching optimization.
+- **Remaining concern:** If a future code path batches requests that must be atomic, this would need revisiting.
 
 ### ~~1.3 [High] `pebbleStore.Compact()` is unimplemented — unbounded version accumulation~~ DONE
 
@@ -31,11 +32,9 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. Errors are now logged with full context (gid, primary_key, start_ts, abort_ts).
 
-### 1.6 [High] MVCC compaction does not distinguish transaction internal keys
+### ~~1.6 [High] MVCC compaction does not distinguish transaction internal keys~~ DONE
 
-- **File:** `store/mvcc_store.go:888-956`
-- **Problem:** Compaction treats `!txn|cmt|` and `!txn|rb|` keys the same as user keys. If commit/rollback records are pruned, lock resolution becomes impossible.
-- **Fix:** Skip keys with transaction internal prefixes during compaction, or apply a separate GC policy for them.
+- **Status:** Fixed. Both mvccStore and pebbleStore compaction now skip keys with `!txn|` prefix.
 
 ---
 
@@ -109,10 +108,9 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. Added package-level `var` for all prefix byte slices and common prefix fast-path check.
 
-### 3.8 [Medium] txn codec `bytes.Buffer` allocation per encode
+### ~~3.8 [Medium] txn codec `bytes.Buffer` allocation per encode~~ DONE
 
-- **File:** `kv/txn_codec.go:31-42, 82-97, 147-157`
-- **Fix:** Use `make([]byte, size)` + `binary.BigEndian.PutUint64` directly, or `sync.Pool`.
+- **Status:** Fixed. `EncodeTxnMeta`, `encodeTxnLock`, `encodeTxnIntent` now use direct `make([]byte, size)` + `binary.BigEndian.PutUint64`.
 
 ### 3.9 [Medium] `decodeKey` copies key bytes on every iteration step
 
