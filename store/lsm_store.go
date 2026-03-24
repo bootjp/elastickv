@@ -312,7 +312,7 @@ func (s *pebbleStore) LastCommitTS() uint64 {
 func (s *pebbleStore) MinRetainedTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return s.effectiveMinRetainedTSLocked()
+	return s.minRetainedTS
 }
 
 func (s *pebbleStore) effectiveMinRetainedTSLocked() uint64 {
