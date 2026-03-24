@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultFSMCompactorInterval        = 30 * time.Second
+	defaultFSMCompactorInterval        = 5 * time.Minute
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
 )
@@ -172,7 +172,6 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
 		return errors.Wrapf(err, "compact group %d", runtime.GroupID)
 	}
-	retention.SetMinRetainedTS(safeMinTS)
 	c.logger.InfoContext(compactCtx, "fsm compacted",
 		"group_id", runtime.GroupID,
 		"min_retained_ts", safeMinTS,

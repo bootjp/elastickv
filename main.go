@@ -398,7 +398,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
@@ -407,6 +407,7 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		dynamoL,
 		shardStore,
 		coordinate,
+		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 	)
 	eg.Go(func() error {
@@ -563,7 +564,7 @@ func (r runtimeServerRunner) start() error {
 	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer, r.pubsubRelay); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry); err != nil {
+	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {

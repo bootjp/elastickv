@@ -31,6 +31,29 @@ func TestPebbleStore_ReverseScanAt(t *testing.T) {
 	})
 }
 
+func TestPebbleStore_ReverseScanAt_IgnoresInternalMetaKeys(t *testing.T) {
+	t.Parallel()
+
+	dir, err := os.MkdirTemp("", "pebble-reverse-scan-meta-test")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 20, 0))
+	requirePebbleRetentionController(t, st).SetMinRetainedTS(5)
+
+	kvs, err := st.ReverseScanAt(ctx, []byte(""), nil, 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, []byte("b"), kvs[0].Key)
+	require.Equal(t, []byte("a"), kvs[1].Key)
+}
+
 func testReverseScanAt(t *testing.T, newStore func(*testing.T) MVCCStore) {
 	t.Helper()
 

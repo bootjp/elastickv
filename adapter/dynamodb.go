@@ -114,6 +114,7 @@ type DynamoDBServer struct {
 	coordinator     kv.Coordinator
 	httpServer      *http.Server
 	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
+	readTracker     *kv.ActiveTimestampTracker
 	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
@@ -123,6 +124,12 @@ type DynamoDBServer struct {
 func WithDynamoDBRequestObserver(observer monitoring.DynamoDBRequestObserver) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
 		server.requestObserver = observer
+	}
+}
+
+func WithDynamoDBActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DynamoDBServerOption {
+	return func(server *DynamoDBServer) {
+		server.readTracker = tracker
 	}
 }
 
@@ -1888,6 +1895,8 @@ func (d *DynamoDBServer) queryItems(ctx context.Context, in queryInput) (*queryO
 	if err != nil {
 		return nil, err
 	}
+	readPin := d.pinReadTS(readTS)
+	defer readPin.Release()
 	keySchema, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
 		return nil, err
@@ -1926,6 +1935,8 @@ func (d *DynamoDBServer) scanItems(ctx context.Context, in scanInput) (*queryOut
 	if err != nil {
 		return nil, err
 	}
+	readPin := d.pinReadTS(readTS)
+	defer readPin.Release()
 	indexKeySchema := schema.PrimaryKey
 	if strings.TrimSpace(in.IndexName) != "" {
 		indexKeySchema, err = schema.keySchemaForQuery(in.IndexName)
@@ -7367,6 +7378,13 @@ func (d *DynamoDBServer) nextTxnReadTS() uint64 {
 	return clock.Next()
 }
 
+func (d *DynamoDBServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
+	if d == nil || d.readTracker == nil {
+		return &kv.ActiveTimestampToken{}
+	}
+	return d.readTracker.Pin(ts)
+}
+
 func (d *DynamoDBServer) loadTableSchema(ctx context.Context, tableName string) (*dynamoTableSchema, bool, error) {
 	return d.loadTableSchemaAt(ctx, tableName, snapshotTS(d.coordinator.Clock(), d.store))
 }
@@ -7544,6 +7562,9 @@ func (d *DynamoDBServer) migrateLegacySourceItems(
 	sourceSchema *dynamoTableSchema,
 	readTS uint64,
 ) error {
+	readPin := d.pinReadTS(readTS)
+	defer readPin.Release()
+
 	prefix := dynamoItemPrefixForTable(targetSchema.TableName, sourceSchema.Generation)
 	upper := prefixScanEnd(prefix)
 	cursor := bytes.Clone(prefix)
@@ -7741,6 +7762,9 @@ func (d *DynamoDBServer) scanAllByPrefix(ctx context.Context, prefix []byte) ([]
 }
 
 func (d *DynamoDBServer) scanAllByPrefixAt(ctx context.Context, prefix []byte, readTS uint64) ([]*store.KVPair, error) {
+	readPin := d.pinReadTS(readTS)
+	defer readPin.Release()
+
 	end := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
 

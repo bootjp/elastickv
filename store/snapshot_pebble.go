@@ -37,18 +37,7 @@ func newPebbleSnapshot(snapshot *pebble.Snapshot, lastCommitTS uint64) Snapshot 
 }
 
 func readPebbleSnapshotLastCommitTS(snapshot *pebble.Snapshot) (uint64, error) {
-	val, closer, err := snapshot.Get(metaLastCommitTSBytes)
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return 0, nil
-		}
-		return 0, errors.WithStack(err)
-	}
-	defer closer.Close()
-	if len(val) < timestampSize {
-		return 0, nil
-	}
-	return binary.LittleEndian.Uint64(val), nil
+	return readPebbleUint64(snapshot, metaLastCommitTSBytes)
 }
 
 func (s *pebbleSnapshot) WriteTo(w io.Writer) (int64, error) {
