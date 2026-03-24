@@ -291,7 +291,7 @@ func (s *pebbleStore) LastCommitTS() uint64 {
 func (s *pebbleStore) MinRetainedTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return s.minRetainedTS
+	return s.effectiveMinRetainedTSLocked()
 }
 
 func (s *pebbleStore) effectiveMinRetainedTSLocked() uint64 {
@@ -1043,7 +1043,33 @@ func (s *pebbleStore) runCompactionGC(ctx context.Context, minTS uint64) (pebble
 func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	ctx = ensureContext(ctx)
 	if minTS <= s.effectiveMinRetainedTS() {
-		return nil
+		// Fast path: the requested watermark is already covered. However, a
+		// pending watermark may have survived a previous crash (GC ran and
+		// deleted versions but minRetainedTS was never committed). Finalize it
+		// now so reads < pending are unblocked and the pending key is not leaked.
+		//
+		// The initial read below is a lock-free optimization to skip heavy lock
+		// acquisition when clearly nothing needs to be done.  Correctness is
+		// guaranteed by the re-check under maintenanceMu+dbMu below.
+		s.mtx.RLock()
+		pending, committed := s.pendingMinRetainedTS, s.minRetainedTS
+		s.mtx.RUnlock()
+		if pending <= committed {
+			return nil
+		}
+		// Acquire locks in the canonical order (maintenanceMu → dbMu → mtx)
+		// and re-check to handle any concurrent modifications before committing.
+		s.maintenanceMu.Lock()
+		defer s.maintenanceMu.Unlock()
+		s.dbMu.RLock()
+		defer s.dbMu.RUnlock()
+		s.mtx.RLock()
+		pending, committed = s.pendingMinRetainedTS, s.minRetainedTS
+		s.mtx.RUnlock()
+		if pending <= committed {
+			return nil
+		}
+		return s.commitCompactionMinRetainedTS(pending)
 	}
 
 	s.maintenanceMu.Lock()
