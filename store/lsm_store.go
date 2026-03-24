@@ -414,7 +414,7 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 // getAt is the internal implementation of GetAt.  It must be called while the
 // caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) getAt(key []byte, ts uint64) ([]byte, error) {
+func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, error) {
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
 	}
@@ -480,7 +480,7 @@ func (s *pebbleStore) getAt(key []byte, ts uint64) ([]byte, error) {
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	return s.getAt(key, ts)
+	return s.getAt(ctx, key, ts)
 }
 
 func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -488,7 +488,7 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	defer s.dbMu.RUnlock()
 
 	// Use internal getAt to avoid a recursive dbMu.RLock() acquisition.
-	val, err := s.getAt(key, ts)
+	val, err := s.getAt(ctx, key, ts)
 	if errors.Is(err, ErrKeyNotFound) {
 		return false, nil
 	}
@@ -773,7 +773,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	// Must read latest value first to preserve it; use internal getAt to
 	// avoid a recursive dbMu.RLock() while we already hold it.
-	val, err := s.getAt(key, commitTS)
+	val, err := s.getAt(ctx, key, commitTS)
 	if err != nil {
 		return err
 	}
@@ -789,7 +789,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 // latestCommitTS is the internal implementation of LatestCommitTS.  It must be
 // called while the caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) latestCommitTS(key []byte) (uint64, bool, error) {
+func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
 	// Peek latest version (SeekGE key + ^MaxUint64)
 	iter, err := s.db.NewIter(nil)
 	if err != nil {
@@ -811,14 +811,14 @@ func (s *pebbleStore) latestCommitTS(key []byte) (uint64, bool, error) {
 func (s *pebbleStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	return s.latestCommitTS(key)
+	return s.latestCommitTS(ctx, key)
 }
 
-func (s *pebbleStore) checkConflicts(mutations []*KVPairMutation, startTS uint64) error {
+func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMutation, startTS uint64) error {
 	for _, mut := range mutations {
 		// Use the internal latestCommitTS to avoid re-acquiring dbMu (the caller
 		// – ApplyMutations – already holds dbMu.RLock()).
-		ts, exists, err := s.latestCommitTS(mut.Key)
+		ts, exists, err := s.latestCommitTS(ctx, mut.Key)
 		if err != nil {
 			return err
 		}
@@ -860,7 +860,7 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	b := s.db.NewBatch()
 	defer b.Close()
 
-	if err := s.checkConflicts(mutations, startTS); err != nil {
+	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
 		return err
 	}
 
