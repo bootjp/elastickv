@@ -9,8 +9,10 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 - **Raft-based Data Replication**: KV state replication is implemented on Raft, with leader-based commit and follower forwarding paths.
 - **Shard-aware Data Plane**: Static shard ranges across multiple Raft groups with shard routing/coordinator are implemented.
 - **Durable Route Control Plane (Milestone 1)**: Durable route catalog, versioned route snapshot apply, watcher-based route refresh, and manual `ListRoutes`/`SplitRange` (same-group split) are implemented.
-- **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis (core commands + `MULTI/EXEC` and list operations), and DynamoDB-compatible API (`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems`) implementations are available (runtime exposure depends on the selected server entrypoint/configuration).
+- **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis-compatible server, DynamoDB-compatible HTTP API, and S3-compatible HTTP API implementations are available (runtime exposure depends on the selected server entrypoint/configuration).
+- **Redis Compatibility Scope**: Strings, hashes, lists, sets, sorted sets, HyperLogLog, streams (`XADD`/`XREAD`/`XRANGE`/`XREVRANGE`/`XTRIM`/`XLEN`), Pub/Sub (`PUBLISH`/`SUBSCRIBE`), transactions (`MULTI`/`EXEC`/`DISCARD`), TTL/expiry (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`), key scanning (`KEYS`/`SCAN`), and Lua scripting (`EVAL`/`EVALSHA`) are implemented. A Redis-protocol reverse proxy (`cmd/redis-proxy`) supports phased zero-downtime migration from existing Redis deployments.
 - **DynamoDB Compatibility Scope**: `CreateTable`/`DeleteTable`/`DescribeTable`/`ListTables`/`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems` are implemented.
+- **S3 Compatibility Scope**: `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`, `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, and `ListObjectsV2` (path-style) are implemented. AWS Signature Version 4 authentication with static credentials is supported. The server exposes an S3-compatible HTTP endpoint via `--s3Address`.
 - **Basic Consistency Behaviors**: Write-after-read checks, leader redirection/forwarding paths, and OCC conflict detection for transactional writes are covered by tests.
 
 ## Planned Features
@@ -29,6 +31,11 @@ Architecture diagrams are available in:
 Deployment/runbook documents:
 
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
+- `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
+
+Design documents:
+
+- `docs/s3_compatible_adapter_design.md` (S3-compatible object storage adapter design, data model, routing, and rollout plan)
 
 ## Metrics and Grafana
 
@@ -110,6 +117,9 @@ go run . \
   --address "127.0.0.1:50051" \
   --redisAddress "127.0.0.1:6379" \
   --dynamoAddress "127.0.0.1:8000" \
+  --s3Address "127.0.0.1:9000" \
+  --s3Region "us-east-1" \
+  --s3CredentialsFile "/etc/elastickv/s3creds.json" \
   --metricsAddress "127.0.0.1:9090" \
   --raftId "n1"
 ```
@@ -134,6 +144,53 @@ set key value
 get key
 quit
 ```
+
+#### Sorted Sets, Streams, and Other Data Structures
+The Redis adapter supports the full range of Redis data structures including sorted sets (`ZADD`/`ZRANGE`/`ZSCORE`), HyperLogLog (`PFADD`/`PFCOUNT`), streams (`XADD`/`XREAD`/`XRANGE`), sets (`SADD`/`SMEMBERS`), hashes (`HGET`/`HSET`/`HGETALL`), and Pub/Sub (`PUBLISH`/`SUBSCRIBE`). Lua scripts can be executed via `EVAL` and `EVALSHA`.
+
+#### Migrating from Redis
+
+A Redis-protocol reverse proxy (`redis-proxy`) enables phased zero-downtime migration. It supports dual-write, shadow-read comparison, and primary cutover modes. See `docs/redis-proxy-deployment.md` for the full deployment guide.
+
+```bash
+# Run redis-proxy in dual-write mode (writes to both Redis and Elastickv)
+# The proxy listens on :6479 inside the container, exposed as :6379 on the host
+# so existing clients can connect without changing their configuration.
+docker run --rm \
+  -p 6379:6479 \
+  ghcr.io/bootjp/elastickv/redis-proxy:latest \
+  -listen :6479 \
+  -primary redis.internal:6379 \
+  -secondary elastickv.internal:6380 \
+  -mode dual-write
+```
+
+### Working with S3-compatible Storage
+
+Elastickv exposes an S3-compatible HTTP API on `--s3Address` (default `:9000`). Any S3 client or SDK that supports path-style requests and AWS Signature Version 4 can connect to it.
+
+```bash
+# Configure the AWS CLI to point at Elastickv
+aws configure set aws_access_key_id YOUR_ACCESS_KEY
+aws configure set aws_secret_access_key YOUR_SECRET_KEY
+
+# Create a bucket
+aws --endpoint-url http://localhost:9000 s3api create-bucket --bucket my-bucket
+
+# Upload an object
+aws --endpoint-url http://localhost:9000 s3api put-object \
+  --bucket my-bucket --key hello.txt --body hello.txt
+
+# Download an object
+aws --endpoint-url http://localhost:9000 s3api get-object \
+  --bucket my-bucket --key hello.txt /tmp/hello.txt
+
+# List objects
+aws --endpoint-url http://localhost:9000 s3api list-objects-v2 \
+  --bucket my-bucket
+```
+
+See `docs/s3_compatible_adapter_design.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan.
 
 ### Connecting to a Follower Node
 To connect to a follower node:

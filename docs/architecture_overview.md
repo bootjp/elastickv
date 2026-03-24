@@ -11,6 +11,8 @@ flowchart TB
     DC["DynamoDB Client"]
     GC["gRPC RawKV/Transactional Client"]
     OC["Operator Client (grpcurl/SDK)"]
+    SC["S3 Client (AWS CLI / SDKs / rclone)"]
+    RP["redis-proxy (cmd/redis-proxy)"]
   end
 
   subgraph Node["Elastickv Node Process"]
@@ -19,10 +21,11 @@ flowchart TB
       DBS["DynamoDB Server (adapter/dynamodb.go)"]
       GS["gRPC Server (adapter/grpc.go)"]
       DS["Distribution Server (adapter/distribution_server.go)"]
+      S3S["S3 Server (adapter/s3.go)"]
     end
 
     subgraph DataPlane["Data Plane"]
-      SC["Sharded Coordinator (kv/sharded_coordinator.go)"]
+      SCC["Sharded Coordinator (kv/sharded_coordinator.go)"]
       SS["Shard Store (kv/shard_store.go)"]
       SR["Shard Router (kv/shard_router.go)"]
     end
@@ -44,20 +47,23 @@ flowchart TB
   DC --> DBS
   GC --> GS
   OC --> DS
+  SC --> S3S
+  RP --> RS
 
-  RS --> SC
-  DBS --> SC
-  GS --> SC
+  RS --> SCC
+  DBS --> SCC
+  GS --> SCC
   GS --> SS
-  SC --> SR
-  SC --> DE
+  S3S --> SCC
+  SCC --> SR
+  SCC --> DE
   SS --> DE
 
-  DS --> SC
+  DS --> SCC
   DS --> CS
 
   SR --> RG
-  SC --> RG
+  SCC --> RG
   SS --> RG
   RG --> FSM
   FSM --> MV
@@ -73,7 +79,7 @@ flowchart TB
 flowchart LR
   subgraph Cluster["Elastickv Cluster"]
     subgraph N1["Node A"]
-      AIN["Ingress (gRPC/Redis/DynamoDB)"]
+      AIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
       ADE["Route Engine"]
       ACW["Catalog Watcher"]
       ARG0["Default Group Runtime (Catalog Keys)"]
@@ -81,7 +87,7 @@ flowchart LR
     end
 
     subgraph N2["Node B"]
-      BIN["Ingress (gRPC/Redis/DynamoDB)"]
+      BIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
       BDE["Route Engine"]
       BCW["Catalog Watcher"]
       BRG0["Default Group Runtime (Catalog Keys)"]
@@ -89,7 +95,7 @@ flowchart LR
     end
 
     subgraph N3["Node C"]
-      CIN["Ingress (gRPC/Redis/DynamoDB)"]
+      CIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
       CDE["Route Engine"]
       CCW["Catalog Watcher"]
       CRG0["Default Group Runtime (Catalog Keys)"]
