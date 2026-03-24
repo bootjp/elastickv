@@ -943,12 +943,17 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 		if !ok {
 			continue
 		}
+		keyBytes, ok := it.Key().([]byte)
+		if !ok {
+			continue
+		}
+		// Skip transaction internal keys — their lifecycle is managed by
+		// lock resolution, not MVCC compaction.
+		if bytes.HasPrefix(keyBytes, TxnInternalKeyPrefix) {
+			continue
+		}
 		newVersions, changed := compactVersions(versions, minTS)
 		if changed {
-			keyBytes, ok := it.Key().([]byte)
-			if !ok {
-				continue
-			}
 			pending = append(pending, compactEntry{
 				key:         bytes.Clone(keyBytes),
 				newVersions: newVersions,

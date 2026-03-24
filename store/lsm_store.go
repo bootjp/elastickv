@@ -993,6 +993,12 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 		if isPebbleMetaKey(rawKey) {
 			continue
 		}
+		// Skip transaction internal keys — their lifecycle is managed by
+		// lock resolution, not MVCC compaction.
+		userKey, _ := decodeKeyView(rawKey)
+		if userKey != nil && bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
+			continue
+		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {
 			continue
 		}
