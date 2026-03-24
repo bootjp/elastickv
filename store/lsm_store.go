@@ -414,7 +414,7 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 // getAt is the internal implementation of GetAt.  It must be called while the
 // caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, error) {
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
 	}
@@ -789,7 +789,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 // latestCommitTS is the internal implementation of LatestCommitTS.  It must be
 // called while the caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) latestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
 	// Peek latest version (SeekGE key + ^MaxUint64)
 	iter, err := s.db.NewIter(nil)
 	if err != nil {
@@ -1557,14 +1557,20 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	s.db = newDB
 	lastCommitTS, err := s.findMaxCommitTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	minRetainedTS, err := s.findMinRetainedTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	s.lastCommitTS = lastCommitTS
