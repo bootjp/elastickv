@@ -79,13 +79,19 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return b, nil
+		out := make([]byte, 1+len(b))
+		out[0] = raftEncodeSingle
+		copy(out[1:], b)
+		return out, nil
 	}
 	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return b, nil
+	out := make([]byte, 1+len(b))
+	out[0] = raftEncodeBatch
+	copy(out[1:], b)
+	return out, nil
 }
 
 // applyRequests submits one raft command and returns per-request FSM results.

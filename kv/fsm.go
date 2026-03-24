@@ -68,17 +68,44 @@ func (f *kvFSM) Apply(l *raft.Log) any {
 	return nil
 }
 
+const (
+	raftEncodeSingle byte = 0x00
+	raftEncodeBatch  byte = 0x01
+)
+
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
-	cmd := &pb.RaftCommand{}
-	if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
-		return cmd.Requests, nil
+	if len(data) == 0 {
+		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 
-	req := &pb.Request{}
-	if err := proto.Unmarshal(data, req); err != nil {
-		return nil, errors.WithStack(err)
+	switch data[0] {
+	case raftEncodeSingle:
+		req := &pb.Request{}
+		if err := proto.Unmarshal(data[1:], req); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return []*pb.Request{req}, nil
+	case raftEncodeBatch:
+		cmd := &pb.RaftCommand{}
+		if err := proto.Unmarshal(data[1:], cmd); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(cmd.Requests) == 0 {
+			return nil, errors.WithStack(ErrInvalidRequest)
+		}
+		return cmd.Requests, nil
+	default:
+		// Legacy format (no prefix byte) — try both for backward compatibility.
+		cmd := &pb.RaftCommand{}
+		if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
+			return cmd.Requests, nil
+		}
+		req := &pb.Request{}
+		if err := proto.Unmarshal(data, req); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return []*pb.Request{req}, nil
 	}
-	return []*pb.Request{req}, nil
 }
 
 func requestCommitTS(r *pb.Request) (uint64, error) {

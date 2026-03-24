@@ -38,6 +38,9 @@ func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.Forwa
 	if i.raft.State() != raft.Leader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
+	if err := i.raft.VerifyLeader().Error(); err != nil {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
 
 	if err := i.stampTimestamps(req); err != nil {
 		return &pb.ForwardResponse{

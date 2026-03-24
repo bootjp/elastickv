@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -12,6 +13,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 )
+
+const proxyForwardTimeout = 5 * time.Second
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -453,6 +456,8 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 		return 0, false, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
 	if err != nil {
@@ -1157,6 +1162,8 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
@@ -1192,6 +1199,8 @@ func (s *ShardStore) proxyRawScanAt(
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
 		StartKey: start,
