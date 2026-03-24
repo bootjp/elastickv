@@ -331,28 +331,51 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 	}
 
 	result := make([]*KVPair, 0, capHint)
-	s.tree.Each(func(key any, value any) {
-		if len(result) >= limit {
-			return
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return result, nil
+	}
+	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
 		}
-		k, ok := key.([]byte)
-		if !ok || !withinBoundsKey(k, start, end) {
-			return
+		if end != nil && bytes.Compare(k, end) > 0 {
+			break
 		}
-
-		versions, _ := value.([]VersionedValue)
-		val, ok := visibleValue(versions, ts)
-		if !ok {
-			return
+		versions, _ := it.Value().([]VersionedValue)
+		val, visible := visibleValue(versions, ts)
+		if !visible {
+			continue
 		}
-
 		result = append(result, &KVPair{
 			Key:   bytes.Clone(k),
 			Value: bytes.Clone(val),
 		})
-	})
+	}
 
 	return result, nil
+}
+
+// seekForwardIteratorStart positions the iterator at the first key >= start.
+// Returns true if such a position was found, false if no elements satisfy the bound.
+func seekForwardIteratorStart(tree *treemap.Map, it *treemap.Iterator, start []byte) bool {
+	if start == nil {
+		return it.First()
+	}
+	ceilKey, _ := tree.Ceiling(start)
+	if ceilKey == nil {
+		return false
+	}
+	target, ok := ceilKey.([]byte)
+	if !ok {
+		return false
+	}
+	it.Begin()
+	return it.NextTo(func(key any, value any) bool {
+		k, keyOK := key.([]byte)
+		return keyOK && bytes.Equal(k, target)
+	})
 }
 
 func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {

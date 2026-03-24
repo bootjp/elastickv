@@ -331,6 +331,12 @@ func (s *pebbleStore) effectiveMinRetainedTS() uint64 {
 func (s *pebbleStore) updateLastCommitTS(ts uint64) {
 	if ts > s.lastCommitTS {
 		s.lastCommitTS = ts
+	}
+}
+
+func (s *pebbleStore) updateAndPersistLastCommitTS(ts uint64) {
+	if ts > s.lastCommitTS {
+		s.lastCommitTS = ts
 		// Best effort persist
 		if err := s.saveLastCommitTS(ts); err != nil {
 			s.log.Error("failed to persist last commit timestamp", slog.Any("error", err))
@@ -427,7 +433,7 @@ func (s *pebbleStore) commitMinRetainedTSLocked(ts uint64, opts *pebble.WriteOpt
 func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	s.updateLastCommitTS(commitTS)
+	s.updateAndPersistLastCommitTS(commitTS)
 	return commitTS
 }
 
@@ -446,28 +452,7 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 	}
 	defer iter.Close()
 
-	// Seek to Key + ^ts (which effectively means Key with version <= ts)
-	// Because we use inverted timestamp, larger TS (smaller inverted) comes first.
-	// We want the largest TS that is <= requested ts.
-	// So we construct a key with requested ts.
 	seekKey := encodeKey(key, ts)
-
-	// SeekGE will find the first key >= seekKey.
-	// Since keys are [UserKey][InvTS], and InvTS decreases as TS increases.
-	// We want TS <= requested_ts.
-	// Example: Request TS=10. InvTS=^10 (Large).
-	// Stored: TS=12 (Inv=Small), TS=10 (Inv=Large), TS=8 (Inv=Larger).
-	// SeekGE(Key + ^10) will skip TS=12 (Key + Small) because Key+Small < Key+Large.
-	// It will land on TS=10 or TS=8.
-	// Wait, standard byte comparison:
-	// Key is same.
-	// ^12 < ^10 < ^8.
-	// We want largest TS <= 10.
-	// If we SeekGE(Key + ^10), we might find Key + ^10 (TS=10) or Key + ^8 (TS=8).
-	// These are valid candidates.
-	// If we hit Key + ^12, that is smaller than seekKey (since ^12 < ^10), so SeekGE wouldn't find it if we started before it.
-	// But we want to filter out TS > 10 (i.e. ^TS < ^10).
-	// So SeekGE(Key + ^10) is correct. It skips anything with ^TS < ^10 (meaning TS > 10).
 
 	if iter.SeekGE(seekKey) {
 		k := iter.Key()
@@ -766,7 +751,7 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	k := encodeKey(key, commitTS)
 	v := encodeValue(value, false, expireAt)
 
-	if err := s.db.Set(k, v, pebble.Sync); err != nil { //nolint:wrapcheck
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "put_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
@@ -781,7 +766,7 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	k := encodeKey(key, commitTS)
 	v := encodeValue(nil, true, 0)
 
-	if err := s.db.Set(k, v, pebble.Sync); err != nil {
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "delete_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
@@ -806,7 +791,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
 	v := encodeValue(val, false, expireAt)
-	if err := s.db.Set(k, v, pebble.Sync); err != nil {
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -822,8 +807,7 @@ func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, boo
 	}
 	defer iter.Close()
 
-	seekKey := encodeKey(key, math.MaxUint64)
-	if iter.SeekGE(seekKey) {
+	if iter.First() {
 		k := iter.Key()
 		userKey, version := decodeKey(k)
 		if bytes.Equal(userKey, key) {
@@ -889,7 +873,12 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	commitTS = s.alignCommitTS(commitTS)
+	s.updateLastCommitTS(commitTS)
+	var tsBuf [timestampSize]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], s.lastCommitTS)
+	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
+		return errors.WithStack(err)
+	}
 
 	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
 		return err
