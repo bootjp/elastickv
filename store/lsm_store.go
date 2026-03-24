@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/gob"
+	"hash"
 	"hash/crc32"
 	"io"
 	"log/slog"
@@ -811,75 +812,97 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	return errors.WithStack(b.Commit(pebble.Sync))
 }
 
-func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
+type pebbleCompactionStats struct {
+	updatedKeys      int
+	deletedVersions  int
+	committedDeletes bool
+}
+
+func ensureContext(ctx context.Context) context.Context {
 	if ctx == nil {
-		ctx = context.Background()
+		return context.Background()
 	}
-	if minTS <= s.MinRetainedTS() {
-		return nil
-	}
+	return ctx
+}
 
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-
+func (s *pebbleStore) beginCompaction(minTS uint64) (bool, error) {
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	if minTS <= s.minRetainedTS {
-		s.mtx.Unlock()
-		return nil
+		return false, nil
 	}
 	if err := s.setPendingMinRetainedTSLocked(minTS, pebble.Sync); err != nil {
-		s.mtx.Unlock()
-		return err
+		return false, err
 	}
-	s.mtx.Unlock()
+	return true, nil
+}
 
-	committedDeletes := false
-	clearPending := func() {
-		s.mtx.Lock()
-		defer s.mtx.Unlock()
-		if err := s.clearPendingMinRetainedTSLocked(pebble.Sync); err != nil {
-			s.log.Error("failed to clear pending min retained timestamp", slog.Any("error", err))
-		}
+func (s *pebbleStore) cleanupPendingCompaction(committedDeletes *bool) {
+	if committedDeletes != nil && *committedDeletes {
+		return
 	}
-	defer func() {
-		if committedDeletes {
-			return
-		}
-		clearPending()
-	}()
 
-	snap := s.db.NewSnapshot()
-	defer func() { _ = snap.Close() }()
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if err := s.clearPendingMinRetainedTSLocked(pebble.Sync); err != nil {
+		s.log.Error("failed to clear pending min retained timestamp", slog.Any("error", err))
+	}
+}
 
-	iter, err := snap.NewIter(nil)
-	if err != nil {
+func (s *pebbleStore) commitCompactionMinRetainedTS(minTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.commitMinRetainedTSLocked(minTS, pebble.Sync)
+}
+
+func shouldDeleteCompactionVersion(rawKey []byte, minTS uint64, currentUserKey *[]byte, keptVisibleAtMinTS *bool, changedCurrentKey *bool) bool {
+	userKey, version := decodeKey(rawKey)
+	if userKey == nil {
+		return false
+	}
+	if !bytes.Equal(*currentUserKey, userKey) {
+		*currentUserKey = append((*currentUserKey)[:0], userKey...)
+		*keptVisibleAtMinTS = false
+		*changedCurrentKey = false
+	}
+	if version > minTS {
+		return false
+	}
+	if !*keptVisibleAtMinTS {
+		*keptVisibleAtMinTS = true
+		return false
+	}
+	return true
+}
+
+func addCompactionDelete(batch *pebble.Batch, rawKey []byte, stats *pebbleCompactionStats, changedCurrentKey *bool) error {
+	if err := batch.Delete(append([]byte(nil), rawKey...), pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
-	defer func() { _ = iter.Close() }()
+	if !*changedCurrentKey {
+		stats.updatedKeys++
+		*changedCurrentKey = true
+	}
+	stats.deletedVersions++
+	return nil
+}
 
-	batch := s.db.NewBatch()
-	defer func() {
-		if batch != nil {
-			_ = batch.Close()
-		}
-	}()
+func (s *pebbleStore) flushCompactionBatch(batch **pebble.Batch, stats *pebbleCompactionStats, opts *pebble.WriteOptions) error {
+	batchHasDeletes := batch != nil && *batch != nil && !(*batch).Empty()
+	if err := flushSnapshotBatch(s.db, batch, opts); err != nil {
+		return err
+	}
+	if batchHasDeletes {
+		stats.committedDeletes = true
+	}
+	return nil
+}
 
+func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, iter *pebble.Iterator, batch **pebble.Batch, stats *pebbleCompactionStats) error {
 	var currentUserKey []byte
 	keptVisibleAtMinTS := false
 	changedCurrentKey := false
-	updatedKeys := 0
-	deletedVersions := 0
-
-	flushDeleteBatch := func(opts *pebble.WriteOptions) error {
-		batchHasDeletes := batch != nil && !batch.Empty()
-		if err := flushSnapshotBatch(s.db, &batch, opts); err != nil {
-			return err
-		}
-		if batchHasDeletes {
-			committedDeletes = true
-		}
-		return nil
-	}
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
@@ -890,62 +913,95 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 		if isPebbleMetaKey(rawKey) {
 			continue
 		}
-
-		userKey, version := decodeKey(rawKey)
-		if userKey == nil {
+		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {
 			continue
 		}
-		if !bytes.Equal(currentUserKey, userKey) {
-			currentUserKey = append(currentUserKey[:0], userKey...)
-			keptVisibleAtMinTS = false
-			changedCurrentKey = false
+		if err := addCompactionDelete(*batch, rawKey, stats, &changedCurrentKey); err != nil {
+			return err
 		}
-		if version > minTS {
-			continue
-		}
-		if !keptVisibleAtMinTS {
-			keptVisibleAtMinTS = true
-			continue
-		}
-
-		if err := batch.Delete(append([]byte(nil), rawKey...), pebble.NoSync); err != nil {
-			return errors.WithStack(err)
-		}
-		if !changedCurrentKey {
-			updatedKeys++
-			changedCurrentKey = true
-		}
-		deletedVersions++
-		if snapshotBatchShouldFlush(batch) {
-			if err := flushDeleteBatch(pebble.NoSync); err != nil {
+		if snapshotBatchShouldFlush(*batch) {
+			if err := s.flushCompactionBatch(batch, stats, pebble.NoSync); err != nil {
 				return err
 			}
 		}
 	}
-	if err := iter.Error(); err != nil {
-		return errors.WithStack(err)
-	}
-	batchHasDeletes := batch != nil && !batch.Empty()
-	if err := commitSnapshotBatch(batch, pebble.Sync); err != nil {
+	return errors.WithStack(iter.Error())
+}
+
+func commitCompactionDeletes(batch **pebble.Batch, stats *pebbleCompactionStats) error {
+	batchHasDeletes := batch != nil && *batch != nil && !(*batch).Empty()
+	if err := commitSnapshotBatch(*batch, pebble.Sync); err != nil {
 		return err
 	}
 	if batchHasDeletes {
-		committedDeletes = true
+		stats.committedDeletes = true
 	}
-	batch = nil
+	*batch = nil
+	return nil
+}
 
-	s.mtx.Lock()
-	if err := s.commitMinRetainedTSLocked(minTS, pebble.Sync); err != nil {
-		s.mtx.Unlock()
+func (s *pebbleStore) runCompactionGC(ctx context.Context, minTS uint64) (pebbleCompactionStats, error) {
+	snap := s.db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	iter, err := snap.NewIter(nil)
+	if err != nil {
+		return pebbleCompactionStats{}, errors.WithStack(err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	batch := s.db.NewBatch()
+	defer func() {
+		if batch != nil {
+			_ = batch.Close()
+		}
+	}()
+
+	stats := pebbleCompactionStats{}
+	if err := s.scanCompactionDeletes(ctx, minTS, iter, &batch, &stats); err != nil {
+		return pebbleCompactionStats{}, errors.WithStack(err)
+	}
+	if err := commitCompactionDeletes(&batch, &stats); err != nil {
+		return pebbleCompactionStats{}, err
+	}
+	return stats, nil
+}
+
+func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
+	ctx = ensureContext(ctx)
+	if minTS <= s.MinRetainedTS() {
+		return nil
+	}
+
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+
+	shouldRun, err := s.beginCompaction(minTS)
+	if err != nil {
 		return err
 	}
-	s.mtx.Unlock()
+	if !shouldRun {
+		return nil
+	}
+
+	committedDeletes := false
+	defer s.cleanupPendingCompaction(&committedDeletes)
+
+	stats, err := s.runCompactionGC(ctx, minTS)
+	if err != nil {
+		return err
+	}
+	committedDeletes = stats.committedDeletes
+
+	if err := s.commitCompactionMinRetainedTS(minTS); err != nil {
+		return err
+	}
 	committedDeletes = false
 
 	s.log.InfoContext(ctx, "compact",
 		slog.Uint64("min_ts", minTS),
-		slog.Int("updated_keys", updatedKeys),
-		slog.Int("deleted_versions", deletedVersions),
+		slog.Int("updated_keys", stats.updatedKeys),
+		slog.Int("deleted_versions", stats.deletedVersions),
 	)
 	return nil
 }
@@ -1298,29 +1354,29 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
+func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, error) {
 	expectedChecksum, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return err
+		return nil, nil, 0, 0, 0, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
-
 	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
 	if err != nil {
-		return err
+		return nil, nil, 0, 0, 0, err
 	}
+	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, nil
+}
 
-	// Write to a temporary Pebble directory so that the real store is only
-	// updated after checksum verification succeeds.
-	tmpDir := filepath.Clean(s.dir) + ".restore-tmp"
+func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64) (string, error) {
+	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
-		return errors.WithStack(err)
+		return "", errors.WithStack(err)
 	}
 	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
 	if err != nil {
-		return errors.WithStack(err)
+		return "", errors.WithStack(err)
 	}
 	cleanupTmp := func() {
 		_ = tmpDB.Close()
@@ -1329,34 +1385,38 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 
 	if err := writeMVCCEntriesToDB(body, tmpDB); err != nil {
 		cleanupTmp()
-		return err
+		return "", err
 	}
-
-	// Verify checksum before committing the restore.
 	if hash.Sum32() != expectedChecksum {
 		cleanupTmp()
-		return errors.WithStack(ErrInvalidChecksum)
+		return "", errors.WithStack(ErrInvalidChecksum)
 	}
-
-	// Persist lastCommitTS in the temp DB.
 	if err := writePebbleUint64(tmpDB, metaLastCommitTSBytes, lastCommitTS, pebble.NoSync); err != nil {
 		cleanupTmp()
-		return errors.WithStack(err)
+		return "", errors.WithStack(err)
 	}
 	if err := writePebbleUint64(tmpDB, metaMinRetainedTSBytes, minRetainedTS, pebble.Sync); err != nil {
 		cleanupTmp()
-		return errors.WithStack(err)
+		return "", errors.WithStack(err)
 	}
-
-	// Close the temp DB and atomically swap it into place.
 	if err := tmpDB.Close(); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		return "", errors.WithStack(err)
 	}
-	if err := s.swapInTempDB(tmpDir); err != nil {
+	return tmpDir, nil
+}
+
+func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
+	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, err := readStreamingMVCCRestoreHeader(r)
+	if err != nil {
 		return err
 	}
-	return nil
+
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS)
+	if err != nil {
+		return err
+	}
+	return s.swapInTempDB(tmpDir)
 }
 
 // writeMVCCEntriesToDB reads MVCC snapshot entries from body and writes them
