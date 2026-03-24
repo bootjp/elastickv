@@ -1557,14 +1557,20 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	s.db = newDB
 	lastCommitTS, err := s.findMaxCommitTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	minRetainedTS, err := s.findMinRetainedTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
 	if err != nil {
+		_ = newDB.Close()
+		s.db = nil
 		return err
 	}
 	s.lastCommitTS = lastCommitTS
