@@ -7,11 +7,9 @@ Items are ordered by priority within each section.
 
 ## 1. Data Loss
 
-### 1.1 [Critical] `saveLastCommitTS` uses `pebble.NoSync` — timestamp rollback after crash
+### ~~1.1 [Critical] `saveLastCommitTS` uses `pebble.NoSync` — timestamp rollback after crash~~ DONE
 
-- **File:** `store/lsm_store.go:178`
-- **Problem:** `lastCommitTS` is written with `pebble.NoSync` while data writes use `pebble.Sync`. On crash recovery, `lastCommitTS` may roll back, breaking MVCC timestamp ordering and causing reads to miss committed data.
-- **Fix:** Write `lastCommitTS` inside the same `WriteBatch` as data mutations so it is atomically persisted, or change to `pebble.Sync`.
+- **Status:** Fixed. `saveLastCommitTS` changed to `pebble.Sync`; `ApplyMutations` writes `lastCommitTS` atomically in the same `WriteBatch`.
 
 ### 1.2 [Critical] Batch Apply in FSM allows partial application without rollback
 
@@ -19,11 +17,9 @@ Items are ordered by priority within each section.
 - **Problem:** When a `RaftCommand` contains multiple requests, each is applied individually. If request N fails, requests 1..N-1 are already persisted with no rollback. The client receives an error but has no visibility into which writes succeeded.
 - **Fix:** Apply all requests in a single atomic store batch. On any error, discard the entire batch.
 
-### 1.3 [High] `pebbleStore.Compact()` is unimplemented — unbounded version accumulation
+### ~~1.3 [High] `pebbleStore.Compact()` is unimplemented — unbounded version accumulation~~ DONE
 
-- **File:** `store/lsm_store.go:610-619`
-- **Problem:** `Compact` is a no-op (TODO). `RetentionController` is also not implemented, so `FSMCompactor` always skips pebbleStore. MVCC versions accumulate indefinitely, leading to disk exhaustion and scan degradation.
-- **Fix:** Implement MVCC garbage collection for pebbleStore and the `RetentionController` interface.
+- **Status:** Fixed. Implemented MVCC GC for pebbleStore and `RetentionController` interface (`MinRetainedTS`/`SetMinRetainedTS`).
 
 ### 1.4 [High] Secondary commit is best-effort — lock residue on failure
 
@@ -31,11 +27,9 @@ Items are ordered by priority within each section.
 - **Problem:** After primary commit succeeds, secondary commits retry 3 times then give up with a log warning. Remaining locks/intents block subsequent access to those keys. Cross-shard lock resolution may also fail under network partition.
 - **Fix:** Introduce a background lock resolution worker that periodically scans for expired/orphaned locks and resolves them.
 
-### 1.5 [High] `abortPreparedTxn` silently ignores errors
+### ~~1.5 [High] `abortPreparedTxn` silently ignores errors~~ DONE
 
-- **File:** `kv/sharded_coordinator.go:237-259`
-- **Problem:** Abort results are discarded (`_, _`). If abort fails, locks and intents remain permanently.
-- **Fix:** Log errors and enqueue failed aborts for background retry.
+- **Status:** Fixed. Errors are now logged with full context (gid, primary_key, start_ts, abort_ts).
 
 ### 1.6 [High] MVCC compaction does not distinguish transaction internal keys
 
@@ -47,11 +41,9 @@ Items are ordered by priority within each section.
 
 ## 2. Concurrency / Distributed Failures
 
-### 2.1 [Critical] TOCTOU in `pebbleStore.ApplyMutations`
+### ~~2.1 [Critical] TOCTOU in `pebbleStore.ApplyMutations`~~ DONE
 
-- **File:** `store/lsm_store.go:592-607`
-- **Problem:** No lock held between `checkConflicts` and `batch.Commit`. Safe when called from single-threaded FSM Apply, but direct callers (e.g., `CatalogStore.Save`) can experience lost updates.
-- **Fix:** Hold `mtx.Lock()` from conflict check through batch commit, or use Pebble indexed batch for atomic read-check-write.
+- **Status:** Fixed. `ApplyMutations` now holds `mtx.Lock()` from conflict check through batch commit.
 
 ### 2.2 [High] Leader proxy forward loop risk
 
@@ -65,17 +57,13 @@ Items are ordered by priority within each section.
 - **Problem:** (Same as 1.4) No background lock resolution worker exists.
 - **Fix:** (Same as 1.4)
 
-### 2.4 [Medium] `redirect` in Coordinate has no timeout
+### ~~2.4 [Medium] `redirect` in Coordinate has no timeout~~ DONE
 
-- **File:** `kv/coordinator.go:189-233`
-- **Problem:** gRPC forward call uses the caller's context with no deadline. If the leader is unresponsive, the goroutine blocks indefinitely.
-- **Fix:** Wrap context with `context.WithTimeout`.
+- **Status:** Fixed. Added 5s `context.WithTimeout` to redirect gRPC forward call.
 
-### 2.5 [Medium] Proxy gRPC calls (`proxyRawGet` etc.) have no timeout
+### ~~2.5 [Medium] Proxy gRPC calls (`proxyRawGet` etc.) have no timeout~~ DONE
 
-- **File:** `kv/shard_store.go:1146-1171`
-- **Problem:** Same pattern — caller context passed without deadline.
-- **Fix:** Add a maximum timeout to all proxy gRPC calls.
+- **Status:** Fixed. Added 5s `context.WithTimeout` to `proxyRawGet`, `proxyRawScanAt`, and `proxyLatestCommitTS`.
 
 ### 2.6 [Medium] `GRPCConnCache` leaks connections after Close
 
@@ -83,39 +71,29 @@ Items are ordered by priority within each section.
 - **Problem:** After `Close` sets `conns = nil`, subsequent `ConnFor` calls lazy-init a new map and create leaked connections.
 - **Fix:** Add a `closed` flag checked by `ConnFor`.
 
-### 2.7 [Medium] `Forward` handler skips `VerifyLeader`
+### ~~2.7 [Medium] `Forward` handler skips `VerifyLeader`~~ DONE
 
-- **File:** `adapter/internal.go:37-61`
-- **Problem:** Uses `raft.State()` only, unlike `LeaderProxy.Commit` which calls `verifyRaftLeader`. Stale leader may accept and timeout on `raft.Apply`.
-- **Fix:** Add `verifyRaftLeader` check to `Forward`.
+- **Status:** Fixed. Added `raft.VerifyLeader()` quorum check to `Forward` handler.
 
 ---
 
 ## 3. Performance
 
-### 3.1 [Critical] `mvccStore.ScanAt` scans the entire treemap
+### ~~3.1 [Critical] `mvccStore.ScanAt` scans the entire treemap~~ DONE
 
-- **File:** `store/mvcc_store.go:324`
-- **Problem:** `tree.Each()` cannot break early. A scan with `limit=10` on 1M keys traverses all keys.
-- **Fix:** Use `tree.Iterator()` with `Ceiling(start)` seek and break on limit.
+- **Status:** Fixed. Replaced `tree.Each()` with `Iterator()` loop that breaks on limit and seeks via `Ceiling(start)`.
 
-### 3.2 [Critical] PebbleStore uses unbounded iterators in `GetAt` / `LatestCommitTS`
+### ~~3.2 [Critical] PebbleStore uses unbounded iterators in `GetAt` / `LatestCommitTS`~~ DONE
 
-- **File:** `store/lsm_store.go:207, 540-557`
-- **Problem:** `NewIter(nil)` creates an iterator over all SSTables. Called on every read and every mutation in `checkConflicts`.
-- **Fix:** Set `IterOptions.LowerBound/UpperBound` scoped to the target key. Reuse a single iterator in `checkConflicts`.
+- **Status:** Fixed. Both methods now use bounded `IterOptions` scoped to the target key.
 
-### 3.3 [High] FSM double-deserialization for single requests
+### ~~3.3 [High] FSM double-deserialization for single requests~~ DONE
 
-- **File:** `kv/fsm.go:71-82`
-- **Problem:** `decodeRaftRequests` tries `RaftCommand` unmarshal first, fails, then tries `Request`. Single requests (common case) always pay for two unmarshal attempts.
-- **Fix:** Add a discriminator byte/flag at encode time so decode can dispatch in one step.
+- **Status:** Fixed. Added prefix byte (`0x00` single, `0x01` batch) to `marshalRaftCommand` and `decodeRaftRequests` with legacy fallback.
 
-### 3.4 [High] Excessive `pebble.Sync` on every write
+### ~~3.4 [High] Excessive `pebble.Sync` on every write~~ DONE
 
-- **File:** `store/lsm_store.go:500, 513, 534`
-- **Problem:** `PutAt` and `DeleteAt` use `pebble.Sync` per call. Durability is already guaranteed by the Raft log.
-- **Fix:** Use `pebble.NoSync` for FSM-driven writes. Reserve `Sync` for non-Raft paths if any.
+- **Status:** Fixed. `PutAt`, `DeleteAt`, `ExpireAt` changed to `pebble.NoSync`. `ApplyMutations` retains `pebble.Sync`.
 
 ### 3.5 [High] `VerifyLeader` called on every read — network round-trip
 
@@ -123,17 +101,13 @@ Items are ordered by priority within each section.
 - **Problem:** Each read triggers a quorum-based leader verification with network round-trip.
 - **Fix:** Introduce a lease-based caching mechanism; verify only when the lease expires.
 
-### 3.6 [High] `mvccStore.Compact` holds exclusive lock during full tree scan
+### ~~3.6 [High] `mvccStore.Compact` holds exclusive lock during full tree scan~~ DONE
 
-- **File:** `store/mvcc_store.go:919-956`
-- **Problem:** All reads and writes are blocked during compaction.
-- **Fix:** Use incremental compaction: scan under RLock, collect keys, upgrade to Lock for batch delete, release periodically.
+- **Status:** Fixed. Split into 2 phases: scan under RLock, then apply updates in batched Lock/Unlock cycles (batch size 500).
 
-### 3.7 [High] `isTxnInternalKey` allocates `[]byte` on every call (5x)
+### ~~3.7 [High] `isTxnInternalKey` allocates `[]byte` on every call (5x)~~ DONE
 
-- **File:** `kv/txn_keys.go:49-55`
-- **Problem:** `[]byte(stringLiteral)` allocates on the heap each time. Called on every mutation and scan filter.
-- **Fix:** Use package-level `var` for pre-allocated `[]byte` slices, or check the common prefix `"!txn|"` first.
+- **Status:** Fixed. Added package-level `var` for all prefix byte slices and common prefix fast-path check.
 
 ### 3.8 [Medium] txn codec `bytes.Buffer` allocation per encode
 

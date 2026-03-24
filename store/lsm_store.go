@@ -65,7 +65,7 @@ type pebbleStore struct {
 	dir                  string
 }
 
-// Ensure pebbleStore implements MVCCStore
+// Ensure pebbleStore implements MVCCStore and RetentionController.
 var _ MVCCStore = (*pebbleStore)(nil)
 var _ RetentionController = (*pebbleStore)(nil)
 
