@@ -939,41 +939,81 @@ func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue,
 	return newVersions, true
 }
 
+const compactScanBatchSize = 500
+
 func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
+	// Phase 1: Scan under RLock to collect keys that need compaction.
+	type compactEntry struct {
+		key         []byte
+		newVersions []VersionedValue
+	}
 
-	// Estimate size to avoid frequent allocations, though exact count is unknown
-	updates := make(map[string][]VersionedValue)
+	var pending []compactEntry
 
+	s.mtx.RLock()
 	it := s.tree.Iterator()
 	for it.Next() {
 		versions, ok := it.Value().([]VersionedValue)
 		if !ok {
 			continue
 		}
-
 		newVersions, changed := compactVersions(versions, minTS)
 		if changed {
-			// tree keys are []byte, need string for map key
 			keyBytes, ok := it.Key().([]byte)
 			if !ok {
 				continue
 			}
-			updates[string(keyBytes)] = newVersions
+			pending = append(pending, compactEntry{
+				key:         bytes.Clone(keyBytes),
+				newVersions: newVersions,
+			})
 		}
 	}
+	s.mtx.RUnlock()
 
-	for k, v := range updates {
-		s.tree.Put([]byte(k), v)
+	if len(pending) == 0 {
+		return nil
 	}
+
+	// Phase 2: Apply updates in batches under Lock to minimize blocking.
+	updatedTotal := 0
+	for i := 0; i < len(pending); i += compactScanBatchSize {
+		end := i + compactScanBatchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[i:end]
+
+		s.mtx.Lock()
+		for _, e := range batch {
+			// Re-check: concurrent writes may have added newer versions since
+			// the RLock scan. Re-compact against the current version chain.
+			cur, found := s.tree.Get(e.key)
+			if !found {
+				continue
+			}
+			versions, ok := cur.([]VersionedValue)
+			if !ok {
+				continue
+			}
+			fresh, changed := compactVersions(versions, minTS)
+			if changed {
+				s.tree.Put(e.key, fresh)
+				updatedTotal++
+			}
+		}
+		s.mtx.Unlock()
+	}
+
+	s.mtx.Lock()
 	if minTS > s.minRetainedTS {
 		s.minRetainedTS = minTS
 	}
+	s.mtx.Unlock()
 
 	s.log.InfoContext(ctx, "compact",
 		slog.Uint64("min_ts", minTS),
-		slog.Int("updated_keys", len(updates)),
+		slog.Int("updated_keys", updatedTotal),
 	)
 	return nil
 }

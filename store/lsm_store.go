@@ -30,15 +30,17 @@ var metaLastCommitTSBytes = []byte(metaLastCommitTS)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 type pebbleStore struct {
-	db           *pebble.DB
-	log          *slog.Logger
-	lastCommitTS uint64
-	mtx          sync.RWMutex
-	dir          string
+	db            *pebble.DB
+	log           *slog.Logger
+	lastCommitTS  uint64
+	minRetainedTS uint64
+	mtx           sync.RWMutex
+	dir           string
 }
 
-// Ensure pebbleStore implements MVCCStore
+// Ensure pebbleStore implements MVCCStore and RetentionController.
 var _ MVCCStore = (*pebbleStore)(nil)
+var _ RetentionController = (*pebbleStore)(nil)
 
 // PebbleStoreOption configures the PebbleStore.
 type PebbleStoreOption func(*pebbleStore)
@@ -188,6 +190,20 @@ func (s *pebbleStore) LastCommitTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return s.lastCommitTS
+}
+
+func (s *pebbleStore) MinRetainedTS() uint64 {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.minRetainedTS
+}
+
+func (s *pebbleStore) SetMinRetainedTS(ts uint64) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if ts > s.minRetainedTS {
+		s.minRetainedTS = ts
+	}
 }
 
 func (s *pebbleStore) updateLastCommitTS(ts uint64) {
@@ -617,14 +633,90 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	return errors.WithStack(b.Commit(pebble.Sync))
 }
 
+const compactBatchLimit = 1000
+
 func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
-	// TODO: Implement MVCC garbage collection.
-	// We should iterate through all keys and remove versions older than minTS,
-	// keeping at least one version <= minTS for snapshot consistency.
-	// This is a heavy operation and should be done in the background or using
-	// a Pebble CompactionFilter if possible.
-	// For now, we simply log the request.
-	s.log.Info("Compact requested", slog.Uint64("minTS", minTS))
+	// MVCC GC: for each user key, keep the newest version <= minTS and remove
+	// all older versions. We iterate in encoded key order; consecutive entries
+	// sharing the same user key belong to the same version chain.
+	iter, err := s.db.NewIter(nil)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	batch := s.db.NewBatch()
+	batchCount := 0
+	deletedTotal := 0
+
+	var prevUserKey []byte
+	keepSeen := false // true once we've seen the version to keep for the current user key
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		if ctx.Err() != nil {
+			batch.Close()
+			return ctx.Err()
+		}
+
+		raw := iter.Key()
+		userKey, ts := decodeKey(raw)
+		if userKey == nil {
+			continue
+		}
+
+		// Skip meta keys.
+		if bytes.Equal(raw, metaLastCommitTSBytes) {
+			continue
+		}
+
+		// Detect user-key boundary.
+		if !bytes.Equal(userKey, prevUserKey) {
+			prevUserKey = append(prevUserKey[:0], userKey...)
+			keepSeen = false
+		}
+
+		if ts > minTS {
+			// Version newer than compaction watermark — always keep.
+			continue
+		}
+
+		if !keepSeen {
+			// First version <= minTS for this key — keep it as the snapshot anchor.
+			keepSeen = true
+			continue
+		}
+
+		// Older than the kept version — safe to delete.
+		encodedKey := make([]byte, len(raw))
+		copy(encodedKey, raw)
+		if err := batch.Delete(encodedKey, nil); err != nil {
+			batch.Close()
+			return errors.WithStack(err)
+		}
+		batchCount++
+		deletedTotal++
+
+		if batchCount >= compactBatchLimit {
+			if err := batch.Commit(pebble.NoSync); err != nil {
+				return errors.WithStack(err)
+			}
+			batch = s.db.NewBatch()
+			batchCount = 0
+		}
+	}
+
+	if batchCount > 0 {
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return errors.WithStack(err)
+		}
+	} else {
+		batch.Close()
+	}
+
+	s.log.InfoContext(ctx, "compact",
+		slog.Uint64("min_ts", minTS),
+		slog.Int("deleted_versions", deletedTotal),
+	)
 	return nil
 }
 
