@@ -896,9 +896,13 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
+	s.mtx.Lock()
 	s.updateLastCommitTS(commitTS)
+	lastTS := s.lastCommitTS
+	s.mtx.Unlock()
+
 	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], s.lastCommitTS)
+	binary.LittleEndian.PutUint64(tsBuf[:], lastTS)
 	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
 		return errors.WithStack(err)
 	}
