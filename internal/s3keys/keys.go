@@ -100,6 +100,58 @@ func GCUploadKey(bucket string, generation uint64, object string, uploadID strin
 	return buildObjectKey(gcUploadPrefixBytes, bucket, generation, object, uploadID, 0, 0)
 }
 
+// UploadPartPrefixForUpload returns the key prefix that covers all part descriptors
+// for a specific multipart upload. Used to scan/list parts for ListParts and cleanup.
+func UploadPartPrefixForUpload(bucket string, generation uint64, object string, uploadID string) []byte {
+	out := make([]byte, 0, len(UploadPartPrefix)+len(bucket)+len(object)+len(uploadID)+2*u64Bytes+buildObjectExtraBytes)
+	out = append(out, uploadPartPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	return out
+}
+
+// BlobPrefixForUpload returns the key prefix that covers all blob chunks
+// for a specific multipart upload. Used for cleanup of all chunks in an upload.
+func BlobPrefixForUpload(bucket string, generation uint64, object string, uploadID string) []byte {
+	out := make([]byte, 0, len(BlobPrefix)+len(bucket)+len(object)+len(uploadID)+2*u64Bytes+buildObjectExtraBytes)
+	out = append(out, blobPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	return out
+}
+
+// ParseUploadPartKey extracts bucket, generation, object, uploadID, and partNo from a part descriptor key.
+func ParseUploadPartKey(key []byte) (bucket string, generation uint64, object string, uploadID string, partNo uint64, ok bool) {
+	if !bytes.HasPrefix(key, uploadPartPrefixBytes) {
+		return "", 0, "", "", 0, false
+	}
+	bucketRaw, next, valid := decodeSegment(key, len(uploadPartPrefixBytes))
+	if !valid {
+		return "", 0, "", "", 0, false
+	}
+	generation, next, valid = readU64(key, next)
+	if !valid {
+		return "", 0, "", "", 0, false
+	}
+	objectRaw, next, valid := decodeSegment(key, next)
+	if !valid {
+		return "", 0, "", "", 0, false
+	}
+	uploadIDRaw, next, valid := decodeSegment(key, next)
+	if !valid {
+		return "", 0, "", "", 0, false
+	}
+	partNo, next, valid = readU64(key, next)
+	if !valid || next != len(key) {
+		return "", 0, "", "", 0, false
+	}
+	return string(bucketRaw), generation, string(objectRaw), string(uploadIDRaw), partNo, true
+}
+
 func RouteKey(bucket string, generation uint64, object string) []byte {
 	out := make([]byte, 0, len(RoutePrefix)+len(bucket)+len(object)+2*u64Bytes+routeKeyExtraBytes)
 	out = append(out, routePrefixBytes...)

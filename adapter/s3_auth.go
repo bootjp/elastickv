@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,11 +82,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 		return nil
 	}
 	if strings.TrimSpace(r.URL.Query().Get("X-Amz-Algorithm")) != "" {
-		return &s3AuthError{
-			Status:  http.StatusNotImplemented,
-			Code:    "NotImplemented",
-			Message: "presigned URLs are not supported yet",
-		}
+		return s.authorizePresignedRequest(r)
 	}
 
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -262,6 +259,175 @@ func parseS3AuthorizationHeader(raw string) (s3AuthorizationHeader, error) {
 
 func normalizeS3PayloadHash(raw string) string {
 	return strings.TrimSpace(raw)
+}
+
+const s3PresignMaxExpiry = 7 * 24 * 60 * 60 // 604800 seconds (7 days)
+
+//nolint:cyclop // Presigned URL validation must check multiple parameters precisely.
+func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
+	query := r.URL.Query()
+	algorithm := strings.TrimSpace(query.Get("X-Amz-Algorithm"))
+	if algorithm != s3SigV4Algorithm {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "unsupported signature algorithm",
+		}
+	}
+	credential := strings.TrimSpace(query.Get("X-Amz-Credential"))
+	amzDate := strings.TrimSpace(query.Get("X-Amz-Date"))
+	expiresStr := strings.TrimSpace(query.Get("X-Amz-Expires"))
+	signedHeaders := strings.TrimSpace(query.Get("X-Amz-SignedHeaders"))
+	signature := strings.TrimSpace(query.Get("X-Amz-Signature"))
+
+	if credential == "" || amzDate == "" || signedHeaders == "" || signature == "" {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "missing required presigned URL parameters",
+		}
+	}
+
+	// Parse credential scope: AKID/date/region/s3/aws4_request
+	scope := strings.Split(credential, "/")
+	if len(scope) != 5 || scope[4] != "aws4_request" || scope[3] != "s3" {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "credential scope is malformed",
+		}
+	}
+	accessKeyID := scope[0]
+	scopeRegion := scope[2]
+
+	secretAccessKey, ok := s.staticCreds[accessKeyID]
+	if !ok {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "InvalidAccessKeyId",
+			Message: "unknown access key",
+		}
+	}
+	if scopeRegion != s.effectiveRegion() {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "credential scope region does not match server region",
+		}
+	}
+
+	signingTime, err := time.Parse(s3DateHeaderFormat, amzDate)
+	if err != nil {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "invalid X-Amz-Date",
+		}
+	}
+	if scope[1] != signingTime.UTC().Format("20060102") {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "credential scope date does not match X-Amz-Date",
+		}
+	}
+
+	if expiresStr != "" {
+		expires, err := strconv.Atoi(expiresStr)
+		if err != nil || expires <= 0 || expires > s3PresignMaxExpiry {
+			return &s3AuthError{
+				Status:  http.StatusForbidden,
+				Code:    "AuthorizationQueryParametersError",
+				Message: "X-Amz-Expires must be between 1 and 604800",
+			}
+		}
+		if time.Now().UTC().After(signingTime.UTC().Add(time.Duration(expires) * time.Second)) {
+			return &s3AuthError{
+				Status:  http.StatusForbidden,
+				Code:    "AccessDenied",
+				Message: "presigned URL has expired",
+			}
+		}
+	} else {
+		// No explicit expiry: fall back to clock skew check.
+		skew := time.Now().UTC().Sub(signingTime.UTC())
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > s3RequestTimeMaxSkew {
+			return &s3AuthError{
+				Status:  http.StatusForbidden,
+				Code:    "AccessDenied",
+				Message: "presigned URL has expired",
+			}
+		}
+	}
+
+	// Use the SDK's PresignHTTP to rebuild the expected presigned URL.
+	// Strip all presign query params to get a clean base request,
+	// then presign it with the same parameters.
+	verifyURL := *r.URL
+	q := verifyURL.Query()
+	for _, param := range []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token"} {
+		q.Del(param)
+	}
+	verifyURL.RawQuery = q.Encode()
+
+	verifyReq, err := http.NewRequestWithContext(context.Background(), r.Method, verifyURL.String(), nil)
+	if err != nil {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "SignatureDoesNotMatch",
+			Message: "failed to verify presigned request signature",
+		}
+	}
+	verifyReq.Host = r.Host
+	// Copy only the signed headers from the original request.
+	for _, h := range strings.Split(signedHeaders, ";") {
+		h = strings.TrimSpace(h)
+		if h == "" || strings.EqualFold(h, "host") {
+			continue
+		}
+		verifyReq.Header.Set(h, r.Header.Get(h))
+	}
+
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	creds := aws.Credentials{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		Source:          "elastickv-s3-presign",
+	}
+	presignedURL, _, err := signer.PresignHTTP(context.Background(), creds, verifyReq, s3UnsignedPayload, "s3", s.effectiveRegion(), signingTime)
+	if err != nil {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "SignatureDoesNotMatch",
+			Message: "failed to verify presigned request signature",
+		}
+	}
+	expectedSig := extractPresignedSignature(presignedURL)
+	if expectedSig == "" || subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSig)) != 1 {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "SignatureDoesNotMatch",
+			Message: "presigned URL signature does not match",
+		}
+	}
+	return nil
+}
+
+func extractPresignedSignature(presignedURL string) string {
+	idx := strings.Index(presignedURL, "X-Amz-Signature=")
+	if idx < 0 {
+		return ""
+	}
+	sig := presignedURL[idx+len("X-Amz-Signature="):]
+	if ampIdx := strings.IndexByte(sig, '&'); ampIdx >= 0 {
+		sig = sig[:ampIdx]
+	}
+	return sig
 }
 
 // extractS3Signature returns the hex signature value from a SigV4
