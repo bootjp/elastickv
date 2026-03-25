@@ -942,7 +942,7 @@ func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 		if !ok {
 			continue
 		}
-		if bytes.HasPrefix(keyBytes, TxnInternalKeyPrefix) {
+		if bytes.HasPrefix(keyBytes, txnInternalKeyPrefix) {
 			continue
 		}
 		newVersions, changed := compactVersions(versions, minTS)

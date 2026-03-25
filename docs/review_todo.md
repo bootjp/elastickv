@@ -9,7 +9,7 @@ Items are ordered by priority within each section.
 
 ### ~~1.1 [Critical] `saveLastCommitTS` uses `pebble.NoSync` — timestamp rollback after crash~~ DONE
 
-- **Status:** Fixed. `saveLastCommitTS` changed to `pebble.Sync`; `ApplyMutations` writes `lastCommitTS` atomically in the same `WriteBatch`.
+- **Status:** Fixed. Durable `lastCommitTS` is now guaranteed by the synced `ApplyMutations` `WriteBatch`; `saveLastCommitTS` remains a best-effort hint written with `pebble.NoSync`.
 
 ### 1.2 [Low — downgraded] Batch Apply in FSM allows partial application without rollback
 

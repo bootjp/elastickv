@@ -79,18 +79,18 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		out := make([]byte, 1+len(b))
+		out := make([]byte, 1, 1+len(b))
 		out[0] = raftEncodeSingle
-		copy(out[1:], b)
+		out = append(out, b...)
 		return out, nil
 	}
 	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	out := make([]byte, 1+len(b))
+	out := make([]byte, 1, 1+len(b))
 	out[0] = raftEncodeBatch
-	copy(out[1:], b)
+	out = append(out, b...)
 	return out, nil
 }
 

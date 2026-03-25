@@ -372,7 +372,7 @@ func TestPebbleStore_Compact_TxnInternalKeysSkipped(t *testing.T) {
 	ctx := context.Background()
 
 	// Write a transaction internal key directly (simulating lock resolution).
-	txnKey := append([]byte(nil), TxnInternalKeyPrefix...)
+	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
 	txnKey = append(txnKey, []byte("lock:k1")...)
 	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 5, 0))
 

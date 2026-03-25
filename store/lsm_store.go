@@ -896,13 +896,16 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	s.mtx.Lock()
-	s.updateLastCommitTS(commitTS)
-	lastTS := s.lastCommitTS
-	s.mtx.Unlock()
+	// Compute the new lastCommitTS without mutating in-memory state yet.
+	s.mtx.RLock()
+	newLastTS := s.lastCommitTS
+	s.mtx.RUnlock()
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
 
 	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], lastTS)
+	binary.LittleEndian.PutUint64(tsBuf[:], newLastTS)
 	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
 		return errors.WithStack(err)
 	}
@@ -911,7 +914,16 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	return errors.WithStack(b.Commit(pebble.Sync))
+	if err := b.Commit(pebble.Sync); err != nil {
+		return errors.WithStack(err)
+	}
+
+	// Update in-memory state only after successful durable commit.
+	s.mtx.Lock()
+	s.updateLastCommitTS(commitTS)
+	s.mtx.Unlock()
+
+	return nil
 }
 
 type pebbleCompactionStats struct {
@@ -1023,7 +1035,7 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 		// Skip transaction internal keys — their lifecycle is managed by
 		// lock resolution, not MVCC compaction.
 		userKey, _ := decodeKeyView(rawKey)
-		if userKey != nil && bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
+		if userKey != nil && bytes.HasPrefix(userKey, txnInternalKeyPrefix) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {

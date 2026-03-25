@@ -6,11 +6,16 @@ import (
 )
 
 const (
-	txnLockPrefix     = "!txn|lock|"
-	txnIntentPrefix   = "!txn|int|"
-	txnCommitPrefix   = "!txn|cmt|"
-	txnRollbackPrefix = "!txn|rb|"
-	txnMetaPrefix     = "!txn|meta|"
+	// TxnKeyPrefix is the common prefix shared by all transaction internal
+	// key namespaces. It is exported so that the store package can reference
+	// it for compaction skipping without duplicating the literal.
+	TxnKeyPrefix = "!txn|"
+
+	txnLockPrefix     = TxnKeyPrefix + "lock|"
+	txnIntentPrefix   = TxnKeyPrefix + "int|"
+	txnCommitPrefix   = TxnKeyPrefix + "cmt|"
+	txnRollbackPrefix = TxnKeyPrefix + "rb|"
+	txnMetaPrefix     = TxnKeyPrefix + "meta|"
 )
 
 // TxnMetaPrefix is the key prefix used for transaction metadata mutations.
@@ -22,7 +27,7 @@ var (
 	txnCommitPrefixBytes   = []byte(txnCommitPrefix)
 	txnRollbackPrefixBytes = []byte(txnRollbackPrefix)
 	txnMetaPrefixBytes     = []byte(txnMetaPrefix)
-	txnCommonPrefix        = []byte("!txn|")
+	txnCommonPrefix        = []byte(TxnKeyPrefix)
 )
 
 const txnStartTSSuffixLen = 8
