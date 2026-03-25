@@ -229,12 +229,11 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	buf := make([]byte, timestampSize)
 	binary.LittleEndian.PutUint64(buf, ts)
 	b := s.db.NewBatch()
+	defer b.Close()
 	if err := b.Set(metaLastCommitTSBytes, buf, nil); err != nil {
-		b.Close()
 		return ts, nil // migration failed, still return the value
 	}
 	if err := b.Delete(legacyMetaLastCommitTSBytes, nil); err != nil {
-		b.Close()
 		return ts, nil
 	}
 	if err := b.Commit(pebble.Sync); err != nil {
@@ -712,7 +711,7 @@ func (s *pebbleStore) shouldDeleteEntry(raw []byte, minTS uint64, state *compact
 	if isMetaKey(raw) {
 		return false
 	}
-	if bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
+	if bytes.HasPrefix(userKey, txnInternalKeyPrefix) {
 		return false
 	}
 	if !bytes.Equal(userKey, state.prevUserKey) {
@@ -733,9 +732,11 @@ func (s *pebbleStore) compactFlushBatch(batch **pebble.Batch, batchCount *int) e
 	if *batchCount < compactBatchLimit {
 		return nil
 	}
-	if err := (*batch).Commit(pebble.NoSync); err != nil {
+	old := *batch
+	if err := old.Commit(pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
+	old.Close()
 	*batch = s.db.NewBatch()
 	*batchCount = 0
 	return nil
@@ -780,8 +781,10 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 
 	if batchCount > 0 {
 		if err := batch.Commit(pebble.NoSync); err != nil {
+			batch.Close()
 			return errors.WithStack(err)
 		}
+		batch.Close()
 	} else {
 		batch.Close()
 	}
@@ -939,8 +942,10 @@ func (s *pebbleStore) restoreMVCCEntries(body io.Reader, checksum hash.Hash32, e
 			batchCnt++
 			if batchCnt >= snapshotBatchSize {
 				if err := batch.Commit(pebble.NoSync); err != nil {
+					batch.Close()
 					return errors.WithStack(err)
 				}
+				batch.Close()
 				batch = s.db.NewBatch()
 				batchCnt = 0
 			}
@@ -950,7 +955,12 @@ func (s *pebbleStore) restoreMVCCEntries(body io.Reader, checksum hash.Hash32, e
 		batch.Close()
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-	return errors.WithStack(batch.Commit(pebble.Sync))
+	if err := batch.Commit(pebble.Sync); err != nil {
+		batch.Close()
+		return errors.WithStack(err)
+	}
+	batch.Close()
+	return nil
 }
 
 // restoreFromStreamingMVCC restores from the in-memory MVCCStore streaming
@@ -991,14 +1001,21 @@ func (s *pebbleStore) restoreGobEntries(entries []mvccSnapshotEntry) error {
 			batchCnt++
 			if batchCnt >= snapshotBatchSize {
 				if err := batch.Commit(pebble.NoSync); err != nil {
+					batch.Close()
 					return errors.WithStack(err)
 				}
+				batch.Close()
 				batch = s.db.NewBatch()
 				batchCnt = 0
 			}
 		}
 	}
-	return errors.WithStack(batch.Commit(pebble.Sync))
+	if err := batch.Commit(pebble.Sync); err != nil {
+		batch.Close()
+		return errors.WithStack(err)
+	}
+	batch.Close()
+	return nil
 }
 
 // restoreFromLegacyGob restores from the legacy gob-encoded MVCCStore

@@ -9,10 +9,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// TxnInternalKeyPrefix is the common prefix for all transaction internal keys
+// txnInternalKeyPrefix is the common prefix for all transaction internal keys
 // (locks, intents, commit records, rollback records, metadata). Compaction
 // must skip these keys to avoid breaking lock resolution.
-var TxnInternalKeyPrefix = []byte("!txn|")
+var txnInternalKeyPrefix = []byte("!txn|")
 
 var ErrKeyNotFound = errors.New("not found")
 var ErrUnknownOp = errors.New("unknown op")
