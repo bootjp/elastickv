@@ -139,20 +139,17 @@ Items are ordered by priority within each section.
 
 Overall coverage: **60.5%** — **1,043 functions at 0%**.
 
-### 5.1 [Critical] FSM Abort path entirely untested
+### ~~5.1 [Critical] FSM Abort path entirely untested~~ DONE
 
-- **File:** `kv/fsm.go` — `handleAbortRequest`, `buildAbortCleanupStoreMutations`, `appendRollbackRecord` all 0%.
-- **Needed:** Prepare->Abort flow, abort rejection for committed txns, lock cleanup verification.
+- **Status:** Fixed. Added `kv/fsm_abort_test.go` with 10 tests: Prepare→Abort flow, commit rejection, lock/intent cleanup, rollback record verification, non-primary abort, timestamp validation, idempotent abort conflict, missing primary key, empty mutations.
 
-### 5.2 [Critical] PebbleStore transaction functions entirely untested
+### ~~5.2 [Critical] PebbleStore transaction functions entirely untested~~ DONE
 
-- **File:** `store/lsm_store.go` — `ApplyMutations`, `checkConflicts`, `LatestCommitTS`, `Compact` all 0%.
-- **Needed:** Write conflict detection, atomic batch application, TTL put/expire, compaction visibility.
+- **Status:** Fixed. Added `store/lsm_store_txn_test.go` with 14 tests: ApplyMutations (put/delete/TTL/conflict/no-conflict/atomicity/lastCommitTS update), LatestCommitTS (single/multi/not-found), Compact (old version removal/newest retained/tombstone cleanup/meta key skip/txn internal key skip/multi-key).
 
-### 5.3 [Critical] `Coordinate.Dispatch` untested
+### ~~5.3 [Critical] `Coordinate.Dispatch` untested~~ DONE
 
-- **File:** `kv/coordinator.go` — `Dispatch`, `dispatchRaw`, `redirect` all 0%.
-- **Needed:** Leader dispatch, follower redirect, leader-absent error handling.
+- **Status:** Fixed. Added `kv/coordinator_dispatch_test.go` with 6 tests: raw put, raw delete, one-phase txn, nil request, empty elems, startTS assignment.
 
 ### 5.4 [High] ShardedCoordinator Abort rollback flow untested
 
