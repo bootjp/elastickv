@@ -160,6 +160,23 @@ func fillEncodedKey(dst []byte, key []byte, ts uint64) {
 	binary.BigEndian.PutUint64(dst[len(key):], ^ts)
 }
 
+// keyUpperBound returns the smallest key that is strictly greater than all
+// encoded keys with the given userKey prefix (i.e. the next lexicographic
+// prefix after key). Returns nil when the key consists entirely of 0xFF bytes
+// (no finite upper bound exists). This is used as the UpperBound in Pebble
+// IterOptions to tightly confine iteration to a single user key.
+func keyUpperBound(key []byte) []byte {
+	upper := make([]byte, len(key))
+	copy(upper, key)
+	for i := len(upper) - 1; i >= 0; i-- {
+		upper[i]++
+		if upper[i] != 0 {
+			return upper[:i+1]
+		}
+	}
+	return nil // key is all 0xFF; no finite upper bound
+}
+
 func decodeKey(k []byte) ([]byte, uint64) {
 	if len(k) < timestampSize {
 		return nil, 0
@@ -446,7 +463,10 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 		return nil, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: encodeKey(key, ts),
+		UpperBound: keyUpperBound(key),
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -801,7 +821,10 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 // called while the caller holds at least s.dbMu.RLock().
 func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
 	// Peek latest version (SeekGE key + ^MaxUint64)
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: encodeKey(key, math.MaxUint64),
+		UpperBound: keyUpperBound(key),
+	})
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}

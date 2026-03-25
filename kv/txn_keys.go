@@ -28,15 +28,15 @@ var (
 const txnStartTSSuffixLen = 8
 
 func txnLockKey(userKey []byte) []byte {
-	k := make([]byte, 0, len(txnLockPrefix)+len(userKey))
-	k = append(k, txnLockPrefix...)
+	k := make([]byte, 0, len(txnLockPrefixBytes)+len(userKey))
+	k = append(k, txnLockPrefixBytes...)
 	k = append(k, userKey...)
 	return k
 }
 
 func txnIntentKey(userKey []byte) []byte {
-	k := make([]byte, 0, len(txnIntentPrefix)+len(userKey))
-	k = append(k, txnIntentPrefix...)
+	k := make([]byte, 0, len(txnIntentPrefixBytes)+len(userKey))
+	k = append(k, txnIntentPrefixBytes...)
 	k = append(k, userKey...)
 	return k
 }
