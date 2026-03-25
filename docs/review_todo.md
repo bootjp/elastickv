@@ -151,17 +151,17 @@ Overall coverage: **60.5%** — **1,043 functions at 0%**.
 
 - **Status:** Fixed. Added `kv/coordinator_dispatch_test.go` with 6 tests: raw put, raw delete, one-phase txn, nil request, empty elems, startTS assignment.
 
-### 5.4 [High] ShardedCoordinator Abort rollback flow untested
+### ~~5.4 [High] ShardedCoordinator Abort rollback flow untested~~ DONE
 
-- **Needed:** Test that when Shard2 Prepare fails, Shard1 (already prepared) receives a correct Abort.
+- **Status:** Fixed. Added `kv/sharded_coordinator_abort_test.go` testing that when Shard2 Prepare fails, Shard1's locks are cleaned up via Abort.
 
 ### 5.5 [High] Jepsen tests are single-shard, single-workload only
 
 - **Current:** Append workload on one Raft group, 30s duration.
 - **Needed:** Multi-shard transactions, CAS workload, longer duration (5-10 min).
 
-### 5.6 [Medium] No concurrent access tests for ShardStore / ShardedCoordinator
+### ~~5.6 [Medium] No concurrent access tests for ShardStore / ShardedCoordinator~~ DONE
 
-- Only `mvcc_store_concurrency_test.go` with 1 test exists.
+- **Status:** Fixed. Expanded `store/mvcc_store_concurrency_test.go` from 1 to 8 tests with race detection: concurrent PutAt (different/same keys), concurrent GetAt+PutAt, concurrent ApplyMutations (single/multi-key), concurrent ScanAt+PutAt, scan snapshot consistency.
 
 ### 5.7 [Medium] No error-path tests (I/O failure, corrupt data, gRPC connection failure)
