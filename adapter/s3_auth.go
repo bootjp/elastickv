@@ -263,6 +263,34 @@ func normalizeS3PayloadHash(raw string) string {
 
 const s3PresignMaxExpiry = 7 * 24 * 60 * 60 // 604800 seconds (7 days)
 
+// checkPresignExpiry validates the expiry of a presigned request.
+// It returns an *s3AuthError if the request has expired or the expiry is invalid.
+func checkPresignExpiry(expiresStr string, signingTime time.Time) *s3AuthError {
+	if expiresStr == "" {
+		// No explicit expiry: fall back to clock skew check.
+		skew := time.Now().UTC().Sub(signingTime.UTC())
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > s3RequestTimeMaxSkew {
+			return &s3AuthError{Status: http.StatusForbidden, Code: "AccessDenied", Message: "presigned URL has expired"}
+		}
+		return nil
+	}
+	expires, err := strconv.Atoi(expiresStr)
+	if err != nil || expires <= 0 || expires > s3PresignMaxExpiry {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "X-Amz-Expires must be between 1 and 604800",
+		}
+	}
+	if time.Now().UTC().After(signingTime.UTC().Add(time.Duration(expires) * time.Second)) {
+		return &s3AuthError{Status: http.StatusForbidden, Code: "AccessDenied", Message: "presigned URL has expired"}
+	}
+	return nil
+}
+
 //nolint:cyclop // Presigned URL validation must check multiple parameters precisely.
 func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	query := r.URL.Query()
@@ -332,35 +360,8 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		}
 	}
 
-	if expiresStr != "" {
-		expires, err := strconv.Atoi(expiresStr)
-		if err != nil || expires <= 0 || expires > s3PresignMaxExpiry {
-			return &s3AuthError{
-				Status:  http.StatusForbidden,
-				Code:    "AuthorizationQueryParametersError",
-				Message: "X-Amz-Expires must be between 1 and 604800",
-			}
-		}
-		if time.Now().UTC().After(signingTime.UTC().Add(time.Duration(expires) * time.Second)) {
-			return &s3AuthError{
-				Status:  http.StatusForbidden,
-				Code:    "AccessDenied",
-				Message: "presigned URL has expired",
-			}
-		}
-	} else {
-		// No explicit expiry: fall back to clock skew check.
-		skew := time.Now().UTC().Sub(signingTime.UTC())
-		if skew < 0 {
-			skew = -skew
-		}
-		if skew > s3RequestTimeMaxSkew {
-			return &s3AuthError{
-				Status:  http.StatusForbidden,
-				Code:    "AccessDenied",
-				Message: "presigned URL has expired",
-			}
-		}
+	if authErr := checkPresignExpiry(expiresStr, signingTime); authErr != nil {
+		return authErr
 	}
 
 	// Use the SDK's PresignHTTP to rebuild the expected presigned URL.
@@ -373,7 +374,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	}
 	verifyURL.RawQuery = q.Encode()
 
-	verifyReq, err := http.NewRequestWithContext(context.Background(), r.Method, verifyURL.String(), nil)
+	verifyReq, err := http.NewRequestWithContext(context.Background(), r.Method, verifyURL.String(), nil) //nolint:gosec // G704: URL is derived from the incoming request's own URL to rebuild and verify its signature; no outbound network request is made.
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
@@ -389,6 +390,14 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 			continue
 		}
 		verifyReq.Header.Set(h, r.Header.Get(h))
+	}
+
+	// Re-add X-Amz-Expires so PresignHTTP includes it in the canonical request,
+	// matching the client's original signature computation.
+	if expiresStr != "" {
+		vq := verifyReq.URL.Query()
+		vq.Set("X-Amz-Expires", expiresStr)
+		verifyReq.URL.RawQuery = vq.Encode()
 	}
 
 	signer := v4.NewSigner(func(opts *v4.SignerOptions) {

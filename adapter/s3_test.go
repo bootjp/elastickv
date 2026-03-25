@@ -855,6 +855,29 @@ func TestS3Server_RangeReadInvalidRange(t *testing.T) {
 	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
 }
 
+func TestS3Server_RangeReadEmptyObject(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-empty-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload an empty object.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-empty-range/empty.txt", strings.NewReader("")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Suffix range on empty object must return 416.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-empty-range/empty.txt", nil)
+	req.Header.Set("Range", "bytes=-4")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+}
+
 func TestS3Server_MultipartUploadETagComputation(t *testing.T) {
 	t.Parallel()
 
@@ -949,6 +972,68 @@ func TestS3Server_MultipartUploadRejectsInvalidPartOrder(t *testing.T) {
 		strings.NewReader(completeBody)))
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "InvalidPartOrder")
+}
+
+func TestS3Server_CompleteMultipartUploadTooManyParts(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-toomany", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-toomany/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Build a CompleteMultipartUpload request with too many parts (> 10000).
+	var sb strings.Builder
+	sb.WriteString("<CompleteMultipartUpload>")
+	for i := 1; i <= s3MaxPartsPerUpload+1; i++ {
+		fmt.Fprintf(&sb, "<Part><PartNumber>%d</PartNumber><ETag>\"abc\"</ETag></Part>", i)
+	}
+	sb.WriteString("</CompleteMultipartUpload>")
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-toomany/obj?uploadId=%s", uploadID),
+		strings.NewReader(sb.String())))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidArgument")
+}
+
+func TestS3Server_CompleteMultipartUploadOutOfRangePartNumber(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-partrange", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-partrange/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Use part number 0 (below s3MinPartNumber=1).
+	completeBody := `<CompleteMultipartUpload>
+		<Part><PartNumber>0</PartNumber><ETag>"abc"</ETag></Part>
+	</CompleteMultipartUpload>`
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-partrange/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidArgument")
 }
 
 func TestS3Server_MultipartNoSuchUpload(t *testing.T) {
@@ -1243,9 +1328,9 @@ func TestS3Server_CompleteMultipartUploadETagMismatch(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	// Complete with wrong ETag.
-	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+	completeBody := `<CompleteMultipartUpload>
 		<Part><PartNumber>1</PartNumber><ETag>"0000000000000000deadbeef00000000"</ETag></Part>
-	</CompleteMultipartUpload>`)
+	</CompleteMultipartUpload>`
 	rec = httptest.NewRecorder()
 	server.handle(rec, newS3TestRequest(http.MethodPost,
 		fmt.Sprintf("/bucket-etag-mm/obj?uploadId=%s", uploadID),
