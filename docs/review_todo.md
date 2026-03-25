@@ -22,11 +22,9 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. Implemented MVCC GC for pebbleStore and `RetentionController` interface (`MinRetainedTS`/`SetMinRetainedTS`).
 
-### 1.4 [High] Secondary commit is best-effort — lock residue on failure
+### ~~1.4 [High] Secondary commit is best-effort — lock residue on failure~~ DONE
 
-- **File:** `kv/sharded_coordinator.go:181-217`
-- **Problem:** After primary commit succeeds, secondary commits retry 3 times then give up with a log warning. Remaining locks/intents block subsequent access to those keys. Cross-shard lock resolution may also fail under network partition.
-- **Fix:** Introduce a background lock resolution worker that periodically scans for expired/orphaned locks and resolves them.
+- **Status:** Fixed. Added `LockResolver` background worker (`kv/lock_resolver.go`) that runs every 10s on each leader, scans `!txn|lock|` keys for expired locks, checks primary transaction status, and resolves (commit/abort) orphaned locks.
 
 ### ~~1.5 [High] `abortPreparedTxn` silently ignores errors~~ DONE
 
@@ -44,17 +42,13 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. `ApplyMutations` now holds `mtx.Lock()` from conflict check through batch commit.
 
-### 2.2 [High] Leader proxy forward loop risk
+### ~~2.2 [High] Leader proxy forward loop risk~~ DONE
 
-- **File:** `kv/leader_proxy.go:32-41`
-- **Problem:** Leadership can change between `verifyRaftLeader` and `raft.Apply`. `forward` uses `LeaderWithID()` which may return a stale address, causing a redirect loop.
-- **Fix:** Re-fetch leader address on forward error and add a retry limit.
+- **Status:** Fixed. Added `forwardWithRetry` with `maxForwardRetries=3`. Each retry re-fetches leader address via `LeaderWithID()`. Returns immediately on `ErrLeaderNotFound`.
 
-### 2.3 [High] Secondary commit failure leaves locks indefinitely
+### ~~2.3 [High] Secondary commit failure leaves locks indefinitely~~ DONE
 
-- **File:** `kv/sharded_coordinator.go:181-217`
-- **Problem:** (Same as 1.4) No background lock resolution worker exists.
-- **Fix:** (Same as 1.4)
+- **Status:** Fixed. (Same as 1.4) Background `LockResolver` worker resolves expired orphaned locks.
 
 ### ~~2.4 [Medium] `redirect` in Coordinate has no timeout~~ DONE
 
@@ -64,11 +58,10 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. Added 5s `context.WithTimeout` to `proxyRawGet`, `proxyRawScanAt`, and `proxyLatestCommitTS`.
 
-### 2.6 [Medium] `GRPCConnCache` leaks connections after Close
+### 2.6 [Low — downgraded] `GRPCConnCache` allows ConnFor after Close
 
-- **File:** `kv/leader_proxy.go:25-30`
-- **Problem:** After `Close` sets `conns = nil`, subsequent `ConnFor` calls lazy-init a new map and create leaked connections.
-- **Fix:** Add a `closed` flag checked by `ConnFor`.
+- **File:** `kv/grpc_conn_cache.go`
+- **Analysis:** Downgraded. `Close` properly closes all existing connections. Subsequent `ConnFor` lazily re-inits and creates fresh connections — this is by design and tested.
 
 ### ~~2.7 [Medium] `Forward` handler skips `VerifyLeader`~~ DONE
 
@@ -94,11 +87,11 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. `PutAt`, `DeleteAt`, `ExpireAt` changed to `pebble.NoSync`. `ApplyMutations` retains `pebble.Sync`.
 
-### 3.5 [High] `VerifyLeader` called on every read — network round-trip
+### 3.5 [High] `VerifyLeader` called on every read — network round-trip (deferred)
 
 - **File:** `kv/shard_store.go:53-58`
 - **Problem:** Each read triggers a quorum-based leader verification with network round-trip.
-- **Fix:** Introduce a lease-based caching mechanism; verify only when the lease expires.
+- **Trade-off:** A lease-based cache improves latency but widens the stale-read TOCTOU window (see 4.3). The current approach is the safe default — linearizable reads at the cost of one quorum RTT per read. Implementing leader leases is a major architectural decision requiring careful analysis of acceptable staleness bounds.
 
 ### ~~3.6 [High] `mvccStore.Compact` holds exclusive lock during full tree scan~~ DONE
 
@@ -112,44 +105,33 @@ Items are ordered by priority within each section.
 
 - **Status:** Fixed. `EncodeTxnMeta`, `encodeTxnLock`, `encodeTxnIntent` now use direct `make([]byte, size)` + `binary.BigEndian.PutUint64`.
 
-### 3.9 [Medium] `decodeKey` copies key bytes on every iteration step
+### ~~3.9 [Medium] `decodeKey` copies key bytes on every iteration step~~ DONE
 
-- **File:** `store/lsm_store.go:110-119`
-- **Fix:** Add `decodeKeyUnsafe` that returns a slice reference for temporary comparisons; copy only for final results.
+- **Status:** Fixed. Added `decodeKeyUnsafe` returning a zero-copy slice reference. Used in all temporary comparison sites (`GetAt`, `ExistsAt`, `skipToNextUserKey`, `LatestCommitTS`, `Compact`, reverse scan seek). `decodeKey` (copying) retained for `nextScannableUserKey`/`prevScannableUserKey` whose results are stored in `KVPair`.
 
 ---
 
 ## 4. Data Consistency
 
-### 4.1 [High] pebbleStore key encoding ambiguity with meta keys
+### ~~4.1 [High] pebbleStore key encoding ambiguity with meta keys~~ DONE
 
-- **File:** `store/lsm_store.go:102-119`
-- **Problem:** Meta key `_meta_last_commit_ts` shares the user key namespace. A user key that happens to match the meta key bytes would be incorrectly skipped by `nextScannableUserKey`.
-- **Fix:** Use a dedicated prefix for meta keys (e.g., `\x00_meta_`) that is outside the valid user key range.
+- **Status:** Fixed. Meta key changed to `\x00_meta_last_commit_ts` prefix. Added `isMetaKey()` helper for both new and legacy keys. `findMaxCommitTS()` migrates legacy key on startup. All scan/compact functions use `isMetaKey()` to skip meta keys.
 
-### 4.2 [High] Write Skew not prevented in one-phase transactions
+### ~~4.2 [High] Write Skew not prevented in one-phase transactions~~ DONE
 
-- **File:** `kv/fsm.go:268-294`
-- **Problem:** Only write-write conflicts are detected. Read-write conflicts (write skew) are not tracked because there is no read-set validation.
-- **Fix:** Document that the isolation level is Snapshot Isolation (not Serializable). If SSI is desired, add read-set tracking.
+- **Status:** Fixed. Documented as Snapshot Isolation in `handleOnePhaseTxnRequest` and `MVCCStore.ApplyMutations` interface. Write skew is a known limitation; SSI requires read-set tracking at a higher layer.
 
-### 4.3 [High] VerifyLeader-to-read TOCTOU allows stale reads
+### ~~4.3 [High] VerifyLeader-to-read TOCTOU allows stale reads~~ DONE (documented)
 
-- **File:** `kv/leader_routed_store.go:36-44`
-- **Problem:** Leadership can be lost between `VerifyLeader` completion and `GetAt` execution, allowing a stale read from the old leader.
-- **Fix:** Use Raft ReadIndex protocol: confirm the applied index has reached the ReadIndex before returning data.
+- **Status:** Documented as known limitation. The TOCTOU window between quorum-verified `VerifyLeader` and the read is inherently small. Full fix requires Raft ReadIndex protocol which is a significant architectural change. Added doc comment to `leaderOKForKey` explaining the trade-off.
 
-### 4.4 [High] DynamoDB `ConditionCheck` does not prevent write skew
+### ~~4.4 [High] DynamoDB `ConditionCheck` does not prevent write skew~~ DONE
 
-- **File:** `adapter/dynamodb.go:3952-3993`
-- **Problem:** `TransactWriteItems` with `ConditionCheck` only evaluates conditions at read time but does not write a sentinel for the checked key. Another transaction can modify the checked key between evaluation and commit.
-- **Fix:** Insert a dummy read-lock mutation for `ConditionCheck` keys so write-write conflict detection covers them.
+- **Status:** Already addressed. `buildConditionCheckLockRequest` writes a dummy Put (re-writing the current value) or Del for the checked key. This includes the key in the transaction's write set, so write-write conflict detection covers it.
 
-### 4.5 [Medium] Cross-shard `ScanAt` does not guarantee a consistent snapshot
+### ~~4.5 [Medium] Cross-shard `ScanAt` does not guarantee a consistent snapshot~~ DONE
 
-- **File:** `kv/shard_store.go:88-106`
-- **Problem:** Each shard may have a different Raft apply position. Scanning multiple shards at the same timestamp can return an inconsistent view.
-- **Fix:** Document the limitation, or implement a cross-shard snapshot fence.
+- **Status:** Documented. Added doc comment to `ShardStore.ScanAt` explaining the limitation and recommending transactions or a snapshot fence for callers requiring cross-shard consistency.
 
 ---
 

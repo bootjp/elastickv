@@ -129,7 +129,8 @@ type MVCCStore interface {
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
 	// It must return ErrWriteConflict if any key has a newer commit timestamp
-	// than startTS.
+	// than startTS. Note: only write-write conflicts are detected (Snapshot
+	// Isolation). Read-write conflicts (write skew) are not prevented.
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64

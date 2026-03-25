@@ -89,6 +89,11 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 	return v != nil, nil
 }
 
+// ScanAt scans keys across shards at the given timestamp. Note: when the range
+// spans multiple shards, each shard may have a different Raft apply position.
+// This means the returned view is NOT a globally consistent snapshot — it is
+// a best-effort point-in-time scan. Callers requiring cross-shard consistency
+// should use a transaction or implement a cross-shard snapshot fence.
 func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil

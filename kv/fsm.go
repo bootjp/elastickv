@@ -292,6 +292,12 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return nil
 }
 
+// handleOnePhaseTxnRequest applies a single-shard transaction atomically.
+// The isolation level is Snapshot Isolation (SI): only write-write conflicts
+// are detected via ApplyMutations. Read-write conflicts (write skew) are NOT
+// prevented because the read-set is not tracked. Callers requiring
+// Serializable Snapshot Isolation (SSI) must implement read-set validation
+// at a higher layer.
 func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {

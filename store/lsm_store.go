@@ -456,7 +456,7 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 
 	if iter.SeekGE(seekKey) {
 		k := iter.Key()
-		userKey, _ := decodeKey(k)
+		userKey, _ := decodeKeyView(k)
 
 		if !bytes.Equal(userKey, key) {
 			// Moved to next user key
@@ -529,7 +529,7 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 		return false
 	}
 	k := iter.Key()
-	currentUserKey, _ := decodeKey(k)
+	currentUserKey, _ := decodeKeyView(k)
 	return bytes.Equal(currentUserKey, userKey)
 }
 
@@ -538,7 +538,7 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 		return false
 	}
 	k := iter.Key()
-	u, _ := decodeKey(k)
+	u, _ := decodeKeyView(k)
 	if bytes.Equal(u, userKey) {
 		return iter.Next()
 	}
@@ -698,7 +698,7 @@ func (s *pebbleStore) nextReverseScanKV(
 	if !iter.SeekGE(encodeKey(userKey, ts)) {
 		return nil, false, true, nil
 	}
-	currentUserKey, _ := decodeKey(iter.Key())
+	currentUserKey, _ := decodeKeyView(iter.Key())
 	if !bytes.Equal(currentUserKey, userKey) {
 		nextValid := iter.SeekLT(encodeKey(userKey, math.MaxUint64))
 		return nil, nextValid, false, nil
@@ -809,7 +809,7 @@ func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, boo
 
 	if iter.First() {
 		k := iter.Key()
-		userKey, version := decodeKey(k)
+		userKey, version := decodeKeyView(k)
 		if bytes.Equal(userKey, key) {
 			return version, true, nil
 		}
