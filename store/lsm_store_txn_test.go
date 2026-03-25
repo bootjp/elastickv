@@ -277,14 +277,14 @@ func TestPebbleStore_Compact_RemovesOldVersions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v3"), val)
 
-	// TS=20 still visible (kept as snapshot anchor).
-	val, err = s.GetAt(ctx, []byte("k1"), 20)
+	// TS=25 returns the anchor version (v2 at TS=20).
+	val, err = s.GetAt(ctx, []byte("k1"), 25)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v2"), val)
 
-	// TS=10 should have been removed by compaction.
+	// Reads below minTS=25 are rejected as compacted.
 	_, err = s.GetAt(ctx, []byte("k1"), 15)
-	assert.ErrorIs(t, err, ErrKeyNotFound)
+	assert.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
 func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
@@ -301,9 +301,14 @@ func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
 	// The single version at TS=10 should be kept as the anchor.
 	require.NoError(t, s.Compact(ctx, 100))
 
-	val, err := s.GetAt(ctx, []byte("k1"), 10)
+	// Read at minTS=100 — the anchor (v1@10) should still be visible.
+	val, err := s.GetAt(ctx, []byte("k1"), 100)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v1"), val)
+
+	// Reads below minTS are rejected.
+	_, err = s.GetAt(ctx, []byte("k1"), 10)
+	assert.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
 func TestPebbleStore_Compact_TombstoneCleanup(t *testing.T) {
@@ -321,13 +326,13 @@ func TestPebbleStore_Compact_TombstoneCleanup(t *testing.T) {
 	// the put at TS=10 is older and should be removed.
 	require.NoError(t, s.Compact(ctx, 25))
 
-	// The tombstone anchor is still present, so key is still "not found".
-	_, err = s.GetAt(ctx, []byte("k1"), 20)
+	// Read at minTS=25 — the tombstone anchor makes the key "not found".
+	_, err = s.GetAt(ctx, []byte("k1"), 25)
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 
-	// The version at TS=10 was removed, so reading at TS=15 also yields not found.
+	// Reads below minTS are rejected as compacted.
 	_, err = s.GetAt(ctx, []byte("k1"), 15)
-	assert.ErrorIs(t, err, ErrKeyNotFound)
+	assert.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
 func TestPebbleStore_Compact_MetaKeyNotAffected(t *testing.T) {
@@ -378,13 +383,12 @@ func TestPebbleStore_Compact_TxnInternalKeysSkipped(t *testing.T) {
 	// Compact. The txn internal key should be untouched.
 	require.NoError(t, s.Compact(ctx, 15))
 
-	// The txn internal key should still be readable.
-	val, err := s.GetAt(ctx, txnKey, 10)
+	// The txn internal key should still be readable at/above minTS.
+	val, err := s.GetAt(ctx, txnKey, 15)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("lock-data"), val)
 
 	// Regular key: TS=20 is above minTS, kept. TS=10 is the anchor, kept.
-	// Only one version <= minTS=15 exists (TS=10), so nothing to remove.
 	val, err = s.GetAt(ctx, []byte("k1"), 20)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v2"), val)
@@ -417,22 +421,22 @@ func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("k1v20"), val)
 
-	// k1@10 visible (anchor).
-	val, err = s.GetAt(ctx, []byte("k1"), 10)
+	// k1@12 returns anchor (k1v10).
+	val, err = s.GetAt(ctx, []byte("k1"), 12)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("k1v10"), val)
 
-	// k1@5 was compacted — reading at TS=7 should not find it.
+	// Reads below minTS=12 are rejected.
 	_, err = s.GetAt(ctx, []byte("k1"), 7)
-	assert.ErrorIs(t, err, ErrKeyNotFound)
+	assert.ErrorIs(t, err, ErrReadTSCompacted)
 
 	// k2@15 visible.
 	val, err = s.GetAt(ctx, []byte("k2"), 15)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("k2v15"), val)
 
-	// k2@8 visible (anchor).
-	val, err = s.GetAt(ctx, []byte("k2"), 8)
+	// k2@12 returns anchor (k2v8).
+	val, err = s.GetAt(ctx, []byte("k2"), 12)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("k2v8"), val)
 }
