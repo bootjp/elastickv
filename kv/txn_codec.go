@@ -20,6 +20,9 @@ const (
 
 const txnLockFlagPrimary byte = 0x01
 
+// uint64FieldSize is the byte size of a serialized uint64 field.
+const uint64FieldSize = 8
+
 // TxnMeta is embedded into transactional raft log requests via a synthetic
 // mutation (key prefix "!txn|meta|"). It is not persisted in the MVCC store.
 type TxnMeta struct {
@@ -30,7 +33,7 @@ type TxnMeta struct {
 
 func EncodeTxnMeta(m TxnMeta) []byte {
 	// version(1) + LockTTLms(8) + CommitTS(8) + primaryLen(8) + primaryKey
-	size := 1 + 8 + 8 + 8 + len(m.PrimaryKey)
+	size := 1 + uint64FieldSize + uint64FieldSize + uint64FieldSize + len(m.PrimaryKey)
 	b := make([]byte, size)
 	b[0] = txnMetaVersion
 	binary.BigEndian.PutUint64(b[1:], m.LockTTLms)
@@ -79,7 +82,7 @@ type txnLock struct {
 
 func encodeTxnLock(l txnLock) []byte {
 	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey
-	size := 1 + 8 + 8 + 1 + 8 + len(l.PrimaryKey)
+	size := 1 + uint64FieldSize + uint64FieldSize + 1 + uint64FieldSize + len(l.PrimaryKey)
 	b := make([]byte, size)
 	b[0] = txnLockVersion
 	binary.BigEndian.PutUint64(b[1:], l.StartTS)
@@ -143,7 +146,7 @@ const (
 
 func encodeTxnIntent(i txnIntent) []byte {
 	// version(1) + StartTS(8) + Op(1) + valLen(8) + value
-	size := 1 + 8 + 1 + 8 + len(i.Value)
+	size := 1 + uint64FieldSize + 1 + uint64FieldSize + len(i.Value)
 	b := make([]byte, size)
 	b[0] = txnIntentVersion
 	binary.BigEndian.PutUint64(b[1:], i.StartTS)

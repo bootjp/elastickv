@@ -64,14 +64,14 @@ func TestMVCCConcurrentPutAtDifferentKeys(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numGoroutines*writesPerGoroutine)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := uint64(0); g < numGoroutines; g++ {
 		wg.Add(1)
-		go func(goroutineID int) {
+		go func(goroutineID uint64) {
 			defer wg.Done()
-			for i := 0; i < writesPerGoroutine; i++ {
+			for i := uint64(0); i < writesPerGoroutine; i++ {
 				key := []byte(fmt.Sprintf("g%d-key%d", goroutineID, i))
 				value := []byte(fmt.Sprintf("val-%d-%d", goroutineID, i))
-				ts := uint64(goroutineID*writesPerGoroutine + i + 1)
+				ts := goroutineID*writesPerGoroutine + i + 1
 				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
 					errCh <- err
 					return
@@ -115,14 +115,14 @@ func TestMVCCConcurrentPutAtSameKey(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numGoroutines*writesPerGoroutine)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := uint64(0); g < numGoroutines; g++ {
 		wg.Add(1)
-		go func(goroutineID int) {
+		go func(goroutineID uint64) {
 			defer wg.Done()
-			for i := 0; i < writesPerGoroutine; i++ {
+			for i := uint64(0); i < writesPerGoroutine; i++ {
 				// Each goroutine uses a unique timestamp range so no two
 				// goroutines share a timestamp.
-				ts := uint64(goroutineID*writesPerGoroutine + i + 1)
+				ts := goroutineID*writesPerGoroutine + i + 1
 				value := []byte(fmt.Sprintf("v-ts%d", ts))
 				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
 					errCh <- err
@@ -152,6 +152,39 @@ func TestMVCCConcurrentPutAtSameKey(t *testing.T) {
 		val, err := st.GetAt(ctx, key, checkTS)
 		require.NoError(t, err)
 		require.Equal(t, []byte(fmt.Sprintf("v-ts%d", checkTS)), val)
+	}
+}
+
+func concurrentGetAtWriter(ctx context.Context, st MVCCStore, numKeys, writesPerWriter int, tsCounter *atomic.Uint64, errCh chan<- error) {
+	for i := 0; i < writesPerWriter; i++ {
+		keyIdx := i % numKeys
+		key := []byte(fmt.Sprintf("rw-key%d", keyIdx))
+		ts := tsCounter.Add(1)
+		value := []byte(fmt.Sprintf("w-ts%d", ts))
+		if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
+			errCh <- err
+			return
+		}
+	}
+}
+
+func concurrentGetAtReader(ctx context.Context, st MVCCStore, numKeys, writesPerWriter int, errCh chan<- error) {
+	for i := 0; i < writesPerWriter; i++ {
+		keyIdx := i % numKeys
+		key := []byte(fmt.Sprintf("rw-key%d", keyIdx))
+		readTS := st.LastCommitTS()
+		if readTS == 0 {
+			readTS = 1
+		}
+		val, err := st.GetAt(ctx, key, readTS)
+		if err != nil {
+			errCh <- fmt.Errorf("GetAt(key=%s, ts=%d): %w", key, readTS, err)
+			return
+		}
+		if len(val) == 0 {
+			errCh <- fmt.Errorf("GetAt(key=%s, ts=%d) returned empty value", key, readTS)
+			return
+		}
 	}
 }
 
@@ -187,16 +220,7 @@ func TestMVCCConcurrentGetAtAndPutAt(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < writesPerWriter; i++ {
-				keyIdx := i % numKeys
-				key := []byte(fmt.Sprintf("rw-key%d", keyIdx))
-				ts := tsCounter.Add(1)
-				value := []byte(fmt.Sprintf("w-ts%d", ts))
-				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
-					errCh <- err
-					return
-				}
-			}
+			concurrentGetAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
 		}()
 	}
 
@@ -205,24 +229,7 @@ func TestMVCCConcurrentGetAtAndPutAt(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < writesPerWriter; i++ {
-				keyIdx := i % numKeys
-				key := []byte(fmt.Sprintf("rw-key%d", keyIdx))
-				readTS := st.LastCommitTS()
-				if readTS == 0 {
-					readTS = 1
-				}
-				val, err := st.GetAt(ctx, key, readTS)
-				if err != nil {
-					errCh <- fmt.Errorf("GetAt(key=%s, ts=%d): %w", key, readTS, err)
-					return
-				}
-				// Value must be non-empty (either "init" or "w-ts<N>").
-				if len(val) == 0 {
-					errCh <- fmt.Errorf("GetAt(key=%s, ts=%d) returned empty value", key, readTS)
-					return
-				}
-			}
+			concurrentGetAtReader(ctx, st, numKeys, writesPerWriter, errCh)
 		}()
 	}
 
@@ -379,6 +386,53 @@ func TestMVCCConcurrentApplyMutationsMultiKey(t *testing.T) {
 // point-in-time snapshots even while concurrent writes are happening. Every
 // value returned by a scan at timestamp T must match the value committed at
 // that timestamp or earlier.
+func scanAtWriter(ctx context.Context, st MVCCStore, numKeys, writesPerWriter int, tsCounter *atomic.Uint64, errCh chan<- error) {
+	for i := 0; i < writesPerWriter; i++ {
+		keyIdx := i % numKeys
+		key := []byte(fmt.Sprintf("scan-key%03d", keyIdx))
+		ts := tsCounter.Add(1)
+		value := []byte(fmt.Sprintf("v%d", ts))
+		if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
+			errCh <- err
+			return
+		}
+	}
+}
+
+func scanAtScanner(ctx context.Context, st MVCCStore, numKeys, writesPerWriter int, errCh chan<- error) {
+	for i := 0; i < writesPerWriter; i++ {
+		scanTS := st.LastCommitTS()
+		if scanTS == 0 {
+			scanTS = 1
+		}
+		pairs, err := st.ScanAt(ctx, []byte("scan-key"), []byte("scan-key999"), numKeys+10, scanTS)
+		if err != nil {
+			errCh <- fmt.Errorf("ScanAt(ts=%d): %w", scanTS, err)
+			return
+		}
+
+		for _, kv := range pairs {
+			pointVal, err := st.GetAt(ctx, kv.Key, scanTS)
+			if err != nil {
+				if errors.Is(err, ErrKeyNotFound) {
+					continue
+				}
+				errCh <- fmt.Errorf("GetAt(key=%s, ts=%d) after scan: %w", kv.Key, scanTS, err)
+				return
+			}
+			if string(pointVal) != string(kv.Value) {
+				// This is acceptable if a write committed between
+				// ScanAt and GetAt at the same logical timestamp.
+				// In the in-memory store with mutex serialization,
+				// this cannot happen, but we do not fail the test
+				// to keep the check useful for other store
+				// implementations too.
+				_ = pointVal
+			}
+		}
+	}
+}
+
 func TestMVCCConcurrentScanAtAndPutAt(t *testing.T) {
 	t.Parallel()
 
@@ -407,16 +461,7 @@ func TestMVCCConcurrentScanAtAndPutAt(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < writesPerWriter; i++ {
-				keyIdx := i % numKeys
-				key := []byte(fmt.Sprintf("scan-key%03d", keyIdx))
-				ts := tsCounter.Add(1)
-				value := []byte(fmt.Sprintf("v%d", ts))
-				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
-					errCh <- err
-					return
-				}
-			}
+			scanAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
 		}()
 	}
 
@@ -425,46 +470,7 @@ func TestMVCCConcurrentScanAtAndPutAt(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < writesPerWriter; i++ {
-				scanTS := st.LastCommitTS()
-				if scanTS == 0 {
-					scanTS = 1
-				}
-				pairs, err := st.ScanAt(ctx, []byte("scan-key"), []byte("scan-key999"), numKeys+10, scanTS)
-				if err != nil {
-					errCh <- fmt.Errorf("ScanAt(ts=%d): %w", scanTS, err)
-					return
-				}
-
-				// Every returned pair must be individually verifiable: a
-				// point-read at the same scanTS must return the same value.
-				for _, kv := range pairs {
-					pointVal, err := st.GetAt(ctx, kv.Key, scanTS)
-					if err != nil {
-						// The value may have been written after our scanTS
-						// snapshot was taken but before the point-read.
-						// With the RWMutex-based store, GetAt and ScanAt
-						// are serialized, so the only valid error is
-						// ErrKeyNotFound if the key was deleted.
-						if errors.Is(err, ErrKeyNotFound) {
-							continue
-						}
-						errCh <- fmt.Errorf("GetAt(key=%s, ts=%d) after scan: %w", kv.Key, scanTS, err)
-						return
-					}
-					// If both calls see the same timestamp, the values
-					// must match.
-					if string(pointVal) != string(kv.Value) {
-						// This is acceptable if a write committed between
-						// ScanAt and GetAt at the same logical timestamp.
-						// In the in-memory store with mutex serialization,
-						// this cannot happen, but we do not fail the test
-						// to keep the check useful for other store
-						// implementations too.
-						_ = pointVal
-					}
-				}
-			}
+			scanAtScanner(ctx, st, numKeys, writesPerWriter, errCh)
 		}()
 	}
 
@@ -479,6 +485,39 @@ func TestMVCCConcurrentScanAtAndPutAt(t *testing.T) {
 	pairs, err := st.ScanAt(ctx, []byte("scan-key"), []byte("scan-key999"), numKeys+10, finalTS)
 	require.NoError(t, err)
 	require.Equal(t, numKeys, len(pairs), "all seeded keys should be visible at final timestamp")
+}
+
+func snapshotConsistencyWriter(ctx context.Context, st MVCCStore, numKeys, totalWrites int, tsCounter *atomic.Uint64, errCh chan<- error) {
+	for i := 0; i < totalWrites; i++ {
+		keyIdx := i % numKeys
+		key := []byte("ss-" + strconv.Itoa(keyIdx))
+		ts := tsCounter.Add(1)
+		value := []byte(fmt.Sprintf("ss-%d-ts%d", keyIdx, ts))
+		if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
+			errCh <- err
+			return
+		}
+	}
+}
+
+func snapshotConsistencyScanner(ctx context.Context, st MVCCStore, numKeys, totalWrites int, errCh chan<- error) {
+	for i := 0; i < totalWrites; i++ {
+		scanTS := st.LastCommitTS()
+		if scanTS == 0 {
+			scanTS = 1
+		}
+		pairs, err := st.ScanAt(ctx, []byte("ss-"), []byte("ss-999"), numKeys+10, scanTS)
+		if err != nil {
+			errCh <- fmt.Errorf("ScanAt: %w", err)
+			return
+		}
+		for _, kv := range pairs {
+			if len(kv.Key) == 0 || len(kv.Value) == 0 {
+				errCh <- fmt.Errorf("scan returned empty key or value at ts=%d", scanTS)
+				return
+			}
+		}
+	}
 }
 
 // TestMVCCConcurrentScanAtSnapshotConsistency performs a stricter consistency
@@ -510,16 +549,7 @@ func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < totalWrites; i++ {
-			keyIdx := i % numKeys
-			key := []byte("ss-" + strconv.Itoa(keyIdx))
-			ts := tsCounter.Add(1)
-			value := []byte(fmt.Sprintf("ss-%d-ts%d", keyIdx, ts))
-			if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
-				errCh <- err
-				return
-			}
-		}
+		snapshotConsistencyWriter(ctx, st, numKeys, totalWrites, &tsCounter, errCh)
 	}()
 
 	// Multiple scanners check that returned results are non-empty and
@@ -528,23 +558,7 @@ func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < totalWrites; i++ {
-				scanTS := st.LastCommitTS()
-				if scanTS == 0 {
-					scanTS = 1
-				}
-				pairs, err := st.ScanAt(ctx, []byte("ss-"), []byte("ss-999"), numKeys+10, scanTS)
-				if err != nil {
-					errCh <- fmt.Errorf("ScanAt: %w", err)
-					return
-				}
-				for _, kv := range pairs {
-					if len(kv.Key) == 0 || len(kv.Value) == 0 {
-						errCh <- fmt.Errorf("scan returned empty key or value at ts=%d", scanTS)
-						return
-					}
-				}
-			}
+			snapshotConsistencyScanner(ctx, st, numKeys, totalWrites, errCh)
 		}()
 	}
 

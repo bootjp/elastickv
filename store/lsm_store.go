@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/gob"
+	"hash"
 	"hash/crc32"
 	"io"
 	"log/slog"
@@ -19,10 +20,10 @@ import (
 )
 
 const (
-	timestampSize     = 8
-	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchSize = 1000
-	dirPerms          = 0755
+	timestampSize          = 8
+	valueHeaderSize        = 9 // 1 byte tombstone + 8 bytes expireAt
+	snapshotBatchSize      = 1000
+	dirPerms               = 0755
 	metaLastCommitTS       = "\x00_meta_last_commit_ts"
 	legacyMetaLastCommitTS = "_meta_last_commit_ts"
 )
@@ -111,6 +112,23 @@ func encodeKey(key []byte, ts uint64) []byte {
 	// Invert TS for descending order (newer first)
 	binary.BigEndian.PutUint64(k[len(key):], ^ts)
 	return k
+}
+
+// keyUpperBound returns the smallest key that is strictly greater than all
+// encoded keys with the given userKey prefix (i.e. the next lexicographic
+// prefix after key). Returns nil when the key consists entirely of 0xFF bytes
+// (no finite upper bound exists). This is used as the UpperBound in Pebble
+// IterOptions to tightly confine iteration to a single user key.
+func keyUpperBound(key []byte) []byte {
+	upper := make([]byte, len(key))
+	copy(upper, key)
+	for i := len(upper) - 1; i >= 0; i-- {
+		upper[i]++
+		if upper[i] != 0 {
+			return upper[:i+1]
+		}
+	}
+	return nil // key is all 0xFF; no finite upper bound
 }
 
 func decodeKey(k []byte) ([]byte, uint64) {
@@ -285,12 +303,9 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	lower := encodeKey(key, ts)
-	upper := encodeKey(key, 0)
-	// Append a byte to upper bound to make it exclusive and cover all timestamps
-	upper = append(upper, 0)
 	opts := &pebble.IterOptions{
 		LowerBound: lower,
-		UpperBound: upper,
+		UpperBound: keyUpperBound(key),
 	}
 	iter, err := s.db.NewIter(opts)
 	if err != nil {
@@ -606,12 +621,9 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 func (s *pebbleStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	lower := encodeKey(key, math.MaxUint64)
-	upper := encodeKey(key, 0)
-	// Append a byte to upper bound to make it exclusive and cover all timestamps
-	upper = append(upper, 0)
 	opts := &pebble.IterOptions{
 		LowerBound: lower,
-		UpperBound: upper,
+		UpperBound: keyUpperBound(key),
 	}
 	iter, err := s.db.NewIter(opts)
 	if err != nil {
@@ -687,10 +699,49 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 
 const compactBatchLimit = 1000
 
+type compactEntryState struct {
+	prevUserKey []byte
+	keepSeen    bool
+}
+
+func (s *pebbleStore) shouldDeleteEntry(raw []byte, minTS uint64, state *compactEntryState) bool {
+	userKey, ts := decodeKeyUnsafe(raw)
+	if userKey == nil {
+		return false
+	}
+	if isMetaKey(raw) {
+		return false
+	}
+	if bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
+		return false
+	}
+	if !bytes.Equal(userKey, state.prevUserKey) {
+		state.prevUserKey = append(state.prevUserKey[:0], userKey...)
+		state.keepSeen = false
+	}
+	if ts > minTS {
+		return false
+	}
+	if !state.keepSeen {
+		state.keepSeen = true
+		return false
+	}
+	return true
+}
+
+func (s *pebbleStore) compactFlushBatch(batch **pebble.Batch, batchCount *int) error {
+	if *batchCount < compactBatchLimit {
+		return nil
+	}
+	if err := (*batch).Commit(pebble.NoSync); err != nil {
+		return errors.WithStack(err)
+	}
+	*batch = s.db.NewBatch()
+	*batchCount = 0
+	return nil
+}
+
 func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
-	// MVCC GC: for each user key, keep the newest version <= minTS and remove
-	// all older versions. We iterate in encoded key order; consecutive entries
-	// sharing the same user key belong to the same version chain.
 	iter, err := s.db.NewIter(nil)
 	if err != nil {
 		return errors.WithStack(err)
@@ -700,51 +751,19 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	batch := s.db.NewBatch()
 	batchCount := 0
 	deletedTotal := 0
-
-	var prevUserKey []byte
-	keepSeen := false // true once we've seen the version to keep for the current user key
+	state := &compactEntryState{}
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		if ctx.Err() != nil {
 			batch.Close()
-			return ctx.Err()
+			return errors.WithStack(ctx.Err())
 		}
 
 		raw := iter.Key()
-		userKey, ts := decodeKeyUnsafe(raw)
-		if userKey == nil {
+		if !s.shouldDeleteEntry(raw, minTS, state) {
 			continue
 		}
 
-		// Skip meta keys.
-		if isMetaKey(raw) {
-			continue
-		}
-
-		// Skip transaction internal keys — their lifecycle is managed by
-		// lock resolution, not MVCC compaction.
-		if bytes.HasPrefix(userKey, TxnInternalKeyPrefix) {
-			continue
-		}
-
-		// Detect user-key boundary.
-		if !bytes.Equal(userKey, prevUserKey) {
-			prevUserKey = append(prevUserKey[:0], userKey...)
-			keepSeen = false
-		}
-
-		if ts > minTS {
-			// Version newer than compaction watermark — always keep.
-			continue
-		}
-
-		if !keepSeen {
-			// First version <= minTS for this key — keep it as the snapshot anchor.
-			keepSeen = true
-			continue
-		}
-
-		// Older than the kept version — safe to delete.
 		encodedKey := make([]byte, len(raw))
 		copy(encodedKey, raw)
 		if err := batch.Delete(encodedKey, nil); err != nil {
@@ -754,12 +773,8 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 		batchCount++
 		deletedTotal++
 
-		if batchCount >= compactBatchLimit {
-			if err := batch.Commit(pebble.NoSync); err != nil {
-				return errors.WithStack(err)
-			}
-			batch = s.db.NewBatch()
-			batchCount = 0
+		if err := s.compactFlushBatch(&batch, &batchCount); err != nil {
+			return err
 		}
 	}
 
@@ -902,32 +917,13 @@ func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
 	return s.restoreBatchLoop(r)
 }
 
-// restoreFromStreamingMVCC restores from the in-memory MVCCStore streaming
-// snapshot format (magic "EKVMVCC2") by converting each MVCC entry into
-// Pebble's key encoding (userKey + inverted TS) and value encoding.
-func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	expectedChecksum, err := readMVCCSnapshotHeader(r)
-	if err != nil {
-		return err
-	}
-
-	hash := crc32.NewIEEE()
-	body := io.TeeReader(r, hash)
-
-	lastCommitTS, _, err := readMVCCSnapshotMetadata(body)
-	if err != nil {
-		return err
-	}
-	s.lastCommitTS = lastCommitTS
-	if err := s.saveLastCommitTS(lastCommitTS); err != nil {
-		return err
-	}
-
+func (s *pebbleStore) restoreMVCCEntries(body io.Reader, checksum hash.Hash32, expectedChecksum uint32) error {
 	batch := s.db.NewBatch()
 	batchCnt := 0
 	for {
 		key, versions, eof, err := readMVCCSnapshotEntry(body)
 		if err != nil {
+			batch.Close()
 			return err
 		}
 		if eof {
@@ -937,6 +933,7 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 			pKey := encodeKey(key, v.TS)
 			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
 			if err := batch.Set(pKey, pVal, nil); err != nil {
+				batch.Close()
 				return errors.WithStack(err)
 			}
 			batchCnt++
@@ -949,9 +946,57 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 			}
 		}
 	}
-
-	if hash.Sum32() != expectedChecksum {
+	if checksum.Sum32() != expectedChecksum {
+		batch.Close()
 		return errors.WithStack(ErrInvalidChecksum)
+	}
+	return errors.WithStack(batch.Commit(pebble.Sync))
+}
+
+// restoreFromStreamingMVCC restores from the in-memory MVCCStore streaming
+// snapshot format (magic "EKVMVCC2") by converting each MVCC entry into
+// Pebble's key encoding (userKey + inverted TS) and value encoding.
+func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
+	expectedChecksum, err := readMVCCSnapshotHeader(r)
+	if err != nil {
+		return err
+	}
+
+	checksum := crc32.NewIEEE()
+	body := io.TeeReader(r, checksum)
+
+	lastCommitTS, _, err := readMVCCSnapshotMetadata(body)
+	if err != nil {
+		return err
+	}
+	s.lastCommitTS = lastCommitTS
+	if err := s.saveLastCommitTS(lastCommitTS); err != nil {
+		return err
+	}
+
+	return s.restoreMVCCEntries(body, checksum, expectedChecksum)
+}
+
+func (s *pebbleStore) restoreGobEntries(entries []mvccSnapshotEntry) error {
+	batch := s.db.NewBatch()
+	batchCnt := 0
+	for _, entry := range entries {
+		for _, v := range entry.Versions {
+			pKey := encodeKey(entry.Key, v.TS)
+			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
+			if err := batch.Set(pKey, pVal, nil); err != nil {
+				batch.Close()
+				return errors.WithStack(err)
+			}
+			batchCnt++
+			if batchCnt >= snapshotBatchSize {
+				if err := batch.Commit(pebble.NoSync); err != nil {
+					return errors.WithStack(err)
+				}
+				batch = s.db.NewBatch()
+				batchCnt = 0
+			}
+		}
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
@@ -982,26 +1027,7 @@ func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
 		return err
 	}
 
-	batch := s.db.NewBatch()
-	batchCnt := 0
-	for _, entry := range snapshot.Entries {
-		for _, v := range entry.Versions {
-			pKey := encodeKey(entry.Key, v.TS)
-			pVal := encodeValue(v.Value, v.Tombstone, v.ExpireAt)
-			if err := batch.Set(pKey, pVal, nil); err != nil {
-				return errors.WithStack(err)
-			}
-			batchCnt++
-			if batchCnt >= snapshotBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
-					return errors.WithStack(err)
-				}
-				batch = s.db.NewBatch()
-				batchCnt = 0
-			}
-		}
-	}
-	return errors.WithStack(batch.Commit(pebble.Sync))
+	return s.restoreGobEntries(snapshot.Entries)
 }
 
 func (s *pebbleStore) Close() error {
