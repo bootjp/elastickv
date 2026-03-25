@@ -1328,9 +1328,9 @@ func TestS3Server_CompleteMultipartUploadETagMismatch(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	// Complete with wrong ETag.
-	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+	completeBody := `<CompleteMultipartUpload>
 		<Part><PartNumber>1</PartNumber><ETag>"0000000000000000deadbeef00000000"</ETag></Part>
-	</CompleteMultipartUpload>`)
+	</CompleteMultipartUpload>`
 	rec = httptest.NewRecorder()
 	server.handle(rec, newS3TestRequest(http.MethodPost,
 		fmt.Sprintf("/bucket-etag-mm/obj?uploadId=%s", uploadID),

@@ -48,6 +48,7 @@ const (
 	s3ManifestCleanupWorkers = 16
 
 	s3PathSplitParts   = 2
+	s3RangeSplitParts  = 2
 	s3GenerationBytes  = 8
 	s3HLCPhysicalShift = 16
 
@@ -855,8 +856,8 @@ func parseS3RangeHeader(header string, totalSize int64) (start int64, end int64,
 	if strings.Contains(spec, ",") {
 		return 0, 0, false // multi-range not supported
 	}
-	parts := strings.SplitN(spec, "-", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(spec, "-", s3RangeSplitParts)
+	if len(parts) != s3RangeSplitParts {
 		return 0, 0, false
 	}
 	left := strings.TrimSpace(parts[0])
@@ -1063,29 +1064,42 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 
 	for {
 		n, readErr := r.Body.Read(buf)
-		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
-			if _, err := hasher.Write(chunk); err != nil {
-				writeS3InternalError(w, err)
-				return
+		if n == 0 {
+			if errors.Is(readErr, io.EOF) {
+				break
 			}
-			chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo)
-			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
-			cs, err := uint64FromInt(n)
-			if err != nil {
-				writeS3InternalError(w, err)
-				return
-			}
-			chunkSizes = append(chunkSizes, cs)
-			if len(pendingBatch) >= s3ChunkBatchOps {
-				if err := flushBatch(); err != nil {
-					writeS3InternalError(w, err)
+			if readErr != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(readErr, &maxBytesErr) {
+					writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
 					return
 				}
+				writeS3InternalError(w, readErr)
+				return
 			}
-			sizeBytes += int64(n)
-			chunkNo++
+			continue
 		}
+		chunk := append([]byte(nil), buf[:n]...)
+		if _, err := hasher.Write(chunk); err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+		chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo)
+		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
+		cs, err := uint64FromInt(n)
+		if err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+		chunkSizes = append(chunkSizes, cs)
+		if len(pendingBatch) >= s3ChunkBatchOps {
+			if err := flushBatch(); err != nil {
+				writeS3InternalError(w, err)
+				return
+			}
+		}
+		sizeBytes += int64(n)
+		chunkNo++
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -1144,7 +1158,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 
 //nolint:cyclop,gocognit,gocyclo // CompleteMultipartUpload validates parts, computes composite ETag, and commits atomically.
 func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, s3ChunkSize))
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1259,13 +1273,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return
 		}
 
-		manifestParts = append(manifestParts, s3ObjectPart{
-			PartNo:     desc.PartNo,
-			ETag:       desc.ETag,
-			SizeBytes:  desc.SizeBytes,
-			ChunkCount: desc.ChunkCount,
-			ChunkSizes: desc.ChunkSizes,
-		})
+		manifestParts = append(manifestParts, s3ObjectPart(desc))
 		totalSize += desc.SizeBytes
 	}
 	readPin.Release()
