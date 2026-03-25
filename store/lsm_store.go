@@ -113,6 +113,23 @@ func encodeKey(key []byte, ts uint64) []byte {
 	return k
 }
 
+// keyUpperBound returns the smallest key that is strictly greater than all
+// encoded keys with the given userKey prefix (i.e. the next lexicographic
+// prefix after key). Returns nil when the key consists entirely of 0xFF bytes
+// (no finite upper bound exists). This is used as the UpperBound in Pebble
+// IterOptions to tightly confine iteration to a single user key.
+func keyUpperBound(key []byte) []byte {
+	upper := make([]byte, len(key))
+	copy(upper, key)
+	for i := len(upper) - 1; i >= 0; i-- {
+		upper[i]++
+		if upper[i] != 0 {
+			return upper[:i+1]
+		}
+	}
+	return nil // key is all 0xFF; no finite upper bound
+}
+
 func decodeKey(k []byte) ([]byte, uint64) {
 	if len(k) < timestampSize {
 		return nil, 0
@@ -285,12 +302,9 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	lower := encodeKey(key, ts)
-	upper := encodeKey(key, 0)
-	// Append a byte to upper bound to make it exclusive and cover all timestamps
-	upper = append(upper, 0)
 	opts := &pebble.IterOptions{
 		LowerBound: lower,
-		UpperBound: upper,
+		UpperBound: keyUpperBound(key),
 	}
 	iter, err := s.db.NewIter(opts)
 	if err != nil {
@@ -606,12 +620,9 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 func (s *pebbleStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	lower := encodeKey(key, math.MaxUint64)
-	upper := encodeKey(key, 0)
-	// Append a byte to upper bound to make it exclusive and cover all timestamps
-	upper = append(upper, 0)
 	opts := &pebble.IterOptions{
 		LowerBound: lower,
-		UpperBound: upper,
+		UpperBound: keyUpperBound(key),
 	}
 	iter, err := s.db.NewIter(opts)
 	if err != nil {
