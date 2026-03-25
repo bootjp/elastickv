@@ -391,6 +391,14 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		verifyReq.Header.Set(h, r.Header.Get(h))
 	}
 
+	// Re-add X-Amz-Expires so PresignHTTP includes it in the canonical request,
+	// matching the client's original signature computation.
+	if expiresStr != "" {
+		vq := verifyReq.URL.Query()
+		vq.Set("X-Amz-Expires", expiresStr)
+		verifyReq.URL.RawQuery = vq.Encode()
+	}
+
 	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
 		opts.DisableURIPathEscaping = true
 	})

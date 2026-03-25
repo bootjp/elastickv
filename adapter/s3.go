@@ -807,11 +807,22 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 			}
 			chunkIndex, err := uint64FromInt(chunkIdx)
 			if err != nil {
+				slog.ErrorContext(r.Context(), "streamObjectChunks: uint64FromInt failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"err", err,
+				)
 				return
 			}
 			chunkKey := s3keys.BlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex)
 			chunk, err := s.store.GetAt(r.Context(), chunkKey, readTS)
 			if err != nil {
+				slog.ErrorContext(r.Context(), "streamObjectChunks: GetAt failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"chunk_key", string(chunkKey),
+					"err", err,
+				)
 				return
 			}
 			start := int64(0)
@@ -852,6 +863,10 @@ func parseS3RangeHeader(header string, totalSize int64) (start int64, end int64,
 		// suffix range: bytes=-N
 		n, err := strconv.ParseInt(right, 10, 64)
 		if err != nil || n <= 0 {
+			return 0, 0, false
+		}
+		if totalSize <= 0 {
+			// Nothing to serve from an empty object; caller should return 416.
 			return 0, 0, false
 		}
 		if n > totalSize {
@@ -1114,6 +1129,8 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			{Op: kv.Put, Key: partKey, Value: descBody},
 		},
 	}); err != nil {
+		// Clean up orphaned blob chunks so they don't accumulate in the store.
+		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo)
 		writeS3InternalError(w, err)
 		return
 	}
@@ -1138,10 +1155,19 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "at least one part is required", bucket, objectKey)
 		return
 	}
+	if len(completionReq.Parts) > s3MaxPartsPerUpload {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument",
+			fmt.Sprintf("too many parts in CompleteMultipartUpload request (maximum %d)", s3MaxPartsPerUpload), bucket, objectKey)
+		return
+	}
 
-	// Parts must be in ascending order.
-	for i := 1; i < len(completionReq.Parts); i++ {
-		if completionReq.Parts[i].PartNumber <= completionReq.Parts[i-1].PartNumber {
+	// Parts must be in ascending order, within allowed part number range.
+	for i, part := range completionReq.Parts {
+		if part.PartNumber < s3MinPartNumber || part.PartNumber > s3MaxPartNumber {
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "part number out of allowed range", bucket, objectKey)
+			return
+		}
+		if i > 0 && part.PartNumber <= completionReq.Parts[i-1].PartNumber {
 			writeS3Error(w, http.StatusBadRequest, "InvalidPartOrder", "parts must be in ascending order", bucket, objectKey)
 			return
 		}
@@ -1291,12 +1317,19 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return errors.WithStack(err)
 		}
 
-		// Atomically: write manifest, delete UploadMeta + GCUpload (fence against Abort).
+		bucketFence, err := encodeS3BucketMeta(meta)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		// Atomically: fence bucket (conflict with DELETE bucket), write manifest,
+		// delete UploadMeta + GCUpload (fence against Abort).
 		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
 				{Op: kv.Put, Key: headKey, Value: manifestBody},
 				{Op: kv.Del, Key: uploadMetaKey},
 				{Op: kv.Del, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID)},
@@ -1455,8 +1488,13 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 }
 
 func (s *S3Server) cleanupUploadPartsAsync(bucket string, generation uint64, objectKey string, uploadID string) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
 	go func() {
-		s.cleanupSem <- struct{}{}
 		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
@@ -1469,9 +1507,57 @@ func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, genera
 	s.deleteByPrefix(ctx, partPrefix, bucket, generation, objectKey, uploadID)
 }
 
-func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, objectKey string, uploadID string) {
+// cleanupPartBlobsAsync asynchronously deletes the blob chunk keys for a single
+// upload part. It is used to garbage-collect orphaned chunks when a part
+// descriptor write fails after the chunks have already been committed.
+func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objectKey string, uploadID string, partNo uint64, chunkCount uint64) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
 	go func() {
-		s.cleanupSem <- struct{}{}
+		defer func() { <-s.cleanupSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
+		defer cancel()
+		pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+				slog.ErrorContext(ctx, "cleanupPartBlobsAsync: coordinator dispatch failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"upload_id", uploadID,
+					"part_no", partNo,
+					"err", err,
+				)
+			}
+			pending = pending[:0]
+		}
+		for i := uint64(0); i < chunkCount; i++ {
+			pending = append(pending, &kv.Elem[kv.OP]{
+				Op:  kv.Del,
+				Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, partNo, i),
+			})
+			if len(pending) >= s3ChunkBatchOps {
+				flush()
+			}
+		}
+		flush()
+	}()
+}
+
+func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, objectKey string, uploadID string) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
+	go func() {
 		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
@@ -1710,8 +1796,13 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	if manifest == nil {
 		return
 	}
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
 	go func() {
-		s.cleanupSem <- struct{}{}
 		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
