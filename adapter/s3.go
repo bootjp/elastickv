@@ -213,8 +213,8 @@ type s3CompleteMultipartUploadResult struct {
 }
 
 type s3CompleteMultipartUploadRequest struct {
-	XMLName xml.Name                          `xml:"CompleteMultipartUpload"`
-	Parts   []s3CompleteMultipartUploadPart   `xml:"Part"`
+	XMLName xml.Name                        `xml:"CompleteMultipartUpload"`
+	Parts   []s3CompleteMultipartUploadPart `xml:"Part"`
 }
 
 type s3CompleteMultipartUploadPart struct {
@@ -347,6 +347,7 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 }
 
+//nolint:cyclop // handleObject routes to sub-handlers based on method+operation; branching is by design.
 func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	query := r.URL.Query()
 	uploadID := query.Get("uploadId")
@@ -788,6 +789,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength)
 }
 
+//nolint:cyclop // streamObjectChunks iterates nested part/chunk loops with necessary error-handling branches.
 func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) {
 	remaining := length
 	pos := int64(0)
@@ -799,7 +801,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 			if remaining <= 0 {
 				break
 			}
-			cs := int64(chunkSize)
+			cs := int64(chunkSize) //nolint:gosec // G115: chunkSize is bounded by s3ChunkSize which fits in int64.
 			chunkEnd := pos + cs
 			if chunkEnd <= offset {
 				pos = chunkEnd
@@ -844,6 +846,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 	}
 }
 
+//nolint:cyclop // parseS3RangeHeader handles all RFC-compliant byte-range forms; each branch is a distinct syntax.
 func parseS3RangeHeader(header string, totalSize int64) (start int64, end int64, ok bool) {
 	if !strings.HasPrefix(header, "bytes=") {
 		return 0, 0, false
@@ -1004,7 +1007,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-//nolint:cyclop // Upload part is intentionally linear and maps directly to protocol steps.
+//nolint:cyclop,gocognit // Upload part is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string, partNumberStr string) {
 	partNumber, err := strconv.Atoi(partNumberStr)
 	if err != nil || partNumber < s3MinPartNumber || partNumber > s3MaxPartNumber {
@@ -1139,7 +1142,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop,gocognit // CompleteMultipartUpload validates parts, computes composite ETag, and commits atomically.
+//nolint:cyclop,gocognit,gocyclo // CompleteMultipartUpload validates parts, computes composite ETag, and commits atomically.
 func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
 	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -1213,7 +1216,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 	totalSize := int64(0)
 
 	for i, reqPart := range completionReq.Parts {
-		partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, uint64(reqPart.PartNumber))
+		partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, uint64(reqPart.PartNumber)) //nolint:gosec // G115: PartNumber validated in [1,10000].
 		raw, err := s.store.GetAt(r.Context(), partKey, readTS)
 		if err != nil {
 			readPin.Release()
@@ -1414,6 +1417,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+//nolint:cyclop // listParts validates upload, parses pagination params, and iterates parts; branches are inherent.
 func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
 	readTS := s.readTS()
 	readPin := s.pinReadTS(readTS)
@@ -1477,11 +1481,11 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 			return
 		}
 		result.Parts = append(result.Parts, s3ListPartEntry{
-			PartNumber: int(desc.PartNo),
+			PartNumber: int(desc.PartNo), //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
 			ETag:       quoteS3ETag(desc.ETag),
 			Size:       desc.SizeBytes,
 		})
-		result.NextPartNumberMarker = int(desc.PartNo)
+		result.NextPartNumberMarker = int(desc.PartNo) //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
 	}
 
 	writeS3XML(w, http.StatusOK, result)
