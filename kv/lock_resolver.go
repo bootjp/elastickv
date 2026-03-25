@@ -92,7 +92,7 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 	}
 
 	// Scan lock key range: [!txn|lock| ... !txn|lock|<max>)
-	lockStart := txnLockKey(nil)                 // "!txn|lock|"
+	lockStart := txnLockKey(nil)                   // "!txn|lock|"
 	lockEnd := append(txnLockKey(nil), byte(0xFF)) // one past the lock namespace
 
 	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, lockResolverBatchSize, math.MaxUint64)

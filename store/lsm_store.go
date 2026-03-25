@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	timestampSize     = 8
-	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchSize = 1000
-	dirPerms          = 0755
+	timestampSize          = 8
+	valueHeaderSize        = 9 // 1 byte tombstone + 8 bytes expireAt
+	snapshotBatchSize      = 1000
+	dirPerms               = 0755
 	metaLastCommitTS       = "\x00_meta_last_commit_ts"
 	legacyMetaLastCommitTS = "_meta_last_commit_ts"
 )

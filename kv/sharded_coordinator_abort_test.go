@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/distribution"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
