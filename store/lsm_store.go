@@ -23,10 +23,14 @@ const (
 	valueHeaderSize   = 9 // 1 byte tombstone + 8 bytes expireAt
 	snapshotBatchSize = 1000
 	dirPerms          = 0755
-	metaLastCommitTS  = "_meta_last_commit_ts"
+	metaLastCommitTS       = "\x00_meta_last_commit_ts"
+	legacyMetaLastCommitTS = "_meta_last_commit_ts"
 )
 
-var metaLastCommitTSBytes = []byte(metaLastCommitTS)
+var (
+	metaLastCommitTSBytes       = []byte(metaLastCommitTS)
+	legacyMetaLastCommitTSBytes = []byte(legacyMetaLastCommitTS)
+)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 type pebbleStore struct {
@@ -120,6 +124,19 @@ func decodeKey(k []byte) ([]byte, uint64) {
 	return key, ^invTs
 }
 
+// decodeKeyUnsafe returns a slice referencing the underlying storage without
+// copying. The returned key is only valid until the iterator advances or the
+// source buffer is reused. Use decodeKey when the key must outlive the
+// iterator step (e.g., when stored in results).
+func decodeKeyUnsafe(k []byte) ([]byte, uint64) {
+	if len(k) < timestampSize {
+		return nil, 0
+	}
+	keyLen := len(k) - timestampSize
+	invTs := binary.BigEndian.Uint64(k[keyLen:])
+	return k[:keyLen], ^invTs
+}
+
 // Value encoding: We use gob to encode VersionedValue structure minus the key/ts which are in the key.
 type storedValue struct {
 	Value     []byte
@@ -154,13 +171,30 @@ func decodeValue(data []byte) (storedValue, error) {
 	}, nil
 }
 
+// isMetaKey returns true for internal meta keys that must be skipped during
+// user-key iteration and compaction. Covers both the current \x00-prefixed key
+// and the legacy key for backward compatibility with existing on-disk stores.
+func isMetaKey(rawKey []byte) bool {
+	return bytes.Equal(rawKey, metaLastCommitTSBytes) ||
+		bytes.Equal(rawKey, legacyMetaLastCommitTSBytes)
+}
+
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
-	// This is expensive on large DBs. Ideally, persist LastCommitTS in a special key.
-	// iterating the whole DB is not feasible for large datasets.
-	// For this task, we will persist LastCommitTS in a special meta key "_meta_last_commit_ts"
-	// whenever we update it (or periodically).
-	// For now, let's look for that key.
+	// Try the current meta key first.
 	val, closer, err := s.db.Get(metaLastCommitTSBytes)
+	if err == nil {
+		defer closer.Close()
+		if len(val) >= timestampSize {
+			return binary.LittleEndian.Uint64(val), nil
+		}
+		return 0, nil
+	}
+	if !errors.Is(err, pebble.ErrNotFound) {
+		return 0, errors.WithStack(err)
+	}
+
+	// Fall back to legacy key for stores created before the namespace change.
+	val, closer, err = s.db.Get(legacyMetaLastCommitTSBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return 0, nil
@@ -171,7 +205,25 @@ func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	if len(val) < timestampSize {
 		return 0, nil
 	}
-	return binary.LittleEndian.Uint64(val), nil
+	ts := binary.LittleEndian.Uint64(val)
+
+	// Migrate: write under the new key and delete the legacy key.
+	buf := make([]byte, timestampSize)
+	binary.LittleEndian.PutUint64(buf, ts)
+	b := s.db.NewBatch()
+	if err := b.Set(metaLastCommitTSBytes, buf, nil); err != nil {
+		b.Close()
+		return ts, nil // migration failed, still return the value
+	}
+	if err := b.Delete(legacyMetaLastCommitTSBytes, nil); err != nil {
+		b.Close()
+		return ts, nil
+	}
+	if err := b.Commit(pebble.Sync); err != nil {
+		return ts, nil
+	}
+
+	return ts, nil
 }
 
 func (s *pebbleStore) saveLastCommitTSToBatch(b *pebble.Batch, ts uint64) error {
@@ -250,7 +302,7 @@ func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 
 	if iter.SeekGE(seekKey) {
 		k := iter.Key()
-		userKey, _ := decodeKey(k)
+		userKey, _ := decodeKeyUnsafe(k)
 
 		if !bytes.Equal(userKey, key) {
 			// Moved to next user key
@@ -313,7 +365,7 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 		return false
 	}
 	k := iter.Key()
-	currentUserKey, _ := decodeKey(k)
+	currentUserKey, _ := decodeKeyUnsafe(k)
 	return bytes.Equal(currentUserKey, userKey)
 }
 
@@ -322,7 +374,7 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 		return false
 	}
 	k := iter.Key()
-	u, _ := decodeKey(k)
+	u, _ := decodeKeyUnsafe(k)
 	if bytes.Equal(u, userKey) {
 		return iter.Next()
 	}
@@ -336,7 +388,7 @@ func pastScanEnd(userKey, end []byte) bool {
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if bytes.Equal(rawKey, metaLastCommitTSBytes) {
+		if isMetaKey(rawKey) {
 			if !iter.Next() {
 				return nil, 0, false
 			}
@@ -357,7 +409,7 @@ func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if bytes.Equal(rawKey, metaLastCommitTSBytes) {
+		if isMetaKey(rawKey) {
 			if !iter.Prev() {
 				return nil, false
 			}
@@ -473,7 +525,7 @@ func (s *pebbleStore) nextReverseScanKV(
 	if !iter.SeekGE(encodeKey(userKey, ts)) {
 		return nil, false, true, nil
 	}
-	currentUserKey, _ := decodeKey(iter.Key())
+	currentUserKey, _ := decodeKeyUnsafe(iter.Key())
 	if !bytes.Equal(currentUserKey, userKey) {
 		nextValid := iter.SeekLT(encodeKey(userKey, math.MaxUint64))
 		return nil, nextValid, false, nil
@@ -569,7 +621,7 @@ func (s *pebbleStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, b
 
 	if iter.First() {
 		k := iter.Key()
-		userKey, version := decodeKey(k)
+		userKey, version := decodeKeyUnsafe(k)
 		if bytes.Equal(userKey, key) {
 			return version, true, nil
 		}
@@ -659,13 +711,13 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 		}
 
 		raw := iter.Key()
-		userKey, ts := decodeKey(raw)
+		userKey, ts := decodeKeyUnsafe(raw)
 		if userKey == nil {
 			continue
 		}
 
 		// Skip meta keys.
-		if bytes.Equal(raw, metaLastCommitTSBytes) {
+		if isMetaKey(raw) {
 			continue
 		}
 
