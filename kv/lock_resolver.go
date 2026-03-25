@@ -16,6 +16,9 @@ const (
 	lockResolverInterval = 10 * time.Second
 	// lockResolverBatchSize limits the number of locks scanned per group per cycle.
 	lockResolverBatchSize = 100
+	// txnNamespaceSentinel is appended to a namespace prefix key to produce a
+	// key that sorts just after all valid keys in that namespace.
+	txnNamespaceSentinel byte = 0xFF
 )
 
 // LockResolver periodically scans for expired transaction locks and resolves
@@ -92,8 +95,8 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 	}
 
 	// Scan lock key range: [!txn|lock| ... !txn|lock|<max>)
-	lockStart := txnLockKey(nil)                   // "!txn|lock|"
-	lockEnd := append(txnLockKey(nil), byte(0xFF)) // one past the lock namespace
+	lockStart := txnLockKey(nil)                             // "!txn|lock|"
+	lockEnd := append(txnLockKey(nil), txnNamespaceSentinel) // one past the lock namespace
 
 	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, lockResolverBatchSize, math.MaxUint64)
 	if err != nil {
@@ -103,9 +106,8 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 	var resolved, skipped int
 	for _, kvp := range lockKVs {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return errors.WithStack(ctx.Err())
 		}
-
 		userKey, ok := txnUserKeyFromLockKey(kvp.Key)
 		if !ok {
 			continue

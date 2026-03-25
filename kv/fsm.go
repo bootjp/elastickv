@@ -95,17 +95,20 @@ func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
 		}
 		return cmd.Requests, nil
 	default:
-		// Legacy format (no prefix byte) — try both for backward compatibility.
-		cmd := &pb.RaftCommand{}
-		if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
-			return cmd.Requests, nil
-		}
-		req := &pb.Request{}
-		if err := proto.Unmarshal(data, req); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return []*pb.Request{req}, nil
+		return decodeLegacyRaftRequest(data)
 	}
+}
+
+func decodeLegacyRaftRequest(data []byte) ([]*pb.Request, error) {
+	cmd := &pb.RaftCommand{}
+	if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
+		return cmd.Requests, nil
+	}
+	req := &pb.Request{}
+	if err := proto.Unmarshal(data, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return []*pb.Request{req}, nil
 }
 
 func requestCommitTS(r *pb.Request) (uint64, error) {

@@ -305,6 +305,29 @@ func joinClusterWaitError(err error) error {
 	return err
 }
 
+func setupFSMStore(cfg config, cleanup *internalutil.CleanupStack) (store.MVCCStore, error) {
+	var st store.MVCCStore
+	var err error
+	if cfg.raftDataDir != "" {
+		st, err = store.NewPebbleStore(filepath.Join(cfg.raftDataDir, "fsm.db"))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+	} else {
+		fsmDir, tmpErr := os.MkdirTemp("", "elastickv-fsm-*")
+		if tmpErr != nil {
+			return nil, errors.WithStack(tmpErr)
+		}
+		cleanup.Add(func() { os.RemoveAll(fsmDir) })
+		st, err = store.NewPebbleStore(fsmDir)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
+	cleanup.Add(func() { st.Close() })
+	return st, nil
+}
+
 func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
 	if dir == "" {
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
@@ -376,24 +399,10 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	var st store.MVCCStore
-	if cfg.raftDataDir != "" {
-		st, err = store.NewPebbleStore(filepath.Join(cfg.raftDataDir, "fsm.db"))
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	} else {
-		fsmDir, tmpErr := os.MkdirTemp("", "elastickv-fsm-*")
-		if tmpErr != nil {
-			return errors.WithStack(tmpErr)
-		}
-		cleanup.Add(func() { os.RemoveAll(fsmDir) })
-		st, err = store.NewPebbleStore(fsmDir)
-		if err != nil {
-			return errors.WithStack(err)
-		}
+	st, err := setupFSMStore(cfg, &cleanup)
+	if err != nil {
+		return err
 	}
-	cleanup.Add(func() { st.Close() })
 	fsm := kv.NewKvFSM(st)
 	readTracker := kv.NewActiveTimestampTracker()
 

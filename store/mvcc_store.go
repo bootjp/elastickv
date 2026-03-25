@@ -48,6 +48,11 @@ type mvccSnapshotEntry struct {
 	Versions []VersionedValue
 }
 
+type compactEntry struct {
+	key         []byte
+	newVersions []VersionedValue
+}
+
 func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
@@ -61,16 +66,6 @@ func byteSliceComparator(a, b any) int {
 	default:
 		return 0
 	}
-}
-
-func withinBoundsKey(k, start, end []byte) bool {
-	if start != nil && bytes.Compare(k, start) < 0 {
-		return false
-	}
-	if end != nil && bytes.Compare(k, end) > 0 {
-		return false
-	}
-	return true
 }
 
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
@@ -301,30 +296,19 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 	return true, nil
 }
 
-func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	if readTSCompacted(ts, s.minRetainedTS) {
-		return nil, ErrReadTSCompacted
-	}
-
-	if limit <= 0 {
-		return []*KVPair{}, nil
-	}
-
+func computeScanCapHint(treeSize, limit int) int {
 	capHint := boundedScanResultCapacity(limit)
-	if size := s.tree.Size(); size < capHint {
-		capHint = size
+	if treeSize < capHint {
+		capHint = treeSize
 	}
 	if capHint < 0 {
 		capHint = 0
 	}
+	return capHint
+}
 
+func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) []*KVPair {
 	result := make([]*KVPair, 0, capHint)
-	it := s.tree.Iterator()
-	if !seekForwardIteratorStart(s.tree, &it, start) {
-		return result, nil
-	}
 	for ok := true; ok && len(result) < limit; ok = it.Next() {
 		k, keyOK := it.Key().([]byte)
 		if !keyOK {
@@ -343,8 +327,26 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 			Value: bytes.Clone(val),
 		})
 	}
+	return result
+}
 
-	return result, nil
+func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
+
+	if limit <= 0 {
+		return []*KVPair{}, nil
+	}
+
+	capHint := computeScanCapHint(s.tree.Size(), limit)
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return make([]*KVPair, 0, capHint), nil
+	}
+	return s.collectScanResults(&it, end, limit, capHint, ts), nil
 }
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.
@@ -941,15 +943,8 @@ func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue,
 
 const compactScanBatchSize = 500
 
-func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
-	// Phase 1: Scan under RLock to collect keys that need compaction.
-	type compactEntry struct {
-		key         []byte
-		newVersions []VersionedValue
-	}
-
+func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 	var pending []compactEntry
-
 	s.mtx.RLock()
 	it := s.tree.Iterator()
 	for it.Next() {
@@ -961,8 +956,6 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 		if !ok {
 			continue
 		}
-		// Skip transaction internal keys — their lifecycle is managed by
-		// lock resolution, not MVCC compaction.
 		if bytes.HasPrefix(keyBytes, TxnInternalKeyPrefix) {
 			continue
 		}
@@ -975,12 +968,10 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 		}
 	}
 	s.mtx.RUnlock()
+	return pending
+}
 
-	if len(pending) == 0 {
-		return nil
-	}
-
-	// Phase 2: Apply updates in batches under Lock to minimize blocking.
+func (s *mvccStore) compactPhase2(pending []compactEntry, minTS uint64) int {
 	updatedTotal := 0
 	for i := 0; i < len(pending); i += compactScanBatchSize {
 		end := i + compactScanBatchSize
@@ -991,8 +982,6 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 
 		s.mtx.Lock()
 		for _, e := range batch {
-			// Re-check: concurrent writes may have added newer versions since
-			// the RLock scan. Re-compact against the current version chain.
 			cur, found := s.tree.Get(e.key)
 			if !found {
 				continue
@@ -1009,6 +998,17 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 		}
 		s.mtx.Unlock()
 	}
+	return updatedTotal
+}
+
+func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
+	pending := s.compactPhase1(minTS)
+
+	if len(pending) == 0 {
+		return nil
+	}
+
+	updatedTotal := s.compactPhase2(pending, minTS)
 
 	s.mtx.Lock()
 	if minTS > s.minRetainedTS {
