@@ -939,9 +939,6 @@ func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 		if !ok {
 			continue
 		}
-		if bytes.HasPrefix(keyBytes, txnInternalKeyPrefix) {
-			continue
-		}
 		if compactKeepIndex(versions, minTS) >= 0 {
 			pending = append(pending, compactEntry{
 				key: bytes.Clone(keyBytes),

@@ -901,7 +901,10 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	}
 
 	// Compute the new lastCommitTS without mutating in-memory state yet.
+	// Read under mtx to synchronize with PutAt/alignCommitTS.
+	s.mtx.RLock()
 	newLastTS := s.lastCommitTS
+	s.mtx.RUnlock()
 	if commitTS > newLastTS {
 		newLastTS = commitTS
 	}
@@ -1032,12 +1035,6 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 
 		rawKey := iter.Key()
 		if isPebbleMetaKey(rawKey) {
-			continue
-		}
-		// Skip transaction internal keys — their lifecycle is managed by
-		// lock resolution, not MVCC compaction.
-		userKey, _ := decodeKeyView(rawKey)
-		if userKey != nil && bytes.HasPrefix(userKey, txnInternalKeyPrefix) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {
