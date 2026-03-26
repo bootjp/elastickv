@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -13,6 +14,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 )
+
+const proxyForwardTimeout = 5 * time.Second
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -86,6 +89,11 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 	return v != nil, nil
 }
 
+// ScanAt scans keys across shards at the given timestamp. Note: when the range
+// spans multiple shards, each shard may have a different Raft apply position.
+// This means the returned view is NOT a globally consistent snapshot — it is
+// a best-effort point-in-time scan. Callers requiring cross-shard consistency
+// should use a transaction or implement a cross-shard snapshot fence.
 func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
@@ -511,6 +519,8 @@ func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key
 		return 0, false, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
 	if err != nil {
@@ -1215,6 +1225,8 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if err != nil {
@@ -1250,6 +1262,8 @@ func (s *ShardStore) proxyRawScanAt(
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
 		StartKey: start,
