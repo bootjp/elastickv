@@ -895,12 +895,12 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	}, nil
 }
 
-func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+// compactKeepIndex returns the index from which versions should be kept when
+// compacting with the given minTS. Returns -1 when no compaction is needed.
+func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
 	if len(versions) == 0 {
-		return versions, false
+		return -1
 	}
-
-	// Find the latest version that is <= minTS
 	keepIdx := -1
 	for i := len(versions) - 1; i >= 0; i-- {
 		if versions[i].TS <= minTS {
@@ -908,19 +908,17 @@ func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue,
 			break
 		}
 	}
+	if keepIdx <= 0 {
+		return -1
+	}
+	return keepIdx
+}
 
-	// If all versions are newer than minTS, keep everything
-	if keepIdx == -1 {
+func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+	keepIdx := compactKeepIndex(versions, minTS)
+	if keepIdx < 0 {
 		return versions, false
 	}
-
-	// If the oldest version is the one to keep, we can't remove anything before it
-	if keepIdx == 0 {
-		return versions, false
-	}
-
-	// We keep versions starting from keepIdx
-	// The version at keepIdx represents the state at minTS.
 	newVersions := make([]VersionedValue, len(versions)-keepIdx)
 	copy(newVersions, versions[keepIdx:])
 	return newVersions, true
@@ -944,8 +942,7 @@ func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 		if bytes.HasPrefix(keyBytes, txnInternalKeyPrefix) {
 			continue
 		}
-		_, changed := compactVersions(versions, minTS)
-		if changed {
+		if compactKeepIndex(versions, minTS) >= 0 {
 			pending = append(pending, compactEntry{
 				key: bytes.Clone(keyBytes),
 			})

@@ -61,6 +61,7 @@ type pebbleStore struct {
 	minRetainedTS        uint64
 	pendingMinRetainedTS uint64
 	mtx                  sync.RWMutex
+	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu        sync.Mutex
 	dir                  string
 }
@@ -887,7 +888,11 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	// Write Batch
+	// Serialize conflict check → batch commit so concurrent ApplyMutations
+	// cannot both pass checkConflicts and then both commit.
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	b := s.db.NewBatch()
 	defer b.Close()
 
@@ -896,9 +901,7 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	}
 
 	// Compute the new lastCommitTS without mutating in-memory state yet.
-	s.mtx.RLock()
 	newLastTS := s.lastCommitTS
-	s.mtx.RUnlock()
 	if commitTS > newLastTS {
 		newLastTS = commitTS
 	}
