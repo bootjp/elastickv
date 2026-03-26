@@ -264,18 +264,14 @@ func normalizeS3PayloadHash(raw string) string {
 const s3PresignMaxExpiry = 7 * 24 * 60 * 60 // 604800 seconds (7 days)
 
 // checkPresignExpiry validates the expiry of a presigned request.
-// It returns an *s3AuthError if the request has expired or the expiry is invalid.
+// It returns an *s3AuthError if X-Amz-Expires is missing, invalid, or the URL has expired.
 func checkPresignExpiry(expiresStr string, signingTime time.Time) *s3AuthError {
 	if expiresStr == "" {
-		// No explicit expiry: fall back to clock skew check.
-		skew := time.Now().UTC().Sub(signingTime.UTC())
-		if skew < 0 {
-			skew = -skew
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "AuthorizationQueryParametersError",
+			Message: "X-Amz-Expires is required for presigned URLs",
 		}
-		if skew > s3RequestTimeMaxSkew {
-			return &s3AuthError{Status: http.StatusForbidden, Code: "AccessDenied", Message: "presigned URL has expired"}
-		}
-		return nil
 	}
 	expires, err := strconv.Atoi(expiresStr)
 	if err != nil || expires <= 0 || expires > s3PresignMaxExpiry {

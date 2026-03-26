@@ -878,6 +878,97 @@ func TestS3Server_RangeReadEmptyObject(t *testing.T) {
 	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
 }
 
+func TestS3Server_HeadWithRange(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-head-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := "hello ranged head"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-head-range/obj.txt", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// HEAD with valid Range: expect 206 + Content-Range, no body.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodHead, "/bucket-head-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+	require.Equal(t, "bytes 0-4/17", rec.Header().Get("Content-Range"))
+	require.Equal(t, "5", rec.Header().Get("Content-Length"))
+	require.Empty(t, rec.Body.String())
+
+	// HEAD with out-of-range Range: expect 416 + Content-Range header.
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodHead, "/bucket-head-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=999-1000")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+	require.Equal(t, "bytes */17", rec.Header().Get("Content-Range"))
+}
+
+func TestS3Server_InvalidRangeContentRangeHeader(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-inv-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := "abcdefghij" // 10 bytes
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-inv-range/obj.txt", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// GET with out-of-range Range: 416 response must include Content-Range header.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-inv-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=100-200")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+	require.Equal(t, "bytes */10", rec.Header().Get("Content-Range"))
+}
+
+func TestS3Server_PresignedURLMissingExpires(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Build a presigned URL without X-Amz-Expires: server must reject it.
+	signingTime := currentS3SigningTime()
+	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket/obj.txt", nil)
+	require.NoError(t, err)
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	creds := aws.Credentials{AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test"}
+	presignedURL, _, err := signer.PresignHTTP(context.Background(), creds, presignReq,
+		s3UnsignedPayload, "s3", testS3Region, signingTime)
+	require.NoError(t, err)
+
+	parsedURL, err := url.Parse(presignedURL)
+	require.NoError(t, err)
+	presignGetReq := newS3TestRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	presignGetReq.Host = "localhost"
+	rec := httptest.NewRecorder()
+	server.handle(rec, presignGetReq)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "AuthorizationQueryParametersError")
+	require.Contains(t, rec.Body.String(), "X-Amz-Expires")
+}
+
 func TestS3Server_MultipartUploadETagComputation(t *testing.T) {
 	t.Parallel()
 
@@ -1094,6 +1185,10 @@ func TestS3Server_PresignedURL(t *testing.T) {
 	// Build a presigned GET URL using a proper absolute URL.
 	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket-presign/obj.txt", nil)
 	require.NoError(t, err)
+	// Set X-Amz-Expires to satisfy the server's presigned URL requirement (900 s validity).
+	presignQuery := presignReq.URL.Query()
+	presignQuery.Set("X-Amz-Expires", "900")
+	presignReq.URL.RawQuery = presignQuery.Encode()
 	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
 		opts.DisableURIPathEscaping = true
 	})
@@ -1134,11 +1229,16 @@ func TestS3Server_PresignedURLExpired(t *testing.T) {
 		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
 	)
 
-	// Build a presigned URL with the default 900s expiry that's already expired.
-	// Signing 20 minutes ago means expiry was 5 minutes ago.
+	// Build a presigned URL with a 60 s expiry that's already expired.
+	// Signing 20 minutes ago means expiry was ~19 minutes ago.
 	oldTime := time.Now().UTC().Add(-20 * time.Minute)
 	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket-presign/obj.txt", nil)
 	require.NoError(t, err)
+	// Set a 60 s expiry that will have elapsed given the signing time of 20 minutes ago,
+	// ensuring the presigned URL is expired when the server validates it.
+	presignQuery := presignReq.URL.Query()
+	presignQuery.Set("X-Amz-Expires", "60")
+	presignReq.URL.RawQuery = presignQuery.Encode()
 	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
 		opts.DisableURIPathEscaping = true
 	})

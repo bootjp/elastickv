@@ -3,7 +3,7 @@
 ## Priority 1 (Critical)
 
 - [x] 1. createMultipartUpload の IsTxn=true 化 — 分散環境での原子性保証
-- [x] 2. セマフォ満杯時の GC 回復 — goroutine内でブロッキング待機に変更
+- [x] 2. セマフォ満杯時の GC 回復 — non-blocking select でセマフォ満杯時に cleanup を skip（goroutine スポーン前に semaphore 取得済み、無限 goroutine 蓄積を防止）
 - [x] 3. completeMultipartUpload リトライ最適化 — パート検証を retry 外へ分離
 
 ## Priority 2 (Medium)
