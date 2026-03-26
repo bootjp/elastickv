@@ -86,10 +86,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if len(b) > maxMarshaledCommandSize {
 			return nil, errors.New("marshaled request too large")
 		}
-		out := make([]byte, 1, 1+len(b))
-		out[0] = raftEncodeSingle
-		out = append(out, b...)
-		return out, nil
+		return prependByte(raftEncodeSingle, b), nil
 	}
 	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
 	if err != nil {
@@ -98,10 +95,15 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 	if len(b) > maxMarshaledCommandSize {
 		return nil, errors.New("marshaled request batch too large")
 	}
-	out := make([]byte, 1, 1+len(b))
-	out[0] = raftEncodeBatch
-	out = append(out, b...)
-	return out, nil
+	return prependByte(raftEncodeBatch, b), nil
+}
+
+// prependByte returns a new slice with prefix followed by data.
+func prependByte(prefix byte, data []byte) []byte {
+	out := make([]byte, len(data)+1)
+	out[0] = prefix
+	copy(out[1:], data)
+	return out
 }
 
 // applyRequests submits one raft command and returns per-request FSM results.

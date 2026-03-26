@@ -7,8 +7,9 @@ import (
 
 const (
 	// TxnKeyPrefix is the common prefix shared by all transaction internal
-	// key namespaces. It is exported so that the store package can reference
-	// it for compaction skipping without duplicating the literal.
+	// key namespaces. All per-namespace prefixes below are derived from it.
+	// NOTE: store/store.go duplicates this literal as txnInternalKeyPrefix
+	// because an import cycle prevents store from importing kv.
 	TxnKeyPrefix = "!txn|"
 
 	txnLockPrefix     = TxnKeyPrefix + "lock|"
