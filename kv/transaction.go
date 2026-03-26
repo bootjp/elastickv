@@ -83,7 +83,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		if len(b) > maxMarshaledCommandSize {
+		if len(b) >= maxMarshaledCommandSize {
 			return nil, errors.New("marshaled request too large")
 		}
 		return prependByte(raftEncodeSingle, b), nil
@@ -92,7 +92,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if len(b) > maxMarshaledCommandSize {
+	if len(b) >= maxMarshaledCommandSize {
 		return nil, errors.New("marshaled request batch too large")
 	}
 	return prependByte(raftEncodeBatch, b), nil

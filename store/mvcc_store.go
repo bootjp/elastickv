@@ -56,8 +56,7 @@ type mvccSnapshotEntry struct {
 }
 
 type compactEntry struct {
-	key         []byte
-	newVersions []VersionedValue
+	key []byte
 }
 func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
@@ -944,11 +943,10 @@ func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 		if bytes.HasPrefix(keyBytes, txnInternalKeyPrefix) {
 			continue
 		}
-		newVersions, changed := compactVersions(versions, minTS)
+		_, changed := compactVersions(versions, minTS)
 		if changed {
 			pending = append(pending, compactEntry{
-				key:         bytes.Clone(keyBytes),
-				newVersions: newVersions,
+				key: bytes.Clone(keyBytes),
 			})
 		}
 	}
@@ -989,11 +987,10 @@ func (s *mvccStore) compactPhase2(pending []compactEntry, minTS uint64) int {
 func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 	pending := s.compactPhase1(minTS)
 
-	if len(pending) == 0 {
-		return nil
+	updatedTotal := 0
+	if len(pending) > 0 {
+		updatedTotal = s.compactPhase2(pending, minTS)
 	}
-
-	updatedTotal := s.compactPhase2(pending, minTS)
 
 	s.mtx.Lock()
 	if minTS > s.minRetainedTS {
