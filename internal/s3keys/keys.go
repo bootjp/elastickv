@@ -96,6 +96,34 @@ func BlobKey(bucket string, generation uint64, object string, uploadID string, p
 	return buildObjectKey(blobPrefixBytes, bucket, generation, object, uploadID, partNo, chunkNo)
 }
 
+// VersionedBlobKey returns the blob key for a specific part attempt identified by
+// partVersion (typically the part's commit timestamp). When partVersion is 0 the
+// result is identical to BlobKey, preserving backward compatibility with data
+// written before versioned keys were introduced. When partVersion is non-zero the
+// key includes an extra u64 suffix so concurrent re-uploads of the same part
+// (e.g. retry or parallel UploadPart for the same partNo) write to a distinct key
+// space, making blob data immutable per attempt.
+func VersionedBlobKey(bucket string, generation uint64, object string, uploadID string, partNo uint64, chunkNo uint64, partVersion uint64) []byte {
+	if partVersion == 0 {
+		return BlobKey(bucket, generation, object, uploadID, partNo, chunkNo)
+	}
+	// Capacity breakdown:
+	//   - len(BlobPrefix)               prefix bytes
+	//   - len(bucket)+len(object)+len(uploadID)  segment content
+	//   - buildObjectExtraBytes         escape/terminator overhead for 3 segments (bucket, object, uploadID)
+	//   - 4*u64Bytes                    four fixed-width u64 fields: generation, partNo, chunkNo, partVersion
+	out := make([]byte, 0, len(BlobPrefix)+len(bucket)+len(object)+len(uploadID)+buildObjectExtraBytes+4*u64Bytes)
+	out = append(out, blobPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	out = appendU64(out, partNo)
+	out = appendU64(out, chunkNo)
+	out = appendU64(out, partVersion)
+	return out
+}
+
 func GCUploadKey(bucket string, generation uint64, object string, uploadID string) []byte {
 	return buildObjectKey(gcUploadPrefixBytes, bucket, generation, object, uploadID, 0, 0)
 }

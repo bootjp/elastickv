@@ -95,11 +95,12 @@ type s3ObjectManifest struct {
 }
 
 type s3ObjectPart struct {
-	PartNo     uint64   `json:"part_no"`
-	ETag       string   `json:"etag"`
-	SizeBytes  int64    `json:"size_bytes"`
-	ChunkCount uint64   `json:"chunk_count"`
-	ChunkSizes []uint64 `json:"chunk_sizes,omitempty"`
+	PartNo      uint64   `json:"part_no"`
+	ETag        string   `json:"etag"`
+	SizeBytes   int64    `json:"size_bytes"`
+	ChunkCount  uint64   `json:"chunk_count"`
+	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion uint64   `json:"part_version,omitempty"`
 }
 
 type s3ContinuationToken struct {
@@ -189,11 +190,12 @@ type s3UploadMeta struct {
 }
 
 type s3PartDescriptor struct {
-	PartNo     uint64   `json:"part_no"`
-	ETag       string   `json:"etag"`
-	SizeBytes  int64    `json:"size_bytes"`
-	ChunkCount uint64   `json:"chunk_count"`
-	ChunkSizes []uint64 `json:"chunk_sizes,omitempty"`
+	PartNo      uint64   `json:"part_no"`
+	ETag        string   `json:"etag"`
+	SizeBytes   int64    `json:"size_bytes"`
+	ChunkCount  uint64   `json:"chunk_count"`
+	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion uint64   `json:"part_version,omitempty"`
 }
 
 type s3InitiateMultipartUploadResult struct {
@@ -761,23 +763,43 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 
 	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
-	if headOnly || rangeHeader == "" {
-		writeS3ObjectHeaders(w.Header(), manifest)
-		if rangeHeader != "" {
-			w.Header().Set("Accept-Ranges", "bytes")
-		}
-		w.WriteHeader(http.StatusOK)
-		if headOnly {
+
+	// HEAD requests: mirror GET range semantics but never write a body.
+	if headOnly {
+		if rangeHeader == "" {
+			writeS3ObjectHeaders(w.Header(), manifest)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
+		rangeStart, rangeEnd, ok := parseS3RangeHeader(rangeHeader, manifest.SizeBytes)
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.SizeBytes))
+			writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
+				"range not satisfiable", bucket, objectKey)
+			return
+		}
+		contentLength := rangeEnd - rangeStart + 1
+		writeS3ObjectHeaders(w.Header(), manifest)
+		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		return
+	}
+
+	// GET without Range: stream the full object.
+	if rangeHeader == "" {
+		writeS3ObjectHeaders(w.Header(), manifest)
+		w.WriteHeader(http.StatusOK)
 		s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes)
 		return
 	}
 
 	rangeStart, rangeEnd, ok := parseS3RangeHeader(rangeHeader, manifest.SizeBytes)
 	if !ok {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.SizeBytes))
 		writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
-			fmt.Sprintf("bytes */%d", manifest.SizeBytes), bucket, objectKey)
+			"range not satisfiable", bucket, objectKey)
 		return
 	}
 
@@ -817,7 +839,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 				)
 				return
 			}
-			chunkKey := s3keys.BlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex)
+			chunkKey := s3keys.VersionedBlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex, part.PartVersion)
 			chunk, err := s.store.GetAt(r.Context(), chunkKey, readTS)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "streamObjectChunks: GetAt failed",
@@ -1043,6 +1065,22 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, s3MaxPartSizeBytes)
+
+	// Pre-allocate the part's commit timestamp before writing any blob chunks so
+	// that the same version identifier is used for every chunk in this attempt.
+	// Embedding partCommitTS as PartVersion in the blob keys isolates each
+	// UploadPart attempt in its own key space: a concurrent or retried request
+	// for the same partNo receives a different timestamp and therefore writes to
+	// different keys, leaving the chunk data referenced by an in-progress
+	// CompleteMultipartUpload untouched.
+	partReadTS := s.readTS()
+	partStartTS := s.txnStartTS(partReadTS)
+	partCommitTS, err := s.nextTxnCommitTS(partStartTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+
 	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
 	sizeBytes := int64(0)
 	chunkNo := uint64(0)
@@ -1084,7 +1122,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			writeS3InternalError(w, err)
 			return
 		}
-		chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo)
+		chunkKey := s3keys.VersionedBlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
 		cs, err := uint64FromInt(n)
 		if err != nil {
@@ -1120,11 +1158,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 
 	etag := hex.EncodeToString(hasher.Sum(nil))
 	partDesc := &s3PartDescriptor{
-		PartNo:     partNo,
-		ETag:       etag,
-		SizeBytes:  sizeBytes,
-		ChunkCount: chunkNo,
-		ChunkSizes: chunkSizes,
+		PartNo:      partNo,
+		ETag:        etag,
+		SizeBytes:   sizeBytes,
+		ChunkCount:  chunkNo,
+		ChunkSizes:  chunkSizes,
+		PartVersion: partCommitTS,
 	}
 	descBody, err := json.Marshal(partDesc)
 	if err != nil {
@@ -1132,22 +1171,16 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, partNo)
-	startTS := s.txnStartTS(readTS)
-	partCommitTS, err := s.nextTxnCommitTS(startTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
 	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  startTS,
+		StartTS:  partStartTS,
 		CommitTS: partCommitTS,
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: partKey, Value: descBody},
 		},
 	}); err != nil {
 		// Clean up orphaned blob chunks so they don't accumulate in the store.
-		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo)
+		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		writeS3InternalError(w, err)
 		return
 	}
@@ -1522,7 +1555,8 @@ func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, genera
 // cleanupPartBlobsAsync asynchronously deletes the blob chunk keys for a single
 // upload part. It is used to garbage-collect orphaned chunks when a part
 // descriptor write fails after the chunks have already been committed.
-func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objectKey string, uploadID string, partNo uint64, chunkCount uint64) {
+// partVersion must match the value used when writing the chunk keys.
+func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objectKey string, uploadID string, partNo uint64, chunkCount uint64, partVersion uint64) {
 	select {
 	case s.cleanupSem <- struct{}{}:
 	default:
@@ -1552,7 +1586,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 		for i := uint64(0); i < chunkCount; i++ {
 			pending = append(pending, &kv.Elem[kv.OP]{
 				Op:  kv.Del,
-				Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, partNo, i),
+				Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion),
 			})
 			if len(pending) >= s3ChunkBatchOps {
 				flush()
@@ -1859,7 +1893,7 @@ func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, 
 		}
 		pending = append(pending, &kv.Elem[kv.OP]{
 			Op:  kv.Del,
-			Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex),
+			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
 		})
 		if len(pending) >= s3ChunkBatchOps {
 			flush()

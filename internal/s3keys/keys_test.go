@@ -149,6 +149,41 @@ func TestUploadPartPrefixForUpload_IsPrefixOfPartKeys(t *testing.T) {
 	require.False(t, bytes.HasPrefix(otherKey, prefix))
 }
 
+func TestVersionedBlobKey_ZeroVersionMatchesBlobKey(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-v"
+	generation := uint64(5)
+	object := "file.bin"
+	uploadID := "upload-v"
+	partNo := uint64(2)
+	chunkNo := uint64(3)
+
+	// VersionedBlobKey with version=0 must produce the same key as BlobKey.
+	require.Equal(t, BlobKey(bucket, generation, object, uploadID, partNo, chunkNo),
+		VersionedBlobKey(bucket, generation, object, uploadID, partNo, chunkNo, 0))
+}
+
+func TestVersionedBlobKey_NonZeroVersionDiffersFromBlobKey(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-v"
+	generation := uint64(5)
+	object := "file.bin"
+	uploadID := "upload-v"
+	partNo := uint64(2)
+	chunkNo := uint64(3)
+	version := uint64(999)
+
+	versionedKey := VersionedBlobKey(bucket, generation, object, uploadID, partNo, chunkNo, version)
+	unversionedKey := BlobKey(bucket, generation, object, uploadID, partNo, chunkNo)
+	require.NotEqual(t, unversionedKey, versionedKey)
+
+	// Different part versions must produce different keys.
+	otherVersionKey := VersionedBlobKey(bucket, generation, object, uploadID, partNo, chunkNo, version+1)
+	require.NotEqual(t, versionedKey, otherVersionKey)
+}
+
 func TestBlobPrefixForUpload_IsPrefixOfBlobKeys(t *testing.T) {
 	t.Parallel()
 
