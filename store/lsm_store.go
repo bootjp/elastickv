@@ -463,16 +463,15 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 		return nil, ErrReadTSCompacted
 	}
 
+	seekKey := encodeKey(key, ts)
 	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: encodeKey(key, ts),
+		LowerBound: seekKey,
 		UpperBound: keyUpperBound(key),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	defer iter.Close()
-
-	seekKey := encodeKey(key, ts)
 
 	if iter.SeekGE(seekKey) {
 		k := iter.Key()
@@ -566,7 +565,7 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 }
 
 func pastScanEnd(userKey, end []byte) bool {
-	return end != nil && bytes.Compare(userKey, end) > 0
+	return end != nil && bytes.Compare(userKey, end) >= 0
 }
 
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {

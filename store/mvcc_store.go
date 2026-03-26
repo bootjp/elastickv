@@ -58,6 +58,7 @@ type mvccSnapshotEntry struct {
 type compactEntry struct {
 	key []byte
 }
+
 func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
@@ -322,7 +323,7 @@ func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, 
 		if !keyOK {
 			continue
 		}
-		if end != nil && bytes.Compare(k, end) > 0 {
+		if end != nil && bytes.Compare(k, end) >= 0 {
 			break
 		}
 		versions, _ := it.Value().([]VersionedValue)
