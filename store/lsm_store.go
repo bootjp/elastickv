@@ -61,11 +61,12 @@ type pebbleStore struct {
 	minRetainedTS        uint64
 	pendingMinRetainedTS uint64
 	mtx                  sync.RWMutex
+	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu        sync.Mutex
 	dir                  string
 }
 
-// Ensure pebbleStore implements MVCCStore
+// Ensure pebbleStore implements MVCCStore and RetentionController.
 var _ MVCCStore = (*pebbleStore)(nil)
 var _ RetentionController = (*pebbleStore)(nil)
 
@@ -158,6 +159,23 @@ func fillEncodedKey(dst []byte, key []byte, ts uint64) {
 	copy(dst, key)
 	// Invert TS for descending order (newer first)
 	binary.BigEndian.PutUint64(dst[len(key):], ^ts)
+}
+
+// keyUpperBound returns the smallest key that is strictly greater than all
+// encoded keys with the given userKey prefix (i.e. the next lexicographic
+// prefix after key). Returns nil when the key consists entirely of 0xFF bytes
+// (no finite upper bound exists). This is used as the UpperBound in Pebble
+// IterOptions to tightly confine iteration to a single user key.
+func keyUpperBound(key []byte) []byte {
+	upper := make([]byte, len(key))
+	copy(upper, key)
+	for i := len(upper) - 1; i >= 0; i-- {
+		upper[i]++
+		if upper[i] != 0 {
+			return upper[:i+1]
+		}
+	}
+	return nil // key is all 0xFF; no finite upper bound
 }
 
 func decodeKey(k []byte) ([]byte, uint64) {
@@ -331,6 +349,12 @@ func (s *pebbleStore) effectiveMinRetainedTS() uint64 {
 func (s *pebbleStore) updateLastCommitTS(ts uint64) {
 	if ts > s.lastCommitTS {
 		s.lastCommitTS = ts
+	}
+}
+
+func (s *pebbleStore) updateAndPersistLastCommitTS(ts uint64) {
+	if ts > s.lastCommitTS {
+		s.lastCommitTS = ts
 		// Best effort persist
 		if err := s.saveLastCommitTS(ts); err != nil {
 			s.log.Error("failed to persist last commit timestamp", slog.Any("error", err))
@@ -427,7 +451,7 @@ func (s *pebbleStore) commitMinRetainedTSLocked(ts uint64, opts *pebble.WriteOpt
 func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	s.updateLastCommitTS(commitTS)
+	s.updateAndPersistLastCommitTS(commitTS)
 	return commitTS
 }
 
@@ -440,38 +464,19 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 		return nil, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(nil)
+	seekKey := encodeKey(key, ts)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: seekKey,
+		UpperBound: keyUpperBound(key),
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	defer iter.Close()
 
-	// Seek to Key + ^ts (which effectively means Key with version <= ts)
-	// Because we use inverted timestamp, larger TS (smaller inverted) comes first.
-	// We want the largest TS that is <= requested ts.
-	// So we construct a key with requested ts.
-	seekKey := encodeKey(key, ts)
-
-	// SeekGE will find the first key >= seekKey.
-	// Since keys are [UserKey][InvTS], and InvTS decreases as TS increases.
-	// We want TS <= requested_ts.
-	// Example: Request TS=10. InvTS=^10 (Large).
-	// Stored: TS=12 (Inv=Small), TS=10 (Inv=Large), TS=8 (Inv=Larger).
-	// SeekGE(Key + ^10) will skip TS=12 (Key + Small) because Key+Small < Key+Large.
-	// It will land on TS=10 or TS=8.
-	// Wait, standard byte comparison:
-	// Key is same.
-	// ^12 < ^10 < ^8.
-	// We want largest TS <= 10.
-	// If we SeekGE(Key + ^10), we might find Key + ^10 (TS=10) or Key + ^8 (TS=8).
-	// These are valid candidates.
-	// If we hit Key + ^12, that is smaller than seekKey (since ^12 < ^10), so SeekGE wouldn't find it if we started before it.
-	// But we want to filter out TS > 10 (i.e. ^TS < ^10).
-	// So SeekGE(Key + ^10) is correct. It skips anything with ^TS < ^10 (meaning TS > 10).
-
 	if iter.SeekGE(seekKey) {
 		k := iter.Key()
-		userKey, _ := decodeKey(k)
+		userKey, _ := decodeKeyView(k)
 
 		if !bytes.Equal(userKey, key) {
 			// Moved to next user key
@@ -544,7 +549,7 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 		return false
 	}
 	k := iter.Key()
-	currentUserKey, _ := decodeKey(k)
+	currentUserKey, _ := decodeKeyView(k)
 	return bytes.Equal(currentUserKey, userKey)
 }
 
@@ -553,7 +558,7 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 		return false
 	}
 	k := iter.Key()
-	u, _ := decodeKey(k)
+	u, _ := decodeKeyView(k)
 	if bytes.Equal(u, userKey) {
 		return iter.Next()
 	}
@@ -561,7 +566,7 @@ func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) b
 }
 
 func pastScanEnd(userKey, end []byte) bool {
-	return end != nil && bytes.Compare(userKey, end) > 0
+	return end != nil && bytes.Compare(userKey, end) >= 0
 }
 
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
@@ -713,7 +718,7 @@ func (s *pebbleStore) nextReverseScanKV(
 	if !iter.SeekGE(encodeKey(userKey, ts)) {
 		return nil, false, true, nil
 	}
-	currentUserKey, _ := decodeKey(iter.Key())
+	currentUserKey, _ := decodeKeyView(iter.Key())
 	if !bytes.Equal(currentUserKey, userKey) {
 		nextValid := iter.SeekLT(encodeKey(userKey, math.MaxUint64))
 		return nil, nextValid, false, nil
@@ -766,7 +771,7 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	k := encodeKey(key, commitTS)
 	v := encodeValue(value, false, expireAt)
 
-	if err := s.db.Set(k, v, pebble.Sync); err != nil { //nolint:wrapcheck
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "put_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
@@ -781,7 +786,7 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	k := encodeKey(key, commitTS)
 	v := encodeValue(nil, true, 0)
 
-	if err := s.db.Set(k, v, pebble.Sync); err != nil {
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "delete_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
@@ -806,7 +811,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
 	v := encodeValue(val, false, expireAt)
-	if err := s.db.Set(k, v, pebble.Sync); err != nil {
+	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -816,16 +821,18 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 // called while the caller holds at least s.dbMu.RLock().
 func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
 	// Peek latest version (SeekGE key + ^MaxUint64)
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: encodeKey(key, math.MaxUint64),
+		UpperBound: keyUpperBound(key),
+	})
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
 	defer iter.Close()
 
-	seekKey := encodeKey(key, math.MaxUint64)
-	if iter.SeekGE(seekKey) {
+	if iter.First() {
 		k := iter.Key()
-		userKey, version := decodeKey(k)
+		userKey, version := decodeKeyView(k)
 		if bytes.Equal(userKey, key) {
 			return version, true, nil
 		}
@@ -881,7 +888,11 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	// Write Batch
+	// Serialize conflict check → batch commit so concurrent ApplyMutations
+	// cannot both pass checkConflicts and then both commit.
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	b := s.db.NewBatch()
 	defer b.Close()
 
@@ -889,13 +900,32 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	commitTS = s.alignCommitTS(commitTS)
+	// Compute the new lastCommitTS without mutating in-memory state yet.
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+
+	var tsBuf [timestampSize]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], newLastTS)
+	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
+		return errors.WithStack(err)
+	}
 
 	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
 		return err
 	}
 
-	return errors.WithStack(b.Commit(pebble.Sync))
+	if err := b.Commit(pebble.Sync); err != nil {
+		return errors.WithStack(err)
+	}
+
+	// Update in-memory state only after successful durable commit.
+	s.mtx.Lock()
+	s.updateLastCommitTS(commitTS)
+	s.mtx.Unlock()
+
+	return nil
 }
 
 type pebbleCompactionStats struct {
@@ -1002,6 +1032,12 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 
 		rawKey := iter.Key()
 		if isPebbleMetaKey(rawKey) {
+			continue
+		}
+		// Skip transaction internal keys — their lifecycle is managed by
+		// lock resolution, not MVCC compaction.
+		userKey, _ := decodeKeyView(rawKey)
+		if userKey != nil && bytes.HasPrefix(userKey, txnInternalKeyPrefix) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {

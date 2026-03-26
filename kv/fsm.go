@@ -68,12 +68,42 @@ func (f *kvFSM) Apply(l *raft.Log) any {
 	return nil
 }
 
+const (
+	raftEncodeSingle byte = 0x00
+	raftEncodeBatch  byte = 0x01
+)
+
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
+	if len(data) == 0 {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+
+	switch data[0] {
+	case raftEncodeSingle:
+		req := &pb.Request{}
+		if err := proto.Unmarshal(data[1:], req); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return []*pb.Request{req}, nil
+	case raftEncodeBatch:
+		cmd := &pb.RaftCommand{}
+		if err := proto.Unmarshal(data[1:], cmd); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(cmd.Requests) == 0 {
+			return nil, errors.WithStack(ErrInvalidRequest)
+		}
+		return cmd.Requests, nil
+	default:
+		return decodeLegacyRaftRequest(data)
+	}
+}
+
+func decodeLegacyRaftRequest(data []byte) ([]*pb.Request, error) {
 	cmd := &pb.RaftCommand{}
 	if err := proto.Unmarshal(data, cmd); err == nil && len(cmd.Requests) > 0 {
 		return cmd.Requests, nil
 	}
-
 	req := &pb.Request{}
 	if err := proto.Unmarshal(data, req); err != nil {
 		return nil, errors.WithStack(err)
@@ -265,6 +295,12 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	return nil
 }
 
+// handleOnePhaseTxnRequest applies a single-shard transaction atomically.
+// The isolation level is Snapshot Isolation (SI): only write-write conflicts
+// are detected via ApplyMutations. Read-write conflicts (write skew) are NOT
+// prevented because the read-set is not tracked. Callers requiring
+// Serializable Snapshot Isolation (SSI) must implement read-set validation
+// at a higher layer.
 func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
