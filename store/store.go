@@ -10,8 +10,7 @@ import (
 )
 
 // txnInternalKeyPrefix is the common prefix for all transaction internal keys
-// (locks, intents, commit records, rollback records, metadata). Compaction
-// must skip these keys to avoid breaking lock resolution.
+// (locks, intents, commit records, rollback records, metadata).
 // NOTE: this must match kv.TxnKeyPrefix ("!txn|"). The two cannot share a
 // single definition due to the store→kv import cycle.
 var txnInternalKeyPrefix = []byte("!txn|")
