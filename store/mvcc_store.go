@@ -56,10 +56,8 @@ type mvccSnapshotEntry struct {
 }
 
 type compactEntry struct {
-	key         []byte
-	newVersions []VersionedValue
+	key []byte
 }
-
 func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
