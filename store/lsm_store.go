@@ -900,21 +900,6 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	// Compute the new lastCommitTS without mutating in-memory state yet.
-	// Read under mtx to synchronize with PutAt/alignCommitTS.
-	s.mtx.RLock()
-	newLastTS := s.lastCommitTS
-	s.mtx.RUnlock()
-	if commitTS > newLastTS {
-		newLastTS = commitTS
-	}
-
-	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], newLastTS)
-	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
-		return errors.WithStack(err)
-	}
-
 	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
 		return err
 	}
@@ -923,9 +908,12 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return errors.WithStack(err)
 	}
 
-	// Update in-memory state only after successful durable commit.
+	// Update in-memory and persisted lastCommitTS after a successful durable
+	// commit.  updateAndPersistLastCommitTS only advances the value (monotonic),
+	// so it is safe to call concurrently with PutAt/alignCommitTS which hold the
+	// same mtx.Lock().
 	s.mtx.Lock()
-	s.updateLastCommitTS(commitTS)
+	s.updateAndPersistLastCommitTS(commitTS)
 	s.mtx.Unlock()
 
 	return nil
