@@ -12,9 +12,10 @@ func TestCompactKeepIndex_EmptyVersions(t *testing.T) {
 }
 
 func TestCompactKeepIndex_AllNewerThanMinTS(t *testing.T) {
+	// Versions stored in ascending order (oldest first) as in mvccStore.
 	versions := []VersionedValue{
-		{TS: 200, Value: []byte("v200")},
 		{TS: 100, Value: []byte("v100")},
+		{TS: 200, Value: []byte("v200")},
 	}
 	assert.Equal(t, -1, compactKeepIndex(versions, 50))
 }
@@ -36,12 +37,14 @@ func TestCompactKeepIndex_SingleVersionBelowMinTS(t *testing.T) {
 }
 
 func TestCompactKeepIndex_TwoVersionsOldestKept(t *testing.T) {
+	// Versions stored in ascending order (oldest first) as in mvccStore.
 	versions := []VersionedValue{
-		{TS: 200, Value: []byte("v200")},
 		{TS: 100, Value: []byte("v100")},
+		{TS: 200, Value: []byte("v200")},
 	}
-	// keepIdx=1, which is > 0 → return 1 (keep from idx 1)
-	assert.Equal(t, 1, compactKeepIndex(versions, 150))
+	// minTS=200: the visible version is TS=200 (last version <= 200).
+	// keepIdx=1, which is > 0 → return 1 (compact versions before idx 1).
+	assert.Equal(t, 1, compactKeepIndex(versions, 200))
 }
 
 func TestCompactKeepIndex_MultipleVersions(t *testing.T) {

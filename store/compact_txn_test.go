@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -227,8 +228,9 @@ func TestPebbleStore_Compact_AdvancesMinRetainedTSWithNoPending(t *testing.T) {
 // --- pebbleStore: ApplyMutations serialization ---
 
 // TestPebbleStore_ApplyMutations_ConcurrentConflictDetection verifies that
-// applyMu serializes conflict check + commit so two concurrent
-// ApplyMutations with the same startTS cannot both succeed.
+// applyMu serializes conflict check + commit so concurrent ApplyMutations
+// sharing the same startTS cannot all succeed — at least (goroutines-1) must
+// conflict.
 func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-apply-concurrent-*")
 	require.NoError(t, err)
@@ -241,11 +243,19 @@ func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
 	ctx := context.Background()
 	key := []byte("contended")
 
-	// Seed key.
+	// Seed key at TS=1 so startTS=1 sees an existing version.
 	require.NoError(t, s.PutAt(ctx, key, []byte("seed"), 1, 0))
 
 	const goroutines = 10
-	const rounds = 20
+
+	// All goroutines share the same startTS and commitTS so that after the first
+	// one commits, all remaining goroutines must observe a conflict.
+	startTS := s.LastCommitTS() // == 1
+	require.Equal(t, uint64(1), startTS, "expected LastCommitTS to equal the seed TS")
+	commitTS := startTS + 1 // == 2
+
+	var ready sync.WaitGroup
+	ready.Add(goroutines)
 
 	type result struct {
 		success  int
@@ -255,18 +265,19 @@ func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
 
 	for g := 0; g < goroutines; g++ {
 		go func() {
+			// Signal ready and wait for all goroutines to be ready before
+			// starting, maximizing contention.
+			ready.Done()
+			ready.Wait()
+
+			err := s.ApplyMutations(ctx, []*KVPairMutation{
+				{Op: OpTypePut, Key: key, Value: []byte("val")},
+			}, startTS, commitTS)
 			r := result{}
-			for i := 0; i < rounds; i++ {
-				startTS := s.LastCommitTS()
-				commitTS := startTS + 1
-				err := s.ApplyMutations(ctx, []*KVPairMutation{
-					{Op: OpTypePut, Key: key, Value: []byte("val")},
-				}, startTS, commitTS)
-				if err == nil {
-					r.success++
-				} else {
-					r.conflict++
-				}
+			if err == nil {
+				r.success++
+			} else {
+				r.conflict++
 			}
 			results <- r
 		}()
@@ -280,6 +291,9 @@ func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
 		totalConflict += r.conflict
 	}
 
-	assert.Equal(t, goroutines*rounds, totalSuccess+totalConflict)
+	assert.Equal(t, goroutines, totalSuccess+totalConflict)
 	assert.Greater(t, totalSuccess, 0, "at least one must succeed")
+	// All goroutines share the same startTS: after the first commits, the rest
+	// must conflict because the key's latest TS will exceed startTS.
+	assert.Greater(t, totalConflict, 0, "at least one must conflict")
 }
