@@ -373,7 +373,7 @@ func TestPebbleStore_Compact_TxnInternalKeySingleVersionPreserved(t *testing.T) 
 
 	// Write a transaction internal key with a single version (active lock).
 	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock:k1")...)
+	txnKey = append(txnKey, []byte("lock|k1")...)
 	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 5, 0))
 
 	// Also write a regular key with two versions.
@@ -405,7 +405,7 @@ func TestPebbleStore_Compact_TxnInternalKeyOldVersionRemoved(t *testing.T) {
 	// Simulate a lock lifecycle: PREPARE writes lock at startTS, COMMIT
 	// writes tombstone at commitTS.
 	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock:k1")...)
+	txnKey = append(txnKey, []byte("lock|k1")...)
 	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
 	require.NoError(t, s.DeleteAt(ctx, txnKey, 20))
 
