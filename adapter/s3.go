@@ -1511,7 +1511,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 
 	query := r.URL.Query()
 	maxParts := parseS3MaxParts(query.Get("max-parts"))
-	partNumberMarker, _ := strconv.Atoi(query.Get("part-number-marker"))
+	partNumberMarker := parseS3PartNumberMarker(query.Get("part-number-marker"))
 
 	partPrefix := s3keys.UploadPartPrefixForUpload(bucket, meta.Generation, objectKey, uploadID)
 	start := partPrefix
@@ -1680,6 +1680,20 @@ func parseS3MaxParts(raw string) int {
 	}
 	if v > s3ListPartsMaxParts {
 		return s3ListPartsMaxParts
+	}
+	return v
+}
+
+func parseS3PartNumberMarker(raw string) int {
+	if strings.TrimSpace(raw) == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return 0
+	}
+	if v > s3MaxPartNumber {
+		return s3MaxPartNumber
 	}
 	return v
 }

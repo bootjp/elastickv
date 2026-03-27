@@ -356,6 +356,16 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		}
 	}
 
+	// Reject if signing time is too far in the future (matches AWS behavior).
+	// For presigned URLs, past signing times are expected and validated via expiry.
+	if signingTime.UTC().After(time.Now().UTC().Add(s3RequestTimeMaxSkew)) {
+		return &s3AuthError{
+			Status:  http.StatusForbidden,
+			Code:    "RequestTimeTooSkewed",
+			Message: "The difference between the request time and the server's time is too large",
+		}
+	}
+
 	if authErr := checkPresignExpiry(expiresStr, signingTime); authErr != nil {
 		return authErr
 	}
