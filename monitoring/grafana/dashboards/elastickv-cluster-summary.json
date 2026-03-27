@@ -15,10 +15,10 @@
       }
     ]
   },
-  "description": "Compact overview of DynamoDB request activity and core Raft state for elastickv.",
+  "description": "DynamoDB-compatible request health for elastickv: throughput, latency, errors, tables, and noisy nodes.",
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
   "links": [],
   "panels": [
@@ -29,7 +29,6 @@
           "color": {
             "mode": "thresholds"
           },
-          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -45,7 +44,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 4,
         "x": 0,
         "y": 0
       },
@@ -53,33 +52,25 @@
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
+        }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
-          "instant": false,
+          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
           "legendFormat": "requests/s",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Request Rate",
+      "title": "Requests / s",
       "type": "stat"
     },
     {
@@ -89,21 +80,71 @@
           "color": {
             "mode": "thresholds"
           },
-          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 0.95
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])) / clamp_min(sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m])), 0.001)",
+          "legendFormat": "success rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Success Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": null,
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
                 "value": 0
-              },
-              {
-                "color": "orange",
-                "value": 0.1
-              },
-              {
-                "color": "red",
-                "value": 1
               }
             ]
           },
@@ -113,41 +154,33 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
+        "w": 4,
+        "x": 8,
         "y": 0
       },
-      "id": 2,
+      "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
+        }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
-          "instant": false,
-          "legendFormat": "errors/s",
+          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[5m]))",
+          "legendFormat": "system errors/s",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Error Rate",
+      "title": "System Errors / s",
       "type": "stat"
     },
     {
@@ -157,7 +190,57 @@
           "color": {
             "mode": "thresholds"
           },
-          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[5m]))",
+          "legendFormat": "user errors/s",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "User Errors / s",
+      "type": "stat"
+    },
+    {
+      "datasource": null,
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -181,41 +264,33 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 12,
+        "w": 4,
+        "x": 16,
         "y": 0
       },
-      "id": 3,
+      "id": 5,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
+        }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\"}[5m])))",
-          "instant": false,
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "legendFormat": "p95 success",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "P95 Latency",
+      "title": "Success P95 Latency",
       "type": "stat"
     },
     {
@@ -225,7 +300,6 @@
           "color": {
             "mode": "thresholds"
           },
-          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -241,41 +315,33 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
+        "w": 4,
+        "x": 20,
         "y": 0
       },
-      "id": 4,
+      "id": 6,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
+        }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum(elastickv_dynamodb_inflight_requests{job=\"elastickv\"})",
-          "instant": false,
-          "legendFormat": "in-flight",
+          "expr": "sum(elastickv_dynamodb_inflight_requests{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"})",
+          "legendFormat": "inflight",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "In-flight Requests",
+      "title": "Inflight Requests",
       "type": "stat"
     },
     {
@@ -286,51 +352,10 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
             "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
+            "showPoints": "auto"
           },
           "unit": "reqps"
         },
@@ -342,32 +367,29 @@
         "x": 0,
         "y": 4
       },
-      "id": 5,
+      "id": 7,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\"}[5m]))",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Requests by Operation",
+      "title": "Request Rate by Operation",
       "type": "timeseries"
     },
     {
@@ -378,53 +400,12 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
             "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "showPoints": "auto"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "reqps"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -434,32 +415,45 @@
         "x": 12,
         "y": 4
       },
-      "id": 6,
+      "id": 8,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",outcome!=\"success\"}[5m]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "legendFormat": "p50 {{operation}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "legendFormat": "p95 {{operation}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "legendFormat": "p99 {{operation}}",
+          "range": true,
+          "refId": "C"
         }
       ],
-      "title": "Error Split by Outcome",
+      "title": "Latency P50 / P95 / P99 by Operation",
       "type": "timeseries"
     },
     {
@@ -470,53 +464,12 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
             "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "showPoints": "auto"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -526,48 +479,45 @@
         "x": 0,
         "y": 12
       },
-      "id": 7,
+      "id": 9,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=\"elastickv\"}[5m]))",
-          "legendFormat": "returned {{table}}",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[5m]))",
+          "legendFormat": "system_error {{operation}}",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=\"elastickv\"}[5m]))",
-          "legendFormat": "scanned {{table}}",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[5m]))",
+          "legendFormat": "user_error {{operation}}",
           "range": true,
           "refId": "B"
         },
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=\"elastickv\"}[5m]))",
-          "legendFormat": "written {{table}}",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"conditional_check_failed\"}[5m]))",
+          "legendFormat": "conditional {{operation}}",
           "range": true,
           "refId": "C"
         }
       ],
-      "title": "Per-table Item Activity",
+      "title": "System / User / Conditional Errors by Operation",
       "type": "timeseries"
     },
     {
@@ -578,51 +528,106 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
             "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "showPoints": "auto"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum by (node_id, node_address) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
+          "legendFormat": "{{node_id}} {{node_address}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Request Rate by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": null,
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, node_id, node_address) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "legendFormat": "{{node_id}} {{node_address}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Success P95 Latency by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": null,
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
           },
           "unit": "short"
         },
@@ -632,42 +637,31 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 12
+        "y": 20
       },
-      "id": 8,
+      "id": 12,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, node_id) (elastickv_raft_commit_index{job=\"elastickv\"})",
-          "legendFormat": "commit g{{group}} {{node_id}}",
+          "expr": "sum by (operation) (elastickv_dynamodb_inflight_requests{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"})",
+          "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": null,
-          "editorMode": "code",
-          "expr": "max by (group, node_id) (elastickv_raft_applied_index{job=\"elastickv\"})",
-          "legendFormat": "applied g{{group}} {{node_id}}",
-          "range": true,
-          "refId": "B"
         }
       ],
-      "title": "Raft Index Progress",
+      "title": "Inflight by Operation",
       "type": "timeseries"
     },
     {
@@ -678,55 +672,32 @@
             "align": "auto",
             "cellOptions": {
               "type": "auto"
-            },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
+            }
           }
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 8,
         "x": 0,
-        "y": 20
+        "y": 28
       },
-      "id": 9,
+      "id": 13,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\"} * on(group, node_id, node_address) (elastickv_raft_local_state{job=\"elastickv\",state=\"leader\"} == 1))",
+          "expr": "topk(10, sum by (table) (rate(elastickv_dynamodb_table_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m])))",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} leader {{leader_id}}",
-          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Current Leader per Group",
+      "title": "Top Tables by Request Rate",
       "transformations": [
         {
           "id": "labelsToFields",
@@ -742,18 +713,15 @@
             "excludeByName": {
               "Metric": true,
               "Time": true,
-              "Value": true,
-              "Value #A": true
+              "Value": true
             },
             "indexByName": {
-              "group": 0,
-              "leader_id": 1,
-              "leader_address": 2
+              "table": 0,
+              "Value #A": 1
             },
             "renameByName": {
-              "group": "Raft Group",
-              "leader_address": "Leader Address",
-              "leader_id": "Leader ID"
+              "table": "Table",
+              "Value #A": "Requests / s"
             }
           }
         }
@@ -768,55 +736,48 @@
             "align": "auto",
             "cellOptions": {
               "type": "auto"
-            },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
+            }
           }
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 8,
         "x": 8,
-        "y": 20
+        "y": 28
       },
-      "id": 10,
+      "id": 14,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",state=\"leader\"} == 1))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_system_errors_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} member {{member_id}}",
-          "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_user_errors_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_conditional_check_failed_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
         }
       ],
-      "title": "Current Members",
+      "title": "Tables by System / User / Conditional Error Rate",
       "transformations": [
         {
           "id": "labelsToFields",
@@ -832,20 +793,19 @@
             "excludeByName": {
               "Metric": true,
               "Time": true,
-              "Value": true,
-              "Value #A": true
+              "Value": true
             },
             "indexByName": {
-              "group": 0,
-              "member_id": 1,
-              "member_address": 2,
-              "suffrage": 3
+              "table": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3
             },
             "renameByName": {
-              "group": "Raft Group",
-              "member_address": "Member Address",
-              "member_id": "Member ID",
-              "suffrage": "Suffrage"
+              "table": "Table",
+              "Value #A": "System Errors / s",
+              "Value #B": "User Errors / s",
+              "Value #C": "Conditional / s"
             }
           }
         }
@@ -860,67 +820,48 @@
             "align": "auto",
             "cellOptions": {
               "type": "auto"
-            },
-            "inspect": false
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "text": "Follower"
-                },
-                "1": {
-                  "text": "Leader"
-                }
-              },
-              "type": "value"
             }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
           }
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 8,
         "x": 16,
-        "y": 20
+        "y": 28
       },
-      "id": 11,
+      "id": 15,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
-      "pluginVersion": "12.1.1",
       "targets": [
         {
           "datasource": null,
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address) (elastickv_raft_member_is_leader{job=\"elastickv\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",state=\"leader\"} == 1))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} member {{member_id}}",
-          "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": null,
+          "editorMode": "code",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
         }
       ],
-      "title": "Leader Flag per Member",
+      "title": "Returned / Scanned / Written by Table",
       "transformations": [
         {
           "id": "labelsToFields",
@@ -935,21 +876,20 @@
           "options": {
             "excludeByName": {
               "Metric": true,
-              "Time": true
+              "Time": true,
+              "Value": true
             },
             "indexByName": {
-              "group": 0,
-              "member_id": 1,
-              "member_address": 2,
-              "Value": 3,
-              "Value #A": 3
+              "table": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3
             },
             "renameByName": {
-              "Value": "Leader Flag",
-              "Value #A": "Leader Flag",
-              "group": "Raft Group",
-              "member_address": "Member Address",
-              "member_id": "Member ID"
+              "table": "Table",
+              "Value #A": "Returned / s",
+              "Value #B": "Scanned / s",
+              "Value #C": "Written / s"
             }
           }
         }
@@ -957,25 +897,106 @@
       "type": "table"
     }
   ],
-  "preload": false,
   "refresh": "10s",
   "schemaVersion": 41,
   "tags": [
     "elastickv",
-    "raft",
     "dynamodb",
+    "requests",
     "summary"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, node_id)",
+        "includeAll": true,
+        "label": "Node ID",
+        "multi": true,
+        "name": "node_id",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, node_id)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, operation)",
+        "includeAll": true,
+        "label": "Operation",
+        "multi": true,
+        "name": "operation",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, operation)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(elastickv_dynamodb_table_requests_total{job=\"elastickv\"}, table)",
+        "includeAll": true,
+        "label": "Table",
+        "multi": true,
+        "name": "table",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(elastickv_dynamodb_table_requests_total{job=\"elastickv\"}, table)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
-    "from": "now-2d",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Elastickv Cluster Summary",
+  "title": "Elastickv Request Health",
   "uid": "elastickv-cluster-summary",
-  "version": 1
+  "version": 2
 }
