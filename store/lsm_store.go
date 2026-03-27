@@ -900,29 +900,28 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	// Compute the new lastCommitTS without mutating in-memory state yet.
-	newLastTS := s.lastCommitTS
-	if commitTS > newLastTS {
-		newLastTS = commitTS
-	}
-
-	var tsBuf [timestampSize]byte
-	binary.LittleEndian.PutUint64(tsBuf[:], newLastTS)
-	if err := b.Set(metaLastCommitTSBytes, tsBuf[:], nil); err != nil {
-		return errors.WithStack(err)
-	}
-
 	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
 		return err
 	}
 
+	// Hold mtx across read → batch-set → commit → in-memory update so that a
+	// concurrent alignCommitTS (PutAt/DeleteAt/ExpireAt) cannot advance+persist
+	// metaLastCommitTS between our read and batch commit, which would let this
+	// batch overwrite the meta key with a smaller value.
+	s.mtx.Lock()
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		s.mtx.Unlock()
+		return err
+	}
 	if err := b.Commit(pebble.Sync); err != nil {
+		s.mtx.Unlock()
 		return errors.WithStack(err)
 	}
-
-	// Update in-memory state only after successful durable commit.
-	s.mtx.Lock()
-	s.updateLastCommitTS(commitTS)
+	s.updateLastCommitTS(newLastTS)
 	s.mtx.Unlock()
 
 	return nil
@@ -1032,12 +1031,6 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 
 		rawKey := iter.Key()
 		if isPebbleMetaKey(rawKey) {
-			continue
-		}
-		// Skip transaction internal keys — their lifecycle is managed by
-		// lock resolution, not MVCC compaction.
-		userKey, _ := decodeKeyView(rawKey)
-		if userKey != nil && bytes.HasPrefix(userKey, txnInternalKeyPrefix) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {
