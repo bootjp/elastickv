@@ -904,27 +904,23 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		return err
 	}
 
-	// Include metaLastCommitTS in the same synced batch so that a crash after
-	// the commit cannot leave the persisted meta key behind the durable data.
-	// Read the current in-memory value first so we never write a smaller TS
-	// than one already committed by a concurrent PutAt/alignCommitTS.
-	s.mtx.RLock()
+	// Hold mtx across read → batch-set → commit → in-memory update so that a
+	// concurrent alignCommitTS (PutAt/DeleteAt/ExpireAt) cannot advance+persist
+	// metaLastCommitTS between our read and batch commit, which would let this
+	// batch overwrite the meta key with a smaller value.
+	s.mtx.Lock()
 	newLastTS := s.lastCommitTS
-	s.mtx.RUnlock()
 	if commitTS > newLastTS {
 		newLastTS = commitTS
 	}
 	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		s.mtx.Unlock()
 		return err
 	}
-
 	if err := b.Commit(pebble.Sync); err != nil {
+		s.mtx.Unlock()
 		return errors.WithStack(err)
 	}
-
-	// Update in-memory lastCommitTS after the durable commit. Skip the extra
-	// persist - the value is already durable via the batch above.
-	s.mtx.Lock()
 	s.updateLastCommitTS(newLastTS)
 	s.mtx.Unlock()
 
