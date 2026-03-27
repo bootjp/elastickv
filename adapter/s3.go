@@ -1322,6 +1322,30 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 		retryPin := s.pinReadTS(retryReadTS)
 		defer retryPin.Release()
 
+		// Re-verify bucket generation hasn't changed (fence against delete+recreate).
+		retryMeta, retryExists, err := s.loadBucketMetaAt(r.Context(), bucket, retryReadTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !retryExists || retryMeta == nil {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchBucket",
+				Message: "bucket not found",
+				Bucket:  bucket,
+				Key:     objectKey,
+			}
+		}
+		if retryMeta.Generation != generation {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchUpload",
+				Message: "upload not found (bucket was recreated)",
+				Bucket:  bucket,
+				Key:     objectKey,
+			}
+		}
+
 		// Re-verify upload still exists (fence against concurrent Abort).
 		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, retryReadTS); err != nil {
 			if errors.Is(err, store.ErrKeyNotFound) {
@@ -1623,7 +1647,13 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 		readPin := s.pinReadTS(readTS)
 		kvs, err := s.store.ScanAt(ctx, cursor, end, s3ChunkBatchOps, readTS)
 		readPin.Release()
-		if err != nil || len(kvs) == 0 {
+		if err != nil {
+			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
+				"bucket", bucket, "generation", generation,
+				"object_key", objectKey, "upload_id", uploadID, "err", err)
+			return
+		}
+		if len(kvs) == 0 {
 			return
 		}
 		pending := make([]*kv.Elem[kv.OP], 0, len(kvs))
