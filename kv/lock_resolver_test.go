@@ -110,7 +110,7 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	startTS := uint64(10)
+	startTS := uint64(20)
 	primaryKey := []byte("b")   // group 1
 	secondaryKey := []byte("n") // group 2
 
@@ -146,7 +146,7 @@ func TestLockResolver_SkipsNonExpiredLocks(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	startTS := uint64(10)
+	startTS := uint64(30)
 	key := []byte("b") // group 1
 
 	// Prepare a lock with a large TTL so it won't be expired.
@@ -178,7 +178,7 @@ func TestLockResolver_LeaderOnlyExecution(t *testing.T) {
 	lr := NewLockResolver(ss, groups, nil)
 	defer lr.Close()
 
-	startTS := uint64(10)
+	startTS := uint64(40)
 	prepareLock(t, groups[1], startTS, []byte("a"), []byte("a"), []byte("v"), 0)
 
 	// Manually call resolveAllGroups — the group's raft is leader so it runs.

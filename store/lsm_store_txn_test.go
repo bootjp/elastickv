@@ -363,7 +363,7 @@ func TestPebbleStore_Compact_MetaKeyNotAffected(t *testing.T) {
 	assert.Equal(t, lastBefore, s2.LastCommitTS())
 }
 
-func TestPebbleStore_Compact_TxnInternalKeysSkipped(t *testing.T) {
+func TestPebbleStore_Compact_TxnInternalKeySingleVersionPreserved(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -371,19 +371,19 @@ func TestPebbleStore_Compact_TxnInternalKeysSkipped(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Write a transaction internal key directly (simulating lock resolution).
+	// Write a transaction internal key with a single version (active lock).
 	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock:k1")...)
+	txnKey = append(txnKey, []byte("lock|k1")...)
 	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 5, 0))
 
-	// Also write a regular key.
+	// Also write a regular key with two versions.
 	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
 	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v2"), 20, 0))
 
-	// Compact. The txn internal key should be untouched.
+	// Compact. The single-version txn key is preserved (nothing older to remove).
 	require.NoError(t, s.Compact(ctx, 15))
 
-	// The txn internal key should still be readable at/above minTS.
+	// The txn internal key should still be readable.
 	val, err := s.GetAt(ctx, txnKey, 15)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("lock-data"), val)
@@ -392,6 +392,30 @@ func TestPebbleStore_Compact_TxnInternalKeysSkipped(t *testing.T) {
 	val, err = s.GetAt(ctx, []byte("k1"), 20)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v2"), val)
+}
+
+func TestPebbleStore_Compact_TxnInternalKeyOldVersionRemoved(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Simulate a lock lifecycle: PREPARE writes lock at startTS, COMMIT
+	// writes tombstone at commitTS.
+	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
+	txnKey = append(txnKey, []byte("lock|k1")...)
+	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
+	require.NoError(t, s.DeleteAt(ctx, txnKey, 20))
+
+	// Compact with minTS above commitTS. The old version (TS=10) should be
+	// removed, keeping only the tombstone at TS=20.
+	require.NoError(t, s.Compact(ctx, 25))
+
+	// The lock should not be readable (tombstone).
+	_, err = s.GetAt(ctx, txnKey, 25)
+	require.ErrorIs(t, err, ErrKeyNotFound)
 }
 
 func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {

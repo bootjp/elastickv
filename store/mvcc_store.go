@@ -902,9 +902,9 @@ func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
 		return -1
 	}
 	keepIdx := -1
-	for i := len(versions) - 1; i >= 0; i-- {
-		if versions[i].TS <= minTS {
-			keepIdx = i
+	for i := len(versions); i > 0; i-- {
+		if versions[i-1].TS <= minTS {
+			keepIdx = i - 1
 			break
 		}
 	}
@@ -937,9 +937,6 @@ func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 		}
 		keyBytes, ok := it.Key().([]byte)
 		if !ok {
-			continue
-		}
-		if bytes.HasPrefix(keyBytes, txnInternalKeyPrefix) {
 			continue
 		}
 		if compactKeepIndex(versions, minTS) >= 0 {
