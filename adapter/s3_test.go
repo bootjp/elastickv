@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -593,6 +595,763 @@ func newSignedS3Request(
 	return req
 }
 
+// --- Phase 2 Tests ---
+
+func TestS3Server_MultipartUploadHappyPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	// Create bucket.
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-mp", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// CreateMultipartUpload.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPost, "/bucket-mp/large-file.bin?uploads=", nil)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	require.Equal(t, "bucket-mp", initResult.Bucket)
+	require.Equal(t, "large-file.bin", initResult.Key)
+	require.NotEmpty(t, initResult.UploadId)
+	uploadID := initResult.UploadId
+
+	// UploadPart 1 (5 MiB).
+	part1Data := strings.Repeat("A", 5*1024*1024)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-mp/large-file.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(part1Data)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	part1ETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+	require.Equal(t, md5Hex(part1Data), part1ETag)
+
+	// UploadPart 2 (smaller, last part).
+	part2Data := "final-chunk-data"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-mp/large-file.bin?uploadId=%s&partNumber=2", uploadID),
+		strings.NewReader(part2Data)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	part2ETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+	require.Equal(t, md5Hex(part2Data), part2ETag)
+
+	// CompleteMultipartUpload.
+	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>"%s"</ETag></Part>
+	</CompleteMultipartUpload>`, part1ETag, part2ETag)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-mp/large-file.bin?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var completeResult s3CompleteMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &completeResult))
+	require.Equal(t, "bucket-mp", completeResult.Bucket)
+	require.Equal(t, "large-file.bin", completeResult.Key)
+	// Verify composite ETag format: hex-2
+	require.Contains(t, completeResult.ETag, "-2")
+
+	// Verify GetObject returns complete data.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-mp/large-file.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, part1Data+part2Data, rec.Body.String())
+
+	// HeadObject shows correct size.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodHead, "/bucket-mp/large-file.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	expectedSize := fmt.Sprintf("%d", len(part1Data)+len(part2Data))
+	require.Equal(t, expectedSize, rec.Header().Get("Content-Length"))
+
+	// ListObjectsV2 includes the multipart object.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-mp?list-type=2", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Key>large-file.bin</Key>")
+}
+
+func TestS3Server_AbortMultipartUpload(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-abort", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Create upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-abort/file.bin?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Upload a part.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-abort/file.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader("some data")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Abort.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodDelete,
+		fmt.Sprintf("/bucket-abort/file.bin?uploadId=%s", uploadID),
+		nil))
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	// Re-abort should fail with NoSuchUpload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodDelete,
+		fmt.Sprintf("/bucket-abort/file.bin?uploadId=%s", uploadID),
+		nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchUpload")
+
+	// Object should not be visible.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-abort/file.bin", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestS3Server_ListParts(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-lp", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Create upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-lp/obj.bin?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Upload parts 1, 3, 5 (non-contiguous).
+	for _, pn := range []int{1, 3, 5} {
+		data := fmt.Sprintf("part-%d-data", pn)
+		rec = httptest.NewRecorder()
+		server.handle(rec, newS3TestRequest(http.MethodPut,
+			fmt.Sprintf("/bucket-lp/obj.bin?uploadId=%s&partNumber=%d", uploadID, pn),
+			strings.NewReader(data)))
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+
+	// ListParts.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet,
+		fmt.Sprintf("/bucket-lp/obj.bin?uploadId=%s", uploadID), nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var listResult s3ListPartsResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &listResult))
+	require.Len(t, listResult.Parts, 3)
+	require.Equal(t, 1, listResult.Parts[0].PartNumber)
+	require.Equal(t, 3, listResult.Parts[1].PartNumber)
+	require.Equal(t, 5, listResult.Parts[2].PartNumber)
+
+	// ListParts with pagination.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet,
+		fmt.Sprintf("/bucket-lp/obj.bin?uploadId=%s&max-parts=2", uploadID), nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var page1Result s3ListPartsResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &page1Result))
+	require.Len(t, page1Result.Parts, 2)
+	require.True(t, page1Result.IsTruncated)
+	require.Equal(t, 3, page1Result.NextPartNumberMarker)
+
+	// Continue from marker.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet,
+		fmt.Sprintf("/bucket-lp/obj.bin?uploadId=%s&max-parts=2&part-number-marker=3", uploadID), nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var page2Result s3ListPartsResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &page2Result))
+	require.Len(t, page2Result.Parts, 1)
+	require.False(t, page2Result.IsTruncated)
+	require.Equal(t, 5, page2Result.Parts[0].PartNumber)
+}
+
+func TestS3Server_RangeReadFullAndPartial(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := "0123456789ABCDEF"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-range/file.txt", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	tests := []struct {
+		name       string
+		rangeHdr   string
+		wantStatus int
+		wantBody   string
+		wantCR     string // Content-Range
+	}{
+		{"first 5 bytes", "bytes=0-4", 206, "01234", "bytes 0-4/16"},
+		{"middle range", "bytes=5-9", 206, "56789", "bytes 5-9/16"},
+		{"open-ended", "bytes=10-", 206, "ABCDEF", "bytes 10-15/16"},
+		{"suffix range", "bytes=-4", 206, "CDEF", "bytes 12-15/16"},
+		{"full range", "bytes=0-15", 206, payload, "bytes 0-15/16"},
+		{"beyond end clamped", "bytes=0-99", 206, payload, "bytes 0-15/16"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rr := httptest.NewRecorder()
+			req := newS3TestRequest(http.MethodGet, "/bucket-range/file.txt", nil)
+			req.Header.Set("Range", tc.rangeHdr)
+			server.handle(rr, req)
+			require.Equal(t, tc.wantStatus, rr.Code)
+			require.Equal(t, tc.wantBody, rr.Body.String())
+			require.Equal(t, tc.wantCR, rr.Header().Get("Content-Range"))
+		})
+	}
+}
+
+func TestS3Server_RangeReadInvalidRange(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rinv", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rinv/f.txt", strings.NewReader("hello")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-rinv/f.txt", nil)
+	req.Header.Set("Range", "bytes=99-100")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+}
+
+func TestS3Server_RangeReadEmptyObject(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-empty-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload an empty object.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-empty-range/empty.txt", strings.NewReader("")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Suffix range on empty object must return 416.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-empty-range/empty.txt", nil)
+	req.Header.Set("Range", "bytes=-4")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+}
+
+func TestS3Server_HeadWithRange(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-head-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := "hello ranged head"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-head-range/obj.txt", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// HEAD with valid Range: expect 206 + Content-Range, no body.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodHead, "/bucket-head-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+	require.Equal(t, "bytes 0-4/17", rec.Header().Get("Content-Range"))
+	require.Equal(t, "5", rec.Header().Get("Content-Length"))
+	require.Empty(t, rec.Body.String())
+
+	// HEAD with out-of-range Range: expect 416 + Content-Range header.
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodHead, "/bucket-head-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=999-1000")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+	require.Equal(t, "bytes */17", rec.Header().Get("Content-Range"))
+}
+
+func TestS3Server_InvalidRangeContentRangeHeader(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-inv-range", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := "abcdefghij" // 10 bytes
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-inv-range/obj.txt", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// GET with out-of-range Range: 416 response must include Content-Range header.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-inv-range/obj.txt", nil)
+	req.Header.Set("Range", "bytes=100-200")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+	require.Equal(t, "bytes */10", rec.Header().Get("Content-Range"))
+}
+
+func TestS3Server_PresignedURLMissingExpires(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Build a presigned URL without X-Amz-Expires: server must reject it.
+	signingTime := currentS3SigningTime()
+	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket/obj.txt", nil)
+	require.NoError(t, err)
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	creds := aws.Credentials{AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test"}
+	presignedURL, _, err := signer.PresignHTTP(context.Background(), creds, presignReq,
+		s3UnsignedPayload, "s3", testS3Region, signingTime)
+	require.NoError(t, err)
+
+	parsedURL, err := url.Parse(presignedURL)
+	require.NoError(t, err)
+	presignGetReq := newS3TestRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	presignGetReq.Host = "localhost"
+	rec := httptest.NewRecorder()
+	server.handle(rec, presignGetReq)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "AuthorizationQueryParametersError")
+	require.Contains(t, rec.Body.String(), "X-Amz-Expires")
+}
+
+func TestS3Server_MultipartUploadETagComputation(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-etag", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-etag/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Upload 3 parts (5MiB+5MiB+small).
+	partData := make([]string, 3)
+	partETags := make([]string, 3)
+	partData[0] = strings.Repeat("X", 5*1024*1024)
+	partData[1] = strings.Repeat("Y", 5*1024*1024)
+	partData[2] = "final"
+	for i, data := range partData {
+		rec = httptest.NewRecorder()
+		server.handle(rec, newS3TestRequest(http.MethodPut,
+			fmt.Sprintf("/bucket-etag/obj?uploadId=%s&partNumber=%d", uploadID, i+1),
+			strings.NewReader(data)))
+		require.Equal(t, http.StatusOK, rec.Code)
+		partETags[i] = strings.Trim(rec.Header().Get("ETag"), `"`)
+	}
+
+	// Complete.
+	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>"%s"</ETag></Part>
+		<Part><PartNumber>3</PartNumber><ETag>"%s"</ETag></Part>
+	</CompleteMultipartUpload>`, partETags[0], partETags[1], partETags[2])
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-etag/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var completeResult s3CompleteMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &completeResult))
+
+	// Compute expected composite ETag.
+	concatMD5 := md5.New() //nolint:gosec
+	for _, etag := range partETags {
+		raw, _ := hex.DecodeString(etag)
+		_, _ = concatMD5.Write(raw)
+	}
+	expectedETag := fmt.Sprintf(`"%s-3"`, hex.EncodeToString(concatMD5.Sum(nil)))
+	require.Equal(t, expectedETag, completeResult.ETag)
+}
+
+func TestS3Server_MultipartUploadRejectsInvalidPartOrder(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-order", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-order/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Upload parts.
+	for _, pn := range []int{1, 2} {
+		rec = httptest.NewRecorder()
+		server.handle(rec, newS3TestRequest(http.MethodPut,
+			fmt.Sprintf("/bucket-order/obj?uploadId=%s&partNumber=%d", uploadID, pn),
+			strings.NewReader(strings.Repeat("x", 5*1024*1024))))
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+
+	// Complete with wrong order.
+	completeBody := `<CompleteMultipartUpload>
+		<Part><PartNumber>2</PartNumber><ETag>"x"</ETag></Part>
+		<Part><PartNumber>1</PartNumber><ETag>"y"</ETag></Part>
+	</CompleteMultipartUpload>`
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-order/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidPartOrder")
+}
+
+func TestS3Server_CompleteMultipartUploadTooManyParts(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-toomany", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-toomany/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Build a CompleteMultipartUpload request with too many parts (> 10000).
+	var sb strings.Builder
+	sb.WriteString("<CompleteMultipartUpload>")
+	for i := 1; i <= s3MaxPartsPerUpload+1; i++ {
+		fmt.Fprintf(&sb, "<Part><PartNumber>%d</PartNumber><ETag>\"abc\"</ETag></Part>", i)
+	}
+	sb.WriteString("</CompleteMultipartUpload>")
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-toomany/obj?uploadId=%s", uploadID),
+		strings.NewReader(sb.String())))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidArgument")
+}
+
+func TestS3Server_CompleteMultipartUploadOutOfRangePartNumber(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-partrange", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-partrange/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Use part number 0 (below s3MinPartNumber=1).
+	completeBody := `<CompleteMultipartUpload>
+		<Part><PartNumber>0</PartNumber><ETag>"abc"</ETag></Part>
+	</CompleteMultipartUpload>`
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-partrange/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidArgument")
+}
+
+func TestS3Server_MultipartNoSuchUpload(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-nosu", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// UploadPart to nonexistent upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		"/bucket-nosu/obj?uploadId=nonexistent&partNumber=1",
+		strings.NewReader("data")))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchUpload")
+
+	// Complete nonexistent upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		"/bucket-nosu/obj?uploadId=nonexistent",
+		strings.NewReader(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"x"</ETag></Part></CompleteMultipartUpload>`)))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchUpload")
+
+	// ListParts nonexistent upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet,
+		"/bucket-nosu/obj?uploadId=nonexistent", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchUpload")
+}
+
+func TestS3Server_PresignedURL(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Create a bucket using a signed request.
+	signingTime := currentS3SigningTime()
+	rec := httptest.NewRecorder()
+	server.handle(rec, newSignedS3Request(t, "/bucket-presign", "", signingTime))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// PUT object with a signed request.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newSignedS3Request(t, "/bucket-presign/obj.txt", "hello presign", signingTime))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Build a presigned GET URL using a proper absolute URL.
+	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket-presign/obj.txt", nil)
+	require.NoError(t, err)
+	// Set X-Amz-Expires to satisfy the server's presigned URL requirement (900 s validity).
+	presignQuery := presignReq.URL.Query()
+	presignQuery.Set("X-Amz-Expires", "900")
+	presignReq.URL.RawQuery = presignQuery.Encode()
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	creds := aws.Credentials{
+		AccessKeyID:     testS3AccessKey,
+		SecretAccessKey: testS3SecretKey,
+		Source:          "test",
+	}
+	presignedURL, _, err := signer.PresignHTTP(
+		context.Background(),
+		creds,
+		presignReq,
+		s3UnsignedPayload,
+		"s3",
+		testS3Region,
+		signingTime,
+	)
+	require.NoError(t, err)
+
+	// Make the presigned request.
+	parsedURL, err := url.Parse(presignedURL)
+	require.NoError(t, err)
+	presignGetReq := newS3TestRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	presignGetReq.Host = "localhost"
+	rec = httptest.NewRecorder()
+	server.handle(rec, presignGetReq)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "hello presign", rec.Body.String())
+}
+
+func TestS3Server_PresignedURLExpired(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Build a presigned URL with a 60 s expiry that's already expired.
+	// Signing 20 minutes ago means expiry was ~19 minutes ago.
+	oldTime := time.Now().UTC().Add(-20 * time.Minute)
+	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket-presign/obj.txt", nil)
+	require.NoError(t, err)
+	// Set a 60 s expiry that will have elapsed given the signing time of 20 minutes ago,
+	// ensuring the presigned URL is expired when the server validates it.
+	presignQuery := presignReq.URL.Query()
+	presignQuery.Set("X-Amz-Expires", "60")
+	presignReq.URL.RawQuery = presignQuery.Encode()
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	creds := aws.Credentials{
+		AccessKeyID:     testS3AccessKey,
+		SecretAccessKey: testS3SecretKey,
+		Source:          "test",
+	}
+	presignedURL, _, err := signer.PresignHTTP(
+		context.Background(),
+		creds,
+		presignReq,
+		s3UnsignedPayload,
+		"s3",
+		testS3Region,
+		oldTime,
+	)
+	require.NoError(t, err)
+
+	parsedURL, err := url.Parse(presignedURL)
+	require.NoError(t, err)
+	presignGetReq := newS3TestRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	presignGetReq.Host = "localhost"
+	rec := httptest.NewRecorder()
+	server.handle(rec, presignGetReq)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "expired")
+}
+
+func TestS3Server_RangeReadAcrossMultipleChunks(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rmc", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Create a payload larger than one chunk (s3ChunkSize=1MiB), use 2MiB+1.
+	payload := strings.Repeat("Z", 2*1024*1024+1)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rmc/big.bin", strings.NewReader(payload)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Range read spanning chunk boundary.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/bucket-rmc/big.bin", nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", 1024*1024-5, 1024*1024+5))
+	server.handle(rec, req)
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+	require.Equal(t, payload[1024*1024-5:1024*1024+6], rec.Body.String())
+}
+
+func TestS3Server_MultipartUploadPartOverwrite(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-overwrite", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-overwrite/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// Upload part 1 twice.
+	data1 := strings.Repeat("A", 5*1024*1024)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-overwrite/obj?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(data1)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	data2 := strings.Repeat("B", 5*1024*1024)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-overwrite/obj?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(data2)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	overwriteETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+
+	// The latest part 1 should be used in complete.
+	lastPart := "end"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-overwrite/obj?uploadId=%s&partNumber=2", uploadID),
+		strings.NewReader(lastPart)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	lastETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+
+	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>"%s"</ETag></Part>
+	</CompleteMultipartUpload>`, overwriteETag, lastETag)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-overwrite/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Verify the overwritten data is used.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-overwrite/obj", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, data2+lastPart, rec.Body.String())
+}
+
 func TestExtractS3Signature(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -640,4 +1399,136 @@ func TestExtractS3Signature(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestS3Server_CompleteMultipartUploadETagMismatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-etag-mm", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// CreateMultipartUpload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-etag-mm/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// UploadPart 1.
+	partData := strings.Repeat("X", 5*1024*1024)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-etag-mm/obj?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(partData)))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Complete with wrong ETag.
+	completeBody := `<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>"0000000000000000deadbeef00000000"</ETag></Part>
+	</CompleteMultipartUpload>`
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-etag-mm/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidPart")
+	require.Contains(t, rec.Body.String(), "ETag mismatch")
+}
+
+func TestS3Server_CompleteMultipartUploadEntityTooSmall(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-small", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// CreateMultipartUpload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-small/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	uploadID := initResult.UploadId
+
+	// UploadPart 1 — only 100 bytes (too small for non-last part).
+	part1Data := strings.Repeat("A", 100)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-small/obj?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(part1Data)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	part1ETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+
+	// UploadPart 2 — last part, small is OK.
+	part2Data := "end"
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-small/obj?uploadId=%s&partNumber=2", uploadID),
+		strings.NewReader(part2Data)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	part2ETag := strings.Trim(rec.Header().Get("ETag"), `"`)
+
+	// Complete — part 1 is not the last and is < 5 MiB.
+	completeBody := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>"%s"</ETag></Part>
+	</CompleteMultipartUpload>`, part1ETag, part2ETag)
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost,
+		fmt.Sprintf("/bucket-small/obj?uploadId=%s", uploadID),
+		strings.NewReader(completeBody)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "EntityTooSmall")
+}
+
+func TestS3Server_PresignedURLWrongCredentials(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3Region(testS3Region),
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	signingTime := currentS3SigningTime()
+
+	// Build a presigned URL with unknown access key.
+	presignReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/bucket-presign/obj.txt", nil)
+	require.NoError(t, err)
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	wrongCreds := aws.Credentials{
+		AccessKeyID:     "unknown-access-key",
+		SecretAccessKey: "wrong-secret",
+		Source:          "test",
+	}
+	presignedURL, _, err := signer.PresignHTTP(
+		context.Background(),
+		wrongCreds,
+		presignReq,
+		s3UnsignedPayload,
+		"s3",
+		testS3Region,
+		signingTime,
+	)
+	require.NoError(t, err)
+
+	parsedURL, err := url.Parse(presignedURL)
+	require.NoError(t, err)
+	presignGetReq := newS3TestRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	presignGetReq.Host = "localhost"
+	rec := httptest.NewRecorder()
+	server.handle(rec, presignGetReq)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "InvalidAccessKeyId")
 }
