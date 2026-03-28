@@ -131,7 +131,7 @@ func GCUploadKey(bucket string, generation uint64, object string, uploadID strin
 // UploadPartPrefixForUpload returns the key prefix that covers all part descriptors
 // for a specific multipart upload. Used to scan/list parts for ListParts and cleanup.
 func UploadPartPrefixForUpload(bucket string, generation uint64, object string, uploadID string) []byte {
-	out := make([]byte, 0, len(UploadPartPrefix)+len(bucket)+len(object)+len(uploadID)+2*u64Bytes+buildObjectExtraBytes)
+	out := make([]byte, 0, len(UploadPartPrefix)+len(bucket)+len(object)+len(uploadID)+u64Bytes+buildObjectExtraBytes)
 	out = append(out, uploadPartPrefixBytes...)
 	out = append(out, EncodeSegment([]byte(bucket))...)
 	out = appendU64(out, generation)
@@ -143,7 +143,7 @@ func UploadPartPrefixForUpload(bucket string, generation uint64, object string, 
 // BlobPrefixForUpload returns the key prefix that covers all blob chunks
 // for a specific multipart upload. Used for cleanup of all chunks in an upload.
 func BlobPrefixForUpload(bucket string, generation uint64, object string, uploadID string) []byte {
-	out := make([]byte, 0, len(BlobPrefix)+len(bucket)+len(object)+len(uploadID)+2*u64Bytes+buildObjectExtraBytes)
+	out := make([]byte, 0, len(BlobPrefix)+len(bucket)+len(object)+len(uploadID)+u64Bytes+buildObjectExtraBytes)
 	out = append(out, blobPrefixBytes...)
 	out = append(out, EncodeSegment([]byte(bucket))...)
 	out = appendU64(out, generation)
