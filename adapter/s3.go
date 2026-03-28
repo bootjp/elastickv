@@ -1010,11 +1010,17 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		writeS3InternalError(w, err)
 		return
 	}
+	bucketFence, err := encodeS3BucketMeta(meta)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
 			{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 		},
@@ -1546,9 +1552,10 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 			return
 		}
 		result.Parts = append(result.Parts, s3ListPartEntry{
-			PartNumber: int(desc.PartNo), //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
-			ETag:       quoteS3ETag(desc.ETag),
-			Size:       desc.SizeBytes,
+			PartNumber:   int(desc.PartNo), //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
+			ETag:         quoteS3ETag(desc.ETag),
+			Size:         desc.SizeBytes,
+			LastModified: formatS3ISOTime(desc.PartVersion),
 		})
 		result.NextPartNumberMarker = int(desc.PartNo) //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
 	}
