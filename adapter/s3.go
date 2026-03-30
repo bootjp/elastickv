@@ -48,8 +48,16 @@ const (
 	s3ManifestCleanupWorkers = 16
 
 	s3PathSplitParts   = 2
+	s3RangeSplitParts  = 2
 	s3GenerationBytes  = 8
 	s3HLCPhysicalShift = 16
+
+	s3MinPartNumber     = 1
+	s3MaxPartNumber     = 10000
+	s3MinPartSize       = 5 * 1024 * 1024 // 5 MiB (except last part)
+	s3MaxPartSizeBytes  = 5 * 1024 * 1024 * 1024
+	s3MaxPartsPerUpload = 10000
+	s3ListPartsMaxParts = 1000
 )
 
 type S3Server struct {
@@ -87,11 +95,12 @@ type s3ObjectManifest struct {
 }
 
 type s3ObjectPart struct {
-	PartNo     uint64   `json:"part_no"`
-	ETag       string   `json:"etag"`
-	SizeBytes  int64    `json:"size_bytes"`
-	ChunkCount uint64   `json:"chunk_count"`
-	ChunkSizes []uint64 `json:"chunk_sizes,omitempty"`
+	PartNo      uint64   `json:"part_no"`
+	ETag        string   `json:"etag"`
+	SizeBytes   int64    `json:"size_bytes"`
+	ChunkCount  uint64   `json:"chunk_count"`
+	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion uint64   `json:"part_version,omitempty"`
 }
 
 type s3ContinuationToken struct {
@@ -168,6 +177,72 @@ type s3ListObjectContent struct {
 
 type s3CommonPrefix struct {
 	Prefix string `xml:"Prefix"`
+}
+
+type s3UploadMeta struct {
+	Bucket      string            `json:"bucket"`
+	Object      string            `json:"object"`
+	Generation  uint64            `json:"generation"`
+	UploadID    string            `json:"upload_id"`
+	CreatedHLC  uint64            `json:"created_hlc"`
+	ContentType string            `json:"content_type,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
+type s3PartDescriptor struct {
+	PartNo      uint64   `json:"part_no"`
+	ETag        string   `json:"etag"`
+	SizeBytes   int64    `json:"size_bytes"`
+	ChunkCount  uint64   `json:"chunk_count"`
+	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion uint64   `json:"part_version,omitempty"`
+}
+
+type s3InitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	XMLNS    string   `xml:"xmlns,attr,omitempty"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadId string   `xml:"UploadId"`
+}
+
+type s3CompleteMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	XMLNS    string   `xml:"xmlns,attr,omitempty"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+}
+
+type s3CompleteMultipartUploadRequest struct {
+	XMLName xml.Name                        `xml:"CompleteMultipartUpload"`
+	Parts   []s3CompleteMultipartUploadPart `xml:"Part"`
+}
+
+type s3CompleteMultipartUploadPart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type s3ListPartsResult struct {
+	XMLName              xml.Name          `xml:"ListPartsResult"`
+	XMLNS                string            `xml:"xmlns,attr,omitempty"`
+	Bucket               string            `xml:"Bucket"`
+	Key                  string            `xml:"Key"`
+	UploadId             string            `xml:"UploadId"`
+	MaxParts             int               `xml:"MaxParts"`
+	IsTruncated          bool              `xml:"IsTruncated"`
+	PartNumberMarker     int               `xml:"PartNumberMarker"`
+	NextPartNumberMarker int               `xml:"NextPartNumberMarker"`
+	Parts                []s3ListPartEntry `xml:"Part"`
+}
+
+type s3ListPartEntry struct {
+	PartNumber   int    `xml:"PartNumber"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
 }
 
 func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[raft.ServerAddress]string, opts ...S3ServerOption) *S3Server {
@@ -275,15 +350,42 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 }
 
+//nolint:cyclop // handleObject routes to sub-handlers based on method+operation; branching is by design.
 func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
+	query := r.URL.Query()
+	uploadID := query.Get("uploadId")
+
 	switch r.Method {
+	case http.MethodPost:
+		if query.Has("uploads") {
+			s.createMultipartUpload(w, r, bucket, objectKey)
+			return
+		}
+		if uploadID != "" {
+			s.completeMultipartUpload(w, r, bucket, objectKey, uploadID)
+			return
+		}
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "unsupported POST operation", bucket, objectKey)
 	case http.MethodPut:
+		if uploadID != "" {
+			partNumber := query.Get("partNumber")
+			s.uploadPart(w, r, bucket, objectKey, uploadID, partNumber)
+			return
+		}
 		s.putObject(w, r, bucket, objectKey)
 	case http.MethodGet:
+		if uploadID != "" {
+			s.listParts(w, r, bucket, objectKey, uploadID)
+			return
+		}
 		s.getObject(w, r, bucket, objectKey, false)
 	case http.MethodHead:
 		s.getObject(w, r, bucket, objectKey, true)
 	case http.MethodDelete:
+		if uploadID != "" {
+			s.abortMultipartUpload(w, r, bucket, objectKey, uploadID)
+			return
+		}
 		s.deleteObject(w, r, bucket, objectKey)
 	default:
 		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", bucket, objectKey)
@@ -634,12 +736,8 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop // The read handler branches on bucket/object existence and HEAD vs GET response flow.
+//nolint:cyclop,gocognit // The read handler branches on bucket/object existence, range, and HEAD vs GET response flow.
 func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, headOnly bool) {
-	if !headOnly && strings.TrimSpace(r.Header.Get("Range")) != "" {
-		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "range reads are not implemented yet", bucket, objectKey)
-		return
-	}
 	readTS := s.readTS()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
@@ -664,30 +762,164 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return
 	}
 
-	writeS3ObjectHeaders(w.Header(), manifest)
-	w.WriteHeader(http.StatusOK)
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+
+	// HEAD requests: mirror GET range semantics but never write a body.
 	if headOnly {
+		if rangeHeader == "" {
+			writeS3ObjectHeaders(w.Header(), manifest)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		rangeStart, rangeEnd, ok := parseS3RangeHeader(rangeHeader, manifest.SizeBytes)
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.SizeBytes))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		contentLength := rangeEnd - rangeStart + 1
+		writeS3ObjectHeaders(w.Header(), manifest)
+		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
 		return
 	}
+
+	// GET without Range: stream the full object.
+	if rangeHeader == "" {
+		writeS3ObjectHeaders(w.Header(), manifest)
+		w.WriteHeader(http.StatusOK)
+		s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes)
+		return
+	}
+
+	rangeStart, rangeEnd, ok := parseS3RangeHeader(rangeHeader, manifest.SizeBytes)
+	if !ok {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.SizeBytes))
+		writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
+			"range not satisfiable", bucket, objectKey)
+		return
+	}
+
+	contentLength := rangeEnd - rangeStart + 1
+	writeS3ObjectHeaders(w.Header(), manifest)
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.WriteHeader(http.StatusPartialContent)
+	s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength)
+}
+
+//nolint:cyclop // streamObjectChunks iterates nested part/chunk loops with necessary error-handling branches.
+func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) {
+	remaining := length
+	pos := int64(0)
 	for _, part := range manifest.Parts {
-		for chunkNo := range part.ChunkSizes {
-			chunkIndex, err := uint64FromInt(chunkNo)
+		if remaining <= 0 {
+			break
+		}
+		for chunkIdx, chunkSize := range part.ChunkSizes {
+			if remaining <= 0 {
+				break
+			}
+			cs := int64(chunkSize) //nolint:gosec // G115: chunkSize is bounded by s3ChunkSize which fits in int64.
+			chunkEnd := pos + cs
+			if chunkEnd <= offset {
+				pos = chunkEnd
+				continue
+			}
+			chunkIndex, err := uint64FromInt(chunkIdx)
 			if err != nil {
-				writeS3InternalError(w, err)
+				slog.ErrorContext(r.Context(), "streamObjectChunks: uint64FromInt failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"err", err,
+				)
 				return
 			}
-			chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex)
+			chunkKey := s3keys.VersionedBlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex, part.PartVersion)
 			chunk, err := s.store.GetAt(r.Context(), chunkKey, readTS)
 			if err != nil {
-				writeS3InternalError(w, err)
+				slog.ErrorContext(r.Context(), "streamObjectChunks: GetAt failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"chunk_key", string(chunkKey),
+					"err", err,
+				)
 				return
+			}
+			chunkLen := int64(len(chunk))
+			start := int64(0)
+			if pos < offset {
+				start = offset - pos
+			}
+			if start >= chunkLen {
+				pos = chunkEnd
+				continue
+			}
+			end := chunkLen
+			if start+remaining < end {
+				end = start + remaining
 			}
 			//nolint:gosec // G705: S3 serves stored object bytes verbatim by design.
-			if _, err := w.Write(chunk); err != nil {
+			n, err := w.Write(chunk[start:end])
+			remaining -= int64(n)
+			if err != nil {
 				return
 			}
+			pos = chunkEnd
 		}
 	}
+}
+
+//nolint:cyclop // parseS3RangeHeader handles all RFC-compliant byte-range forms; each branch is a distinct syntax.
+func parseS3RangeHeader(header string, totalSize int64) (start int64, end int64, ok bool) {
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	if strings.Contains(spec, ",") {
+		return 0, 0, false // multi-range not supported
+	}
+	parts := strings.SplitN(spec, "-", s3RangeSplitParts)
+	if len(parts) != s3RangeSplitParts {
+		return 0, 0, false
+	}
+	left := strings.TrimSpace(parts[0])
+	right := strings.TrimSpace(parts[1])
+
+	if left == "" {
+		// suffix range: bytes=-N
+		n, err := strconv.ParseInt(right, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false
+		}
+		if totalSize <= 0 {
+			// Nothing to serve from an empty object; caller should return 416.
+			return 0, 0, false
+		}
+		if n > totalSize {
+			n = totalSize
+		}
+		return totalSize - n, totalSize - 1, true
+	}
+	start, err := strconv.ParseInt(left, 10, 64)
+	if err != nil || start < 0 || start >= totalSize {
+		return 0, 0, false
+	}
+	if right == "" {
+		// open-ended: bytes=N-
+		return start, totalSize - 1, true
+	}
+	end, err = strconv.ParseInt(right, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, false
+	}
+	if end >= totalSize {
+		end = totalSize - 1
+	}
+	return start, end, true
 }
 
 func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
@@ -744,6 +976,769 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists || meta == nil {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return
+	}
+
+	uploadID := newS3UploadID(s.clock())
+	startTS := s.txnStartTS(readTS)
+	commitTS, err := s.nextTxnCommitTS(startTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	uploadMeta := &s3UploadMeta{
+		Bucket:      bucket,
+		Object:      objectKey,
+		Generation:  meta.Generation,
+		UploadID:    uploadID,
+		CreatedHLC:  commitTS,
+		ContentType: headerOrDefault(r.Header.Get("Content-Type"), "application/octet-stream"),
+		Metadata:    collectS3UserMetadata(r.Header),
+	}
+	body, err := json.Marshal(uploadMeta)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	bucketFence, err := encodeS3BucketMeta(meta)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
+			{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
+			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
+		},
+	}); err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	writeS3XML(w, http.StatusOK, s3InitiateMultipartUploadResult{
+		XMLNS:    s3XMLNamespace,
+		Bucket:   bucket,
+		Key:      objectKey,
+		UploadId: uploadID,
+	})
+}
+
+//nolint:cyclop,gocognit,gocyclo // Upload part is intentionally linear and maps directly to protocol steps.
+func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string, partNumberStr string) {
+	partNumber, err := strconv.Atoi(partNumberStr)
+	if err != nil || partNumber < s3MinPartNumber || partNumber > s3MaxPartNumber {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "part number must be between 1 and 10000", bucket, objectKey)
+		return
+	}
+	partNo := uint64(partNumber)
+
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists || meta == nil {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return
+	}
+
+	// Verify upload exists.
+	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
+	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
+			return
+		}
+		writeS3InternalError(w, err)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s3MaxPartSizeBytes)
+
+	// Pre-allocate the part's commit timestamp before writing any blob chunks so
+	// that the same version identifier is used for every chunk in this attempt.
+	// Embedding partCommitTS as PartVersion in the blob keys isolates each
+	// UploadPart attempt in its own key space: a concurrent or retried request
+	// for the same partNo receives a different timestamp and therefore writes to
+	// different keys, leaving the chunk data referenced by an in-progress
+	// CompleteMultipartUpload untouched.
+	partReadTS := s.readTS()
+	partStartTS := s.txnStartTS(partReadTS)
+	partCommitTS, err := s.nextTxnCommitTS(partStartTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+
+	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
+	sizeBytes := int64(0)
+	chunkNo := uint64(0)
+	buf := make([]byte, s3ChunkSize)
+	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+	chunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	partCommitted := false
+	defer func() {
+		if !partCommitted && chunkNo > 0 {
+			s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
+		}
+	}()
+
+	flushBatch := func() error {
+		if len(pendingBatch) == 0 {
+			return nil
+		}
+		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		pendingBatch = pendingBatch[:0]
+		return nil
+	}
+
+	for {
+		n, readErr := r.Body.Read(buf)
+		if n == 0 {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			if readErr != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(readErr, &maxBytesErr) {
+					writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+					return
+				}
+				writeS3InternalError(w, readErr)
+				return
+			}
+			continue
+		}
+		chunk := append([]byte(nil), buf[:n]...)
+		if _, err := hasher.Write(chunk); err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+		chunkKey := s3keys.VersionedBlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
+		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
+		cs, err := uint64FromInt(n)
+		if err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+		chunkSizes = append(chunkSizes, cs)
+		if len(pendingBatch) >= s3ChunkBatchOps {
+			if err := flushBatch(); err != nil {
+				writeS3InternalError(w, err)
+				return
+			}
+		}
+		sizeBytes += int64(n)
+		chunkNo++
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(readErr, &maxBytesErr) {
+				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, readErr)
+			return
+		}
+	}
+	if err := flushBatch(); err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+
+	etag := hex.EncodeToString(hasher.Sum(nil))
+	partDesc := &s3PartDescriptor{
+		PartNo:      partNo,
+		ETag:        etag,
+		SizeBytes:   sizeBytes,
+		ChunkCount:  chunkNo,
+		ChunkSizes:  chunkSizes,
+		PartVersion: partCommitTS,
+	}
+	descBody, err := json.Marshal(partDesc)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, partNo)
+
+	// Load previous part descriptor (if any) so we can clean up its blobs after overwrite.
+	var prevDesc *s3PartDescriptor
+	if prevRaw, err := s.store.GetAt(r.Context(), partKey, readTS); err == nil {
+		var pd s3PartDescriptor
+		if json.Unmarshal(prevRaw, &pd) == nil {
+			prevDesc = &pd
+		}
+	}
+
+	// Re-verify upload still exists at a fresh snapshot before committing.
+	// This narrows the race window with concurrent Abort/Complete.
+	freshTS := s.readTS()
+	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, freshTS); err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
+			return
+		}
+		writeS3InternalError(w, err)
+		return
+	}
+
+	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  partStartTS,
+		CommitTS: partCommitTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: partKey, Value: descBody},
+		},
+	}); err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	partCommitted = true
+
+	// Clean up blobs from the previous version of this part (if overwritten).
+	if prevDesc != nil {
+		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, prevDesc.PartNo, prevDesc.ChunkCount, prevDesc.PartVersion)
+	}
+
+	w.Header().Set("ETag", quoteS3ETag(etag))
+	w.WriteHeader(http.StatusOK)
+}
+
+//nolint:cyclop,gocognit,gocyclo // CompleteMultipartUpload validates parts, computes composite ETag, and commits atomically.
+func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, s3ChunkSize))
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	var completionReq s3CompleteMultipartUploadRequest
+	if err := xml.Unmarshal(bodyBytes, &completionReq); err != nil {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "request body is not valid XML", bucket, objectKey)
+		return
+	}
+	if len(completionReq.Parts) == 0 {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "at least one part is required", bucket, objectKey)
+		return
+	}
+	if len(completionReq.Parts) > s3MaxPartsPerUpload {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument",
+			fmt.Sprintf("too many parts in CompleteMultipartUpload request (maximum %d)", s3MaxPartsPerUpload), bucket, objectKey)
+		return
+	}
+
+	// Parts must be in ascending order, within allowed part number range.
+	for i, part := range completionReq.Parts {
+		if part.PartNumber < s3MinPartNumber || part.PartNumber > s3MaxPartNumber {
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "part number out of allowed range", bucket, objectKey)
+			return
+		}
+		if i > 0 && part.PartNumber <= completionReq.Parts[i-1].PartNumber {
+			writeS3Error(w, http.StatusBadRequest, "InvalidPartOrder", "parts must be in ascending order", bucket, objectKey)
+			return
+		}
+	}
+
+	// Phase 1: Read and validate parts (outside retry — idempotent, avoids O(parts) re-reads).
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		readPin.Release()
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists || meta == nil {
+		readPin.Release()
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return
+	}
+	generation := meta.Generation
+
+	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
+	uploadMetaRaw, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS)
+	if err != nil {
+		readPin.Release()
+		if errors.Is(err, store.ErrKeyNotFound) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
+			return
+		}
+		writeS3InternalError(w, err)
+		return
+	}
+	var uploadMeta s3UploadMeta
+	if err := json.Unmarshal(uploadMetaRaw, &uploadMeta); err != nil {
+		readPin.Release()
+		writeS3InternalError(w, err)
+		return
+	}
+
+	manifestParts := make([]s3ObjectPart, 0, len(completionReq.Parts))
+	md5Concat := md5.New() //nolint:gosec // S3 composite ETag requires MD5.
+	totalSize := int64(0)
+
+	for i, reqPart := range completionReq.Parts {
+		partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, uint64(reqPart.PartNumber)) //nolint:gosec // G115: PartNumber validated in [1,10000].
+		raw, err := s.store.GetAt(r.Context(), partKey, readTS)
+		if err != nil {
+			readPin.Release()
+			if errors.Is(err, store.ErrKeyNotFound) {
+				writeS3Error(w, http.StatusBadRequest, "InvalidPart", fmt.Sprintf("part %d not found", reqPart.PartNumber), bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, err)
+			return
+		}
+		var desc s3PartDescriptor
+		if err := json.Unmarshal(raw, &desc); err != nil {
+			readPin.Release()
+			writeS3InternalError(w, err)
+			return
+		}
+		reqETag := strings.Trim(reqPart.ETag, `"`)
+		if reqETag != desc.ETag {
+			readPin.Release()
+			writeS3Error(w, http.StatusBadRequest, "InvalidPart",
+				fmt.Sprintf("part %d ETag mismatch: got %q, want %q", reqPart.PartNumber, reqETag, desc.ETag), bucket, objectKey)
+			return
+		}
+		if i < len(completionReq.Parts)-1 && desc.SizeBytes < int64(s3MinPartSize) {
+			readPin.Release()
+			writeS3Error(w, http.StatusBadRequest, "EntityTooSmall",
+				fmt.Sprintf("part %d is too small (%d bytes)", reqPart.PartNumber, desc.SizeBytes), bucket, objectKey)
+			return
+		}
+
+		partMD5, err := hex.DecodeString(desc.ETag)
+		if err != nil {
+			readPin.Release()
+			writeS3InternalError(w, err)
+			return
+		}
+		if _, err := md5Concat.Write(partMD5); err != nil {
+			readPin.Release()
+			writeS3InternalError(w, err)
+			return
+		}
+
+		manifestParts = append(manifestParts, s3ObjectPart(desc))
+		totalSize += desc.SizeBytes
+	}
+	readPin.Release()
+
+	compositeETag := hex.EncodeToString(md5Concat.Sum(nil)) + fmt.Sprintf("-%d", len(completionReq.Parts))
+
+	// Phase 2: Commit (inside retry — only fencing + manifest write).
+	var previous *s3ObjectManifest
+
+	err = s.retryS3Mutation(r.Context(), func() error {
+		retryReadTS := s.readTS()
+		startTS := s.txnStartTS(retryReadTS)
+		retryPin := s.pinReadTS(retryReadTS)
+		defer retryPin.Release()
+
+		// Re-verify bucket generation hasn't changed (fence against delete+recreate).
+		retryMeta, retryExists, err := s.loadBucketMetaAt(r.Context(), bucket, retryReadTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !retryExists || retryMeta == nil {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchBucket",
+				Message: "bucket not found",
+				Bucket:  bucket,
+				Key:     objectKey,
+			}
+		}
+		if retryMeta.Generation != generation {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchUpload",
+				Message: "upload not found (bucket was recreated)",
+				Bucket:  bucket,
+				Key:     objectKey,
+			}
+		}
+
+		// Re-verify upload still exists (fence against concurrent Abort).
+		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, retryReadTS); err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				return &s3ResponseError{
+					Status:  http.StatusNotFound,
+					Code:    "NoSuchUpload",
+					Message: "upload not found",
+					Bucket:  bucket,
+					Key:     objectKey,
+				}
+			}
+			return errors.WithStack(err)
+		}
+
+		commitTS, err := s.nextTxnCommitTS(startTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		headKey := s3keys.ObjectManifestKey(bucket, retryMeta.Generation, objectKey)
+		previous, _, err = s.loadObjectManifestAt(r.Context(), headKey, retryReadTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		manifest := &s3ObjectManifest{
+			UploadID:        uploadID,
+			ETag:            compositeETag,
+			SizeBytes:       totalSize,
+			LastModifiedHLC: commitTS,
+			ContentType:     uploadMeta.ContentType,
+			UserMetadata:    uploadMeta.Metadata,
+			Parts:           manifestParts,
+		}
+		manifestBody, err := encodeS3ObjectManifest(manifest)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		bucketFence, err := encodeS3BucketMeta(retryMeta)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		// Atomically: fence bucket (conflict with DELETE bucket), write manifest,
+		// delete UploadMeta + GCUpload (fence against Abort).
+		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  startTS,
+			CommitTS: commitTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
+				{Op: kv.Put, Key: headKey, Value: manifestBody},
+				{Op: kv.Del, Key: uploadMetaKey},
+				{Op: kv.Del, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID)},
+			},
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
+		writeS3MutationError(w, err, bucket, objectKey)
+		return
+	}
+
+	if previous != nil {
+		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, previous)
+	}
+	s.cleanupUploadPartsAsync(bucket, generation, objectKey, uploadID)
+
+	writeS3XML(w, http.StatusOK, s3CompleteMultipartUploadResult{
+		XMLNS:  s3XMLNamespace,
+		Bucket: bucket,
+		Key:    objectKey,
+		ETag:   quoteS3ETag(compositeETag),
+	})
+}
+
+func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
+	var generation uint64
+	err := s.retryS3Mutation(r.Context(), func() error {
+		readTS := s.readTS()
+		startTS := s.txnStartTS(readTS)
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !exists || meta == nil {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchBucket",
+				Message: "bucket not found",
+				Bucket:  bucket,
+				Key:     objectKey,
+			}
+		}
+		generation = meta.Generation
+
+		uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
+		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				return &s3ResponseError{
+					Status:  http.StatusNotFound,
+					Code:    "NoSuchUpload",
+					Message: "upload not found",
+					Bucket:  bucket,
+					Key:     objectKey,
+				}
+			}
+			return errors.WithStack(err)
+		}
+
+		// Transactional delete with startTS fencing — conflicts with concurrent Complete.
+		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+			IsTxn:   true,
+			StartTS: startTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: uploadMetaKey},
+				{Op: kv.Del, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID)},
+			},
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
+		writeS3MutationError(w, err, bucket, objectKey)
+		return
+	}
+
+	// Async cleanup of parts and blobs.
+	s.cleanupUploadDataAsync(bucket, generation, objectKey, uploadID)
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+//nolint:cyclop // listParts validates upload, parses pagination params, and iterates parts; branches are inherent.
+func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists || meta == nil {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return
+	}
+
+	// Verify upload exists.
+	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
+	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
+			return
+		}
+		writeS3InternalError(w, err)
+		return
+	}
+
+	query := r.URL.Query()
+	maxParts := parseS3MaxParts(query.Get("max-parts"))
+	partNumberMarker := parseS3PartNumberMarker(query.Get("part-number-marker"))
+
+	partPrefix := s3keys.UploadPartPrefixForUpload(bucket, meta.Generation, objectKey, uploadID)
+	start := partPrefix
+	if partNumberMarker > 0 {
+		start = nextScanCursor(s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, uint64(partNumberMarker)))
+	}
+	end := prefixScanEnd(partPrefix)
+
+	kvs, err := s.store.ScanAt(r.Context(), start, end, maxParts+1, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+
+	result := s3ListPartsResult{
+		XMLNS:            s3XMLNamespace,
+		Bucket:           bucket,
+		Key:              objectKey,
+		UploadId:         uploadID,
+		MaxParts:         maxParts,
+		PartNumberMarker: partNumberMarker,
+	}
+
+	for i, kvp := range kvs {
+		if i >= maxParts {
+			result.IsTruncated = true
+			break
+		}
+		var desc s3PartDescriptor
+		if err := json.Unmarshal(kvp.Value, &desc); err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+		result.Parts = append(result.Parts, s3ListPartEntry{
+			PartNumber:   int(desc.PartNo), //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
+			ETag:         quoteS3ETag(desc.ETag),
+			Size:         desc.SizeBytes,
+			LastModified: formatS3ISOTime(desc.PartVersion),
+		})
+		result.NextPartNumberMarker = int(desc.PartNo) //nolint:gosec // G115: PartNo is in [1,10000], safe for int.
+	}
+
+	writeS3XML(w, http.StatusOK, result)
+}
+
+func (s *S3Server) cleanupUploadPartsAsync(bucket string, generation uint64, objectKey string, uploadID string) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
+	go func() {
+		defer func() { <-s.cleanupSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
+		defer cancel()
+		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
+	}()
+}
+
+func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, generation uint64, objectKey string, uploadID string) {
+	partPrefix := s3keys.UploadPartPrefixForUpload(bucket, generation, objectKey, uploadID)
+	s.deleteByPrefix(ctx, partPrefix, bucket, generation, objectKey, uploadID)
+}
+
+// cleanupPartBlobsAsync asynchronously deletes the blob chunk keys for a single
+// upload part. It is used to garbage-collect orphaned chunks when a part
+// descriptor write fails after the chunks have already been committed.
+// partVersion must match the value used when writing the chunk keys.
+func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objectKey string, uploadID string, partNo uint64, chunkCount uint64, partVersion uint64) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
+	go func() {
+		defer func() { <-s.cleanupSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
+		defer cancel()
+		pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+				slog.ErrorContext(ctx, "cleanupPartBlobsAsync: coordinator dispatch failed",
+					"bucket", bucket,
+					"object_key", objectKey,
+					"upload_id", uploadID,
+					"part_no", partNo,
+					"err", err,
+				)
+			}
+			pending = pending[:0]
+		}
+		for i := uint64(0); i < chunkCount; i++ {
+			pending = append(pending, &kv.Elem[kv.OP]{
+				Op:  kv.Del,
+				Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion),
+			})
+			if len(pending) >= s3ChunkBatchOps {
+				flush()
+			}
+		}
+		flush()
+	}()
+}
+
+func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, objectKey string, uploadID string) {
+	select {
+	case s.cleanupSem <- struct{}{}:
+	default:
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
+		return
+	}
+	go func() {
+		defer func() { <-s.cleanupSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
+		defer cancel()
+		// Delete part descriptors.
+		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
+		// Delete blob chunks.
+		blobPrefix := s3keys.BlobPrefixForUpload(bucket, generation, objectKey, uploadID)
+		s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
+	}()
+}
+
+func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket string, generation uint64, objectKey string, uploadID string) {
+	end := prefixScanEnd(prefix)
+	cursor := prefix
+	for {
+		readTS := s.readTS()
+		readPin := s.pinReadTS(readTS)
+		kvs, err := s.store.ScanAt(ctx, cursor, end, s3ChunkBatchOps, readTS)
+		readPin.Release()
+		if err != nil {
+			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
+				"bucket", bucket, "generation", generation,
+				"object_key", objectKey, "upload_id", uploadID, "err", err)
+			return
+		}
+		if len(kvs) == 0 {
+			return
+		}
+		pending := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		for _, kvp := range kvs {
+			pending = append(pending, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
+		}
+		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+			slog.ErrorContext(ctx, "deleteByPrefix: dispatch failed",
+				"bucket", bucket, "generation", generation,
+				"object_key", objectKey, "upload_id", uploadID, "err", err)
+			return
+		}
+		cursor = nextScanCursor(kvs[len(kvs)-1].Key)
+	}
+}
+
+func parseS3MaxParts(raw string) int {
+	if strings.TrimSpace(raw) == "" {
+		return s3ListPartsMaxParts
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return s3ListPartsMaxParts
+	}
+	if v > s3ListPartsMaxParts {
+		return s3ListPartsMaxParts
+	}
+	return v
+}
+
+func parseS3PartNumberMarker(raw string) int {
+	if strings.TrimSpace(raw) == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return 0
+	}
+	if v > s3MaxPartNumber {
+		return s3MaxPartNumber
+	}
+	return v
 }
 
 //nolint:cyclop,gocognit,gocyclo,nestif // ListObjectsV2 combines token validation, shard-stable snapshotting, and delimiter pagination rules.
@@ -937,8 +1932,7 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	select {
 	case s.cleanupSem <- struct{}{}:
 	default:
-		// All cleanup workers are busy; skip this cleanup to avoid unbounded goroutine growth.
-		// Orphaned blobs from skipped cleanups may persist until explicitly overwritten or deleted.
+		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
 		return
 	}
 	go func() {
@@ -986,7 +1980,7 @@ func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, 
 		}
 		pending = append(pending, &kv.Elem[kv.OP]{
 			Op:  kv.Del,
-			Key: s3keys.BlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex),
+			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
 		})
 		if len(pending) >= s3ChunkBatchOps {
 			flush()
