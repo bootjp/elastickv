@@ -13,6 +13,8 @@ import (
 type TransactionManager struct {
 	raft *raft.Raft
 
+	proposalObserver ProposalObserver
+
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
 	rawFlushing bool
@@ -37,11 +39,32 @@ var rawBatchWindow = 500 * time.Microsecond
 
 var errRawQueueFull = errors.New("raw commit queue is full; try again later")
 
-func NewTransaction(raft *raft.Raft) *TransactionManager {
-	return &TransactionManager{
+// ProposalObserver records raft proposal failures for operational metrics.
+type ProposalObserver interface {
+	ObserveProposalFailure()
+}
+
+type TransactionOption func(*TransactionManager)
+
+// WithProposalObserver records raft.Apply failures without coupling kv to a
+// concrete monitoring backend.
+func WithProposalObserver(observer ProposalObserver) TransactionOption {
+	return func(t *TransactionManager) {
+		t.proposalObserver = observer
+	}
+}
+
+func NewTransaction(raft *raft.Raft, opts ...TransactionOption) *TransactionManager {
+	t := &TransactionManager{
 		raft:    raft,
 		closeCh: make(chan struct{}),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(t)
+		}
+	}
+	return t
 }
 
 var errShuttingDown = errors.New("transaction manager is shutting down")
@@ -92,7 +115,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 // HashiCorp Raft delivers FSM responses via ApplyFuture.Response(), not Error(),
 // so we must inspect the response to avoid silently treating failed writes as
 // successes.
-func applyRequests(r *raft.Raft, reqs []*pb.Request) (uint64, []error, error) {
+func applyRequests(r *raft.Raft, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
 	b, err := marshalRaftCommand(reqs)
 	if err != nil {
 		return 0, nil, errors.WithStack(err)
@@ -100,6 +123,7 @@ func applyRequests(r *raft.Raft, reqs []*pb.Request) (uint64, []error, error) {
 
 	af := r.Apply(b, time.Second)
 	if err := af.Error(); err != nil {
+		recordProposalFailure(proposalObserver)
 		return 0, nil, errors.WithStack(err)
 	}
 
@@ -113,11 +137,19 @@ func applyRequests(r *raft.Raft, reqs []*pb.Request) (uint64, []error, error) {
 		return af.Index(), []error{errors.WithStack(resp)}, nil
 	case *fsmApplyResponse:
 		if len(resp.results) != len(reqs) {
+			recordProposalFailure(proposalObserver)
 			return 0, nil, errors.WithStack(errors.Newf("unexpected apply response size: got %d want %d", len(resp.results), len(reqs)))
 		}
 		return af.Index(), resp.results, nil
 	default:
+		recordProposalFailure(proposalObserver)
 		return 0, nil, errors.WithStack(errors.Newf("unexpected apply response type %T", resp))
+	}
+}
+
+func recordProposalFailure(observer ProposalObserver) {
+	if observer != nil {
+		observer.ObserveProposalFailure()
 	}
 }
 
@@ -144,7 +176,7 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 	commitIndex, err := func() (uint64, error) {
 		commitIndex := uint64(0)
 		for _, req := range reqs {
-			idx, results, err := applyRequests(t.raft, []*pb.Request{req})
+			idx, results, err := applyRequests(t.raft, []*pb.Request{req}, t.proposalObserver)
 			if err != nil {
 				return 0, err
 			}
@@ -294,7 +326,7 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	}
 	offsets = append(offsets, len(reqs))
 
-	idx, results, err := applyRequests(t.raft, reqs)
+	idx, results, err := applyRequests(t.raft, reqs, t.proposalObserver)
 	if err != nil {
 		for _, item := range batch {
 			item.done <- rawCommitResult{err: err}
@@ -333,7 +365,7 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 
 	var commitIndex uint64
 	for _, req := range abortReqs {
-		idx, results, err := applyRequests(t.raft, []*pb.Request{req})
+		idx, results, err := applyRequests(t.raft, []*pb.Request{req}, t.proposalObserver)
 		if err != nil {
 			return nil, err
 		}
