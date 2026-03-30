@@ -1097,6 +1097,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	buf := make([]byte, s3ChunkSize)
 	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
 	chunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	partCommitted := false
+	defer func() {
+		if !partCommitted && chunkNo > 0 {
+			s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
+		}
+	}()
 
 	flushBatch := func() error {
 		if len(pendingBatch) == 0 {
@@ -1199,11 +1205,10 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			{Op: kv.Put, Key: partKey, Value: descBody},
 		},
 	}); err != nil {
-		// Clean up orphaned blob chunks so they don't accumulate in the store.
-		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		writeS3InternalError(w, err)
 		return
 	}
+	partCommitted = true
 
 	// Clean up blobs from the previous version of this part (if overwritten).
 	if prevDesc != nil {
