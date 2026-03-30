@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -434,15 +435,11 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 }
 
 func extractPresignedSignature(presignedURL string) string {
-	idx := strings.Index(presignedURL, "X-Amz-Signature=")
-	if idx < 0 {
+	parsed, err := url.Parse(presignedURL)
+	if err != nil {
 		return ""
 	}
-	sig := presignedURL[idx+len("X-Amz-Signature="):]
-	if ampIdx := strings.IndexByte(sig, '&'); ampIdx >= 0 {
-		sig = sig[:ampIdx]
-	}
-	return sig
+	return parsed.Query().Get("X-Amz-Signature")
 }
 
 // extractS3Signature returns the hex signature value from a SigV4

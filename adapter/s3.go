@@ -1177,6 +1177,16 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, partNo)
+
+	// Load previous part descriptor (if any) so we can clean up its blobs after overwrite.
+	var prevDesc *s3PartDescriptor
+	if prevRaw, err := s.store.GetAt(r.Context(), partKey, readTS); err == nil {
+		var pd s3PartDescriptor
+		if json.Unmarshal(prevRaw, &pd) == nil && pd.PartVersion != 0 {
+			prevDesc = &pd
+		}
+	}
+
 	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  partStartTS,
@@ -1189,6 +1199,11 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		writeS3InternalError(w, err)
 		return
+	}
+
+	// Clean up blobs from the previous version of this part (if overwritten).
+	if prevDesc != nil {
+		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, prevDesc.PartNo, prevDesc.ChunkCount, prevDesc.PartVersion)
 	}
 
 	w.Header().Set("ETag", quoteS3ETag(etag))
