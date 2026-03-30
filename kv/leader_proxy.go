@@ -11,6 +11,7 @@ import (
 )
 
 const leaderForwardTimeout = 5 * time.Second
+const maxForwardRetries = 3
 
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
@@ -31,30 +32,50 @@ func NewLeaderProxy(r *raft.Raft, opts ...TransactionOption) *LeaderProxy {
 
 func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
 	if p.raft.State() != raft.Leader {
-		return p.forward(reqs)
+		return p.forwardWithRetry(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
 	if err := verifyRaftLeader(p.raft); err != nil {
-		return p.forward(reqs)
+		return p.forwardWithRetry(reqs)
 	}
 	return p.tm.Commit(reqs)
 }
 
 func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 	if p.raft.State() != raft.Leader {
-		return p.forward(reqs)
+		return p.forwardWithRetry(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
 	if err := verifyRaftLeader(p.raft); err != nil {
-		return p.forward(reqs)
+		return p.forwardWithRetry(reqs)
 	}
 	return p.tm.Abort(reqs)
 }
 
-func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
+// forwardWithRetry attempts to forward to the leader up to maxForwardRetries
+// times, re-fetching the leader address on each failure to handle leadership
+// changes between attempts.
+func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxForwardRetries; attempt++ {
+		resp, err := p.forward(reqs)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		// If the leader is simply not found, retry won't help immediately.
+		if errors.Is(err, ErrLeaderNotFound) {
+			return nil, err
+		}
+	}
+	return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries)
+}
+
+func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
 	addr, _ := p.raft.LeaderWithID()
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)

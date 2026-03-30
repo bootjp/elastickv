@@ -55,6 +55,10 @@ type mvccSnapshotEntry struct {
 	Versions []VersionedValue
 }
 
+type compactEntry struct {
+	key []byte
+}
+
 func byteSliceComparator(a, b any) int {
 	ab, okA := a.([]byte)
 	bb, okB := b.([]byte)
@@ -68,16 +72,6 @@ func byteSliceComparator(a, b any) int {
 	default:
 		return 0
 	}
-}
-
-func withinBoundsKey(k, start, end []byte) bool {
-	if start != nil && bytes.Compare(k, start) < 0 {
-		return false
-	}
-	if end != nil && bytes.Compare(k, end) > 0 {
-		return false
-	}
-	return true
 }
 
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
@@ -311,6 +305,40 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 	return true, nil
 }
 
+func computeScanCapHint(treeSize, limit int) int {
+	capHint := boundedScanResultCapacity(limit)
+	if treeSize < capHint {
+		capHint = treeSize
+	}
+	if capHint < 0 {
+		capHint = 0
+	}
+	return capHint
+}
+
+func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) []*KVPair {
+	result := make([]*KVPair, 0, capHint)
+	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if end != nil && bytes.Compare(k, end) >= 0 {
+			break
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		val, visible := visibleValue(versions, ts)
+		if !visible {
+			continue
+		}
+		result = append(result, &KVPair{
+			Key:   bytes.Clone(k),
+			Value: bytes.Clone(val),
+		})
+	}
+	return result
+}
+
 func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -322,37 +350,33 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 		return []*KVPair{}, nil
 	}
 
-	capHint := boundedScanResultCapacity(limit)
-	if size := s.tree.Size(); size < capHint {
-		capHint = size
+	capHint := computeScanCapHint(s.tree.Size(), limit)
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return make([]*KVPair, 0, capHint), nil
 	}
-	if capHint < 0 {
-		capHint = 0
+	return s.collectScanResults(&it, end, limit, capHint, ts), nil
+}
+
+// seekForwardIteratorStart positions the iterator at the first key >= start.
+// Returns true if such a position was found, false if no elements satisfy the bound.
+func seekForwardIteratorStart(tree *treemap.Map, it *treemap.Iterator, start []byte) bool {
+	if start == nil {
+		return it.First()
 	}
-
-	result := make([]*KVPair, 0, capHint)
-	s.tree.Each(func(key any, value any) {
-		if len(result) >= limit {
-			return
-		}
-		k, ok := key.([]byte)
-		if !ok || !withinBoundsKey(k, start, end) {
-			return
-		}
-
-		versions, _ := value.([]VersionedValue)
-		val, ok := visibleValue(versions, ts)
-		if !ok {
-			return
-		}
-
-		result = append(result, &KVPair{
-			Key:   bytes.Clone(k),
-			Value: bytes.Clone(val),
-		})
+	ceilKey, _ := tree.Ceiling(start)
+	if ceilKey == nil {
+		return false
+	}
+	target, ok := ceilKey.([]byte)
+	if !ok {
+		return false
+	}
+	it.Begin()
+	return it.NextTo(func(key any, value any) bool {
+		k, keyOK := key.([]byte)
+		return keyOK && bytes.Equal(k, target)
 	})
-
-	return result, nil
 }
 
 func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
@@ -871,72 +895,107 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 	}, nil
 }
 
-func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+// compactKeepIndex returns the index from which versions should be kept when
+// compacting with the given minTS. Returns -1 when no compaction is needed.
+func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
 	if len(versions) == 0 {
-		return versions, false
+		return -1
 	}
-
-	// Find the latest version that is <= minTS
 	keepIdx := -1
-	for i := len(versions) - 1; i >= 0; i-- {
-		if versions[i].TS <= minTS {
-			keepIdx = i
+	for i := len(versions); i > 0; i-- {
+		if versions[i-1].TS <= minTS {
+			keepIdx = i - 1
 			break
 		}
 	}
+	if keepIdx <= 0 {
+		return -1
+	}
+	return keepIdx
+}
 
-	// If all versions are newer than minTS, keep everything
-	if keepIdx == -1 {
+func compactVersions(versions []VersionedValue, minTS uint64) ([]VersionedValue, bool) {
+	keepIdx := compactKeepIndex(versions, minTS)
+	if keepIdx < 0 {
 		return versions, false
 	}
-
-	// If the oldest version is the one to keep, we can't remove anything before it
-	if keepIdx == 0 {
-		return versions, false
-	}
-
-	// We keep versions starting from keepIdx
-	// The version at keepIdx represents the state at minTS.
 	newVersions := make([]VersionedValue, len(versions)-keepIdx)
 	copy(newVersions, versions[keepIdx:])
 	return newVersions, true
 }
 
-func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
+const compactScanBatchSize = 500
 
-	// Estimate size to avoid frequent allocations, though exact count is unknown
-	updates := make(map[string][]VersionedValue)
-
+func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
+	var pending []compactEntry
+	s.mtx.RLock()
 	it := s.tree.Iterator()
 	for it.Next() {
 		versions, ok := it.Value().([]VersionedValue)
 		if !ok {
 			continue
 		}
+		keyBytes, ok := it.Key().([]byte)
+		if !ok {
+			continue
+		}
+		if compactKeepIndex(versions, minTS) >= 0 {
+			pending = append(pending, compactEntry{
+				key: bytes.Clone(keyBytes),
+			})
+		}
+	}
+	s.mtx.RUnlock()
+	return pending
+}
 
-		newVersions, changed := compactVersions(versions, minTS)
-		if changed {
-			// tree keys are []byte, need string for map key
-			keyBytes, ok := it.Key().([]byte)
+func (s *mvccStore) compactPhase2(pending []compactEntry, minTS uint64) int {
+	updatedTotal := 0
+	for i := 0; i < len(pending); i += compactScanBatchSize {
+		end := i + compactScanBatchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[i:end]
+
+		s.mtx.Lock()
+		for _, e := range batch {
+			cur, found := s.tree.Get(e.key)
+			if !found {
+				continue
+			}
+			versions, ok := cur.([]VersionedValue)
 			if !ok {
 				continue
 			}
-			updates[string(keyBytes)] = newVersions
+			fresh, changed := compactVersions(versions, minTS)
+			if changed {
+				s.tree.Put(e.key, fresh)
+				updatedTotal++
+			}
 		}
+		s.mtx.Unlock()
+	}
+	return updatedTotal
+}
+
+func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
+	pending := s.compactPhase1(minTS)
+
+	updatedTotal := 0
+	if len(pending) > 0 {
+		updatedTotal = s.compactPhase2(pending, minTS)
 	}
 
-	for k, v := range updates {
-		s.tree.Put([]byte(k), v)
-	}
+	s.mtx.Lock()
 	if minTS > s.minRetainedTS {
 		s.minRetainedTS = minTS
 	}
+	s.mtx.Unlock()
 
 	s.log.InfoContext(ctx, "compact",
 		slog.Uint64("min_ts", minTS),
-		slog.Int("updated_keys", len(updates)),
+		slog.Int("updated_keys", updatedTotal),
 	)
 	return nil
 }

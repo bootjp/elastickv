@@ -108,6 +108,8 @@ func run() error {
 		}
 	})
 	cleanup.Add(cancel)
+	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
+	cleanup.Add(func() { lockResolver.Close() })
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {

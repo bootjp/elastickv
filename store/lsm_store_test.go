@@ -41,8 +41,14 @@ func countPebbleVersions(t *testing.T, st MVCCStore) int {
 	return count
 }
 
-func requireChannelBlocked[T any](t *testing.T, ch <-chan T) {
+func requireChannelBlocked[T any](t *testing.T, ch <-chan T, started <-chan struct{}) {
 	t.Helper()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("goroutine did not start in time")
+	}
 
 	select {
 	case <-ch:
@@ -369,11 +375,13 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 
 	ps.maintenanceMu.Lock()
 	done := make(chan error, 1)
+	started := make(chan struct{}, 1)
 	go func() {
+		started <- struct{}{}
 		done <- ps.Compact(ctx, 15)
 	}()
 
-	requireChannelBlocked(t, done)
+	requireChannelBlocked(t, done, started)
 	ps.maintenanceMu.Unlock()
 
 	select {
@@ -398,11 +406,13 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 
 	ps.maintenanceMu.Lock()
 	done := make(chan error, 1)
+	started := make(chan struct{}, 1)
 	go func() {
+		started <- struct{}{}
 		done <- ps.Restore(bytes.NewReader(nil))
 	}()
 
-	requireChannelBlocked(t, done)
+	requireChannelBlocked(t, done, started)
 	ps.maintenanceMu.Unlock()
 
 	select {

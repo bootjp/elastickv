@@ -9,6 +9,12 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// txnInternalKeyPrefix is the common prefix for all transaction internal keys
+// (locks, intents, commit records, rollback records, metadata).
+// NOTE: this must match kv.TxnKeyPrefix ("!txn|"). The two cannot share a
+// single definition due to the store→kv import cycle.
+var txnInternalKeyPrefix = []byte("!txn|")
+
 var ErrKeyNotFound = errors.New("not found")
 var ErrUnknownOp = errors.New("unknown op")
 var ErrNotSupported = errors.New("not supported")
@@ -124,7 +130,8 @@ type MVCCStore interface {
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
 	// It must return ErrWriteConflict if any key has a newer commit timestamp
-	// than startTS.
+	// than startTS. Note: only write-write conflicts are detected (Snapshot
+	// Isolation). Read-write conflicts (write skew) are not prevented.
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64

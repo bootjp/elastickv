@@ -265,7 +265,15 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, pg.keys...),
 		}
-		_, _ = g.Txn.Commit([]*pb.Request{req})
+		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
+			slog.Warn("txn abort failed; locks may remain until TTL expiry",
+				slog.Uint64("gid", pg.gid),
+				slog.String("primary_key", string(primaryKey)),
+				slog.Uint64("start_ts", startTS),
+				slog.Uint64("abort_ts", abortTS),
+				slog.Any("err", err),
+			)
+		}
 	}
 }
 

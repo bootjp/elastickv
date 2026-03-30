@@ -3,11 +3,14 @@ package kv
 import (
 	"bytes"
 	"context"
+	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
 )
+
+const redirectForwardTimeout = 5 * time.Second
 
 func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
 	return &Coordinate{
@@ -237,7 +240,9 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		}
 	}
 
-	r, err := cli.Forward(ctx, c.toForwardRequest(requests))
+	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
+	defer cancel()
+	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -35,6 +35,10 @@ type rawCommitResult struct {
 const maxRawBatchRequests = 64
 const maxRawPendingItems = 4096
 
+// maxMarshaledCommandSize is the upper bound on a marshaled Raft command.
+// Protects against integer overflow when computing allocation sizes.
+const maxMarshaledCommandSize = 64 * 1024 * 1024 // 64 MiB
+
 var rawBatchWindow = 500 * time.Microsecond
 
 var errRawQueueFull = errors.New("raw commit queue is full; try again later")
@@ -102,13 +106,27 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return b, nil
+		if len(b)+1 > maxMarshaledCommandSize {
+			return nil, errors.New("marshaled request too large")
+		}
+		return prependByte(raftEncodeSingle, b), nil
 	}
 	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return b, nil
+	if len(b)+1 > maxMarshaledCommandSize {
+		return nil, errors.New("marshaled request batch too large")
+	}
+	return prependByte(raftEncodeBatch, b), nil
+}
+
+// prependByte returns a new slice with prefix followed by data.
+func prependByte(prefix byte, data []byte) []byte {
+	out := make([]byte, len(data)+1)
+	out[0] = prefix
+	copy(out[1:], data)
+	return out
 }
 
 // applyRequests submits one raft command and returns per-request FSM results.

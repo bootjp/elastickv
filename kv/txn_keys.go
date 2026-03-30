@@ -6,24 +6,45 @@ import (
 )
 
 const (
-	txnLockPrefix     = "!txn|lock|"
-	txnIntentPrefix   = "!txn|int|"
-	txnCommitPrefix   = "!txn|cmt|"
-	txnRollbackPrefix = "!txn|rb|"
-	txnMetaPrefix     = "!txn|meta|"
+	// TxnKeyPrefix is the common prefix shared by all transaction internal
+	// key namespaces. All per-namespace prefixes below are derived from it.
+	// NOTE: store/store.go duplicates this literal as txnInternalKeyPrefix
+	// because an import cycle prevents store from importing kv.
+	TxnKeyPrefix = "!txn|"
+
+	txnLockPrefix     = TxnKeyPrefix + "lock|"
+	txnIntentPrefix   = TxnKeyPrefix + "int|"
+	txnCommitPrefix   = TxnKeyPrefix + "cmt|"
+	txnRollbackPrefix = TxnKeyPrefix + "rb|"
+	txnMetaPrefix     = TxnKeyPrefix + "meta|"
 )
 
 // TxnMetaPrefix is the key prefix used for transaction metadata mutations.
 const TxnMetaPrefix = txnMetaPrefix
 
+var (
+	txnLockPrefixBytes     = []byte(txnLockPrefix)
+	txnIntentPrefixBytes   = []byte(txnIntentPrefix)
+	txnCommitPrefixBytes   = []byte(txnCommitPrefix)
+	txnRollbackPrefixBytes = []byte(txnRollbackPrefix)
+	txnMetaPrefixBytes     = []byte(txnMetaPrefix)
+	txnCommonPrefix        = []byte(TxnKeyPrefix)
+)
+
 const txnStartTSSuffixLen = 8
 
 func txnLockKey(userKey []byte) []byte {
-	return append([]byte(txnLockPrefix), userKey...)
+	k := make([]byte, 0, len(txnLockPrefixBytes)+len(userKey))
+	k = append(k, txnLockPrefixBytes...)
+	k = append(k, userKey...)
+	return k
 }
 
 func txnIntentKey(userKey []byte) []byte {
-	return append([]byte(txnIntentPrefix), userKey...)
+	k := make([]byte, 0, len(txnIntentPrefixBytes)+len(userKey))
+	k = append(k, txnIntentPrefixBytes...)
+	k = append(k, userKey...)
+	return k
 }
 
 func txnCommitKey(primaryKey []byte, startTS uint64) []byte {
@@ -47,35 +68,38 @@ func txnRollbackKey(primaryKey []byte, startTS uint64) []byte {
 }
 
 func isTxnInternalKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(txnLockPrefix)) ||
-		bytes.HasPrefix(key, []byte(txnIntentPrefix)) ||
-		bytes.HasPrefix(key, []byte(txnCommitPrefix)) ||
-		bytes.HasPrefix(key, []byte(txnRollbackPrefix)) ||
-		bytes.HasPrefix(key, []byte(txnMetaPrefix))
+	if !bytes.HasPrefix(key, txnCommonPrefix) {
+		return false
+	}
+	return bytes.HasPrefix(key, txnLockPrefixBytes) ||
+		bytes.HasPrefix(key, txnIntentPrefixBytes) ||
+		bytes.HasPrefix(key, txnCommitPrefixBytes) ||
+		bytes.HasPrefix(key, txnRollbackPrefixBytes) ||
+		bytes.HasPrefix(key, txnMetaPrefixBytes)
 }
 
 func isTxnMetaKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(txnMetaPrefix))
+	return bytes.HasPrefix(key, txnMetaPrefixBytes)
 }
 
 // txnRouteKey strips transaction-internal key prefixes to recover the embedded
 // logical user key for shard routing.
 func txnRouteKey(key []byte) ([]byte, bool) {
 	switch {
-	case bytes.HasPrefix(key, []byte(txnLockPrefix)):
-		return key[len(txnLockPrefix):], true
-	case bytes.HasPrefix(key, []byte(txnIntentPrefix)):
-		return key[len(txnIntentPrefix):], true
-	case bytes.HasPrefix(key, []byte(txnMetaPrefix)):
-		return key[len(txnMetaPrefix):], true
-	case bytes.HasPrefix(key, []byte(txnCommitPrefix)):
-		rest := key[len(txnCommitPrefix):]
+	case bytes.HasPrefix(key, txnLockPrefixBytes):
+		return key[len(txnLockPrefixBytes):], true
+	case bytes.HasPrefix(key, txnIntentPrefixBytes):
+		return key[len(txnIntentPrefixBytes):], true
+	case bytes.HasPrefix(key, txnMetaPrefixBytes):
+		return key[len(txnMetaPrefixBytes):], true
+	case bytes.HasPrefix(key, txnCommitPrefixBytes):
+		rest := key[len(txnCommitPrefixBytes):]
 		if len(rest) < txnStartTSSuffixLen {
 			return nil, false
 		}
 		return rest[:len(rest)-txnStartTSSuffixLen], true
-	case bytes.HasPrefix(key, []byte(txnRollbackPrefix)):
-		rest := key[len(txnRollbackPrefix):]
+	case bytes.HasPrefix(key, txnRollbackPrefixBytes):
+		rest := key[len(txnRollbackPrefixBytes):]
 		if len(rest) < txnStartTSSuffixLen {
 			return nil, false
 		}

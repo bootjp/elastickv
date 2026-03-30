@@ -33,6 +33,12 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 	}
 }
 
+// leaderOKForKey verifies leadership via a quorum check. Note: there is a
+// small TOCTOU window between VerifyLeader returning and the subsequent read —
+// leadership could theoretically change in that interval, allowing a stale
+// read from a deposed leader. The Raft ReadIndex protocol would close this
+// gap but is not yet implemented. For most use cases, the quorum-verified
+// window is acceptably small.
 func (s *LeaderRoutedStore) leaderOKForKey(key []byte) bool {
 	if s.coordinator == nil {
 		return true
