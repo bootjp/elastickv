@@ -850,11 +850,16 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 				)
 				return
 			}
+			chunkLen := int64(len(chunk))
 			start := int64(0)
 			if pos < offset {
 				start = offset - pos
 			}
-			end := int64(len(chunk))
+			if start >= chunkLen {
+				pos = chunkEnd
+				continue
+			}
+			end := chunkLen
 			if start+remaining < end {
 				end = start + remaining
 			}
