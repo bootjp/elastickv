@@ -43,15 +43,23 @@ Elastickv now exposes Prometheus metrics on `--metricsAddress` (default: `localh
 
 The exported metrics cover:
 
-- DynamoDB-compatible API request rate, success/error split, latency, request/response size, and per-table read/write item counts
-- Raft local state, leader identity, current members, commit/applied index, and leader contact lag
+- DynamoDB-compatible API request rate, success/system-error/user-error split, latency, in-flight requests, and per-table read/write activity
+- Raft local state, leader identity, membership, leader changes seen, failed proposals, last-log/commit/applied/snapshot index, FSM backlog, and leader contact lag
 
 Provisioned monitoring assets live under:
 
 - `monitoring/prometheus/prometheus.yml`
 - `monitoring/grafana/dashboards/elastickv-cluster-overview.json`
+- `monitoring/grafana/dashboards/elastickv-cluster-summary.json`
+- `monitoring/grafana/dashboards/elastickv-raft-status.json`
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
+
+The provisioned dashboards are organized by operator task:
+
+- `Elastickv Cluster Overview` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health
+- `Elastickv Request Health` is the DynamoDB/API drilldown for slow operations, noisy nodes, and hot/erroring tables
+- `Elastickv Raft Status` is the control-plane drilldown for membership, leader changes, failed proposals, node state, index drift, backlog, and leader contact
 
 If you bind `--metricsAddress` to a non-loopback address, `--metricsToken` is required. Prometheus must send the same bearer token, for example:
 

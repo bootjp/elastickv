@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -65,4 +66,15 @@ func (r *Registry) RaftObserver() *RaftObserver {
 		return nil
 	}
 	return newRaftObserver(r.raft)
+}
+
+// RaftProposalObserver returns a group-scoped observer for failed raft proposals.
+func (r *Registry) RaftProposalObserver(groupID uint64) *raftProposalObserver {
+	if r == nil || r.raft == nil {
+		return nil
+	}
+	return &raftProposalObserver{
+		metrics: r.raft,
+		group:   strconv.FormatUint(groupID, 10),
+	}
 }

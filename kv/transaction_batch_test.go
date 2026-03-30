@@ -13,6 +13,23 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type stubProposalObserver struct {
+	mu       sync.Mutex
+	failures int
+}
+
+func (o *stubProposalObserver) ObserveProposalFailure() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.failures++
+}
+
+func (o *stubProposalObserver) FailureCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.failures
+}
+
 func TestFSMApplyBatchKeepsPerRequestResults(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
@@ -134,4 +151,44 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 	got, err = st.GetAt(context.Background(), []byte("k2"), ^uint64(0))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), got)
+}
+
+func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
+	st := store.NewMVCCStore()
+	r, stop := newSingleRaft(t, "proposal-fail", NewKvFSM(st))
+	stop()
+
+	observer := &stubProposalObserver{}
+	reqs := []*pb.Request{{
+		IsTxn: false,
+		Ts:    100,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		},
+	}}
+
+	_, _, err := applyRequests(r, reqs, observer)
+	require.Error(t, err)
+	require.Equal(t, 1, observer.FailureCount())
+}
+
+func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
+	st := store.NewMVCCStore()
+	r, stop := newSingleRaft(t, "proposal-business-error", NewKvFSM(st))
+	defer stop()
+
+	observer := &stubProposalObserver{}
+	reqs := []*pb.Request{{
+		IsTxn: false,
+		Ts:    100,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: nil, Value: []byte("bad")},
+		},
+	}}
+
+	_, results, err := applyRequests(r, reqs, observer)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0], ErrInvalidRequest)
+	require.Zero(t, observer.FailureCount())
 }

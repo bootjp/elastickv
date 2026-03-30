@@ -121,6 +121,10 @@ func main() {
 		// Demo cluster mode (3 nodes)
 		slog.Info("Starting demo cluster with 3 nodes...")
 		demoMetricsToken := effectiveDemoMetricsToken(*metricsToken)
+		demoPprofAddresses := []string{"127.0.0.1:6061", "127.0.0.1:6062", "127.0.0.1:6063"}
+		if strings.TrimSpace(*pprofAddress) == "" {
+			demoPprofAddresses = []string{"", "", ""}
+		}
 		nodes := []config{
 			{
 				address:        "127.0.0.1:50051",
@@ -131,7 +135,7 @@ func main() {
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9091",
 				metricsToken:   demoMetricsToken,
-				pprofAddress:   "127.0.0.1:6061",
+				pprofAddress:   demoPprofAddresses[0],
 				raftID:         "n1",
 				raftDataDir:    "", // In-memory
 				raftBootstrap:  true,
@@ -145,7 +149,7 @@ func main() {
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9092",
 				metricsToken:   demoMetricsToken,
-				pprofAddress:   "127.0.0.1:6062",
+				pprofAddress:   demoPprofAddresses[1],
 				raftID:         "n2",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -159,7 +163,7 @@ func main() {
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9093",
 				metricsToken:   demoMetricsToken,
-				pprofAddress:   "127.0.0.1:6063",
+				pprofAddress:   demoPprofAddresses[2],
 				raftID:         "n3",
 				raftDataDir:    "",
 				raftBootstrap:  false,
@@ -397,9 +401,9 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-	trx := kv.NewTransaction(r)
+	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
 	tm.Register(s)
@@ -527,7 +531,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
-	trx := kv.NewTransaction(r)
+	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
+	proposalObserver := metricsRegistry.RaftProposalObserver(1)
+	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
 	coordinator := kv.NewCoordinator(trx, r)
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
@@ -540,7 +546,6 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		adapter.WithDistributionCoordinator(coordinator),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
 	compactor := kv.NewFSMCompactor(
 		[]kv.FSMCompactRuntime{{
@@ -552,7 +557,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer, relay)
+	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer, relay, proposalObserver)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {

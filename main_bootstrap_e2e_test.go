@@ -278,7 +278,7 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, nil)
 	if err != nil {
 		return nil, err
 	}
