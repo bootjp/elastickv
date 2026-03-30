@@ -1041,7 +1041,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-//nolint:cyclop,gocognit // Upload part is intentionally linear and maps directly to protocol steps.
+//nolint:cyclop,gocognit,gocyclo // Upload part is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string, partNumberStr string) {
 	partNumber, err := strconv.Atoi(partNumberStr)
 	if err != nil || partNumber < s3MinPartNumber || partNumber > s3MaxPartNumber {
