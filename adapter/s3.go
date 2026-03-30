@@ -1197,6 +1197,18 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		}
 	}
 
+	// Re-verify upload still exists at a fresh snapshot before committing.
+	// This narrows the race window with concurrent Abort/Complete.
+	freshTS := s.readTS()
+	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, freshTS); err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
+			return
+		}
+		writeS3InternalError(w, err)
+		return
+	}
+
 	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  partStartTS,

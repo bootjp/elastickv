@@ -381,7 +381,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	}
 	verifyURL.RawQuery = q.Encode()
 
-	verifyReq, err := http.NewRequestWithContext(context.Background(), r.Method, verifyURL.String(), nil) //nolint:gosec // G704: URL is derived from the incoming request's own URL to rebuild and verify its signature; no outbound network request is made.
+	verifyReq, err := http.NewRequestWithContext(r.Context(), r.Method, verifyURL.String(), nil) //nolint:gosec // G704: URL is derived from the incoming request's own URL to rebuild and verify its signature; no outbound network request is made.
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
@@ -415,7 +415,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		SecretAccessKey: secretAccessKey,
 		Source:          "elastickv-s3-presign",
 	}
-	presignedURL, _, err := signer.PresignHTTP(context.Background(), creds, verifyReq, s3UnsignedPayload, "s3", s.effectiveRegion(), signingTime)
+	presignedURL, _, err := signer.PresignHTTP(r.Context(), creds, verifyReq, s3UnsignedPayload, "s3", s.effectiveRegion(), signingTime)
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
