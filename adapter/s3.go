@@ -774,8 +774,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		rangeStart, rangeEnd, ok := parseS3RangeHeader(rangeHeader, manifest.SizeBytes)
 		if !ok {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.SizeBytes))
-			writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
-				"range not satisfiable", bucket, objectKey)
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
 		contentLength := rangeEnd - rangeStart + 1
@@ -1187,7 +1186,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	var prevDesc *s3PartDescriptor
 	if prevRaw, err := s.store.GetAt(r.Context(), partKey, readTS); err == nil {
 		var pd s3PartDescriptor
-		if json.Unmarshal(prevRaw, &pd) == nil && pd.PartVersion != 0 {
+		if json.Unmarshal(prevRaw, &pd) == nil {
 			prevDesc = &pd
 		}
 	}

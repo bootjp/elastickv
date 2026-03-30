@@ -910,6 +910,7 @@ func TestS3Server_HeadWithRange(t *testing.T) {
 	server.handle(rec, req)
 	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
 	require.Equal(t, "bytes */17", rec.Header().Get("Content-Range"))
+	require.Empty(t, rec.Body.String(), "HEAD response body must be empty")
 }
 
 func TestS3Server_InvalidRangeContentRangeHeader(t *testing.T) {
