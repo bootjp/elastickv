@@ -1407,7 +1407,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return errors.WithStack(err)
 		}
 
-		headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
+		headKey := s3keys.ObjectManifestKey(bucket, retryMeta.Generation, objectKey)
 		previous, _, err = s.loadObjectManifestAt(r.Context(), headKey, retryReadTS)
 		if err != nil {
 			return errors.WithStack(err)
@@ -1427,7 +1427,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return errors.WithStack(err)
 		}
 
-		bucketFence, err := encodeS3BucketMeta(meta)
+		bucketFence, err := encodeS3BucketMeta(retryMeta)
 		if err != nil {
 			return errors.WithStack(err)
 		}
