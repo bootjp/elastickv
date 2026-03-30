@@ -26,6 +26,7 @@ var loggedLastContactParseValues sync.Map
 const (
 	defaultObserveInterval  = 5 * time.Second
 	lastContactUnknownValue = -1
+	observerBufferSize      = 16
 )
 
 // RaftRuntime describes a raft group observed by the metrics exporter.
@@ -63,6 +64,10 @@ type RaftMetrics struct {
 	fsmPending *prometheus.GaugeVec
 	// numPeers is the number of other voting servers in the cluster, excluding this node.
 	numPeers *prometheus.GaugeVec
+	// leaderChanges counts observed leader transitions for each group.
+	leaderChanges *prometheus.CounterVec
+	// proposalsFailed counts raft proposals that failed before yielding a usable response.
+	proposalsFailed *prometheus.CounterVec
 }
 
 func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
@@ -158,6 +163,20 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 			},
 			[]string{"group"},
 		),
+		leaderChanges: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_leader_changes_seen_total",
+				Help: "Total number of observed leader changes for each group.",
+			},
+			[]string{"group"},
+		),
+		proposalsFailed: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_proposals_failed_total",
+				Help: "Total number of raft proposals that failed before returning a usable apply response.",
+			},
+			[]string{"group"},
+		),
 	}
 
 	registerer.MustRegister(
@@ -174,6 +193,8 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 		m.lastSnapshotIndex,
 		m.fsmPending,
 		m.numPeers,
+		m.leaderChanges,
+		m.proposalsFailed,
 	)
 
 	return m
@@ -205,6 +226,7 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 	if interval <= 0 {
 		interval = defaultObserveInterval
 	}
+	o.registerRuntimeObservers(ctx, runtimes)
 	o.ObserveOnce(runtimes)
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -218,6 +240,38 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 			}
 		}
 	}()
+}
+
+func (o *RaftObserver) registerRuntimeObservers(ctx context.Context, runtimes []RaftRuntime) {
+	if o == nil {
+		return
+	}
+	for _, runtime := range runtimes {
+		if runtime.Raft == nil {
+			continue
+		}
+		group := strconv.FormatUint(runtime.GroupID, 10)
+		ch := make(chan raft.Observation, observerBufferSize)
+		observer := raft.NewObserver(ch, false, func(ob *raft.Observation) bool {
+			_, ok := ob.Data.(raft.LeaderObservation)
+			return ok
+		})
+		runtime.Raft.RegisterObserver(observer)
+
+		go func(r *raft.Raft, group string, ch <-chan raft.Observation, observer *raft.Observer) {
+			defer r.DeregisterObserver(observer)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ob := <-ch:
+					if _, ok := ob.Data.(raft.LeaderObservation); ok {
+						o.observeLeaderChange(group)
+					}
+				}
+			}
+		}(runtime.Raft, group, ch, observer)
+	}
 }
 
 // ObserveOnce captures the latest raft state for all configured runtimes.
@@ -284,6 +338,13 @@ func (o *RaftObserver) setLeaderMetric(group string, leaderID string, leaderAddr
 	}
 	o.metrics.leaderIdentity.With(labels).Set(1)
 	o.leaderLabels[group] = labels
+}
+
+func (o *RaftObserver) observeLeaderChange(group string) {
+	if o == nil || o.metrics == nil {
+		return
+	}
+	o.metrics.leaderChanges.WithLabelValues(group).Inc()
 }
 
 func (o *RaftObserver) setMembers(group string, leaderID string, servers []raft.Server) {
@@ -384,4 +445,16 @@ func parseLastContactSeconds(raw string) float64 {
 		return lastContactUnknownValue
 	}
 	return d.Seconds()
+}
+
+type raftProposalObserver struct {
+	metrics *RaftMetrics
+	group   string
+}
+
+func (o *raftProposalObserver) ObserveProposalFailure() {
+	if o == nil || o.metrics == nil || o.group == "" {
+		return
+	}
+	o.metrics.proposalsFailed.WithLabelValues(o.group).Inc()
 }

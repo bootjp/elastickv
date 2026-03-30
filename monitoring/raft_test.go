@@ -86,3 +86,27 @@ elastickv_raft_num_peers{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
 	)
 	require.NoError(t, err)
 }
+
+func TestRaftMetricsExportLeaderChangesAndProposalFailures(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RaftObserver()
+	require.NotNil(t, observer)
+
+	observer.observeLeaderChange("1")
+	registry.RaftProposalObserver(1).ObserveProposalFailure()
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_raft_leader_changes_seen_total Total number of observed leader changes for each group.
+# TYPE elastickv_raft_leader_changes_seen_total counter
+elastickv_raft_leader_changes_seen_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 1
+# HELP elastickv_raft_proposals_failed_total Total number of raft proposals that failed before returning a usable apply response.
+# TYPE elastickv_raft_proposals_failed_total counter
+elastickv_raft_proposals_failed_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 1
+`),
+		"elastickv_raft_leader_changes_seen_total",
+		"elastickv_raft_proposals_failed_total",
+	)
+	require.NoError(t, err)
+}
