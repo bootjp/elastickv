@@ -150,6 +150,7 @@ func applyRequests(r *raft.Raft, reqs []*pb.Request, proposalObserver ProposalOb
 		return af.Index(), make([]error, len(reqs)), nil
 	case error:
 		if len(reqs) != 1 {
+			recordProposalFailure(proposalObserver)
 			return 0, nil, errors.WithStack(resp)
 		}
 		return af.Index(), []error{errors.WithStack(resp)}, nil

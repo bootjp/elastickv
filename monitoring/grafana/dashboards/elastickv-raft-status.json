@@ -70,9 +70,9 @@
           "instant": true
         }
       ],
-      "title": "Current Term",
+      "title": "Max Observed Term",
       "type": "stat",
-      "description": "Current Raft term for the selected group."
+      "description": "Maximum Raft term observed across nodes in the selected group."
     },
     {
       "datasource": "$datasource",
@@ -176,7 +176,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (clamp_min(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}, 0))",
+          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
           "refId": "A",
           "instant": true
@@ -607,7 +607,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (clamp_min(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}, 0))",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "H"
@@ -884,7 +884,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (clamp_min(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}, 0))",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"

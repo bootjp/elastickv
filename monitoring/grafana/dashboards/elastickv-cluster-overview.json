@@ -379,7 +379,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max(clamp_min(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}, 0))",
+          "expr": "max(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} != -1)",
           "legendFormat": "max last contact",
           "refId": "A",
           "instant": true
@@ -676,7 +676,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (clamp_min(elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}, 0))",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} unless elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} == -1)",
           "format": "table",
           "instant": true,
           "refId": "G"
