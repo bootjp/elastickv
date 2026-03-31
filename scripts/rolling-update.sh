@@ -31,6 +31,11 @@ Optional environment:
   REDIS_PORT
   DYNAMO_PORT
   RAFT_TO_REDIS_MAP
+  RAFT_TO_S3_MAP
+  S3_PORT
+  S3_REGION
+  S3_CREDENTIALS_FILE
+  S3_PATH_STYLE_ONLY
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS
   LEADER_DISCOVERY_TIMEOUT_SECONDS
@@ -45,6 +50,8 @@ Optional environment:
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
+  - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
+    RAFT_PORT, and S3_PORT.
   - If RAFTADMIN_BIN is set, it must already be executable on the remote nodes.
 EOF
 }
@@ -71,6 +78,10 @@ SERVER_ENTRYPOINT="${SERVER_ENTRYPOINT:-/app}"
 RAFT_PORT="${RAFT_PORT:-50051}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 DYNAMO_PORT="${DYNAMO_PORT:-8000}"
+S3_PORT="${S3_PORT:-9000}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-}"
+S3_PATH_STYLE_ONLY="${S3_PATH_STYLE_ONLY:-true}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-60}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
 LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
@@ -84,6 +95,7 @@ NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
+RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -252,6 +264,20 @@ derive_raft_to_redis_map() {
   )
 }
 
+derive_raft_to_s3_map() {
+  local parts=()
+  local i
+
+  for i in "${!NODE_IDS[@]}"; do
+    parts+=("${NODE_HOSTS[$i]}:${RAFT_PORT}=${NODE_HOSTS[$i]}:${S3_PORT}")
+  done
+
+  (
+    IFS=,
+    printf '%s\n' "${parts[*]}"
+  )
+}
+
 ensure_local_raftadmin() {
   if [[ -n "$RAFTADMIN_LOCAL_BIN" ]]; then
     if [[ ! -x "$RAFTADMIN_LOCAL_BIN" ]]; then
@@ -372,6 +398,10 @@ update_one_node() {
       RAFT_PORT="$RAFT_PORT" \
       REDIS_PORT="$REDIS_PORT" \
       DYNAMO_PORT="$DYNAMO_PORT" \
+      S3_PORT="$S3_PORT" \
+      S3_REGION="$S3_REGION" \
+      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE" \
+      S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
@@ -381,6 +411,7 @@ update_one_node() {
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
+      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -606,18 +637,31 @@ stop_container() {
 }
 
 run_container() {
+  local s3_creds_volume=()
+  local s3_creds_flag=()
+  if [[ -n "$S3_CREDENTIALS_FILE" ]]; then
+    s3_creds_volume=(-v "${S3_CREDENTIALS_FILE}:${S3_CREDENTIALS_FILE}:ro")
+    s3_creds_flag=(--s3CredentialsFile "$S3_CREDENTIALS_FILE")
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
     -v "$DATA_DIR:$DATA_DIR" \
+    "${s3_creds_volume[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
+    --s3Address "${NODE_HOST}:${S3_PORT}" \
+    --s3Region "$S3_REGION" \
+    --s3PathStyleOnly="$S3_PATH_STYLE_ONLY" \
     --raftId "$NODE_ID" \
     --raftDataDir "$DATA_DIR" \
-    --raftRedisMap "$RAFT_TO_REDIS_MAP" >/dev/null
+    --raftRedisMap "$RAFT_TO_REDIS_MAP" \
+    --raftS3Map "$RAFT_TO_S3_MAP" \
+    "${s3_creds_flag[@]}" >/dev/null
 }
 
 require_passwordless_sudo() {
@@ -736,6 +780,10 @@ prepare_rolling_order
 
 if [[ -z "$RAFT_TO_REDIS_MAP" ]]; then
   RAFT_TO_REDIS_MAP="$(derive_raft_to_redis_map)"
+fi
+
+if [[ -z "$RAFT_TO_S3_MAP" ]]; then
+  RAFT_TO_S3_MAP="$(derive_raft_to_s3_map)"
 fi
 
 ensure_local_raftadmin
