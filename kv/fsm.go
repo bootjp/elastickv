@@ -342,6 +342,9 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if commitTS <= startTS {
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
+	if len(meta.PrimaryKey) == 0 {
+		return errors.WithStack(ErrTxnPrimaryKeyRequired)
+	}
 	applyStartTS := startTS
 	if recordedCommitTS, committed, err := f.txnCommitTS(ctx, meta.PrimaryKey, startTS); err != nil {
 		return err
