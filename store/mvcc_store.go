@@ -902,10 +902,9 @@ func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
 		return -1
 	}
 	keepIdx := -1
-	for i := len(versions); i > 0; i-- {
-		if versions[i-1].TS <= minTS {
-			keepIdx = i - 1
-			break
+	for i, version := range versions {
+		if version.TS <= minTS {
+			keepIdx = i
 		}
 	}
 	if keepIdx <= 0 {
