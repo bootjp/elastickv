@@ -347,7 +347,11 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	} else if committed {
 		if recordedCommitTS != commitTS {
-			return errors.Wrapf(ErrTxnInvalidMeta, "commit_ts mismatch for primary key %s", string(meta.PrimaryKey))
+			return errors.Wrapf(
+				ErrTxnInvalidMeta,
+				"commit_ts mismatch for primary key %s: recordedCommitTS=%d requestedCommitTS=%d startTS=%d",
+				string(meta.PrimaryKey), recordedCommitTS, commitTS, startTS,
+			)
 		}
 		// Treat duplicate commits as idempotent so stale txn artifacts can be
 		// cleaned up after the commit record already exists.
