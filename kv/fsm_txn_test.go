@@ -118,6 +118,31 @@ func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
 	require.Equal(t, commitTS, gotCommitTS)
 }
 
+func TestCommitRejectsMissingPrimaryKey(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(12)
+	commitTS := uint64(22)
+	key := []byte("k")
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: nil, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: key},
+		},
+	}
+	err := applyFSMRequest(t, fsm, commit)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
+}
+
 func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 	t.Parallel()
 
