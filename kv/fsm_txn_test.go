@@ -177,15 +177,26 @@ func TestCommitIsIdempotentOnSecondaryShardWhenKeyAlreadyCommitted(t *testing.T)
 func TestCommitPropagatesSecondaryShardLatestCommitTSError(t *testing.T) {
 	t.Parallel()
 
+	ctx := context.Background()
 	underlying := store.NewMVCCStore()
 	userKey := []byte("k")
-	errorStore := erroringLatestCommitStore{MVCCStore: underlying, key: userKey}
-	fsm, ok := NewKvFSM(errorStore).(*kvFSM)
-	require.True(t, ok)
-
 	startTS := uint64(16)
 	commitTS := uint64(26)
 	primaryKey := []byte("p") // no txnCommitKey in store → secondary-shard path
+
+	// Set up a PREPARED state directly in the underlying store.
+	lockVal := encodeTxnLock(txnLock{StartTS: startTS, PrimaryKey: primaryKey})
+	require.NoError(t, underlying.PutAt(ctx, txnLockKey(userKey), lockVal, startTS, 0))
+	intentVal := encodeTxnIntent(txnIntent{StartTS: startTS, Op: txnIntentOpPut, Value: []byte("v")})
+	require.NoError(t, underlying.PutAt(ctx, txnIntentKey(userKey), intentVal, startTS, 0))
+
+	// Write a conflicting version that will cause ApplyMutations to return a
+	// write-conflict, triggering the LatestCommitTS fallback path.
+	require.NoError(t, underlying.PutAt(ctx, userKey, []byte("other"), commitTS+1, 0))
+
+	errorStore := erroringLatestCommitStore{MVCCStore: underlying, key: userKey}
+	fsm, ok := NewKvFSM(errorStore).(*kvFSM)
+	require.True(t, ok)
 
 	commit := &pb.Request{
 		IsTxn: true,

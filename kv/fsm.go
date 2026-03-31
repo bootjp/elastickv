@@ -345,55 +345,77 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if len(meta.PrimaryKey) == 0 {
 		return errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
-	applyStartTS := startTS
-	if recordedCommitTS, committed, err := f.txnCommitTS(ctx, meta.PrimaryKey, startTS); err != nil {
+	applyStartTS, err := f.commitApplyStartTS(ctx, meta.PrimaryKey, startTS, commitTS)
+	if err != nil {
 		return err
-	} else if committed {
-		if recordedCommitTS != commitTS {
-			return errors.Wrapf(
-				ErrTxnInvalidMeta,
-				"commit_ts mismatch for primary key %s: recordedCommitTS=%d requestedCommitTS=%d startTS=%d",
-				string(meta.PrimaryKey), recordedCommitTS, commitTS, startTS,
-			)
-		}
-		// Treat duplicate commits as idempotent so stale txn artifacts can be
-		// cleaned up after the commit record already exists.
-		applyStartTS = commitTS
 	}
-
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
 	}
-
-	// Secondary-shard fallback: txnCommitKey lives only on the primary shard.
-	// If this shard doesn't hold the primary key, detect an already-committed
-	// state by checking whether any target data key already has a committed
-	// version at or beyond commitTS. If so, use commitTS as the conflict-check
-	// baseline so that idempotent re-application doesn't trip on the
-	// already-written version.
-	if applyStartTS == startTS {
-		for _, mut := range uniq {
-			latestTS, exists, err := f.store.LatestCommitTS(ctx, mut.Key)
-			if err != nil {
-				return err
-			}
-			if exists && latestTS >= commitTS {
-				applyStartTS = commitTS
-				break
-			}
-		}
-	}
-
 	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS)
 	if err != nil {
 		return err
 	}
-
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, applyStartTS, commitTS))
+	return f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS)
+}
+
+// commitApplyStartTS resolves the startTS to use for MVCC conflict detection
+// during a COMMIT. If a commit record already exists for the primary key it
+// returns commitTS (making the apply idempotent); otherwise it returns startTS.
+func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, startTS, commitTS uint64) (uint64, error) {
+	recordedCommitTS, committed, err := f.txnCommitTS(ctx, primaryKey, startTS)
+	if err != nil {
+		return 0, err
+	}
+	if !committed {
+		return startTS, nil
+	}
+	if recordedCommitTS != commitTS {
+		return 0, errors.Wrapf(
+			ErrTxnInvalidMeta,
+			"commit_ts mismatch for primary key %s: recordedCommitTS=%d requestedCommitTS=%d startTS=%d",
+			string(primaryKey), recordedCommitTS, commitTS, startTS,
+		)
+	}
+	// Commit record exists — use commitTS so stale artifacts can be cleaned up
+	// without triggering a write-conflict.
+	return commitTS, nil
+}
+
+// applyCommitWithIdempotencyFallback applies storeMuts at (applyStartTS,
+// commitTS). If the apply fails with a write-conflict and any of the target
+// keys already has a committed version at or beyond commitTS, the conflict is
+// treated as an idempotent secondary-shard retry and the apply is retried with
+// commitTS as the conflict-check baseline.
+//
+// The secondary-shard LatestCommitTS scan is intentionally deferred to the
+// write-conflict path so the hot (first-time) commit path pays no extra cost.
+func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
+	err := f.store.ApplyMutations(ctx, storeMuts, applyStartTS, commitTS)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, store.ErrWriteConflict) {
+		return errors.WithStack(err)
+	}
+	// Write-conflict: scan mutations one by one and return as soon as we find
+	// a key that is already committed at or beyond commitTS — this indicates an
+	// idempotent secondary-shard retry (txnCommitKey lives on the primary
+	// shard, not here).  Retry with commitTS as the conflict-check baseline.
+	for _, mut := range uniq {
+		latestTS, exists, lErr := f.store.LatestCommitTS(ctx, mut.Key)
+		if lErr != nil {
+			return errors.WithStack(lErr)
+		}
+		if exists && latestTS >= commitTS {
+			return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, commitTS, commitTS))
+		}
+	}
+	return errors.WithStack(err)
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS uint64) error {
