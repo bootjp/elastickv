@@ -15,8 +15,16 @@
         "patch",
         "pin",
         "digest"
-      ],
-      "automerge": true
+      ]
     }
-  ]
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "automerge": true,
+    "minimumReleaseAge": "7 days",
+    "labels": [
+      "automerge",
+      "security"
+    ]
+  }
 }
