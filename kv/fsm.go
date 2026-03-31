@@ -365,6 +365,26 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
+
+	// Secondary-shard fallback: txnCommitKey lives only on the primary shard.
+	// If this shard doesn't hold the primary key, detect an already-committed
+	// state by checking whether any target data key already has a committed
+	// version at or beyond commitTS. If so, use commitTS as the conflict-check
+	// baseline so that idempotent re-application doesn't trip on the
+	// already-written version.
+	if applyStartTS == startTS {
+		for _, mut := range uniq {
+			latestTS, exists, err := f.store.LatestCommitTS(ctx, mut.Key)
+			if err != nil {
+				return err
+			}
+			if exists && latestTS >= commitTS {
+				applyStartTS = commitTS
+				break
+			}
+		}
+	}
+
 	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS)
 	if err != nil {
 		return err
