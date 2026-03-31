@@ -97,7 +97,7 @@ Shared metrics bearer token (required because the examples bind `--metricsAddres
 ELASTICKV_METRICS_TOKEN="$(openssl rand -hex 32)"
 ```
 
-For a 4-node cluster, remove the `n5` entry from all variables above.
+For a 4-node cluster, remove the n5 entry from RAFT_TO_REDIS_MAP, RAFT_TO_S3_MAP, and RAFT_BOOTSTRAP_MEMBERS.
 
 ## 4) Start Nodes with `docker run`
 
