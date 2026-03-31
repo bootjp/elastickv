@@ -67,6 +67,57 @@ func TestTxnDuplicateMutations_LastWriteWins(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(13)
+	commitTS := uint64(23)
+	key := []byte("k")
+
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: key},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+
+	value, err := st.GetAt(ctx, key, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), value)
+
+	_, err = st.GetAt(ctx, txnLockKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnIntentKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	commitRecord, err := st.GetAt(ctx, txnCommitKey(key, startTS), ^uint64(0))
+	require.NoError(t, err)
+	gotCommitTS, err := decodeTxnCommitRecord(commitRecord)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, gotCommitTS)
+}
+
 func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 	t.Parallel()
 

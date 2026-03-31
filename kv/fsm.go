@@ -342,6 +342,17 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if commitTS <= startTS {
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
+	applyStartTS := startTS
+	if recordedCommitTS, committed, err := f.txnCommitTS(ctx, meta.PrimaryKey, startTS); err != nil {
+		return err
+	} else if committed {
+		if recordedCommitTS != commitTS {
+			return errors.Wrapf(ErrTxnInvalidMeta, "commit_ts mismatch for primary key %s", string(meta.PrimaryKey))
+		}
+		// Treat duplicate commits as idempotent so stale txn artifacts can be
+		// cleaned up after the commit record already exists.
+		applyStartTS = commitTS
+	}
 
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
@@ -355,7 +366,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, startTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, applyStartTS, commitTS))
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS uint64) error {
@@ -484,6 +495,21 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 		Value: encodeTxnRollbackRecord(),
 	})
 	return nil
+}
+
+func (f *kvFSM) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint64) (uint64, bool, error) {
+	b, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	commitTS, derr := decodeTxnCommitRecord(b)
+	if derr != nil {
+		return 0, false, errors.WithStack(derr)
+	}
+	return commitTS, true, nil
 }
 
 func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {
