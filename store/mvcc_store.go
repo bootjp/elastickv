@@ -901,12 +901,13 @@ func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
 	if len(versions) == 0 {
 		return -1
 	}
-	keepIdx := -1
-	for i, version := range versions {
-		if version.TS <= minTS {
-			keepIdx = i
-		}
-	}
+	// versions are sorted ascending by TS; use binary search for O(log n).
+	// Find the first index where TS > minTS; everything before it has TS <= minTS.
+	n := sort.Search(len(versions), func(i int) bool {
+		return versions[i].TS > minTS
+	})
+	// n-1 is the last index with TS <= minTS.
+	keepIdx := n - 1
 	if keepIdx <= 0 {
 		return -1
 	}
