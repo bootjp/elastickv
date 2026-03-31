@@ -72,13 +72,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
 	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
 	if err != nil {
 		return err
 	}
 	bootstrap := *raftBootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(*raftId, *raftDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers)
+	runtimes, shardGroups, err := buildShardGroups(
+		*raftId,
+		*raftDir,
+		cfg.groups,
+		cfg.multi,
+		bootstrap,
+		bootstrapServers,
+		func(groupID uint64) kv.ProposalObserver {
+			return metricsRegistry.RaftProposalObserver(groupID)
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -114,7 +125,6 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
 	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
@@ -251,7 +261,15 @@ func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers
 	return nil, errors.Wrapf(ErrBootstrapMembersMissingLocalNode, "raftId=%q", raftID)
 }
 
-func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi bool, bootstrap bool, bootstrapServers []raft.Server) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
+func buildShardGroups(
+	raftID string,
+	raftDir string,
+	groups []groupSpec,
+	multi bool,
+	bootstrap bool,
+	bootstrapServers []raft.Server,
+	proposalObserverForGroup func(uint64) kv.ProposalObserver,
+) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
@@ -291,10 +309,17 @@ func buildShardGroups(raftID string, raftDir string, groups []groupSpec, multi b
 		shardGroups[g.id] = &kv.ShardGroup{
 			Raft:  r,
 			Store: st,
-			Txn:   kv.NewLeaderProxy(r),
+			Txn:   kv.NewLeaderProxy(r, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
 		}
 	}
 	return runtimes, shardGroups, nil
+}
+
+func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) kv.ProposalObserver {
+	if factory == nil {
+		return nil
+	}
+	return factory(groupID)
 }
 
 func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
@@ -326,10 +351,20 @@ func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime 
 	return out
 }
 
-func startRaftServers(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, shardStore *kv.ShardStore, coordinate kv.Coordinator, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay) error {
+func startRaftServers(
+	ctx context.Context,
+	lc *net.ListenConfig,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	relay *adapter.RedisPubSubRelay,
+	proposalObserverForGroup func(uint64) kv.ProposalObserver,
+) error {
 	for _, rt := range runtimes {
 		gs := grpc.NewServer(internalutil.GRPCServerOptions()...)
-		trx := kv.NewTransaction(rt.raft)
+		trx := kv.NewTransaction(rt.raft, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
@@ -563,7 +598,19 @@ func (r runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startRaftServers(r.ctx, r.lc, r.eg, r.runtimes, r.shardStore, r.coordinate, r.distServer, r.pubsubRelay); err != nil {
+	if err := startRaftServers(
+		r.ctx,
+		r.lc,
+		r.eg,
+		r.runtimes,
+		r.shardStore,
+		r.coordinate,
+		r.distServer,
+		r.pubsubRelay,
+		func(groupID uint64) kv.ProposalObserver {
+			return r.metricsRegistry.RaftProposalObserver(groupID)
+		},
+	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry, r.readTracker); err != nil {

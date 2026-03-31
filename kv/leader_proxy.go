@@ -23,10 +23,10 @@ type LeaderProxy struct {
 }
 
 // NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
-func NewLeaderProxy(r *raft.Raft) *LeaderProxy {
+func NewLeaderProxy(r *raft.Raft, opts ...TransactionOption) *LeaderProxy {
 	return &LeaderProxy{
 		raft: r,
-		tm:   NewTransaction(r),
+		tm:   NewTransaction(r, opts...),
 	}
 }
 

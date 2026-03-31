@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Raft consensus status for elastickv: term, leadership, index progress, replication lag, and FSM backpressure.",
+  "description": "Raft control-plane status for elastickv: leader, membership, node state, index drift, backlog, and leader contact.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -23,19 +23,7 @@
   "links": [],
   "panels": [
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "title": "Cluster Overview",
-      "type": "row"
-    },
-    {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -46,7 +34,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -56,41 +44,90 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 4,
         "x": 0,
-        "y": 1
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group) (elastickv_raft_term{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "{{group}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Max Observed Term",
+      "type": "stat",
+      "description": "Maximum Raft term observed across nodes in the selected group."
+    },
+    {
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
       },
       "id": 2,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "textMode": "auto"
+        }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_term{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
-          "instant": false,
+          "expr": "max by (group) (elastickv_raft_members{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
-          "range": true,
-          "refId": "A"
+          "refId": "A",
+          "instant": true
         }
       ],
-      "title": "Raft Term",
-      "type": "stat"
+      "title": "Member Count",
+      "type": "stat",
+      "description": "Current member count for the selected Raft group."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -101,51 +138,56 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 0.2
+              },
+              {
+                "color": "red",
+                "value": 1
               }
             ]
           },
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 1
+        "w": 4,
+        "x": 16,
+        "y": 0
       },
       "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "textMode": "auto"
+        }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "clamp_min(count by (group) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\",suffrage=\"voter\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1)) - 1, 0)",
-          "instant": false,
+          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
-          "range": true,
-          "refId": "A"
+          "refId": "A",
+          "instant": true
         }
       ],
-      "title": "Other Voting Peers",
-      "type": "stat"
+      "title": "Max Follower Last Contact",
+      "type": "stat",
+      "description": "Worst observed time since leader contact across follower nodes."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -156,65 +198,10 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 1
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": null,
-          "editorMode": "code",
-          "expr": "count by (group) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
-          "instant": false,
-          "legendFormat": "{{group}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Config Members",
-      "type": "stat"
-    },
-    {
-      "datasource": null,
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
+                "value": 0
               },
               {
-                "color": "yellow",
+                "color": "orange",
                 "value": 10
               },
               {
@@ -229,87 +216,78 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 1
+        "w": 4,
+        "x": 20,
+        "y": 0
       },
-      "id": 5,
+      "id": 4,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        },
-        "textMode": "auto"
+        }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
+          "expr": "max by (group) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
-          "range": true,
-          "refId": "A"
+          "refId": "A",
+          "instant": true
         }
       ],
-      "title": "Max FSM Pending",
-      "type": "stat"
+      "title": "Max Commit-Applied Gap",
+      "type": "stat",
+      "description": "Largest commit-minus-applied backlog across nodes."
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 5
-      },
-      "id": 6,
-      "title": "Leader & State",
-      "type": "row"
-    },
-    {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 7,
+        "w": 8,
         "x": 0,
-        "y": 6
+        "y": 4
       },
-      "id": 7,
+      "id": 5,
       "options": {
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
+          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} leader {{leader_id}}",
           "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "count by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
         }
       ],
-      "title": "Current Leader per Group",
+      "title": "Current Leader",
       "transformations": [
         {
           "id": "labelsToFields",
@@ -331,50 +309,51 @@
             "indexByName": {
               "group": 0,
               "leader_id": 1,
-              "leader_address": 2
+              "leader_address": 2,
+              "Value #B": 3
             },
             "renameByName": {
               "group": "Raft Group",
               "leader_address": "Leader Address",
-              "leader_id": "Leader ID"
+              "leader_id": "Leader ID",
+              "Value #B": "Observer Count"
             }
           }
         }
       ],
-      "type": "table"
+      "type": "table",
+      "description": "Current leader identity for each Raft group and how many nodes observe that same leader."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 6
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 4
       },
-      "id": 8,
+      "id": 6,
       "options": {
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"} == 1)",
+          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} node {{node_id}} {{state}}",
           "refId": "A"
         }
       ],
@@ -412,44 +391,78 @@
           }
         }
       ],
-      "type": "table"
+      "type": "table",
+      "description": "Leader, follower, candidate, or shutdown state for each node."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Leader Flag"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": {
+                        "index": 0,
+                        "text": "follower"
+                      },
+                      "1": {
+                        "index": 1,
+                        "text": "leader"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 14
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 4
       },
-      "id": 9,
+      "id": 7,
       "options": {
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
         "showHeader": true
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\"} * on(group, node_id, node_address) group_left() (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",state=\"leader\"} == 1))",
+          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
-          "legendFormat": "group {{group}} member {{member_id}}",
           "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, member_id, member_address) (elastickv_raft_member_is_leader{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
         }
       ],
-      "title": "Cluster Members",
+      "title": "Membership",
       "transformations": [
         {
           "id": "labelsToFields",
@@ -472,37 +485,207 @@
               "group": 0,
               "member_id": 1,
               "member_address": 2,
-              "suffrage": 3
+              "suffrage": 3,
+              "Value #B": 4
             },
             "renameByName": {
               "group": "Raft Group",
               "member_address": "Member Address",
               "member_id": "Member ID",
-              "suffrage": "Suffrage"
+              "suffrage": "Suffrage",
+              "Value #B": "Leader Flag"
             }
           }
         }
       ],
-      "type": "table"
+      "type": "table",
+      "description": "Current Raft membership and leader flag for each member."
     },
     {
-      "collapsed": false,
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last Contact (s)"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "-1": {
+                        "index": 0,
+                        "text": "unknown"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
       "gridPos": {
-        "h": 1,
+        "h": 9,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 11
       },
-      "id": 10,
-      "title": "Index Progress",
-      "type": "row"
+      "id": 8,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "D"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "E"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "F"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "G"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "H"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "I"
+        }
+      ],
+      "title": "Per-Node Index Snapshot",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Metric": true,
+              "Time": true,
+              "Value": true,
+              "Value #A": true
+            },
+            "indexByName": {
+              "group": 0,
+              "node_id": 1,
+              "node_address": 2,
+              "state": 3,
+              "Value #B": 4,
+              "Value #C": 5,
+              "Value #D": 6,
+              "Value #E": 7,
+              "Value #F": 8,
+              "Value #G": 9,
+              "Value #H": 10,
+              "Value #I": 11
+            },
+            "renameByName": {
+              "group": "Raft Group",
+              "node_address": "Node Address",
+              "node_id": "Node ID",
+              "state": "Local State",
+              "Value #B": "Last Log Index",
+              "Value #C": "Commit Index",
+              "Value #D": "Applied Index",
+              "Value #E": "Snapshot Index",
+              "Value #F": "Last Log-Applied",
+              "Value #G": "Commit-Applied",
+              "Value #H": "Last Contact (s)",
+              "Value #I": "FSM Pending"
+            }
+          }
+        }
+      ],
+      "type": "table",
+      "description": "Per-node index snapshot including log, commit, applied, snapshot, lag, last leader contact, and FSM backlog."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
           },
           "unit": "short"
         },
@@ -512,80 +695,70 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 23
+        "y": 20
       },
-      "id": 11,
+      "id": 9,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "last log - {{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "last_log g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
         },
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "commit - {{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "commit g{{group}} {{node_id}}",
           "range": true,
           "refId": "B"
         },
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "applied - {{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "applied g{{group}} {{node_id}}",
           "range": true,
           "refId": "C"
         },
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "snapshot - {{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "snapshot g{{group}} {{node_id}}",
           "range": true,
           "refId": "D"
         }
       ],
-      "title": "Index Progress",
-      "type": "timeseries"
+      "title": "Last Log / Commit / Applied / Snapshot by Node",
+      "type": "timeseries",
+      "description": "Compare last log, commit, applied, and snapshot indexes by node."
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 31
-      },
-      "id": 12,
-      "title": "Replication Health",
-      "type": "row"
-    },
-    {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
           },
           "unit": "short"
         },
@@ -595,41 +768,95 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 28
       },
-      "id": 13,
+      "id": 10,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\"}) - max by (group) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "lag - {{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Replication Lag (unapplied entries)",
-      "type": "timeseries"
+      "title": "Last Log-Applied Backlog by Node",
+      "type": "timeseries",
+      "description": "Last log minus applied backlog by node."
     },
     {
-      "datasource": null,
+      "datasource": "$datasource",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "g{{group}} {{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Commit-Applied Backlog by Node",
+      "type": "timeseries",
+      "description": "Commit minus applied backlog by node."
+    },
+    {
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
           },
           "unit": "s"
         },
@@ -638,72 +865,294 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 32
+        "x": 0,
+        "y": 36
       },
-      "id": 14,
+      "id": 12,
       "options": {
         "legend": {
-          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "datasource": null,
+          "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\"})",
-          "instant": false,
-          "legendFormat": "{{group}}",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Last Leader Contact",
-      "type": "timeseries"
+      "title": "Last Contact by Node",
+      "type": "timeseries",
+      "description": "Time since last leader contact by node."
+    },
+    {
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "legendFormat": "g{{group}} {{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "FSM Pending by Node",
+      "type": "timeseries",
+      "description": "Commands waiting to be applied to the FSM by node."
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Observed leader changes over the last 24 hours. Uses max by group to avoid counting the same election once per observer node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 14,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (group) (increase(elastickv_raft_leader_changes_seen_total{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}[24h]))",
+          "instant": true,
+          "legendFormat": "{{group}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Leader Changes (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Raft proposals that failed before a usable apply response was returned over the last 15 minutes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 15,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (group) (increase(elastickv_raft_proposals_failed_total{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}[15m]))",
+          "instant": true,
+          "legendFormat": "{{group}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Failed Proposals (15m)",
+      "type": "stat"
     }
   ],
   "refresh": "10s",
-  "schemaVersion": 39,
+  "schemaVersion": 41,
   "tags": [
     "elastickv",
-    "raft"
+    "raft",
+    "control-plane"
   ],
   "templating": {
     "list": [
       {
-        "current": {},
-        "datasource": null,
-        "definition": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
+        "current": {
+          "selected": false,
+          "text": "default",
+          "value": "default"
+        },
         "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "$datasource",
+        "definition": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
         "includeAll": true,
         "label": "Raft Group",
         "multi": true,
         "name": "group",
         "options": [],
         "query": {
+          "qryType": 1,
           "query": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
-          "refId": "StandardVariableQuery"
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "$datasource",
+        "definition": "label_values(elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"}, node_id)",
+        "includeAll": true,
+        "label": "Node ID",
+        "multi": true,
+        "name": "node_id",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"}, node_id)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
         "sort": 1,
         "type": "query"
       }
     ]
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "Elastickv Raft Status",
   "uid": "elastickv-raft-status",
-  "version": 1
+  "version": 2
 }
