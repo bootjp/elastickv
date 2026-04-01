@@ -2,47 +2,47 @@
 
 ## 1. Background
 
-現在の S3 互換アダプターは全リクエストに AWS Signature V4 認証を要求する。バケット単位・オブジェクト単位のアクセス制御は存在せず、認証が通れば全リソースにフルアクセスとなる。
+The current S3-compatible adapter requires AWS Signature Version 4 authentication for all requests. There is no bucket-level or object-level access control; once authentication succeeds, the client has full access to all resources.
 
-静的アセット配信や公開データセット共有などのユースケースでは、特定のバケットを認証なしで読み取り可能にする機能が求められる。本ドキュメントでは、バケットレベルの公開配信機能を設計する。
+For use cases such as serving static assets or sharing public data sets, we need the ability to make specific buckets readable without authentication. This document designs bucket-level public distribution functionality.
 
 ## 2. Goals and Non-goals
 
 ### 2.1 Goals
 
-1. バケット単位で公開/非公開を切り替えられる仕組みを提供する。
-2. 公開バケットに対する `GetObject`, `HeadObject`, `ListObjectsV2` を認証なしで許可する。
-3. 書き込み操作（`PutObject`, `DeleteObject`, マルチパート等）は公開バケットでも認証を必須とする。
-4. 既存のバケットはデフォルトで非公開（後方互換性を維持）。
-5. `PutBucketAcl` / `GetBucketAcl` API で公開設定を変更・確認できるようにする。
+1. Provide a mechanism to switch each bucket between public and private.
+2. Allow unauthenticated `GetObject`, `HeadObject`, and `ListObjectsV2` requests against public buckets.
+3. Require authentication for all write operations (`PutObject`, `DeleteObject`, multipart uploads, etc.), even on public buckets.
+4. Keep all existing buckets private by default (to preserve backward compatibility).
+5. Allow changing and inspecting the public access setting via the `PutBucketAcl` / `GetBucketAcl` APIs.
 
 ### 2.2 Non-goals
 
-1. オブジェクト単位の ACL（`x-amz-acl` per object）。
-2. バケットポリシー JSON（IAM-style の条件付きポリシー）。
-3. IAM / STS / クロスアカウント認可。
-4. S3 静的ウェブサイトホスティング（index.html 自動解決、カスタムエラーページ等）。
-5. CORS 設定。
-6. 公開バケットへの匿名書き込み。
+1. Object-level ACLs (`x-amz-acl` per object).
+2. Bucket policy JSON (IAM-style conditional policies).
+3. IAM / STS / cross-account authorization.
+4. S3 static website hosting (automatic index.html resolution, custom error pages, etc.).
+5. CORS configuration.
+6. Anonymous writes to public buckets.
 
 ## 3. ACL Model
 
 ### 3.1 Supported ACL values
 
-AWS S3 の Canned ACL のうち、以下の 2 つのみをサポートする：
+Among AWS S3 canned ACLs, we only support the following two:
 
-| Canned ACL | 読み取り | 書き込み |
+| Canned ACL | Read | Write |
 |---|---|---|
-| `private`（デフォルト） | 認証必須 | 認証必須 |
-| `public-read` | 認証不要 | 認証必須 |
+| `private` (default) | Auth required | Auth required |
+| `public-read` | No auth required | Auth required |
 
-それ以外の Canned ACL（`public-read-write`, `authenticated-read`, `aws-exec-read`, `bucket-owner-read`, `bucket-owner-full-control` 等）はエラー `NotImplemented` を返す。
+All other canned ACLs (`public-read-write`, `authenticated-read`, `aws-exec-read`, `bucket-owner-read`, `bucket-owner-full-control`, etc.) return a `NotImplemented` error.
 
 ### 3.2 Why bucket-level only
 
-- オブジェクト単位の ACL は AWS 自身も非推奨（S3 Object Ownership の `BucketOwnerEnforced` がデフォルト）。
-- 実装の複雑さを大幅に抑えつつ、公開配信の主要ユースケースをカバーできる。
-- 将来バケットポリシーを導入する場合も、バケットレベル ACL は自然に共存する。
+- Object-level ACLs are discouraged even by AWS itself (S3 Object Ownership with `BucketOwnerEnforced` is the default).
+- We can cover the main public-distribution use cases while keeping the implementation substantially simpler.
+- If we introduce bucket policies in the future, bucket-level ACLs will coexist with them naturally.
 
 ## 4. Data Model Changes
 
