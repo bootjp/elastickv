@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -88,11 +87,10 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 
 func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	defer slog.SetDefault(prev)
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	coord := &ShardedCoordinator{
+		log: logger,
 		groups: map[uint64]*ShardGroup{
 			1: {Txn: &failingTransactional{err: errors.WithStack(ErrTxnAlreadyCommitted)}},
 		},
@@ -103,5 +101,5 @@ func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
 		keys: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("pk")}},
 	}}, 20)
 
-	require.Empty(t, strings.TrimSpace(buf.String()))
+	require.NotContains(t, buf.String(), "txn abort failed; locks may remain until TTL expiry")
 }

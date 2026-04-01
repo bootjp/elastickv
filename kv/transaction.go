@@ -232,11 +232,11 @@ func needsTxnCleanup(reqs []*pb.Request) bool {
 		if req == nil || !req.IsTxn {
 			continue
 		}
-		switch req.Phase {
-		case pb.Phase_PREPARE, pb.Phase_COMMIT:
+		// Be conservative: any transactional phase other than NONE/ABORT may have
+		// left intents that require cleanup, including unknown enum values that
+		// can appear during rolling upgrades.
+		if req.Phase != pb.Phase_NONE && req.Phase != pb.Phase_ABORT {
 			return true
-		case pb.Phase_NONE, pb.Phase_ABORT:
-			continue
 		}
 	}
 	return false
