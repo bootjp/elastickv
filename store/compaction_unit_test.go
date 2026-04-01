@@ -55,8 +55,7 @@ func TestCompactKeepIndex_MultipleVersions(t *testing.T) {
 		{TS: 300, Value: []byte("v300")},
 		{TS: 400, Value: []byte("v400")},
 	}
-	// minTS=250: iterates from end: i=3(400>250), i=2(300>250), i=1(200<=250)
-	// keepIdx=1, > 0 → compact versions before idx 1
+	// minTS=250: first index with TS>250 is idx 2 (TS=300); keepIdx = 2-1 = 1.
 	assert.Equal(t, 1, compactKeepIndex(versions, 250))
 }
 
@@ -67,7 +66,7 @@ func TestCompactKeepIndex_AllBelowMinTS(t *testing.T) {
 		{TS: 20, Value: []byte("v20")},
 		{TS: 30, Value: []byte("v30")},
 	}
-	// minTS=100: iterates from end: i=2(30<=100) → keepIdx=2, > 0 → return 2
+	// minTS=100: first index with TS>100 is len(versions)=3; keepIdx = 3-1 = 2.
 	// compact versions before idx 2 (i.e. TS=10 and TS=20)
 	assert.Equal(t, 2, compactKeepIndex(versions, 100))
 }

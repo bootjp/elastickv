@@ -90,14 +90,17 @@ func (r *SentryReporter) CaptureDivergence(div Divergence) {
 	r.hub.WithScope(func(scope *sentry.Scope) {
 		scope.SetTag("command", div.Command)
 		scope.SetTag("kind", div.Kind.String())
-		// Omit raw key from Sentry tags to avoid leaking sensitive data;
-		// only send a truncated form as an extra for debugging.
-		scope.SetExtra("key", truncateValue(div.Key))
-		if div.Pattern != "" {
-			scope.SetExtra("pattern", truncateValue(div.Pattern))
+		// Omit raw key from Sentry tags to avoid leaking sensitive data; attach
+		// truncated values under a named context for debugging instead.
+		context := sentry.Context{
+			"key":       truncateValue(div.Key),
+			"primary":   truncateValue(div.Primary),
+			"secondary": truncateValue(div.Secondary),
 		}
-		scope.SetExtra("primary", truncateValue(div.Primary))
-		scope.SetExtra("secondary", truncateValue(div.Secondary))
+		if div.Pattern != "" {
+			context["pattern"] = truncateValue(div.Pattern)
+		}
+		scope.SetContext("divergence", context)
 		scope.SetFingerprint([]string{"divergence", div.Kind.String(), div.Command})
 		scope.SetLevel(sentry.LevelWarning)
 		r.hub.CaptureMessage(fmt.Sprintf("data divergence: %s %s", div.Kind, div.Command))
