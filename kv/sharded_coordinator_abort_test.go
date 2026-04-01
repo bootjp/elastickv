@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -81,4 +83,23 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 	// Shard2 should also have no data (it was never prepared).
 	_, err = s2.GetAt(ctx, []byte("x"), ^uint64(0))
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "user data for key 'x' should not exist on shard2")
+}
+
+func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	coord := &ShardedCoordinator{
+		log: logger,
+		groups: map[uint64]*ShardGroup{
+			1: {Txn: &failingTransactional{err: errors.WithStack(ErrTxnAlreadyCommitted)}},
+		},
+	}
+
+	coord.abortPreparedTxn(10, []byte("pk"), []preparedGroup{{
+		gid:  1,
+		keys: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("pk")}},
+	}}, 20)
+
+	require.NotContains(t, buf.String(), "txn abort failed; locks may remain until TTL expiry")
 }

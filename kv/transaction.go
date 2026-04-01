@@ -229,7 +229,13 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 
 func needsTxnCleanup(reqs []*pb.Request) bool {
 	for _, req := range reqs {
-		if req != nil && req.IsTxn && req.Phase != pb.Phase_NONE {
+		if req == nil || !req.IsTxn {
+			continue
+		}
+		// Be conservative: any transactional phase other than NONE/ABORT may have
+		// left intents that require cleanup, including unknown enum values that
+		// can appear during rolling upgrades.
+		if req.Phase != pb.Phase_NONE && req.Phase != pb.Phase_ABORT {
 			return true
 		}
 	}
