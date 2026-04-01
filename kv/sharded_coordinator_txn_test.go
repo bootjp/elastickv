@@ -166,6 +166,49 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
 }
 
+func TestShardedCoordinatorDispatchTxn_SingleShardUsesOnePhase(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 17},
+		},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	startTS := uint64(10)
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("c"), Value: []byte("v2")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(17), resp.CommitIndex)
+
+	require.Len(t, g1Txn.requests, 1)
+	req := g1Txn.requests[0]
+	require.Equal(t, pb.Phase_NONE, req.Phase)
+	require.Equal(t, startTS, req.Ts)
+	require.Len(t, req.Mutations, 3)
+	require.Equal(t, []byte("b"), req.Mutations[1].Key)
+	require.Equal(t, []byte("c"), req.Mutations[2].Key)
+
+	meta := requestTxnMeta(t, req)
+	require.Equal(t, []byte("b"), meta.PrimaryKey)
+	require.Zero(t, meta.LockTTLms)
+	require.Greater(t, meta.CommitTS, startTS)
+}
+
 func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	t.Parallel()
 
