@@ -103,15 +103,13 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(startTS)
-	} else {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
+	commitTS, err = c.resolveTxnCommitTS(startTS, commitTS)
+	if err != nil {
+		return nil, err
 	}
-	if commitTS == 0 || commitTS <= startTS {
-		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+
+	if len(gids) == 1 {
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
 	}
 
 	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
@@ -127,6 +125,37 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 
 	maxIndex = c.commitSecondaryTxns(startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+}
+
+func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
+	if commitTS == 0 {
+		commitTS = c.nextTxnTSAfter(startTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
+	}
+	if commitTS == 0 || commitTS <= startTS {
+		return 0, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	return commitTS, nil
+}
+
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+	g, err := c.txnGroupForID(gid)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.Txn.Commit([]*pb.Request{
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems),
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if resp == nil {
+		return &CoordinateResponse{}, nil
+	}
+	return &CoordinateResponse{CommitIndex: resp.CommitIndex}, nil
 }
 
 type preparedGroup struct {
