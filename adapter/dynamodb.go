@@ -62,10 +62,10 @@ const (
 	batchWriteItemMaxItems      = 25
 	dynamoMaxRequestBodyBytes   = 1 << 20
 
-	dynamoTableMetaPrefix       = "!ddb|meta|table|"
-	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
-	dynamoItemPrefix            = "!ddb|item|"
-	dynamoGSIPrefix             = "!ddb|gsi|"
+	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
+	dynamoTableGenerationPrefix = kv.DynamoTableGenerationPrefix
+	dynamoItemPrefix            = kv.DynamoItemPrefix
+	dynamoGSIPrefix             = kv.DynamoGSIPrefix
 	dynamoScanPageLimit         = 1024
 	dynamoKeyEscapeByte         = byte(0x00)
 	dynamoKeyTerminatorByte     = byte(0x01)

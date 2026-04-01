@@ -516,16 +516,9 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	commitTS := reqs.CommitTS
-	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(reqs.StartTS)
-	} else {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
-	}
-	if commitTS == 0 || commitTS <= reqs.StartTS {
-		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	commitTS, err := c.resolveTxnCommitTS(reqs.StartTS, reqs.CommitTS)
+	if err != nil {
+		return nil, err
 	}
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }

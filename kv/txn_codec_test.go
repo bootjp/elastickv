@@ -74,3 +74,22 @@ func TestDecodeTxnMetaV1Compatibility(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, meta, decoded)
 }
+
+func TestDecodeTxnMetaV2RejectsUnknownFlags(t *testing.T) {
+	t.Parallel()
+
+	encoded := encodeTxnMetaV2(TxnMeta{PrimaryKey: []byte("pk")})
+	encoded[1] |= 0x80
+
+	_, err := DecodeTxnMeta(encoded)
+	require.ErrorContains(t, err, "unsupported flags")
+}
+
+func TestDecodeTxnMetaV2RejectsTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	encoded := append(encodeTxnMetaV2(TxnMeta{PrimaryKey: []byte("pk")}), 0x01)
+
+	_, err := DecodeTxnMeta(encoded)
+	require.ErrorContains(t, err, "unexpected trailing bytes")
+}

@@ -12,19 +12,24 @@ const redisInternalRoutePrefix = "!redis|"
 var redisInternalRoutePrefixBytes = []byte(redisInternalRoutePrefix)
 
 const (
-	dynamoRoutePrefix           = "!ddb|route|table|"
-	dynamoTableMetaPrefix       = "!ddb|meta|table|"
-	dynamoTableGenerationPrefix = "!ddb|meta|gen|"
-	dynamoItemPrefix            = "!ddb|item|"
-	dynamoGSIPrefix             = "!ddb|gsi|"
+	dynamoRoutePrefix = "!ddb|route|table|"
+
+	// DynamoTableMetaPrefix prefixes DynamoDB table metadata keys.
+	DynamoTableMetaPrefix = "!ddb|meta|table|"
+	// DynamoTableGenerationPrefix prefixes DynamoDB table generation keys.
+	DynamoTableGenerationPrefix = "!ddb|meta|gen|"
+	// DynamoItemPrefix prefixes DynamoDB item storage keys.
+	DynamoItemPrefix = "!ddb|item|"
+	// DynamoGSIPrefix prefixes DynamoDB GSI storage keys.
+	DynamoGSIPrefix = "!ddb|gsi|"
 )
 
 var (
 	dynamoRoutePrefixBytes           = []byte(dynamoRoutePrefix)
-	dynamoTableMetaPrefixBytes       = []byte(dynamoTableMetaPrefix)
-	dynamoTableGenerationPrefixBytes = []byte(dynamoTableGenerationPrefix)
-	dynamoItemPrefixBytes            = []byte(dynamoItemPrefix)
-	dynamoGSIPrefixBytes             = []byte(dynamoGSIPrefix)
+	dynamoTableMetaPrefixBytes       = []byte(DynamoTableMetaPrefix)
+	dynamoTableGenerationPrefixBytes = []byte(DynamoTableGenerationPrefix)
+	dynamoItemPrefixBytes            = []byte(DynamoItemPrefix)
+	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
 )
 
 // routeKey normalizes internal keys (e.g., list metadata/items) to the logical

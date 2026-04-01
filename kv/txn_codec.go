@@ -25,6 +25,7 @@ const txnLockFlagPrimary byte = 0x01
 const (
 	txnMetaFlagLockTTL  byte = 0x01
 	txnMetaFlagCommitTS byte = 0x02
+	txnMetaKnownFlags   byte = txnMetaFlagLockTTL | txnMetaFlagCommitTS
 )
 
 const txnMetaHeaderSize = 2
@@ -139,6 +140,9 @@ func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
 		return TxnMeta{}, errors.New("txn meta: truncated flags")
 	}
 	flags := b[1]
+	if flags&^txnMetaKnownFlags != 0 {
+		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unsupported flags 0x%02x", flags))
+	}
 	r := bytes.NewReader(b[txnMetaHeaderSize:])
 	primaryLen, err := readTxnUint64(r, "txn meta: primary key length truncated")
 	if err != nil {
@@ -161,6 +165,9 @@ func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
 		if err != nil {
 			return TxnMeta{}, err
 		}
+	}
+	if r.Len() != 0 {
+		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unexpected trailing bytes %d", r.Len()))
 	}
 	return meta, nil
 }

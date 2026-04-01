@@ -36,10 +36,10 @@ func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	indexSegment := base64.RawURLEncoding.EncodeToString([]byte("status-index"))
 	want := dynamoRouteTableKey(tableSegment)
 
-	metaKey := append([]byte(dynamoTableMetaPrefix), tableSegment...)
-	generationKey := append([]byte(dynamoTableGenerationPrefix), tableSegment...)
-	itemKey := append([]byte(dynamoItemPrefix+string(tableSegment)+"|7|"), []byte("pk\x00\x01")...)
-	gsiKey := append([]byte(dynamoGSIPrefix+string(tableSegment)+"|7|"+indexSegment+"|"), []byte("idx\x00\x01pk\x00\x01")...)
+	metaKey := append([]byte(DynamoTableMetaPrefix), tableSegment...)
+	generationKey := append([]byte(DynamoTableGenerationPrefix), tableSegment...)
+	itemKey := append([]byte(DynamoItemPrefix+string(tableSegment)+"|7|"), []byte("pk\x00\x01")...)
+	gsiKey := append([]byte(DynamoGSIPrefix+string(tableSegment)+"|7|"+indexSegment+"|"), []byte("idx\x00\x01pk\x00\x01")...)
 
 	require.Equal(t, want, routeKey(metaKey))
 	require.Equal(t, want, routeKey(generationKey))
