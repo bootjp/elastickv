@@ -36,6 +36,7 @@ type ShardedCoordinator struct {
 	defaultGroup uint64
 	clock        *HLC
 	store        store.MVCCStore
+	log          *slog.Logger
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
@@ -52,6 +53,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		defaultGroup: defaultGroup,
 		clock:        clock,
 		store:        st,
+		log:          slog.Default(),
 	}
 }
 
@@ -211,7 +213,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 		}
 		r, err := commitSecondaryWithRetry(g, req)
 		if err != nil {
-			slog.Warn("txn secondary commit failed",
+			c.log.Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
@@ -269,7 +271,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			if errors.Is(err, ErrTxnAlreadyCommitted) {
 				continue
 			}
-			slog.Warn("txn abort failed; locks may remain until TTL expiry",
+			c.log.Warn("txn abort failed; locks may remain until TTL expiry",
 				slog.Uint64("gid", pg.gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
