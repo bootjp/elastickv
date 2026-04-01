@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	txnMetaVersion     byte = 1
+	txnMetaVersionV1   byte = 1
+	txnMetaVersion     byte = 2
 	txnLockVersion     byte = 1
 	txnIntentVersion   byte = 1
 	txnCommitVersion   byte = 1
@@ -19,6 +20,13 @@ const (
 )
 
 const txnLockFlagPrimary byte = 0x01
+
+const (
+	txnMetaFlagLockTTL  byte = 0x01
+	txnMetaFlagCommitTS byte = 0x02
+)
+
+const txnMetaHeaderSize = 2
 
 // uint64FieldSize is the byte size of a serialized uint64 field.
 const uint64FieldSize = 8
@@ -32,14 +40,29 @@ type TxnMeta struct {
 }
 
 func EncodeTxnMeta(m TxnMeta) []byte {
-	// version(1) + LockTTLms(8) + CommitTS(8) + primaryLen(8) + primaryKey
-	size := 1 + uint64FieldSize + uint64FieldSize + uint64FieldSize + len(m.PrimaryKey)
+	// version(1) + flags(1) + primaryLen(8) + primaryKey + optional fields.
+	flags := txnMetaFlags(m)
+	size := txnMetaHeaderSize + uint64FieldSize + len(m.PrimaryKey)
+	if flags&txnMetaFlagLockTTL != 0 {
+		size += uint64FieldSize
+	}
+	if flags&txnMetaFlagCommitTS != 0 {
+		size += uint64FieldSize
+	}
 	b := make([]byte, size)
 	b[0] = txnMetaVersion
-	binary.BigEndian.PutUint64(b[1:], m.LockTTLms)
-	binary.BigEndian.PutUint64(b[9:], m.CommitTS)
-	binary.BigEndian.PutUint64(b[17:], uint64(len(m.PrimaryKey)))
-	copy(b[25:], m.PrimaryKey)
+	b[1] = flags
+	binary.BigEndian.PutUint64(b[txnMetaHeaderSize:], uint64(len(m.PrimaryKey)))
+	offset := txnMetaHeaderSize + uint64FieldSize
+	copy(b[offset:], m.PrimaryKey)
+	offset += len(m.PrimaryKey)
+	if flags&txnMetaFlagLockTTL != 0 {
+		binary.BigEndian.PutUint64(b[offset:], m.LockTTLms)
+		offset += uint64FieldSize
+	}
+	if flags&txnMetaFlagCommitTS != 0 {
+		binary.BigEndian.PutUint64(b[offset:], m.CommitTS)
+	}
 	return b
 }
 
@@ -47,9 +70,28 @@ func DecodeTxnMeta(b []byte) (TxnMeta, error) {
 	if len(b) < 1 {
 		return TxnMeta{}, errors.New("txn meta: empty")
 	}
-	if b[0] != txnMetaVersion {
+	switch b[0] {
+	case txnMetaVersionV1:
+		return decodeTxnMetaV1(b)
+	case txnMetaVersion:
+		return decodeTxnMetaV2(b)
+	default:
 		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unsupported version %d", b[0]))
 	}
+}
+
+func txnMetaFlags(m TxnMeta) byte {
+	var flags byte
+	if m.LockTTLms != 0 {
+		flags |= txnMetaFlagLockTTL
+	}
+	if m.CommitTS != 0 {
+		flags |= txnMetaFlagCommitTS
+	}
+	return flags
+}
+
+func decodeTxnMetaV1(b []byte) (TxnMeta, error) {
 	r := bytes.NewReader(b[1:])
 	var ttl uint64
 	var commitTS uint64
@@ -71,6 +113,35 @@ func DecodeTxnMeta(b []byte) (TxnMeta, error) {
 		return TxnMeta{}, err
 	}
 	return TxnMeta{PrimaryKey: pk, LockTTLms: ttl, CommitTS: commitTS}, nil
+}
+
+func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
+	if len(b) < txnMetaHeaderSize {
+		return TxnMeta{}, errors.New("txn meta: truncated flags")
+	}
+	flags := b[1]
+	r := bytes.NewReader(b[txnMetaHeaderSize:])
+	var primaryLen uint64
+	if err := binary.Read(r, binary.BigEndian, &primaryLen); err != nil {
+		return TxnMeta{}, errors.WithStack(err)
+	}
+	pk, err := readTxnField(r, primaryLen, "txn meta: primary key truncated")
+	if err != nil {
+		return TxnMeta{}, err
+	}
+
+	meta := TxnMeta{PrimaryKey: pk}
+	if flags&txnMetaFlagLockTTL != 0 {
+		if err := binary.Read(r, binary.BigEndian, &meta.LockTTLms); err != nil {
+			return TxnMeta{}, errors.WithStack(err)
+		}
+	}
+	if flags&txnMetaFlagCommitTS != 0 {
+		if err := binary.Read(r, binary.BigEndian, &meta.CommitTS); err != nil {
+			return TxnMeta{}, errors.WithStack(err)
+		}
+	}
+	return meta, nil
 }
 
 type txnLock struct {
