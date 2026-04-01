@@ -1,13 +1,12 @@
 package kv
 
 import (
-	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestEncodeTxnMetaOmitsCommitTSForPrepareMeta(t *testing.T) {
+func TestEncodeTxnMetaDefaultsToV1ForRollingUpgradeSafety(t *testing.T) {
 	t.Parallel()
 
 	meta := TxnMeta{
@@ -16,7 +15,24 @@ func TestEncodeTxnMetaOmitsCommitTSForPrepareMeta(t *testing.T) {
 	}
 	encoded := EncodeTxnMeta(meta)
 
-	require.Equal(t, txnMetaVersion, encoded[0])
+	require.Equal(t, txnMetaVersionV1, encoded[0])
+	require.Len(t, encoded, 1+uint64FieldSize+uint64FieldSize+uint64FieldSize+len(meta.PrimaryKey))
+
+	decoded, err := DecodeTxnMeta(encoded)
+	require.NoError(t, err)
+	require.Equal(t, meta, decoded)
+}
+
+func TestEncodeTxnMetaV2OmitsCommitTSForPrepareMeta(t *testing.T) {
+	t.Parallel()
+
+	meta := TxnMeta{
+		PrimaryKey: []byte("pk"),
+		LockTTLms:  defaultTxnLockTTLms,
+	}
+	encoded := encodeTxnMetaV2(meta)
+
+	require.Equal(t, txnMetaVersionV2, encoded[0])
 	require.Equal(t, txnMetaFlagLockTTL, encoded[1])
 	require.Len(t, encoded, 1+1+uint64FieldSize+len(meta.PrimaryKey)+uint64FieldSize)
 
@@ -25,16 +41,16 @@ func TestEncodeTxnMetaOmitsCommitTSForPrepareMeta(t *testing.T) {
 	require.Equal(t, meta, decoded)
 }
 
-func TestEncodeTxnMetaOmitsLockTTLForCommitMeta(t *testing.T) {
+func TestEncodeTxnMetaV2OmitsLockTTLForCommitMeta(t *testing.T) {
 	t.Parallel()
 
 	meta := TxnMeta{
 		PrimaryKey: []byte("pk"),
 		CommitTS:   42,
 	}
-	encoded := EncodeTxnMeta(meta)
+	encoded := encodeTxnMetaV2(meta)
 
-	require.Equal(t, txnMetaVersion, encoded[0])
+	require.Equal(t, txnMetaVersionV2, encoded[0])
 	require.Equal(t, txnMetaFlagCommitTS, encoded[1])
 	require.Len(t, encoded, 1+1+uint64FieldSize+len(meta.PrimaryKey)+uint64FieldSize)
 
@@ -52,20 +68,9 @@ func TestDecodeTxnMetaV1Compatibility(t *testing.T) {
 		CommitTS:   21,
 	}
 
-	encoded := encodeTxnMetaV1ForTest(meta)
+	encoded := encodeTxnMetaV1(meta)
 
 	decoded, err := DecodeTxnMeta(encoded)
 	require.NoError(t, err)
 	require.Equal(t, meta, decoded)
-}
-
-func encodeTxnMetaV1ForTest(m TxnMeta) []byte {
-	size := 1 + uint64FieldSize + uint64FieldSize + uint64FieldSize + len(m.PrimaryKey)
-	b := make([]byte, size)
-	b[0] = txnMetaVersionV1
-	binary.BigEndian.PutUint64(b[1:], m.LockTTLms)
-	binary.BigEndian.PutUint64(b[9:], m.CommitTS)
-	binary.BigEndian.PutUint64(b[17:], uint64(len(m.PrimaryKey)))
-	copy(b[25:], m.PrimaryKey)
-	return b
 }
