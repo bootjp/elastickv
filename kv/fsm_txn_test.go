@@ -67,6 +67,176 @@ func TestTxnDuplicateMutations_LastWriteWins(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(13)
+	commitTS := uint64(23)
+	key := []byte("k")
+
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: key},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+
+	value, err := st.GetAt(ctx, key, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), value)
+
+	_, err = st.GetAt(ctx, txnLockKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnIntentKey(key), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	commitRecord, err := st.GetAt(ctx, txnCommitKey(key, startTS), ^uint64(0))
+	require.NoError(t, err)
+	gotCommitTS, err := decodeTxnCommitRecord(commitRecord)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, gotCommitTS)
+}
+
+func TestCommitIsIdempotentOnSecondaryShardWhenKeyAlreadyCommitted(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(15)
+	commitTS := uint64(25)
+	primaryKey := []byte("p") // lives on another shard; no txnCommitKey here
+	userKey := []byte("k")
+
+	// PREPARE: write lock and intent for userKey.
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: userKey, Value: []byte("v")},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+
+	// Simulate a partial commit: the data key is written at commitTS but the
+	// txn lock/intent are still present (inconsistent state that the
+	// secondary-shard idempotency check must handle).
+	require.NoError(t, st.PutAt(ctx, userKey, []byte("v"), commitTS, 0))
+
+	// COMMIT on this secondary shard (no txnCommitKey for primaryKey here).
+	// Without the secondary-shard LatestCommitTS check this would fail with a
+	// write-conflict error because userKey@commitTS > startTS.
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: userKey},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+
+	// The committed value should still be readable.
+	v, err := st.GetAt(ctx, userKey, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), v)
+
+	// The lock and intent should be cleaned up.
+	_, err = st.GetAt(ctx, txnLockKey(userKey), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnIntentKey(userKey), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestCommitPropagatesSecondaryShardLatestCommitTSError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	underlying := store.NewMVCCStore()
+	userKey := []byte("k")
+	startTS := uint64(16)
+	commitTS := uint64(26)
+	primaryKey := []byte("p") // no txnCommitKey in store → secondary-shard path
+
+	// Set up a PREPARED state directly in the underlying store.
+	lockVal := encodeTxnLock(txnLock{StartTS: startTS, PrimaryKey: primaryKey})
+	require.NoError(t, underlying.PutAt(ctx, txnLockKey(userKey), lockVal, startTS, 0))
+	intentVal := encodeTxnIntent(txnIntent{StartTS: startTS, Op: txnIntentOpPut, Value: []byte("v")})
+	require.NoError(t, underlying.PutAt(ctx, txnIntentKey(userKey), intentVal, startTS, 0))
+
+	// Write a conflicting version that will cause ApplyMutations to return a
+	// write-conflict, triggering the LatestCommitTS fallback path.
+	require.NoError(t, underlying.PutAt(ctx, userKey, []byte("other"), commitTS+1, 0))
+
+	errorStore := erroringLatestCommitStore{MVCCStore: underlying, key: userKey}
+	fsm, ok := NewKvFSM(errorStore).(*kvFSM)
+	require.True(t, ok)
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: userKey},
+		},
+	}
+	err := applyFSMRequest(t, fsm, commit)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTestLatestCommitTS)
+}
+
+func TestCommitRejectsMissingPrimaryKey(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(12)
+	commitTS := uint64(22)
+	key := []byte("k")
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: nil, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: key},
+		},
+	}
+	err := applyFSMRequest(t, fsm, commit)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
+}
+
 func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 	t.Parallel()
 

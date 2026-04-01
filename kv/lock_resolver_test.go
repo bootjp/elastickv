@@ -103,6 +103,41 @@ func TestLockResolver_ResolvesExpiredCommittedLock(t *testing.T) {
 	require.Equal(t, "v2", string(v))
 }
 
+func TestLockResolver_ResolvesExpiredCommittedPrimaryLock(t *testing.T) {
+	t.Parallel()
+
+	lr, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS := uint64(11)
+	commitTS := uint64(21)
+	primaryKey := []byte("b") // group 1
+
+	prepareLock(t, groups[1], startTS, primaryKey, primaryKey, []byte("v1"), 60_000)
+	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
+
+	// Recreate the leaked-primary-lock state: the commit record exists, but the
+	// primary lock is still visible and already expired.
+	staleLock := encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		TTLExpireAt:  1,
+		PrimaryKey:   primaryKey,
+		IsPrimaryKey: true,
+	})
+	require.NoError(t, groups[1].Store.PutAt(ctx, txnLockKey(primaryKey), staleLock, commitTS, 0))
+
+	err := lr.resolveGroupLocks(ctx, 1, groups[1])
+	require.NoError(t, err)
+
+	_, err = groups[1].Store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	v, err := ss.GetAt(ctx, primaryKey, commitTS)
+	require.NoError(t, err)
+	require.Equal(t, "v1", string(v))
+}
+
 func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	t.Parallel()
 
