@@ -229,8 +229,14 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 
 func needsTxnCleanup(reqs []*pb.Request) bool {
 	for _, req := range reqs {
-		if req != nil && req.IsTxn && req.Phase != pb.Phase_NONE {
+		if req == nil || !req.IsTxn {
+			continue
+		}
+		switch req.Phase {
+		case pb.Phase_PREPARE, pb.Phase_COMMIT:
 			return true
+		case pb.Phase_NONE, pb.Phase_ABORT:
+			continue
 		}
 	}
 	return false
