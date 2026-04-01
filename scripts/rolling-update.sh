@@ -35,6 +35,9 @@ Optional environment:
   S3_PORT
   S3_REGION
   S3_CREDENTIALS_FILE
+    Path to an S3 credentials file on each target host. This file must already
+    exist and be readable on every remote node; it will be bind-mounted into
+    the container at the same path.
   S3_PATH_STYLE_ONLY
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS

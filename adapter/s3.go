@@ -372,7 +372,11 @@ func (s *S3Server) resolveAuth(r *http.Request, bucket string) *s3AuthError {
 	}
 	// Check if the bucket is public-read and the request is read-only.
 	if isReadOnlyS3Request(r) {
-		meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, s.readTS())
+		readTS := s.readTS()
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
 		if err == nil && isPublicReadBucket(meta) {
 			return nil
 		}
