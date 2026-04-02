@@ -1983,6 +1983,8 @@ func TestIsReadOnlyS3Request(t *testing.T) {
 		{"GetBucket_NoListType", http.MethodGet, "/bucket", false},
 		// Not allowed: object GET with extra query params.
 		{"GetObject_WithQuery", http.MethodGet, "/bucket/key.txt?versionId=xyz", false},
+		// Allowed: HeadBucket with "location" query param.
+		{"HeadBucket_WithLocation", http.MethodHead, "/bucket?location", true},
 		// Not allowed: ACL / multipart subresources.
 		{"GetAcl", http.MethodGet, "/bucket?acl", false},
 		{"ListMultipart", http.MethodGet, "/bucket?uploads", false},
