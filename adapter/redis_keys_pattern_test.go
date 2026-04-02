@@ -11,7 +11,8 @@ import (
 )
 
 type stubAdapterCoordinator struct {
-	clock *kv.HLC
+	clock           *kv.HLC
+	verifyLeaderErr error
 }
 
 func (s *stubAdapterCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -23,7 +24,7 @@ func (s *stubAdapterCoordinator) IsLeader() bool {
 }
 
 func (s *stubAdapterCoordinator) VerifyLeader() error {
-	return nil
+	return s.verifyLeaderErr
 }
 
 func (s *stubAdapterCoordinator) RaftLeader() raft.ServerAddress {
