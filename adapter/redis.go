@@ -455,7 +455,10 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	switch {
 	case r.requestObserver != nil:
-		metricsConn := redisMetricsConnPool.Get().(*redisMetricsConn)
+		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)
+		if metricsConn == nil {
+			metricsConn = &redisMetricsConn{}
+		}
 		metricsConn.reset(conn)
 		if r.traceCommands {
 			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
