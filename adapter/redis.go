@@ -842,7 +842,15 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
-	key := cmd.Args[1]
+	for attempts := 0; attempts < 2; attempts++ {
+		if !r.tryGet(conn, cmd.Args[1]) {
+			return
+		}
+	}
+	conn.WriteError(raft.ErrNotLeader.Error())
+}
+
+func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
 	isLeader := r.coordinator.IsLeaderForKey(key)
 	readTS := r.readTS()
 	ctx := context.Background()
@@ -855,23 +863,26 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		var err error
 		readTS, err = r.linearizableReadTSForKey(ctx, key)
 		if err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				return true
+			}
 			conn.WriteError(err.Error())
-			return
+			return false
 		}
 	}
 
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
-		return
+		return false
 	}
 	if typ == redisTypeNone {
 		r.getHandleNone(conn, key, isLeader)
-		return
+		return false
 	}
 	if typ != redisTypeString {
 		conn.WriteError(wrongTypeMessage)
-		return
+		return false
 	}
 
 	var v []byte
@@ -883,15 +894,19 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		v, err = r.readValueAt(key, 0)
 	}
 	if err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return true
+		}
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
 		} else {
 			conn.WriteError(err.Error())
 		}
-		return
+		return false
 	}
 
 	conn.WriteBulk(v)
+	return false
 }
 
 // getHandleNone handles GET when the local type check returns none.
@@ -1071,6 +1086,18 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 		defer cancel()
 
 		if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				keys, proxyErr := r.proxyKeys(pattern)
+				if proxyErr != nil {
+					conn.WriteError(proxyErr.Error())
+					return
+				}
+				conn.WriteArray(len(keys))
+				for _, k := range keys {
+					conn.WriteBulkString(k)
+				}
+				return
+			}
 			conn.WriteError(err.Error())
 			return
 		}
@@ -2214,8 +2241,20 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
+	for attempts := 0; attempts < 2; attempts++ {
+		values, retry, err := r.rangeListOnce(key, startRaw, endRaw)
+		if retry {
+			continue
+		}
+		return values, err
+	}
+	return nil, errors.WithStack(raft.ErrNotLeader)
+}
+
+func (r *RedisServer) rangeListOnce(key []byte, startRaw, endRaw []byte) ([]string, bool, error) {
 	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
+		values, err := r.proxyLRange(key, startRaw, endRaw)
+		return values, false, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
@@ -2223,34 +2262,38 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 
 	readTS, err := r.linearizableReadTSForKey(ctx, key)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, raft.ErrNotLeader) {
+			return nil, true, nil
+		}
+		return nil, false, err
 	}
 
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if typ == redisTypeNone {
-		return []string{}, nil
+		return []string{}, false, nil
 	}
 	if typ != redisTypeList {
-		return nil, wrongTypeError()
+		return nil, false, wrongTypeError()
 	}
 
 	meta, exists, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !exists || meta.Len == 0 {
-		return []string{}, nil
+		return []string{}, false, nil
 	}
 
 	s, e, err := parseRangeBounds(startRaw, endRaw, int(meta.Len))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
+	values, err := r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
+	return values, false, err
 }
 
 func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
@@ -2396,6 +2439,9 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 		var err error
 		readTS, err = r.linearizableReadTSForKey(ctx, key)
 		if err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				return r.tryLeaderGetAt(key, 0)
+			}
 			return nil, err
 		}
 	} else if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/hashicorp/raft"
 	"github.com/tidwall/redcon"
 )
 
@@ -418,6 +419,15 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 	defer cancel()
 
 	if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			size, proxyErr := r.proxyDBSize()
+			if proxyErr != nil {
+				conn.WriteError(proxyErr.Error())
+				return
+			}
+			conn.WriteInt(size)
+			return
+		}
 		conn.WriteError(err.Error())
 		return
 	}

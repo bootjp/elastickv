@@ -39,7 +39,9 @@ func shutdown(nodes []Node) {
 			n.dynamoServer.Stop()
 		}
 		if n.raft != nil {
-			n.raft.Shutdown()
+			kv.UnregisterRaftAppliedIndexWaiter(n.raft)
+			kv.UnregisterRaftLeaderVerifier(n.raft)
+			_ = n.raft.Shutdown().Error()
 		}
 		if n.tm != nil {
 			if err := n.tm.Close(); err != nil {

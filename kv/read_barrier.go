@@ -48,6 +48,9 @@ func linearizableReadIndexWithWaiter(ctx context.Context, r linearizableRaft, wa
 	if err := waitForLinearizableReadIndex(ctx, r, waiter, target); err != nil {
 		return 0, errors.WithStack(err)
 	}
+	if r.State() != raft.Leader {
+		return 0, errors.WithStack(raft.ErrNotLeader)
+	}
 	return target, nil
 }
 
@@ -85,16 +88,20 @@ func waitForBootstrapAppliedIndex(ctx context.Context, r linearizableRaft, waite
 		if hasReachedTarget(waiter, target) {
 			return nil
 		}
+		if r.State() != raft.Leader {
+			return errors.WithStack(raft.ErrNotLeader)
+		}
 
-		if waiter == nil || waiter.AppliedIndex() == 0 {
-			if bootstrapReadReady(r.Stats(), target) {
-				stableBootstrapReads++
-				if stableBootstrapReads >= linearizableReadStableBootstrapChecks {
-					return nil
+		if bootstrapReadReady(r.Stats(), target) {
+			stableBootstrapReads++
+			if stableBootstrapReads >= linearizableReadStableBootstrapChecks {
+				if r.State() != raft.Leader {
+					return errors.WithStack(raft.ErrNotLeader)
 				}
-			} else {
-				stableBootstrapReads = 0
+				return nil
 			}
+		} else {
+			stableBootstrapReads = 0
 		}
 
 		select {

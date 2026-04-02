@@ -46,6 +46,10 @@ func (f *fakeLinearizableRaft) State() raft.RaftState {
 	return raft.RaftState(f.state.Load())
 }
 
+func (f *fakeLinearizableRaft) setState(state raft.RaftState) {
+	f.state.Store(uint32(state))
+}
+
 func (f *fakeLinearizableRaft) CommitIndex() uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -69,6 +73,16 @@ func (f *fakeLinearizableRaft) Stats() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func (f *fakeLinearizableRaft) setStats(stats map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.stats = make(map[string]string, len(stats))
+	for k, v := range stats {
+		f.stats[k] = v
+	}
 }
 
 func (f *fakeLinearizableRaft) verifyCalls() int64 {
@@ -121,6 +135,23 @@ func TestLinearizableReadIndexWithWaiterWaitsForFSMApply(t *testing.T) {
 	require.Equal(t, int64(1), r.verifyCalls())
 }
 
+func TestLinearizableReadIndexWithWaiterUsesBootstrapFallbackBeforeFirstFSMApply(t *testing.T) {
+	t.Parallel()
+
+	r := newFakeLinearizableRaft(raft.Leader, 7, map[string]string{
+		"applied_index": "7",
+		"fsm_pending":   "0",
+	})
+	waiter := newAppliedIndexTracker()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	index, err := linearizableReadIndexWithWaiter(ctx, r, waiter)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), index)
+}
+
 func TestLinearizableReadIndexWithWaiterUsesBootstrapFallback(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +178,28 @@ func TestLinearizableReadIndexWithWaiterRejectsFollowers(t *testing.T) {
 	require.Equal(t, int64(0), r.verifyCalls())
 }
 
+func TestLinearizableReadIndexWithWaiterRejectsLeaderLossAfterTrackedWait(t *testing.T) {
+	t.Parallel()
+
+	r := newFakeLinearizableRaft(raft.Leader, 7, map[string]string{
+		"applied_index": "7",
+		"fsm_pending":   "1",
+	})
+	waiter := newAppliedIndexTracker()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		r.setState(raft.Follower)
+		waiter.markAppliedIndex(7)
+	}()
+
+	_, err := linearizableReadIndexWithWaiter(ctx, r, waiter)
+	require.ErrorIs(t, err, raft.ErrNotLeader)
+}
+
 func TestLinearizableReadIndexWithWaiterRejectsInvalidBootstrapStats(t *testing.T) {
 	t.Parallel()
 
@@ -161,4 +214,28 @@ func TestLinearizableReadIndexWithWaiterRejectsInvalidBootstrapStats(t *testing.
 	_, err := linearizableReadIndexWithWaiter(ctx, r, nil)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
+}
+
+func TestLinearizableReadIndexWithWaiterRejectsLeaderLossDuringBootstrapWait(t *testing.T) {
+	t.Parallel()
+
+	r := newFakeLinearizableRaft(raft.Leader, 11, map[string]string{
+		"applied_index": "0",
+		"fsm_pending":   "1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		r.setState(raft.Follower)
+		r.setStats(map[string]string{
+			"applied_index": "11",
+			"fsm_pending":   "0",
+		})
+	}()
+
+	_, err := linearizableReadIndexWithWaiter(ctx, r, nil)
+	require.ErrorIs(t, err, raft.ErrNotLeader)
 }

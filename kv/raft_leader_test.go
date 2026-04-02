@@ -158,3 +158,12 @@ func TestRaftLeaderVerifyCache_UnregisterRemovesState(t *testing.T) {
 	_, ok = cache.states.Load(r)
 	require.False(t, ok)
 }
+
+func TestRaftLeaderVerifyCache_IsFreshRejectsFutureTimestamp(t *testing.T) {
+	t.Parallel()
+
+	cache := newRaftLeaderVerifyCache(time.Minute)
+	future := time.Now().Add(time.Minute).UnixNano()
+
+	require.False(t, cache.isFresh(future))
+}

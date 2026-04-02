@@ -118,5 +118,9 @@ func (c *raftLeaderVerifyCache) isFresh(verifiedAt int64) bool {
 	if c == nil || c.ttl <= 0 || verifiedAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, verifiedAt)) < c.ttl
+	now := time.Now().UnixNano()
+	if now < verifiedAt {
+		return false
+	}
+	return now-verifiedAt < c.ttl.Nanoseconds()
 }

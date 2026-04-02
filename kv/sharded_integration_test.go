@@ -56,7 +56,8 @@ func newSingleRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 
 	return r, func() {
 		UnregisterRaftAppliedIndexWaiter(r)
-		r.Shutdown()
+		UnregisterRaftLeaderVerifier(r)
+		_ = r.Shutdown().Error()
 	}
 }
 
