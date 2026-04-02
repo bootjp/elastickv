@@ -1947,7 +1947,7 @@ func TestS3Server_PutBucketAcl_RejectsXMLBody(t *testing.T) {
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	// PutBucketAcl with XML body — must be rejected with NotImplemented.
+	// PutBucketAcl with XML body and explicit ContentLength — must be rejected.
 	xmlBody := `<AccessControlPolicy><Owner><ID>owner</ID></Owner></AccessControlPolicy>`
 	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
 	req.ContentLength = int64(len(xmlBody))
@@ -1955,6 +1955,20 @@ func TestS3Server_PutBucketAcl_RejectsXMLBody(t *testing.T) {
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	signer := v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
 	err := signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
+	}, req, payloadHash, "s3", testS3Region, sigTime)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+
+	// PutBucketAcl with chunked body (ContentLength == -1) — must also be rejected.
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
+	req.ContentLength = -1 // simulate chunked transfer encoding
+	payloadHash = sha256Hex(xmlBody)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	signer = v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	err = signer.SignHTTP(context.Background(), aws.Credentials{
 		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
 	}, req, payloadHash, "s3", testS3Region, sigTime)
 	require.NoError(t, err)

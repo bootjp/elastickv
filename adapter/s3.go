@@ -695,7 +695,16 @@ func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 
 func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
 	// ACL specification via XML body is not supported; only the x-amz-acl header is accepted.
-	if r.ContentLength > 0 {
+	// Detect a body via ContentLength, and also peek for chunked-encoded bodies (ContentLength == -1).
+	hasBody := r.ContentLength > 0
+	if !hasBody && r.ContentLength < 0 && r.Body != nil {
+		buf := make([]byte, 1)
+		n, readErr := r.Body.Read(buf)
+		if n > 0 || (readErr != nil && !errors.Is(readErr, io.EOF)) {
+			hasBody = true
+		}
+	}
+	if hasBody {
 		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "ACL specification via XML body is not supported; use the x-amz-acl header", bucket, "")
 		return
 	}
@@ -2645,18 +2654,11 @@ func isReadOnlyS3Request(r *http.Request) bool {
 		return false
 	}
 
-	// Parse path to distinguish bucket-level vs object-level operations.
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" {
+	// Use parseS3Path for consistent path parsing (EscapedPath + PathUnescape) matching handle().
+	bucket, _, hasObject, err := parseS3Path(r)
+	if err != nil || bucket == "" {
 		return false
 	}
-
-	// Split into at most three segments: ["bucket"], ["bucket", ""], or ["bucket", "key..."].
-	parts := strings.SplitN(path, "/", 3)
-	if parts[0] == "" {
-		return false
-	}
-	hasObject := len(parts) >= 2 && parts[1] != ""
 
 	if hasObject {
 		// Object-level operations: only plain GetObject / HeadObject (no extra query params).
