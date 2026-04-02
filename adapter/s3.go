@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
 	"crypto/rand"
@@ -700,7 +701,12 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	if !hasBody && r.ContentLength < 0 && r.Body != nil {
 		buf := make([]byte, 1)
 		n, readErr := r.Body.Read(buf)
-		if n > 0 || (readErr != nil && !errors.Is(readErr, io.EOF)) {
+		if n > 0 {
+			hasBody = true
+			// Restore the peeked byte so the body is not corrupted for any downstream use.
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+		} else if readErr != nil && !errors.Is(readErr, io.EOF) {
+			// Conservatively treat unexpected read errors as if a body is present.
 			hasBody = true
 		}
 	}
