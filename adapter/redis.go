@@ -495,6 +495,7 @@ func (r *RedisServer) Run() error {
 				state.queue = append(state.queue, cloneCommand(cmd))
 				r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
 				conn.WriteString("QUEUED")
+				r.observeRedisSuccess(name, time.Since(start))
 				return
 			}
 
@@ -726,6 +727,17 @@ func (r *RedisServer) observeRedisError(command string, dur time.Duration) {
 	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
 		Command:  command,
 		IsError:  true,
+		Duration: dur,
+	})
+}
+
+func (r *RedisServer) observeRedisSuccess(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:  command,
+		IsError:  false,
 		Duration: dur,
 	})
 }
