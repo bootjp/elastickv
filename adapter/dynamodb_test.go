@@ -237,6 +237,53 @@ func TestDynamoDB_Healthz(t *testing.T) {
 	require.Equal(t, "ok\n", string(body))
 }
 
+func TestDynamoDB_LeaderHealthz(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 2)
+	defer shutdown(nodes)
+
+	cases := []struct {
+		name   string
+		addr   string
+		status int
+		body   string
+	}{
+		{
+			name:   "leader",
+			addr:   nodes[0].dynamoAddress,
+			status: http.StatusOK,
+			body:   "ok\n",
+		},
+		{
+			name:   "follower",
+			addr:   nodes[1].dynamoAddress,
+			status: http.StatusServiceUnavailable,
+			body:   "not leader\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://"+tc.addr+dynamoLeaderHealthPath,
+				nil,
+			)
+			require.NoError(t, err)
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			require.Equal(t, tc.status, resp.StatusCode)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, tc.body, string(body))
+		})
+	}
+}
+
 func TestDynamoDB_PutItem_RequestBodyTooLarge(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)

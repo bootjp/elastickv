@@ -26,7 +26,7 @@ The design goal is S3 compatibility, not full AWS parity. The adapter should be 
 ### 2.2 Non-goals
 
 1. Full AWS S3 feature parity.
-2. IAM, STS, ACLs, bucket policies, or cross-account authorization.
+2. IAM, STS, bucket policies, or cross-account authorization. (Bucket-level canned ACLs `private`/`public-read` are supported — see `docs/s3_public_bucket_design.md`.)
 3. Public S3 object versioning APIs in the first milestone.
 4. Lifecycle rules, replication, object lock, event notifications, website hosting, or SSE-KMS.
 5. Zero-copy `CopyObject` in the first milestone.
@@ -51,6 +51,8 @@ Initial compatibility should focus on the APIs most clients actually need:
 | `CompleteMultipartUpload` | 2 |
 | `AbortMultipartUpload` | 2 |
 | `ListParts` | 2, optional but recommended |
+| `PutBucketAcl` | Implemented (`private`, `public-read`) |
+| `GetBucketAcl` | Implemented |
 | `CopyObject` | 3 |
 | Versioning APIs | Later |
 | Presigned URLs | 2 |
@@ -359,15 +361,15 @@ Milestone 1 should support a narrow, explicit security model:
 1. AWS Signature Version 4 request signing
 2. Static access-key and secret-key pairs from local configuration
 3. Optional fixed region from server configuration
+4. Bucket-level canned ACLs (`private`, `public-read`) via `PutBucketAcl` / `GetBucketAcl` and `x-amz-acl` header on `CreateBucket`. Public buckets allow anonymous read access (GetObject, HeadObject, ListObjectsV2) while write operations always require authentication. See `docs/s3_public_bucket_design.md` for details.
 
 Not in scope for Milestone 1:
 
 1. IAM policies
-2. ACLs
+2. Object-level ACLs or bucket policies (JSON)
 3. Temporary credentials
-4. Anonymous access
 
-The server should reject headers and APIs that imply unsupported policy or ACL behavior instead of silently pretending to support them.
+The server should reject headers and APIs that imply unsupported policy behavior instead of silently pretending to support them.
 
 ## 10. Failure Handling and Cleanup
 

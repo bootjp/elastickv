@@ -17,6 +17,7 @@ Use private VM IPs for all bind addresses and lock down network access because g
 - 1 node = 1 VM
 - Total nodes: 4 or 5
 - VMs must be able to reach each other over TCP (at minimum `50051/tcp`)
+- S3-compatible API clients must be able to reach `9000/tcp` on each node
 - Prometheus must be able to reach each node's metrics endpoint if you want centralized monitoring (`9090/tcp` in the examples below)
 - Docker Engine installed on every VM
 
@@ -47,7 +48,7 @@ These examples prioritize operational clarity, not hardening. Treat them as base
 
 - Mandatory isolation: do not expose any Elastickv cluster port to the public Internet or to shared/multi-tenant networks.
 - Restrict inbound sources with firewall/security groups/NACLs so only Elastickv nodes and tightly controlled admin hosts can connect.
-- Endpoints are unauthenticated and plaintext by default: gRPC (including `RaftAdmin`), Redis API, and DynamoDB-compatible API.
+- All endpoints use plaintext transport (no TLS) and are unauthenticated by default: gRPC (including `RaftAdmin`), Redis API, DynamoDB-compatible API, and S3-compatible API. The S3-compatible API remains plaintext HTTP even when `--s3CredentialsFile` is configured; that option only enables SigV4 authentication. Buckets marked as `public-read` (via `PutBucketAcl` or `x-amz-acl` header on `CreateBucket`) allow unauthenticated read access (GetObject, HeadObject, ListObjectsV2) even when credentials are configured.
 - Any principal with network access to these ports can read/modify data and reconfigure cluster membership.
 - Run Elastickv on dedicated private subnets/VPCs for the cluster, without direct Internet routing and without cross-tenant sharing.
 - Enforce network segmentation and, where possible, add TLS/mTLS and authentication via Elastickv features or a trusted terminating proxy/service mesh.
@@ -67,8 +68,8 @@ sudo mkdir -p /var/lib/elastickv
 
 ## 3) Define Shared Cluster Variables
 
-`RAFT_TO_REDIS_MAP` is only for Redis leader routing.  
-It is not used for Raft transport membership.
+`RAFT_TO_REDIS_MAP` and `RAFT_TO_S3_MAP` are for Redis/S3 leader routing only.
+They are not used for Raft transport membership.
 
 Raft node-to-node communication uses `--address` (gRPC transport).
 
@@ -76,6 +77,12 @@ Shared `RAFT_TO_REDIS_MAP` (5-node example):
 
 ```bash
 RAFT_TO_REDIS_MAP="10.0.0.11:50051=10.0.0.11:6379,10.0.0.12:50051=10.0.0.12:6379,10.0.0.13:50051=10.0.0.13:6379,10.0.0.14:50051=10.0.0.14:6379,10.0.0.15:50051=10.0.0.15:6379"
+```
+
+Shared `RAFT_TO_S3_MAP` (5-node example):
+
+```bash
+RAFT_TO_S3_MAP="10.0.0.11:50051=10.0.0.11:9000,10.0.0.12:50051=10.0.0.12:9000,10.0.0.13:50051=10.0.0.13:9000,10.0.0.14:50051=10.0.0.14:9000,10.0.0.15:50051=10.0.0.15:9000"
 ```
 
 Shared fixed bootstrap voters (5-node example):
@@ -90,7 +97,7 @@ Shared metrics bearer token (required because the examples bind `--metricsAddres
 ELASTICKV_METRICS_TOKEN="$(openssl rand -hex 32)"
 ```
 
-For a 4-node cluster, remove the `n5` entry from both variables.
+For a 4-node cluster, remove the n5 entry from RAFT_TO_REDIS_MAP, RAFT_TO_S3_MAP, and RAFT_BOOTSTRAP_MEMBERS.
 
 ## 4) Start Nodes with `docker run`
 
@@ -98,7 +105,7 @@ This guide uses `--network host` and explicit VM private IPs.
 
 Binding guidance:
 
-- Set `--address`, `--redisAddress`, and `--dynamoAddress` to the VM private IP.
+- Set `--address`, `--redisAddress`, `--dynamoAddress`, and `--s3Address` to the VM private IP.
 - Set `--metricsAddress` to the VM private IP if Prometheus scrapes from another host.
 - Set `--metricsToken` to the same shared bearer token on every node whenever `--metricsAddress` is non-loopback.
 - Do not use `0.0.0.0` as the advertised address.
@@ -118,11 +125,15 @@ docker run -d \
   --address "10.0.0.11:50051" \
   --redisAddress "10.0.0.11:6379" \
   --dynamoAddress "10.0.0.11:8000" \
+  --s3Address "10.0.0.11:9000" \
+  --s3Region "us-east-1" \
+  --s3PathStyleOnly=true \
   --metricsAddress "10.0.0.11:9090" \
   --metricsToken "${ELASTICKV_METRICS_TOKEN}" \
   --raftId "n1" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
+  --raftS3Map "${RAFT_TO_S3_MAP}" \
   --raftBootstrapMembers "${RAFT_BOOTSTRAP_MEMBERS}" \
   --raftBootstrap
 ```
@@ -141,11 +152,15 @@ docker run -d \
   --address "10.0.0.12:50051" \
   --redisAddress "10.0.0.12:6379" \
   --dynamoAddress "10.0.0.12:8000" \
+  --s3Address "10.0.0.12:9000" \
+  --s3Region "us-east-1" \
+  --s3PathStyleOnly=true \
   --metricsAddress "10.0.0.12:9090" \
   --metricsToken "${ELASTICKV_METRICS_TOKEN}" \
   --raftId "n2" \
   --raftDataDir "/var/lib/elastickv" \
   --raftRedisMap "${RAFT_TO_REDIS_MAP}" \
+  --raftS3Map "${RAFT_TO_S3_MAP}" \
   --raftBootstrapMembers "${RAFT_BOOTSTRAP_MEMBERS}" \
   --raftBootstrap
 ```
@@ -155,6 +170,7 @@ Start `n3` to `n5` the same way by replacing:
 - `--address`
 - `--redisAddress`
 - `--dynamoAddress`
+- `--s3Address`
 - `--metricsAddress`
 - `--raftId`
 
