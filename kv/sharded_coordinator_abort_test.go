@@ -101,5 +101,5 @@ func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
 		keys: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("pk")}},
 	}}, 20)
 
-	require.NotContains(t, buf.String(), "txn abort failed; locks may remain until TTL expiry")
+	require.Empty(t, buf.String())
 }
