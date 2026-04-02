@@ -342,7 +342,13 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if commitTS <= startTS {
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
-
+	if len(meta.PrimaryKey) == 0 {
+		return errors.WithStack(ErrTxnPrimaryKeyRequired)
+	}
+	applyStartTS, err := f.commitApplyStartTS(ctx, meta.PrimaryKey, startTS, commitTS)
+	if err != nil {
+		return err
+	}
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
@@ -351,11 +357,65 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, startTS, commitTS))
+	return f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS)
+}
+
+// commitApplyStartTS resolves the startTS to use for MVCC conflict detection
+// during a COMMIT. If a commit record already exists for the primary key it
+// returns commitTS (making the apply idempotent); otherwise it returns startTS.
+func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, startTS, commitTS uint64) (uint64, error) {
+	recordedCommitTS, committed, err := f.txnCommitTS(ctx, primaryKey, startTS)
+	if err != nil {
+		return 0, err
+	}
+	if !committed {
+		return startTS, nil
+	}
+	if recordedCommitTS != commitTS {
+		return 0, errors.Wrapf(
+			ErrTxnInvalidMeta,
+			"commit_ts mismatch for primary key %s: recordedCommitTS=%d requestedCommitTS=%d startTS=%d",
+			string(primaryKey), recordedCommitTS, commitTS, startTS,
+		)
+	}
+	// Commit record exists — use commitTS so stale artifacts can be cleaned up
+	// without triggering a write-conflict.
+	return commitTS, nil
+}
+
+// applyCommitWithIdempotencyFallback applies storeMuts at (applyStartTS,
+// commitTS). If the apply fails with a write-conflict and any of the target
+// keys already has a committed version at or beyond commitTS, the conflict is
+// treated as an idempotent secondary-shard retry and the apply is retried with
+// commitTS as the conflict-check baseline.
+//
+// The secondary-shard LatestCommitTS scan is intentionally deferred to the
+// write-conflict path so the hot (first-time) commit path pays no extra cost.
+func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
+	err := f.store.ApplyMutations(ctx, storeMuts, applyStartTS, commitTS)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, store.ErrWriteConflict) {
+		return errors.WithStack(err)
+	}
+	// Write-conflict: scan mutations one by one and return as soon as we find
+	// a key that is already committed at or beyond commitTS — this indicates an
+	// idempotent secondary-shard retry (txnCommitKey lives on the primary
+	// shard, not here).  Retry with commitTS as the conflict-check baseline.
+	for _, mut := range uniq {
+		latestTS, exists, lErr := f.store.LatestCommitTS(ctx, mut.Key)
+		if lErr != nil {
+			return errors.WithStack(lErr)
+		}
+		if exists && latestTS >= commitTS {
+			return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, commitTS, commitTS))
+		}
+	}
+	return errors.WithStack(err)
 }
 
 func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS uint64) error {
@@ -484,6 +544,21 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 		Value: encodeTxnRollbackRecord(),
 	})
 	return nil
+}
+
+func (f *kvFSM) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint64) (uint64, bool, error) {
+	b, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	commitTS, derr := decodeTxnCommitRecord(b)
+	if derr != nil {
+		return 0, false, errors.WithStack(derr)
+	}
+	return commitTS, true, nil
 }
 
 func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

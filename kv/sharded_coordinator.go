@@ -36,6 +36,7 @@ type ShardedCoordinator struct {
 	defaultGroup uint64
 	clock        *HLC
 	store        store.MVCCStore
+	log          *slog.Logger
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
@@ -52,6 +53,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		defaultGroup: defaultGroup,
 		clock:        clock,
 		store:        st,
+		log:          slog.Default(),
 	}
 }
 
@@ -103,15 +105,13 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(startTS)
-	} else {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
+	commitTS, err = c.resolveTxnCommitTS(startTS, commitTS)
+	if err != nil {
+		return nil, err
 	}
-	if commitTS == 0 || commitTS <= startTS {
-		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+
+	if len(gids) == 1 {
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
 	}
 
 	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
@@ -127,6 +127,37 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 
 	maxIndex = c.commitSecondaryTxns(startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+}
+
+func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
+	if commitTS == 0 {
+		commitTS = c.nextTxnTSAfter(startTS)
+	} else {
+		// Observe caller-provided commitTS to keep the HLC monotonic; without
+		// this the clock could later issue timestamps smaller than commitTS.
+		c.clock.Observe(commitTS)
+	}
+	if commitTS == 0 || commitTS <= startTS {
+		return 0, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	return commitTS, nil
+}
+
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+	g, err := c.txnGroupForID(gid)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.Txn.Commit([]*pb.Request{
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems),
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if resp == nil {
+		return &CoordinateResponse{}, nil
+	}
+	return &CoordinateResponse{CommitIndex: resp.CommitIndex}, nil
 }
 
 type preparedGroup struct {
@@ -211,7 +242,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 		}
 		r, err := commitSecondaryWithRetry(g, req)
 		if err != nil {
-			slog.Warn("txn secondary commit failed",
+			c.log.Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
@@ -266,7 +297,10 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			Mutations: append([]*pb.Mutation{meta}, pg.keys...),
 		}
 		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
-			slog.Warn("txn abort failed; locks may remain until TTL expiry",
+			if errors.Is(err, ErrTxnAlreadyCommitted) {
+				continue
+			}
+			c.log.Warn("txn abort failed; locks may remain until TTL expiry",
 				slog.Uint64("gid", pg.gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
@@ -482,16 +516,9 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	commitTS := reqs.CommitTS
-	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(reqs.StartTS)
-	} else {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
-	}
-	if commitTS == 0 || commitTS <= reqs.StartTS {
-		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	commitTS, err := c.resolveTxnCommitTS(reqs.StartTS, reqs.CommitTS)
+	if err != nil {
+		return nil, err
 	}
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }
