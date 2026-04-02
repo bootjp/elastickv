@@ -16,7 +16,7 @@ import (
 // authoritative for serving reads.
 //
 // The cache window is intentionally shorter than the leader lease used in this
-// repository's runtime/test configs (50ms-100ms).
+// repository's runtime and test configurations.
 const raftLeaderVerifySuccessCacheTTL = 20 * time.Millisecond
 
 type raftLeaderVerifier interface {
