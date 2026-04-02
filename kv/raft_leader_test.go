@@ -141,3 +141,20 @@ func TestRaftLeaderVerifyCache_ClearsOnFollowerAndFailure(t *testing.T) {
 	require.NoError(t, cache.verify(r))
 	require.Equal(t, int64(3), r.verifyCalls())
 }
+
+func TestRaftLeaderVerifyCache_UnregisterRemovesState(t *testing.T) {
+	t.Parallel()
+
+	cache := newRaftLeaderVerifyCache(time.Minute)
+	r := newFakeRaftLeader()
+
+	require.NoError(t, cache.verify(r))
+
+	_, ok := cache.states.Load(r)
+	require.True(t, ok)
+
+	cache.unregister(r)
+
+	_, ok = cache.states.Load(r)
+	require.False(t, ok)
+}

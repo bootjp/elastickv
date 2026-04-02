@@ -48,6 +48,13 @@ func verifyRaftLeader(r *raft.Raft) error {
 	return defaultRaftLeaderVerifyCache.verify(r)
 }
 
+func UnregisterRaftLeaderVerifier(r *raft.Raft) {
+	if r == nil {
+		return
+	}
+	defaultRaftLeaderVerifyCache.unregister(r)
+}
+
 func (c *raftLeaderVerifyCache) verify(r raftLeaderVerifier) error {
 	if r.State() != raft.Leader {
 		c.clear(r)
@@ -98,6 +105,13 @@ func (c *raftLeaderVerifyCache) clear(r raftLeaderVerifier) {
 			state.verifiedAt.Store(0)
 		}
 	}
+}
+
+func (c *raftLeaderVerifyCache) unregister(r raftLeaderVerifier) {
+	if c == nil || r == nil {
+		return
+	}
+	c.states.Delete(r)
 }
 
 func (c *raftLeaderVerifyCache) isFresh(verifiedAt int64) bool {

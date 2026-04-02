@@ -32,6 +32,7 @@ func (r *raftGroupRuntime) Close() {
 	}
 	if r.raft != nil {
 		kv.UnregisterRaftAppliedIndexWaiter(r.raft)
+		kv.UnregisterRaftLeaderVerifier(r.raft)
 		_ = r.raft.Shutdown().Error()
 		r.raft = nil
 	}

@@ -843,10 +843,24 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	key := cmd.Args[1]
-	readTS := r.readTS()
 	isLeader := r.coordinator.IsLeaderForKey(key)
+	readTS := r.readTS()
+	ctx := context.Background()
 
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if isLeader {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), redisDispatchTimeout)
+		defer cancel()
+
+		var err error
+		readTS, err = r.linearizableReadTSForKey(ctx, key)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+	}
+
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -860,13 +874,14 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// When proxying reads to the leader, let the leader choose a safe snapshot.
-	// Our local store watermark may lag behind a just-committed transaction.
-	valueTS := readTS
-	if !isLeader {
-		valueTS = 0
+	var v []byte
+	if isLeader {
+		v, err = r.readValueLocalAt(ctx, key, readTS)
+	} else {
+		// When proxying reads to the leader, let the leader choose a safe
+		// snapshot. Our local store watermark may lag a just-committed write.
+		v, err = r.readValueAt(key, 0)
 	}
-	v, err := r.readValueAt(key, valueTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -2199,7 +2214,6 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
-	readTS := r.readTS()
 	if !r.coordinator.IsLeaderForKey(key) {
 		return r.proxyLRange(key, startRaw, endRaw)
 	}
@@ -2207,8 +2221,9 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
-	if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
-		return nil, errors.WithStack(err)
+	readTS, err := r.linearizableReadTSForKey(ctx, key)
+	if err != nil {
+		return nil, err
 	}
 
 	typ, err := r.keyTypeAt(ctx, key, readTS)
@@ -2342,20 +2357,17 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 	return resp.Value, nil
 }
 
-func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
+func (r *RedisServer) linearizableReadTSForKey(ctx context.Context, key []byte) (uint64, error) {
+	if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return r.readTS(), nil
+}
+
+func (r *RedisServer) readValueLocalAt(ctx context.Context, key []byte, readTS uint64) ([]byte, error) {
 	ttlKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
-	}
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.tryLeaderGetAt(key, readTS)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
-
-	if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
-		return nil, errors.WithStack(err)
 	}
 
 	expired, err := r.hasExpiredTTLAt(ctx, ttlKey, readTS)
@@ -2368,6 +2380,29 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 
 	v, err := r.store.GetAt(ctx, key, readTS)
 	return v, errors.WithStack(err)
+}
+
+// readValueAt serves the caller's MVCC snapshot. Pass readTS == 0 to acquire a
+// fresh snapshot after the leader fence for latest-value reads.
+func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
+	if !r.coordinator.IsLeaderForKey(key) {
+		return r.tryLeaderGetAt(key, readTS)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if readTS == 0 {
+		var err error
+		readTS, err = r.linearizableReadTSForKey(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+	} else if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return r.readValueLocalAt(ctx, key, readTS)
 }
 
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)

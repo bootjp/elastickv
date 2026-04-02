@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -76,6 +77,19 @@ func (c *retryOnceCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
 
 func (c *retryOnceCoordinator) Clock() *kv.HLC {
 	return c.clock
+}
+
+type verifyHookCoordinator struct {
+	*localAdapterCoordinator
+	once       sync.Once
+	verifyHook func()
+}
+
+func (c *verifyHookCoordinator) VerifyLeaderForKey([]byte) error {
+	if c.verifyHook != nil {
+		c.once.Do(c.verifyHook)
+	}
+	return nil
 }
 
 type recordingConn struct {
@@ -229,6 +243,35 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	value, err := srv.readValueAt([]byte("retry:lua"), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), value)
+}
+
+func TestRedisGetRefreshesReadTSAfterLeaderFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	coord.Clock().Observe(1)
+
+	coordWithHook := &verifyHookCoordinator{
+		localAdapterCoordinator: coord,
+		verifyHook: func() {
+			require.NoError(t, st.PutAt(ctx, []byte("late:get"), []byte("v2"), 2, 0))
+			coord.Clock().Observe(2)
+		},
+	}
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coordWithHook,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+
+	srv.get(conn, redcon.Command{Args: [][]byte{[]byte(cmdGet), []byte("late:get")}})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, []byte("v2"), conn.bulk)
 }
 
 func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {

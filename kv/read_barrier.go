@@ -9,11 +9,12 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-const linearizableReadPollInterval = 2 * time.Millisecond
+const linearizableReadPollInterval = 10 * time.Millisecond
 const linearizableReadStableBootstrapChecks = 2
 
 type linearizableRaft interface {
 	raftLeaderVerifier
+	CommitIndex() uint64
 	Stats() map[string]string
 }
 
@@ -43,7 +44,7 @@ func linearizableReadIndexWithWaiter(ctx context.Context, r linearizableRaft, wa
 		return 0, err
 	}
 
-	target := parseLinearizableReadStat(r.Stats(), "commit_index")
+	target := r.CommitIndex()
 	if err := waitForLinearizableReadIndex(ctx, r, waiter, target); err != nil {
 		return 0, errors.WithStack(err)
 	}
@@ -109,23 +110,28 @@ func hasReachedTarget(waiter AppliedIndexWaiter, target uint64) bool {
 }
 
 func bootstrapReadReady(stats map[string]string, target uint64) bool {
-	return parseLinearizableReadStat(stats, "applied_index") >= target &&
-		parseLinearizableReadStat(stats, "fsm_pending") == 0
+	applied, ok := parseLinearizableReadStat(stats, "applied_index")
+	if !ok || applied < target {
+		return false
+	}
+
+	pending, ok := parseLinearizableReadStat(stats, "fsm_pending")
+	return ok && pending == 0
 }
 
-func parseLinearizableReadStat(stats map[string]string, key string) uint64 {
+func parseLinearizableReadStat(stats map[string]string, key string) (uint64, bool) {
 	if stats == nil {
-		return 0
+		return 0, false
 	}
 	raw := stats[key]
 	if raw == "" {
-		return 0
+		return 0, false
 	}
 	value, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return value
+	return value, true
 }
 
 func CoordinatorLinearizableRead(ctx context.Context, c Coordinator) (uint64, error) {
