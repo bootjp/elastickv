@@ -42,7 +42,12 @@ const (
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
 )
 
-const dynamoHealthPath = "/healthz"
+const (
+	dynamoHealthPath       = "/healthz"
+	dynamoLeaderHealthPath = "/healthz/leader"
+)
+
+const dynamoHealthMaxRequestBodyBytes = 1024
 
 const (
 	updateSplitCount            = 2
@@ -260,7 +265,7 @@ func (d *DynamoDBServer) Stop() {
 }
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
-	if serveDynamoHealthz(w, r) {
+	if d.serveHealthz(w, r) {
 		return
 	}
 
@@ -295,25 +300,74 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) bool {
-	if r.URL.Path != dynamoHealthPath {
+func (d *DynamoDBServer) serveHealthz(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || r.URL == nil {
 		return false
 	}
 
+	switch r.URL.Path {
+	case dynamoHealthPath:
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
+		}
+		serveDynamoHealthz(w, r)
+		return true
+	case dynamoLeaderHealthPath:
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
+		}
+		d.serveDynamoLeaderHealthz(w, r)
+		return true
+	default:
+		return false
+	}
+}
+
+func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) {
+	if !writeDynamoHealthMethod(w, r) {
+		return
+	}
+	writeDynamoHealthBody(w, r, http.StatusOK, "ok\n")
+}
+
+func (d *DynamoDBServer) serveDynamoLeaderHealthz(w http.ResponseWriter, r *http.Request) {
+	if !writeDynamoHealthMethod(w, r) {
+		return
+	}
+
+	if isVerifiedDynamoLeader(d.coordinator) {
+		writeDynamoHealthBody(w, r, http.StatusOK, "ok\n")
+		return
+	}
+
+	writeDynamoHealthBody(w, r, http.StatusServiceUnavailable, "not leader\n")
+}
+
+func isVerifiedDynamoLeader(coordinator kv.Coordinator) bool {
+	if coordinator == nil || !coordinator.IsLeader() {
+		return false
+	}
+	return coordinator.VerifyLeader() == nil
+}
+
+func writeDynamoHealthMethod(w http.ResponseWriter, r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodHead {
-			return true
-		}
-		_, _ = w.Write([]byte("ok\n"))
 		return true
 	default:
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return true
+		return false
 	}
+}
+
+func writeDynamoHealthBody(w http.ResponseWriter, r *http.Request, statusCode int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(statusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.WriteString(w, body)
 }
 
 func maxDynamoBodyReader(w http.ResponseWriter, r *http.Request) io.Reader {

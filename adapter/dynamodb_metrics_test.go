@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -93,6 +94,41 @@ func TestDynamoDBServerHealthzSkipsDynamoMetrics(t *testing.T) {
 	for _, family := range metricFamilies {
 		require.NotEqual(t, "elastickv_dynamodb_requests_total", family.GetName())
 	}
+}
+
+func TestDynamoDBServerLeaderHealthzSkipsDynamoMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, dynamoLeaderHealthPath, nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "ok\n", rec.Body.String())
+
+	metricFamilies, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+	for _, family := range metricFamilies {
+		require.NotEqual(t, "elastickv_dynamodb_requests_total", family.GetName())
+	}
+}
+
+func TestDynamoDBServerLeaderHealthzReturnsServiceUnavailableWhenNotLeader(t *testing.T) {
+	coord := &stubAdapterCoordinator{
+		leaderSet:       true,
+		leader:          false,
+		verifyLeaderErr: kv.ErrLeaderNotFound,
+	}
+	server := NewDynamoDBServer(nil, nil, coord)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, dynamoLeaderHealthPath, nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "not leader\n", rec.Body.String())
+	require.Zero(t, coord.VerifyLeaderCalls())
 }
 
 func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t *testing.T) {
