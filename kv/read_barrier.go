@@ -40,7 +40,7 @@ func linearizableReadIndexWithWaiter(ctx context.Context, r linearizableRaft, wa
 	if r.State() != raft.Leader {
 		return 0, errors.WithStack(raft.ErrNotLeader)
 	}
-	if err := defaultRaftLeaderVerifyCache.verify(r); err != nil {
+	if err := r.VerifyLeader(); err != nil {
 		return 0, err
 	}
 
