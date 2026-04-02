@@ -122,23 +122,23 @@ func TestWithRedisRequestObserverOption(t *testing.T) {
 // stubRedisConn is a minimal redcon.Conn implementation for unit tests.
 type stubRedisConn struct{}
 
-func (s *stubRedisConn) RemoteAddr() string                  { return "127.0.0.1:9999" }
-func (s *stubRedisConn) Close() error                        { return nil }
-func (s *stubRedisConn) WriteError(msg string)               {}
-func (s *stubRedisConn) WriteString(str string)              {}
-func (s *stubRedisConn) WriteBulk(bulk []byte)               {}
-func (s *stubRedisConn) WriteBulkString(bulk string)         {}
-func (s *stubRedisConn) WriteInt(num int)                    {}
-func (s *stubRedisConn) WriteInt64(num int64)                {}
-func (s *stubRedisConn) WriteUint64(num uint64)              {}
-func (s *stubRedisConn) WriteArray(count int)                {}
-func (s *stubRedisConn) WriteNull()                          {}
-func (s *stubRedisConn) WriteRaw(data []byte)                {}
-func (s *stubRedisConn) WriteAny(v interface{})              {}
-func (s *stubRedisConn) Context() interface{}                { return nil }
-func (s *stubRedisConn) SetContext(v interface{})             {}
-func (s *stubRedisConn) SetReadBuffer(bytes int)             {}
-func (s *stubRedisConn) Detach() redcon.DetachedConn         { return nil }
-func (s *stubRedisConn) ReadPipeline() []redcon.Command      { return nil }
-func (s *stubRedisConn) PeekPipeline() []redcon.Command      { return nil }
-func (s *stubRedisConn) NetConn() net.Conn                   { return nil }
+func (s *stubRedisConn) RemoteAddr() string             { return "127.0.0.1:9999" }
+func (s *stubRedisConn) Close() error                   { return nil }
+func (s *stubRedisConn) WriteError(msg string)          {}
+func (s *stubRedisConn) WriteString(str string)         {}
+func (s *stubRedisConn) WriteBulk(bulk []byte)          {}
+func (s *stubRedisConn) WriteBulkString(bulk string)    {}
+func (s *stubRedisConn) WriteInt(num int)               {}
+func (s *stubRedisConn) WriteInt64(num int64)           {}
+func (s *stubRedisConn) WriteUint64(num uint64)         {}
+func (s *stubRedisConn) WriteArray(count int)           {}
+func (s *stubRedisConn) WriteNull()                     {}
+func (s *stubRedisConn) WriteRaw(data []byte)           {}
+func (s *stubRedisConn) WriteAny(v interface{})         {}
+func (s *stubRedisConn) Context() interface{}           { return nil }
+func (s *stubRedisConn) SetContext(v interface{})       {}
+func (s *stubRedisConn) SetReadBuffer(bytes int)        {}
+func (s *stubRedisConn) Detach() redcon.DetachedConn    { return nil }
+func (s *stubRedisConn) ReadPipeline() []redcon.Command { return nil }
+func (s *stubRedisConn) PeekPipeline() []redcon.Command { return nil }
+func (s *stubRedisConn) NetConn() net.Conn              { return nil }
