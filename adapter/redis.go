@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -253,6 +254,7 @@ type RedisServer struct {
 	redisAddr       string
 	relay           *RedisPubSubRelay
 	relayConnCache  kv.GRPCConnCache
+	requestObserver monitoring.RedisRequestObserver
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -265,6 +267,33 @@ func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisSe
 	return func(r *RedisServer) {
 		r.readTracker = tracker
 	}
+}
+
+// WithRedisRequestObserver enables Prometheus-compatible request metrics.
+func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
+	return func(r *RedisServer) {
+		r.requestObserver = observer
+	}
+}
+
+// redisMetricsConn wraps a redcon.Conn to detect whether WriteError was called.
+type redisMetricsConn struct {
+	redcon.Conn
+	hadError bool
+}
+
+var redisMetricsConnPool = sync.Pool{
+	New: func() any { return &redisMetricsConn{} },
+}
+
+func (c *redisMetricsConn) WriteError(msg string) {
+	c.hadError = true
+	c.Conn.WriteError(msg)
+}
+
+func (c *redisMetricsConn) reset(conn redcon.Conn) {
+	c.Conn = conn
+	c.hadError = false
 }
 
 type connState struct {
@@ -423,21 +452,59 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return r.readTracker.Pin(ts)
 }
 
+func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	switch {
+	case r.requestObserver != nil:
+		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)
+		if metricsConn == nil {
+			metricsConn = &redisMetricsConn{}
+		}
+		metricsConn.reset(conn)
+		if r.traceCommands {
+			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
+			handler(metricsConn, cmd)
+			r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+		} else {
+			handler(metricsConn, cmd)
+		}
+		r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:  name,
+			IsError:  metricsConn.hadError,
+			Duration: time.Since(start),
+		})
+		metricsConn.Conn = nil
+		redisMetricsConnPool.Put(metricsConn)
+	case r.traceCommands:
+		traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
+		handler(conn, cmd)
+		r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+	default:
+		handler(conn, cmd)
+	}
+}
+
 func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
+			needsTiming := r.requestObserver != nil || r.traceCommands
+			var start time.Time
+			if needsTiming {
+				start = time.Now()
+			}
 			state := getConnState(conn)
 			name := strings.ToUpper(string(cmd.Args[0]))
-			f, ok := r.route[name]
+			handler, ok := r.route[name]
 			if !ok {
 				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
+				r.observeRedisError(name, time.Since(start))
 				return
 			}
 
 			if err := r.validateCmd(cmd); err != nil {
 				r.traceCommandError(conn, name, cmd.Args[1:], err.Error())
 				conn.WriteError(err.Error())
+				r.observeRedisError(name, time.Since(start))
 				return
 			}
 
@@ -447,16 +514,11 @@ func (r *RedisServer) Run() error {
 				state.queue = append(state.queue, cloneCommand(cmd))
 				r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
 				conn.WriteString("QUEUED")
+				r.observeRedisSuccess(name, time.Since(start))
 				return
 			}
 
-			if r.traceCommands {
-				traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-				f(conn, cmd)
-				r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
-			} else {
-				f(conn, cmd)
-			}
+			r.dispatchCommand(conn, name, handler, cmd, start)
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
@@ -675,6 +737,28 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 		return nil
 	})
 	return result, err
+}
+
+func (r *RedisServer) observeRedisError(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:  command,
+		IsError:  true,
+		Duration: dur,
+	})
+}
+
+func (r *RedisServer) observeRedisSuccess(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:  command,
+		IsError:  false,
+		Duration: dur,
+	})
 }
 
 func (r *RedisServer) Stop() {
