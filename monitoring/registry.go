@@ -15,6 +15,7 @@ type Registry struct {
 	gatherer     prometheus.Gatherer
 
 	dynamo *DynamoDBMetrics
+	redis  *RedisMetrics
 	raft   *RaftMetrics
 }
 
@@ -32,6 +33,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 		gatherer:     base,
 	}
 	r.dynamo = newDynamoDBMetrics(registerer)
+	r.redis = newRedisMetrics(registerer)
 	r.raft = newRaftMetrics(registerer)
 	return r
 }
@@ -58,6 +60,14 @@ func (r *Registry) DynamoDBObserver() DynamoDBRequestObserver {
 		return nil
 	}
 	return r.dynamo
+}
+
+// RedisObserver returns the Redis request observer backed by this registry.
+func (r *Registry) RedisObserver() RedisRequestObserver {
+	if r == nil {
+		return nil
+	}
+	return r.redis
 }
 
 // RaftObserver returns the Raft topology observer backed by this registry.
