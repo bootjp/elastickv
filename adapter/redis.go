@@ -443,6 +443,32 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return r.readTracker.Pin(ts)
 }
 
+func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, f func(redcon.Conn, redcon.Command), cmd redcon.Command) {
+	switch {
+	case r.requestObserver != nil:
+		mc := &redisMetricsConn{Conn: conn}
+		start := time.Now()
+		if r.traceCommands {
+			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
+			f(mc, cmd)
+			r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+		} else {
+			f(mc, cmd)
+		}
+		r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:  name,
+			IsError:  mc.hadError,
+			Duration: time.Since(start),
+		})
+	case r.traceCommands:
+		traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
+		f(conn, cmd)
+		r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
+	default:
+		f(conn, cmd)
+	}
+}
+
 func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
@@ -472,28 +498,7 @@ func (r *RedisServer) Run() error {
 				return
 			}
 
-			if r.requestObserver != nil {
-				mc := &redisMetricsConn{Conn: conn}
-				start := time.Now()
-				if r.traceCommands {
-					traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-					f(mc, cmd)
-					r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
-				} else {
-					f(mc, cmd)
-				}
-				r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
-					Command:  name,
-					IsError:  mc.hadError,
-					Duration: time.Since(start),
-				})
-			} else if r.traceCommands {
-				traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-				f(conn, cmd)
-				r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
-			} else {
-				f(conn, cmd)
-			}
+			r.dispatchCommand(conn, name, f, cmd)
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.

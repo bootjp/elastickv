@@ -357,26 +357,35 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// requiresStrictAuth reports whether the request must always go through
+// credential verification, regardless of bucket ACL settings.
+func requiresStrictAuth(r *http.Request, bucket string) bool {
+	// Write methods always require authentication.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return true
+	}
+	// ListBuckets (no bucket) always requires authentication.
+	if bucket == "" {
+		return true
+	}
+	// ACL query parameter requests always require authentication.
+	if r.URL.Query().Has("acl") {
+		return true
+	}
+	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
+	// already authenticated; skip the public-bucket metadata read on the hot path.
+	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
+		return true
+	}
+	return false
+}
+
 func (s *S3Server) resolveAuth(r *http.Request, bucket string) *s3AuthError {
 	// When no credentials are configured, all requests are permitted without auth.
 	if len(s.staticCreds) == 0 {
 		return nil
 	}
-	// Write methods always require authentication.
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		return s.authorizeRequest(r)
-	}
-	// ListBuckets (no bucket) always requires authentication.
-	if bucket == "" {
-		return s.authorizeRequest(r)
-	}
-	// ACL query parameter requests always require authentication.
-	if r.URL.Query().Has("acl") {
-		return s.authorizeRequest(r)
-	}
-	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
-	// already authenticated; skip the public-bucket metadata read on the hot path.
-	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
+	if requiresStrictAuth(r, bucket) {
 		return s.authorizeRequest(r)
 	}
 	// Check if the bucket is public-read and the request is read-only.
