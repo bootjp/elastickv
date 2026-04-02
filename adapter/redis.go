@@ -1082,24 +1082,26 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {
-		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-		defer cancel()
+		if r.requiresCoordinatorReadFence() {
+			ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+			defer cancel()
 
-		if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				keys, proxyErr := r.proxyKeys(pattern)
-				if proxyErr != nil {
-					conn.WriteError(proxyErr.Error())
+			if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
+				if errors.Is(err, raft.ErrNotLeader) {
+					keys, proxyErr := r.proxyKeys(pattern)
+					if proxyErr != nil {
+						conn.WriteError(proxyErr.Error())
+						return
+					}
+					conn.WriteArray(len(keys))
+					for _, k := range keys {
+						conn.WriteBulkString(k)
+					}
 					return
 				}
-				conn.WriteArray(len(keys))
-				for _, k := range keys {
-					conn.WriteBulkString(k)
-				}
+				conn.WriteError(err.Error())
 				return
 			}
-			conn.WriteError(err.Error())
-			return
 		}
 		keys, err := r.visibleKeys(pattern)
 		if err != nil {
@@ -1300,6 +1302,14 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 
 	keys, err := cli.Keys(context.Background(), string(pattern)).Result()
 	return keys, errors.WithStack(err)
+}
+
+func (r *RedisServer) requiresCoordinatorReadFence() bool {
+	if r == nil {
+		return false
+	}
+	_, isSharded := r.store.(*kv.ShardStore)
+	return !isSharded
 }
 
 // MULTI/EXEC/DISCARD handling

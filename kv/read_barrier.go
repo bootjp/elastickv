@@ -40,7 +40,7 @@ func linearizableReadIndexWithWaiter(ctx context.Context, r linearizableRaft, wa
 	if r.State() != raft.Leader {
 		return 0, errors.WithStack(raft.ErrNotLeader)
 	}
-	if err := r.VerifyLeader(); err != nil {
+	if err := verifyLinearizableReadLeader(r); err != nil {
 		return 0, err
 	}
 
@@ -139,6 +139,13 @@ func parseLinearizableReadStat(stats map[string]string, key string) (uint64, boo
 		return 0, false
 	}
 	return value, true
+}
+
+func verifyLinearizableReadLeader(r linearizableRaft) error {
+	if raftNode, ok := any(r).(*raft.Raft); ok {
+		return verifyRaftLeaderCached(raftNode)
+	}
+	return verifyFreshRaftLeader(r)
 }
 
 func CoordinatorLinearizableRead(ctx context.Context, c Coordinator) (uint64, error) {

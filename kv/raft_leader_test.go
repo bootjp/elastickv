@@ -167,3 +167,29 @@ func TestRaftLeaderVerifyCache_IsFreshRejectsFutureTimestamp(t *testing.T) {
 
 	require.False(t, cache.isFresh(future))
 }
+
+func TestVerifyFreshRaftLeaderDoesNotUseCache(t *testing.T) {
+	t.Parallel()
+
+	r := newFakeRaftLeader()
+
+	require.NoError(t, verifyFreshRaftLeader(r))
+	require.NoError(t, verifyFreshRaftLeader(r))
+	require.Equal(t, int64(2), r.verifyCalls())
+}
+
+func TestRaftLeaderVerifyCache_StateForReplacesUnexpectedEntry(t *testing.T) {
+	t.Parallel()
+
+	cache := newRaftLeaderVerifyCache(time.Minute)
+	r := newFakeRaftLeader()
+
+	cache.states.Store(r, "bad-state")
+
+	state := cache.stateFor(r)
+	require.NotNil(t, state)
+
+	stored, ok := cache.states.Load(r)
+	require.True(t, ok)
+	require.Same(t, state, stored)
+}

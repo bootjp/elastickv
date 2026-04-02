@@ -418,18 +418,20 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
-	if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			size, proxyErr := r.proxyDBSize()
-			if proxyErr != nil {
-				conn.WriteError(proxyErr.Error())
+	if r.requiresCoordinatorReadFence() {
+		if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				size, proxyErr := r.proxyDBSize()
+				if proxyErr != nil {
+					conn.WriteError(proxyErr.Error())
+					return
+				}
+				conn.WriteInt(size)
 				return
 			}
-			conn.WriteInt(size)
+			conn.WriteError(err.Error())
 			return
 		}
-		conn.WriteError(err.Error())
-		return
 	}
 
 	keys, err := r.visibleKeys([]byte("*"))

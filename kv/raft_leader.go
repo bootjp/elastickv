@@ -45,6 +45,13 @@ func verifyRaftLeader(r *raft.Raft) error {
 	if r == nil {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
+	return verifyFreshRaftLeader(r)
+}
+
+func verifyRaftLeaderCached(r *raft.Raft) error {
+	if r == nil {
+		return errors.WithStack(ErrLeaderNotFound)
+	}
 	return defaultRaftLeaderVerifyCache.verify(r)
 }
 
@@ -56,27 +63,19 @@ func UnregisterRaftLeaderVerifier(r *raft.Raft) {
 }
 
 func (c *raftLeaderVerifyCache) verify(r raftLeaderVerifier) error {
+	state := c.stateFor(r)
 	if r.State() != raft.Leader {
-		c.clear(r)
+		state.verifiedAt.Store(0)
 		return errors.WithStack(raft.ErrNotLeader)
 	}
-
-	state := c.stateFor(r)
 	if c.isFresh(state.verifiedAt.Load()) {
 		return nil
 	}
 
 	_, err, _ := state.group.Do("verify", func() (any, error) {
-		if r.State() != raft.Leader {
+		if err := verifyFreshRaftLeader(r); err != nil {
 			state.verifiedAt.Store(0)
-			return nil, errors.WithStack(raft.ErrNotLeader)
-		}
-		if c.isFresh(state.verifiedAt.Load()) {
-			return nil, nil
-		}
-		if err := r.VerifyLeader().Error(); err != nil {
-			state.verifiedAt.Store(0)
-			return nil, errors.WithStack(err)
+			return nil, err
 		}
 		state.verifiedAt.Store(time.Now().UnixNano())
 		return nil, nil
@@ -89,13 +88,14 @@ func (c *raftLeaderVerifyCache) stateFor(r raftLeaderVerifier) *raftLeaderVerify
 		if state, ok := v.(*raftLeaderVerifyState); ok {
 			return state
 		}
-		return &raftLeaderVerifyState{}
+		c.states.Delete(r)
 	}
 	state := &raftLeaderVerifyState{}
 	actual, _ := c.states.LoadOrStore(r, state)
 	if stored, ok := actual.(*raftLeaderVerifyState); ok {
 		return stored
 	}
+	c.states.Store(r, state)
 	return state
 }
 
@@ -105,6 +105,16 @@ func (c *raftLeaderVerifyCache) clear(r raftLeaderVerifier) {
 			state.verifiedAt.Store(0)
 		}
 	}
+}
+
+func verifyFreshRaftLeader(r raftLeaderVerifier) error {
+	if r == nil {
+		return errors.WithStack(ErrLeaderNotFound)
+	}
+	if r.State() != raft.Leader {
+		return errors.WithStack(raft.ErrNotLeader)
+	}
+	return errors.WithStack(r.VerifyLeader().Error())
 }
 
 func (c *raftLeaderVerifyCache) unregister(r raftLeaderVerifier) {
