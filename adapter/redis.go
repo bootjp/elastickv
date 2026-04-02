@@ -472,6 +472,7 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 			IsError:  metricsConn.hadError,
 			Duration: time.Since(start),
 		})
+		metricsConn.Conn = nil
 		redisMetricsConnPool.Put(metricsConn)
 	case r.traceCommands:
 		traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
