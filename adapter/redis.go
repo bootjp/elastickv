@@ -1052,7 +1052,10 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {
-		if err := r.coordinator.VerifyLeader(); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+		defer cancel()
+
+		if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
@@ -2197,7 +2200,18 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if !r.coordinator.IsLeaderForKey(key) {
+		return r.proxyLRange(key, startRaw, endRaw)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2207,15 +2221,8 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 	if typ != redisTypeList {
 		return nil, wrongTypeError()
 	}
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
-	}
 
-	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	meta, exists, err := r.loadListMetaAt(context.Background(), key, readTS)
+	meta, exists, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2228,7 +2235,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, err
 	}
 
-	return r.fetchListRange(context.Background(), key, meta, int64(s), int64(e), readTS)
+	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
 }
 
 func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
@@ -2340,7 +2347,18 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
 	}
-	expired, err := r.hasExpiredTTLAt(context.Background(), ttlKey, readTS)
+	if !r.coordinator.IsLeaderForKey(key) {
+		return r.tryLeaderGetAt(key, readTS)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if _, err := kv.CoordinatorLinearizableReadForKey(ctx, r.coordinator, key); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	expired, err := r.hasExpiredTTLAt(ctx, ttlKey, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2348,14 +2366,8 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 		return nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 
-	if r.coordinator.IsLeaderForKey(key) {
-		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		v, err := r.store.GetAt(context.Background(), key, readTS)
-		return v, errors.WithStack(err)
-	}
-	return r.tryLeaderGetAt(key, readTS)
+	v, err := r.store.GetAt(ctx, key, readTS)
+	return v, errors.WithStack(err)
 }
 
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)

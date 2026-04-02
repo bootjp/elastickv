@@ -83,6 +83,10 @@ func (c *Coordinate) VerifyLeader() error {
 	return verifyRaftLeader(c.raft)
 }
 
+func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
+	return linearizableReadIndex(ctx, c.raft)
+}
+
 // RaftLeader returns the current leader's address as known by this node.
 func (c *Coordinate) RaftLeader() raft.ServerAddress {
 	addr, _ := c.raft.LeaderWithID()
@@ -99,6 +103,10 @@ func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
 
 func (c *Coordinate) VerifyLeaderForKey(_ []byte) error {
 	return c.VerifyLeader()
+}
+
+func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LinearizableRead(ctx)
 }
 
 func (c *Coordinate) RaftLeaderForKey(_ []byte) raft.ServerAddress {

@@ -422,6 +422,9 @@ func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg ra
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
+	if waiter, ok := fsm.(kv.AppliedIndexWaiter); ok {
+		kv.RegisterRaftAppliedIndexWaiter(r, waiter)
+	}
 
 	if bootstrap {
 		f := r.BootstrapCluster(cfg)
