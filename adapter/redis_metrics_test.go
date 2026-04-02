@@ -119,13 +119,102 @@ func TestWithRedisRequestObserverOption(t *testing.T) {
 	require.NotNil(t, server.requestObserver)
 }
 
+func TestDispatchCommandObservesSuccessMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
+	conn := &stubRedisConn{}
+	handler := func(c redcon.Conn, cmd redcon.Command) {
+		c.WriteString("OK")
+	}
+	cmd := redcon.Command{Args: [][]byte{[]byte("SET"), []byte("key"), []byte("val")}}
+
+	server.dispatchCommand(conn, "SET", handler, cmd, time.Now())
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_redis_requests_total Total number of Redis API requests by command and outcome.
+# TYPE elastickv_redis_requests_total counter
+elastickv_redis_requests_total{command="SET",node_address="10.0.0.1:50051",node_id="n1",outcome="success"} 1
+`),
+		"elastickv_redis_requests_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestDispatchCommandObservesErrorMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
+	conn := &stubRedisConn{}
+	handler := func(c redcon.Conn, cmd redcon.Command) {
+		c.WriteError("ERR something went wrong")
+	}
+	cmd := redcon.Command{Args: [][]byte{[]byte("SET"), []byte("key"), []byte("val")}}
+
+	server.dispatchCommand(conn, "SET", handler, cmd, time.Now())
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_redis_requests_total Total number of Redis API requests by command and outcome.
+# TYPE elastickv_redis_requests_total counter
+elastickv_redis_requests_total{command="SET",node_address="10.0.0.1:50051",node_id="n1",outcome="error"} 1
+# HELP elastickv_redis_errors_total Total number of Redis API errors by command.
+# TYPE elastickv_redis_errors_total counter
+elastickv_redis_errors_total{command="SET",node_address="10.0.0.1:50051",node_id="n1"} 1
+`),
+		"elastickv_redis_requests_total",
+		"elastickv_redis_errors_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestObserveRedisErrorRecordsMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
+
+	server.observeRedisError("BADCMD", time.Millisecond)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_redis_requests_total Total number of Redis API requests by command and outcome.
+# TYPE elastickv_redis_requests_total counter
+elastickv_redis_requests_total{command="unknown",node_address="10.0.0.1:50051",node_id="n1",outcome="error"} 1
+`),
+		"elastickv_redis_requests_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestObserveRedisSuccessRecordsMetrics(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
+
+	server.observeRedisSuccess("GET", time.Millisecond)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_redis_requests_total Total number of Redis API requests by command and outcome.
+# TYPE elastickv_redis_requests_total counter
+elastickv_redis_requests_total{command="GET",node_address="10.0.0.1:50051",node_id="n1",outcome="success"} 1
+`),
+		"elastickv_redis_requests_total",
+	)
+	require.NoError(t, err)
+}
+
 // stubRedisConn is a minimal redcon.Conn implementation for unit tests.
-type stubRedisConn struct{}
+type stubRedisConn struct {
+	lastError  string
+	lastString string
+}
 
 func (s *stubRedisConn) RemoteAddr() string             { return "127.0.0.1:9999" }
 func (s *stubRedisConn) Close() error                   { return nil }
-func (s *stubRedisConn) WriteError(msg string)          {}
-func (s *stubRedisConn) WriteString(str string)         {}
+func (s *stubRedisConn) WriteError(msg string)          { s.lastError = msg }
+func (s *stubRedisConn) WriteString(str string)         { s.lastString = str }
 func (s *stubRedisConn) WriteBulk(bulk []byte)          {}
 func (s *stubRedisConn) WriteBulkString(bulk string)    {}
 func (s *stubRedisConn) WriteInt(num int)               {}

@@ -128,7 +128,7 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 			prometheus.HistogramOpts{
 				Name:    "elastickv_redis_request_duration_seconds",
 				Help:    "End-to-end latency of Redis API requests.",
-				Buckets: []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+				Buckets: []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60},
 			},
 			[]string{"command", "outcome"},
 		),

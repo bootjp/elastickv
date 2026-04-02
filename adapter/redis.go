@@ -282,9 +282,18 @@ type redisMetricsConn struct {
 	hadError bool
 }
 
+var redisMetricsConnPool = sync.Pool{
+	New: func() any { return &redisMetricsConn{} },
+}
+
 func (c *redisMetricsConn) WriteError(msg string) {
 	c.hadError = true
 	c.Conn.WriteError(msg)
+}
+
+func (c *redisMetricsConn) reset(conn redcon.Conn) {
+	c.Conn = conn
+	c.hadError = false
 }
 
 type connState struct {
@@ -446,7 +455,8 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	switch {
 	case r.requestObserver != nil:
-		metricsConn := &redisMetricsConn{Conn: conn}
+		metricsConn := redisMetricsConnPool.Get().(*redisMetricsConn)
+		metricsConn.reset(conn)
 		if r.traceCommands {
 			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
 			handler(metricsConn, cmd)
@@ -459,6 +469,7 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 			IsError:  metricsConn.hadError,
 			Duration: time.Since(start),
 		})
+		redisMetricsConnPool.Put(metricsConn)
 	case r.traceCommands:
 		traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
 		handler(conn, cmd)
@@ -471,7 +482,11 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
-			start := time.Now()
+			needsTiming := r.requestObserver != nil || r.traceCommands
+			var start time.Time
+			if needsTiming {
+				start = time.Now()
+			}
 			state := getConnState(conn)
 			name := strings.ToUpper(string(cmd.Args[0]))
 			handler, ok := r.route[name]
