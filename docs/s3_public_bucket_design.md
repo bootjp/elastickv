@@ -48,7 +48,7 @@ All other canned ACLs (`public-read-write`, `authenticated-read`, `aws-exec-read
 
 ### 4.1 Bucket metadata extension
 
-`s3BucketMeta` に `Acl` フィールドを追加する：
+Add an `Acl` field to `s3BucketMeta`:
 
 ```go
 type s3BucketMeta struct {
@@ -61,16 +61,16 @@ type s3BucketMeta struct {
 }
 ```
 
-- `Acl` が空文字列または未設定の場合は `private` として扱う（後方互換性）。
-- 有効な値は `"private"` と `"public-read"` のみ。
+- When `Acl` is empty or unset, the bucket is treated as `private` (backward compatibility).
+- Valid values are `"private"` and `"public-read"` only.
 
 ### 4.2 Key layout
 
-追加のキーは不要。既存の `!s3|bucket|meta|<bucket-esc>` に ACL 情報が含まれる。
+No additional keys are required. ACL information is stored in the existing `!s3|bucket|meta|<bucket-esc>` entry.
 
 ### 4.3 Migration
 
-既存のバケットメタデータには `acl` フィールドが存在しない。JSON デシリアライズ時に `omitempty` により空文字列となり、これは `private` として扱われるため、マイグレーション不要。
+Existing bucket metadata does not contain the `acl` field. Upon JSON deserialization, `omitempty` produces an empty string, which is treated as `private`. No migration is required.
 
 ## 5. API Changes
 
@@ -81,17 +81,17 @@ PUT /<bucket>?acl HTTP/1.1
 x-amz-acl: public-read
 ```
 
-- **認証**: 必須（SigV4）
-- **リクエスト**: `x-amz-acl` ヘッダーで Canned ACL を指定。XML ボディによる ACL 指定はサポートしない（`NotImplemented` を返す）。
-- **処理**:
-  1. バケットメタデータを読み取る
-  2. `Acl` フィールドを更新
-  3. OCC トランザクションでメタデータを書き戻す
-- **レスポンス**: `200 OK`（ボディなし）
-- **エラー**:
-  - `NoSuchBucket`: バケットが存在しない
-  - `NotImplemented`: サポート外の ACL 値
-  - `AccessDenied`: 認証失敗
+- **Authentication**: Required (SigV4).
+- **Request**: Specify the canned ACL with the `x-amz-acl` header. ACL specification via XML body is not supported (`NotImplemented` is returned).
+- **Processing**:
+  1. Read the bucket metadata.
+  2. Update the `Acl` field.
+  3. Write the metadata back in an OCC transaction.
+- **Response**: `200 OK` (empty body).
+- **Errors**:
+  - `NoSuchBucket`: bucket does not exist.
+  - `NotImplemented`: unsupported ACL value.
+  - `AccessDenied`: authentication failed.
 
 ### 5.2 GetBucketAcl
 
@@ -99,8 +99,8 @@ x-amz-acl: public-read
 GET /<bucket>?acl HTTP/1.1
 ```
 
-- **認証**: 必須（SigV4）
-- **レスポンス**: AWS 互換の XML:
+- **Authentication**: Required (SigV4).
+- **Response**: AWS-compatible XML:
 
 ```xml
 <AccessControlPolicy>
@@ -117,7 +117,7 @@ GET /<bucket>?acl HTTP/1.1
       </Grantee>
       <Permission>FULL_CONTROL</Permission>
     </Grant>
-    <!-- public-read の場合のみ追加 -->
+    <!-- added only when public-read -->
     <Grant>
       <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xsi:type="Group">
@@ -136,11 +136,11 @@ PUT /<bucket> HTTP/1.1
 x-amz-acl: public-read
 ```
 
-既存の `createBucket` に `x-amz-acl` ヘッダー処理を追加。省略時は `private`。
+Add `x-amz-acl` header handling to the existing `createBucket`. Defaults to `private` when omitted.
 
 ### 5.4 PutObject ACL header
 
-`PutObject` リクエストの `x-amz-acl` ヘッダーは**無視**する（オブジェクト単位 ACL は非サポート）。将来的に対応する場合は `NotImplemented` を返す方針に変更可能。
+The `x-amz-acl` header on `PutObject` requests is **ignored** (per-object ACLs are not supported). If support is added in the future, the behavior can be changed to return `NotImplemented`.
 
 ## 6. Authentication Flow Changes
 
@@ -148,7 +148,7 @@ x-amz-acl: public-read
 
 ```
 handle(w, r)
-  → authorizeRequest(r)        // 全リクエストに SigV4 検証
+  → authorizeRequest(r)        // SigV4 validation on all requests
   → parseS3Path(r)
   → route to handler
 ```
@@ -157,7 +157,7 @@ handle(w, r)
 
 ```
 handle(w, r)
-  → parseS3Path(r)             // パスを先にパースする（軽量操作）
+  → parseS3Path(r)             // parse path first (lightweight)
   → resolveAuth(r, bucket, objectKey, method)
     → isPublicReadRequest(bucket, method, query)?
       → yes: skip auth
@@ -165,52 +165,53 @@ handle(w, r)
   → route to handler
 ```
 
-### 6.3 resolveAuth の詳細
+### 6.3 resolveAuth details
 
 ```go
 func (s *S3Server) resolveAuth(r *http.Request, bucket, objectKey string) *s3AuthError {
-    // ACL/管理 API は常に認証必須
+    // ACL / admin APIs always require authentication
     if isAclRequest(r) || isWriteMethod(r) {
         return s.authorizeRequest(r)
     }
 
-    // バケットが空（ListBuckets）は認証必須
+    // Empty bucket (ListBuckets) always requires authentication
     if bucket == "" {
         return s.authorizeRequest(r)
     }
 
-    // バケットの ACL を確認
+    // Check the bucket's ACL
     meta, err := s.loadBucketMeta(r.Context(), bucket)
     if err != nil || meta == nil {
-        // バケットが見つからない場合は認証フローへ（NoSuchBucket は後段で処理）
+        // If the bucket is not found, fall through to the auth flow
+        // (NoSuchBucket is handled later in the pipeline)
         return s.authorizeRequest(r)
     }
 
     if meta.Acl == "public-read" && isReadOnlyRequest(r) {
-        return nil  // 認証スキップ
+        return nil  // skip authentication
     }
 
     return s.authorizeRequest(r)
 }
 ```
 
-### 6.4 Read-only request の定義
+### 6.4 Definition of a read-only request
 
-以下の条件をすべて満たすリクエストを read-only とみなす：
+A request is considered read-only when all of the following conditions are met:
 
-- HTTP メソッドが `GET` または `HEAD`
-- クエリパラメータに `acl`, `uploads`, `uploadId` を含まない
-- 対象が `ListObjectsV2`、`GetObject`、`HeadObject`、`HeadBucket` のいずれか
+- HTTP method is `GET` or `HEAD`.
+- The query string does not contain `acl`, `uploads`, or `uploadId`.
+- The operation is one of `ListObjectsV2`, `GetObject`, `HeadObject`, or `HeadBucket`.
 
-### 6.5 パフォーマンスへの影響
+### 6.5 Performance impact
 
-公開バケット判定のためにメタデータ読み取りが認証前に 1 回追加される。ただし：
+One additional metadata read is added before authentication to determine whether the bucket is public. However:
 
-- バケットメタデータは小さい（〜100 バイト）
-- `GetObject` / `ListObjectsV2` はいずれにせよバケットメタデータを後段で読み取るため、キャッシュで重複を回避できる
-- 非公開バケットでは従来と同じ認証パスを通るためオーバーヘッドは最小
+- Bucket metadata is small (~100 bytes).
+- `GetObject` and `ListObjectsV2` already read bucket metadata downstream, so a cache can eliminate the duplicate.
+- For private buckets, the code follows the same auth path as before, keeping overhead minimal.
 
-将来的にインメモリの ACL キャッシュ（TTL 付き）を導入してメタデータ読み取りを削減できるが、初期実装では不要。
+An in-memory ACL cache with a TTL can be introduced in the future to reduce metadata reads, but is not required for the initial implementation.
 
 ## 7. Request Flow Examples
 
@@ -219,12 +220,12 @@ func (s *S3Server) resolveAuth(r *http.Request, bucket, objectKey string) *s3Aut
 ```
 Client                    S3 Server
   |  GET /public-bucket/file.txt    |
-  |  (Authorization ヘッダーなし)    |
+  |  (no Authorization header)      |
   |-------------------------------->|
   |                                 | parseS3Path → bucket="public-bucket"
   |                                 | loadBucketMeta → acl="public-read"
   |                                 | isReadOnlyRequest → true
-  |                                 | → 認証スキップ
+  |                                 | → skip authentication
   |                                 | getObject()
   |  200 OK + body                  |
   |<--------------------------------|
@@ -235,7 +236,7 @@ Client                    S3 Server
 ```
 Client                    S3 Server
   |  PUT /public-bucket/file.txt    |
-  |  (Authorization ヘッダーなし)    |
+  |  (no Authorization header)      |
   |-------------------------------->|
   |                                 | parseS3Path → bucket="public-bucket"
   |                                 | isWriteMethod → true
@@ -249,7 +250,7 @@ Client                    S3 Server
 ```
 Client                    S3 Server
   |  GET /private-bucket/file.txt   |
-  |  (Authorization ヘッダーなし)    |
+  |  (no Authorization header)      |
   |-------------------------------->|
   |                                 | parseS3Path → bucket="private-bucket"
   |                                 | loadBucketMeta → acl="" (private)
@@ -277,75 +278,75 @@ Client                    S3 Server
 
 ### Phase 1: Core ACL infrastructure
 
-1. `s3BucketMeta` に `Acl` フィールドを追加
-2. ACL バリデーション関数 (`validateCannedAcl`) を追加
-3. `isPublicReadBucket` / `isReadOnlyRequest` ヘルパーを追加
+1. Add `Acl` field to `s3BucketMeta`.
+2. Add ACL validation function (`validateCannedAcl`).
+3. Add `isPublicReadBucket` / `isReadOnlyRequest` helpers.
 
 ### Phase 2: Auth flow changes
 
-1. `handle()` の認証フローを変更し、`resolveAuth()` を導入
-2. パスのパースを認証より前に移動
-3. 公開バケットの read-only リクエストで認証をスキップ
+1. Change the auth flow in `handle()` to introduce `resolveAuth()`.
+2. Move path parsing before authentication.
+3. Skip authentication for read-only requests on public buckets.
 
 ### Phase 3: ACL API endpoints
 
-1. `PutBucketAcl` ハンドラーを実装
-2. `GetBucketAcl` ハンドラーを実装
-3. `CreateBucket` に `x-amz-acl` ヘッダー処理を追加
-4. `handleBucket` のルーティングに `?acl` クエリパラメータ分岐を追加
+1. Implement `PutBucketAcl` handler.
+2. Implement `GetBucketAcl` handler.
+3. Add `x-amz-acl` header handling to `CreateBucket`.
+4. Add `?acl` query parameter routing in `handleBucket`.
 
 ### Phase 4: Proxy integration
 
-1. `maybeProxyToLeader` でプロキシ時にも公開バケット判定が正しく動作することを確認
-2. フォロワーノードでのメタデータ読み取りの一貫性を検証
+1. Verify that public-bucket logic works correctly when proxying via `maybeProxyToLeader`.
+2. Validate metadata read consistency on follower nodes.
 
 ## 9. Security Considerations
 
 ### 9.1 Write protection
 
-公開バケットであっても書き込み操作は常に認証を要求する。`resolveAuth` では HTTP メソッドを最初にチェックし、`PUT`, `POST`, `DELETE` は早期に認証フローへ送る。
+Even for public buckets, write operations always require authentication. `resolveAuth` checks the HTTP method first and routes `PUT`, `POST`, and `DELETE` to the auth flow immediately.
 
-### 9.2 ACL 変更の保護
+### 9.2 ACL change protection
 
-`PutBucketAcl` は認証必須。意図しない公開化を防ぐため、サーバー起動オプションとして `--s3DenyPublicBuckets` フラグを将来追加可能（初期実装では不要）。
+`PutBucketAcl` requires authentication. To prevent accidental public exposure, a `--s3DenyPublicBuckets` server flag can be added in the future (not required for the initial implementation).
 
 ### 9.3 Listing protection
 
-公開バケットでは `ListObjectsV2` を認証なしで許可する。これは AWS S3 の `public-read` ACL と同じ挙動。バケット内のキー一覧が見えることを許容するユースケースのみを想定。
+`ListObjectsV2` on a public bucket is allowed without authentication, matching the behavior of AWS S3's `public-read` ACL. This is intended only for use cases where exposing the key listing of a bucket is acceptable.
 
 ### 9.4 ListBuckets
 
-`ListBuckets`（`GET /`）は公開バケットが存在しても常に認証を要求する。バケット一覧の公開は行わない。
+`ListBuckets` (`GET /`) always requires authentication even when public buckets exist. The bucket list is never exposed publicly.
 
 ## 10. Testing Plan
 
 ### 10.1 Unit tests
 
-1. `validateCannedAcl` のバリデーション（private, public-read, 不正値）
-2. `isReadOnlyRequest` の判定ロジック（GET/HEAD/POST/PUT/DELETE × クエリパラメータ）
-3. `resolveAuth` の分岐（公開バケット×read / 公開バケット×write / 非公開バケット×read）
-4. `GetBucketAcl` の XML レスポンス生成
+1. `validateCannedAcl` validation (private, public-read, invalid values).
+2. `isReadOnlyRequest` decision logic (GET/HEAD/POST/PUT/DELETE × query parameters).
+3. `resolveAuth` branching (public bucket × read / public bucket × write / private bucket × read).
+4. `GetBucketAcl` XML response generation.
 
 ### 10.2 Integration tests
 
-1. バケット作成時に `x-amz-acl: public-read` を指定 → 匿名 GET 成功
-2. 匿名 PUT → 403
-3. 匿名 ListObjectsV2 on public bucket → 成功
-4. 匿名 GetObject on private bucket → 403
-5. `PutBucketAcl` で public-read → private に変更 → 匿名 GET が 403 に変化
-6. 既存バケット（`acl` フィールドなし）が private として動作する後方互換性テスト
+1. Create bucket with `x-amz-acl: public-read` → anonymous GET succeeds.
+2. Anonymous PUT → 403.
+3. Anonymous ListObjectsV2 on public bucket → succeeds.
+4. Anonymous GetObject on private bucket → 403.
+5. `PutBucketAcl` changes public-read → private → anonymous GET now returns 403.
+6. Backward compatibility test: bucket with no `acl` field behaves as private.
 
 ### 10.3 Compatibility tests
 
 1. `aws s3api put-bucket-acl --acl public-read`
 2. `aws s3api get-bucket-acl`
-3. `curl` による匿名アクセス（Authorization ヘッダーなし）
-4. `aws s3 cp` による匿名ダウンロード（`--no-sign-request`）
+3. Anonymous access via `curl` (no Authorization header).
+4. Anonymous download via `aws s3 cp --no-sign-request`.
 
 ## 11. Future Extensions
 
-- **バケットポリシー**: JSON ベースの条件付きポリシーによる細粒度アクセス制御
-- **`--s3DenyPublicBuckets`**: クラスタレベルで公開バケット作成を禁止するガードレール
-- **ACL キャッシュ**: インメモリキャッシュによるメタデータ読み取り削減
-- **静的ウェブサイトホスティング**: index.html 自動解決、カスタムエラーページ
-- **CORS 設定**: ブラウザからの直接アクセス対応
+- **Bucket policy**: fine-grained access control via JSON-based conditional policies.
+- **`--s3DenyPublicBuckets`**: a cluster-level guardrail that prevents creating public buckets.
+- **ACL cache**: reduce metadata reads with an in-memory cache with TTL.
+- **Static website hosting**: automatic index.html resolution and custom error pages.
+- **CORS configuration**: direct browser access support.

@@ -23,6 +23,7 @@ import (
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	json "github.com/goccy/go-json"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -1890,30 +1891,40 @@ func TestS3Server_BackwardCompatibility_NoBucketAclFieldIsPrivate(t *testing.T) 
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	// No credentials → all requests pass auth, simulating no-auth setup.
-	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	coord := newLocalAdapterCoordinator(st)
 
-	// Create bucket without ACL header (pre-existing bucket pattern).
-	rec := httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodPut, "/legacy-bucket", nil)
-	server.handle(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
+	// Write a legacy bucket meta JSON directly into the store without the "acl"
+	// field, simulating a bucket created before the ACL feature was introduced.
+	type legacyBucketMeta struct {
+		BucketName   string `json:"bucket_name"`
+		Generation   uint64 `json:"generation"`
+		CreatedAtHLC uint64 `json:"created_at_hlc"`
+		Owner        string `json:"owner,omitempty"`
+		Region       string `json:"region,omitempty"`
+		// intentionally omits Acl to replicate the pre-ACL schema
+	}
+	legacyMeta := legacyBucketMeta{
+		BucketName:   "legacy-bucket",
+		Generation:   1,
+		CreatedAtHLC: 1,
+	}
+	legacyJSON, err := json.Marshal(legacyMeta)
+	require.NoError(t, err)
+	commitTS := coord.Clock().Next()
+	err = st.ApplyMutations(context.Background(), []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: s3keys.BucketMetaKey("legacy-bucket"), Value: legacyJSON},
+	}, commitTS-1, commitTS)
+	require.NoError(t, err)
 
-	// Upload object.
-	rec = httptest.NewRecorder()
-	req = newS3TestRequest(http.MethodPut, "/legacy-bucket/file.txt", strings.NewReader("data"))
-	server.handle(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	// Now create a server WITH credentials to test that legacy bucket is private.
+	// Create a server WITH credentials; the legacy bucket has no acl field.
 	authServer := NewS3Server(
 		nil, "", st, newLocalAdapterCoordinator(st), nil,
 		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
 	)
 
-	// Anonymous GET should fail on legacy bucket (treated as private).
-	rec = httptest.NewRecorder()
-	req = newS3TestRequest(http.MethodGet, "/legacy-bucket/file.txt", nil)
+	// Anonymous GET should fail on legacy bucket (empty acl field treated as private).
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/legacy-bucket/file.txt", nil)
 	authServer.handle(rec, req)
 	require.Equal(t, http.StatusForbidden, rec.Code)
 }
