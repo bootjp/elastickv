@@ -409,12 +409,12 @@ func startRaftServers(
 	return nil
 }
 
-func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker) error {
+func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker))
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker), adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()))
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})
@@ -595,7 +595,7 @@ type runtimeServerRunner struct {
 }
 
 func (r runtimeServerRunner) start() error {
-	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.readTracker); err != nil {
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startRaftServers(
