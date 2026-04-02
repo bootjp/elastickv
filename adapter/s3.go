@@ -58,6 +58,9 @@ const (
 	s3MaxPartSizeBytes  = 5 * 1024 * 1024 * 1024
 	s3MaxPartsPerUpload = 10000
 	s3ListPartsMaxParts = 1000
+
+	s3AclPrivate    = "private"
+	s3AclPublicRead = "public-read"
 )
 
 type S3Server struct {
@@ -79,6 +82,7 @@ type s3BucketMeta struct {
 	CreatedAtHLC uint64 `json:"created_at_hlc"`
 	Owner        string `json:"owner,omitempty"`
 	Region       string `json:"region,omitempty"`
+	Acl          string `json:"acl,omitempty"`
 }
 
 type s3ObjectManifest struct {
@@ -150,6 +154,35 @@ type s3BucketsCollection struct {
 type s3BucketEntry struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`
+}
+
+type s3AccessControlPolicy struct {
+	XMLName           xml.Name            `xml:"AccessControlPolicy"`
+	XMLNS             string              `xml:"xmlns,attr,omitempty"`
+	Owner             s3AclOwner          `xml:"Owner"`
+	AccessControlList s3AccessControlList `xml:"AccessControlList"`
+}
+
+type s3AclOwner struct {
+	ID          string `xml:"ID"`
+	DisplayName string `xml:"DisplayName"`
+}
+
+type s3AccessControlList struct {
+	Grants []s3AclGrant `xml:"Grant"`
+}
+
+type s3AclGrant struct {
+	Grantee    s3AclGrantee `xml:"Grantee"`
+	Permission string       `xml:"Permission"`
+}
+
+type s3AclGrantee struct {
+	XMLNS       string `xml:"xmlns:xsi,attr,omitempty"`
+	Type        string `xml:"xsi:type,attr"`
+	ID          string `xml:"ID,omitempty"`
+	DisplayName string `xml:"DisplayName,omitempty"`
+	URI         string `xml:"URI,omitempty"`
 }
 
 type s3ListBucketResult struct {
@@ -302,14 +335,15 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.maybeProxyToLeader(w, r) {
 		return
 	}
-	if authErr := s.authorizeRequest(r); authErr != nil {
-		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, "", "")
-		return
-	}
 
 	bucket, objectKey, hasObject, err := parseS3Path(r)
 	if err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidURI", err.Error(), bucket, objectKey)
+		return
+	}
+
+	if authErr := s.resolveAuth(r, bucket); authErr != nil {
+		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, bucket, objectKey)
 		return
 	}
 
@@ -323,6 +357,42 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *S3Server) resolveAuth(r *http.Request, bucket string) *s3AuthError {
+	// When no credentials are configured, all requests are permitted without auth.
+	if len(s.staticCreds) == 0 {
+		return nil
+	}
+	// Write methods always require authentication.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return s.authorizeRequest(r)
+	}
+	// ListBuckets (no bucket) always requires authentication.
+	if bucket == "" {
+		return s.authorizeRequest(r)
+	}
+	// ACL query parameter requests always require authentication.
+	if r.URL.Query().Has("acl") {
+		return s.authorizeRequest(r)
+	}
+	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
+	// already authenticated; skip the public-bucket metadata read on the hot path.
+	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
+		return s.authorizeRequest(r)
+	}
+	// Check if the bucket is public-read and the request is read-only.
+	if isReadOnlyS3Request(r) {
+		readTS := s.readTS()
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+		if err == nil && isPublicReadBucket(meta) {
+			return nil
+		}
+	}
+	return s.authorizeRequest(r)
+}
+
 func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", "", "")
@@ -331,7 +401,20 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	s.listBuckets(w, r)
 }
 
+//nolint:cyclop // handleBucket routes to sub-handlers based on method+query; branching is by design.
 func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	query := r.URL.Query()
+	if query.Has("acl") {
+		switch r.Method {
+		case http.MethodGet:
+			s.getBucketAcl(w, r, bucket)
+		case http.MethodPut:
+			s.putBucketAcl(w, r, bucket)
+		default:
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", bucket, "")
+		}
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		s.createBucket(w, r, bucket)
@@ -340,7 +423,7 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket s
 	case http.MethodDelete:
 		s.deleteBucket(w, r, bucket)
 	case http.MethodGet:
-		if r.URL.Query().Get("list-type") == "2" {
+		if query.Get("list-type") == "2" {
 			s.listObjectsV2(w, r, bucket)
 			return
 		}
@@ -424,9 +507,18 @@ func (s *S3Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	writeS3XML(w, http.StatusOK, out)
 }
 
+//nolint:cyclop // createBucket includes ACL validation and bucket-existence checks.
 func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	if err := validateS3BucketName(bucket); err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", err.Error(), bucket, "")
+		return
+	}
+	acl := strings.TrimSpace(r.Header.Get("x-amz-acl"))
+	if acl == "" {
+		acl = s3AclPrivate
+	}
+	if err := validateS3CannedAcl(acl); err != nil {
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", err.Error(), bucket, "")
 		return
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
@@ -461,6 +553,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 			Generation:   nextGeneration,
 			CreatedAtHLC: commitTS,
 			Region:       s.effectiveRegion(),
+			Acl:          acl,
 		}
 		body, err := encodeS3BucketMeta(meta)
 		if err != nil {
@@ -550,6 +643,104 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists || meta == nil {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		return
+	}
+
+	ownerID := meta.Owner
+	if ownerID == "" {
+		ownerID = "owner"
+	}
+	grants := []s3AclGrant{
+		{
+			Grantee: s3AclGrantee{
+				XMLNS:       "http://www.w3.org/2001/XMLSchema-instance",
+				Type:        "CanonicalUser",
+				ID:          ownerID,
+				DisplayName: ownerID,
+			},
+			Permission: "FULL_CONTROL",
+		},
+	}
+	if meta.Acl == s3AclPublicRead {
+		grants = append(grants, s3AclGrant{
+			Grantee: s3AclGrantee{
+				XMLNS: "http://www.w3.org/2001/XMLSchema-instance",
+				Type:  "Group",
+				URI:   "http://acs.amazonaws.com/groups/global/AllUsers",
+			},
+			Permission: "READ",
+		})
+	}
+
+	writeS3XML(w, http.StatusOK, s3AccessControlPolicy{
+		XMLNS:             s3XMLNamespace,
+		Owner:             s3AclOwner{ID: ownerID, DisplayName: ownerID},
+		AccessControlList: s3AccessControlList{Grants: grants},
+	})
+}
+
+func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
+	acl := strings.TrimSpace(r.Header.Get("x-amz-acl"))
+	if acl == "" {
+		acl = s3AclPrivate
+	}
+	if err := validateS3CannedAcl(acl); err != nil {
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", err.Error(), bucket, "")
+		return
+	}
+
+	err := s.retryS3Mutation(r.Context(), func() error {
+		readTS := s.readTS()
+		startTS := s.txnStartTS(readTS)
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !exists || meta == nil {
+			return &s3ResponseError{
+				Status:  http.StatusNotFound,
+				Code:    "NoSuchBucket",
+				Message: "bucket not found",
+				Bucket:  bucket,
+			}
+		}
+
+		meta.Acl = acl
+		body, err := encodeS3BucketMeta(meta)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+			IsTxn:   true,
+			StartTS: startTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: body},
+			},
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
+		writeS3MutationError(w, err, bucket, "")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 //nolint:cyclop,gocognit,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
@@ -2419,6 +2610,32 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		return
 	}
 	writeS3InternalError(w, err)
+}
+
+var errUnsupportedCannedAcl = errors.New("unsupported canned ACL")
+
+func validateS3CannedAcl(acl string) error {
+	switch acl {
+	case "", s3AclPrivate, s3AclPublicRead:
+		return nil
+	default:
+		return errors.Wrapf(errUnsupportedCannedAcl, "%s", acl)
+	}
+}
+
+func isPublicReadBucket(meta *s3BucketMeta) bool {
+	return meta != nil && meta.Acl == s3AclPublicRead
+}
+
+func isReadOnlyS3Request(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	q := r.URL.Query()
+	if q.Has("acl") || q.Has("uploads") || q.Has("uploadId") {
+		return false
+	}
+	return true
 }
 
 func validateS3BucketName(bucket string) error {

@@ -35,6 +35,9 @@ Optional environment:
   S3_PORT
   S3_REGION
   S3_CREDENTIALS_FILE
+    Path to an S3 credentials file on each target host. This file must already
+    exist and be readable on every remote node; it will be bind-mounted into
+    the container at the same path.
   S3_PATH_STYLE_ONLY
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS
@@ -639,7 +642,11 @@ stop_container() {
 run_container() {
   local s3_creds_volume=()
   local s3_creds_flag=()
-  if [[ -n "$S3_CREDENTIALS_FILE" ]]; then
+  if [[ -n "${S3_CREDENTIALS_FILE:-}" ]]; then
+    if [[ ! -f "$S3_CREDENTIALS_FILE" || ! -r "$S3_CREDENTIALS_FILE" ]]; then
+      echo "S3_CREDENTIALS_FILE is set to '$S3_CREDENTIALS_FILE' but the file is missing or not readable; aborting docker run" >&2
+      exit 1
+    fi
     s3_creds_volume=(-v "${S3_CREDENTIALS_FILE}:${S3_CREDENTIALS_FILE}:ro")
     s3_creds_flag=(--s3CredentialsFile "$S3_CREDENTIALS_FILE")
   fi

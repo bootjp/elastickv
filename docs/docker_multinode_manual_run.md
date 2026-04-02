@@ -48,7 +48,7 @@ These examples prioritize operational clarity, not hardening. Treat them as base
 
 - Mandatory isolation: do not expose any Elastickv cluster port to the public Internet or to shared/multi-tenant networks.
 - Restrict inbound sources with firewall/security groups/NACLs so only Elastickv nodes and tightly controlled admin hosts can connect.
-- Endpoints are unauthenticated and plaintext by default: gRPC (including `RaftAdmin`), Redis API, DynamoDB-compatible API, and S3-compatible API (unless `--s3CredentialsFile` is configured).
+- All endpoints use plaintext transport (no TLS) and are unauthenticated by default: gRPC (including `RaftAdmin`), Redis API, DynamoDB-compatible API, and S3-compatible API. The S3-compatible API remains plaintext HTTP even when `--s3CredentialsFile` is configured; that option only enables SigV4 authentication. Buckets marked as `public-read` (via `PutBucketAcl` or `x-amz-acl` header on `CreateBucket`) allow unauthenticated read access (GetObject, HeadObject, ListObjectsV2) even when credentials are configured.
 - Any principal with network access to these ports can read/modify data and reconfigure cluster membership.
 - Run Elastickv on dedicated private subnets/VPCs for the cluster, without direct Internet routing and without cross-tenant sharing.
 - Enforce network segmentation and, where possible, add TLS/mTLS and authentication via Elastickv features or a trusted terminating proxy/service mesh.
@@ -97,7 +97,7 @@ Shared metrics bearer token (required because the examples bind `--metricsAddres
 ELASTICKV_METRICS_TOKEN="$(openssl rand -hex 32)"
 ```
 
-For a 4-node cluster, remove the `n5` entry from all variables above.
+For a 4-node cluster, remove the n5 entry from RAFT_TO_REDIS_MAP, RAFT_TO_S3_MAP, and RAFT_BOOTSTRAP_MEMBERS.
 
 ## 4) Start Nodes with `docker run`
 
