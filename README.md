@@ -198,7 +198,34 @@ aws --endpoint-url http://localhost:9000 s3api list-objects-v2 \
   --bucket my-bucket
 ```
 
-See `docs/s3_compatible_adapter_design.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan.
+#### Public Bucket Access
+
+Buckets support a bucket-level ACL that allows anonymous (unauthenticated) read access. Supported canned ACL values are `private` (default) and `public-read`.
+
+```bash
+# Create a public bucket
+aws --endpoint-url http://localhost:9000 s3api create-bucket \
+  --bucket public-assets --acl public-read
+
+# Change an existing bucket to public
+aws --endpoint-url http://localhost:9000 s3api put-bucket-acl \
+  --bucket my-bucket --acl public-read
+
+# Check a bucket's ACL
+aws --endpoint-url http://localhost:9000 s3api get-bucket-acl \
+  --bucket my-bucket
+
+# Anonymous download (no credentials required)
+curl http://localhost:9000/public-assets/hello.txt
+
+# Revert to private
+aws --endpoint-url http://localhost:9000 s3api put-bucket-acl \
+  --bucket my-bucket --acl private
+```
+
+Public buckets allow unauthenticated `GetObject`, `HeadObject`, `HeadBucket`, and `ListObjectsV2`. Write operations (`PutObject`, `DeleteObject`, multipart uploads) always require authentication. `ListBuckets` and ACL management also always require authentication.
+
+See `docs/s3_compatible_adapter_design.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan. See `docs/s3_public_bucket_design.md` for the public bucket ACL design.
 
 ### Connecting to a Follower Node
 To connect to a follower node:

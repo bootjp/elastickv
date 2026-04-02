@@ -23,6 +23,7 @@ import (
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	json "github.com/goccy/go-json"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -592,6 +593,34 @@ func newSignedS3Request(
 	expectedAuth, err := buildS3AuthorizationHeader(req, testS3AccessKey, testS3SecretKey, testS3Region, signingTime, payloadHash)
 	require.NoError(t, err)
 	require.Equal(t, strings.TrimSpace(req.Header.Get("Authorization")), expectedAuth)
+	return req
+}
+
+func resignS3Request(t *testing.T, req *http.Request, signingTime time.Time) *http.Request {
+	t.Helper()
+
+	payloadHash := sha256Hex("")
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Amz-Date")
+
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
+		opts.DisableURIPathEscaping = true
+	})
+	err := signer.SignHTTP(
+		context.Background(),
+		aws.Credentials{
+			AccessKeyID:     testS3AccessKey,
+			SecretAccessKey: testS3SecretKey,
+			Source:          "test",
+		},
+		req,
+		payloadHash,
+		"s3",
+		testS3Region,
+		signingTime,
+	)
+	require.NoError(t, err)
 	return req
 }
 
@@ -1532,4 +1561,461 @@ func TestS3Server_PresignedURLWrongCredentials(t *testing.T) {
 	server.handle(rec, presignGetReq)
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	require.Contains(t, rec.Body.String(), "InvalidAccessKeyId")
+}
+
+// --- Public Bucket ACL Tests ---
+
+func TestS3Server_PublicBucket_AnonymousGetObject(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Create bucket with public-read ACL (signed).
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/pub-bucket", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "create bucket: %s", rec.Body.String())
+
+	// Upload object (signed).
+	payload := "public-data"
+	req = newSignedS3Request(t, "/pub-bucket/file.txt", payload, sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "put object: %s", rec.Body.String())
+
+	// Anonymous GET (no auth header).
+	req = newS3TestRequest(http.MethodGet, "/pub-bucket/file.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "anonymous get: %s", rec.Body.String())
+	require.Equal(t, payload, rec.Body.String())
+}
+
+func TestS3Server_PublicBucket_AnonymousPutRejected(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Create public bucket.
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/pub-bucket-wr", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous PUT must be rejected.
+	req = newS3TestRequest(http.MethodPut, "/pub-bucket-wr/file.txt", strings.NewReader("evil"))
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestS3Server_PublicBucket_AnonymousListObjectsV2(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	// Create public bucket.
+	req := newSignedS3Request(t, "/pub-list", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload object.
+	req = newSignedS3Request(t, "/pub-list/obj.txt", "data", sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous ListObjectsV2.
+	req = newS3TestRequest(http.MethodGet, "/pub-list?list-type=2", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Key>obj.txt</Key>")
+}
+
+func TestS3Server_PrivateBucket_AnonymousGetRejected(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	// Create private bucket (default ACL).
+	req := newSignedS3Request(t, "/priv-bucket", "", sigTime)
+	req.Method = http.MethodPut
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload object.
+	req = newSignedS3Request(t, "/priv-bucket/secret.txt", "secret", sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous GET rejected.
+	req = newS3TestRequest(http.MethodGet, "/priv-bucket/secret.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestS3Server_PutBucketAcl_ChangeToPublicAndBack(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	// Create private bucket.
+	req := newSignedS3Request(t, "/acl-bucket", "", sigTime)
+	req.Method = http.MethodPut
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload object.
+	req = newSignedS3Request(t, "/acl-bucket/file.txt", "hello", sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous GET should fail (private).
+	req = newS3TestRequest(http.MethodGet, "/acl-bucket/file.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+
+	// PutBucketAcl → public-read.
+	req = newSignedS3Request(t, "/acl-bucket?acl", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "put acl: %s", rec.Body.String())
+
+	// Anonymous GET should now succeed.
+	req = newS3TestRequest(http.MethodGet, "/acl-bucket/file.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "hello", rec.Body.String())
+
+	// PutBucketAcl → private.
+	req = newSignedS3Request(t, "/acl-bucket?acl", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "private")
+	req = resignS3Request(t, req, sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous GET should fail again.
+	req = newS3TestRequest(http.MethodGet, "/acl-bucket/file.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestS3Server_GetBucketAcl_Private(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/acl-get-priv", "", sigTime)
+	req.Method = http.MethodPut
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// GetBucketAcl on private bucket.
+	req = newSignedS3Request(t, "/acl-get-priv?acl", "", sigTime)
+	req.Method = http.MethodGet
+	req = resignS3Request(t, req, sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	require.Contains(t, body, "FULL_CONTROL")
+	require.NotContains(t, body, "AllUsers")
+}
+
+func TestS3Server_GetBucketAcl_PublicRead(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/acl-get-pub", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// GetBucketAcl on public bucket.
+	req = newSignedS3Request(t, "/acl-get-pub?acl", "", sigTime)
+	req.Method = http.MethodGet
+	req = resignS3Request(t, req, sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	require.Contains(t, body, "FULL_CONTROL")
+	require.Contains(t, body, "AllUsers")
+	require.Contains(t, body, "READ")
+}
+
+func TestS3Server_CreateBucketWithUnsupportedAcl(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/unsupported-acl", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read-write")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+}
+
+func TestS3Server_PublicBucket_AnonymousHeadObject(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/pub-head", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload object.
+	req = newSignedS3Request(t, "/pub-head/file.txt", "head-test", sigTime)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous HEAD.
+	req = newS3TestRequest(http.MethodHead, "/pub-head/file.txt", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "9", rec.Header().Get("Content-Length"))
+}
+
+func TestS3Server_PublicBucket_AnonymousGetBucketAclRejected(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	req := newSignedS3Request(t, "/pub-acl-reject", "", sigTime)
+	req.Method = http.MethodPut
+	req.Header.Set("x-amz-acl", "public-read")
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Anonymous GetBucketAcl must be rejected even on public bucket.
+	req = newS3TestRequest(http.MethodGet, "/pub-acl-reject?acl", nil)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestS3Server_BackwardCompatibility_NoBucketAclFieldIsPrivate(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+
+	// Write legacy bucket metadata as JSON directly into the store without the
+	// "acl" field, simulating a bucket created before the ACL feature was introduced.
+	type legacyBucketMeta struct {
+		BucketName   string `json:"bucket_name"`
+		Generation   uint64 `json:"generation"`
+		CreatedAtHLC uint64 `json:"created_at_hlc"`
+		Owner        string `json:"owner,omitempty"`
+		Region       string `json:"region,omitempty"`
+		// intentionally omits Acl to replicate the pre-ACL schema
+	}
+	legacyMeta := legacyBucketMeta{
+		BucketName:   "legacy-bucket",
+		Generation:   1,
+		CreatedAtHLC: 1,
+	}
+	legacyJSON, err := json.Marshal(legacyMeta)
+	require.NoError(t, err)
+	commitTS := coord.Clock().Next()
+	err = st.ApplyMutations(context.Background(), []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: s3keys.BucketMetaKey("legacy-bucket"), Value: legacyJSON},
+	}, commitTS-1, commitTS)
+	require.NoError(t, err)
+
+	// Create a server WITH credentials; the legacy bucket has no acl field.
+	authServer := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	// Anonymous GET should fail on legacy bucket (empty acl field treated as private).
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodGet, "/legacy-bucket/file.txt", nil)
+	authServer.handle(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestS3Server_PutBucketAcl_RejectsXMLBody(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	// Create bucket first.
+	req := newSignedS3Request(t, "/xml-acl-bucket", "", sigTime)
+	req.Method = http.MethodPut
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// PutBucketAcl with XML body and explicit ContentLength — must be rejected.
+	xmlBody := `<AccessControlPolicy><Owner><ID>owner</ID></Owner></AccessControlPolicy>`
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
+	req.ContentLength = int64(len(xmlBody))
+	payloadHash := sha256Hex(xmlBody)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	err := signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
+	}, req, payloadHash, "s3", testS3Region, sigTime)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+
+	// PutBucketAcl with chunked body (ContentLength == -1) — must also be rejected.
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
+	req.ContentLength = -1 // simulate chunked transfer encoding
+	payloadHash = sha256Hex(xmlBody)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	signer = v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	err = signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
+	}, req, payloadHash, "s3", testS3Region, sigTime)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+}
+
+func TestIsReadOnlyS3Request(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   bool
+	}{
+		// Allowed: object-level GET/HEAD with no query params.
+		{"GetObject", http.MethodGet, "/bucket/key.txt", true},
+		{"HeadObject", http.MethodHead, "/bucket/key.txt", true},
+		// Allowed: HeadBucket with no query params.
+		{"HeadBucket", http.MethodHead, "/bucket", true},
+		// Allowed: ListObjectsV2.
+		{"ListObjectsV2", http.MethodGet, "/bucket?list-type=2", true},
+		// Not allowed: bucket GET without list-type=2 (returns NotImplemented later, not via anonymous path).
+		{"GetBucket_NoListType", http.MethodGet, "/bucket", false},
+		// Not allowed: object GET with extra query params.
+		{"GetObject_WithQuery", http.MethodGet, "/bucket/key.txt?versionId=xyz", false},
+		// Allowed: HeadBucket with "location" query param.
+		{"HeadBucket_WithLocation", http.MethodHead, "/bucket?location", true},
+		// Not allowed: ACL / multipart subresources.
+		{"GetAcl", http.MethodGet, "/bucket?acl", false},
+		{"ListMultipart", http.MethodGet, "/bucket?uploads", false},
+		{"GetUploadPart", http.MethodGet, "/bucket/key.txt?uploadId=u1", false},
+		// Not allowed: write methods.
+		{"PutObject", http.MethodPut, "/bucket/key.txt", false},
+		{"DeleteObject", http.MethodDelete, "/bucket/key.txt", false},
+		// Not allowed: root path.
+		{"ListBuckets", http.MethodGet, "/", false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := newS3TestRequest(tc.method, tc.path, nil)
+			require.Equal(t, tc.want, isReadOnlyS3Request(req), "path=%s method=%s", tc.path, tc.method)
+		})
+	}
 }
