@@ -1928,3 +1928,94 @@ func TestS3Server_BackwardCompatibility_NoBucketAclFieldIsPrivate(t *testing.T) 
 	authServer.handle(rec, req)
 	require.Equal(t, http.StatusForbidden, rec.Code)
 }
+
+func TestS3Server_PutBucketAcl_RejectsXMLBody(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
+	)
+
+	sigTime := currentS3SigningTime()
+	// Create bucket first.
+	req := newSignedS3Request(t, "/xml-acl-bucket", "", sigTime)
+	req.Method = http.MethodPut
+	req = resignS3Request(t, req, sigTime)
+	rec := httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// PutBucketAcl with XML body and explicit ContentLength — must be rejected.
+	xmlBody := `<AccessControlPolicy><Owner><ID>owner</ID></Owner></AccessControlPolicy>`
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
+	req.ContentLength = int64(len(xmlBody))
+	payloadHash := sha256Hex(xmlBody)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	err := signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
+	}, req, payloadHash, "s3", testS3Region, sigTime)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+
+	// PutBucketAcl with chunked body (ContentLength == -1) — must also be rejected.
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/xml-acl-bucket?acl", strings.NewReader(xmlBody))
+	req.ContentLength = -1 // simulate chunked transfer encoding
+	payloadHash = sha256Hex(xmlBody)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	signer = v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	err = signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: testS3AccessKey, SecretAccessKey: testS3SecretKey, Source: "test",
+	}, req, payloadHash, "s3", testS3Region, sigTime)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+}
+
+func TestIsReadOnlyS3Request(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   bool
+	}{
+		// Allowed: object-level GET/HEAD with no query params.
+		{"GetObject", http.MethodGet, "/bucket/key.txt", true},
+		{"HeadObject", http.MethodHead, "/bucket/key.txt", true},
+		// Allowed: HeadBucket with no query params.
+		{"HeadBucket", http.MethodHead, "/bucket", true},
+		// Allowed: ListObjectsV2.
+		{"ListObjectsV2", http.MethodGet, "/bucket?list-type=2", true},
+		// Not allowed: bucket GET without list-type=2 (returns NotImplemented later, not via anonymous path).
+		{"GetBucket_NoListType", http.MethodGet, "/bucket", false},
+		// Not allowed: object GET with extra query params.
+		{"GetObject_WithQuery", http.MethodGet, "/bucket/key.txt?versionId=xyz", false},
+		// Allowed: HeadBucket with "location" query param.
+		{"HeadBucket_WithLocation", http.MethodHead, "/bucket?location", true},
+		// Not allowed: ACL / multipart subresources.
+		{"GetAcl", http.MethodGet, "/bucket?acl", false},
+		{"ListMultipart", http.MethodGet, "/bucket?uploads", false},
+		{"GetUploadPart", http.MethodGet, "/bucket/key.txt?uploadId=u1", false},
+		// Not allowed: write methods.
+		{"PutObject", http.MethodPut, "/bucket/key.txt", false},
+		{"DeleteObject", http.MethodDelete, "/bucket/key.txt", false},
+		// Not allowed: root path.
+		{"ListBuckets", http.MethodGet, "/", false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := newS3TestRequest(tc.method, tc.path, nil)
+			require.Equal(t, tc.want, isReadOnlyS3Request(req), "path=%s method=%s", tc.path, tc.method)
+		})
+	}
+}

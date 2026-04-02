@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
 	"crypto/rand"
@@ -703,6 +704,25 @@ func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
+	// ACL specification via XML body is not supported; only the x-amz-acl header is accepted.
+	// Detect a body via ContentLength, and also peek for chunked-encoded bodies (ContentLength == -1).
+	hasBody := r.ContentLength > 0
+	if !hasBody && r.ContentLength < 0 && r.Body != nil {
+		buf := make([]byte, 1)
+		n, readErr := r.Body.Read(buf)
+		if n > 0 {
+			hasBody = true
+			// Restore the peeked byte so the body is not corrupted for any downstream use.
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+		} else if readErr != nil && !errors.Is(readErr, io.EOF) {
+			// Conservatively treat unexpected read errors as if a body is present.
+			hasBody = true
+		}
+	}
+	if hasBody {
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "ACL specification via XML body is not supported; use the x-amz-acl header", bucket, "")
+		return
+	}
 	acl := strings.TrimSpace(r.Header.Get("x-amz-acl"))
 	if acl == "" {
 		acl = s3AclPrivate
@@ -2637,14 +2657,39 @@ func isPublicReadBucket(meta *s3BucketMeta) bool {
 }
 
 func isReadOnlyS3Request(r *http.Request) bool {
+	// Only GET/HEAD are considered for anonymous read-only access.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
+
 	q := r.URL.Query()
+
+	// Explicitly disallow operations that modify ACLs or multipart uploads.
 	if q.Has("acl") || q.Has("uploads") || q.Has("uploadId") {
 		return false
 	}
-	return true
+
+	// Use parseS3Path for consistent path parsing (EscapedPath + PathUnescape) matching handle().
+	bucket, _, hasObject, err := parseS3Path(r)
+	if err != nil || bucket == "" {
+		return false
+	}
+
+	if hasObject {
+		// Object-level operations: only plain GetObject / HeadObject (no extra query params).
+		return len(q) == 0
+	}
+
+	// Bucket-level operations.
+	switch r.Method {
+	case http.MethodHead:
+		// HeadBucket: no query params (or only "location").
+		return len(q) == 0 || (len(q) == 1 && q.Has("location"))
+	case http.MethodGet:
+		// ListObjectsV2 only.
+		return q.Get("list-type") == "2"
+	}
+	return false
 }
 
 func validateS3BucketName(bucket string) error {

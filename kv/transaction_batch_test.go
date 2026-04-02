@@ -203,4 +203,5 @@ func TestNeedsTxnCleanupSkipsAbortRequests(t *testing.T) {
 	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}}))
 	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}}))
 	require.False(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}}))
+	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase(99)}}))
 }
