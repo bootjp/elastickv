@@ -443,29 +443,29 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return r.readTracker.Pin(ts)
 }
 
-func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, f func(redcon.Conn, redcon.Command), cmd redcon.Command) {
+func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command) {
 	switch {
 	case r.requestObserver != nil:
-		mc := &redisMetricsConn{Conn: conn}
+		metricsConn := &redisMetricsConn{Conn: conn}
 		start := time.Now()
 		if r.traceCommands {
 			traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-			f(mc, cmd)
+			handler(metricsConn, cmd)
 			r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
 		} else {
-			f(mc, cmd)
+			handler(metricsConn, cmd)
 		}
 		r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
 			Command:  name,
-			IsError:  mc.hadError,
+			IsError:  metricsConn.hadError,
 			Duration: time.Since(start),
 		})
 	case r.traceCommands:
 		traceID, traceStart := r.traceCommandStart(conn, name, cmd.Args[1:])
-		f(conn, cmd)
+		handler(conn, cmd)
 		r.traceCommandFinish(traceID, conn, name, time.Since(traceStart))
 	default:
-		f(conn, cmd)
+		handler(conn, cmd)
 	}
 }
 
@@ -474,7 +474,7 @@ func (r *RedisServer) Run() error {
 		func(conn redcon.Conn, cmd redcon.Command) {
 			state := getConnState(conn)
 			name := strings.ToUpper(string(cmd.Args[0]))
-			f, ok := r.route[name]
+			handler, ok := r.route[name]
 			if !ok {
 				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
@@ -498,7 +498,7 @@ func (r *RedisServer) Run() error {
 				return
 			}
 
-			r.dispatchCommand(conn, name, f, cmd)
+			r.dispatchCommand(conn, name, handler, cmd)
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
