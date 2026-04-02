@@ -304,15 +304,18 @@ func (d *DynamoDBServer) serveHealthz(w http.ResponseWriter, r *http.Request) bo
 	if r == nil || r.URL == nil {
 		return false
 	}
-	if r.Body != nil {
-		r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
-	}
 
 	switch r.URL.Path {
 	case dynamoHealthPath:
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
+		}
 		serveDynamoHealthz(w, r)
 		return true
 	case dynamoLeaderHealthPath:
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
+		}
 		d.serveDynamoLeaderHealthz(w, r)
 		return true
 	default:
