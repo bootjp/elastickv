@@ -115,7 +115,12 @@ func TestDynamoDBServerLeaderHealthzSkipsDynamoMetrics(t *testing.T) {
 }
 
 func TestDynamoDBServerLeaderHealthzReturnsServiceUnavailableWhenNotLeader(t *testing.T) {
-	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{verifyLeaderErr: kv.ErrLeaderNotFound})
+	coord := &stubAdapterCoordinator{
+		leaderSet:       true,
+		leader:          false,
+		verifyLeaderErr: kv.ErrLeaderNotFound,
+	}
+	server := NewDynamoDBServer(nil, nil, coord)
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, dynamoLeaderHealthPath, nil)
 	rec := httptest.NewRecorder()
@@ -123,6 +128,7 @@ func TestDynamoDBServerLeaderHealthzReturnsServiceUnavailableWhenNotLeader(t *te
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Equal(t, "not leader\n", rec.Body.String())
+	require.Zero(t, coord.VerifyLeaderCalls())
 }
 
 func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t *testing.T) {

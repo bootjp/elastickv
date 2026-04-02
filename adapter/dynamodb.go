@@ -47,6 +47,8 @@ const (
 	dynamoLeaderHealthPath = "/healthz/leader"
 )
 
+const dynamoHealthMaxRequestBodyBytes = 1024
+
 const (
 	updateSplitCount            = 2
 	splitPartsInitialCapacity   = 2
@@ -299,58 +301,60 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DynamoDBServer) serveHealthz(w http.ResponseWriter, r *http.Request) bool {
-	switch {
-	case serveDynamoHealthz(w, r):
+	if r == nil || r.URL == nil {
+		return false
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, dynamoHealthMaxRequestBodyBytes)
+	}
+
+	switch r.URL.Path {
+	case dynamoHealthPath:
+		serveDynamoHealthz(w, r)
 		return true
-	case serveDynamoLeaderHealthz(w, r, d.coordinator):
+	case dynamoLeaderHealthPath:
+		d.serveDynamoLeaderHealthz(w, r)
 		return true
 	default:
 		return false
 	}
 }
 
-func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) bool {
-	if r == nil || r.URL == nil || r.URL.Path != dynamoHealthPath {
-		return false
+func serveDynamoHealthz(w http.ResponseWriter, r *http.Request) {
+	if !writeDynamoHealthMethod(w, r) {
+		return
 	}
-
-	return writeDynamoHealthResponse(w, r, http.StatusOK, "ok\n")
+	writeDynamoHealthBody(w, r, http.StatusOK, "ok\n")
 }
 
-func serveDynamoLeaderHealthz(w http.ResponseWriter, r *http.Request, coordinator kv.Coordinator) bool {
-	if r == nil || r.URL == nil || r.URL.Path != dynamoLeaderHealthPath {
-		return false
+func (d *DynamoDBServer) serveDynamoLeaderHealthz(w http.ResponseWriter, r *http.Request) {
+	if !writeDynamoHealthMethod(w, r) {
+		return
 	}
 
-	if err := writeDynamoHealthMethod(w, r); err != nil {
-		return true
-	}
-
-	if coordinator != nil && coordinator.VerifyLeader() == nil {
+	if isVerifiedDynamoLeader(d.coordinator) {
 		writeDynamoHealthBody(w, r, http.StatusOK, "ok\n")
-		return true
+		return
 	}
 
 	writeDynamoHealthBody(w, r, http.StatusServiceUnavailable, "not leader\n")
-	return true
 }
 
-func writeDynamoHealthResponse(w http.ResponseWriter, r *http.Request, statusCode int, body string) bool {
-	if err := writeDynamoHealthMethod(w, r); err != nil {
-		return true
+func isVerifiedDynamoLeader(coordinator kv.Coordinator) bool {
+	if coordinator == nil || !coordinator.IsLeader() {
+		return false
 	}
-	writeDynamoHealthBody(w, r, statusCode, body)
-	return true
+	return coordinator.VerifyLeader() == nil
 }
 
-func writeDynamoHealthMethod(w http.ResponseWriter, r *http.Request) error {
+func writeDynamoHealthMethod(w http.ResponseWriter, r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		return nil
+		return true
 	default:
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return errors.WithStack(errors.New("health method not allowed"))
+		return false
 	}
 }
 
