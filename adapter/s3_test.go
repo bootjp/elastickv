@@ -1893,8 +1893,8 @@ func TestS3Server_BackwardCompatibility_NoBucketAclFieldIsPrivate(t *testing.T) 
 	st := store.NewMVCCStore()
 	coord := newLocalAdapterCoordinator(st)
 
-	// Write a legacy bucket meta JSON directly into the store without the "acl"
-	// field, simulating a bucket created before the ACL feature was introduced.
+	// Write legacy bucket metadata as JSON directly into the store without the
+	// "acl" field, simulating a bucket created before the ACL feature was introduced.
 	type legacyBucketMeta struct {
 		BucketName   string `json:"bucket_name"`
 		Generation   uint64 `json:"generation"`

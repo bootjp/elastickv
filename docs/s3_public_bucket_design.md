@@ -182,8 +182,7 @@ func (s *S3Server) resolveAuth(r *http.Request, bucket, objectKey string) *s3Aut
     // Check the bucket's ACL
     meta, err := s.loadBucketMeta(r.Context(), bucket)
     if err != nil || meta == nil {
-        // If the bucket is not found, fall through to the auth flow
-        // (NoSuchBucket is handled later in the pipeline)
+        // If the bucket is not found, fall through to the auth flow (NoSuchBucket is handled later in the pipeline).
         return s.authorizeRequest(r)
     }
 
