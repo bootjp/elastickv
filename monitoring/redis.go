@@ -1,7 +1,6 @@
 package monitoring
 
 import (
-	"slices"
 	"strings"
 	"time"
 
@@ -14,87 +13,87 @@ const (
 	redisCommandUnknown = "unknown"
 )
 
-var redisCommands = []string{
-	"BZPOPMIN",
-	"CLIENT",
-	"DBSIZE",
-	"DEL",
-	"DISCARD",
-	"EVAL",
-	"EVALSHA",
-	"EXEC",
-	"EXISTS",
-	"EXPIRE",
-	"FLUSHALL",
-	"FLUSHDB",
-	"GET",
-	"GETDEL",
-	"HDEL",
-	"HEXISTS",
-	"HGET",
-	"HGETALL",
-	"HINCRBY",
-	"HLEN",
-	"HMGET",
-	"HMSET",
-	"HSET",
-	"INCR",
-	"INFO",
-	"KEYS",
-	"LINDEX",
-	"LLEN",
-	"LPOP",
-	"LPOS",
-	"LPUSH",
-	"LRANGE",
-	"LREM",
-	"LSET",
-	"LTRIM",
-	"MULTI",
-	"PEXPIRE",
-	"PFADD",
-	"PFCOUNT",
-	"PING",
-	"PTTL",
-	"PUBLISH",
-	"PUBSUB",
-	"QUIT",
-	"RENAME",
-	"RPOP",
-	"RPOPLPUSH",
-	"RPUSH",
-	"SADD",
-	"SCAN",
-	"SCARD",
-	"SELECT",
-	"SET",
-	"SETEX",
-	"SETNX",
-	"SISMEMBER",
-	"SMEMBERS",
-	"SREM",
-	"SUBSCRIBE",
-	"TTL",
-	"TYPE",
-	"XADD",
-	"XLEN",
-	"XRANGE",
-	"XREAD",
-	"XREVRANGE",
-	"XTRIM",
-	"ZADD",
-	"ZCARD",
-	"ZCOUNT",
-	"ZINCRBY",
-	"ZPOPMIN",
-	"ZRANGE",
-	"ZRANGEBYSCORE",
-	"ZREM",
-	"ZREMRANGEBYRANK",
-	"ZREMRANGEBYSCORE",
-	"ZREVRANGE",
-	"ZREVRANGEBYSCORE",
-	"ZSCORE",
+var redisCommandSet = map[string]struct{}{
+	"BZPOPMIN":         {},
+	"CLIENT":           {},
+	"DBSIZE":           {},
+	"DEL":              {},
+	"DISCARD":          {},
+	"EVAL":             {},
+	"EVALSHA":          {},
+	"EXEC":             {},
+	"EXISTS":           {},
+	"EXPIRE":           {},
+	"FLUSHALL":         {},
+	"FLUSHDB":          {},
+	"GET":              {},
+	"GETDEL":           {},
+	"HDEL":             {},
+	"HEXISTS":          {},
+	"HGET":             {},
+	"HGETALL":          {},
+	"HINCRBY":          {},
+	"HLEN":             {},
+	"HMGET":            {},
+	"HMSET":            {},
+	"HSET":             {},
+	"INCR":             {},
+	"INFO":             {},
+	"KEYS":             {},
+	"LINDEX":           {},
+	"LLEN":             {},
+	"LPOP":             {},
+	"LPOS":             {},
+	"LPUSH":            {},
+	"LRANGE":           {},
+	"LREM":             {},
+	"LSET":             {},
+	"LTRIM":            {},
+	"MULTI":            {},
+	"PEXPIRE":          {},
+	"PFADD":            {},
+	"PFCOUNT":          {},
+	"PING":             {},
+	"PTTL":             {},
+	"PUBLISH":          {},
+	"PUBSUB":           {},
+	"QUIT":             {},
+	"RENAME":           {},
+	"RPOP":             {},
+	"RPOPLPUSH":        {},
+	"RPUSH":            {},
+	"SADD":             {},
+	"SCAN":             {},
+	"SCARD":            {},
+	"SELECT":           {},
+	"SET":              {},
+	"SETEX":            {},
+	"SETNX":            {},
+	"SISMEMBER":        {},
+	"SMEMBERS":         {},
+	"SREM":             {},
+	"SUBSCRIBE":        {},
+	"TTL":              {},
+	"TYPE":             {},
+	"XADD":             {},
+	"XLEN":             {},
+	"XRANGE":           {},
+	"XREAD":            {},
+	"XREVRANGE":        {},
+	"XTRIM":            {},
+	"ZADD":             {},
+	"ZCARD":            {},
+	"ZCOUNT":           {},
+	"ZINCRBY":          {},
+	"ZPOPMIN":          {},
+	"ZRANGE":           {},
+	"ZRANGEBYSCORE":    {},
+	"ZREM":             {},
+	"ZREMRANGEBYRANK":  {},
+	"ZREMRANGEBYSCORE": {},
+	"ZREVRANGE":        {},
+	"ZREVRANGEBYSCORE": {},
+	"ZSCORE":           {},
 }
 
 // RedisRequestObserver records per-command Redis API metrics.
@@ -111,21 +110,13 @@ type RedisRequestReport struct {
 
 // RedisMetrics holds all Prometheus metric vectors for the Redis adapter.
 type RedisMetrics struct {
-	inflightRequests *prometheus.GaugeVec
-	requestsTotal    *prometheus.CounterVec
-	requestDuration  *prometheus.HistogramVec
-	errorsTotal      *prometheus.CounterVec
+	requestsTotal   *prometheus.CounterVec
+	requestDuration *prometheus.HistogramVec
+	errorsTotal     *prometheus.CounterVec
 }
 
 func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 	m := &RedisMetrics{
-		inflightRequests: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "elastickv_redis_inflight_requests",
-				Help: "Current number of in-flight Redis API requests.",
-			},
-			[]string{"command"},
-		),
 		requestsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_redis_requests_total",
@@ -151,7 +142,6 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 	}
 
 	registerer.MustRegister(
-		m.inflightRequests,
 		m.requestsTotal,
 		m.requestDuration,
 		m.errorsTotal,
@@ -184,7 +174,7 @@ func normalizeRedisCommand(command string) string {
 	if command == "" {
 		return redisCommandUnknown
 	}
-	if !slices.Contains(redisCommands, command) {
+	if _, ok := redisCommandSet[command]; !ok {
 		return redisCommandUnknown
 	}
 	return command
