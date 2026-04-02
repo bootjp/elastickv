@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -11,7 +12,11 @@ import (
 )
 
 type stubAdapterCoordinator struct {
-	clock *kv.HLC
+	clock           *kv.HLC
+	verifyLeaderErr error
+	leaderSet       bool
+	leader          bool
+	verifyCalls     atomic.Int32
 }
 
 func (s *stubAdapterCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -19,11 +24,15 @@ func (s *stubAdapterCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv
 }
 
 func (s *stubAdapterCoordinator) IsLeader() bool {
+	if s.leaderSet {
+		return s.leader
+	}
 	return true
 }
 
 func (s *stubAdapterCoordinator) VerifyLeader() error {
-	return nil
+	s.verifyCalls.Add(1)
+	return s.verifyLeaderErr
 }
 
 func (s *stubAdapterCoordinator) RaftLeader() raft.ServerAddress {
@@ -47,6 +56,13 @@ func (s *stubAdapterCoordinator) Clock() *kv.HLC {
 		s.clock = kv.NewHLC()
 	}
 	return s.clock
+}
+
+func (s *stubAdapterCoordinator) VerifyLeaderCalls() int32 {
+	if s == nil {
+		return 0
+	}
+	return s.verifyCalls.Load()
 }
 
 type tsTrackingStore struct {

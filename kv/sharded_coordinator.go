@@ -242,7 +242,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 		}
 		r, err := commitSecondaryWithRetry(g, req)
 		if err != nil {
-			c.log.Warn("txn secondary commit failed",
+			c.logger().Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
@@ -276,6 +276,13 @@ func commitSecondaryWithRetry(g *ShardGroup, req *pb.Request) (*TransactionRespo
 	return nil, errors.WithStack(lastErr)
 }
 
+func (c *ShardedCoordinator) logger() *slog.Logger {
+	if c != nil && c.log != nil {
+		return c.log
+	}
+	return slog.Default()
+}
+
 func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
 	if len(prepared) == 0 {
 		return
@@ -300,7 +307,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			if errors.Is(err, ErrTxnAlreadyCommitted) {
 				continue
 			}
-			c.log.Warn("txn abort failed; locks may remain until TTL expiry",
+			c.logger().Warn("txn abort failed; locks may remain until TTL expiry",
 				slog.Uint64("gid", pg.gid),
 				slog.String("primary_key", string(primaryKey)),
 				slog.Uint64("start_ts", startTS),
