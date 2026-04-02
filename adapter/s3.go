@@ -694,6 +694,11 @@ func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
+	// ACL specification via XML body is not supported; only the x-amz-acl header is accepted.
+	if r.ContentLength > 0 {
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "ACL specification via XML body is not supported; use the x-amz-acl header", bucket, "")
+		return
+	}
 	acl := strings.TrimSpace(r.Header.Get("x-amz-acl"))
 	if acl == "" {
 		acl = s3AclPrivate
@@ -2628,14 +2633,46 @@ func isPublicReadBucket(meta *s3BucketMeta) bool {
 }
 
 func isReadOnlyS3Request(r *http.Request) bool {
+	// Only GET/HEAD are considered for anonymous read-only access.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
+
 	q := r.URL.Query()
+
+	// Explicitly disallow operations that modify ACLs or multipart uploads.
 	if q.Has("acl") || q.Has("uploads") || q.Has("uploadId") {
 		return false
 	}
-	return true
+
+	// Parse path to distinguish bucket-level vs object-level operations.
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" {
+		return false
+	}
+
+	// Split into at most three segments: ["bucket"], ["bucket", ""], or ["bucket", "key..."].
+	parts := strings.SplitN(path, "/", 3)
+	if parts[0] == "" {
+		return false
+	}
+	hasObject := len(parts) >= 2 && parts[1] != ""
+
+	if hasObject {
+		// Object-level operations: only plain GetObject / HeadObject (no extra query params).
+		return len(q) == 0
+	}
+
+	// Bucket-level operations.
+	switch r.Method {
+	case http.MethodHead:
+		// HeadBucket: no query params (or only "location").
+		return len(q) == 0 || (len(q) == 1 && q.Has("location"))
+	case http.MethodGet:
+		// ListObjectsV2 only.
+		return q.Get("list-type") == "2"
+	}
+	return false
 }
 
 func validateS3BucketName(bucket string) error {
