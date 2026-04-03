@@ -10,14 +10,14 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// HashiCorp Raft's leader lease is used for leader step-down, not as a read
-// lease. We therefore keep only a very short local cache of successful
-// VerifyLeader probes to collapse bursty calls without treating the lease as
-// authoritative for serving reads.
+// Linearizable read fences need a fresh quorum verification for each read. The
+// shared verifier therefore deduplicates only concurrent VerifyLeader probes by
+// default; time-based reuse of successful probes is disabled unless a non-zero
+// TTL is requested explicitly.
 //
-// The cache window is intentionally shorter than the leader lease used in this
-// repository's runtime and test configurations.
-const raftLeaderVerifySuccessCacheTTL = 20 * time.Millisecond
+// HashiCorp Raft's leader lease remains a step-down mechanism, not a read
+// lease.
+const raftLeaderVerifySuccessCacheTTL time.Duration = 0
 
 type raftLeaderVerifier interface {
 	State() raft.RaftState
@@ -97,14 +97,6 @@ func (c *raftLeaderVerifyCache) stateFor(r raftLeaderVerifier) *raftLeaderVerify
 	}
 	c.states.Store(r, state)
 	return state
-}
-
-func (c *raftLeaderVerifyCache) clear(r raftLeaderVerifier) {
-	if v, ok := c.states.Load(r); ok {
-		if state, ok := v.(*raftLeaderVerifyState); ok {
-			state.verifiedAt.Store(0)
-		}
-	}
 }
 
 func verifyFreshRaftLeader(r raftLeaderVerifier) error {

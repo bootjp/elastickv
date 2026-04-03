@@ -94,6 +94,17 @@ func TestRaftLeaderVerifyCache_ExpiresAndRechecks(t *testing.T) {
 	require.Equal(t, int64(2), r.verifyCalls())
 }
 
+func TestRaftLeaderVerifyCache_ZeroTTLDoesNotReuseSequentialSuccess(t *testing.T) {
+	t.Parallel()
+
+	cache := newRaftLeaderVerifyCache(0)
+	r := newFakeRaftLeader()
+
+	require.NoError(t, cache.verify(r))
+	require.NoError(t, cache.verify(r))
+	require.Equal(t, int64(2), r.verifyCalls())
+}
+
 func TestRaftLeaderVerifyCache_DeduplicatesConcurrentVerify(t *testing.T) {
 	t.Parallel()
 
