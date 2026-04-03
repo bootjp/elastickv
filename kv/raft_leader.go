@@ -95,7 +95,6 @@ func (c *raftLeaderVerifyCache) stateFor(r raftLeaderVerifier) *raftLeaderVerify
 	if stored, ok := actual.(*raftLeaderVerifyState); ok {
 		return stored
 	}
-	c.states.Store(r, state)
 	return state
 }
 
