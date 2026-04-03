@@ -306,9 +306,6 @@ func buildShardGroups(
 			store:       st,
 			closeStores: closeStores,
 		})
-		if waiter, ok := fsm.(kv.AppliedIndexWaiter); ok {
-			kv.RegisterRaftAppliedIndexWaiter(r, waiter)
-		}
 		shardGroups[g.id] = &kv.ShardGroup{
 			Raft:  r,
 			Store: st,

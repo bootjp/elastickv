@@ -46,30 +46,19 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 		return s.localGetAt(ctx, g, key, ts)
 	}
 
-	ok, err := s.localReadAllowedForGroup(ctx, g)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	// Verify leadership with a quorum before serving reads from local state to
+	// avoid stale results from a deposed leader.
+	if isVerifiedRaftLeader(g.Raft) {
 		return s.leaderGetAt(ctx, g, key, ts)
 	}
 	return s.proxyRawGet(ctx, g, key, ts)
 }
 
-func (s *ShardStore) localReadAllowedForGroup(ctx context.Context, g *ShardGroup) (bool, error) {
-	if g == nil || g.Raft == nil {
-		return true, nil
+func isVerifiedRaftLeader(r *raft.Raft) bool {
+	if r == nil || r.State() != raft.Leader {
+		return false
 	}
-	if g.Raft.State() != raft.Leader {
-		return false, nil
-	}
-	if _, err := linearizableReadIndex(ctx, g.Raft); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return verifyRaftLeader(r) == nil
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
@@ -281,11 +270,7 @@ func (s *ShardStore) scanRouteAtDirection(
 		return filterTxnInternalKVs(kvs), nil
 	}
 
-	ok, err := s.localReadAllowedForGroup(ctx, g)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	if isVerifiedRaftLeader(g.Raft) {
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
@@ -505,16 +490,16 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 		return ts, exists, nil
 	}
 
-	ok, err := s.localReadAllowedForGroup(ctx, g)
-	if err != nil {
-		return 0, false, err
-	}
-	if ok {
-		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
-		if err != nil {
-			return 0, false, errors.WithStack(err)
+	// Avoid returning a stale watermark when our local raft instance is a
+	// deposed leader.
+	if g.Raft.State() == raft.Leader {
+		if err := verifyRaftLeader(g.Raft); err == nil {
+			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+			if err != nil {
+				return 0, false, errors.WithStack(err)
+			}
+			return ts, exists, nil
 		}
-		return ts, exists, nil
 	}
 
 	return s.proxyLatestCommitTS(ctx, g, key)

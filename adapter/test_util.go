@@ -39,9 +39,7 @@ func shutdown(nodes []Node) {
 			n.dynamoServer.Stop()
 		}
 		if n.raft != nil {
-			kv.UnregisterRaftAppliedIndexWaiter(n.raft)
-			kv.UnregisterRaftLeaderVerifier(n.raft)
-			_ = n.raft.Shutdown().Error()
+			n.raft.Shutdown()
 		}
 		if n.tm != nil {
 			if err := n.tm.Close(); err != nil {
@@ -423,9 +421,6 @@ func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg ra
 	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
-	}
-	if waiter, ok := fsm.(kv.AppliedIndexWaiter); ok {
-		kv.RegisterRaftAppliedIndexWaiter(r, waiter)
 	}
 
 	if bootstrap {

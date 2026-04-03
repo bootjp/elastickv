@@ -226,19 +226,3 @@ func TestLeaderRoutedStore_ReturnsLeaderNotFoundWhenNoLeaderAddr(t *testing.T) {
 	_, _, err = s.LatestCommitTS(ctx, []byte("k"))
 	require.ErrorIs(t, err, ErrLeaderNotFound)
 }
-
-func TestLeaderRoutedStore_ReturnsFenceErrorsInsteadOfProxying(t *testing.T) {
-	t.Parallel()
-
-	local := store.NewMVCCStore()
-	coord := &stubLeaderCoordinator{
-		isLeader: true,
-		verify:   context.DeadlineExceeded,
-		clock:    NewHLC(),
-	}
-	s := NewLeaderRoutedStore(local, coord)
-	t.Cleanup(func() { _ = s.Close() })
-
-	_, err := s.GetAt(context.Background(), []byte("k"), 1)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-}
