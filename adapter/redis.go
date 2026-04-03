@@ -981,7 +981,10 @@ func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
 func (r *RedisServer) getReadState(ctx context.Context, key []byte) (bool, uint64, bool, error) {
 	isLeader := r.coordinator.IsLeaderForKey(key)
 	if !isLeader {
-		return false, r.readTS(), false, nil
+		// Followers/proxied reads must let the leader choose the snapshot for
+		// both type checks and value reads, otherwise the GET path can mix an
+		// old local type view with a newer proxied value read.
+		return false, 0, false, nil
 	}
 
 	readTS, err := r.linearizableReadTSForKey(ctx, key)

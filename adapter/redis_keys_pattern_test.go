@@ -70,6 +70,14 @@ type tsTrackingStore struct {
 	scanTS []uint64
 }
 
+type followerKeyCoordinator struct {
+	*stubAdapterCoordinator
+}
+
+func (c *followerKeyCoordinator) IsLeaderForKey([]byte) bool {
+	return false
+}
+
 func (s *tsTrackingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	s.scanTS = append(s.scanTS, ts)
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
@@ -205,4 +213,20 @@ func TestLocalKeysExact_FindsListByUserKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 	require.Equal(t, []byte("exact:list"), keys[0])
+}
+
+func TestGetReadStateUsesLeaderChosenSnapshotForFollowers(t *testing.T) {
+	t.Parallel()
+
+	r := &RedisServer{
+		coordinator: &followerKeyCoordinator{
+			stubAdapterCoordinator: &stubAdapterCoordinator{clock: kv.NewHLC()},
+		},
+	}
+
+	isLeader, readTS, retry, err := r.getReadState(context.Background(), []byte("follower:get"))
+	require.NoError(t, err)
+	require.False(t, isLeader)
+	require.False(t, retry)
+	require.Zero(t, readTS)
 }
