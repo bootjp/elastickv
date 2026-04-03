@@ -405,41 +405,31 @@ func (r *RedisServer) subscribe(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
-	if !r.coordinator.IsLeader() {
-		size, err := r.proxyDBSize()
-		if err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteInt(size)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
-
-	if r.requiresCoordinatorReadFence() {
-		if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				size, proxyErr := r.proxyDBSize()
-				if proxyErr != nil {
-					conn.WriteError(proxyErr.Error())
-					return
-				}
-				conn.WriteInt(size)
-				return
-			}
-			conn.WriteError(err.Error())
-			return
-		}
-	}
-
-	keys, err := r.visibleKeys([]byte("*"))
+	size, err := r.dbsizeValue()
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	conn.WriteInt(len(keys))
+	conn.WriteInt(size)
+}
+
+func (r *RedisServer) dbsizeValue() (int, error) {
+	if !r.coordinator.IsLeader() {
+		return r.proxyDBSize()
+	}
+
+	if err := r.coordinatorLinearizableRead(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return r.proxyDBSize()
+		}
+		return 0, err
+	}
+
+	keys, err := r.visibleKeys([]byte("*"))
+	if err != nil {
+		return 0, err
+	}
+	return len(keys), nil
 }
 
 func (r *RedisServer) flushdb(conn redcon.Conn, _ redcon.Command) {

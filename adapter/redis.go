@@ -935,24 +935,16 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
-	isLeader := r.coordinator.IsLeaderForKey(key)
-	readTS := r.readTS()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
 
-	if isLeader {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), redisDispatchTimeout)
-		defer cancel()
-
-		var err error
-		readTS, err = r.linearizableReadTSForKey(ctx, key)
-		if err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				return true
-			}
-			conn.WriteError(err.Error())
-			return false
-		}
+	isLeader, readTS, retry, err := r.getReadState(ctx, key)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return false
+	}
+	if retry {
+		return true
 	}
 
 	typ, err := r.keyTypeAt(ctx, key, readTS)
@@ -969,18 +961,11 @@ func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
 		return false
 	}
 
-	var v []byte
-	if isLeader {
-		v, err = r.readValueLocalAt(ctx, key, readTS)
-	} else {
-		// When proxying reads to the leader, let the leader choose a safe
-		// snapshot. Our local store watermark may lag a just-committed write.
-		v, err = r.readValueAt(key, 0)
+	v, retry, err := r.readStringValueForGet(ctx, key, isLeader, readTS)
+	if retry {
+		return true
 	}
 	if err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return true
-		}
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
 		} else {
@@ -991,6 +976,40 @@ func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
 
 	conn.WriteBulk(v)
 	return false
+}
+
+func (r *RedisServer) getReadState(ctx context.Context, key []byte) (bool, uint64, bool, error) {
+	isLeader := r.coordinator.IsLeaderForKey(key)
+	if !isLeader {
+		return false, r.readTS(), false, nil
+	}
+
+	readTS, err := r.linearizableReadTSForKey(ctx, key)
+	if err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return true, 0, true, nil
+		}
+		return true, 0, false, err
+	}
+	return true, readTS, false, nil
+}
+
+func (r *RedisServer) readStringValueForGet(ctx context.Context, key []byte, isLeader bool, readTS uint64) ([]byte, bool, error) {
+	if isLeader {
+		v, err := r.readValueLocalAt(ctx, key, readTS)
+		if errors.Is(err, raft.ErrNotLeader) {
+			return nil, true, nil
+		}
+		return v, false, err
+	}
+
+	// When proxying reads to the leader, let the leader choose a safe
+	// snapshot. Our local store watermark may lag a just-committed write.
+	v, err := r.readValueAt(key, 0)
+	if errors.Is(err, raft.ErrNotLeader) {
+		return nil, true, nil
+	}
+	return v, false, err
 }
 
 // getHandleNone handles GET when the local type check returns none.
@@ -1163,43 +1182,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
-	pattern := cmd.Args[1]
-
-	if r.coordinator.IsLeader() {
-		if r.requiresCoordinatorReadFence() {
-			ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-			defer cancel()
-
-			if _, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator); err != nil {
-				if errors.Is(err, raft.ErrNotLeader) {
-					keys, proxyErr := r.proxyKeys(pattern)
-					if proxyErr != nil {
-						conn.WriteError(proxyErr.Error())
-						return
-					}
-					conn.WriteArray(len(keys))
-					for _, k := range keys {
-						conn.WriteBulkString(k)
-					}
-					return
-				}
-				conn.WriteError(err.Error())
-				return
-			}
-		}
-		keys, err := r.visibleKeys(pattern)
-		if err != nil {
-			conn.WriteError(err.Error())
-			return
-		}
-		conn.WriteArray(len(keys))
-		for _, k := range keys {
-			conn.WriteBulk(k)
-		}
-		return
-	}
-
-	keys, err := r.proxyKeys(pattern)
+	keys, err := r.keysForPattern(cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1207,7 +1190,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 
 	conn.WriteArray(len(keys))
 	for _, k := range keys {
-		conn.WriteBulkString(k)
+		conn.WriteBulk(k)
 	}
 }
 
@@ -1394,6 +1377,46 @@ func (r *RedisServer) requiresCoordinatorReadFence() bool {
 	}
 	_, isSharded := r.store.(*kv.ShardStore)
 	return !isSharded
+}
+
+func (r *RedisServer) coordinatorLinearizableRead() error {
+	if !r.requiresCoordinatorReadFence() {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	_, err := kv.CoordinatorLinearizableRead(ctx, r.coordinator)
+	return errors.WithStack(err)
+}
+
+func (r *RedisServer) keysForPattern(pattern []byte) ([][]byte, error) {
+	if !r.coordinator.IsLeader() {
+		return r.proxyKeysBytes(pattern)
+	}
+
+	if err := r.coordinatorLinearizableRead(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return r.proxyKeysBytes(pattern)
+		}
+		return nil, err
+	}
+
+	return r.visibleKeys(pattern)
+}
+
+func (r *RedisServer) proxyKeysBytes(pattern []byte) ([][]byte, error) {
+	keys, err := r.proxyKeys(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, []byte(key))
+	}
+	return out, nil
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -2346,51 +2369,63 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 }
 
 func (r *RedisServer) rangeListOnce(key []byte, startRaw, endRaw []byte) ([]string, bool, error) {
-	if !r.coordinator.IsLeaderForKey(key) {
-		values, err := r.proxyLRange(key, startRaw, endRaw)
-		return values, false, err
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
+	if !r.coordinator.IsLeaderForKey(key) {
+		values, err := r.proxyLRange(ctx, key, startRaw, endRaw)
+		return values, false, err
+	}
+
+	readTS, retry, err := r.rangeListReadTS(ctx, key)
+	if retry || err != nil {
+		return nil, retry, err
+	}
+
+	values, err := r.rangeListLocal(ctx, key, startRaw, endRaw, readTS)
+	return values, false, err
+}
+
+func (r *RedisServer) rangeListReadTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	readTS, err := r.linearizableReadTSForKey(ctx, key)
 	if err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
-			return nil, true, nil
+			return 0, true, nil
 		}
-		return nil, false, err
+		return 0, false, err
 	}
+	return readTS, false, nil
+}
 
+func (r *RedisServer) rangeListLocal(ctx context.Context, key, startRaw, endRaw []byte, readTS uint64) ([]string, error) {
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if typ == redisTypeNone {
-		return []string{}, false, nil
+		return []string{}, nil
 	}
 	if typ != redisTypeList {
-		return nil, false, wrongTypeError()
+		return nil, wrongTypeError()
 	}
 
 	meta, exists, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !exists || meta.Len == 0 {
-		return []string{}, false, nil
+		return []string{}, nil
 	}
 
 	s, e, err := parseRangeBounds(startRaw, endRaw, int(meta.Len))
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	values, err := r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
-	return values, false, err
+	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
 }
 
-func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
+func (r *RedisServer) proxyLRange(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
 	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
 		return nil, ErrLeaderNotFound
@@ -2412,7 +2447,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	res, err := cli.LRange(context.Background(), string(key), int64(start), int64(end)).Result()
+	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
 	return res, errors.WithStack(err)
 }
 
