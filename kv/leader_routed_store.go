@@ -33,6 +33,15 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 	}
 }
 
+// LocalStore returns the underlying local MVCC store. Callers must already
+// have established any leader/read fence they require before using it.
+func (s *LeaderRoutedStore) LocalStore() store.MVCCStore {
+	if s == nil {
+		return nil
+	}
+	return s.local
+}
+
 func (s *LeaderRoutedStore) localReadAllowedForKey(ctx context.Context, key []byte) (bool, error) {
 	if s.coordinator == nil {
 		return true, nil

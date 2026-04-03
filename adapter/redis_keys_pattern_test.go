@@ -17,6 +17,7 @@ type stubAdapterCoordinator struct {
 	leaderSet       bool
 	leader          bool
 	verifyCalls     atomic.Int32
+	verifyKeyCalls  atomic.Int32
 }
 
 func (s *stubAdapterCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -44,6 +45,7 @@ func (s *stubAdapterCoordinator) IsLeaderForKey([]byte) bool {
 }
 
 func (s *stubAdapterCoordinator) VerifyLeaderForKey([]byte) error {
+	s.verifyKeyCalls.Add(1)
 	return nil
 }
 
@@ -63,6 +65,13 @@ func (s *stubAdapterCoordinator) VerifyLeaderCalls() int32 {
 		return 0
 	}
 	return s.verifyCalls.Load()
+}
+
+func (s *stubAdapterCoordinator) VerifyLeaderForKeyCalls() int32 {
+	if s == nil {
+		return 0
+	}
+	return s.verifyKeyCalls.Load()
 }
 
 type tsTrackingStore struct {

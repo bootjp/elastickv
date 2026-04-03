@@ -274,6 +274,30 @@ func TestRedisGetRefreshesReadTSAfterLeaderFence(t *testing.T) {
 	require.Equal(t, []byte("v2"), conn.bulk)
 }
 
+func TestRedisGetLeaderRoutedStoreUsesSingleFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("leader-routed:get"), []byte("v1"), 1, 0))
+
+	coord := &stubAdapterCoordinator{clock: kv.NewHLC()}
+	coord.Clock().Observe(1)
+
+	srv := &RedisServer{
+		store:       kv.NewLeaderRoutedStore(st, coord),
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+
+	srv.get(conn, redcon.Command{Args: [][]byte{[]byte(cmdGet), []byte("leader-routed:get")}})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, []byte("v1"), conn.bulk)
+	require.Equal(t, int32(1), coord.VerifyLeaderForKeyCalls())
+}
+
 func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {
 	t.Parallel()
 

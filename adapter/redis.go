@@ -947,7 +947,7 @@ func (r *RedisServer) tryGet(conn redcon.Conn, key []byte) bool {
 		return true
 	}
 
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeForGet(ctx, key, isLeader, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return false
@@ -995,6 +995,22 @@ func (r *RedisServer) getReadState(ctx context.Context, key []byte) (bool, uint6
 		return true, 0, false, err
 	}
 	return true, readTS, false, nil
+}
+
+func (r *RedisServer) leaderVerifiedStore() store.MVCCStore {
+	if routed, ok := r.store.(*kv.LeaderRoutedStore); ok {
+		if local := routed.LocalStore(); local != nil {
+			return local
+		}
+	}
+	return r.store
+}
+
+func (r *RedisServer) keyTypeForGet(ctx context.Context, key []byte, isLeader bool, readTS uint64) (redisValueType, error) {
+	if !isLeader {
+		return r.keyTypeAt(ctx, key, readTS)
+	}
+	return keyTypeOnStoreAt(r.leaderVerifiedStore(), ctx, key, readTS)
 }
 
 func (r *RedisServer) readStringValueForGet(ctx context.Context, key []byte, isLeader bool, readTS uint64) ([]byte, bool, error) {
@@ -2540,12 +2556,13 @@ func (r *RedisServer) linearizableReadTSForKey(ctx context.Context, key []byte) 
 }
 
 func (r *RedisServer) readValueLocalAt(ctx context.Context, key []byte, readTS uint64) ([]byte, error) {
+	st := r.leaderVerifiedStore()
 	ttlKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
 	}
 
-	expired, err := r.hasExpiredTTLAt(ctx, ttlKey, readTS)
+	expired, err := hasExpiredTTLOnStoreAt(st, ctx, ttlKey, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2553,7 +2570,7 @@ func (r *RedisServer) readValueLocalAt(ctx context.Context, key []byte, readTS u
 		return nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 
-	v, err := r.store.GetAt(ctx, key, readTS)
+	v, err := st.GetAt(ctx, key, readTS)
 	return v, errors.WithStack(err)
 }
 
