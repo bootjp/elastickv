@@ -9,7 +9,6 @@ import (
 	transport "github.com/Jille/raft-grpc-transport"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftstore"
-	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
@@ -31,8 +30,6 @@ func (r *raftGroupRuntime) Close() {
 		return
 	}
 	if r.raft != nil {
-		kv.UnregisterRaftAppliedIndexWaiter(r.raft)
-		kv.UnregisterRaftLeaderVerifier(r.raft)
 		_ = r.raft.Shutdown().Error()
 		r.raft = nil
 	}

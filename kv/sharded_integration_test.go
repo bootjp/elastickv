@@ -28,9 +28,6 @@ func newSingleRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 	if err != nil {
 		t.Fatalf("new raft: %v", err)
 	}
-	if waiter, ok := fsm.(AppliedIndexWaiter); ok {
-		RegisterRaftAppliedIndexWaiter(r, waiter)
-	}
 	cfg := raft.Configuration{
 		Servers: []raft.Server{
 			{
@@ -54,11 +51,7 @@ func newSingleRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 		t.Fatalf("node %s is not leader", id)
 	}
 
-	return r, func() {
-		UnregisterRaftAppliedIndexWaiter(r)
-		UnregisterRaftLeaderVerifier(r)
-		_ = r.Shutdown().Error()
-	}
+	return r, func() { r.Shutdown() }
 }
 
 func TestShardedCoordinatorDispatch(t *testing.T) {

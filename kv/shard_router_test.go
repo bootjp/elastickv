@@ -25,8 +25,7 @@ func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
 
 	shutdown := func() {
 		for _, r := range rafts {
-			UnregisterRaftLeaderVerifier(r)
-			_ = r.Shutdown().Error()
+			r.Shutdown()
 		}
 	}
 	return rafts[0], shutdown

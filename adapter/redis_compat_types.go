@@ -175,8 +175,8 @@ func decodeRedisTTL(raw []byte) (time.Time, error) {
 	return time.UnixMilli(int64(ms)), nil // #nosec G115 -- ms <= MaxInt64 is guaranteed by the check above.
 }
 
-func ttlOnStoreAt(st store.MVCCStore, ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
-	raw, err := st.GetAt(ctx, redisTTLKey(userKey), readTS)
+func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
+	raw, err := r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -190,12 +190,8 @@ func ttlOnStoreAt(st store.MVCCStore, ctx context.Context, userKey []byte, readT
 	return &ttl, nil
 }
 
-func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
-	return ttlOnStoreAt(r.store, ctx, userKey, readTS)
-}
-
-func hasExpiredTTLOnStoreAt(st store.MVCCStore, ctx context.Context, userKey []byte, readTS uint64) (bool, error) {
-	ttl, err := ttlOnStoreAt(st, ctx, userKey, readTS)
+func (r *RedisServer) hasExpiredTTLAt(ctx context.Context, userKey []byte, readTS uint64) (bool, error) {
+	ttl, err := r.ttlAt(ctx, userKey, readTS)
 	if err != nil {
 		return false, err
 	}

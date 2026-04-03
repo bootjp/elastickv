@@ -15,14 +15,12 @@ import (
 )
 
 type kvFSM struct {
-	store   store.MVCCStore
-	log     *slog.Logger
-	applied *appliedIndexTracker
+	store store.MVCCStore
+	log   *slog.Logger
 }
 
 type FSM interface {
 	raft.FSM
-	AppliedIndexWaiter
 }
 
 func NewKvFSM(store store.MVCCStore) FSM {
@@ -31,7 +29,6 @@ func NewKvFSM(store store.MVCCStore) FSM {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		applied: newAppliedIndexTracker(),
 	}
 }
 
@@ -45,8 +42,6 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(l *raft.Log) any {
-	defer f.markAppliedIndex(l)
-
 	ctx := context.TODO()
 
 	reqs, err := decodeRaftRequests(l.Data)
@@ -71,27 +66,6 @@ func (f *kvFSM) Apply(l *raft.Log) any {
 		return resp
 	}
 	return nil
-}
-
-func (f *kvFSM) AppliedIndex() uint64 {
-	if f == nil || f.applied == nil {
-		return 0
-	}
-	return f.applied.AppliedIndex()
-}
-
-func (f *kvFSM) WaitForAppliedIndex(ctx context.Context, index uint64) error {
-	if f == nil || f.applied == nil {
-		return nil
-	}
-	return errors.WithStack(f.applied.WaitForAppliedIndex(ctx, index))
-}
-
-func (f *kvFSM) markAppliedIndex(l *raft.Log) {
-	if f == nil || f.applied == nil || l == nil {
-		return
-	}
-	f.applied.markAppliedIndex(l.Index)
 }
 
 const (

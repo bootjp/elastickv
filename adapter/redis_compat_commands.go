@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
-	"github.com/hashicorp/raft"
 	"github.com/tidwall/redcon"
 )
 
@@ -405,31 +404,26 @@ func (r *RedisServer) subscribe(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
-	size, err := r.dbsizeValue()
-	if err != nil {
-		conn.WriteError(err.Error())
+	if !r.coordinator.IsLeader() {
+		size, err := r.proxyDBSize()
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt(size)
 		return
 	}
-	conn.WriteInt(size)
-}
-
-func (r *RedisServer) dbsizeValue() (int, error) {
-	if !r.coordinator.IsLeader() {
-		return r.proxyDBSize()
-	}
-
-	if err := r.coordinatorLinearizableRead(); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return r.proxyDBSize()
-		}
-		return 0, err
+	if err := r.coordinator.VerifyLeader(); err != nil {
+		conn.WriteError(err.Error())
+		return
 	}
 
 	keys, err := r.visibleKeys([]byte("*"))
 	if err != nil {
-		return 0, err
+		conn.WriteError(err.Error())
+		return
 	}
-	return len(keys), nil
+	conn.WriteInt(len(keys))
 }
 
 func (r *RedisServer) flushdb(conn redcon.Conn, _ redcon.Command) {

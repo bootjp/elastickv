@@ -33,29 +33,20 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 	}
 }
 
-// LocalStore returns the underlying local MVCC store. Callers must already
-// have established any leader/read fence they require before using it.
-func (s *LeaderRoutedStore) LocalStore() store.MVCCStore {
-	if s == nil {
-		return nil
-	}
-	return s.local
-}
-
-func (s *LeaderRoutedStore) localReadAllowedForKey(ctx context.Context, key []byte) (bool, error) {
+// leaderOKForKey verifies leadership via a quorum check. Note: there is a
+// small TOCTOU window between VerifyLeader returning and the subsequent read —
+// leadership could theoretically change in that interval, allowing a stale
+// read from a deposed leader. The Raft ReadIndex protocol would close this
+// gap but is not yet implemented. For most use cases, the quorum-verified
+// window is acceptably small.
+func (s *LeaderRoutedStore) leaderOKForKey(key []byte) bool {
 	if s.coordinator == nil {
-		return true, nil
+		return true
 	}
 	if !s.coordinator.IsLeaderForKey(key) {
-		return false, nil
+		return false
 	}
-	if _, err := CoordinatorLinearizableReadForKey(ctx, s.coordinator, key); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return s.coordinator.VerifyLeaderForKey(key) == nil
 }
 
 func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) raft.ServerAddress {
@@ -152,11 +143,7 @@ func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([
 	if s == nil || s.local == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	ok, err := s.localReadAllowedForKey(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	if s.leaderOKForKey(key) {
 		val, err := s.local.GetAt(ctx, key, ts)
 		return val, errors.WithStack(err)
 	}
@@ -181,11 +168,7 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	ok, err := s.localReadAllowedForKey(ctx, start)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	if s.leaderOKForKey(start) {
 		kvs, err := s.local.ScanAt(ctx, start, end, limit, ts)
 		return kvs, errors.WithStack(err)
 	}
@@ -199,11 +182,7 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	ok, err := s.localReadAllowedForKey(ctx, start)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	if s.leaderOKForKey(start) {
 		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, ts)
 		return kvs, errors.WithStack(err)
 	}
@@ -242,11 +221,7 @@ func (s *LeaderRoutedStore) LatestCommitTS(ctx context.Context, key []byte) (uin
 	if s == nil || s.local == nil {
 		return 0, false, nil
 	}
-	ok, err := s.localReadAllowedForKey(ctx, key)
-	if err != nil {
-		return 0, false, err
-	}
-	if ok {
+	if s.leaderOKForKey(key) {
 		ts, exists, err := s.local.LatestCommitTS(ctx, key)
 		return ts, exists, errors.WithStack(err)
 	}

@@ -104,10 +104,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		r, err := raft.NewRaft(c, NewKvFSM(store.NewMVCCStore()), ldb, sdb, fss, leaderTrans)
 		require.NoError(t, err)
 		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
-		t.Cleanup(func() {
-			UnregisterRaftLeaderVerifier(r)
-			_ = r.Shutdown().Error()
-		})
+		t.Cleanup(func() { _ = r.Shutdown().Error() })
 		return r
 	}()
 
@@ -124,10 +121,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		r, err := raft.NewRaft(c, NewKvFSM(store.NewMVCCStore()), ldb, sdb, fss, followerTrans)
 		require.NoError(t, err)
 		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
-		t.Cleanup(func() {
-			UnregisterRaftLeaderVerifier(r)
-			_ = r.Shutdown().Error()
-		})
+		t.Cleanup(func() { _ = r.Shutdown().Error() })
 		return r
 	}()
 
