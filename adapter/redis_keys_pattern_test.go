@@ -17,6 +17,7 @@ type stubAdapterCoordinator struct {
 	leaderSet       bool
 	leader          bool
 	verifyCalls     atomic.Int32
+	verifyKeyCalls  atomic.Int32
 }
 
 func (s *stubAdapterCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -44,6 +45,7 @@ func (s *stubAdapterCoordinator) IsLeaderForKey([]byte) bool {
 }
 
 func (s *stubAdapterCoordinator) VerifyLeaderForKey([]byte) error {
+	s.verifyKeyCalls.Add(1)
 	return nil
 }
 
@@ -65,9 +67,24 @@ func (s *stubAdapterCoordinator) VerifyLeaderCalls() int32 {
 	return s.verifyCalls.Load()
 }
 
+func (s *stubAdapterCoordinator) VerifyLeaderForKeyCalls() int32 {
+	if s == nil {
+		return 0
+	}
+	return s.verifyKeyCalls.Load()
+}
+
 type tsTrackingStore struct {
 	store.MVCCStore
 	scanTS []uint64
+}
+
+type followerKeyCoordinator struct {
+	*stubAdapterCoordinator
+}
+
+func (c *followerKeyCoordinator) IsLeaderForKey([]byte) bool {
+	return false
 }
 
 func (s *tsTrackingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
@@ -205,4 +222,20 @@ func TestLocalKeysExact_FindsListByUserKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 	require.Equal(t, []byte("exact:list"), keys[0])
+}
+
+func TestGetReadStateUsesLeaderChosenSnapshotForFollowers(t *testing.T) {
+	t.Parallel()
+
+	r := &RedisServer{
+		coordinator: &followerKeyCoordinator{
+			stubAdapterCoordinator: &stubAdapterCoordinator{clock: kv.NewHLC()},
+		},
+	}
+
+	isLeader, readTS, retry, err := r.getReadState(context.Background(), []byte("follower:get"))
+	require.NoError(t, err)
+	require.False(t, isLeader)
+	require.False(t, retry)
+	require.Zero(t, readTS)
 }

@@ -419,6 +419,14 @@ func (c *ShardedCoordinator) VerifyLeader() error {
 	return verifyRaftLeader(g.Raft)
 }
 
+func (c *ShardedCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	g, ok := c.groups[c.defaultGroup]
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return linearizableReadIndex(ctx, g.Raft)
+}
+
 func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok || g.Raft == nil {
@@ -442,6 +450,14 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
 	return verifyRaftLeader(g.Raft)
+}
+
+func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return linearizableReadIndex(ctx, g.Raft)
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {

@@ -18,7 +18,7 @@ func wrongTypeError() error {
 	return errors.New(wrongTypeMessage)
 }
 
-func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+func rawKeyTypeOnStoreAt(st store.MVCCStore, ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	checks := []struct {
 		typ redisValueType
 		key []byte
@@ -33,7 +33,7 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeString, key: key},
 	}
 	for _, check := range checks {
-		exists, err := r.store.ExistsAt(ctx, check.key, readTS)
+		exists, err := st.ExistsAt(ctx, check.key, readTS)
 		if err != nil {
 			return redisTypeNone, errors.WithStack(err)
 		}
@@ -44,12 +44,16 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 	return redisTypeNone, nil
 }
 
-func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
+func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	return rawKeyTypeOnStoreAt(r.store, ctx, key, readTS)
+}
+
+func keyTypeOnStoreAt(st store.MVCCStore, ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	typ, err := rawKeyTypeOnStoreAt(st, ctx, key, readTS)
 	if err != nil || typ == redisTypeNone {
 		return typ, err
 	}
-	expired, err := r.hasExpiredTTLAt(ctx, key, readTS)
+	expired, err := hasExpiredTTLOnStoreAt(st, ctx, key, readTS)
 	if err != nil {
 		return redisTypeNone, err
 	}
@@ -57,6 +61,10 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 		return redisTypeNone, nil
 	}
 	return typ, nil
+}
+
+func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	return keyTypeOnStoreAt(r.store, ctx, key, readTS)
 }
 
 func (r *RedisServer) keyType(ctx context.Context, key []byte) (redisValueType, error) {
