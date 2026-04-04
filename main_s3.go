@@ -36,6 +36,10 @@ func startS3Server(
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
 ) error {
+	s3Addr = strings.TrimSpace(s3Addr)
+	if s3Addr == "" {
+		return nil
+	}
 	if !pathStyleOnly {
 		return errors.New("virtual-hosted style S3 requests are not implemented")
 	}
