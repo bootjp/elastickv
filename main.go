@@ -40,7 +40,7 @@ var (
 	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
 	redisAddr            = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
 	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
-	s3Addr               = flag.String("s3Address", "localhost:9000", "TCP host+port for S3-compatible API")
+	s3Addr               = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
 	s3Region             = flag.String("s3Region", "us-east-1", "S3 signing region")
 	s3CredsFile          = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyleOnly      = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
