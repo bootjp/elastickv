@@ -103,6 +103,9 @@ func loadS3StaticCredentials(path string) (map[string]string, error) {
 		if accessKeyID == "" || secretAccessKey == "" {
 			return nil, errors.New("s3 credentials file contains an empty access key or secret key")
 		}
+		if _, exists := out[accessKeyID]; exists {
+			return nil, errors.Newf("s3 credentials file contains duplicate access key ID: %q", accessKeyID)
+		}
 		out[accessKeyID] = secretAccessKey
 	}
 	return out, nil

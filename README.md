@@ -175,7 +175,7 @@ docker run --rm \
 
 ### Working with S3-compatible Storage
 
-Elastickv exposes an S3-compatible HTTP API on `--s3Address` (default `:9000`). Any S3 client or SDK that supports path-style requests and AWS Signature Version 4 can connect to it.
+Elastickv exposes an S3-compatible HTTP API when `--s3Address` is set (for example `127.0.0.1:9000`). Any S3 client or SDK that supports path-style requests and AWS Signature Version 4 can connect to it.
 
 ```bash
 # Configure the AWS CLI to point at Elastickv
