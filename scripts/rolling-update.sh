@@ -33,6 +33,7 @@ Optional environment:
   RAFT_TO_REDIS_MAP
   RAFT_TO_S3_MAP
   S3_PORT
+  ENABLE_S3
   S3_REGION
   S3_CREDENTIALS_FILE
     Path to an S3 credentials file on each target host. This file must already
@@ -82,6 +83,7 @@ RAFT_PORT="${RAFT_PORT:-50051}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 DYNAMO_PORT="${DYNAMO_PORT:-8000}"
 S3_PORT="${S3_PORT:-9000}"
+ENABLE_S3="${ENABLE_S3:-true}"
 S3_REGION="${S3_REGION:-us-east-1}"
 S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-}"
 S3_PATH_STYLE_ONLY="${S3_PATH_STYLE_ONLY:-true}"
@@ -402,6 +404,7 @@ update_one_node() {
       REDIS_PORT="$REDIS_PORT" \
       DYNAMO_PORT="$DYNAMO_PORT" \
       S3_PORT="$S3_PORT" \
+      ENABLE_S3="$ENABLE_S3" \
       S3_REGION="$S3_REGION" \
       S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
@@ -642,13 +645,23 @@ stop_container() {
 run_container() {
   local s3_creds_volume=()
   local s3_creds_flag=()
-  if [[ -n "${S3_CREDENTIALS_FILE:-}" ]]; then
+  local s3_flags=()
+  if [[ "${ENABLE_S3}" == "true" && -n "${S3_CREDENTIALS_FILE:-}" ]]; then
     if [[ ! -f "$S3_CREDENTIALS_FILE" || ! -r "$S3_CREDENTIALS_FILE" ]]; then
       echo "S3_CREDENTIALS_FILE is set to '$S3_CREDENTIALS_FILE' but the file is missing or not readable; aborting docker run" >&2
       exit 1
     fi
     s3_creds_volume=(-v "${S3_CREDENTIALS_FILE}:${S3_CREDENTIALS_FILE}:ro")
     s3_creds_flag=(--s3CredentialsFile "$S3_CREDENTIALS_FILE")
+  fi
+  if [[ "${ENABLE_S3}" == "true" ]]; then
+    s3_flags=(
+      --s3Address "${NODE_HOST}:${S3_PORT}"
+      --s3Region "$S3_REGION"
+      --s3PathStyleOnly="$S3_PATH_STYLE_ONLY"
+      --raftS3Map "$RAFT_TO_S3_MAP"
+      "${s3_creds_flag[@]}"
+    )
   fi
 
   docker run -d \
@@ -661,14 +674,10 @@ run_container() {
     --address "${NODE_HOST}:${RAFT_PORT}" \
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
-    --s3Address "${NODE_HOST}:${S3_PORT}" \
-    --s3Region "$S3_REGION" \
-    --s3PathStyleOnly="$S3_PATH_STYLE_ONLY" \
     --raftId "$NODE_ID" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
-    --raftS3Map "$RAFT_TO_S3_MAP" \
-    "${s3_creds_flag[@]}" >/dev/null
+    "${s3_flags[@]}" >/dev/null
 }
 
 require_passwordless_sudo() {
@@ -789,7 +798,7 @@ if [[ -z "$RAFT_TO_REDIS_MAP" ]]; then
   RAFT_TO_REDIS_MAP="$(derive_raft_to_redis_map)"
 fi
 
-if [[ -z "$RAFT_TO_S3_MAP" ]]; then
+if [[ "${ENABLE_S3}" == "true" && -z "$RAFT_TO_S3_MAP" ]]; then
   RAFT_TO_S3_MAP="$(derive_raft_to_s3_map)"
 fi
 
