@@ -116,31 +116,14 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 }
 
 func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
-	out := make(map[raft.ServerAddress]string)
-	if raw == "" {
-		return out, nil
-	}
-	parts := strings.SplitSeq(raw, ",")
-	for part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		kv := strings.SplitN(part, "=", splitParts)
-		if len(kv) != splitParts {
-			return nil, errors.Wrapf(ErrInvalidRaftRedisMapEntry, "%q", part)
-		}
-		k := strings.TrimSpace(kv[0])
-		v := strings.TrimSpace(kv[1])
-		if k == "" || v == "" {
-			return nil, errors.Wrapf(ErrInvalidRaftRedisMapEntry, "%q", part)
-		}
-		out[raft.ServerAddress(k)] = v
-	}
-	return out, nil
+	return parseRaftAddressMap(raw, ErrInvalidRaftRedisMapEntry)
 }
 
 func parseRaftS3Map(raw string) (map[raft.ServerAddress]string, error) {
+	return parseRaftAddressMap(raw, ErrInvalidRaftS3MapEntry)
+}
+
+func parseRaftAddressMap(raw string, invalidEntry error) (map[raft.ServerAddress]string, error) {
 	out := make(map[raft.ServerAddress]string)
 	if raw == "" {
 		return out, nil
@@ -153,12 +136,12 @@ func parseRaftS3Map(raw string) (map[raft.ServerAddress]string, error) {
 		}
 		kv := strings.SplitN(part, "=", splitParts)
 		if len(kv) != splitParts {
-			return nil, errors.Wrapf(ErrInvalidRaftS3MapEntry, "%q", part)
+			return nil, errors.Wrapf(invalidEntry, "%q", part)
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
 		if k == "" || v == "" {
-			return nil, errors.Wrapf(ErrInvalidRaftS3MapEntry, "%q", part)
+			return nil, errors.Wrapf(invalidEntry, "%q", part)
 		}
 		out[raft.ServerAddress(k)] = v
 	}

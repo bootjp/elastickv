@@ -228,31 +228,30 @@ func buildEngine(ranges []rangeSpec) *distribution.Engine {
 }
 
 func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) (map[raft.ServerAddress]string, error) {
-	leaderRedis, err := parseRaftRedisMap(raftRedisMap)
-	if err != nil {
-		return nil, err
-	}
-	for _, g := range groups {
-		addr := raft.ServerAddress(g.address)
-		if _, ok := leaderRedis[addr]; !ok {
-			leaderRedis[addr] = redisAddr
-		}
-	}
-	return leaderRedis, nil
+	return buildLeaderAddrMap(groups, redisAddr, raftRedisMap, parseRaftRedisMap)
 }
 
 func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[raft.ServerAddress]string, error) {
-	leaderS3, err := parseRaftS3Map(raftS3Map)
+	return buildLeaderAddrMap(groups, s3Addr, raftS3Map, parseRaftS3Map)
+}
+
+func buildLeaderAddrMap(
+	groups []groupSpec,
+	defaultAddr string,
+	rawMap string,
+	parse func(string) (map[raft.ServerAddress]string, error),
+) (map[raft.ServerAddress]string, error) {
+	leaderAddrMap, err := parse(rawMap)
 	if err != nil {
 		return nil, err
 	}
 	for _, g := range groups {
 		addr := raft.ServerAddress(g.address)
-		if _, ok := leaderS3[addr]; !ok {
-			leaderS3[addr] = s3Addr
+		if _, ok := leaderAddrMap[addr]; !ok {
+			leaderAddrMap[addr] = defaultAddr
 		}
 	}
-	return leaderS3, nil
+	return leaderAddrMap, nil
 }
 
 var (
