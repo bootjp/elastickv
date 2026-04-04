@@ -30,6 +30,7 @@ var (
 	ErrInvalidRaftGroupsEntry           = errors.New("invalid raftGroups entry")
 	ErrInvalidShardRangesEntry          = errors.New("invalid shardRanges entry")
 	ErrInvalidRaftRedisMapEntry         = errors.New("invalid raftRedisMap entry")
+	ErrInvalidRaftS3MapEntry            = errors.New("invalid raftS3Map entry")
 	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
 )
 
@@ -133,6 +134,31 @@ func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 		v := strings.TrimSpace(kv[1])
 		if k == "" || v == "" {
 			return nil, errors.Wrapf(ErrInvalidRaftRedisMapEntry, "%q", part)
+		}
+		out[raft.ServerAddress(k)] = v
+	}
+	return out, nil
+}
+
+func parseRaftS3Map(raw string) (map[raft.ServerAddress]string, error) {
+	out := make(map[raft.ServerAddress]string)
+	if raw == "" {
+		return out, nil
+	}
+	parts := strings.SplitSeq(raw, ",")
+	for part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", splitParts)
+		if len(kv) != splitParts {
+			return nil, errors.Wrapf(ErrInvalidRaftS3MapEntry, "%q", part)
+		}
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == "" || v == "" {
+			return nil, errors.Wrapf(ErrInvalidRaftS3MapEntry, "%q", part)
 		}
 		out[raft.ServerAddress(k)] = v
 	}
