@@ -83,12 +83,13 @@ func loadS3StaticCredentials(path string) (map[string]string, error) {
 	if path == "" {
 		return nil, nil
 	}
-	body, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	defer f.Close()
 	file := s3CredentialFile{}
-	if err := json.Unmarshal(body, &file); err != nil {
+	if err := json.NewDecoder(f).Decode(&file); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	out := make(map[string]string, len(file.Credentials))
