@@ -181,7 +181,7 @@ All of those would need equivalents before migration is production-safe.
 
 ### 4. Data migration complexity
 
-The current durable Raft data format is HashiCorp-specific. A direct wire-format conversion to `etcd/raft` is possible in theory but expensive and risky.
+The current durable Raft data format is HashiCorp-specific. A direct on-disk format conversion to etcd/raft is possible in theory but expensive and risky.
 
 ### 5. No mixed-cluster compatibility
 
