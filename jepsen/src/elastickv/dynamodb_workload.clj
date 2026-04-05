@@ -5,10 +5,10 @@
    UpdateItem; reads fetch the list via GetItem."
   (:gen-class)
   (:require [clojure.string :as str]
-            [clojure.tools.cli :as tools.cli]
             [clojure.tools.logging :refer [warn]]
             [cheshire.core :as json]
             [clj-http.client :as http]
+            [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [jepsen [client :as client]
                     [core :as jepsen]
@@ -161,15 +161,6 @@
                                    nil)]
     (assoc workload :client client)))
 
-(defn ports->node-map
-  [ports nodes]
-  (into {} (map (fn [n p] [n p]) nodes ports)))
-
-(defn- normalize-faults [faults]
-  (->> faults
-       (map (fn [f] (case f :reboot :kill f)))
-       vec))
-
 (defn elastickv-dynamodb-test
   "Builds a Jepsen test map that drives elastickv's DynamoDB-compatible API
    with the list-append workload."
@@ -177,7 +168,7 @@
   ([opts]
    (let [nodes       (or (:nodes opts) default-nodes)
          dynamo-ports (or (:dynamo-ports opts) (repeat (count nodes) (or (:dynamo-port opts) 8000)))
-         node->port  (or (:node->port opts) (ports->node-map dynamo-ports nodes))
+         node->port  (or (:node->port opts) (cli/ports->node-map dynamo-ports nodes))
          local?      (:local opts)
          db          (if local?
                        jdb/noop
@@ -190,7 +181,7 @@
          time-limit  (or (:time-limit opts) 30)
          faults      (if local?
                        []
-                       (normalize-faults (or (:faults opts) [:partition :kill])))
+                       (cli/normalize-faults (or (:faults opts) [:partition :kill])))
          nemesis-p   (when-not local?
                        (combined/nemesis-package {:db       db
                                                   :faults   faults
@@ -226,14 +217,9 @@
 ;; CLI
 ;; ---------------------------------------------------------------------------
 
-(def cli-opts
-  [[nil "--nodes NODES" "Comma separated node names."
-    :default "n1,n2,n3,n4,n5"]
-   [nil "--local" "Run locally without SSH or nemesis."
-    :default false]
-   [nil "--host HOST" "DynamoDB host override for clients."
-    :default nil]
-   [nil "--dynamo-ports PORTS" "Comma separated DynamoDB ports (per node)."
+(def dynamo-cli-opts
+  "DynamoDB-specific CLI options, appended to common opts."
+  [[nil "--dynamo-ports PORTS" "Comma separated DynamoDB ports (per node)."
     :default nil
     :parse-fn (fn [s]
                 (->> (str/split s #",")
@@ -244,87 +230,25 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--redis-port PORT" "Redis port."
     :default 6379
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--grpc-port PORT" "gRPC/Raft port."
-    :default 50051
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--raft-groups GROUPS" "Comma separated raft groups (groupID=port,...)"
-    :parse-fn (fn [s]
-                (->> (str/split s #",")
-                     (remove str/blank?)
-                     (map (fn [part]
-                            (let [[gid port] (str/split part #"=" 2)]
-                              [(Long/parseLong gid) (Integer/parseInt port)])))
-                     (into {})))]
-   [nil "--shard-ranges RANGES" "Shard ranges (start:end=groupID,...)"
-    :default nil]
-   [nil "--faults LIST" "Comma separated faults (partition,kill,clock)."
-    :default "partition,kill,clock"]
-   [nil "--ssh-key PATH" "SSH private key path."
-    :default "/home/vagrant/.ssh/id_rsa"]
-   [nil "--ssh-user USER" "SSH username."
-    :default "vagrant"]
-   [nil "--time-limit SECONDS" "How long to run the workload."
-    :default 30
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--rate HZ" "Approx ops/sec per worker."
-    :default 5
-    :parse-fn #(Double/parseDouble %)]
-   [nil "--concurrency N" "Number of worker threads."
-    :default 5
-    :parse-fn #(Integer/parseInt %)]
-   ["-h" "--help"]])
+    :parse-fn #(Integer/parseInt %)]])
 
-(defn fail-on-invalid!
-  "Raises when Jepsen completed analysis and found the history invalid."
-  [result]
-  (when (false? (:valid? result))
-    (throw (ex-info "Jepsen analysis invalid" {:result result})))
-  result)
+(defn- prepare-dynamo-opts
+  "Transform parsed CLI options into the map expected by elastickv-dynamodb-test."
+  [options]
+  (let [dynamo-ports (:dynamo-ports options)
+        options (cli/parse-common-opts options dynamo-ports)
+        node->port (if dynamo-ports
+                     (cli/ports->node-map dynamo-ports (:nodes options))
+                     (zipmap (:nodes options) (repeat (:dynamo-port options))))]
+    (assoc options
+      :dynamo-host (:host options)
+      :node->port node->port
+      :dynamo-port (:dynamo-port options)
+      :redis-port (:redis-port options))))
 
 (defn -main
   [& args]
-  (try
-    (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
-          default-nodes-str "n1,n2,n3,n4,n5"
-          dynamo-ports (:dynamo-ports options)
-          local? (or (:local options) (and (:host options) (seq dynamo-ports)))
-          nodes-raw (if (and dynamo-ports (= (:nodes options) default-nodes-str))
-                      (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count dynamo-ports)))))
-                      (:nodes options))
-          node-list (-> nodes-raw
-                        (str/split #",")
-                        (->> (remove str/blank?) vec))
-          faults    (-> (:faults options)
-                        (str/split #",")
-                        (->> (remove str/blank?)
-                             (map (comp keyword str/lower-case))
-                             vec))
-          node->port (if dynamo-ports
-                       (ports->node-map dynamo-ports node-list)
-                       (zipmap node-list (repeat (:dynamo-port options))))
-          options   (assoc options
-                      :nodes node-list
-                      :faults faults
-                      :local local?
-                      :dynamo-host (:host options)
-                      :node->port node->port
-                      :dynamo-port (:dynamo-port options)
-                      :redis-port (:redis-port options)
-                      :grpc-port (:grpc-port options)
-                      :raft-groups (:raft-groups options)
-                      :shard-ranges (:shard-ranges options)
-                      :ssh {:username (:ssh-user options)
-                            :private-key-path (:ssh-key options)
-                            :strict-host-key-checking false})]
-      (cond
-        (:help options)  (println summary)
-        (seq errors)     (do (binding [*out* *err*]
-                             (println "Error parsing options:" (str/join "; " errors)))
-                           (System/exit 1))
-        (:local options) (binding [control/*dummy* true]
-                           (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options))))
-        :else            (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options)))))
-    (catch clojure.lang.ExceptionInfo e
-      (warn (.getMessage e))
-      (System/exit 1))))
+  (cli/run-workload! args
+                     (into cli/common-cli-opts dynamo-cli-opts)
+                     prepare-dynamo-opts
+                     elastickv-dynamodb-test))
