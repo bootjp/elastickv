@@ -6,10 +6,12 @@
             [jepsen.control :as control]
             [jepsen.core :as jepsen]))
 
+(def default-nodes-str "n1,n2,n3,n4,n5")
+
 (def common-cli-opts
   "CLI options shared by all workloads."
   [[nil "--nodes NODES" "Comma separated node names."
-    :default "n1,n2,n3,n4,n5"]
+    :default default-nodes-str]
    [nil "--local" "Run locally without SSH or nemesis."
     :default false]
    [nil "--host HOST" "Host override for clients."
@@ -23,6 +25,9 @@
                      (remove str/blank?)
                      (map (fn [part]
                             (let [[gid port] (str/split part #"=" 2)]
+                              (when-not (and gid port)
+                                (throw (IllegalArgumentException.
+                                         (str "Invalid raft group format: " part ". Expected groupID=port"))))
                               [(Long/parseLong gid) (Integer/parseInt port)])))
                      (into {})))]
    [nil "--shard-ranges RANGES" "Shard ranges (start:end=groupID,...)"
@@ -46,7 +51,7 @@
 
 (defn ports->node-map
   [ports nodes]
-  (into {} (map (fn [n p] [n p]) nodes ports)))
+  (zipmap nodes ports))
 
 (defn normalize-faults [faults]
   (->> faults
@@ -64,8 +69,7 @@
   "Parse nodes, faults, ssh config from raw CLI options.
    `per-node-ports` is the parsed per-node port vector (or nil)."
   [options per-node-ports]
-  (let [default-nodes-str "n1,n2,n3,n4,n5"
-        local? (or (:local options) (and (:host options) (seq per-node-ports)))
+  (let [local? (or (:local options) (and (:host options) (seq per-node-ports)))
         nodes-raw (if (and per-node-ports (= (:nodes options) default-nodes-str))
                     (str/join "," (map (fn [i] (str "n" i))
                                       (range 1 (inc (count per-node-ports)))))
@@ -82,9 +86,6 @@
       :nodes node-list
       :faults faults
       :local local?
-      :grpc-port (:grpc-port options)
-      :raft-groups (:raft-groups options)
-      :shard-ranges (:shard-ranges options)
       :ssh {:username (:ssh-user options)
             :private-key-path (:ssh-key options)
             :strict-host-key-checking false})))
@@ -103,9 +104,10 @@
         (seq errors)     (do (binding [*out* *err*]
                                (println "Error parsing options:" (str/join "; " errors)))
                            (System/exit 1))
-        (:local options) (binding [control/*dummy* true]
-                           (fail-on-invalid! (jepsen/run! (test-fn options))))
-        :else            (fail-on-invalid! (jepsen/run! (test-fn options)))))
-    (catch clojure.lang.ExceptionInfo e
+        :else (let [run! #(fail-on-invalid! (jepsen/run! (test-fn options)))]
+                (if (:local options)
+                  (binding [control/*dummy* true] (run!))
+                  (run!)))))
+    (catch Exception e
       (warn (.getMessage e))
       (System/exit 1))))
