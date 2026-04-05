@@ -134,7 +134,7 @@ func TestCoordinateDispatch_TxnAssignsStartTS(t *testing.T) {
 
 	c := &Coordinate{
 		transactionManager: tx,
-		raft:               r,
+		engine:             engineFromRaft(r),
 		clock:              NewHLC(),
 	}
 
@@ -166,7 +166,7 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 
 	c := &Coordinate{
 		transactionManager: tx,
-		raft:               r,
+		engine:             engineFromRaft(r),
 		clock:              NewHLC(),
 	}
 

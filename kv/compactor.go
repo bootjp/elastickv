@@ -3,9 +3,9 @@ package kv
 import (
 	"context"
 	"log/slog"
-	"strconv"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -16,14 +16,14 @@ const (
 	defaultFSMCompactorTimeout         = 5 * time.Second
 )
 
-type RaftStatsProvider interface {
-	Stats() map[string]string
+type RaftStatusProvider interface {
+	Status() raftengine.Status
 }
 
 type FSMCompactRuntime struct {
-	GroupID uint64
-	Raft    RaftStatsProvider
-	Store   store.MVCCStore
+	GroupID      uint64
+	StatusReader RaftStatusProvider
+	Store        store.MVCCStore
 }
 
 type FSMCompactorOption func(*FSMCompactor)
@@ -147,7 +147,7 @@ func (c *FSMCompactor) validate() error {
 }
 
 func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRuntime) error {
-	if runtime.Raft == nil || runtime.Store == nil {
+	if runtime.StatusReader == nil || runtime.Store == nil {
 		return nil
 	}
 	retention, ok := runtime.Store.(store.RetentionController)
@@ -155,8 +155,8 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		return nil
 	}
 
-	stats := runtime.Raft.Stats()
-	if shouldSkipFSMCompaction(stats) {
+	status := runtime.StatusReader.Status()
+	if shouldSkipFSMCompaction(status) {
 		return nil
 	}
 
@@ -204,28 +204,14 @@ func (c *FSMCompactor) compactContext(ctx context.Context) (context.Context, con
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-func shouldSkipFSMCompaction(stats map[string]string) bool {
-	if stats == nil {
+func shouldSkipFSMCompaction(status raftengine.Status) bool {
+	if status.State == raftengine.StateCandidate {
 		return true
 	}
-	if stats["state"] == "Candidate" {
+	if status.FSMPending > 0 {
 		return true
 	}
-	if parseFSMCompactionStatUint(stats["fsm_pending"]) > 0 {
-		return true
-	}
-	return parseFSMCompactionStatUint(stats["applied_index"]) < parseFSMCompactionStatUint(stats["commit_index"])
-}
-
-func parseFSMCompactionStatUint(raw string) uint64 {
-	if raw == "" {
-		return 0
-	}
-	v, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
+	return status.AppliedIndex < status.CommitIndex
 }
 
 func (c *FSMCompactor) safeMinTS(now time.Time) uint64 {

@@ -3,8 +3,9 @@ package monitoring
 import (
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -15,13 +16,13 @@ func TestRaftObserverSetMembersReplacesRemovedMembers(t *testing.T) {
 	require.NotNil(t, observer)
 
 	observer.setLeaderMetric("1", "n2", "10.0.0.2:50051")
-	observer.setMembers("1", "n2", []raft.Server{
-		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: raft.Voter},
-		{ID: "n2", Address: "10.0.0.2:50051", Suffrage: raft.Voter},
+	observer.setMembers("1", "n2", []raftengine.Server{
+		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: "voter"},
+		{ID: "n2", Address: "10.0.0.2:50051", Suffrage: "voter"},
 	})
 	observer.setLeaderMetric("1", "n1", "10.0.0.1:50051")
-	observer.setMembers("1", "n1", []raft.Server{
-		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: raft.Voter},
+	observer.setMembers("1", "n1", []raftengine.Server{
+		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: "voter"},
 	})
 
 	err := testutil.GatherAndCompare(
@@ -40,12 +41,10 @@ elastickv_raft_member_present{group="1",member_address="10.0.0.1:50051",member_i
 	require.NoError(t, err)
 }
 
-func TestParseLastContactSeconds(t *testing.T) {
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds(""))
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("never"))
-	require.Equal(t, 0.0, parseLastContactSeconds("0"))
-	require.Equal(t, 0.25, parseLastContactSeconds("250ms"))
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("invalid"))
+func TestLastContactSeconds(t *testing.T) {
+	require.Equal(t, float64(lastContactUnknownValue), lastContactSeconds(-1))
+	require.Equal(t, 0.0, lastContactSeconds(0))
+	require.Equal(t, 0.25, lastContactSeconds(250*time.Millisecond))
 }
 
 func TestRaftMetricsNewFields(t *testing.T) {
