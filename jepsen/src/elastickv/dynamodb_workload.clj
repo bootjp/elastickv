@@ -151,9 +151,11 @@
 (defn dynamodb-append-workload
   "Builds the list-append workload map targeting the DynamoDB endpoint."
   [opts]
+  ;; DynamoDB has no read+write transaction API, so each Jepsen "txn" must
+  ;; contain exactly one micro-operation to keep it atomic.
   (let [workload (append/test {:key-count            (or (:key-count opts) 12)
                                :min-txn-length       1
-                               :max-txn-length       (or (:max-txn-length opts) 4)
+                               :max-txn-length       (or (:max-txn-length opts) 1)
                                :max-writes-per-key   (or (:max-writes-per-key opts) 128)
                                :consistency-models   [:strict-serializable]})
         client   (->DynamoDBClient (or (:node->port opts)
