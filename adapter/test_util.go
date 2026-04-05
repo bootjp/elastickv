@@ -375,7 +375,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, server.Run())
 		}(rd)
 
-		ds := NewDynamoDBServer(dynamoSock, st, coordinator)
+		ds := NewDynamoDBServer(dynamoSock, routedStore, coordinator)
 		go func() {
 			assert.NoError(t, ds.Run())
 		}()

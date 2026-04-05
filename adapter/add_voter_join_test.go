@@ -191,7 +191,7 @@ func startAddVoterJoinNode(
 		return err
 	})
 
-	ds := NewDynamoDBServer(lis.dynamo, st, coordinator)
+	ds := NewDynamoDBServer(lis.dynamo, routedStore, coordinator)
 	workers.Go(func() error {
 		err := ds.Run()
 		if errors.Is(err, net.ErrClosed) {
