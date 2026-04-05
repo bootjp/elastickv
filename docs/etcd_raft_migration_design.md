@@ -366,6 +366,31 @@ Recommended first cut:
 
 This is safer than attempting to convert HashiCorp log/stable state into `etcd/raft` durable state in place.
 
+### Zero-downtime target state
+
+The first safe migration path may still require downtime, but the production target should be a blue/green cutover with bounded or zero write unavailability.
+
+Candidate live-migration approaches:
+
+1. dual-write proxy mode:
+   - writes are mirrored to both clusters during a bounded transition window
+   - reads stay pinned to the source cluster until lag and verification checks pass
+2. source-to-target logical replication:
+   - the old cluster emits committed logical mutations or snapshots
+   - the new cluster replays them until it reaches a verified catch-up point
+3. maintenance-window cutover:
+   - traffic is drained
+   - a final snapshot is exported
+   - the new cluster is brought online from that snapshot
+
+The document does not assume that a live path is cheap. Dual-write and replication bridges add their own correctness and operational risks, especially around idempotence, ordering, and cutover verification. For that reason, the recommended sequence is:
+
+1. ship a maintenance-window migration first
+2. decide separately whether production requirements justify a bridge-based zero-downtime path
+3. only implement bridge mode behind explicit migration tooling, not as an ad hoc operator workflow
+
+If zero-downtime migration is a hard requirement, that requirement should be treated as a go/no-go gate before Phase 2 is considered complete.
+
 ### Exit criteria
 
 1. Crash recovery is deterministic.
@@ -456,7 +481,7 @@ Ship migration safely with an explicit rollback plan.
 1. The migration may consume substantial engineering time without enough runtime benefit in current workloads.
 2. Rebuilding admin and operational tooling may delay production readiness more than the consensus core itself.
 3. A custom transport or persistence bug could create correctness issues in the most sensitive part of the system.
-4. Mixed-engine rolling upgrades are likely infeasible, which increases migration coordination cost.
+4. Mixed-engine rolling upgrades are likely infeasible, which increases migration coordination cost unless a dedicated bridge or proxy migration mode is built and validated.
 5. The current read fence may already satisfy practical needs, weakening the case for migration.
 
 ## Open Questions
@@ -466,6 +491,7 @@ Ship migration safely with an explicit rollback plan.
 3. Would a HashiCorp Raft fork with `ReadIndex` cover enough of the need at lower cost?
 4. Do we want to preserve existing on-disk FSM snapshots as-is during migration, or redefine snapshot packaging at the same time?
 5. Is migration only for new clusters acceptable, or must existing clusters be migratable in place?
+6. If in-place migration is required, should Elastickv build dual-write proxy mode, logical replication bridge mode, or both?
 
 ## Decision Criteria
 
