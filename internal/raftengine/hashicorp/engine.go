@@ -41,7 +41,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	}
 
 	af := e.raft.Apply(data, timeout)
-	if err := af.Error(); err != nil {
+	if err := waitForFuture(ctx, af.Error); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return nil, ctxErr
 		}
@@ -93,7 +93,7 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 		return errors.WithStack(errNilEngine)
 	}
 
-	if err := e.raft.VerifyLeader().Error(); err != nil {
+	if err := waitForFuture(ctx, e.raft.VerifyLeader().Error); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return ctxErr
 		}
@@ -111,7 +111,7 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := e.raft.Barrier(timeout).Error(); err != nil {
+	if err := waitForFuture(ctx, e.raft.Barrier(timeout).Error); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return 0, ctxErr
 		}
@@ -149,7 +149,7 @@ func (e *Engine) Configuration(ctx context.Context) (raftengine.Configuration, e
 	}
 
 	future := e.raft.GetConfiguration()
-	if err := future.Error(); err != nil {
+	if err := waitForFuture(ctx, future.Error); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return raftengine.Configuration{}, ctxErr
 		}
@@ -193,6 +193,30 @@ func contextErr(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func waitForFuture(ctx context.Context, wait func() error) error {
+	if wait == nil {
+		return nil
+	}
+	if ctx == nil {
+		return wait()
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- wait()
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	}
 }
 
 func normalizeState(raw string) raftengine.State {

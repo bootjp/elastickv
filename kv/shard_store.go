@@ -47,17 +47,17 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 	}
 
 	// Wait for a leader read fence before serving from local state.
-	if isLinearizableRaftLeader(engineForGroup(g)) {
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		return s.leaderGetAt(ctx, g, key, ts)
 	}
 	return s.proxyRawGet(ctx, g, key, ts)
 }
 
-func isLinearizableRaftLeader(engine raftengine.LeaderView) bool {
+func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView) bool {
 	if !isLeaderEngine(engine) {
 		return false
 	}
-	_, err := linearizableReadEngine(engine)
+	_, err := linearizableReadEngineCtx(ctx, engine)
 	return err == nil
 }
 
@@ -270,7 +270,7 @@ func (s *ShardStore) scanRouteAtDirection(
 		return filterTxnInternalKVs(kvs), nil
 	}
 
-	if isLinearizableRaftLeader(engineForGroup(g)) {
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
@@ -493,7 +493,7 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 	// Avoid returning a stale watermark when our local raft instance is a
 	// deposed leader.
 	if engine := engineForGroup(g); isLeaderEngine(engine) {
-		if _, err := linearizableReadEngine(engine); err == nil {
+		if _, err := linearizableReadEngineCtx(ctx, engine); err == nil {
 			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 			if err != nil {
 				return 0, false, errors.WithStack(err)

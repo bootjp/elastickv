@@ -222,7 +222,7 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 	if interval <= 0 {
 		interval = defaultObserveInterval
 	}
-	o.ObserveOnce(runtimes)
+	o.observeOnce(ctx, runtimes)
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
@@ -231,7 +231,7 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				o.ObserveOnce(runtimes)
+				o.observeOnce(ctx, runtimes)
 			}
 		}
 	}()
@@ -239,15 +239,19 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 
 // ObserveOnce captures the latest raft state for all configured runtimes.
 func (o *RaftObserver) ObserveOnce(runtimes []RaftRuntime) {
+	o.observeOnce(context.Background(), runtimes)
+}
+
+func (o *RaftObserver) observeOnce(ctx context.Context, runtimes []RaftRuntime) {
 	if o == nil {
 		return
 	}
 	for _, runtime := range runtimes {
-		o.observeRuntime(runtime)
+		o.observeRuntime(ctx, runtime)
 	}
 }
 
-func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
+func (o *RaftObserver) observeRuntime(ctx context.Context, runtime RaftRuntime) {
 	if o == nil || o.metrics == nil || runtime.StatusReader == nil {
 		return
 	}
@@ -277,7 +281,7 @@ func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
 	if runtime.ConfigReader == nil {
 		return
 	}
-	cfg, err := runtime.ConfigReader.Configuration(context.Background())
+	cfg, err := runtime.ConfigReader.Configuration(ctx)
 	if err != nil {
 		return
 	}

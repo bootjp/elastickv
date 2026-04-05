@@ -429,12 +429,12 @@ func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
 	return leaderAddrFromEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) LinearizableRead() (uint64, error) {
+func (c *ShardedCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return linearizableReadEngine(engineForGroup(g))
+	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
@@ -461,12 +461,12 @@ func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {
 	return leaderAddrFromEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) LinearizableReadForKey(key []byte) (uint64, error) {
+func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return linearizableReadEngine(engineForGroup(g))
+	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

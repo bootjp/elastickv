@@ -30,18 +30,22 @@ func isLeaderEngine(engine raftengine.LeaderView) bool {
 	return engine != nil && engine.State() == raftengine.StateLeader
 }
 
-func verifyLeaderEngine(engine raftengine.LeaderView) error {
+func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) error {
 	if engine == nil {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return errors.WithStack(engine.VerifyLeader(context.Background()))
+	return errors.WithStack(engine.VerifyLeader(ctx))
 }
 
-func linearizableReadEngine(engine raftengine.LeaderView) (uint64, error) {
+func verifyLeaderEngine(engine raftengine.LeaderView) error {
+	return verifyLeaderEngineCtx(context.Background(), engine)
+}
+
+func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {
 	if engine == nil {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	index, err := engine.LinearizableRead(context.Background())
+	index, err := engine.LinearizableRead(ctx)
 	if err != nil {
 		return 0, errors.WithStack(err)
 	}

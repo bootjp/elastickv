@@ -27,7 +27,7 @@ type LeaderRoutedStore struct {
 }
 
 type linearizableKeyCoordinator interface {
-	LinearizableReadForKey(key []byte) (uint64, error)
+	LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error)
 }
 
 func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *LeaderRoutedStore {
@@ -39,12 +39,12 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 
 // leaderOKForKey prefers a linearizable read fence when the coordinator
 // exposes one. Older coordinators fall back to the legacy quorum verify check.
-func (s *LeaderRoutedStore) leaderOKForKey(key []byte) bool {
+func (s *LeaderRoutedStore) leaderOKForKey(ctx context.Context, key []byte) bool {
 	if s.coordinator == nil {
 		return true
 	}
 	if reader, ok := s.coordinator.(linearizableKeyCoordinator); ok {
-		_, err := reader.LinearizableReadForKey(key)
+		_, err := reader.LinearizableReadForKey(ctx, key)
 		return err == nil
 	}
 	if !s.coordinator.IsLeaderForKey(key) {
@@ -147,7 +147,7 @@ func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([
 	if s == nil || s.local == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	if s.leaderOKForKey(key) {
+	if s.leaderOKForKey(ctx, key) {
 		val, err := s.local.GetAt(ctx, key, ts)
 		return val, errors.WithStack(err)
 	}
@@ -172,7 +172,7 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	if s.leaderOKForKey(start) {
+	if s.leaderOKForKey(ctx, start) {
 		kvs, err := s.local.ScanAt(ctx, start, end, limit, ts)
 		return kvs, errors.WithStack(err)
 	}
@@ -186,7 +186,7 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	if s.leaderOKForKey(start) {
+	if s.leaderOKForKey(ctx, start) {
 		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, ts)
 		return kvs, errors.WithStack(err)
 	}
@@ -225,7 +225,7 @@ func (s *LeaderRoutedStore) LatestCommitTS(ctx context.Context, key []byte) (uin
 	if s == nil || s.local == nil {
 		return 0, false, nil
 	}
-	if s.leaderOKForKey(key) {
+	if s.leaderOKForKey(ctx, key) {
 		ts, exists, err := s.local.LatestCommitTS(ctx, key)
 		return ts, exists, errors.WithStack(err)
 	}

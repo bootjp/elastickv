@@ -50,7 +50,7 @@ func (s *stubLeaderCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
 	return s.leader
 }
 
-func (s *stubLeaderCoordinator) LinearizableRead() (uint64, error) {
+func (s *stubLeaderCoordinator) LinearizableRead(context.Context) (uint64, error) {
 	s.linearizableCalls++
 	if !s.isLeader {
 		return 0, ErrLeaderNotFound
@@ -58,8 +58,8 @@ func (s *stubLeaderCoordinator) LinearizableRead() (uint64, error) {
 	return 0, s.linearizableErr
 }
 
-func (s *stubLeaderCoordinator) LinearizableReadForKey([]byte) (uint64, error) {
-	return s.LinearizableRead()
+func (s *stubLeaderCoordinator) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return s.LinearizableRead(ctx)
 }
 
 func (s *stubLeaderCoordinator) Clock() *HLC {

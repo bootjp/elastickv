@@ -110,12 +110,12 @@ func (c *Coordinate) RaftLeaderForKey(_ []byte) raft.ServerAddress {
 	return c.RaftLeader()
 }
 
-func (c *Coordinate) LinearizableRead() (uint64, error) {
-	return linearizableReadEngine(c.engine)
+func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
+	return linearizableReadEngineCtx(ctx, c.engine)
 }
 
-func (c *Coordinate) LinearizableReadForKey(_ []byte) (uint64, error) {
-	return c.LinearizableRead()
+func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LinearizableRead(ctx)
 }
 
 func (c *Coordinate) nextStartTS() uint64 {
