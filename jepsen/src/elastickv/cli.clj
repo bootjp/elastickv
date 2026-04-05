@@ -108,6 +108,6 @@
                 (if (:local options)
                   (binding [control/*dummy* true] (run!))
                   (run!)))))
-    (catch Exception e
-      (warn (.getMessage e))
+    (catch Throwable t
+      (warn t "Workload failed")
       (System/exit 1))))
