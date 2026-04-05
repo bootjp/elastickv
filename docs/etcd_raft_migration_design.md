@@ -312,6 +312,374 @@ Create a minimal engine boundary and move the application off direct `*raft.Raft
 2. Existing tests still pass on the HashiCorp implementation.
 3. The project can implement an `etcd/raft` prototype without changing adapters again.
 
+### Concrete Phase 0 scope
+
+Phase 0 should be deliberately narrower than the full target architecture. The goal is not to fully model every future `etcd/raft` concern up front. The goal is to remove direct application dependence on `*raft.Raft` while preserving current behavior on the HashiCorp backend.
+
+Phase 0 should cover:
+
+1. command proposal
+2. leader discovery
+3. leader verification for writes
+4. linearizable-read entry point
+5. configuration readback for monitoring
+6. structured status for monitoring
+7. engine construction and shutdown
+
+Phase 0 should explicitly not cover:
+
+1. add/remove voter APIs in application code
+2. replacing `raftadmin` or `leaderhealth`
+3. changing external gRPC/Redis/DynamoDB APIs
+4. changing command encoding or FSM semantics
+5. implementing the `etcd/raft` backend yet
+
+### Proposed package layout
+
+Phase 0 should introduce:
+
+1. `internal/raftengine/types.go`
+2. `internal/raftengine/engine.go`
+3. `internal/raftengine/hashicorp/engine.go`
+4. `internal/raftengine/hashicorp/factory.go`
+5. `internal/raftengine/hashicorp/status.go`
+6. `internal/raftengine/testing/` for shared conformance tests
+
+Code that remains HashiCorp-specific after Phase 0 should live only under `internal/raftengine/hashicorp` and backend-specific tests.
+
+### Proposed core interfaces
+
+The Phase 0 interfaces should be narrow and shaped around current call sites.
+
+```go
+package raftengine
+
+import (
+	"context"
+	"io"
+	"time"
+)
+
+type State string
+
+const (
+	StateFollower  State = "follower"
+	StateCandidate State = "candidate"
+	StateLeader    State = "leader"
+	StateShutdown  State = "shutdown"
+	StateUnknown   State = "unknown"
+)
+
+type Server struct {
+	ID       string
+	Address  string
+	Suffrage string
+}
+
+type LeaderInfo struct {
+	ID      string
+	Address string
+}
+
+type Configuration struct {
+	Servers []Server
+}
+
+type Status struct {
+	State             State
+	Leader            LeaderInfo
+	Term              uint64
+	CommitIndex       uint64
+	AppliedIndex      uint64
+	LastLogIndex      uint64
+	LastSnapshotIndex uint64
+	FSMPending        uint64
+	NumPeers          uint64
+	LastContact       time.Duration
+}
+
+type ProposalResult struct {
+	CommitIndex uint64
+	Response    any
+}
+
+type Proposer interface {
+	Propose(ctx context.Context, data []byte, timeout time.Duration) (*ProposalResult, error)
+}
+
+type LeaderView interface {
+	State() State
+	Leader() LeaderInfo
+	VerifyLeader(ctx context.Context) error
+	LinearizableRead(ctx context.Context) (uint64, error)
+}
+
+type StatusReader interface {
+	Status() Status
+}
+
+type ConfigReader interface {
+	Configuration(ctx context.Context) (Configuration, error)
+}
+
+type Engine interface {
+	Proposer
+	LeaderView
+	StatusReader
+	ConfigReader
+	io.Closer
+}
+
+type Snapshot interface {
+	WriteTo(w io.Writer) (int64, error)
+	Close() error
+}
+
+type StateMachine interface {
+	Apply(data []byte) any
+	Snapshot() (Snapshot, error)
+	Restore(r io.ReadCloser) error
+}
+
+type AppliedIndexWaiter interface {
+	AppliedIndex() uint64
+	WaitForAppliedIndex(ctx context.Context, target uint64) error
+}
+
+type OpenConfig struct {
+	LocalID          string
+	LocalAddress     string
+	DataDir          string
+	Bootstrap        bool
+	BootstrapServers []Server
+	StateMachine     StateMachine
+}
+
+type Factory interface {
+	Open(ctx context.Context, cfg OpenConfig) (Engine, error)
+}
+```
+
+### Interface design notes
+
+1. `ProposalResult.Response any` is intentionally loose in Phase 0.
+   It preserves the current `HashiCorp Raft -> FSM response` contract used by `kv/transaction.go` without forcing a second refactor at the same time.
+2. `LinearizableRead(ctx)` is the only read-fence entry point higher layers should use.
+   `CommitIndex()`, `VerifyLeader()`, and waiter registration should move behind the backend implementation.
+3. `StateMachine` is intentionally command-oriented, not `raft.FSM`-shaped.
+   The HashiCorp backend can adapt the current `kvFSM`, and the future `etcd/raft` backend can reuse the same state machine contract.
+4. `AppliedIndexWaiter` is optional.
+   In Phase 0 the HashiCorp backend can type-assert the provided state machine or adapter when it needs local-apply waiting for linearizable reads.
+5. `Tick()` is not exposed.
+   Logical clock progression remains an engine-internal responsibility.
+6. Leadership transfer and mutating config changes should remain out of the Phase 0 core interface.
+   They can be added later as optional extension interfaces once a real application caller exists.
+
+### Call-site mapping
+
+The Phase 0 refactor should move these packages to the new boundary:
+
+| Current caller | New dependency | Notes |
+| --- | --- | --- |
+| `kv/transaction.go` | `raftengine.Proposer` | Replaces direct `raft.Apply(...)` usage |
+| `kv/leader_proxy.go` | `raftengine.Proposer` + `raftengine.LeaderView` | Keeps leader-forwarding logic in `kv`, moves raft details out |
+| `kv/coordinator.go` | `raftengine.Proposer` + `raftengine.LeaderView` | External `Coordinator` interface can stay unchanged |
+| `kv/sharded_coordinator.go` | `ShardGroup.Engine raftengine.Engine` | Group routing remains in `kv`, per-group runtime becomes opaque |
+| `kv/leader_routed_store.go` | `raftengine.LeaderView` | Reads use `LinearizableRead(ctx)` only |
+| `kv/raft_leader.go` | move behind backend | Should become backend-internal code |
+| `main.go` / `multiraft_runtime.go` | `raftengine.Factory` | Startup path should no longer call `raft.NewRaft(...)` directly |
+| `monitoring/raft.go` | `raftengine.StatusReader` + `raftengine.ConfigReader` | Replace `Stats()` string parsing with structured fields |
+| `adapter/test_util.go` | `raftengine.Factory` | Shared cluster harness should stop returning raw `*raft.Raft` to most tests |
+
+### Explicit boundary decisions
+
+To keep Phase 0 tractable, the following should stay where they are:
+
+1. protobuf command encoding stays in `kv/transaction.go`
+2. raw-request batching stays in `kv/transaction.go`
+3. HLC issuance stays in `kv/coordinator.go` and `kv/sharded_coordinator.go`
+4. shard routing stays in `kv/sharded_coordinator.go` and `kv/shard_router.go`
+5. gRPC proxying stays in `kv/leader_proxy.go` and adapter code
+
+This keeps Phase 0 focused on swapping the Raft runtime boundary, not redesigning the data plane.
+
+### Recommended PR split for Phase 0
+
+#### PR1: Introduce `internal/raftengine` types and HashiCorp wrapper
+
+Goal:
+
+Add the new package and a HashiCorp-backed `Engine` implementation without changing application behavior yet.
+
+Main files:
+
+1. `internal/raftengine/types.go`
+2. `internal/raftengine/engine.go`
+3. `internal/raftengine/hashicorp/engine.go`
+4. `internal/raftengine/hashicorp/status.go`
+5. `internal/raftengine/hashicorp/fsm_adapter.go`
+
+Tasks:
+
+1. Define `State`, `LeaderInfo`, `Status`, `Configuration`, and `ProposalResult`.
+2. Implement a HashiCorp-backed `Engine` wrapper around `*raft.Raft`.
+3. Implement structured status extraction in one place instead of leaking `Stats()` parsing.
+4. Add a small state-machine adapter that wraps current FSM behavior.
+5. Add unit tests for:
+   - `Propose`
+   - `State`
+   - `Leader`
+   - `VerifyLeader`
+   - `LinearizableRead`
+   - `Status`
+   - `Configuration`
+
+Done criteria:
+
+1. The new package compiles and is tested.
+2. No application caller depends on it yet.
+
+#### PR2: Move write-path consumers to `raftengine`
+
+Goal:
+
+Remove direct `*raft.Raft` usage from the write path in `kv`.
+
+Main files:
+
+1. `kv/transaction.go`
+2. `kv/leader_proxy.go`
+3. `kv/coordinator.go`
+4. related tests in `kv/`
+
+Tasks:
+
+1. Change `TransactionManager` to depend on `raftengine.Proposer`.
+2. Change `LeaderProxy` to depend on `raftengine.LeaderView`.
+3. Keep public `Coordinator` behavior unchanged.
+4. Preserve current proposal batching and FSM response handling.
+
+Done criteria:
+
+1. No direct `raft.Apply(...)` remains in `kv/transaction.go`.
+2. Existing transactional tests pass with the HashiCorp backend.
+
+#### PR3: Move read-path consumers to `raftengine`
+
+Goal:
+
+Remove direct `*raft.Raft` usage from linearizable-read paths.
+
+Main files:
+
+1. `kv/coordinator.go`
+2. `kv/sharded_coordinator.go`
+3. `kv/leader_routed_store.go`
+4. `kv/shard_store.go`
+5. any remaining `kv/raft_leader.go` helpers, which should move under the backend
+
+Tasks:
+
+1. Replace higher-level use of `VerifyLeader`, `CommitIndex()`, and `State()` with `LinearizableRead(ctx)` and `Leader()`.
+2. Move HashiCorp-specific read-fence logic behind `internal/raftengine/hashicorp`.
+3. Keep read proxy behavior unchanged.
+4. Update tests to use engine-backed fakes/stubs instead of `*raft.Raft` where practical.
+
+Done criteria:
+
+1. Read-path application code is backend-agnostic.
+2. HashiCorp-specific read fence code is isolated under the backend package.
+
+#### PR4: Switch runtime construction to `raftengine.Factory`
+
+Goal:
+
+Move server startup and shared cluster harnesses to the new factory.
+
+Main files:
+
+1. `main.go`
+2. `multiraft_runtime.go`
+3. `adapter/test_util.go`
+4. `kv/sharded_coordinator.go`
+
+Tasks:
+
+1. Change `ShardGroup` to store `raftengine.Engine` instead of raw `*raft.Raft` where possible.
+2. Introduce a HashiCorp `Factory` used by production startup.
+3. Keep the same bootstrap behavior and on-disk layout.
+4. Limit raw `*raft.Raft` access to backend-private code and backend-specific tests.
+
+Done criteria:
+
+1. `main.go` no longer calls `raft.NewRaft(...)` directly.
+2. Shared test harnesses can start clusters through the factory.
+
+#### PR5: Move monitoring to structured engine status
+
+Goal:
+
+Remove direct monitoring dependence on HashiCorp `Stats()` and `GetConfiguration()`.
+
+Main files:
+
+1. `monitoring/raft.go`
+2. `monitoring/registry.go`
+3. `main.go`
+4. related monitoring tests
+
+Tasks:
+
+1. Change `monitoring.RaftRuntime` to carry engine-facing readers instead of `*raft.Raft`.
+2. Replace `Stats()` parsing with `Status()`.
+3. Replace direct `GetConfiguration()` with `Configuration(ctx)`.
+4. Derive leader-change observations from polled state deltas in Phase 0 rather than carrying observer registration through the new abstraction.
+
+Done criteria:
+
+1. Monitoring no longer imports or depends on HashiCorp types outside the backend.
+2. Existing dashboards still have equivalent fields available.
+
+#### PR6: Add shared conformance tests and cleanup
+
+Goal:
+
+Lock the abstraction boundary before building the `etcd/raft` prototype.
+
+Main files:
+
+1. `internal/raftengine/testing/...`
+2. backend tests
+3. remaining application tests that still use raw `*raft.Raft`
+
+Tasks:
+
+1. Add shared conformance tests for:
+   - leadership discovery
+   - linearizable reads
+   - proposal result handling
+   - configuration reporting
+   - restart/open-close behavior
+2. Convert shared harness tests to use the engine interface where possible.
+3. Leave only intentionally backend-specific tests using raw HashiCorp types.
+
+Done criteria:
+
+1. The boundary is test-locked before the `etcd/raft` implementation starts.
+2. The future backend can be added mostly by satisfying the conformance suite.
+
+### Phase 0 sequencing rationale
+
+The proposed order is designed to reduce merge conflicts and keep every PR reviewable:
+
+1. build the wrapper first
+2. move write paths before read paths
+3. move runtime construction after callers are ready
+4. move monitoring after structured status exists
+5. add conformance tests last, once the boundary is stable
+
+This order also keeps the HashiCorp backend fully shippable after each PR.
+
 ## Phase 1: Single-Group etcd/raft Prototype
 
 ### Goal
