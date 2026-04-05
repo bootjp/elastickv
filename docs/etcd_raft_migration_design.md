@@ -404,7 +404,7 @@ type ProposalResult struct {
 }
 
 type Proposer interface {
-	Propose(ctx context.Context, data []byte, timeout time.Duration) (*ProposalResult, error)
+	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {
@@ -438,7 +438,7 @@ type Snapshot interface {
 type StateMachine interface {
 	Apply(data []byte) any
 	Snapshot() (Snapshot, error)
-	Restore(r io.ReadCloser) error
+	Restore(r io.Reader) error
 }
 
 type AppliedIndexWaiter interface {
@@ -465,14 +465,18 @@ type Factory interface {
 1. `ProposalResult.Response any` is intentionally loose in Phase 0.
    It preserves the current `HashiCorp Raft -> FSM response` contract used by `kv/transaction.go` without forcing a second refactor at the same time.
 2. `LinearizableRead(ctx)` is the only read-fence entry point higher layers should use.
-   `CommitIndex()`, `VerifyLeader()`, and waiter registration should move behind the backend implementation.
-3. `StateMachine` is intentionally command-oriented, not `raft.FSM`-shaped.
+   `CommitIndex()` and local-apply waiting should move behind the backend implementation.
+3. `VerifyLeader(ctx)` remains part of the public engine surface for write-path stale-leader checks.
+   Read paths should not call it directly; they should only use `LinearizableRead(ctx)`.
+4. `StateMachine` is intentionally command-oriented, not `raft.FSM`-shaped.
    The HashiCorp backend can adapt the current `kvFSM`, and the future `etcd/raft` backend can reuse the same state machine contract.
-4. `AppliedIndexWaiter` is optional.
-   In Phase 0 the HashiCorp backend can type-assert the provided state machine or adapter when it needs local-apply waiting for linearizable reads.
-5. `Tick()` is not exposed.
+5. `AppliedIndexWaiter` is an optional backend-internal hook, not a caller-facing requirement.
+   Application code should never type-assert it. If a backend needs local-apply waiting for linearizable reads, the backend can type-assert the provided state machine or adapter internally.
+6. `Restore` uses `io.Reader`, not `io.ReadCloser`.
+   The backend that opened the underlying snapshot stream remains responsible for closing it.
+7. `Tick()` is not exposed.
    Logical clock progression remains an engine-internal responsibility.
-6. Leadership transfer and mutating config changes should remain out of the Phase 0 core interface.
+8. Leadership transfer and mutating config changes should remain out of the Phase 0 core interface.
    They can be added later as optional extension interfaces once a real application caller exists.
 
 ### Call-site mapping
