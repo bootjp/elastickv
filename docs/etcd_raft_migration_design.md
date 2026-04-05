@@ -452,6 +452,10 @@ type OpenConfig struct {
 	DataDir          string
 	Bootstrap        bool
 	BootstrapServers []Server
+	HeartbeatTimeout time.Duration
+	ElectionTimeout  time.Duration
+	LeaderLeaseTimeout time.Duration
+	CommitTimeout    time.Duration
 	StateMachine     StateMachine
 }
 
@@ -471,13 +475,15 @@ type Factory interface {
 4. `StateMachine` is intentionally command-oriented, not `raft.FSM`-shaped.
    The HashiCorp backend can adapt the current `kvFSM`, and the future `etcd/raft` backend can reuse the same state machine contract.
 5. `AppliedIndexWaiter` is a provider-side optional interface for the configured `StateMachine` or its backend adapter.
-   Application code should never depend on it or type-assert it. If a backend needs local-apply waiting for linearizable reads, the backend can detect and use it internally.
+   Consumers of the `Engine` interface, such as the KV layer, should never depend on it or type-assert it. A `StateMachine` and backend adapter may still use it as an optional provider-side contract when local-apply waiting is needed for linearizable reads.
 6. `Restore` uses `io.Reader`, not `io.ReadCloser`.
    The backend that opened the underlying snapshot stream remains responsible for closing it.
 7. `Tick()` is not exposed.
    Logical clock progression remains an engine-internal responsibility.
 8. Leadership transfer and mutating config changes should remain out of the Phase 0 core interface.
    They can be added later as optional extension interfaces once a real application caller exists.
+9. `OpenConfig` should carry the timing knobs that Elastickv already sets on HashiCorp Raft today.
+   Phase 0 is supposed to preserve current behavior, so heartbeat, election, leader-lease, and commit timeout values should move behind the factory boundary instead of being silently hard-coded by one backend.
 
 ### Call-site mapping
 
