@@ -1,5 +1,6 @@
 (ns elastickv.dynamodb-workload-test
   (:require [clojure.test :refer :all]
+            [jepsen.client :as client]
             [elastickv.dynamodb-workload :as workload]))
 
 (deftest builds-test-spec
@@ -24,3 +25,11 @@
                     :concurrency 10
                     :dynamo-port 9000})]
     (is (= 10 (:concurrency test-map)))))
+
+(deftest host-override-uses-provided-host
+  (let [test-map (workload/elastickv-dynamodb-test
+                   {:dynamo-host "127.0.0.1"
+                    :node->port {"n1" 8000 "n2" 8001}})
+        c        (:client test-map)
+        opened   (client/open! c test-map "n1")]
+    (is (re-find #"http://127\.0\.0\.1:8000" (:url opened)))))

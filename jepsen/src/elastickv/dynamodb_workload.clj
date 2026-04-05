@@ -42,13 +42,16 @@
                 :throw-exceptions false
                 :conn-timeout 5000
                 :socket-timeout 10000})]
-    (when (and (:body resp) (not (str/blank? (:body resp))))
-      (let [parsed (json/parse-string (:body resp) true)]
-        (when-let [err-type (:__type parsed)]
-          (when-not (< (:status resp) 400)
-            (throw (ex-info (str "DynamoDB error: " err-type ": " (:message parsed ""))
-                            {:type err-type :status (:status resp) :body parsed}))))
-        parsed))))
+    (if (< (:status resp) 400)
+      (when (and (:body resp) (not (str/blank? (:body resp))))
+        (json/parse-string (:body resp) true))
+      (let [parsed (when (and (:body resp) (not (str/blank? (:body resp))))
+                     (try (json/parse-string (:body resp) true)
+                          (catch Exception _ nil)))
+            err-type (get parsed :__type "UnknownError")
+            message  (get parsed :message (or (:body resp) ""))]
+        (throw (ex-info (str "DynamoDB error: " err-type ": " message)
+                        {:type err-type :status (:status resp) :body parsed}))))))
 
 (defn- create-table!
   "Create the jepsen_append table if it doesn't exist."
@@ -96,10 +99,7 @@
       (assoc this :url (dynamo-url host port))))
 
   (setup! [this _test]
-    (try
-      (create-table! url)
-      (catch Exception e
-        (warn e "table creation failed (may already exist)"))))
+    (create-table! url))
 
   (teardown! [_this _test])
 
@@ -129,7 +129,7 @@
 
             ;; Validation errors are definite failures
             (= "ValidationException" err-type)
-            (assoc op :type :fail :error (str err-type ": " (:message (:body data) "")))
+            (assoc op :type :fail :error (str err-type ": " (get-in data [:body :message] "")))
 
             :else
             (assoc op :type :info :error (.getMessage e)))))
