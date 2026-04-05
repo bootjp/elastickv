@@ -217,8 +217,9 @@
                             :strict-host-key-checking false})]
       (cond
         (:help options) (println summary)
-        (seq errors) (binding [*out* *err*]
-                       (println "Error parsing options:" (str/join "; " errors)))
+        (seq errors) (do (binding [*out* *err*]
+                         (println "Error parsing options:" (str/join "; " errors)))
+                       (System/exit 1))
         (:local options) (binding [control/*dummy* true]
                            (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))
         :else (fail-on-invalid! (jepsen/run! (elastickv-redis-test options)))))
