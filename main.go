@@ -40,6 +40,10 @@ var (
 	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
 	redisAddr            = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
 	dynamoAddr           = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	s3Addr               = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
+	s3Region             = flag.String("s3Region", "us-east-1", "S3 signing region")
+	s3CredsFile          = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
+	s3PathStyleOnly      = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
 	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddr            = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
@@ -51,6 +55,7 @@ var (
 	raftGroups           = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
 	shardRanges          = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
 	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 )
 
 func main() {
@@ -68,7 +73,7 @@ func run() error {
 
 	var lc net.ListenConfig
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *raftGroups, *shardRanges, *raftRedisMap)
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map)
 	if err != nil {
 		return err
 	}
@@ -148,6 +153,11 @@ func run() error {
 		pubsubRelay:     adapter.NewRedisPubSubRelay(),
 		readTracker:     readTracker,
 		dynamoAddress:   *dynamoAddr,
+		s3Address:       *s3Addr,
+		leaderS3:        cfg.leaderS3,
+		s3Region:        *s3Region,
+		s3CredsFile:     *s3CredsFile,
+		s3PathStyleOnly: *s3PathStyleOnly,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
 		pprofAddress:    *pprofAddr,
@@ -171,10 +181,11 @@ type runtimeConfig struct {
 	defaultGroup uint64
 	engine       *distribution.Engine
 	leaderRedis  map[raft.ServerAddress]string
+	leaderS3     map[raft.ServerAddress]string
 	multi        bool
 }
 
-func parseRuntimeConfig(myAddr, redisAddr, raftGroups, shardRanges, raftRedisMap string) (runtimeConfig, error) {
+func parseRuntimeConfig(myAddr, redisAddr, s3Addr, raftGroups, shardRanges, raftRedisMap, raftS3Map string) (runtimeConfig, error) {
 	groups, err := parseRaftGroups(raftGroups, myAddr)
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft groups")
@@ -193,12 +204,17 @@ func parseRuntimeConfig(myAddr, redisAddr, raftGroups, shardRanges, raftRedisMap
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft redis map")
 	}
+	leaderS3, err := buildLeaderS3(groups, s3Addr, raftS3Map)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft s3 map")
+	}
 
 	return runtimeConfig{
 		groups:       groups,
 		defaultGroup: defaultGroup,
 		engine:       engine,
 		leaderRedis:  leaderRedis,
+		leaderS3:     leaderS3,
 		multi:        len(groups) > 1,
 	}, nil
 }
@@ -212,17 +228,30 @@ func buildEngine(ranges []rangeSpec) *distribution.Engine {
 }
 
 func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) (map[raft.ServerAddress]string, error) {
-	leaderRedis, err := parseRaftRedisMap(raftRedisMap)
+	return buildLeaderAddrMap(groups, redisAddr, raftRedisMap, parseRaftRedisMap)
+}
+
+func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[raft.ServerAddress]string, error) {
+	return buildLeaderAddrMap(groups, s3Addr, raftS3Map, parseRaftS3Map)
+}
+
+func buildLeaderAddrMap(
+	groups []groupSpec,
+	defaultAddr string,
+	rawMap string,
+	parse func(string) (map[raft.ServerAddress]string, error),
+) (map[raft.ServerAddress]string, error) {
+	leaderAddrMap, err := parse(rawMap)
 	if err != nil {
 		return nil, err
 	}
 	for _, g := range groups {
 		addr := raft.ServerAddress(g.address)
-		if _, ok := leaderRedis[addr]; !ok {
-			leaderRedis[addr] = redisAddr
+		if _, ok := leaderAddrMap[addr]; !ok {
+			leaderAddrMap[addr] = defaultAddr
 		}
 	}
-	return leaderRedis, nil
+	return leaderAddrMap, nil
 }
 
 var (
@@ -587,6 +616,11 @@ type runtimeServerRunner struct {
 	pubsubRelay     *adapter.RedisPubSubRelay
 	readTracker     *kv.ActiveTimestampTracker
 	dynamoAddress   string
+	s3Address       string
+	leaderS3        map[raft.ServerAddress]string
+	s3Region        string
+	s3CredsFile     string
+	s3PathStyleOnly bool
 	metricsAddress  string
 	metricsToken    string
 	pprofAddress    string
@@ -614,6 +648,9 @@ func (r runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry, r.readTracker); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
