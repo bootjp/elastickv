@@ -90,9 +90,10 @@
 
 (defrecord DynamoDBClient [node->port url]
   client/Client
-  (open! [this _test node]
-    (let [port (get node->port node 8000)]
-      (assoc this :url (dynamo-url node port))))
+  (open! [this test node]
+    (let [port (get node->port node 8000)
+          host (or (:dynamo-host test) (name node))]
+      (assoc this :url (dynamo-url host port))))
 
   (setup! [this _test]
     (try
@@ -202,6 +203,7 @@
             {:name            (or (:name opts) "elastickv-dynamodb-append")
              :nodes           nodes
              :db              db
+             :dynamo-host     (:dynamo-host opts)
              :os              (if local? os/noop debian/os)
              :net             (if local? net/noop net/iptables)
              :ssh             (merge {:username              "vagrant"
@@ -304,6 +306,7 @@
                     :nodes node-list
                     :faults faults
                     :local local?
+                    :dynamo-host (:host options)
                     :node->port node->port
                     :dynamo-port (:dynamo-port options)
                     :redis-port (:redis-port options)
