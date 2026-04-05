@@ -115,6 +115,29 @@ func TestParseRaftRedisMap(t *testing.T) {
 	})
 }
 
+func TestParseRaftS3Map(t *testing.T) {
+	m, err := parseRaftS3Map("a=b, c=d")
+	require.NoError(t, err)
+	require.Equal(t, map[raft.ServerAddress]string{
+		"a": "b",
+		"c": "d",
+	}, m)
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		m, err := parseRaftS3Map(" a = b , c = d ")
+		require.NoError(t, err)
+		require.Equal(t, map[raft.ServerAddress]string{
+			"a": "b",
+			"c": "d",
+		}, m)
+	})
+
+	t.Run("invalid entry errors", func(t *testing.T) {
+		_, err := parseRaftS3Map("a=b, nope")
+		require.ErrorIs(t, err, ErrInvalidRaftS3MapEntry)
+	})
+}
+
 func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
