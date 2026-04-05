@@ -14,10 +14,12 @@ import (
 )
 
 type stubLeaderCoordinator struct {
-	isLeader bool
-	verify   error
-	leader   raft.ServerAddress
-	clock    *HLC
+	isLeader          bool
+	verify            error
+	linearizableErr   error
+	linearizableCalls int
+	leader            raft.ServerAddress
+	clock             *HLC
 }
 
 func (s *stubLeaderCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -46,6 +48,18 @@ func (s *stubLeaderCoordinator) VerifyLeaderForKey([]byte) error {
 
 func (s *stubLeaderCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
 	return s.leader
+}
+
+func (s *stubLeaderCoordinator) LinearizableRead() (uint64, error) {
+	s.linearizableCalls++
+	if !s.isLeader {
+		return 0, ErrLeaderNotFound
+	}
+	return 0, s.linearizableErr
+}
+
+func (s *stubLeaderCoordinator) LinearizableReadForKey([]byte) (uint64, error) {
+	return s.LinearizableRead()
 }
 
 func (s *stubLeaderCoordinator) Clock() *HLC {
@@ -146,6 +160,27 @@ func TestLeaderRoutedStore_UsesLocalStoreWhenLeaderVerified(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(10), ts)
+}
+
+func TestLeaderRoutedStore_PrefersLinearizableReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+
+	coord := &stubLeaderCoordinator{
+		isLeader: true,
+		verify:   ErrLeaderNotFound,
+		clock:    NewHLC(),
+	}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	val, err := s.GetAt(ctx, []byte("k"), 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), val)
+	require.Equal(t, 1, coord.linearizableCalls)
 }
 
 func TestLeaderRoutedStore_ProxiesReadsWhenFollower(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -15,9 +16,10 @@ import (
 )
 
 type ShardGroup struct {
-	Raft  *raft.Raft
-	Store store.MVCCStore
-	Txn   Transactional
+	Raft   *raft.Raft
+	Engine raftengine.Engine
+	Store  store.MVCCStore
+	Txn    Transactional
 }
 
 const (
@@ -405,10 +407,10 @@ func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Ele
 
 func (c *ShardedCoordinator) IsLeader() bool {
 	g, ok := c.groups[c.defaultGroup]
-	if !ok || g.Raft == nil {
+	if !ok {
 		return false
 	}
-	return g.Raft.State() == raft.Leader
+	return isLeaderEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) VerifyLeader() error {
@@ -416,24 +418,31 @@ func (c *ShardedCoordinator) VerifyLeader() error {
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyRaftLeader(g.Raft)
+	return verifyLeaderEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
 	g, ok := c.groups[c.defaultGroup]
-	if !ok || g.Raft == nil {
+	if !ok {
 		return ""
 	}
-	addr, _ := g.Raft.LeaderWithID()
-	return addr
+	return leaderAddrFromEngine(engineForGroup(g))
+}
+
+func (c *ShardedCoordinator) LinearizableRead() (uint64, error) {
+	g, ok := c.groups[c.defaultGroup]
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return linearizableReadEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	g, ok := c.groupForKey(key)
-	if !ok || g.Raft == nil {
+	if !ok {
 		return false
 	}
-	return g.Raft.State() == raft.Leader
+	return isLeaderEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
@@ -441,16 +450,23 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyRaftLeader(g.Raft)
+	return verifyLeaderEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {
 	g, ok := c.groupForKey(key)
-	if !ok || g.Raft == nil {
+	if !ok {
 		return ""
 	}
-	addr, _ := g.Raft.LeaderWithID()
-	return addr
+	return leaderAddrFromEngine(engineForGroup(g))
+}
+
+func (c *ShardedCoordinator) LinearizableReadForKey(key []byte) (uint64, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return linearizableReadEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

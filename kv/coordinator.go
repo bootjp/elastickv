@@ -5,6 +5,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
@@ -13,9 +15,13 @@ import (
 const redirectForwardTimeout = 5 * time.Second
 
 func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
+	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r))
+}
+
+func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine) *Coordinate {
 	return &Coordinate{
 		transactionManager: txm,
-		raft:               r,
+		engine:             engine,
 		clock:              NewHLC(),
 	}
 }
@@ -26,7 +32,7 @@ type CoordinateResponse struct {
 
 type Coordinate struct {
 	transactionManager Transactional
-	raft               *raft.Raft
+	engine             raftengine.Engine
 	clock              *HLC
 	connCache          GRPCConnCache
 }
@@ -76,17 +82,16 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 }
 
 func (c *Coordinate) IsLeader() bool {
-	return c.raft.State() == raft.Leader
+	return isLeaderEngine(c.engine)
 }
 
 func (c *Coordinate) VerifyLeader() error {
-	return verifyRaftLeader(c.raft)
+	return verifyLeaderEngine(c.engine)
 }
 
 // RaftLeader returns the current leader's address as known by this node.
 func (c *Coordinate) RaftLeader() raft.ServerAddress {
-	addr, _ := c.raft.LeaderWithID()
-	return addr
+	return leaderAddrFromEngine(c.engine)
 }
 
 func (c *Coordinate) Clock() *HLC {
@@ -103,6 +108,14 @@ func (c *Coordinate) VerifyLeaderForKey(_ []byte) error {
 
 func (c *Coordinate) RaftLeaderForKey(_ []byte) raft.ServerAddress {
 	return c.RaftLeader()
+}
+
+func (c *Coordinate) LinearizableRead() (uint64, error) {
+	return linearizableReadEngine(c.engine)
+}
+
+func (c *Coordinate) LinearizableReadForKey(_ []byte) (uint64, error) {
+	return c.LinearizableRead()
 }
 
 func (c *Coordinate) nextStartTS() uint64 {
@@ -205,7 +218,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		return nil, ErrInvalidRequest
 	}
 
-	addr, _ := c.raft.LeaderWithID()
+	addr := leaderAddrFromEngine(c.engine)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}

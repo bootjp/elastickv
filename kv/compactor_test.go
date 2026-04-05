@@ -6,16 +6,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
-type fakeRaftStats struct {
-	stats map[string]string
+type fakeRaftStatus struct {
+	status raftengine.Status
 }
 
-func (f fakeRaftStats) Stats() map[string]string {
-	return f.stats
+func (f fakeRaftStatus) Status() raftengine.Status {
+	return f.status
 }
 
 func TestFSMCompactorCompactsEligibleRuntime(t *testing.T) {
@@ -28,11 +29,11 @@ func TestFSMCompactorCompactsEligibleRuntime(t *testing.T) {
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
 			GroupID: 1,
-			Raft: fakeRaftStats{stats: map[string]string{
-				"state":         "Follower",
-				"fsm_pending":   "0",
-				"applied_index": "10",
-				"commit_index":  "10",
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
 			}},
 			Store: st,
 		}},
@@ -64,11 +65,11 @@ func TestFSMCompactorRespectsPinnedTimestamp(t *testing.T) {
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
 			GroupID: 1,
-			Raft: fakeRaftStats{stats: map[string]string{
-				"state":         "Follower",
-				"fsm_pending":   "0",
-				"applied_index": "10",
-				"commit_index":  "10",
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
 			}},
 			Store: st,
 		}},
@@ -93,11 +94,11 @@ func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
 			GroupID: 1,
-			Raft: fakeRaftStats{stats: map[string]string{
-				"state":         "Follower",
-				"fsm_pending":   "1",
-				"applied_index": "9",
-				"commit_index":  "10",
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   1,
+				AppliedIndex: 9,
+				CommitIndex:  10,
 			}},
 			Store: st,
 		}},
@@ -129,11 +130,11 @@ func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
 			GroupID: 1,
-			Raft: fakeRaftStats{stats: map[string]string{
-				"state":         "Follower",
-				"fsm_pending":   "0",
-				"applied_index": "10",
-				"commit_index":  "10",
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
 			}},
 			Store: st,
 		}},

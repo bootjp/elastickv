@@ -26,6 +26,10 @@ type LeaderRoutedStore struct {
 	connCache GRPCConnCache
 }
 
+type linearizableKeyCoordinator interface {
+	LinearizableReadForKey(key []byte) (uint64, error)
+}
+
 func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *LeaderRoutedStore {
 	return &LeaderRoutedStore{
 		local:       local,
@@ -33,15 +37,15 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 	}
 }
 
-// leaderOKForKey verifies leadership via a quorum check. Note: there is a
-// small TOCTOU window between VerifyLeader returning and the subsequent read —
-// leadership could theoretically change in that interval, allowing a stale
-// read from a deposed leader. The Raft ReadIndex protocol would close this
-// gap but is not yet implemented. For most use cases, the quorum-verified
-// window is acceptably small.
+// leaderOKForKey prefers a linearizable read fence when the coordinator
+// exposes one. Older coordinators fall back to the legacy quorum verify check.
 func (s *LeaderRoutedStore) leaderOKForKey(key []byte) bool {
 	if s.coordinator == nil {
 		return true
+	}
+	if reader, ok := s.coordinator.(linearizableKeyCoordinator); ok {
+		_, err := reader.LinearizableReadForKey(key)
+		return err == nil
 	}
 	if !s.coordinator.IsLeaderForKey(key) {
 		return false

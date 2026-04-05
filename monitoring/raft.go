@@ -3,13 +3,11 @@ package monitoring
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -21,22 +19,20 @@ var raftStates = []string{
 	"unknown",
 }
 
-var loggedLastContactParseValues sync.Map
-
 const (
 	defaultObserveInterval  = 5 * time.Second
 	lastContactUnknownValue = -1
-	observerBufferSize      = 16
 )
 
 // RaftRuntime describes a raft group observed by the metrics exporter.
 type RaftRuntime struct {
-	GroupID uint64
-	Raft    *raft.Raft
+	GroupID      uint64
+	StatusReader raftengine.StatusReader
+	ConfigReader raftengine.ConfigReader
 }
 
 // RaftMetrics holds all Prometheus gauge vectors for a single Raft group.
-// Fields are populated by observeRuntime from raft.Raft.Stats().
+// Fields are populated by observeRuntime from raftengine status snapshots.
 type RaftMetrics struct {
 	// localState reports the current state (follower/candidate/leader/shutdown/unknown).
 	localState *prometheus.GaugeVec
@@ -226,7 +222,6 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 	if interval <= 0 {
 		interval = defaultObserveInterval
 	}
-	o.registerRuntimeObservers(ctx, runtimes)
 	o.ObserveOnce(runtimes)
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -242,38 +237,6 @@ func (o *RaftObserver) Start(ctx context.Context, runtimes []RaftRuntime, interv
 	}()
 }
 
-func (o *RaftObserver) registerRuntimeObservers(ctx context.Context, runtimes []RaftRuntime) {
-	if o == nil {
-		return
-	}
-	for _, runtime := range runtimes {
-		if runtime.Raft == nil {
-			continue
-		}
-		group := strconv.FormatUint(runtime.GroupID, 10)
-		ch := make(chan raft.Observation, observerBufferSize)
-		observer := raft.NewObserver(ch, false, func(ob *raft.Observation) bool {
-			_, ok := ob.Data.(raft.LeaderObservation)
-			return ok
-		})
-		runtime.Raft.RegisterObserver(observer)
-
-		go func(r *raft.Raft, group string, ch <-chan raft.Observation, observer *raft.Observer) {
-			defer r.DeregisterObserver(observer)
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ob := <-ch:
-					if _, ok := ob.Data.(raft.LeaderObservation); ok {
-						o.observeLeaderChange(group)
-					}
-				}
-			}
-		}(runtime.Raft, group, ch, observer)
-	}
-}
-
 // ObserveOnce captures the latest raft state for all configured runtimes.
 func (o *RaftObserver) ObserveOnce(runtimes []RaftRuntime) {
 	if o == nil {
@@ -285,13 +248,13 @@ func (o *RaftObserver) ObserveOnce(runtimes []RaftRuntime) {
 }
 
 func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
-	if o == nil || o.metrics == nil || runtime.Raft == nil {
+	if o == nil || o.metrics == nil || runtime.StatusReader == nil {
 		return
 	}
 
 	group := strconv.FormatUint(runtime.GroupID, 10)
-	stats := runtime.Raft.Stats()
-	state := normalizeRaftState(stats["state"])
+	status := runtime.StatusReader.Status()
+	state := normalizeRaftState(status.State)
 	for _, candidate := range raftStates {
 		value := 0.0
 		if candidate == state {
@@ -300,33 +263,41 @@ func (o *RaftObserver) observeRuntime(runtime RaftRuntime) {
 		o.metrics.localState.WithLabelValues(group, candidate).Set(value)
 	}
 
-	o.metrics.commitIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["commit_index"])))
-	o.metrics.appliedIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["applied_index"])))
-	o.metrics.lastContact.WithLabelValues(group).Set(parseLastContactSeconds(stats["last_contact"]))
-	o.metrics.term.WithLabelValues(group).Set(float64(parseUintMetric(stats["term"])))
-	o.metrics.lastLogIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_log_index"])))
-	o.metrics.lastSnapshotIndex.WithLabelValues(group).Set(float64(parseUintMetric(stats["last_snapshot_index"])))
-	o.metrics.fsmPending.WithLabelValues(group).Set(float64(parseUintMetric(stats["fsm_pending"])))
-	o.metrics.numPeers.WithLabelValues(group).Set(float64(parseUintMetric(stats["num_peers"])))
+	o.metrics.commitIndex.WithLabelValues(group).Set(float64(status.CommitIndex))
+	o.metrics.appliedIndex.WithLabelValues(group).Set(float64(status.AppliedIndex))
+	o.metrics.lastContact.WithLabelValues(group).Set(lastContactSeconds(status.LastContact))
+	o.metrics.term.WithLabelValues(group).Set(float64(status.Term))
+	o.metrics.lastLogIndex.WithLabelValues(group).Set(float64(status.LastLogIndex))
+	o.metrics.lastSnapshotIndex.WithLabelValues(group).Set(float64(status.LastSnapshotIndex))
+	o.metrics.fsmPending.WithLabelValues(group).Set(float64(status.FSMPending))
+	o.metrics.numPeers.WithLabelValues(group).Set(float64(status.NumPeers))
 
-	leaderAddr, leaderID := runtime.Raft.LeaderWithID()
-	o.setLeaderMetric(group, string(leaderID), string(leaderAddr))
+	o.setLeaderMetric(group, status.Leader.ID, status.Leader.Address)
 
-	future := runtime.Raft.GetConfiguration()
-	if err := future.Error(); err != nil {
+	if runtime.ConfigReader == nil {
 		return
 	}
-	o.metrics.memberCount.WithLabelValues(group).Set(float64(len(future.Configuration().Servers)))
-	o.setMembers(group, string(leaderID), future.Configuration().Servers)
+	cfg, err := runtime.ConfigReader.Configuration(context.Background())
+	if err != nil {
+		return
+	}
+	o.metrics.memberCount.WithLabelValues(group).Set(float64(len(cfg.Servers)))
+	o.setMembers(group, status.Leader.ID, cfg.Servers)
 }
 
 func (o *RaftObserver) setLeaderMetric(group string, leaderID string, leaderAddress string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	if previous, ok := o.leaderLabels[group]; ok {
+	previous, hadPrevious := o.leaderLabels[group]
+	if hadPrevious {
 		o.metrics.leaderIdentity.Delete(previous)
 		delete(o.leaderLabels, group)
+	}
+	if hadPrevious &&
+		(previous["leader_id"] != leaderID || previous["leader_address"] != leaderAddress) &&
+		(previous["leader_id"] != "" || previous["leader_address"] != "") {
+		o.metrics.leaderChanges.WithLabelValues(group).Inc()
 	}
 	if leaderID == "" && leaderAddress == "" {
 		return
@@ -347,7 +318,7 @@ func (o *RaftObserver) observeLeaderChange(group string) {
 	o.metrics.leaderChanges.WithLabelValues(group).Inc()
 }
 
-func (o *RaftObserver) setMembers(group string, leaderID string, servers []raft.Server) {
+func (o *RaftObserver) setMembers(group string, leaderID string, servers []raftengine.Server) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -363,15 +334,15 @@ func (o *RaftObserver) setMembers(group string, leaderID string, servers []raft.
 	nextMembers := make(map[string]prometheus.Labels, len(servers))
 	nextLeaders := make(map[string]prometheus.Labels, len(servers))
 	for _, server := range servers {
-		memberID := string(server.ID)
-		memberAddress := string(server.Address)
+		memberID := server.ID
+		memberAddress := server.Address
 		memberKey := fmt.Sprintf("%s|%s", memberID, memberAddress)
 
 		memberLabels := prometheus.Labels{
 			"group":          group,
 			"member_id":      memberID,
 			"member_address": memberAddress,
-			"suffrage":       normalizeSuffrage(server.Suffrage),
+			"suffrage":       server.Suffrage,
 		}
 		o.metrics.memberPresent.With(memberLabels).Set(1)
 		nextMembers[memberKey] = memberLabels
@@ -393,55 +364,25 @@ func (o *RaftObserver) setMembers(group string, leaderID string, servers []raft.
 	o.memberLeaders[group] = nextLeaders
 }
 
-func normalizeRaftState(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "follower":
+func normalizeRaftState(state raftengine.State) string {
+	switch state {
+	case raftengine.StateFollower:
 		return "follower"
-	case "candidate":
+	case raftengine.StateCandidate:
 		return "candidate"
-	case "leader":
+	case raftengine.StateLeader:
 		return "leader"
-	case "shutdown":
+	case raftengine.StateShutdown:
 		return "shutdown"
+	case raftengine.StateUnknown:
+		return "unknown"
 	default:
 		return "unknown"
 	}
 }
 
-func normalizeSuffrage(s raft.ServerSuffrage) string {
-	switch s {
-	case raft.Voter:
-		return "voter"
-	case raft.Nonvoter:
-		return "nonvoter"
-	case raft.Staging:
-		return "staging"
-	default:
-		return "unknown"
-	}
-}
-
-func parseUintMetric(raw string) uint64 {
-	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
-}
-
-func parseLastContactSeconds(raw string) float64 {
-	raw = strings.TrimSpace(raw)
-	switch raw {
-	case "", "never":
-		return lastContactUnknownValue
-	case "0":
-		return 0
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		if _, loaded := loggedLastContactParseValues.LoadOrStore(raw, struct{}{}); !loaded {
-			slog.Warn("failed to parse raft last_contact metric", "raw", raw, "err", err)
-		}
+func lastContactSeconds(d time.Duration) float64 {
+	if d < 0 {
 		return lastContactUnknownValue
 	}
 	return d.Seconds()

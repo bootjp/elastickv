@@ -5,6 +5,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
@@ -16,37 +18,41 @@ const maxForwardRetries = 3
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
 type LeaderProxy struct {
-	raft *raft.Raft
-	tm   *TransactionManager
+	engine raftengine.Engine
+	tm     *TransactionManager
 
 	connCache GRPCConnCache
 }
 
 // NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
 func NewLeaderProxy(r *raft.Raft, opts ...TransactionOption) *LeaderProxy {
+	return NewLeaderProxyWithEngine(hashicorpraftengine.New(r), opts...)
+}
+
+func NewLeaderProxyWithEngine(engine raftengine.Engine, opts ...TransactionOption) *LeaderProxy {
 	return &LeaderProxy{
-		raft: r,
-		tm:   NewTransaction(r, opts...),
+		engine: engine,
+		tm:     NewTransactionWithProposer(engine, opts...),
 	}
 }
 
 func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	if p.raft.State() != raft.Leader {
+	if !isLeaderEngine(p.engine) {
 		return p.forwardWithRetry(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
-	if err := verifyRaftLeader(p.raft); err != nil {
+	if err := verifyLeaderEngine(p.engine); err != nil {
 		return p.forwardWithRetry(reqs)
 	}
 	return p.tm.Commit(reqs)
 }
 
 func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
-	if p.raft.State() != raft.Leader {
+	if !isLeaderEngine(p.engine) {
 		return p.forwardWithRetry(reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
-	if err := verifyRaftLeader(p.raft); err != nil {
+	if err := verifyLeaderEngine(p.engine); err != nil {
 		return p.forwardWithRetry(reqs)
 	}
 	return p.tm.Abort(reqs)
@@ -76,7 +82,7 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 }
 
 func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
-	addr, _ := p.raft.LeaderWithID()
+	addr := leaderAddrFromEngine(p.engine)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}

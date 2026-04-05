@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 const proxyForwardTimeout = 5 * time.Second
@@ -42,23 +42,23 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 	}
 
 	// Some tests use ShardStore without raft; in that case serve reads locally.
-	if g.Raft == nil {
+	if engineForGroup(g) == nil {
 		return s.localGetAt(ctx, g, key, ts)
 	}
 
-	// Verify leadership with a quorum before serving reads from local state to
-	// avoid stale results from a deposed leader.
-	if isVerifiedRaftLeader(g.Raft) {
+	// Wait for a leader read fence before serving from local state.
+	if isLinearizableRaftLeader(engineForGroup(g)) {
 		return s.leaderGetAt(ctx, g, key, ts)
 	}
 	return s.proxyRawGet(ctx, g, key, ts)
 }
 
-func isVerifiedRaftLeader(r *raft.Raft) bool {
-	if r == nil || r.State() != raft.Leader {
+func isLinearizableRaftLeader(engine raftengine.LeaderView) bool {
+	if !isLeaderEngine(engine) {
 		return false
 	}
-	return verifyRaftLeader(r) == nil
+	_, err := linearizableReadEngine(engine)
+	return err == nil
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
@@ -262,7 +262,7 @@ func (s *ShardStore) scanRouteAtDirection(
 		return nil, nil
 	}
 
-	if g.Raft == nil {
+	if engineForGroup(g) == nil {
 		kvs, err := s.scanRouteLocal(ctx, g, start, end, limit, ts, reverse)
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -270,7 +270,7 @@ func (s *ShardStore) scanRouteAtDirection(
 		return filterTxnInternalKVs(kvs), nil
 	}
 
-	if isVerifiedRaftLeader(g.Raft) {
+	if isLinearizableRaftLeader(engineForGroup(g)) {
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
@@ -482,7 +482,7 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 		return 0, false, nil
 	}
 
-	if g.Raft == nil {
+	if engineForGroup(g) == nil {
 		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 		if err != nil {
 			return 0, false, errors.WithStack(err)
@@ -492,8 +492,8 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 
 	// Avoid returning a stale watermark when our local raft instance is a
 	// deposed leader.
-	if g.Raft.State() == raft.Leader {
-		if err := verifyRaftLeader(g.Raft); err == nil {
+	if engine := engineForGroup(g); isLeaderEngine(engine) {
+		if _, err := linearizableReadEngine(engine); err == nil {
 			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 			if err != nil {
 				return 0, false, errors.WithStack(err)
@@ -506,10 +506,11 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 }
 
 func (s *ShardStore) proxyLatestCommitTS(ctx context.Context, g *ShardGroup, key []byte) (uint64, bool, error) {
-	if g == nil || g.Raft == nil {
+	engine := engineForGroup(g)
+	if engine == nil {
 		return 0, false, nil
 	}
-	addr, _ := g.Raft.LeaderWithID()
+	addr := leaderAddrFromEngine(engine)
 	if addr == "" {
 		return 0, false, errors.WithStack(ErrLeaderNotFound)
 	}
@@ -1212,10 +1213,11 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 }
 
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
-	if g == nil || g.Raft == nil {
+	engine := engineForGroup(g)
+	if engine == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	addr, _ := g.Raft.LeaderWithID()
+	addr := leaderAddrFromEngine(engine)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
@@ -1249,10 +1251,11 @@ func (s *ShardStore) proxyRawScanAt(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
-	if g == nil || g.Raft == nil {
+	engine := engineForGroup(g)
+	if engine == nil {
 		return nil, store.ErrNotSupported
 	}
-	addr, _ := g.Raft.LeaderWithID()
+	addr := leaderAddrFromEngine(engine)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}

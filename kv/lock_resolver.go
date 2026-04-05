@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -74,7 +73,7 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 			return
 		}
 		// Only resolve on the leader to avoid duplicate work.
-		if g.Raft == nil || g.Raft.State() != raft.Leader {
+		if !isLeaderEngine(engineForGroup(g)) {
 			continue
 		}
 		if err := lr.resolveGroupLocks(ctx, gid, g); err != nil {

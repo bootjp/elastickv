@@ -21,6 +21,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -533,8 +534,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
-	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
-	coordinator := kv.NewCoordinator(trx, r)
+	engine := hashicorpraftengine.New(r)
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
+	coordinator := kv.NewCoordinatorWithEngine(trx, engine)
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
@@ -546,12 +548,16 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		adapter.WithDistributionCoordinator(coordinator),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{GroupID: 1, Raft: r}}, raftObserveInterval)
+	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{
+		GroupID:      1,
+		StatusReader: engine,
+		ConfigReader: engine,
+	}}, raftObserveInterval)
 	compactor := kv.NewFSMCompactor(
 		[]kv.FSMCompactRuntime{{
-			GroupID: 1,
-			Raft:    r,
-			Store:   st,
+			GroupID:      1,
+			StatusReader: engine,
+			Store:        st,
 		}},
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
 	)
