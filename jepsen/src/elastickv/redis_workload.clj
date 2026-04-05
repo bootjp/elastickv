@@ -2,6 +2,7 @@
   (:gen-class)
   (:require [clojure.string :as str]
             [clojure.tools.cli :as tools.cli]
+            [clojure.tools.logging :refer [warn]]
             [elastickv.db :as ekdb]
             [jepsen.db :as jdb]
             [jepsen [client :as client]
@@ -176,10 +177,11 @@
    ["-h" "--help"]])
 
 (defn fail-on-invalid!
-  "Raises when Jepsen completed analysis and found the history invalid."
+  "Exits with code 1 when Jepsen completed analysis and found the history invalid."
   [result]
   (when (false? (:valid? result))
-    (throw (ex-info "Jepsen analysis invalid" {:result result})))
+    (warn "Jepsen analysis invalid!")
+    (System/exit 1))
   result)
 
 (defn -main
