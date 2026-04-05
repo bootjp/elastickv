@@ -333,6 +333,7 @@ Phase 0 should explicitly not cover:
 3. changing external gRPC/Redis/DynamoDB APIs
 4. changing command encoding or FSM semantics
 5. implementing the `etcd/raft` backend yet
+6. widening application-facing transaction APIs just to thread request contexts through the write path
 
 ### Proposed package layout
 
@@ -512,6 +513,17 @@ To keep Phase 0 tractable, the following should stay where they are:
 5. gRPC proxying stays in `kv/leader_proxy.go` and adapter code
 
 This keeps Phase 0 focused on swapping the Raft runtime boundary, not redesigning the data plane.
+
+### Deferred follow-up TODOs
+
+The following items came up during Phase 0 review and implementation, but were intentionally deferred to keep the first abstraction slice small enough to review and land safely.
+
+1. Propagate caller contexts through the write path.
+   `kv/transaction.go` and related batching helpers still collapse to `context.Background()` before proposing commands. A follow-up should widen the application-facing transaction and coordinator path to accept `context.Context`, carry it through leader forwarding and adapters, and derive proposal deadlines from that request context.
+2. Make status age semantics explicit.
+   `Status.LastContact` remains a sampled `time.Duration` in Phase 0 because that maps cleanly to current HashiCorp monitoring data without synthesizing wall-clock timestamps. If the field remains part of the stable abstraction, a follow-up should rename it to something like `LastContactAgo` so callers can read the meaning directly from the API.
+3. Revisit ownership of latest-read MVCC timestamps.
+   Phase 0 keeps the current model where higher layers choose explicit read timestamps and then execute the linearizable read fence before the local read. A follow-up should decide whether a future engine-backed "latest linearizable read" helper should also own timestamp selection so the semantics are explicit in one place.
 
 ### Recommended PR split for Phase 0
 
