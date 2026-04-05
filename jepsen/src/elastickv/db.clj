@@ -97,7 +97,7 @@
          (clojure.string/join ","))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port data-dir raft-groups shard-ranges]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port data-dir raft-groups shard-ranges]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -106,6 +106,8 @@
                (group-addr node raft-groups (first (group-ids raft-groups)))
                (node-addr node (port-for grpc-port node)))
         redis (node-addr node (port-for redis-port node))
+        dynamo (when dynamo-port
+                 (node-addr node (port-for dynamo-port node)))
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         bootstrap? (= node bootstrap-node)
         args (cond-> [server-bin
@@ -114,6 +116,7 @@
                       "--raftId" (name node)
                       "--raftDataDir" data-dir
                       "--raftRedisMap" raft-redis-map]
+               dynamo (conj "--dynamoAddress" dynamo)
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
                bootstrap? (conj "--raftBootstrap"))]
