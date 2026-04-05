@@ -587,9 +587,10 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	dynamoRoutedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	ds := adapter.NewDynamoDBServer(
 		dynamoL,
-		st,
+		dynamoRoutedStore,
 		coordinator,
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 	)
