@@ -276,51 +276,54 @@
    ["-h" "--help"]])
 
 (defn fail-on-invalid!
-  "Exits with code 1 when Jepsen completed analysis and found the history invalid."
+  "Raises when Jepsen completed analysis and found the history invalid."
   [result]
   (when (false? (:valid? result))
-    (warn "Jepsen analysis invalid!")
-    (System/exit 1))
+    (throw (ex-info "Jepsen analysis invalid" {:result result})))
   result)
 
 (defn -main
   [& args]
-  (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
-        default-nodes-str "n1,n2,n3,n4,n5"
-        dynamo-ports (:dynamo-ports options)
-        local? (or (:local options) (and (:host options) (seq dynamo-ports)))
-        nodes-raw (if (and dynamo-ports (= (:nodes options) default-nodes-str))
-                    (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count dynamo-ports)))))
-                    (:nodes options))
-        node-list (-> nodes-raw
-                      (str/split #",")
-                      (->> (remove str/blank?) vec))
-        faults    (-> (:faults options)
-                      (str/split #",")
-                      (->> (remove str/blank?)
-                           (map (comp keyword str/lower-case))
-                           vec))
-        node->port (if dynamo-ports
-                     (ports->node-map dynamo-ports node-list)
-                     (zipmap node-list (repeat (:dynamo-port options))))
-        options   (assoc options
-                    :nodes node-list
-                    :faults faults
-                    :local local?
-                    :dynamo-host (:host options)
-                    :node->port node->port
-                    :dynamo-port (:dynamo-port options)
-                    :redis-port (:redis-port options)
-                    :grpc-port (:grpc-port options)
-                    :raft-groups (:raft-groups options)
-                    :shard-ranges (:shard-ranges options)
-                    :ssh {:username (:ssh-user options)
-                          :private-key-path (:ssh-key options)
-                          :strict-host-key-checking false})]
-    (cond
-      (:help options)  (println summary)
-      (seq errors)     (binding [*out* *err*]
-                         (println "Error parsing options:" (str/join "; " errors)))
-      (:local options) (binding [control/*dummy* true]
-                         (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options))))
-      :else            (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options))))))
+  (try
+    (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
+          default-nodes-str "n1,n2,n3,n4,n5"
+          dynamo-ports (:dynamo-ports options)
+          local? (or (:local options) (and (:host options) (seq dynamo-ports)))
+          nodes-raw (if (and dynamo-ports (= (:nodes options) default-nodes-str))
+                      (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count dynamo-ports)))))
+                      (:nodes options))
+          node-list (-> nodes-raw
+                        (str/split #",")
+                        (->> (remove str/blank?) vec))
+          faults    (-> (:faults options)
+                        (str/split #",")
+                        (->> (remove str/blank?)
+                             (map (comp keyword str/lower-case))
+                             vec))
+          node->port (if dynamo-ports
+                       (ports->node-map dynamo-ports node-list)
+                       (zipmap node-list (repeat (:dynamo-port options))))
+          options   (assoc options
+                      :nodes node-list
+                      :faults faults
+                      :local local?
+                      :dynamo-host (:host options)
+                      :node->port node->port
+                      :dynamo-port (:dynamo-port options)
+                      :redis-port (:redis-port options)
+                      :grpc-port (:grpc-port options)
+                      :raft-groups (:raft-groups options)
+                      :shard-ranges (:shard-ranges options)
+                      :ssh {:username (:ssh-user options)
+                            :private-key-path (:ssh-key options)
+                            :strict-host-key-checking false})]
+      (cond
+        (:help options)  (println summary)
+        (seq errors)     (binding [*out* *err*]
+                           (println "Error parsing options:" (str/join "; " errors)))
+        (:local options) (binding [control/*dummy* true]
+                           (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options))))
+        :else            (fail-on-invalid! (jepsen/run! (elastickv-dynamodb-test options)))))
+    (catch clojure.lang.ExceptionInfo e
+      (warn (.getMessage e))
+      (System/exit 1))))

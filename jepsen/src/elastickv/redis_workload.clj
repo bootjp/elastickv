@@ -177,48 +177,51 @@
    ["-h" "--help"]])
 
 (defn fail-on-invalid!
-  "Exits with code 1 when Jepsen completed analysis and found the history invalid."
+  "Raises when Jepsen completed analysis and found the history invalid."
   [result]
   (when (false? (:valid? result))
-    (warn "Jepsen analysis invalid!")
-    (System/exit 1))
+    (throw (ex-info "Jepsen analysis invalid" {:result result})))
   result)
 
 (defn -main
   [& args]
-  (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
-        default-nodes "n1,n2,n3,n4,n5"
-        ports (:ports options)
-        local? (or (:local options) (and (:host options) (seq ports)))
-        nodes-raw (if (and ports (= (:nodes options) default-nodes))
-                    (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count ports)))))
-                    (:nodes options))
-        node-list (-> nodes-raw
-                      (str/split #",")
-                      (->> (remove str/blank?)
-                           vec))
-        faults    (-> (:faults options)
-                      (str/split #",")
-                      (->> (remove str/blank?)
-                           (map (comp keyword str/lower-case))
-                           vec))
-        options   (assoc options
-                    :nodes node-list
-                    :faults faults
-                    :local local?
-                    :redis-host (:host options)
-                    :redis-ports ports
-                    :redis-port (:redis-port options)
-                    :grpc-port (:grpc-port options)
-                    :raft-groups (:raft-groups options)
-                    :shard-ranges (:shard-ranges options)
-                    :ssh {:username (:ssh-user options)
-                          :private-key-path (:ssh-key options)
-                          :strict-host-key-checking false})]
-    (cond
-      (:help options) (println summary)
-      (seq errors) (binding [*out* *err*]
-                     (println "Error parsing options:" (str/join "; " errors)))
-      (:local options) (binding [control/*dummy* true]
-                         (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))
-      :else (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))))
+  (try
+    (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
+          default-nodes "n1,n2,n3,n4,n5"
+          ports (:ports options)
+          local? (or (:local options) (and (:host options) (seq ports)))
+          nodes-raw (if (and ports (= (:nodes options) default-nodes))
+                      (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count ports)))))
+                      (:nodes options))
+          node-list (-> nodes-raw
+                        (str/split #",")
+                        (->> (remove str/blank?)
+                             vec))
+          faults    (-> (:faults options)
+                        (str/split #",")
+                        (->> (remove str/blank?)
+                             (map (comp keyword str/lower-case))
+                             vec))
+          options   (assoc options
+                      :nodes node-list
+                      :faults faults
+                      :local local?
+                      :redis-host (:host options)
+                      :redis-ports ports
+                      :redis-port (:redis-port options)
+                      :grpc-port (:grpc-port options)
+                      :raft-groups (:raft-groups options)
+                      :shard-ranges (:shard-ranges options)
+                      :ssh {:username (:ssh-user options)
+                            :private-key-path (:ssh-key options)
+                            :strict-host-key-checking false})]
+      (cond
+        (:help options) (println summary)
+        (seq errors) (binding [*out* *err*]
+                       (println "Error parsing options:" (str/join "; " errors)))
+        (:local options) (binding [control/*dummy* true]
+                           (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))
+        :else (fail-on-invalid! (jepsen/run! (elastickv-redis-test options)))))
+    (catch clojure.lang.ExceptionInfo e
+      (warn (.getMessage e))
+      (System/exit 1))))
