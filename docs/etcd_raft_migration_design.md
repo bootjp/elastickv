@@ -263,13 +263,14 @@ The engine layer should own:
 1. proposal submission
 2. commit index reporting
 3. leader identity and local leadership checks
-4. linearizable read fence or `ReadIndex`
+4. linearizable read fence or ReadIndex
 5. membership changes
 6. leadership transfer
 7. snapshot trigger and snapshot restore plumbing
 8. transport start/stop
 9. durable state open/close
 10. metrics/status export
+11. logical clock progression (ticking)
 
 ### Callers that should stop depending on concrete HashiCorp Raft types
 
