@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -62,18 +63,18 @@ func startS3Server(
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
 	)
+	runDoneCtx, runDoneCancel := context.WithCancel(context.Background())
 	eg.Go(func() error {
-		defer s3Server.Stop()
-		stop := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				s3Server.Stop()
-			case <-stop:
-			}
-		}()
+		select {
+		case <-ctx.Done():
+			s3Server.Stop()
+		case <-runDoneCtx.Done():
+		}
+		return nil
+	})
+	eg.Go(func() error {
 		err := s3Server.Run()
-		close(stop)
+		runDoneCancel()
 		if err == nil || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
@@ -104,7 +105,7 @@ func loadS3StaticCredentials(path string) (map[string]string, error) {
 			return nil, errors.New("s3 credentials file contains an empty access key or secret key")
 		}
 		if _, exists := out[accessKeyID]; exists {
-			return nil, errors.Newf("s3 credentials file contains duplicate access key ID: %q", accessKeyID)
+			return nil, errors.WithStack(fmt.Errorf("s3 credentials file contains duplicate access key ID: %q", accessKeyID))
 		}
 		out[accessKeyID] = secretAccessKey
 	}
