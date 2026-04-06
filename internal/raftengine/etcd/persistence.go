@@ -15,10 +15,12 @@ import (
 )
 
 const (
-	stateFileName    = "etcd-raft-state.bin"
-	stateFileVersion = uint32(1)
-	defaultDirPerm   = 0o755
-	defaultFilePerm  = 0o600
+	stateFileName       = "etcd-raft-state.bin"
+	stateFileVersion    = uint32(1)
+	defaultDirPerm      = 0o755
+	defaultFilePerm     = 0o600
+	maxPersistedEntries = uint32(1 << 20)
+	entryCapacityCap    = uint32(1024)
 )
 
 var stateFileMagic = [4]byte{'E', 'K', 'V', 'R'}
@@ -90,7 +92,10 @@ func loadStateFile(path string) (persistedState, error) {
 	if err != nil {
 		return persistedState{}, err
 	}
-	state.Entries = make([]raftpb.Entry, 0, entryCount)
+	if entryCount > maxPersistedEntries {
+		return persistedState{}, errors.WithStack(errors.Newf("persisted entry count %d exceeds limit %d", entryCount, maxPersistedEntries))
+	}
+	state.Entries = make([]raftpb.Entry, 0, minEntryCapacity(entryCount))
 	for range entryCount {
 		var entry raftpb.Entry
 		if err := readMessage(reader, &entry); err != nil {
@@ -108,12 +113,16 @@ func saveStateFile(path string, state persistedState) error {
 		return err
 	}
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, encoded, defaultFilePerm); err != nil {
-		return errors.WithStack(err)
+	if err := writeAndSyncFile(tmpPath, encoded); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return errors.WithStack(err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -269,6 +278,38 @@ func uint32Len(n int) (uint32, error) {
 		return 0, errors.New("length exceeds uint32")
 	}
 	return uint32(n), nil
+}
+
+func minEntryCapacity(entryCount uint32) int {
+	if entryCount > entryCapacityCap {
+		return int(entryCapacityCap)
+	}
+	return int(entryCount)
+}
+
+func writeAndSyncFile(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, defaultFilePerm)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer file.Close()
+
+	if _, err := file.Write(data); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := file.Sync(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer dir.Close()
+	return errors.WithStack(dir.Sync())
 }
 
 type protoMessage interface {

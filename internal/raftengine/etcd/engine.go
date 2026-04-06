@@ -34,6 +34,7 @@ var (
 	errNodeIDRequired    = errors.New("etcd raft node id is required")
 	errDataDirRequired   = errors.New("etcd raft data dir is required")
 	errStateMachineUnset = errors.New("etcd raft state machine is not configured")
+	errSingleNodeOnly    = errors.New("etcd raft phase 1 prototype only supports a single local voter")
 )
 
 type StateMachine interface {
@@ -109,6 +110,11 @@ type readResult struct {
 	err   error
 }
 
+// Open starts the Phase 1 etcd/raft prototype for a single local voter.
+//
+// This prototype intentionally blocks until the local node becomes leader or
+// ctx expires. Multi-node startup and follower transport are deferred to later
+// migration phases.
 func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
@@ -117,6 +123,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 
 	state, err := loadOrCreateState(cfg.DataDir, cfg.NodeID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSingleNodeState(state, cfg.NodeID); err != nil {
 		return nil, err
 	}
 
@@ -659,6 +668,22 @@ func validateConfig(cfg OpenConfig) error {
 	default:
 		return nil
 	}
+}
+
+func validateSingleNodeState(state persistedState, nodeID uint64) error {
+	conf := state.Snapshot.Metadata.ConfState
+	if len(conf.Voters) != 1 || conf.Voters[0] != nodeID {
+		return errors.WithStack(errSingleNodeOnly)
+	}
+	if len(conf.VotersOutgoing) > 0 || len(conf.Learners) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
+		return errors.WithStack(errSingleNodeOnly)
+	}
+	for _, entry := range state.Entries {
+		if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
+			return errors.WithStack(errSingleNodeOnly)
+		}
+	}
+	return nil
 }
 
 func translateState(state etcdraft.StateType) raftengine.State {
