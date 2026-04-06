@@ -57,6 +57,8 @@ type LeaderView interface {
 	State() State
 	Leader() LeaderInfo
 	VerifyLeader(ctx context.Context) error
+	// LinearizableRead blocks until the returned index is safe to read from the
+	// local FSM on that node.
 	LinearizableRead(ctx context.Context) (uint64, error)
 }
 

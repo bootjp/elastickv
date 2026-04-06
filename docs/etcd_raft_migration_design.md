@@ -734,6 +734,13 @@ This order also keeps the HashiCorp backend fully shippable after each PR.
 
 Prove that a single Raft group can run correctly with `etcd/raft` behind the new abstraction.
 
+The first implementation slice is intentionally narrower than the full Phase 1 target:
+
+1. it supports only a single local voter
+2. `Open(...)` may block until that local node becomes leader
+3. restart durability may use a simple whole-state file rewrite to prove bootstrap and replay semantics before a WAL-backed design lands in Phase 2
+4. before broadening this backend to multi-node transport or higher write volume, the whole-state rewrite must be replaced by incremental WAL/snapshot persistence
+
 ### Main tasks
 
 1. Implement an in-process reactor loop:

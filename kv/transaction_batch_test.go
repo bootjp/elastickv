@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/raft"
@@ -187,6 +188,62 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 	}}
 
 	_, results, err := applyRequests(engineFromRaft(r), reqs, observer)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0], ErrInvalidRequest)
+	require.Zero(t, observer.FailureCount())
+}
+
+type etcdFSMAdapter struct {
+	fsm raft.FSM
+}
+
+func (a etcdFSMAdapter) Apply(data []byte) any {
+	return a.fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+}
+
+func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
+	st := store.NewMVCCStore()
+	engine, err := etcdraftengine.Open(context.Background(), etcdraftengine.OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      t.TempDir(),
+		StateMachine: etcdFSMAdapter{fsm: NewKvFSM(st)},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	observer := &stubProposalObserver{}
+	goodReqs := []*pb.Request{{
+		IsTxn: false,
+		Ts:    100,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		},
+	}}
+
+	commitIndex, results, err := applyRequests(engine, goodReqs, observer)
+	require.NoError(t, err)
+	require.NotZero(t, commitIndex)
+	require.Len(t, results, 1)
+	require.NoError(t, results[0])
+
+	got, err := st.GetAt(context.Background(), []byte("k"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+
+	badReqs := []*pb.Request{{
+		IsTxn: false,
+		Ts:    101,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: nil, Value: []byte("bad")},
+		},
+	}}
+
+	_, results, err = applyRequests(engine, badReqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)
