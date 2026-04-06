@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -11,8 +13,12 @@ import (
 )
 
 func NewInternal(txm kv.Transactional, r *raft.Raft, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
+	return NewInternalWithEngine(txm, hashicorpraftengine.New(r), clock, relay)
+}
+
+func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
 	return &Internal{
-		raft:               r,
+		leader:             leader,
 		transactionManager: txm,
 		clock:              clock,
 		relay:              relay,
@@ -20,7 +26,7 @@ func NewInternal(txm kv.Transactional, r *raft.Raft, clock *kv.HLC, relay *Redis
 }
 
 type Internal struct {
-	raft               *raft.Raft
+	leader             raftengine.LeaderView
 	transactionManager kv.Transactional
 	clock              *kv.HLC
 	relay              *RedisPubSubRelay
@@ -34,11 +40,11 @@ var ErrNotLeader = errors.New("not leader")
 var ErrLeaderNotFound = errors.New("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
-func (i *Internal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
-	if i.raft.State() != raft.Leader {
+func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
-	if err := i.raft.VerifyLeader().Error(); err != nil {
+	if err := i.leader.VerifyLeader(ctx); err != nil {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 

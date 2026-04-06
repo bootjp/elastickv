@@ -1,0 +1,77 @@
+package raftengine
+
+import (
+	"context"
+	"io"
+	"time"
+)
+
+type State string
+
+const (
+	StateFollower  State = "follower"
+	StateCandidate State = "candidate"
+	StateLeader    State = "leader"
+	StateShutdown  State = "shutdown"
+	StateUnknown   State = "unknown"
+)
+
+type Server struct {
+	ID       string
+	Address  string
+	Suffrage string
+}
+
+type LeaderInfo struct {
+	ID      string
+	Address string
+}
+
+type Configuration struct {
+	Servers []Server
+}
+
+type Status struct {
+	State             State
+	Leader            LeaderInfo
+	Term              uint64
+	CommitIndex       uint64
+	AppliedIndex      uint64
+	LastLogIndex      uint64
+	LastSnapshotIndex uint64
+	FSMPending        uint64
+	NumPeers          uint64
+	LastContact       time.Duration
+}
+
+type ProposalResult struct {
+	CommitIndex uint64
+	Response    any
+}
+
+type Proposer interface {
+	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
+}
+
+type LeaderView interface {
+	State() State
+	Leader() LeaderInfo
+	VerifyLeader(ctx context.Context) error
+	LinearizableRead(ctx context.Context) (uint64, error)
+}
+
+type StatusReader interface {
+	Status() Status
+}
+
+type ConfigReader interface {
+	Configuration(ctx context.Context) (Configuration, error)
+}
+
+type Engine interface {
+	Proposer
+	LeaderView
+	StatusReader
+	ConfigReader
+	io.Closer
+}

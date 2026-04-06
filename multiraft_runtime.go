@@ -8,6 +8,7 @@ import (
 
 	transport "github.com/Jille/raft-grpc-transport"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -15,10 +16,11 @@ import (
 )
 
 type raftGroupRuntime struct {
-	spec  groupSpec
-	raft  *raft.Raft
-	tm    *transport.Manager
-	store store.MVCCStore
+	spec   groupSpec
+	raft   *raft.Raft
+	engine raftengine.Engine
+	tm     *transport.Manager
+	store  store.MVCCStore
 
 	closeStores func()
 }
@@ -36,6 +38,10 @@ func (r *raftGroupRuntime) Close() {
 	if r.tm != nil {
 		_ = r.tm.Close()
 		r.tm = nil
+	}
+	if r.engine != nil {
+		_ = r.engine.Close()
+		r.engine = nil
 	}
 	if r.closeStores != nil {
 		r.closeStores()
