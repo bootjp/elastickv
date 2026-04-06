@@ -109,3 +109,28 @@ elastickv_raft_proposals_failed_total{group="1",node_address="10.0.0.1:50051",no
 	)
 	require.NoError(t, err)
 }
+
+func TestRaftObserverSetLeaderMetricCountsLeaderReturnAfterGap(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RaftObserver()
+	require.NotNil(t, observer)
+
+	observer.setLeaderMetric("1", "n1", "10.0.0.1:50051")
+	observer.setLeaderMetric("1", "", "")
+	observer.setLeaderMetric("1", "n2", "10.0.0.2:50051")
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_raft_leader_changes_seen_total Total number of observed leader changes for each group.
+# TYPE elastickv_raft_leader_changes_seen_total counter
+elastickv_raft_leader_changes_seen_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
+# HELP elastickv_raft_leader_identity Current leader identity for each raft group, as observed by this node.
+# TYPE elastickv_raft_leader_identity gauge
+elastickv_raft_leader_identity{group="1",leader_address="10.0.0.2:50051",leader_id="n2",node_address="10.0.0.1:50051",node_id="n1"} 1
+`),
+		"elastickv_raft_leader_changes_seen_total",
+		"elastickv_raft_leader_identity",
+	)
+	require.NoError(t, err)
+}

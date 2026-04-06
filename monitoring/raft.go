@@ -294,25 +294,23 @@ func (o *RaftObserver) setLeaderMetric(group string, leaderID string, leaderAddr
 	defer o.mu.Unlock()
 
 	previous, hadPrevious := o.leaderLabels[group]
-	if hadPrevious {
+	if hadPrevious && hasLeaderIdentity(previous) {
 		o.metrics.leaderIdentity.Delete(previous)
-		delete(o.leaderLabels, group)
 	}
-	if hadPrevious &&
-		(previous["leader_id"] != leaderID || previous["leader_address"] != leaderAddress) &&
-		(previous["leader_id"] != "" || previous["leader_address"] != "") {
-		o.metrics.leaderChanges.WithLabelValues(group).Inc()
-	}
-	if leaderID == "" && leaderAddress == "" {
-		return
-	}
-	labels := prometheus.Labels{
+	current := prometheus.Labels{
 		"group":          group,
 		"leader_id":      leaderID,
 		"leader_address": leaderAddress,
 	}
-	o.metrics.leaderIdentity.With(labels).Set(1)
-	o.leaderLabels[group] = labels
+	if hadPrevious && leaderIdentityChanged(previous, current) {
+		o.metrics.leaderChanges.WithLabelValues(group).Inc()
+	}
+	if leaderID == "" && leaderAddress == "" {
+		o.leaderLabels[group] = current
+		return
+	}
+	o.metrics.leaderIdentity.With(current).Set(1)
+	o.leaderLabels[group] = current
 }
 
 func (o *RaftObserver) observeLeaderChange(group string) {
@@ -320,6 +318,14 @@ func (o *RaftObserver) observeLeaderChange(group string) {
 		return
 	}
 	o.metrics.leaderChanges.WithLabelValues(group).Inc()
+}
+
+func hasLeaderIdentity(labels prometheus.Labels) bool {
+	return labels["leader_id"] != "" || labels["leader_address"] != ""
+}
+
+func leaderIdentityChanged(previous prometheus.Labels, current prometheus.Labels) bool {
+	return previous["leader_id"] != current["leader_id"] || previous["leader_address"] != current["leader_address"]
 }
 
 func (o *RaftObserver) setMembers(group string, leaderID string, servers []raftengine.Server) {
