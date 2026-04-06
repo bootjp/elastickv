@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -30,12 +31,16 @@ func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
 
 func TestReadMessageRejectsLargePayload(t *testing.T) {
 	var buf bytes.Buffer
-	require.NoError(t, writeU32(&buf, maxPersistedMessage+1))
+	require.NoError(t, writeU32(&buf, maxPersistedEntryMessage+1))
 
-	var hardState raftpb.HardState
-	err := readMessage(&buf, &hardState)
+	var entry raftpb.Entry
+	err := readMessage(&buf, &entry, maxPersistedEntryMessage, "entry")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeds limit")
+}
+
+func TestPersistedEntryLimitExceedsCurrentTransportBudget(t *testing.T) {
+	require.Greater(t, maxPersistedEntryMessage, uint32(internalutil.GRPCMaxMessageBytes))
 }
 
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {

@@ -9,19 +9,26 @@ import (
 	"os"
 	"path/filepath"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 
 const (
-	stateFileName       = "etcd-raft-state.bin"
-	stateFileVersion    = uint32(1)
-	defaultDirPerm      = 0o755
-	defaultFilePerm     = 0o600
-	maxPersistedEntries = uint32(1 << 20)
-	entryCapacityCap    = uint32(1024)
-	maxPersistedMessage = uint32(64 << 20)
+	stateFileName          = "etcd-raft-state.bin"
+	stateFileVersion       = uint32(1)
+	defaultDirPerm         = 0o755
+	defaultFilePerm        = 0o600
+	maxPersistedEntries    = uint32(1 << 20)
+	entryCapacityCap       = uint32(1024)
+	persistedEntryHeadroom = uint32(1 << 20)
+	// Leave room for raftpb.Entry metadata above the current 64 MiB transport
+	// and command payload budget so persistence does not reject commands that the
+	// write path already accepted.
+	maxPersistedEntryMessage = uint32(internalutil.GRPCMaxMessageBytes) + persistedEntryHeadroom
+	maxPersistedSnapshot     = uint32(256 << 20)
+	maxPersistedHardState    = uint32(1 << 20)
 )
 
 var stateFileMagic = [4]byte{'E', 'K', 'V', 'R'}
@@ -82,10 +89,10 @@ func loadStateFile(path string) (persistedState, error) {
 	}
 
 	var state persistedState
-	if err := readMessage(reader, &state.HardState); err != nil {
+	if err := readMessage(reader, &state.HardState, maxPersistedHardState, "hard state"); err != nil {
 		return persistedState{}, err
 	}
-	if err := readMessage(reader, &state.Snapshot); err != nil {
+	if err := readMessage(reader, &state.Snapshot, maxPersistedSnapshot, "snapshot"); err != nil {
 		return persistedState{}, err
 	}
 
@@ -99,7 +106,7 @@ func loadStateFile(path string) (persistedState, error) {
 	state.Entries = make([]raftpb.Entry, 0, minEntryCapacity(entryCount))
 	for range entryCount {
 		var entry raftpb.Entry
-		if err := readMessage(reader, &entry); err != nil {
+		if err := readMessage(reader, &entry, maxPersistedEntryMessage, "entry"); err != nil {
 			return persistedState{}, err
 		}
 		state.Entries = append(state.Entries, entry)
@@ -320,7 +327,7 @@ type protoMessage interface {
 	Unmarshal([]byte) error
 }
 
-func readMessage(r io.Reader, msg protoMessage) error {
+func readMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) error {
 	size, err := readU32(r)
 	if err != nil {
 		return err
@@ -328,8 +335,8 @@ func readMessage(r io.Reader, msg protoMessage) error {
 	if size == 0 {
 		return nil
 	}
-	if size > maxPersistedMessage {
-		return errors.WithStack(errors.Newf("persisted message size %d exceeds limit %d", size, maxPersistedMessage))
+	if maxSize > 0 && size > maxSize {
+		return errors.WithStack(errors.Newf("persisted %s size %d exceeds limit %d", kind, size, maxSize))
 	}
 	raw := make([]byte, size)
 	if _, err := io.ReadFull(r, raw); err != nil {
