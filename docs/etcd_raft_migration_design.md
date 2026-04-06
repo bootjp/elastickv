@@ -521,7 +521,7 @@ This keeps Phase 0 focused on swapping the Raft runtime boundary, not redesignin
 The following items came up during Phase 0 review and implementation, but were intentionally deferred to keep the first abstraction slice small enough to review and land safely.
 
 1. Propagate caller contexts through the write path.
-   `kv/transaction.go` and related batching helpers still collapse to `context.Background()` before proposing commands. A follow-up should widen the application-facing transaction and coordinator path to accept `context.Context`, carry it through leader forwarding and adapters, and derive proposal deadlines from that request context.
+   `kv/transaction.go` and related batching helpers still collapse to `context.Background()` before proposing commands. A follow-up should widen the application-facing transaction and coordinator path to accept `context.Context`, carry it through leader forwarding and adapters, derive proposal deadlines from that request context, and remove the remaining legacy `VerifyLeader()` / `VerifyLeaderForKey()` paths that still fall back to `context.Background()`.
 2. Make status age semantics explicit.
    `Status.LastContact` remains a sampled `time.Duration` in Phase 0 because that maps cleanly to current HashiCorp monitoring data without synthesizing wall-clock timestamps. If the field remains part of the stable abstraction, a follow-up should rename it to something like `LastContactAgo` so callers can read the meaning directly from the API.
 3. Revisit ownership of latest-read MVCC timestamps.
