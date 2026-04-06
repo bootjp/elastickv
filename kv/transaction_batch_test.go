@@ -167,7 +167,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 		},
 	}}
 
-	_, _, err := applyRequests(r, reqs, observer)
+	_, _, err := applyRequests(engineFromRaft(r), reqs, observer)
 	require.Error(t, err)
 	require.Equal(t, 1, observer.FailureCount())
 }
@@ -186,7 +186,7 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 		},
 	}}
 
-	_, results, err := applyRequests(r, reqs, observer)
+	_, results, err := applyRequests(engineFromRaft(r), reqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)

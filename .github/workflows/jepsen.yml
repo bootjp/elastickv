@@ -39,7 +39,7 @@ jobs:
         working-directory: jepsen
         run: vagrant up
 
-      - name: Run Jepsen workload
+      - name: Run Redis Jepsen workload
         working-directory: jepsen
         env:
           HOME: ${{ github.workspace }}/jepsen/tmp-home
@@ -48,6 +48,21 @@ jobs:
         run: |
           vagrant ssh ctrl -c "cd ~/elastickv/jepsen && \
             lein run -m elastickv.redis-workload \
+              --nodes n1,n2,n3,n4,n5 \
+              --time-limit ${{ github.event.inputs['time-limit'] || github.event.inputs.time-limit }} \
+              --rate ${{ github.event.inputs['rate'] || github.event.inputs.rate }} \
+              --faults ${{ github.event.inputs['faults'] || github.event.inputs.faults }} \
+              --concurrency 10"
+
+      - name: Run DynamoDB Jepsen workload
+        working-directory: jepsen
+        env:
+          HOME: ${{ github.workspace }}/jepsen/tmp-home
+          LEIN_HOME: ${{ github.workspace }}/jepsen/.lein
+          LEIN_JVM_OPTS: -Duser.home=${{ github.workspace }}/jepsen/tmp-home
+        run: |
+          vagrant ssh ctrl -c "cd ~/elastickv/jepsen && \
+            lein run -m elastickv.dynamodb-workload \
               --nodes n1,n2,n3,n4,n5 \
               --time-limit ${{ github.event.inputs['time-limit'] || github.event.inputs.time-limit }} \
               --rate ${{ github.event.inputs['rate'] || github.event.inputs.rate }} \

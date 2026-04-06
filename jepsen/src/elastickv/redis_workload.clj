@@ -1,11 +1,10 @@
 (ns elastickv.redis-workload
   (:gen-class)
   (:require [clojure.string :as str]
-            [clojure.tools.cli :as tools.cli]
+            [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [jepsen.db :as jdb]
             [jepsen [client :as client]
-                    [core :as jepsen]
                     [generator :as gen]
                     [net :as net]]
             [jepsen.control :as control]
@@ -64,19 +63,6 @@
                                        nil)]
     (assoc workload :client client)))
 
-(defn ports->node-map
-  [ports nodes]
-  (into {}
-        (map (fn [n p] [n p]) nodes ports)))
-
-(defn- normalize-faults [faults]
-  (->> faults
-       (map (fn [f]
-              (case f
-                :reboot :kill
-                f)))
-       vec))
-
 (defn elastickv-redis-test
   "Builds a Jepsen test map that drives elastickv's Redis protocol with the
    jepsen-io/redis append workload."
@@ -84,7 +70,7 @@
   ([opts]
    (let [nodes      (or (:nodes opts) default-nodes)
          redis-ports (or (:redis-ports opts) (repeat (count nodes) (or (:redis-port opts) 6379)))
-         node->port (or (:node->port opts) (ports->node-map redis-ports nodes))
+         node->port (or (:node->port opts) (cli/ports->node-map redis-ports nodes))
          local?     (:local opts)
          db         (if local?
                       jdb/noop
@@ -96,7 +82,7 @@
          time-limit (or (:time-limit opts) 30)
          faults     (if local?
                       []
-                      (normalize-faults (or (:faults opts) [:partition :kill])))
+                      (cli/normalize-faults (or (:faults opts) [:partition :kill])))
          nemesis-p  (when-not local?
                       (combined/nemesis-package {:db db
                                                  :faults faults
@@ -129,14 +115,13 @@
                                    (gen/stagger (/ rate))
                                    (gen/time-limit time-limit))}))))
 
-(def cli-opts
-  [[nil "--nodes NODES" "Comma separated node names."
-    :default "n1,n2,n3,n4,n5"]
-   [nil "--local" "Run locally without SSH or nemesis."
-    :default false]
-   [nil "--host HOST" "Redis host override for clients."
-    :default nil]
-   [nil "--ports PORTS" "Comma separated Redis ports (per node)."
+;; ---------------------------------------------------------------------------
+;; CLI
+;; ---------------------------------------------------------------------------
+
+(def redis-cli-opts
+  "Redis-specific CLI options, appended to common opts."
+  [[nil "--ports PORTS" "Comma separated Redis ports (per node)."
     :default nil
     :parse-fn (fn [s]
                 (->> (str/split s #",")
@@ -144,79 +129,21 @@
                      (mapv #(Integer/parseInt %))))]
    [nil "--redis-port PORT" "Redis port (applied to all nodes)."
     :default 6379
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--grpc-port PORT" "gRPC/Raft port."
-    :default 50051
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--raft-groups GROUPS" "Comma separated raft groups (groupID=port,...)"
-    :parse-fn (fn [s]
-                (->> (str/split s #",")
-                     (remove str/blank?)
-                     (map (fn [part]
-                            (let [[gid port] (str/split part #"=" 2)]
-                              [(Long/parseLong gid) (Integer/parseInt port)])))
-                     (into {})))]
-   [nil "--shard-ranges RANGES" "Shard ranges (start:end=groupID,...)"
-    :default nil]
-   [nil "--faults LIST" "Comma separated faults (partition,kill,clock)."
-    :default "partition,kill,clock"]
-   [nil "--ssh-key PATH" "SSH private key path."
-    :default "/home/vagrant/.ssh/id_rsa"]
-   [nil "--ssh-user USER" "SSH username."
-    :default "vagrant"]
-   [nil "--time-limit SECONDS" "How long to run the workload."
-    :default 30
-    :parse-fn #(Integer/parseInt %)]
-   [nil "--rate HZ" "Approx ops/sec per worker."
-    :default 5
-    :parse-fn #(Double/parseDouble %)]
-   [nil "--concurrency N" "Number of worker threads."
-    :default 5
-    :parse-fn #(Integer/parseInt %)]
-   ["-h" "--help"]])
+    :parse-fn #(Integer/parseInt %)]])
 
-(defn fail-on-invalid!
-  "Raises when Jepsen completed analysis and found the history invalid."
-  [result]
-  (when (false? (:valid? result))
-    (throw (ex-info "Jepsen analysis invalid" {:result result})))
-  result)
+(defn- prepare-redis-opts
+  "Transform parsed CLI options into the map expected by elastickv-redis-test."
+  [options]
+  (let [ports (:ports options)
+        options (cli/parse-common-opts options ports)]
+    (assoc options
+      :redis-host (:host options)
+      :redis-ports ports
+      :redis-port (:redis-port options))))
 
 (defn -main
   [& args]
-  (let [{:keys [options errors summary]} (tools.cli/parse-opts args cli-opts)
-        default-nodes "n1,n2,n3,n4,n5"
-        ports (:ports options)
-        local? (or (:local options) (and (:host options) (seq ports)))
-        nodes-raw (if (and ports (= (:nodes options) default-nodes))
-                    (str/join "," (map (fn [i] (str "n" i)) (range 1 (inc (count ports)))))
-                    (:nodes options))
-        node-list (-> nodes-raw
-                      (str/split #",")
-                      (->> (remove str/blank?)
-                           vec))
-        faults    (-> (:faults options)
-                      (str/split #",")
-                      (->> (remove str/blank?)
-                           (map (comp keyword str/lower-case))
-                           vec))
-        options   (assoc options
-                    :nodes node-list
-                    :faults faults
-                    :local local?
-                    :redis-host (:host options)
-                    :redis-ports ports
-                    :redis-port (:redis-port options)
-                    :grpc-port (:grpc-port options)
-                    :raft-groups (:raft-groups options)
-                    :shard-ranges (:shard-ranges options)
-                    :ssh {:username (:ssh-user options)
-                          :private-key-path (:ssh-key options)
-                          :strict-host-key-checking false})]
-    (cond
-      (:help options) (println summary)
-      (seq errors) (binding [*out* *err*]
-                     (println "Error parsing options:" (str/join "; " errors)))
-      (:local options) (binding [control/*dummy* true]
-                         (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))
-      :else (fail-on-invalid! (jepsen/run! (elastickv-redis-test options))))))
+  (cli/run-workload! args
+                     (into cli/common-cli-opts redis-cli-opts)
+                     prepare-redis-opts
+                     elastickv-redis-test))
