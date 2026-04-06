@@ -485,6 +485,8 @@ type Factory interface {
    They can be added later as optional extension interfaces once a real application caller exists.
 9. `OpenConfig` should carry the timing knobs that Elastickv already sets on HashiCorp Raft today.
    Phase 0 is supposed to preserve current behavior, so heartbeat, election, leader-lease, and commit timeout values should move behind the factory boundary instead of being silently hard-coded by one backend.
+10. `Propose(ctx, []byte)` is intentionally byte-oriented at the engine boundary.
+   Raft backends replicate opaque payloads, not KV-specific protobuf commands. If Elastickv wants a typed command API, that should live in a KV-owned layer above `raftengine`, not inside the backend abstraction itself.
 
 ### Call-site mapping
 
@@ -524,6 +526,30 @@ The following items came up during Phase 0 review and implementation, but were i
    `Status.LastContact` remains a sampled `time.Duration` in Phase 0 because that maps cleanly to current HashiCorp monitoring data without synthesizing wall-clock timestamps. If the field remains part of the stable abstraction, a follow-up should rename it to something like `LastContactAgo` so callers can read the meaning directly from the API.
 3. Revisit ownership of latest-read MVCC timestamps.
    Phase 0 keeps the current model where higher layers choose explicit read timestamps and then execute the linearizable read fence before the local read. A follow-up should decide whether a future engine-backed "latest linearizable read" helper should also own timestamp selection so the semantics are explicit in one place.
+4. Introduce a KV-owned `CommandCodec` or `CommandProposer` layer above `raftengine`.
+   Phase 0 leaves protobuf command encoding and raw batch framing in `kv/transaction.go`. A follow-up can extract that into a typed KV-layer API that accepts `pb.Request` or `pb.RaftCommand`, while keeping `raftengine.Propose(ctx, []byte)` byte-oriented and backend-agnostic.
+
+### Possible follow-up: `CommandCodec` layer
+
+If the write path should stop handling raw byte payloads directly, the next layer to add is not a typed engine API. The next layer is a KV-owned adapter above `raftengine`.
+
+Example direction:
+
+```go
+type CommandCodec interface {
+	MarshalRequests(reqs []*pb.Request) ([]byte, error)
+}
+
+type CommandProposer interface {
+	ProposeRequests(ctx context.Context, reqs []*pb.Request) (*raftengine.ProposalResult, error)
+}
+```
+
+This keeps responsibilities split cleanly:
+
+1. `raftengine` owns consensus runtime concerns such as proposal submission, leader view, and read fences.
+2. `kv` owns protobuf schema, single-vs-batch framing, and any future typed command/result conventions.
+3. a future `etcd/raft` backend can still consume opaque bytes without importing KV protobuf packages.
 
 ### Recommended PR split for Phase 0
 
