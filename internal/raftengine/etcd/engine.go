@@ -173,6 +173,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 				Suffrage: "voter",
 			}},
 		},
+		applied:          state.Snapshot.Metadata.Index,
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 	}
@@ -446,7 +447,11 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if len(snapshot.Data) > 0 {
 		return errors.New("snapshot restore is not implemented for the etcd prototype")
 	}
-	return errors.WithStack(e.storage.ApplySnapshot(snapshot))
+	if err := e.storage.ApplySnapshot(snapshot); err != nil {
+		return errors.WithStack(err)
+	}
+	e.applied = snapshot.Metadata.Index
+	return nil
 }
 
 func (e *Engine) applyReadyEntries(entries []raftpb.Entry) error {

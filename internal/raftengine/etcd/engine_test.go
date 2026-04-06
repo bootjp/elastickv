@@ -7,6 +7,8 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
+	etcdraft "go.etcd.io/raft/v3"
+	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 
 type testStateMachine struct {
@@ -117,4 +119,52 @@ func TestOpenSingleNodeRestartsFromPersistedLog(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "three", result.Response)
 	require.Equal(t, [][]byte{[]byte("one"), []byte("two"), []byte("three")}, secondFSM.Applied())
+}
+
+func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	state := persistedState{
+		HardState: raftpb.HardState{
+			Term:   1,
+			Commit: 5,
+		},
+		Snapshot: raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     5,
+				Term:      1,
+			},
+		},
+	}
+	require.NoError(t, saveStateFile(stateFilePath(dir), state))
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	require.Equal(t, uint64(5), engine.Status().AppliedIndex)
+}
+
+func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
+	engine := &Engine{
+		storage: etcdraft.NewMemoryStorage(),
+	}
+
+	err := engine.applyReadySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     7,
+			Term:      2,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), engine.applied)
 }

@@ -292,6 +292,9 @@ func uint32Len(n int) (uint32, error) {
 }
 
 func minEntryCapacity(entryCount uint32) int {
+	// Keep the initial slice modest even after count validation so a truncated or
+	// adversarial file does not force a large allocation before the entry bodies
+	// themselves are validated and read.
 	if entryCount > entryCapacityCap {
 		return int(entryCapacityCap)
 	}
