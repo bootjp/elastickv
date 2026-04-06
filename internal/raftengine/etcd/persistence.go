@@ -21,6 +21,7 @@ const (
 	defaultFilePerm     = 0o600
 	maxPersistedEntries = uint32(1 << 20)
 	entryCapacityCap    = uint32(1024)
+	maxPersistedMessage = uint32(64 << 20)
 )
 
 var stateFileMagic = [4]byte{'E', 'K', 'V', 'R'}
@@ -112,6 +113,9 @@ func saveStateFile(path string, state persistedState) error {
 	if err != nil {
 		return err
 	}
+	// Phase 1 keeps persistence deliberately simple for bootstrap/replay. Phase 2
+	// is expected to replace this whole-state rewrite with incremental WAL-style
+	// storage before broadening the backend beyond the prototype scope.
 	tmpPath := path + ".tmp"
 	if err := writeAndSyncFile(tmpPath, encoded); err != nil {
 		_ = os.Remove(tmpPath)
@@ -323,6 +327,9 @@ func readMessage(r io.Reader, msg protoMessage) error {
 	}
 	if size == 0 {
 		return nil
+	}
+	if size > maxPersistedMessage {
+		return errors.WithStack(errors.Newf("persisted message size %d exceeds limit %d", size, maxPersistedMessage))
 	}
 	raw := make([]byte, size)
 	if _, err := io.ReadFull(r, raw); err != nil {

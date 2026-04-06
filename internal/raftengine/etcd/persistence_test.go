@@ -28,6 +28,16 @@ func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
 	require.Contains(t, err.Error(), "exceeds limit")
 }
 
+func TestReadMessageRejectsLargePayload(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, writeU32(&buf, maxPersistedMessage+1))
+
+	var hardState raftpb.HardState
+	err := readMessage(&buf, &hardState)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeds limit")
+}
+
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 	dir := t.TempDir()
 	state := persistedState{
