@@ -79,7 +79,7 @@ func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 		StateMachine: &testStateMachine{},
 	})
 	require.Error(t, err)
-	require.ErrorContains(t, err, errSingleNodeOnly.Error())
+	require.ErrorContains(t, err, errClusterMismatch.Error())
 }
 
 func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {

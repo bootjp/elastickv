@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
+	etcdstorage "go.etcd.io/etcd/server/v3/storage"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -37,8 +37,8 @@ var (
 	errNodeIDRequired    = errors.New("etcd raft node id is required")
 	errDataDirRequired   = errors.New("etcd raft data dir is required")
 	errStateMachineUnset = errors.New("etcd raft state machine is not configured")
-	errSingleNodeOnly    = errors.New("etcd raft phase 1 prototype only supports a single local voter")
 	errSnapshotRequired  = errors.New("etcd raft snapshot payload is required")
+	errClusterMismatch   = errors.New("etcd raft persisted cluster does not match configured peers")
 )
 
 type Snapshot interface {
@@ -57,6 +57,9 @@ type OpenConfig struct {
 	LocalID        string
 	LocalAddress   string
 	DataDir        string
+	Peers          []Peer
+	Bootstrap      bool
+	Transport      *GRPCTransport
 	TickInterval   time.Duration
 	ElectionTick   int
 	HeartbeatTick  int
@@ -70,24 +73,27 @@ type Engine struct {
 	localID      string
 	localAddress string
 	dataDir      string
-	metaPath     string
-	entriesPath  string
-	snapshotPath string
 	tickInterval time.Duration
 
-	storage *etcdraft.MemoryStorage
-	rawNode *etcdraft.RawNode
-	fsm     StateMachine
+	storage   *etcdraft.MemoryStorage
+	rawNode   *etcdraft.RawNode
+	persist   etcdstorage.Storage
+	fsm       StateMachine
+	peers     map[uint64]Peer
+	transport *GRPCTransport
 
 	nextRequestID atomic.Uint64
 
 	proposeCh chan proposalRequest
 	readCh    chan readRequest
+	stepCh    chan raftpb.Message
 	closeCh   chan struct{}
 	doneCh    chan struct{}
+	startedCh chan struct{}
 
 	leaderReady chan struct{}
 	leaderOnce  sync.Once
+	startOnce   sync.Once
 	closeOnce   sync.Once
 
 	mu      sync.RWMutex
@@ -123,24 +129,38 @@ type readResult struct {
 	err   error
 }
 
-// Open starts the Phase 1 etcd/raft prototype for a single local voter.
+// Open starts the etcd/raft backend.
 //
-// This prototype intentionally blocks until the local node becomes leader or
-// ctx expires. Multi-node startup and follower transport are deferred to later
-// migration phases.
+// Single-node bootstrap waits for local leadership so callers can use the
+// engine immediately. Multi-node startup returns after the local node is
+// running; leadership is established asynchronously through raft transport.
 func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
 
-	state, storage, err := openStorage(cfg)
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers)
 	if err != nil {
 		return nil, err
 	}
-	rawNode, err := newRawNode(cfg, storage)
+	cfg.NodeID = localPeer.NodeID
+	cfg.LocalID = localPeer.ID
+	cfg.LocalAddress = localPeer.Address
+
+	disk, err := openDiskState(cfg, peers)
 	if err != nil {
 		return nil, err
+	}
+	rawNode, err := newRawNode(cfg, disk.Storage)
+	if err != nil {
+		_ = closePersist(disk.Persist)
+		return nil, err
+	}
+
+	peerMap := make(map[uint64]Peer, len(peers))
+	for _, peer := range peers {
+		peerMap[peer.NodeID] = peer
 	}
 
 	engine := &Engine{
@@ -148,53 +168,35 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		localID:      cfg.LocalID,
 		localAddress: cfg.LocalAddress,
 		dataDir:      cfg.DataDir,
-		metaPath:     metadataFilePath(cfg.DataDir),
-		entriesPath:  entriesFilePath(cfg.DataDir),
-		snapshotPath: snapshotDataFilePath(cfg.DataDir),
 		tickInterval: cfg.TickInterval,
-		storage:      storage,
+		storage:      disk.Storage,
 		rawNode:      rawNode,
+		persist:      disk.Persist,
 		fsm:          cfg.StateMachine,
+		peers:        peerMap,
+		transport:    cfg.Transport,
 		proposeCh:    make(chan proposalRequest),
 		readCh:       make(chan readRequest),
+		stepCh:       make(chan raftpb.Message, defaultMaxInflightMsg),
 		closeCh:      make(chan struct{}),
 		doneCh:       make(chan struct{}),
+		startedCh:    make(chan struct{}),
 		leaderReady:  make(chan struct{}),
 		config: raftengine.Configuration{
-			Servers: []raftengine.Server{{
-				ID:       cfg.LocalID,
-				Address:  cfg.LocalAddress,
-				Suffrage: "voter",
-			}},
+			Servers: configServersForPeers(peers),
 		},
-		applied:          state.Snapshot.Metadata.Index,
+		applied:          maxAppliedIndex(disk.Storage, disk.LocalSnap),
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
+	}
+	if engine.transport != nil {
+		engine.transport.SetHandler(engine.enqueueStep)
 	}
 	engine.refreshStatus()
 
 	go engine.run()
 
-	return waitForLeader(ctx, engine)
-}
-
-func openStorage(cfg OpenConfig) (persistedState, *etcdraft.MemoryStorage, error) {
-	state, err := loadOrCreateState(cfg.DataDir, cfg.NodeID)
-	if err != nil {
-		return persistedState{}, nil, err
-	}
-	if err := validateSingleNodeState(state, cfg.NodeID); err != nil {
-		return persistedState{}, nil, err
-	}
-	if err := restorePersistedSnapshot(cfg.StateMachine, snapshotDataFilePath(cfg.DataDir), state.Snapshot); err != nil {
-		return persistedState{}, nil, err
-	}
-
-	storage, err := newMemoryStorage(state)
-	if err != nil {
-		return persistedState{}, nil, err
-	}
-	return state, storage, nil
+	return waitForOpen(ctx, engine, len(peers) == 1)
 }
 
 func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawNode, error) {
@@ -217,12 +219,12 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawN
 	return rawNode, nil
 }
 
-func waitForLeader(ctx context.Context, engine *Engine) (*Engine, error) {
+func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engine, error) {
 	select {
 	case <-ctx.Done():
 		_ = engine.Close()
 		return nil, errors.WithStack(ctx.Err())
-	case <-engine.leaderReady:
+	case <-engine.openReady(waitForLeader):
 		return engine, nil
 	case <-engine.doneCh:
 		if err := engine.currentError(); err != nil {
@@ -372,6 +374,7 @@ func (e *Engine) run() {
 		e.fail(err)
 		return
 	}
+	e.markStarted()
 
 	for {
 		if err := e.drainReady(); err != nil {
@@ -393,6 +396,9 @@ func (e *Engine) startup() error {
 	if e.State() == raftengine.StateLeader {
 		return nil
 	}
+	if len(e.peers) > 1 {
+		return nil
+	}
 	if err := e.rawNode.Campaign(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -409,6 +415,8 @@ func (e *Engine) handleEvent(tick <-chan time.Time) bool {
 		e.handleProposal(req)
 	case req := <-e.readCh:
 		e.handleRead(req)
+	case msg := <-e.stepCh:
+		e.handleStep(msg)
 	}
 	return true
 }
@@ -440,6 +448,9 @@ func (e *Engine) drainReady() error {
 		if err := e.persistReady(rd); err != nil {
 			return err
 		}
+		if err := e.sendMessages(rd.Messages); err != nil {
+			return err
+		}
 		if err := e.applyCommitted(rd.CommittedEntries); err != nil {
 			return err
 		}
@@ -459,18 +470,13 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 	if !readyNeedsPersistence(rd) {
 		return nil
 	}
-	prevLastIndex, err := e.storage.LastIndex()
-	if err != nil {
-		return errors.WithStack(err)
-	}
 	if err := e.applyReady(rd); err != nil {
 		return err
 	}
-	return e.persistReadyState(rd, prevLastIndex)
-}
-
-func readyNeedsPersistence(rd etcdraft.Ready) bool {
-	return !etcdraft.IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 || !etcdraft.IsEmptyHardState(rd.HardState)
+	if e.persist == nil {
+		return nil
+	}
+	return persistReadyToWAL(e.persist, rd)
 }
 
 func (e *Engine) applyReady(rd etcdraft.Ready) error {
@@ -483,31 +489,28 @@ func (e *Engine) applyReady(rd etcdraft.Ready) error {
 	return e.applyReadyHardState(rd.HardState)
 }
 
-func (e *Engine) persistReadyState(rd etcdraft.Ready, prevLastIndex uint64) error {
-	if err := e.persistReadyEntries(rd, prevLastIndex); err != nil {
-		return err
+func (e *Engine) handleStep(msg raftpb.Message) {
+	if e.rawNode == nil {
+		return
 	}
-	if snapshotRequiresMetadata(rd) {
-		return e.persistMetadata()
+	if err := e.rawNode.Step(msg); err != nil {
+		e.fail(errors.WithStack(err))
+	}
+}
+
+func (e *Engine) sendMessages(messages []raftpb.Message) error {
+	for _, msg := range messages {
+		if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
+			continue
+		}
+		if e.transport == nil {
+			continue
+		}
+		if err := e.transport.Dispatch(context.Background(), msg); err != nil {
+			continue
+		}
 	}
 	return nil
-}
-
-func (e *Engine) persistReadyEntries(rd etcdraft.Ready, prevLastIndex uint64) error {
-	switch {
-	case !etcdraft.IsEmptySnap(rd.Snapshot):
-		return e.persistInstalledSnapshot(rd.Snapshot)
-	case len(rd.Entries) == 0:
-		return nil
-	case rd.Entries[0].Index == prevLastIndex+1:
-		return appendEntriesFile(e.entriesPath, rd.Entries)
-	default:
-		return e.rewritePersistedEntries()
-	}
-}
-
-func snapshotRequiresMetadata(rd etcdraft.Ready) bool {
-	return !etcdraft.IsEmptySnap(rd.Snapshot) || !etcdraft.IsEmptyHardState(rd.HardState)
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -543,18 +546,8 @@ func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
 	return errors.WithStack(e.storage.SetHardState(hardState))
 }
 
-func (e *Engine) persistInstalledSnapshot(snapshot raftpb.Snapshot) error {
-	if len(snapshot.Data) == 0 {
-		return errors.WithStack(errSnapshotRequired)
-	}
-	if err := writeAndSyncFile(e.snapshotPath, snapshot.Data); err != nil {
-		return err
-	}
-	return e.rewritePersistedEntries()
-}
-
 func (e *Engine) maybePersistLocalSnapshot() error {
-	if e.applied == 0 {
+	if e.applied == 0 || e.persist == nil {
 		return nil
 	}
 
@@ -565,41 +558,11 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if e.applied <= current.Metadata.Index {
 		return nil
 	}
-
-	if err := writeStateMachineSnapshot(e.snapshotPath, e.fsm); err != nil {
-		return err
-	}
-
-	_, confState, err := e.storage.InitialState()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if _, err := e.storage.CreateSnapshot(e.applied, &confState, nil); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := e.storage.Compact(e.applied); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
-		return errors.WithStack(err)
-	}
-	if err := e.rewritePersistedEntries(); err != nil {
-		return err
-	}
-	return e.persistMetadata()
-}
-
-func (e *Engine) persistMetadata() error {
-	hardState, snapshot, err := storageMetadata(e.storage)
+	snapshot, err := persistLocalSnapshot(e.storage, e.persist, e.fsm, e.applied)
 	if err != nil {
 		return err
 	}
-	return saveMetadataFile(e.metaPath, hardState, snapshot)
-}
-
-func (e *Engine) rewritePersistedEntries() error {
-	entries, err := storageEntries(e.storage)
-	if err != nil {
-		return err
-	}
-	return rewriteEntriesFile(e.entriesPath, entries)
+	return e.refreshLocalSnapshot(snapshot)
 }
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
@@ -690,13 +653,7 @@ func (e *Engine) refreshStatus() {
 	snapshot, _ := e.storage.Snapshot()
 
 	state := translateState(basic.RaftState)
-	leader := raftengine.LeaderInfo{}
-	switch {
-	case basic.Lead == e.nodeID:
-		leader = raftengine.LeaderInfo{ID: e.localID, Address: e.localAddress}
-	case basic.Lead != etcdraft.None:
-		leader = raftengine.LeaderInfo{ID: strconv.FormatUint(basic.Lead, 10)}
-	}
+	leader := e.leaderInfo(basic.Lead)
 
 	status := raftengine.Status{
 		State:             state,
@@ -707,7 +664,7 @@ func (e *Engine) refreshStatus() {
 		LastLogIndex:      lastLogIndex,
 		LastSnapshotIndex: snapshot.Metadata.Index,
 		FSMPending:        pendingEntries(basic.Commit, e.applied),
-		NumPeers:          0,
+		NumPeers:          numRemotePeers(e.peers),
 		LastContact:       lastContactFor(state),
 	}
 
@@ -723,11 +680,24 @@ func (e *Engine) refreshStatus() {
 	}
 }
 
+func (e *Engine) markStarted() {
+	e.startOnce.Do(func() { close(e.startedCh) })
+}
+
+func (e *Engine) openReady(waitForLeader bool) <-chan struct{} {
+	if waitForLeader {
+		return e.leaderReady
+	}
+	return e.startedCh
+}
+
 func (e *Engine) shutdown() {
 	e.mu.Lock()
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	_ = closePersist(e.persist)
+	_ = e.transport.Close()
 	e.failPending(errors.WithStack(errClosed))
 }
 
@@ -739,6 +709,8 @@ func (e *Engine) fail(err error) {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	_ = closePersist(e.persist)
+	_ = e.transport.Close()
 	e.failPending(e.currentErrorOrClosed())
 }
 
@@ -773,9 +745,35 @@ func (e *Engine) nextID() uint64 {
 }
 
 func normalizeConfig(cfg OpenConfig) OpenConfig {
+	cfg = normalizeIdentity(cfg)
+	cfg = normalizePeersConfig(cfg)
+	cfg = normalizeTimingConfig(cfg)
+	cfg = normalizeLimitConfig(cfg)
+	return cfg
+}
+
+func normalizeIdentity(cfg OpenConfig) OpenConfig {
+	if cfg.NodeID == 0 && cfg.LocalID != "" {
+		cfg.NodeID = DeriveNodeID(cfg.LocalID)
+	}
 	if cfg.LocalID == "" && cfg.NodeID != 0 {
 		cfg.LocalID = strconv.FormatUint(cfg.NodeID, 10)
 	}
+	return cfg
+}
+
+func normalizePeersConfig(cfg OpenConfig) OpenConfig {
+	if len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
+		cfg.Peers = []Peer{{
+			NodeID:  cfg.NodeID,
+			ID:      cfg.LocalID,
+			Address: cfg.LocalAddress,
+		}}
+	}
+	return cfg
+}
+
+func normalizeTimingConfig(cfg OpenConfig) OpenConfig {
 	if cfg.TickInterval <= 0 {
 		cfg.TickInterval = defaultTickInterval
 	}
@@ -785,6 +783,10 @@ func normalizeConfig(cfg OpenConfig) OpenConfig {
 	if cfg.ElectionTick <= 0 {
 		cfg.ElectionTick = defaultElectionTick
 	}
+	return cfg
+}
+
+func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 	if cfg.MaxInflightMsg <= 0 {
 		cfg.MaxInflightMsg = defaultMaxInflightMsg
 	}
@@ -809,22 +811,6 @@ func validateConfig(cfg OpenConfig) error {
 	}
 }
 
-func validateSingleNodeState(state persistedState, nodeID uint64) error {
-	conf := state.Snapshot.Metadata.ConfState
-	if len(conf.Voters) != 1 || conf.Voters[0] != nodeID {
-		return errors.WithStack(errSingleNodeOnly)
-	}
-	if len(conf.VotersOutgoing) > 0 || len(conf.Learners) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
-		return errors.WithStack(errSingleNodeOnly)
-	}
-	for _, entry := range state.Entries {
-		if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
-			return errors.WithStack(errSingleNodeOnly)
-		}
-	}
-	return nil
-}
-
 func translateState(state etcdraft.StateType) raftengine.State {
 	switch state {
 	case etcdraft.StateFollower:
@@ -847,6 +833,17 @@ func pendingEntries(commitIndex uint64, appliedIndex uint64) uint64 {
 	return commitIndex - appliedIndex
 }
 
+func numRemotePeers(peers map[uint64]Peer) uint64 {
+	var count uint64
+	for range peers {
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return count - 1
+}
+
 func lastContactFor(state raftengine.State) time.Duration {
 	if state == raftengine.StateLeader {
 		return 0
@@ -864,31 +861,47 @@ func contextErr(ctx context.Context) error {
 	return nil
 }
 
-func restorePersistedSnapshot(fsm StateMachine, path string, snapshot raftpb.Snapshot) error {
-	if fsm == nil || snapshot.Metadata.Index <= 1 {
-		return nil
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(errors.UnwrapAll(err)) {
-			return errors.WithStack(errors.New("persisted snapshot metadata is present without snapshot payload"))
-		}
-		return errors.WithStack(err)
-	}
-	defer file.Close()
-	return errors.WithStack(fsm.Restore(file))
+func readyNeedsPersistence(rd etcdraft.Ready) bool {
+	return !etcdraft.IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 || !etcdraft.IsEmptyHardState(rd.HardState)
 }
 
-func writeStateMachineSnapshot(path string, fsm StateMachine) (err error) {
-	snapshot, err := fsm.Snapshot()
-	if err != nil {
-		return errors.WithStack(err)
+func maxAppliedIndex(storage *etcdraft.MemoryStorage, snapshot raftpb.Snapshot) uint64 {
+	if storage == nil {
+		return snapshot.Metadata.Index
 	}
-	defer func() {
-		err = errors.CombineErrors(err, errors.WithStack(snapshot.Close()))
-	}()
-	return writeSnapshotStreamFile(path, snapshot.WriteTo)
+	lastApplied := snapshot.Metadata.Index
+	if hardState, _, err := storage.InitialState(); err == nil && hardState.Commit > lastApplied {
+		lastApplied = hardState.Commit
+	}
+	return lastApplied
+}
+
+func (e *Engine) refreshLocalSnapshot(snapshot raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snapshot) {
+		return nil
+	}
+	return nil
+}
+
+func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return e.currentErrorOrClosed()
+	case e.stepCh <- msg:
+		return nil
+	}
+}
+
+func (e *Engine) leaderInfo(leaderNodeID uint64) raftengine.LeaderInfo {
+	if leaderNodeID == 0 {
+		return raftengine.LeaderInfo{}
+	}
+	if peer, ok := e.peers[leaderNodeID]; ok {
+		return raftengine.LeaderInfo{ID: peer.ID, Address: peer.Address}
+	}
+	return raftengine.LeaderInfo{ID: strconv.FormatUint(leaderNodeID, 10)}
 }
 
 func encodeProposalEnvelope(id uint64, payload []byte) []byte {

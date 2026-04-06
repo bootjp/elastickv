@@ -5,13 +5,21 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"net"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/server/v3/storage/wal"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 type testStateMachine struct {
@@ -90,6 +98,16 @@ func (s *testStateMachine) Restore(r io.Reader) error {
 
 type testSnapshot struct {
 	data []byte
+}
+
+type transportTestNode struct {
+	peer      Peer
+	lis       net.Listener
+	server    *grpc.Server
+	transport *GRPCTransport
+	fsm       *testStateMachine
+	engine    *Engine
+	dir       string
 }
 
 func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
@@ -280,6 +298,158 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	})
 
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+}
+
+func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 3)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node.engine != nil {
+				require.NoError(t, node.engine.Close())
+			}
+			if node.server != nil {
+				node.server.Stop()
+			}
+			if node.lis != nil {
+				_ = node.lis.Close()
+			}
+			if node.transport != nil {
+				require.NoError(t, node.transport.Close())
+			}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNodes(ctx, nodes, peers))
+
+	leader := waitForLeaderNode(t, nodes)
+	result, err := leader.engine.Propose(context.Background(), []byte("alpha"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			if got := node.fsm.Applied(); len(got) != 1 || string(got[0]) != "alpha" {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
+	t.Helper()
+
+	nodes := make([]*transportTestNode, 0, count)
+	peers := make([]Peer, 0, count)
+	nodeID := uint64(1)
+	for i := range count {
+		lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		peer := Peer{
+			NodeID:  nodeID,
+			ID:      "n" + strconv.Itoa(i+1),
+			Address: lis.Addr().String(),
+		}
+		peers = append(peers, peer)
+		nodes = append(nodes, &transportTestNode{
+			peer: peer,
+			lis:  lis,
+			dir:  t.TempDir(),
+			fsm:  &testStateMachine{},
+		})
+		nodeID++
+	}
+	return nodes, peers
+}
+
+func startTransportTestServers(nodes []*transportTestNode, peers []Peer) {
+	for _, node := range nodes {
+		node.transport = NewGRPCTransport(peers)
+		node.server = grpc.NewServer(internalutil.GRPCServerOptions()...)
+		node.transport.Register(node.server)
+		go func(server *grpc.Server, lis net.Listener) {
+			_ = server.Serve(lis)
+		}(node.server, node.lis)
+	}
+}
+
+func openTransportTestNodes(ctx context.Context, nodes []*transportTestNode, peers []Peer) error {
+	var eg errgroup.Group
+	for _, node := range nodes {
+		eg.Go(func() error {
+			engine, err := Open(ctx, OpenConfig{
+				NodeID:       node.peer.NodeID,
+				LocalID:      node.peer.ID,
+				LocalAddress: node.peer.Address,
+				DataDir:      node.dir,
+				Peers:        peers,
+				Bootstrap:    true,
+				Transport:    node.transport,
+				StateMachine: node.fsm,
+			})
+			if err != nil {
+				return err
+			}
+			node.engine = engine
+			return nil
+		})
+	}
+	return eg.Wait()
+}
+
+func TestSingleNodeWALRotatesSegments(t *testing.T) {
+	oldSegmentSize := wal.SegmentSizeBytes
+	wal.SegmentSizeBytes = 4 * 1024
+	t.Cleanup(func() {
+		wal.SegmentSizeBytes = oldSegmentSize
+	})
+
+	dir := t.TempDir()
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	payload := bytes.Repeat([]byte("a"), 1024)
+	for i := 0; i < 32; i++ {
+		_, err := engine.Propose(context.Background(), payload)
+		require.NoError(t, err)
+	}
+
+	files, err := filepath.Glob(filepath.Join(dir, walDirName, "*.wal"))
+	require.NoError(t, err)
+	require.Greater(t, len(files), 1)
+}
+
+func waitForLeaderNode(t *testing.T, nodes []*transportTestNode) *transportTestNode {
+	t.Helper()
+	var leader *transportTestNode
+	require.Eventually(t, func() bool {
+		leader = nil
+		for _, node := range nodes {
+			if node.engine == nil {
+				return false
+			}
+			if node.engine.State() == raftengine.StateLeader {
+				leader = node
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+	return leader
 }
 
 func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {

@@ -215,42 +215,6 @@ func loadEntriesFile(path string) ([]raftpb.Entry, error) {
 	}
 }
 
-func appendEntriesFile(path string, entries []raftpb.Entry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, defaultFilePerm)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if info.Size() == 0 {
-		if err := writeVersionedHeader(file, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}); err != nil {
-			return err
-		}
-	}
-
-	writer := bufio.NewWriter(file)
-	for _, entry := range entries {
-		if err := writeMessage(writer, entry.Marshal); err != nil {
-			return err
-		}
-	}
-	if err := writer.Flush(); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := file.Sync(); err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
-}
-
 func rewriteEntriesFile(path string, entries []raftpb.Entry) error {
 	return replaceFile(path, func(w io.Writer) error {
 		writer := bufio.NewWriter(w)
@@ -261,19 +225,6 @@ func rewriteEntriesFile(path string, entries []raftpb.Entry) error {
 			if err := writeMessage(writer, entry.Marshal); err != nil {
 				return err
 			}
-		}
-		if err := writer.Flush(); err != nil {
-			return errors.WithStack(err)
-		}
-		return nil
-	})
-}
-
-func writeSnapshotStreamFile(path string, write func(io.Writer) (int64, error)) error {
-	return replaceFile(path, func(w io.Writer) error {
-		writer := bufio.NewWriter(w)
-		if _, err := write(writer); err != nil {
-			return errors.WithStack(err)
 		}
 		if err := writer.Flush(); err != nil {
 			return errors.WithStack(err)
@@ -368,48 +319,6 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 	return buf.Bytes(), nil
-}
-
-func storageMetadata(storage *etcdraft.MemoryStorage) (raftpb.HardState, raftpb.Snapshot, error) {
-	if storage == nil {
-		return raftpb.HardState{}, raftpb.Snapshot{}, errors.New("memory storage is not configured")
-	}
-
-	hardState, _, err := storage.InitialState()
-	if err != nil {
-		return raftpb.HardState{}, raftpb.Snapshot{}, errors.WithStack(err)
-	}
-	snapshot, err := storage.Snapshot()
-	if err != nil {
-		return raftpb.HardState{}, raftpb.Snapshot{}, errors.WithStack(err)
-	}
-	snapshot.Data = nil
-	return hardState, snapshot, nil
-}
-
-func storageEntries(storage *etcdraft.MemoryStorage) ([]raftpb.Entry, error) {
-	if storage == nil {
-		return nil, errors.New("memory storage is not configured")
-	}
-
-	firstIndex, err := storage.FirstIndex()
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	lastIndex, err := storage.LastIndex()
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	var entries []raftpb.Entry
-	if lastIndex >= firstIndex {
-		entries, err = storage.Entries(firstIndex, lastIndex+1, ^uint64(0))
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		entries = append([]raftpb.Entry(nil), entries...)
-	}
-	return entries, nil
 }
 
 func newMemoryStorage(state persistedState) (*etcdraft.MemoryStorage, error) {
