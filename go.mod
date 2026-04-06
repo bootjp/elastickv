@@ -31,6 +31,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/yuin/gopher-lua v1.1.2
 	go.etcd.io/bbolt v1.4.3
+	go.etcd.io/raft/v3 v3.6.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.42.0
 	google.golang.org/grpc v1.79.3
