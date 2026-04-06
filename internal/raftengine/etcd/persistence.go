@@ -34,7 +34,6 @@ const (
 	maxPersistedEntryMessage = uint32(internalutil.GRPCMaxMessageBytes) + persistedEntryHeadroom
 	maxPersistedSnapshotMeta = uint32(1 << 20)
 	maxPersistedHardState    = uint32(1 << 20)
-	entriesGrowthFactor      = 2
 )
 
 var (
@@ -204,9 +203,6 @@ func loadEntriesFile(path string) ([]raftpb.Entry, error) {
 		}
 		if !ok {
 			return entries, nil
-		}
-		if len(entries) == cap(entries) {
-			entries = growEntries(entries)
 		}
 		entries = append(entries, entry)
 		if len(entries) > int(maxPersistedEntries) {
@@ -414,19 +410,6 @@ func minEntryCapacity(entryCount uint32) int {
 		return int(entryCapacityCap)
 	}
 	return int(entryCount)
-}
-
-func growEntries(entries []raftpb.Entry) []raftpb.Entry {
-	if cap(entries) == 0 {
-		return make([]raftpb.Entry, 0, 1)
-	}
-	next := cap(entries) * entriesGrowthFactor
-	if next > int(entryCapacityCap) {
-		next = int(entryCapacityCap)
-	}
-	grown := make([]raftpb.Entry, len(entries), next)
-	copy(grown, entries)
-	return grown
 }
 
 func replaceFile(path string, write func(io.Writer) error) (err error) {

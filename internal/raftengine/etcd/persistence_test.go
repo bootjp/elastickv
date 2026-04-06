@@ -58,6 +58,32 @@ func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
 	require.Contains(t, err.Error(), "exceeds limit")
 }
 
+func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
+	path := entriesFilePath(t.TempDir())
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	require.NoError(t, writeVersionedHeader(writer, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}))
+	index := uint64(1)
+	for i := 0; i < int(entryCapacityCap)+1; i++ {
+		entry := raftpb.Entry{
+			Type:  raftpb.EntryNormal,
+			Index: index,
+			Term:  1,
+			Data:  []byte("x"),
+		}
+		require.NoError(t, writeMessage(writer, entry.Marshal))
+		index++
+	}
+	require.NoError(t, writer.Flush())
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), defaultFilePerm))
+
+	entries, err := loadEntriesFile(path)
+	require.NoError(t, err)
+	require.Len(t, entries, int(entryCapacityCap)+1)
+	require.Equal(t, uint64(int(entryCapacityCap)+1), entries[len(entries)-1].Index)
+}
+
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 	dir := t.TempDir()
 	state := persistedState{
