@@ -126,17 +126,18 @@ func (e *Engine) Status() raftengine.Status {
 	}
 
 	stats := e.raft.Stats()
+	state := e.State()
 	return raftengine.Status{
-		State:             normalizeState(stats["state"]),
+		State:             state,
 		Leader:            e.Leader(),
 		Term:              parseUint(stats["term"]),
-		CommitIndex:       parseUint(stats["commit_index"]),
-		AppliedIndex:      parseUint(stats["applied_index"]),
-		LastLogIndex:      parseUint(stats["last_log_index"]),
+		CommitIndex:       e.raft.CommitIndex(),
+		AppliedIndex:      e.raft.AppliedIndex(),
+		LastLogIndex:      e.raft.LastIndex(),
 		LastSnapshotIndex: parseUint(stats["last_snapshot_index"]),
 		FSMPending:        parseUint(stats["fsm_pending"]),
 		NumPeers:          parseUint(stats["num_peers"]),
-		LastContact:       parseLastContact(stats["last_contact"]),
+		LastContact:       lastContact(state, e.raft.LastContact()),
 	}
 }
 
@@ -195,21 +196,6 @@ func contextErr(ctx context.Context) error {
 	return nil
 }
 
-func normalizeState(raw string) raftengine.State {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "follower":
-		return raftengine.StateFollower
-	case "candidate":
-		return raftengine.StateCandidate
-	case "leader":
-		return raftengine.StateLeader
-	case "shutdown":
-		return raftengine.StateShutdown
-	default:
-		return raftengine.StateUnknown
-	}
-}
-
 func normalizeSuffrage(s raft.ServerSuffrage) string {
 	switch s {
 	case raft.Voter:
@@ -231,15 +217,12 @@ func parseUint(raw string) uint64 {
 	return v
 }
 
-func parseLastContact(raw string) time.Duration {
-	raw = strings.TrimSpace(raw)
-	switch raw {
-	case "", "never":
+func lastContact(state raftengine.State, last time.Time) time.Duration {
+	if state == raftengine.StateLeader {
+		return 0
+	}
+	if last.IsZero() {
 		return unknownLastContact
 	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		return unknownLastContact
-	}
-	return d
+	return time.Since(last)
 }
