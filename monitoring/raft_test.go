@@ -3,8 +3,9 @@ package monitoring
 import (
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -15,13 +16,13 @@ func TestRaftObserverSetMembersReplacesRemovedMembers(t *testing.T) {
 	require.NotNil(t, observer)
 
 	observer.setLeaderMetric("1", "n2", "10.0.0.2:50051")
-	observer.setMembers("1", "n2", []raft.Server{
-		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: raft.Voter},
-		{ID: "n2", Address: "10.0.0.2:50051", Suffrage: raft.Voter},
+	observer.setMembers("1", "n2", []raftengine.Server{
+		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: "voter"},
+		{ID: "n2", Address: "10.0.0.2:50051", Suffrage: "voter"},
 	})
 	observer.setLeaderMetric("1", "n1", "10.0.0.1:50051")
-	observer.setMembers("1", "n1", []raft.Server{
-		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: raft.Voter},
+	observer.setMembers("1", "n1", []raftengine.Server{
+		{ID: "n1", Address: "10.0.0.1:50051", Suffrage: "voter"},
 	})
 
 	err := testutil.GatherAndCompare(
@@ -40,12 +41,10 @@ elastickv_raft_member_present{group="1",member_address="10.0.0.1:50051",member_i
 	require.NoError(t, err)
 }
 
-func TestParseLastContactSeconds(t *testing.T) {
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds(""))
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("never"))
-	require.Equal(t, 0.0, parseLastContactSeconds("0"))
-	require.Equal(t, 0.25, parseLastContactSeconds("250ms"))
-	require.Equal(t, float64(lastContactUnknownValue), parseLastContactSeconds("invalid"))
+func TestLastContactSeconds(t *testing.T) {
+	require.Equal(t, float64(lastContactUnknownValue), lastContactSeconds(-1))
+	require.Equal(t, 0.0, lastContactSeconds(0))
+	require.Equal(t, 0.25, lastContactSeconds(250*time.Millisecond))
 }
 
 func TestRaftMetricsNewFields(t *testing.T) {
@@ -107,6 +106,31 @@ elastickv_raft_proposals_failed_total{group="1",node_address="10.0.0.1:50051",no
 `),
 		"elastickv_raft_leader_changes_seen_total",
 		"elastickv_raft_proposals_failed_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestRaftObserverSetLeaderMetricCountsLeaderReturnAfterGap(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RaftObserver()
+	require.NotNil(t, observer)
+
+	observer.setLeaderMetric("1", "n1", "10.0.0.1:50051")
+	observer.setLeaderMetric("1", "", "")
+	observer.setLeaderMetric("1", "n2", "10.0.0.2:50051")
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_raft_leader_changes_seen_total Total number of observed leader changes for each group.
+# TYPE elastickv_raft_leader_changes_seen_total counter
+elastickv_raft_leader_changes_seen_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
+# HELP elastickv_raft_leader_identity Current leader identity for each raft group, as observed by this node.
+# TYPE elastickv_raft_leader_identity gauge
+elastickv_raft_leader_identity{group="1",leader_address="10.0.0.2:50051",leader_id="n2",node_address="10.0.0.1:50051",node_id="n1"} 1
+`),
+		"elastickv_raft_leader_changes_seen_total",
+		"elastickv_raft_leader_identity",
 	)
 	require.NoError(t, err)
 }
