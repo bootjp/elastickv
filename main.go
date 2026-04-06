@@ -17,6 +17,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -328,17 +329,20 @@ func buildShardGroups(
 			}
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
+		engine := hashicorpraftengine.New(r)
 		runtimes = append(runtimes, &raftGroupRuntime{
 			spec:        g,
 			raft:        r,
+			engine:      engine,
 			tm:          tm,
 			store:       st,
 			closeStores: closeStores,
 		})
 		shardGroups[g.id] = &kv.ShardGroup{
-			Raft:  r,
-			Store: st,
-			Txn:   kv.NewLeaderProxy(r, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
+			Raft:   r,
+			Engine: engine,
+			Store:  st,
+			Txn:    kv.NewLeaderProxyWithEngine(engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
 		}
 	}
 	return runtimes, shardGroups, nil
@@ -354,12 +358,13 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
 	out := make([]monitoring.RaftRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.raft == nil {
+		if runtime == nil || runtime.engine == nil {
 			continue
 		}
 		out = append(out, monitoring.RaftRuntime{
-			GroupID: runtime.spec.id,
-			Raft:    runtime.raft,
+			GroupID:      runtime.spec.id,
+			StatusReader: runtime.engine,
+			ConfigReader: runtime.engine,
 		})
 	}
 	return out
@@ -368,13 +373,13 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime {
 	out := make([]kv.FSMCompactRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.raft == nil || runtime.store == nil {
+		if runtime == nil || runtime.engine == nil || runtime.store == nil {
 			continue
 		}
 		out = append(out, kv.FSMCompactRuntime{
-			GroupID: runtime.spec.id,
-			Raft:    runtime.raft,
-			Store:   runtime.store,
+			GroupID:      runtime.spec.id,
+			StatusReader: runtime.engine,
+			Store:        runtime.store,
 		})
 	}
 	return out
@@ -393,11 +398,11 @@ func startRaftServers(
 ) error {
 	for _, rt := range runtimes {
 		gs := grpc.NewServer(internalutil.GRPCServerOptions()...)
-		trx := kv.NewTransaction(rt.raft, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
+		trx := kv.NewTransactionWithProposer(rt.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock(), relay))
+		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 		pb.RegisterDistributionServer(gs, distServer)
 		rt.tm.Register(gs)
 		leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
