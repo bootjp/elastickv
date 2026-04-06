@@ -1,8 +1,11 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -35,10 +38,18 @@ var (
 	errDataDirRequired   = errors.New("etcd raft data dir is required")
 	errStateMachineUnset = errors.New("etcd raft state machine is not configured")
 	errSingleNodeOnly    = errors.New("etcd raft phase 1 prototype only supports a single local voter")
+	errSnapshotRequired  = errors.New("etcd raft snapshot payload is required")
 )
+
+type Snapshot interface {
+	WriteTo(w io.Writer) (int64, error)
+	Close() error
+}
 
 type StateMachine interface {
 	Apply(data []byte) any
+	Snapshot() (Snapshot, error)
+	Restore(r io.Reader) error
 }
 
 type OpenConfig struct {
@@ -59,7 +70,9 @@ type Engine struct {
 	localID      string
 	localAddress string
 	dataDir      string
-	statePath    string
+	metaPath     string
+	entriesPath  string
+	snapshotPath string
 	tickInterval time.Duration
 
 	storage *etcdraft.MemoryStorage
@@ -121,34 +134,13 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		return nil, err
 	}
 
-	state, err := loadOrCreateState(cfg.DataDir, cfg.NodeID)
+	state, storage, err := openStorage(cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSingleNodeState(state, cfg.NodeID); err != nil {
-		return nil, err
-	}
-
-	storage, err := newMemoryStorage(state)
+	rawNode, err := newRawNode(cfg, storage)
 	if err != nil {
 		return nil, err
-	}
-
-	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
-		ID:                        cfg.NodeID,
-		ElectionTick:              cfg.ElectionTick,
-		HeartbeatTick:             cfg.HeartbeatTick,
-		Storage:                   storage,
-		MaxSizePerMsg:             cfg.MaxSizePerMsg,
-		MaxCommittedSizePerReady:  cfg.MaxSizePerMsg,
-		MaxInflightMsgs:           cfg.MaxInflightMsg,
-		CheckQuorum:               true,
-		PreVote:                   true,
-		ReadOnlyOption:            etcdraft.ReadOnlySafe,
-		DisableProposalForwarding: true,
-	})
-	if err != nil {
-		return nil, errors.WithStack(err)
 	}
 
 	engine := &Engine{
@@ -156,7 +148,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		localID:      cfg.LocalID,
 		localAddress: cfg.LocalAddress,
 		dataDir:      cfg.DataDir,
-		statePath:    stateFilePath(cfg.DataDir),
+		metaPath:     metadataFilePath(cfg.DataDir),
+		entriesPath:  entriesFilePath(cfg.DataDir),
+		snapshotPath: snapshotDataFilePath(cfg.DataDir),
 		tickInterval: cfg.TickInterval,
 		storage:      storage,
 		rawNode:      rawNode,
@@ -181,6 +175,49 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 
 	go engine.run()
 
+	return waitForLeader(ctx, engine)
+}
+
+func openStorage(cfg OpenConfig) (persistedState, *etcdraft.MemoryStorage, error) {
+	state, err := loadOrCreateState(cfg.DataDir, cfg.NodeID)
+	if err != nil {
+		return persistedState{}, nil, err
+	}
+	if err := validateSingleNodeState(state, cfg.NodeID); err != nil {
+		return persistedState{}, nil, err
+	}
+	if err := restorePersistedSnapshot(cfg.StateMachine, snapshotDataFilePath(cfg.DataDir), state.Snapshot); err != nil {
+		return persistedState{}, nil, err
+	}
+
+	storage, err := newMemoryStorage(state)
+	if err != nil {
+		return persistedState{}, nil, err
+	}
+	return state, storage, nil
+}
+
+func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawNode, error) {
+	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
+		ID:                        cfg.NodeID,
+		ElectionTick:              cfg.ElectionTick,
+		HeartbeatTick:             cfg.HeartbeatTick,
+		Storage:                   storage,
+		MaxSizePerMsg:             cfg.MaxSizePerMsg,
+		MaxCommittedSizePerReady:  cfg.MaxSizePerMsg,
+		MaxInflightMsgs:           cfg.MaxInflightMsg,
+		CheckQuorum:               true,
+		PreVote:                   true,
+		ReadOnlyOption:            etcdraft.ReadOnlySafe,
+		DisableProposalForwarding: true,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return rawNode, nil
+}
+
+func waitForLeader(ctx context.Context, engine *Engine) (*Engine, error) {
 	select {
 	case <-ctx.Done():
 		_ = engine.Close()
@@ -408,6 +445,9 @@ func (e *Engine) drainReady() error {
 		}
 		e.handleReadStates(rd.ReadStates)
 		e.rawNode.Advance(rd)
+		if err := e.maybePersistLocalSnapshot(); err != nil {
+			return err
+		}
 		e.refreshStatus()
 		e.resolveReadyReads()
 	}
@@ -419,38 +459,73 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 	if !readyNeedsPersistence(rd) {
 		return nil
 	}
+	prevLastIndex, err := e.storage.LastIndex()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := e.applyReady(rd); err != nil {
+		return err
+	}
+	return e.persistReadyState(rd, prevLastIndex)
+}
+
+func readyNeedsPersistence(rd etcdraft.Ready) bool {
+	return !etcdraft.IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 || !etcdraft.IsEmptyHardState(rd.HardState)
+}
+
+func (e *Engine) applyReady(rd etcdraft.Ready) error {
 	if err := e.applyReadySnapshot(rd.Snapshot); err != nil {
 		return err
 	}
 	if err := e.applyReadyEntries(rd.Entries); err != nil {
 		return err
 	}
-	if err := e.applyReadyHardState(rd.HardState); err != nil {
-		return err
-	}
-
-	state, err := persistedStateFromStorage(e.storage)
-	if err != nil {
-		return err
-	}
-	return saveStateFile(e.statePath, state)
+	return e.applyReadyHardState(rd.HardState)
 }
 
-func readyNeedsPersistence(rd etcdraft.Ready) bool {
-	return len(rd.Entries) > 0 || !etcdraft.IsEmptyHardState(rd.HardState) || !etcdraft.IsEmptySnap(rd.Snapshot)
+func (e *Engine) persistReadyState(rd etcdraft.Ready, prevLastIndex uint64) error {
+	if err := e.persistReadyEntries(rd, prevLastIndex); err != nil {
+		return err
+	}
+	if snapshotRequiresMetadata(rd) {
+		return e.persistMetadata()
+	}
+	return nil
+}
+
+func (e *Engine) persistReadyEntries(rd etcdraft.Ready, prevLastIndex uint64) error {
+	switch {
+	case !etcdraft.IsEmptySnap(rd.Snapshot):
+		return e.persistInstalledSnapshot(rd.Snapshot)
+	case len(rd.Entries) == 0:
+		return nil
+	case rd.Entries[0].Index == prevLastIndex+1:
+		return appendEntriesFile(e.entriesPath, rd.Entries)
+	default:
+		return e.rewritePersistedEntries()
+	}
+}
+
+func snapshotRequiresMetadata(rd etcdraft.Ready) bool {
+	return !etcdraft.IsEmptySnap(rd.Snapshot) || !etcdraft.IsEmptyHardState(rd.HardState)
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
-	if len(snapshot.Data) > 0 {
-		return errors.New("snapshot restore is not implemented for the etcd prototype")
+	if len(snapshot.Data) == 0 {
+		return errors.WithStack(errSnapshotRequired)
 	}
-	if err := e.storage.ApplySnapshot(snapshot); err != nil {
+	if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
 		return errors.WithStack(err)
 	}
-	e.applied = snapshot.Metadata.Index
+	metaSnapshot := snapshot
+	metaSnapshot.Data = nil
+	if err := e.storage.ApplySnapshot(metaSnapshot); err != nil {
+		return errors.WithStack(err)
+	}
+	e.applied = metaSnapshot.Metadata.Index
 	return nil
 }
 
@@ -466,6 +541,65 @@ func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
 		return nil
 	}
 	return errors.WithStack(e.storage.SetHardState(hardState))
+}
+
+func (e *Engine) persistInstalledSnapshot(snapshot raftpb.Snapshot) error {
+	if len(snapshot.Data) == 0 {
+		return errors.WithStack(errSnapshotRequired)
+	}
+	if err := writeAndSyncFile(e.snapshotPath, snapshot.Data); err != nil {
+		return err
+	}
+	return e.rewritePersistedEntries()
+}
+
+func (e *Engine) maybePersistLocalSnapshot() error {
+	if e.applied == 0 {
+		return nil
+	}
+
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if e.applied <= current.Metadata.Index {
+		return nil
+	}
+
+	if err := writeStateMachineSnapshot(e.snapshotPath, e.fsm); err != nil {
+		return err
+	}
+
+	_, confState, err := e.storage.InitialState()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := e.storage.CreateSnapshot(e.applied, &confState, nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := e.storage.Compact(e.applied); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
+		return errors.WithStack(err)
+	}
+	if err := e.rewritePersistedEntries(); err != nil {
+		return err
+	}
+	return e.persistMetadata()
+}
+
+func (e *Engine) persistMetadata() error {
+	hardState, snapshot, err := storageMetadata(e.storage)
+	if err != nil {
+		return err
+	}
+	return saveMetadataFile(e.metaPath, hardState, snapshot)
+}
+
+func (e *Engine) rewritePersistedEntries() error {
+	entries, err := storageEntries(e.storage)
+	if err != nil {
+		return err
+	}
+	return rewriteEntriesFile(e.entriesPath, entries)
 }
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
@@ -728,6 +862,33 @@ func contextErr(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func restorePersistedSnapshot(fsm StateMachine, path string, snapshot raftpb.Snapshot) error {
+	if fsm == nil || snapshot.Metadata.Index <= 1 {
+		return nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(errors.UnwrapAll(err)) {
+			return errors.WithStack(errors.New("persisted snapshot metadata is present without snapshot payload"))
+		}
+		return errors.WithStack(err)
+	}
+	defer file.Close()
+	return errors.WithStack(fsm.Restore(file))
+}
+
+func writeStateMachineSnapshot(path string, fsm StateMachine) (err error) {
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() {
+		err = errors.CombineErrors(err, errors.WithStack(snapshot.Close()))
+	}()
+	return writeSnapshotStreamFile(path, snapshot.WriteTo)
 }
 
 func encodeProposalEnvelope(id uint64, payload []byte) []byte {
