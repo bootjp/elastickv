@@ -15,6 +15,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/server/v3/mock/mockstorage"
 	"go.etcd.io/etcd/server/v3/storage/wal"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
@@ -289,6 +290,71 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	fsm, ok := engine.fsm.(*testStateMachine)
 	require.True(t, ok)
 	require.Equal(t, [][]byte{[]byte("snap")}, fsm.Applied())
+}
+
+func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
+	engine := &Engine{
+		nodeID:     1,
+		transport:  &GRPCTransport{},
+		dispatchCh: make(chan raftpb.Message, 1),
+	}
+	engine.dispatchCh <- raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}
+
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, engine.sendMessages([]raftpb.Message{{
+			Type: raftpb.MsgHeartbeat,
+			To:   2,
+		}}))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sendMessages blocked on a full dispatch queue")
+	}
+}
+
+func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	persist := mockstorage.NewStorageRecorder("")
+	engine := &Engine{
+		storage: storage,
+		persist: persist,
+		fsm:     &testStateMachine{},
+		applied: 2,
+	}
+
+	require.NoError(t, engine.maybePersistLocalSnapshot())
+	require.Empty(t, persist.Action())
+}
+
+func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     5,
+			Term:      2,
+		},
+	}))
+	require.NoError(t, storage.SetHardState(raftpb.HardState{
+		Term:   2,
+		Commit: 9,
+	}))
+
+	require.Equal(t, uint64(5), maxAppliedIndex(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{Index: 5},
+	}))
 }
 
 func TestOpenRestoresLegacySnapshotState(t *testing.T) {

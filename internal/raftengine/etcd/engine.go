@@ -18,12 +18,14 @@ import (
 )
 
 const (
-	defaultTickInterval   = 10 * time.Millisecond
-	defaultHeartbeatTick  = 1
-	defaultElectionTick   = 10
-	defaultMaxInflightMsg = 256
-	defaultMaxSizePerMsg  = 1 << 20
-	unknownLastContact    = time.Duration(-1)
+	defaultTickInterval    = 10 * time.Millisecond
+	defaultHeartbeatTick   = 1
+	defaultElectionTick    = 10
+	defaultMaxInflightMsg  = 256
+	defaultMaxSizePerMsg   = 1 << 20
+	defaultDispatchWorkers = 4
+	defaultSnapshotEvery   = 10_000
+	unknownLastContact     = time.Duration(-1)
 
 	proposalEnvelopeVersion = byte(0x01)
 	readContextVersion      = byte(0x02)
@@ -86,17 +88,21 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh chan proposalRequest
-	readCh    chan readRequest
-	stepCh    chan raftpb.Message
-	closeCh   chan struct{}
-	doneCh    chan struct{}
-	startedCh chan struct{}
+	proposeCh      chan proposalRequest
+	readCh         chan readRequest
+	stepCh         chan raftpb.Message
+	dispatchCh     chan raftpb.Message
+	dispatchStopCh chan struct{}
+	closeCh        chan struct{}
+	doneCh         chan struct{}
+	startedCh      chan struct{}
 
-	leaderReady chan struct{}
-	leaderOnce  sync.Once
-	startOnce   sync.Once
-	closeOnce   sync.Once
+	leaderReady  chan struct{}
+	leaderOnce   sync.Once
+	startOnce    sync.Once
+	closeOnce    sync.Once
+	dispatchOnce sync.Once
+	dispatchWG   sync.WaitGroup
 
 	mu      sync.RWMutex
 	status  raftengine.Status
@@ -187,7 +193,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config: raftengine.Configuration{
 			Servers: configServersForPeers(peers),
 		},
-		applied:          maxAppliedIndex(disk.Storage, disk.LocalSnap),
+		applied:          maxAppliedIndex(disk.LocalSnap),
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 	}
@@ -195,7 +201,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		// Transport listeners may already be accepting RPCs when Open is called.
 		// Gate inbound delivery on startedCh so messages are not enqueued until the
 		// local run loop has completed startup.
+		engine.dispatchCh = make(chan raftpb.Message, dispatchQueueSize(cfg.MaxInflightMsg))
+		engine.dispatchStopCh = make(chan struct{})
 		engine.transport.SetHandler(engine.handleTransportMessage)
+		engine.startDispatchWorkers()
 	}
 	engine.refreshStatus()
 
@@ -508,11 +517,16 @@ func (e *Engine) sendMessages(messages []raftpb.Message) error {
 		if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
 			continue
 		}
-		if e.transport == nil {
+		if e.transport == nil || e.dispatchCh == nil {
 			continue
 		}
-		if err := e.transport.Dispatch(context.Background(), msg); err != nil {
-			continue
+		cloned, err := cloneDispatchMessage(msg)
+		if err != nil {
+			return err
+		}
+		select {
+		case e.dispatchCh <- cloned:
+		default:
 		}
 	}
 	return nil
@@ -560,7 +574,7 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if e.applied <= current.Metadata.Index {
+	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < defaultSnapshotEvery {
 		return nil
 	}
 	snapshot, err := persistLocalSnapshot(e.storage, e.persist, e.fsm, e.applied)
@@ -701,6 +715,7 @@ func (e *Engine) shutdown() {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	e.stopDispatchWorkers()
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(errors.WithStack(errClosed))
@@ -714,6 +729,7 @@ func (e *Engine) fail(err error) {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	e.stopDispatchWorkers()
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(e.currentErrorOrClosed())
@@ -839,14 +855,11 @@ func pendingEntries(commitIndex uint64, appliedIndex uint64) uint64 {
 }
 
 func numRemotePeers(peers map[uint64]Peer) uint64 {
-	var count uint64
-	for range peers {
-		count++
-	}
-	if count == 0 {
+	count, err := uint32Len(len(peers))
+	if err != nil || count == 0 {
 		return 0
 	}
-	return count - 1
+	return uint64(count - 1)
 }
 
 func lastContactFor(state raftengine.State) time.Duration {
@@ -870,15 +883,8 @@ func readyNeedsPersistence(rd etcdraft.Ready) bool {
 	return !etcdraft.IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 || !etcdraft.IsEmptyHardState(rd.HardState)
 }
 
-func maxAppliedIndex(storage *etcdraft.MemoryStorage, snapshot raftpb.Snapshot) uint64 {
-	if storage == nil {
-		return snapshot.Metadata.Index
-	}
-	lastApplied := snapshot.Metadata.Index
-	if hardState, _, err := storage.InitialState(); err == nil && hardState.Commit > lastApplied {
-		lastApplied = hardState.Commit
-	}
-	return lastApplied
+func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
+	return snapshot.Metadata.Index
 }
 
 func (e *Engine) refreshLocalSnapshot(snapshot raftpb.Snapshot) error {
@@ -910,6 +916,39 @@ func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message)
 	}
 }
 
+func (e *Engine) startDispatchWorkers() {
+	if e.dispatchCh == nil {
+		return
+	}
+	for range defaultDispatchWorkers {
+		e.dispatchWG.Add(1)
+		go e.runDispatchWorker()
+	}
+}
+
+func (e *Engine) runDispatchWorker() {
+	defer e.dispatchWG.Done()
+	for {
+		select {
+		case <-e.dispatchStopCh:
+			return
+		case msg := <-e.dispatchCh:
+			if err := e.transport.Dispatch(context.Background(), msg); err != nil {
+				continue
+			}
+		}
+	}
+}
+
+func (e *Engine) stopDispatchWorkers() {
+	e.dispatchOnce.Do(func() {
+		if e.dispatchStopCh != nil {
+			close(e.dispatchStopCh)
+		}
+		e.dispatchWG.Wait()
+	})
+}
+
 func (e *Engine) leaderInfo(leaderNodeID uint64) raftengine.LeaderInfo {
 	if leaderNodeID == 0 {
 		return raftengine.LeaderInfo{}
@@ -933,6 +972,26 @@ func decodeProposalEnvelope(data []byte) (uint64, []byte, bool) {
 		return 0, nil, false
 	}
 	return binary.BigEndian.Uint64(data[1:envelopeHeaderSize]), data[envelopeHeaderSize:], true
+}
+
+func dispatchQueueSize(maxInflight int) int {
+	size := maxInflight
+	if size <= 0 {
+		size = defaultMaxInflightMsg
+	}
+	return size * defaultDispatchWorkers
+}
+
+func cloneDispatchMessage(msg raftpb.Message) (raftpb.Message, error) {
+	raw, err := msg.Marshal()
+	if err != nil {
+		return raftpb.Message{}, errors.WithStack(err)
+	}
+	var cloned raftpb.Message
+	if err := cloned.Unmarshal(raw); err != nil {
+		return raftpb.Message{}, errors.WithStack(err)
+	}
+	return cloned, nil
 }
 
 func encodeReadContext(id uint64) []byte {

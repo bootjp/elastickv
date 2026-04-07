@@ -1,7 +1,6 @@
 package etcd
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -262,29 +261,35 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 
 func receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
 	var metadata raftpb.Message
-	var payload bytes.Buffer
 	seenMetadata := false
+	spool, err := newSnapshotSpool()
+	if err != nil {
+		return raftpb.Message{}, err
+	}
+	defer func() {
+		_ = spool.Close()
+	}()
 
 	for {
 		chunk, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return buildSnapshotMessage(metadata, payload.Bytes(), seenMetadata)
+				return buildSnapshotMessage(metadata, spool, seenMetadata)
 			}
 			return raftpb.Message{}, errors.WithStack(err)
 		}
-		seen, err := appendSnapshotChunk(&metadata, &payload, chunk, seenMetadata)
+		seen, err := appendSnapshotChunk(&metadata, spool, chunk, seenMetadata)
 		if err != nil {
 			return raftpb.Message{}, err
 		}
 		seenMetadata = seen
 		if chunk.Final {
-			return buildSnapshotMessage(metadata, payload.Bytes(), seenMetadata)
+			return buildSnapshotMessage(metadata, spool, seenMetadata)
 		}
 	}
 }
 
-func appendSnapshotChunk(metadata *raftpb.Message, payload *bytes.Buffer, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
+func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
 	if len(chunk.Metadata) > 0 {
 		if seenMetadata {
 			return false, errors.WithStack(errSnapshotMetadataNil)
@@ -302,9 +307,13 @@ func appendSnapshotChunk(metadata *raftpb.Message, payload *bytes.Buffer, chunk 
 	return seenMetadata, nil
 }
 
-func buildSnapshotMessage(metadata raftpb.Message, payload []byte, seenMetadata bool) (raftpb.Message, error) {
+func buildSnapshotMessage(metadata raftpb.Message, spool *snapshotSpool, seenMetadata bool) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
 		return raftpb.Message{}, errors.WithStack(errSnapshotMetadataNil)
+	}
+	payload, err := spool.Bytes()
+	if err != nil {
+		return raftpb.Message{}, err
 	}
 	metadata.Snapshot.Data = payload
 	return metadata, nil

@@ -216,16 +216,29 @@ func stateMachineSnapshotBytes(fsm StateMachine) (data []byte, err error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-
-	var buf bytes.Buffer
-	if _, err := snapshot.WriteTo(&buf); err != nil {
+	spool, err := newSnapshotSpool()
+	if err != nil {
 		closeErr := errors.WithStack(snapshot.Close())
+		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
+	}
+
+	if _, err := snapshot.WriteTo(spool); err != nil {
+		closeErr := errors.CombineErrors(errors.WithStack(snapshot.Close()), spool.Close())
 		return nil, errors.WithStack(errors.CombineErrors(errors.WithStack(err), closeErr))
 	}
 	if err := errors.WithStack(snapshot.Close()); err != nil {
+		_ = spool.Close()
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	data, err = spool.Bytes()
+	closeErr := spool.Close()
+	if err != nil {
+		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return data, nil
 }
 
 func bootstrapStateForPeers(peers []Peer, snapshotData []byte) persistedState {
