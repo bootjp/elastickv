@@ -428,10 +428,14 @@ func replaceFile(path string, write func(io.Writer) error) (err error) {
 	tmpPath := file.Name()
 	closed := false
 	defer func() {
-		var closeErr error
+defer func() {
 		if !closed {
-			closeErr = file.Close()
+			_ = file.Close()
 		}
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 		if err != nil {
 			_ = os.Remove(tmpPath)
 		}
