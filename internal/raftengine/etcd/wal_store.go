@@ -216,13 +216,14 @@ func stateMachineSnapshotBytes(fsm StateMachine) (data []byte, err error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	defer func() {
-		err = errors.CombineErrors(err, errors.WithStack(snapshot.Close()))
-	}()
 
 	var buf bytes.Buffer
 	if _, err := snapshot.WriteTo(&buf); err != nil {
-		return nil, errors.WithStack(err)
+		closeErr := errors.WithStack(snapshot.Close())
+		return nil, errors.WithStack(errors.CombineErrors(errors.WithStack(err), closeErr))
+	}
+	if err := errors.WithStack(snapshot.Close()); err != nil {
+		return nil, err
 	}
 	return buf.Bytes(), nil
 }

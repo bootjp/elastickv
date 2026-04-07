@@ -413,11 +413,19 @@ func minEntryCapacity(entryCount uint32) int {
 }
 
 func replaceFile(path string, write func(io.Writer) error) (err error) {
-	tmpPath := path + ".tmp"
-	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, defaultFilePerm)
+	dir := filepath.Dir(path)
+	// Create the replacement file in the destination directory so the final
+	// rename stays on the same filesystem and remains atomic.
+	file, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	if err := file.Chmod(defaultFilePerm); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return errors.WithStack(err)
+	}
+	tmpPath := file.Name()
 	closed := false
 	defer func() {
 		var closeErr error

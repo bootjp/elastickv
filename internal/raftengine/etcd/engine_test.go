@@ -240,6 +240,36 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	require.Equal(t, uint64(5), engine.Status().AppliedIndex)
 }
 
+func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
+	engine := &Engine{
+		startedCh: make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		stepCh:    make(chan raftpb.Message, 1),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: raftpb.MsgHeartbeat})
+	}()
+
+	select {
+	case <-engine.stepCh:
+		t.Fatal("transport message delivered before startup")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(engine.startedCh)
+
+	select {
+	case msg := <-engine.stepCh:
+		require.Equal(t, raftpb.MsgHeartbeat, msg.Type)
+	case <-time.After(time.Second):
+		t.Fatal("transport message was not delivered after startup")
+	}
+
+	require.NoError(t, <-errCh)
+}
+
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),

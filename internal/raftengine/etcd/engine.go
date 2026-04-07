@@ -42,6 +42,8 @@ var (
 )
 
 type Snapshot interface {
+	// Snapshot is an owned export handle from the state machine. Callers are
+	// responsible for closing it after WriteTo completes.
 	WriteTo(w io.Writer) (int64, error)
 	Close() error
 }
@@ -190,7 +192,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingReads:     map[uint64]readRequest{},
 	}
 	if engine.transport != nil {
-		engine.transport.SetHandler(engine.enqueueStep)
+		// Transport listeners may already be accepting RPCs when Open is called.
+		// Gate inbound delivery on startedCh so messages are not enqueued until the
+		// local run loop has completed startup.
+		engine.transport.SetHandler(engine.handleTransportMessage)
 	}
 	engine.refreshStatus()
 
@@ -891,6 +896,17 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 		return e.currentErrorOrClosed()
 	case e.stepCh <- msg:
 		return nil
+	}
+}
+
+func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message) error {
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return e.currentErrorOrClosed()
+	case <-e.startedCh:
+		return e.enqueueStep(ctx, msg)
 	}
 }
 
