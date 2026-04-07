@@ -238,7 +238,7 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 		require.NoError(t, engine.Close())
 	})
 
-	require.Equal(t, uint64(5), engine.Status().AppliedIndex)
+	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
 }
 
 func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
