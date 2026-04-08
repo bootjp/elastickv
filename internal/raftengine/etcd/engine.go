@@ -584,6 +584,9 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
+	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
+	// requires FSM payload bytes so it can restore local state before applying
+	// the metadata snapshot to MemoryStorage.
 	if len(snapshot.Data) == 0 {
 		return errors.WithStack(errSnapshotRequired)
 	}
