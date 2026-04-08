@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"sync"
@@ -118,6 +119,18 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 	return errors.WithStack(err)
 }
 
+func (t *GRPCTransport) DispatchSnapshotSpool(ctx context.Context, msg raftpb.Message, spool *snapshotSpool) error {
+	if t == nil {
+		return nil
+	}
+	if spool == nil {
+		return t.Dispatch(ctx, msg)
+	}
+	ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
+	defer cancel()
+	return t.sendSnapshotSpool(ctx, msg, spool)
+}
+
 func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) error {
 	msg, err := t.receiveSnapshotStream(stream)
 	if err != nil {
@@ -157,6 +170,31 @@ func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) er
 	}
 
 	if err := sendSnapshotChunks(stream, header, payload, t.chunkSize()); err != nil {
+		return err
+	}
+	_, err = stream.CloseAndRecv()
+	return errors.WithStack(err)
+}
+
+func (t *GRPCTransport) sendSnapshotSpool(ctx context.Context, msg raftpb.Message, spool *snapshotSpool) error {
+	client, err := t.clientFor(msg.To)
+	if err != nil {
+		return err
+	}
+	header, err := snapshotMessageHeader(msg)
+	if err != nil {
+		return err
+	}
+	reader, err := spool.Reader()
+	if err != nil {
+		return err
+	}
+
+	stream, err := client.SendSnapshot(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := sendSnapshotReaderChunks(stream, header, reader, t.chunkSize()); err != nil {
 		return err
 	}
 	_, err = stream.CloseAndRecv()
@@ -204,16 +242,26 @@ func splitSnapshotMessage(msg raftpb.Message) ([]byte, []byte, error) {
 	if msg.Snapshot == nil {
 		return nil, nil, errors.WithStack(errSnapshotMessageNil)
 	}
+	header, err := snapshotMessageHeader(msg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return header, msg.Snapshot.Data, nil
+}
+
+func snapshotMessageHeader(msg raftpb.Message) ([]byte, error) {
+	if msg.Snapshot == nil {
+		return nil, errors.WithStack(errSnapshotMessageNil)
+	}
 	metadata := msg
-	payload := metadata.Snapshot.Data
 	snapshotCopy := *msg.Snapshot
 	metadata.Snapshot = &snapshotCopy
 	metadata.Snapshot.Data = nil
 	header, err := metadata.Marshal()
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
-	return header, payload, nil
+	return header, nil
 }
 
 func sendSnapshotChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, payload []byte, chunkSize int) error {
@@ -244,6 +292,58 @@ func sendSnapshotChunk(stream pb.EtcdRaft_SendSnapshotClient, chunk *pb.EtcdRaft
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, reader io.Reader, chunkSize int) error {
+	if chunkSize <= 0 {
+		chunkSize = defaultSnapshotChunkSize
+	}
+	buffered := bufio.NewReaderSize(reader, chunkSize)
+	current, err := readSnapshotChunk(buffered, chunkSize)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header, Final: true})
+		}
+		return errors.WithStack(err)
+	}
+	first := true
+	for {
+		next, nextErr := readSnapshotChunk(buffered, chunkSize)
+		final := errors.Is(nextErr, io.EOF)
+		if nextErr != nil && !final {
+			return errors.WithStack(nextErr)
+		}
+		chunk := &pb.EtcdRaftSnapshotChunk{
+			Chunk: append([]byte(nil), current...),
+			Final: final,
+		}
+		if first {
+			chunk.Metadata = header
+			first = false
+		}
+		if err := sendSnapshotChunk(stream, chunk); err != nil {
+			return err
+		}
+		if final {
+			return nil
+		}
+		current = next
+	}
+}
+
+func readSnapshotChunk(reader *bufio.Reader, chunkSize int) ([]byte, error) {
+	chunk := make([]byte, chunkSize)
+	n, err := io.ReadFull(reader, chunk)
+	switch {
+	case err == nil:
+		return chunk[:n], nil
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return chunk[:n], io.EOF
+	case errors.Is(err, io.EOF):
+		return nil, io.EOF
+	default:
+		return nil, errors.WithStack(err)
+	}
 }
 
 func transportContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

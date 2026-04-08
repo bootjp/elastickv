@@ -57,6 +57,13 @@ func (s *snapshotSpool) Bytes() ([]byte, error) {
 	return data, nil
 }
 
+func (s *snapshotSpool) Reader() (io.Reader, error) {
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return s.file, nil
+}
+
 func (s *snapshotSpool) Close() error {
 	if s == nil {
 		return nil

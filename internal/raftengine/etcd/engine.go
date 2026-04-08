@@ -95,8 +95,10 @@ type Engine struct {
 	proposeCh      chan proposalRequest
 	readCh         chan readRequest
 	stepCh         chan raftpb.Message
-	dispatchCh     chan raftpb.Message
+	dispatchCh     chan dispatchRequest
 	dispatchStopCh chan struct{}
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
 	snapshotReqCh  chan snapshotRequest
 	snapshotResCh  chan snapshotResult
 	snapshotStopCh chan struct{}
@@ -114,11 +116,15 @@ type Engine struct {
 	snapshotWG   sync.WaitGroup
 
 	mu      sync.RWMutex
+	pending sync.Mutex
 	status  raftengine.Status
 	config  raftengine.Configuration
 	runErr  error
 	closed  bool
 	applied uint64
+
+	lastLeaderContactAt   time.Time
+	lastLeaderContactFrom uint64
 
 	// Restore swaps the underlying store state and must not race with the short
 	// critical section that publishes a newly persisted local snapshot.
@@ -130,9 +136,11 @@ type Engine struct {
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
 	snapshotInFlight bool
+	dispatchFn       func(context.Context, dispatchRequest) error
 }
 
 type proposalRequest struct {
+	ctx     context.Context
 	id      uint64
 	payload []byte
 	done    chan proposalResult
@@ -144,9 +152,11 @@ type proposalResult struct {
 }
 
 type readRequest struct {
-	id     uint64
-	done   chan readResult
-	target uint64
+	ctx         context.Context
+	id          uint64
+	done        chan readResult
+	target      uint64
+	waitApplied bool
 }
 
 type readResult struct {
@@ -162,6 +172,11 @@ type snapshotRequest struct {
 type snapshotResult struct {
 	index uint64
 	err   error
+}
+
+type dispatchRequest struct {
+	msg      raftpb.Message
+	snapshot *snapshotSpool
 }
 
 // Open starts the etcd/raft backend.
@@ -228,8 +243,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		// Transport listeners may already be accepting RPCs when Open is called.
 		// Gate inbound delivery on startedCh so messages are not enqueued until the
 		// local run loop has completed startup.
-		engine.dispatchCh = make(chan raftpb.Message, dispatchQueueSize(cfg.MaxInflightMsg))
+		engine.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
 		engine.dispatchStopCh = make(chan struct{})
+		engine.dispatchCtx, engine.dispatchCancel = context.WithCancel(context.Background())
 		engine.transport.SetSpoolDir(cfg.DataDir)
 		engine.transport.SetHandler(engine.handleTransportMessage)
 		engine.startDispatchWorkers()
@@ -308,6 +324,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	}
 
 	req := proposalRequest{
+		ctx:     ctx,
 		id:      e.nextID(),
 		payload: append([]byte(nil), data...),
 		done:    make(chan proposalResult, 1),
@@ -323,6 +340,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 
 	select {
 	case <-ctx.Done():
+		e.cancelPendingProposal(req.id)
 		return nil, errors.WithStack(ctx.Err())
 	case res := <-req.done:
 		if res.err != nil {
@@ -351,19 +369,15 @@ func (e *Engine) Leader() raftengine.LeaderInfo {
 }
 
 func (e *Engine) VerifyLeader(ctx context.Context) error {
-	if err := contextErr(ctx); err != nil {
-		return err
-	}
-	if e == nil {
-		return errors.WithStack(errNilEngine)
-	}
-	if e.State() != raftengine.StateLeader {
-		return errors.WithStack(errNotLeader)
-	}
-	return nil
+	_, err := e.submitRead(ctx, false)
+	return err
 }
 
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
+	return e.submitRead(ctx, true)
+}
+
+func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {
 	if err := contextErr(ctx); err != nil {
 		return 0, err
 	}
@@ -371,8 +385,10 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 		return 0, errors.WithStack(errNilEngine)
 	}
 	req := readRequest{
-		id:   e.nextID(),
-		done: make(chan readResult, 1),
+		ctx:         ctx,
+		id:          e.nextID(),
+		done:        make(chan readResult, 1),
+		waitApplied: waitApplied,
 	}
 
 	select {
@@ -385,6 +401,7 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 
 	select {
 	case <-ctx.Done():
+		e.cancelPendingRead(req.id)
 		return 0, errors.WithStack(ctx.Err())
 	case res := <-req.done:
 		if res.err != nil {
@@ -482,23 +499,31 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 }
 
 func (e *Engine) handleProposal(req proposalRequest) {
+	if err := contextErr(req.ctx); err != nil {
+		req.done <- proposalResult{err: err}
+		return
+	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
 		return
 	}
-	e.pendingProposals[req.id] = req
+	e.storePendingProposal(req)
 	if err := e.rawNode.Propose(encodeProposalEnvelope(req.id, req.payload)); err != nil {
-		delete(e.pendingProposals, req.id)
+		e.cancelPendingProposal(req.id)
 		req.done <- proposalResult{err: errors.WithStack(err)}
 	}
 }
 
 func (e *Engine) handleRead(req readRequest) {
+	if err := contextErr(req.ctx); err != nil {
+		req.done <- readResult{err: err}
+		return
+	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- readResult{err: errors.WithStack(errNotLeader)}
 		return
 	}
-	e.pendingReads[req.id] = req
+	e.storePendingRead(req)
 	e.rawNode.ReadIndex(encodeReadContext(req.id))
 }
 
@@ -553,6 +578,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	if e.rawNode == nil {
 		return
 	}
+	e.recordLeaderContact(msg)
 	if err := e.rawNode.Step(msg); err != nil {
 		e.fail(errors.WithStack(err))
 	}
@@ -560,24 +586,40 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 
 func (e *Engine) sendMessages(messages []raftpb.Message) error {
 	for _, msg := range messages {
-		if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
+		if e.skipDispatchMessage(msg) {
 			continue
 		}
-		if e.transport == nil || e.dispatchCh == nil {
-			continue
-		}
-		if len(e.dispatchCh) >= cap(e.dispatchCh) {
-			e.recordDroppedDispatch(msg)
-			continue
-		}
-		cloned := cloneDispatchMessage(msg)
-		select {
-		case e.dispatchCh <- cloned:
-		default:
-			e.recordDroppedDispatch(msg)
+		if err := e.enqueueDispatchMessage(msg); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
+	if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
+		return true
+	}
+	return e.transport == nil || e.dispatchCh == nil
+}
+
+func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
+	if len(e.dispatchCh) >= cap(e.dispatchCh) {
+		e.recordDroppedDispatch(msg)
+		return nil
+	}
+	dispatchReq, err := prepareDispatchRequest(msg, e.dataDir)
+	if err != nil {
+		return err
+	}
+	select {
+	case e.dispatchCh <- dispatchReq:
+		return nil
+	default:
+		_ = dispatchReq.Close()
+		e.recordDroppedDispatch(msg)
+		return nil
+	}
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -703,11 +745,10 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 	if !ok {
 		return
 	}
-	req, ok := e.pendingProposals[id]
+	req, ok := e.popPendingProposal(id)
 	if !ok {
 		return
 	}
-	delete(e.pendingProposals, id)
 	req.done <- proposalResult{
 		result: &raftengine.ProposalResult{
 			CommitIndex: commitIndex,
@@ -722,26 +763,28 @@ func (e *Engine) handleReadStates(states []etcdraft.ReadState) {
 		if !ok {
 			continue
 		}
-		req, ok := e.pendingReads[id]
+		req, ok := e.pendingRead(id)
 		if !ok {
 			continue
 		}
 		req.target = state.Index
-		e.pendingReads[id] = req
+		if !req.waitApplied {
+			e.popPendingRead(id)
+			req.done <- readResult{index: state.Index}
+			continue
+		}
+		e.storePendingRead(req)
 	}
 }
 
 func (e *Engine) resolveReadyReads() {
-	for id, req := range e.pendingReads {
-		if req.target == 0 || req.target > e.applied {
-			continue
-		}
-		delete(e.pendingReads, id)
+	for _, req := range e.readyReads(e.applied) {
 		req.done <- readResult{index: req.target}
 	}
 }
 
 func (e *Engine) refreshStatus() {
+	previous := e.Status().State
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
 	snapshot, _ := e.storage.Snapshot()
@@ -759,7 +802,7 @@ func (e *Engine) refreshStatus() {
 		LastSnapshotIndex: snapshot.Metadata.Index,
 		FSMPending:        pendingEntries(basic.Commit, e.applied),
 		NumPeers:          numRemotePeers(e.peers),
-		LastContact:       lastContactFor(state),
+		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
 	}
 
 	e.mu.Lock()
@@ -771,6 +814,9 @@ func (e *Engine) refreshStatus() {
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
+	}
+	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
+		e.failPending(errors.WithStack(errNotLeader))
 	}
 }
 
@@ -813,14 +859,102 @@ func (e *Engine) fail(err error) {
 }
 
 func (e *Engine) failPending(err error) {
-	for id, req := range e.pendingProposals {
-		delete(e.pendingProposals, id)
+	proposals, reads := e.drainPending()
+	for _, req := range proposals {
 		req.done <- proposalResult{err: err}
 	}
-	for id, req := range e.pendingReads {
-		delete(e.pendingReads, id)
+	for _, req := range reads {
 		req.done <- readResult{err: err}
 	}
+}
+
+func (e *Engine) storePendingProposal(req proposalRequest) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	e.pendingProposals[req.id] = req
+}
+
+func (e *Engine) popPendingProposal(id uint64) (proposalRequest, bool) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	req, ok := e.pendingProposals[id]
+	if ok {
+		delete(e.pendingProposals, id)
+	}
+	return req, ok
+}
+
+func (e *Engine) cancelPendingProposal(id uint64) {
+	if id == 0 {
+		return
+	}
+	e.pending.Lock()
+	delete(e.pendingProposals, id)
+	e.pending.Unlock()
+}
+
+func (e *Engine) storePendingRead(req readRequest) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	e.pendingReads[req.id] = req
+}
+
+func (e *Engine) pendingRead(id uint64) (readRequest, bool) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	req, ok := e.pendingReads[id]
+	return req, ok
+}
+
+func (e *Engine) popPendingRead(id uint64) (readRequest, bool) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	req, ok := e.pendingReads[id]
+	if ok {
+		delete(e.pendingReads, id)
+	}
+	return req, ok
+}
+
+func (e *Engine) cancelPendingRead(id uint64) {
+	if id == 0 {
+		return
+	}
+	e.pending.Lock()
+	delete(e.pendingReads, id)
+	e.pending.Unlock()
+}
+
+func (e *Engine) readyReads(applied uint64) []readRequest {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+
+	ready := make([]readRequest, 0)
+	for id, req := range e.pendingReads {
+		if req.target == 0 || req.target > applied {
+			continue
+		}
+		delete(e.pendingReads, id)
+		ready = append(ready, req)
+	}
+	return ready
+}
+
+func (e *Engine) drainPending() ([]proposalRequest, []readRequest) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+
+	proposals := make([]proposalRequest, 0, len(e.pendingProposals))
+	for id, req := range e.pendingProposals {
+		delete(e.pendingProposals, id)
+		proposals = append(proposals, req)
+	}
+	reads := make([]readRequest, 0, len(e.pendingReads))
+	for id, req := range e.pendingReads {
+		delete(e.pendingReads, id)
+		reads = append(reads, req)
+	}
+	return proposals, reads
 }
 
 func (e *Engine) currentError() error {
@@ -939,11 +1073,20 @@ func numRemotePeers(peers map[uint64]Peer) uint64 {
 	return uint64(count - 1)
 }
 
-func lastContactFor(state raftengine.State) time.Duration {
+func lastContactFor(state raftengine.State, leaderNodeID uint64, lastFrom uint64, lastAt time.Time) time.Duration {
 	if state == raftengine.StateLeader {
 		return 0
 	}
-	return unknownLastContact
+	if state != raftengine.StateFollower {
+		return unknownLastContact
+	}
+	if lastAt.IsZero() {
+		return unknownLastContact
+	}
+	if leaderNodeID != 0 && lastFrom != leaderNodeID {
+		return unknownLastContact
+	}
+	return time.Since(lastAt)
 }
 
 func contextErr(ctx context.Context) error {
@@ -986,6 +1129,21 @@ func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message)
 	}
 }
 
+func (e *Engine) recordLeaderContact(msg raftpb.Message) {
+	if !isLeaderContactMessage(msg.Type) || msg.From == 0 {
+		return
+	}
+	e.lastLeaderContactFrom = msg.From
+	e.lastLeaderContactAt = time.Now()
+}
+
+func isLeaderContactMessage(msgType raftpb.MessageType) bool {
+	return msgType == raftpb.MsgApp ||
+		msgType == raftpb.MsgHeartbeat ||
+		msgType == raftpb.MsgSnap ||
+		msgType == raftpb.MsgReadIndexResp
+}
+
 func (e *Engine) startDispatchWorkers() {
 	if e.dispatchCh == nil {
 		return
@@ -1002,26 +1160,31 @@ func (e *Engine) runDispatchWorker() {
 		select {
 		case <-e.dispatchStopCh:
 			return
-		case msg := <-e.dispatchCh:
-			if err := e.transport.Dispatch(context.Background(), msg); err != nil {
+		case req := <-e.dispatchCh:
+			if err := e.dispatchTransport(req); err != nil {
 				count := e.dispatchErrorCount.Add(1)
 				if shouldLogDispatchEvent(count) {
 					slog.Warn("etcd raft outbound dispatch failed",
 						"node_id", e.nodeID,
-						"to", msg.To,
-						"type", msg.Type.String(),
+						"to", req.msg.To,
+						"type", req.msg.Type.String(),
 						"dispatch_error_count", count,
 						"err", err,
 					)
 				}
+				_ = req.Close()
 				continue
 			}
+			_ = req.Close()
 		}
 	}
 }
 
 func (e *Engine) stopDispatchWorkers() {
 	e.dispatchOnce.Do(func() {
+		if e.dispatchCancel != nil {
+			e.dispatchCancel()
+		}
 		if e.dispatchStopCh != nil {
 			close(e.dispatchStopCh)
 		}
@@ -1113,6 +1276,52 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 			"drop_count", count,
 		)
 	}
+}
+
+func (e *Engine) dispatchTransport(req dispatchRequest) error {
+	ctx := e.dispatchCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e.dispatchFn != nil {
+		return e.dispatchFn(ctx, req)
+	}
+	if req.snapshot != nil {
+		return e.transport.DispatchSnapshotSpool(ctx, req.msg, req.snapshot)
+	}
+	return e.transport.Dispatch(ctx, req.msg)
+}
+
+func prepareDispatchRequest(msg raftpb.Message, spoolDir string) (dispatchRequest, error) {
+	if msg.Snapshot == nil || len(msg.Snapshot.Data) == 0 {
+		return dispatchRequest{msg: cloneDispatchMessage(msg)}, nil
+	}
+
+	spool, err := newSnapshotSpool(spoolDir)
+	if err != nil {
+		return dispatchRequest{}, err
+	}
+	if _, err := spool.Write(msg.Snapshot.Data); err != nil {
+		_ = spool.Close()
+		return dispatchRequest{}, err
+	}
+
+	cloned := msg
+	cloned.Entries = cloneDispatchEntries(msg.Entries)
+	cloned.Context = append([]byte(nil), msg.Context...)
+	cloned.Responses = cloneDispatchMessages(msg.Responses)
+	snapshotCopy := *msg.Snapshot
+	snapshotCopy.Data = nil
+	snapshotCopy.Metadata.ConfState = cloneDispatchConfState(msg.Snapshot.Metadata.ConfState)
+	cloned.Snapshot = &snapshotCopy
+	return dispatchRequest{msg: cloned, snapshot: spool}, nil
+}
+
+func (r dispatchRequest) Close() error {
+	if r.snapshot == nil {
+		return nil
+	}
+	return r.snapshot.Close()
 }
 
 func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {

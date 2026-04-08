@@ -282,6 +282,46 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
 }
 
+func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
+	engine := &Engine{
+		readCh: make(chan readRequest, 1),
+		doneCh: make(chan struct{}),
+		status: raftengine.Status{State: raftengine.StateLeader},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.VerifyLeader(context.Background())
+	}()
+
+	select {
+	case req := <-engine.readCh:
+		require.False(t, req.waitApplied)
+		req.done <- readResult{index: 9}
+	case <-time.After(time.Second):
+		t.Fatal("verify leader did not issue read-index request")
+	}
+
+	require.NoError(t, <-errCh)
+}
+
+func TestCancelPendingRequestsRemoveEntries(t *testing.T) {
+	engine := &Engine{
+		pendingProposals: map[uint64]proposalRequest{
+			1: {id: 1, done: make(chan proposalResult, 1)},
+		},
+		pendingReads: map[uint64]readRequest{
+			2: {id: 2, done: make(chan readResult, 1)},
+		},
+	}
+
+	engine.cancelPendingProposal(1)
+	engine.cancelPendingRead(2)
+
+	require.Empty(t, engine.pendingProposals)
+	require.Empty(t, engine.pendingReads)
+}
+
 func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 	engine := &Engine{
 		startedCh: make(chan struct{}),
@@ -341,9 +381,9 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	engine := &Engine{
 		nodeID:     1,
 		transport:  &GRPCTransport{},
-		dispatchCh: make(chan raftpb.Message, 1),
+		dispatchCh: make(chan dispatchRequest, 1),
 	}
-	engine.dispatchCh <- raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}
+	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 
 	done := make(chan struct{})
 	go func() {
@@ -358,6 +398,42 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("sendMessages blocked on a full dispatch queue")
+	}
+}
+
+func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	engine := &Engine{
+		dispatchCh:     make(chan dispatchRequest, 1),
+		dispatchStopCh: make(chan struct{}),
+		dispatchCtx:    ctx,
+		dispatchCancel: cancel,
+	}
+	started := make(chan struct{})
+	engine.dispatchFn = func(ctx context.Context, _ dispatchRequest) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	engine.startDispatchWorkers()
+	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch worker did not start")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		engine.stopDispatchWorkers()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch workers did not stop after cancellation")
 	}
 }
 
@@ -551,6 +627,33 @@ func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	require.Equal(t, []byte("resp"), cloned.Responses[0].Context)
 }
 
+func TestPrepareDispatchRequestSpoolsSnapshotPayload(t *testing.T) {
+	req, err := prepareDispatchRequest(raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Data: []byte("snapshot"),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+				Index:     7,
+				Term:      3,
+			},
+		},
+	}, t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, req.Close())
+	})
+
+	require.NotNil(t, req.snapshot)
+	require.NotNil(t, req.msg.Snapshot)
+	require.Empty(t, req.msg.Snapshot.Data)
+
+	payload, err := req.snapshot.Bytes()
+	require.NoError(t, err)
+	require.Equal(t, []byte("snapshot"), payload)
+}
+
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
@@ -646,6 +749,46 @@ func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
 			}
 		}
 		return true
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestFollowerStatusTracksLeaderContact(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 3)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node.engine != nil {
+				require.NoError(t, node.engine.Close())
+			}
+			if node.server != nil {
+				node.server.Stop()
+			}
+			if node.lis != nil {
+				_ = node.lis.Close()
+			}
+			if node.transport != nil {
+				require.NoError(t, node.transport.Close())
+			}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNodes(ctx, nodes, peers))
+	leader := waitForLeaderNode(t, nodes)
+
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			if node == leader {
+				continue
+			}
+			status := node.engine.Status()
+			if status.State == raftengine.StateFollower && status.LastContact >= 0 {
+				return true
+			}
+		}
+		return false
 	}, 5*time.Second, 20*time.Millisecond)
 }
 
