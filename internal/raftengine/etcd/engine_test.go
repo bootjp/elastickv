@@ -462,6 +462,53 @@ func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 	require.Equal(t, "Release", actions[1].Name)
 }
 
+func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = raftpb.Entry{
+			Type:  raftpb.EntryNormal,
+			Term:  1,
+			Index: uint64(index),
+		}
+	}
+	require.NoError(t, storage.Append(entries))
+
+	engine := &Engine{
+		storage:        storage,
+		persist:        mockstorage.NewStorageRecorder(""),
+		fsm:            &testStateMachine{},
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotStopCh: make(chan struct{}),
+		doneCh:         make(chan struct{}),
+	}
+	close(engine.snapshotStopCh)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.maybePersistLocalSnapshot()
+	}()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errClosed)
+		require.False(t, engine.snapshotInFlight)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("maybePersistLocalSnapshot blocked when snapshot worker was stopped")
+	}
+}
+
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
 		Type:    raftpb.MsgApp,

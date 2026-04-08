@@ -23,6 +23,7 @@ var (
 	errTransportHandlerNil  = errors.New("etcd raft transport handler is not configured")
 	errSnapshotMetadataNil  = errors.New("etcd raft snapshot metadata is required")
 	errSnapshotMessageNil   = errors.New("etcd raft snapshot message is required")
+	errSnapshotStreamShort  = errors.New("etcd raft snapshot stream closed before final chunk")
 )
 
 type MessageHandler func(context.Context, raftpb.Message) error
@@ -293,7 +294,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		chunk, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return buildSnapshotMessage(metadata, spool, seenMetadata)
+				return raftpb.Message{}, errors.WithStack(errSnapshotStreamShort)
 			}
 			return raftpb.Message{}, errors.WithStack(err)
 		}

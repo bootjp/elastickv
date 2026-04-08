@@ -626,12 +626,26 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	e.snapshotInFlight = true
-	e.snapshotReqCh <- snapshotRequest{
+
+	req := snapshotRequest{
 		index:    e.applied,
 		snapshot: snapshot,
 	}
-	return nil
+	return e.enqueueSnapshotRequest(req)
+}
+
+func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
+	select {
+	case <-e.doneCh:
+		_ = req.snapshot.Close()
+		return e.currentErrorOrClosed()
+	case <-e.snapshotStopCh:
+		_ = req.snapshot.Close()
+		return e.currentErrorOrClosed()
+	case e.snapshotReqCh <- req:
+		e.snapshotInFlight = true
+		return nil
+	}
 }
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {

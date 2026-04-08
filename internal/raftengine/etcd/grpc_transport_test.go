@@ -2,13 +2,17 @@ package etcd
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
@@ -66,4 +70,71 @@ func TestNewSnapshotSpoolUsesConfiguredDir(t *testing.T) {
 	require.Equal(t, dir, filepath.Dir(spool.path))
 	_, err = os.Stat(spool.path)
 	require.NoError(t, err)
+}
+
+func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{
+				Index: 7,
+				Term:  3,
+			},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	transport := NewGRPCTransport(nil)
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    []byte("partial"),
+		}},
+	}
+
+	_, err = transport.receiveSnapshotStream(stream)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errSnapshotStreamShort))
+}
+
+type testSendSnapshotServer struct {
+	chunks []*pb.EtcdRaftSnapshotChunk
+	index  int
+}
+
+func (s *testSendSnapshotServer) Recv() (*pb.EtcdRaftSnapshotChunk, error) {
+	if s.index >= len(s.chunks) {
+		return nil, io.EOF
+	}
+	chunk := s.chunks[s.index]
+	s.index++
+	return chunk, nil
+}
+
+func (*testSendSnapshotServer) SendAndClose(*pb.EtcdRaftAck) error {
+	return nil
+}
+
+func (*testSendSnapshotServer) SetHeader(metadata.MD) error {
+	return nil
+}
+
+func (*testSendSnapshotServer) SendHeader(metadata.MD) error {
+	return nil
+}
+
+func (*testSendSnapshotServer) SetTrailer(metadata.MD) {}
+
+func (*testSendSnapshotServer) Context() context.Context {
+	return context.Background()
+}
+
+func (*testSendSnapshotServer) SendMsg(any) error {
+	return nil
+}
+
+func (*testSendSnapshotServer) RecvMsg(any) error {
+	return nil
 }
