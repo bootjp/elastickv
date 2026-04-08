@@ -318,8 +318,9 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 		fsm:     &testStateMachine{},
 	}
 
+	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})
 	err := engine.applyReadySnapshot(raftpb.Snapshot{
-		Data: mustEncodeSnapshotData(t, [][]byte{[]byte("snap")}),
+		Data: payload,
 		Metadata: raftpb.SnapshotMetadata{
 			ConfState: raftpb.ConfState{Voters: []uint64{1}},
 			Index:     7,
@@ -331,6 +332,9 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	fsm, ok := engine.fsm.(*testStateMachine)
 	require.True(t, ok)
 	require.Equal(t, [][]byte{[]byte("snap")}, fsm.Applied())
+	snapshot, err := engine.storage.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, payload, snapshot.Data)
 }
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {

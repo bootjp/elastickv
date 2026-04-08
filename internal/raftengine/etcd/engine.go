@@ -53,6 +53,9 @@ type Snapshot interface {
 
 type StateMachine interface {
 	Apply(data []byte) any
+	// Snapshot should capture a stable export handle quickly. Expensive snapshot
+	// serialization belongs in Snapshot.WriteTo, which the engine can run off
+	// the main raft loop.
 	Snapshot() (Snapshot, error)
 	Restore(r io.Reader) error
 }
@@ -117,6 +120,8 @@ type Engine struct {
 	closed  bool
 	applied uint64
 
+	// Restore swaps the underlying store state and must not race with the short
+	// critical section that publishes a newly persisted local snapshot.
 	snapshotMu sync.Mutex
 
 	dispatchDropCount  atomic.Uint64
@@ -588,12 +593,10 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
 		return errors.WithStack(err)
 	}
-	metaSnapshot := snapshot
-	metaSnapshot.Data = nil
-	if err := e.storage.ApplySnapshot(metaSnapshot); err != nil {
+	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.WithStack(err)
 	}
-	e.applied = metaSnapshot.Metadata.Index
+	e.applied = snapshot.Metadata.Index
 	return nil
 }
 
