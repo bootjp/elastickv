@@ -100,7 +100,7 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 	if err != nil {
 		return err
 	}
-	_, err = client.Send(ctx, &pb.EtcdRaftMessage{Message: raw}, grpc.WaitForReady(true))
+	_, err = client.Send(ctx, &pb.EtcdRaftMessage{Message: raw})
 	return errors.WithStack(err)
 }
 
@@ -137,7 +137,7 @@ func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) er
 		return err
 	}
 
-	stream, err := client.SendSnapshot(ctx, grpc.WaitForReady(true))
+	stream, err := client.SendSnapshot(ctx)
 	if err != nil {
 		return errors.WithStack(err)
 	}

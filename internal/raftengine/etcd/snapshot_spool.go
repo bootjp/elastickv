@@ -46,6 +46,8 @@ func (s *snapshotSpool) Bytes() ([]byte, error) {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	// Read incrementally instead of sizing a buffer from s.size so malformed
+	// inputs stay bounded by maxSnapshotPayloadBytes and file-backed I/O.
 	data, err := io.ReadAll(s.file)
 	if err != nil {
 		return nil, errors.WithStack(err)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -93,6 +94,9 @@ type Engine struct {
 	stepCh         chan raftpb.Message
 	dispatchCh     chan raftpb.Message
 	dispatchStopCh chan struct{}
+	snapshotReqCh  chan snapshotRequest
+	snapshotResCh  chan snapshotResult
+	snapshotStopCh chan struct{}
 	closeCh        chan struct{}
 	doneCh         chan struct{}
 	startedCh      chan struct{}
@@ -102,7 +106,9 @@ type Engine struct {
 	startOnce    sync.Once
 	closeOnce    sync.Once
 	dispatchOnce sync.Once
+	snapshotOnce sync.Once
 	dispatchWG   sync.WaitGroup
+	snapshotWG   sync.WaitGroup
 
 	mu      sync.RWMutex
 	status  raftengine.Status
@@ -111,8 +117,14 @@ type Engine struct {
 	closed  bool
 	applied uint64
 
+	snapshotMu sync.Mutex
+
+	dispatchDropCount  atomic.Uint64
+	dispatchErrorCount atomic.Uint64
+
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
+	snapshotInFlight bool
 }
 
 type proposalRequest struct {
@@ -133,6 +145,16 @@ type readRequest struct {
 }
 
 type readResult struct {
+	index uint64
+	err   error
+}
+
+type snapshotRequest struct {
+	index    uint64
+	snapshot Snapshot
+}
+
+type snapshotResult struct {
 	index uint64
 	err   error
 }
@@ -205,6 +227,12 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		engine.dispatchStopCh = make(chan struct{})
 		engine.transport.SetHandler(engine.handleTransportMessage)
 		engine.startDispatchWorkers()
+	}
+	if engine.persist != nil {
+		engine.snapshotReqCh = make(chan snapshotRequest)
+		engine.snapshotResCh = make(chan snapshotResult, 1)
+		engine.snapshotStopCh = make(chan struct{})
+		engine.startSnapshotWorker()
 	}
 	engine.refreshStatus()
 
@@ -396,7 +424,12 @@ func (e *Engine) run() {
 			return
 		}
 
-		if !e.handleEvent(ticker.C) {
+		ok, err := e.handleEvent(ticker.C)
+		if err != nil {
+			e.fail(err)
+			return
+		}
+		if !ok {
 			e.shutdown()
 			return
 		}
@@ -419,10 +452,10 @@ func (e *Engine) startup() error {
 	return e.drainReady()
 }
 
-func (e *Engine) handleEvent(tick <-chan time.Time) bool {
+func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 	select {
 	case <-e.closeCh:
-		return false
+		return false, nil
 	case <-tick:
 		e.rawNode.Tick()
 	case req := <-e.proposeCh:
@@ -431,8 +464,12 @@ func (e *Engine) handleEvent(tick <-chan time.Time) bool {
 		e.handleRead(req)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
+	case result := <-e.snapshotResCh:
+		if err := e.handleSnapshotResult(result); err != nil {
+			return false, err
+		}
 	}
-	return true
+	return true, nil
 }
 
 func (e *Engine) handleProposal(req proposalRequest) {
@@ -520,13 +557,19 @@ func (e *Engine) sendMessages(messages []raftpb.Message) error {
 		if e.transport == nil || e.dispatchCh == nil {
 			continue
 		}
-		cloned, err := cloneDispatchMessage(msg)
-		if err != nil {
-			return err
-		}
+		cloned := cloneDispatchMessage(msg)
 		select {
 		case e.dispatchCh <- cloned:
 		default:
+			count := e.dispatchDropCount.Add(1)
+			if shouldLogDispatchEvent(count) {
+				slog.Warn("dropping etcd raft outbound message",
+					"node_id", e.nodeID,
+					"to", msg.To,
+					"type", msg.Type.String(),
+					"drop_count", count,
+				)
+			}
 		}
 	}
 	return nil
@@ -539,6 +582,8 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if len(snapshot.Data) == 0 {
 		return errors.WithStack(errSnapshotRequired)
 	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
 	if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
 		return errors.WithStack(err)
 	}
@@ -566,7 +611,7 @@ func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
 }
 
 func (e *Engine) maybePersistLocalSnapshot() error {
-	if e.applied == 0 || e.persist == nil {
+	if e.applied == 0 || e.persist == nil || e.snapshotReqCh == nil || e.snapshotInFlight {
 		return nil
 	}
 
@@ -577,11 +622,16 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < defaultSnapshotEvery {
 		return nil
 	}
-	snapshot, err := persistLocalSnapshot(e.storage, e.persist, e.fsm, e.applied)
+	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
-	return e.refreshLocalSnapshot(snapshot)
+	e.snapshotInFlight = true
+	e.snapshotReqCh <- snapshotRequest{
+		index:    e.applied,
+		snapshot: snapshot,
+	}
+	return nil
 }
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
@@ -716,6 +766,7 @@ func (e *Engine) shutdown() {
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
+	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(errors.WithStack(errClosed))
@@ -730,6 +781,7 @@ func (e *Engine) fail(err error) {
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
+	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(e.currentErrorOrClosed())
@@ -887,13 +939,6 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 	return snapshot.Metadata.Index
 }
 
-func (e *Engine) refreshLocalSnapshot(snapshot raftpb.Snapshot) error {
-	if etcdraft.IsEmptySnap(snapshot) {
-		return nil
-	}
-	return nil
-}
-
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 	select {
 	case <-ctx.Done():
@@ -934,6 +979,16 @@ func (e *Engine) runDispatchWorker() {
 			return
 		case msg := <-e.dispatchCh:
 			if err := e.transport.Dispatch(context.Background(), msg); err != nil {
+				count := e.dispatchErrorCount.Add(1)
+				if shouldLogDispatchEvent(count) {
+					slog.Warn("etcd raft outbound dispatch failed",
+						"node_id", e.nodeID,
+						"to", msg.To,
+						"type", msg.Type.String(),
+						"dispatch_error_count", count,
+						"err", err,
+					)
+				}
 				continue
 			}
 		}
@@ -946,6 +1001,43 @@ func (e *Engine) stopDispatchWorkers() {
 			close(e.dispatchStopCh)
 		}
 		e.dispatchWG.Wait()
+	})
+}
+
+func (e *Engine) startSnapshotWorker() {
+	if e.snapshotReqCh == nil {
+		return
+	}
+	e.snapshotWG.Add(1)
+	go e.runSnapshotWorker()
+}
+
+func (e *Engine) runSnapshotWorker() {
+	defer e.snapshotWG.Done()
+	for {
+		select {
+		case <-e.snapshotStopCh:
+			return
+		case req := <-e.snapshotReqCh:
+			result := snapshotResult{
+				index: req.index,
+				err:   e.persistSnapshot(req),
+			}
+			select {
+			case <-e.snapshotStopCh:
+				return
+			case e.snapshotResCh <- result:
+			}
+		}
+	}
+}
+
+func (e *Engine) stopSnapshotWorker() {
+	e.snapshotOnce.Do(func() {
+		if e.snapshotStopCh != nil {
+			close(e.snapshotStopCh)
+		}
+		e.snapshotWG.Wait()
 	})
 }
 
@@ -982,16 +1074,99 @@ func dispatchQueueSize(maxInflight int) int {
 	return size * defaultDispatchWorkers
 }
 
-func cloneDispatchMessage(msg raftpb.Message) (raftpb.Message, error) {
-	raw, err := msg.Marshal()
+func shouldLogDispatchEvent(count uint64) bool {
+	return count == 1 || count%128 == 0
+}
+
+func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {
+	cloned := msg
+	cloned.Entries = cloneDispatchEntries(msg.Entries)
+	cloned.Snapshot = cloneDispatchSnapshot(msg.Snapshot)
+	cloned.Context = append([]byte(nil), msg.Context...)
+	cloned.Responses = cloneDispatchMessages(msg.Responses)
+	return cloned
+}
+
+func cloneDispatchMessages(messages []raftpb.Message) []raftpb.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	cloned := make([]raftpb.Message, len(messages))
+	for i, msg := range messages {
+		cloned[i] = cloneDispatchMessage(msg)
+	}
+	return cloned
+}
+
+func cloneDispatchEntries(entries []raftpb.Entry) []raftpb.Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]raftpb.Entry, len(entries))
+	for i, entry := range entries {
+		cloned[i] = entry
+		cloned[i].Data = append([]byte(nil), entry.Data...)
+	}
+	return cloned
+}
+
+func cloneDispatchSnapshot(snapshot *raftpb.Snapshot) *raftpb.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := *snapshot
+	cloned.Data = append([]byte(nil), snapshot.Data...)
+	cloned.Metadata.ConfState = cloneDispatchConfState(snapshot.Metadata.ConfState)
+	return &cloned
+}
+
+func cloneDispatchConfState(conf raftpb.ConfState) raftpb.ConfState {
+	conf.Voters = append([]uint64(nil), conf.Voters...)
+	conf.Learners = append([]uint64(nil), conf.Learners...)
+	conf.VotersOutgoing = append([]uint64(nil), conf.VotersOutgoing...)
+	conf.LearnersNext = append([]uint64(nil), conf.LearnersNext...)
+	return conf
+}
+
+func (e *Engine) handleSnapshotResult(result snapshotResult) error {
+	e.snapshotInFlight = false
+	if result.err != nil {
+		return result.err
+	}
+	return e.maybePersistLocalSnapshot()
+}
+
+func (e *Engine) persistSnapshot(req snapshotRequest) error {
+	payload, err := snapshotBytes(req.snapshot)
 	if err != nil {
-		return raftpb.Message{}, errors.WithStack(err)
+		return err
 	}
-	var cloned raftpb.Message
-	if err := cloned.Unmarshal(raw); err != nil {
-		return raftpb.Message{}, errors.WithStack(err)
+
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return errors.WithStack(err)
 	}
-	return cloned, nil
+	if req.index <= current.Metadata.Index {
+		return nil
+	}
+
+	_, err = persistLocalSnapshotPayload(e.storage, e.persist, req.index, payload)
+	if err != nil {
+		switch {
+		case errors.Is(err, etcdraft.ErrCompacted):
+			return nil
+		case errors.Is(err, etcdraft.ErrUnavailable):
+			return nil
+		case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+			return nil
+		default:
+			return err
+		}
+	}
+	return nil
 }
 
 func encodeReadContext(id uint64) []byte {

@@ -216,6 +216,10 @@ func stateMachineSnapshotBytes(fsm StateMachine) (data []byte, err error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	return snapshotBytes(snapshot)
+}
+
+func snapshotBytes(snapshot Snapshot) (data []byte, err error) {
 	spool, err := newSnapshotSpool()
 	if err != nil {
 		closeErr := errors.WithStack(snapshot.Close())
@@ -227,8 +231,7 @@ func stateMachineSnapshotBytes(fsm StateMachine) (data []byte, err error) {
 		return nil, errors.WithStack(errors.CombineErrors(errors.WithStack(err), closeErr))
 	}
 	if err := errors.WithStack(snapshot.Close()); err != nil {
-		_ = spool.Close()
-		return nil, err
+		return nil, errors.WithStack(errors.CombineErrors(err, spool.Close()))
 	}
 	data, err = spool.Bytes()
 	closeErr := spool.Close()
@@ -309,21 +312,15 @@ func persistReadyToWAL(persist etcdstorage.Storage, rd etcdraft.Ready) error {
 	return nil
 }
 
-func persistLocalSnapshot(storage *etcdraft.MemoryStorage, persist etcdstorage.Storage, fsm StateMachine, applied uint64) (raftpb.Snapshot, error) {
-	payload, err := stateMachineSnapshotBytes(fsm)
+func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdstorage.Storage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
+	snapshot, err := buildLocalSnapshot(storage, applied, payload)
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
-
-	_, confState, err := storage.InitialState()
-	if err != nil {
-		return raftpb.Snapshot{}, errors.WithStack(err)
-	}
-	snapshot, err := storage.CreateSnapshot(applied, &confState, payload)
-	if err != nil {
-		return raftpb.Snapshot{}, errors.WithStack(err)
-	}
 	if err := persist.SaveSnap(snapshot); err != nil {
+		return raftpb.Snapshot{}, errors.WithStack(err)
+	}
+	if _, err := storage.CreateSnapshot(applied, &snapshot.Metadata.ConfState, payload); err != nil {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	if err := storage.Compact(applied); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
@@ -333,6 +330,25 @@ func persistLocalSnapshot(storage *etcdraft.MemoryStorage, persist etcdstorage.S
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	return snapshot, nil
+}
+
+func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
+	_, confState, err := storage.InitialState()
+	if err != nil {
+		return raftpb.Snapshot{}, errors.WithStack(err)
+	}
+	term, err := storage.Term(applied)
+	if err != nil {
+		return raftpb.Snapshot{}, errors.WithStack(err)
+	}
+	return raftpb.Snapshot{
+		Data: payload,
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: confState,
+			Index:     applied,
+			Term:      term,
+		},
+	}, nil
 }
 
 func closePersist(persist etcdstorage.Storage) error {

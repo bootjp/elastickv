@@ -101,6 +101,16 @@ type testSnapshot struct {
 	data []byte
 }
 
+type blockingSnapshotStateMachine struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type blockingSnapshot struct {
+	started chan struct{}
+	release chan struct{}
+}
+
 type transportTestNode struct {
 	peer      Peer
 	lis       net.Listener
@@ -117,6 +127,37 @@ func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (s *testSnapshot) Close() error {
+	return nil
+}
+
+func (s *blockingSnapshotStateMachine) Apply(data []byte) any {
+	return string(data)
+}
+
+func (s *blockingSnapshotStateMachine) Snapshot() (Snapshot, error) {
+	return &blockingSnapshot{
+		started: s.started,
+		release: s.release,
+	}, nil
+}
+
+func (s *blockingSnapshotStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
+
+func (s *blockingSnapshot) WriteTo(w io.Writer) (int64, error) {
+	select {
+	case <-s.started:
+	default:
+		close(s.started)
+	}
+	<-s.release
+	n, err := w.Write([]byte("snap"))
+	return int64(n), err
+}
+
+func (s *blockingSnapshot) Close() error {
 	return nil
 }
 
@@ -336,6 +377,127 @@ func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
 
 	require.NoError(t, engine.maybePersistLocalSnapshot())
 	require.Empty(t, persist.Action())
+}
+
+func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = raftpb.Entry{
+			Type:  raftpb.EntryNormal,
+			Term:  1,
+			Index: uint64(index),
+		}
+	}
+	require.NoError(t, storage.Append(entries))
+
+	persist := mockstorage.NewStorageRecorder("")
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage:        storage,
+		persist:        persist,
+		fsm:            fsm,
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotResCh:  make(chan snapshotResult, 1),
+		snapshotStopCh: make(chan struct{}),
+	}
+	engine.startSnapshotWorker()
+	t.Cleanup(func() {
+		release()
+		engine.stopSnapshotWorker()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, engine.maybePersistLocalSnapshot())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("maybePersistLocalSnapshot blocked on snapshot persistence")
+	}
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot worker did not start")
+	}
+
+	require.Empty(t, persist.Action())
+	release()
+
+	select {
+	case result := <-engine.snapshotResCh:
+		require.NoError(t, engine.handleSnapshotResult(result))
+	case <-time.After(time.Second):
+		t.Fatal("snapshot worker did not finish")
+	}
+
+	actions := persist.Action()
+	require.Len(t, actions, 2)
+	require.Equal(t, "SaveSnap", actions[0].Name)
+	require.Equal(t, "Release", actions[1].Name)
+}
+
+func TestCloneDispatchMessageDeepCopy(t *testing.T) {
+	original := raftpb.Message{
+		Type:    raftpb.MsgApp,
+		To:      2,
+		Context: []byte("ctx"),
+		Entries: []raftpb.Entry{{
+			Type:  raftpb.EntryNormal,
+			Term:  3,
+			Index: 4,
+			Data:  []byte("entry"),
+		}},
+		Snapshot: &raftpb.Snapshot{
+			Data: []byte("snapshot"),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{
+					Voters: []uint64{1, 2},
+				},
+				Index: 7,
+				Term:  3,
+			},
+		},
+		Responses: []raftpb.Message{{
+			Type:    raftpb.MsgHeartbeatResp,
+			Context: []byte("resp"),
+		}},
+	}
+
+	cloned := cloneDispatchMessage(original)
+
+	original.Context[0] = 'X'
+	original.Entries[0].Data[0] = 'X'
+	original.Snapshot.Data[0] = 'X'
+	original.Snapshot.Metadata.ConfState.Voters[0] = 99
+	original.Responses[0].Context[0] = 'X'
+
+	require.Equal(t, []byte("ctx"), cloned.Context)
+	require.Equal(t, []byte("entry"), cloned.Entries[0].Data)
+	require.Equal(t, []byte("snapshot"), cloned.Snapshot.Data)
+	require.Equal(t, []uint64{1, 2}, cloned.Snapshot.Metadata.ConfState.Voters)
+	require.Equal(t, []byte("resp"), cloned.Responses[0].Context)
 }
 
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
