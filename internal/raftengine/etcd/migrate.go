@@ -1,7 +1,6 @@
 package etcd
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 
@@ -80,14 +79,11 @@ func readStoreSnapshot(storePath string) ([]byte, int64, error) {
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}
-	defer snapshot.Close()
-
-	var buf bytes.Buffer
-	n, err := snapshot.WriteTo(&buf)
+	data, err := snapshotBytes(snapshot, storePath)
 	if err != nil {
-		return nil, 0, errors.WithStack(err)
+		return nil, 0, err
 	}
-	return buf.Bytes(), n, nil
+	return data, int64(len(data)), nil
 }
 
 func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {

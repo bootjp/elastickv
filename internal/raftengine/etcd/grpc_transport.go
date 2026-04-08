@@ -16,6 +16,7 @@ import (
 const defaultSnapshotChunkSize = 1 << 20
 
 const defaultDispatchTimeout = 5 * time.Second
+const defaultSnapshotDispatchTimeout = 30 * time.Minute
 
 var (
 	errTransportPeerUnknown = errors.New("etcd raft peer is not configured")
@@ -35,6 +36,7 @@ type GRPCTransport struct {
 	conns             map[string]*grpc.ClientConn
 	handler           MessageHandler
 	snapshotChunkSize int
+	spoolDir          string
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -66,6 +68,15 @@ func (t *GRPCTransport) SetHandler(handler MessageHandler) {
 	t.handler = handler
 }
 
+func (t *GRPCTransport) SetSpoolDir(dir string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.spoolDir = dir
+}
+
 func (t *GRPCTransport) Close() error {
 	if t == nil {
 		return nil
@@ -86,11 +97,13 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 	if t == nil {
 		return nil
 	}
-	ctx, cancel := transportContext(ctx)
-	defer cancel()
 	if msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0) {
+		ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
+		defer cancel()
 		return t.sendSnapshot(ctx, msg)
 	}
+	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
+	defer cancel()
 
 	raw, err := msg.Marshal()
 	if err != nil {
@@ -105,7 +118,7 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 }
 
 func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) error {
-	msg, err := receiveSnapshotStream(stream)
+	msg, err := t.receiveSnapshotStream(stream)
 	if err != nil {
 		return err
 	}
@@ -191,7 +204,7 @@ func splitSnapshotMessage(msg raftpb.Message) ([]byte, []byte, error) {
 		return nil, nil, errors.WithStack(errSnapshotMessageNil)
 	}
 	metadata := msg
-	payload := append([]byte(nil), metadata.Snapshot.Data...)
+	payload := metadata.Snapshot.Data
 	snapshotCopy := *msg.Snapshot
 	metadata.Snapshot = &snapshotCopy
 	metadata.Snapshot.Data = nil
@@ -232,11 +245,14 @@ func sendSnapshotChunk(stream pb.EtcdRaft_SendSnapshotClient, chunk *pb.EtcdRaft
 	return nil
 }
 
-func transportContext(ctx context.Context) (context.Context, context.CancelFunc) {
+func transportContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, defaultDispatchTimeout)
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (t *GRPCTransport) peerFor(nodeID uint64) (Peer, error) {
@@ -259,10 +275,10 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 	return errors.WithStack(handler(ctx, msg))
 }
 
-func receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
+func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
 	var metadata raftpb.Message
 	seenMetadata := false
-	spool, err := newSnapshotSpool()
+	spool, err := newSnapshotSpool(t.spoolDir)
 	if err != nil {
 		return raftpb.Message{}, err
 	}

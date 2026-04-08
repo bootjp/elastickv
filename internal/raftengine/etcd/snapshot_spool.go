@@ -16,14 +16,16 @@ var (
 	errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds limit")
 )
 
+const snapshotSpoolPattern = "elastickv-etcd-snapshot-*"
+
 type snapshotSpool struct {
 	file *os.File
 	path string
 	size int64
 }
 
-func newSnapshotSpool() (*snapshotSpool, error) {
-	file, err := os.CreateTemp("", "elastickv-etcd-snapshot-*")
+func newSnapshotSpool(dir string) (*snapshotSpool, error) {
+	file, err := os.CreateTemp(dir, snapshotSpoolPattern)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -64,7 +64,7 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 }
 
 func bootstrapWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
-	snapshotData, err := stateMachineSnapshotBytes(fsm)
+	snapshotData, err := stateMachineSnapshotBytes(fsm, snapDir)
 	if err != nil {
 		return nil, err
 	}
@@ -211,16 +211,16 @@ func saveBootstrapState(persist etcdstorage.Storage, state persistedState) error
 	return nil
 }
 
-func stateMachineSnapshotBytes(fsm StateMachine) (data []byte, err error) {
+func stateMachineSnapshotBytes(fsm StateMachine, spoolDir string) (data []byte, err error) {
 	snapshot, err := fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return snapshotBytes(snapshot)
+	return snapshotBytes(snapshot, spoolDir)
 }
 
-func snapshotBytes(snapshot Snapshot) (data []byte, err error) {
-	spool, err := newSnapshotSpool()
+func snapshotBytes(snapshot Snapshot, spoolDir string) (data []byte, err error) {
+	spool, err := newSnapshotSpool(spoolDir)
 	if err != nil {
 		closeErr := errors.WithStack(snapshot.Close())
 		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))

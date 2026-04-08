@@ -225,6 +225,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		// local run loop has completed startup.
 		engine.dispatchCh = make(chan raftpb.Message, dispatchQueueSize(cfg.MaxInflightMsg))
 		engine.dispatchStopCh = make(chan struct{})
+		engine.transport.SetSpoolDir(cfg.DataDir)
 		engine.transport.SetHandler(engine.handleTransportMessage)
 		engine.startDispatchWorkers()
 	}
@@ -1137,7 +1138,7 @@ func (e *Engine) handleSnapshotResult(result snapshotResult) error {
 }
 
 func (e *Engine) persistSnapshot(req snapshotRequest) error {
-	payload, err := snapshotBytes(req.snapshot)
+	payload, err := snapshotBytes(req.snapshot, e.dataDir)
 	if err != nil {
 		return err
 	}
