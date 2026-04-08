@@ -85,6 +85,9 @@ func loadOrCreateState(dataDir string, nodeID uint64) (persistedState, error) {
 	if err := os.MkdirAll(dataDir, defaultDirPerm); err != nil {
 		return persistedState{}, errors.WithStack(err)
 	}
+	if err := cleanupReplaceTempFiles(dataDir); err != nil {
+		return persistedState{}, err
+	}
 
 	state, err := loadStateFiles(dataDir)
 	if err == nil {
@@ -137,6 +140,25 @@ func saveSplitState(dataDir string, state persistedState) error {
 		return removeFileIfExists(snapshotDataFilePath(dataDir))
 	}
 	return writeAndSyncFile(snapshotDataFilePath(dataDir), state.Snapshot.Data)
+}
+
+func cleanupReplaceTempFiles(dataDir string) error {
+	var err error
+	for _, name := range [...]string{stateFileName, metadataFileName, entriesFileName, snapshotDataFileName} {
+		matches, globErr := filepath.Glob(filepath.Join(dataDir, name+".tmp-*"))
+		if globErr != nil {
+			err = errors.CombineErrors(err, errors.WithStack(globErr))
+			continue
+		}
+		for _, match := range matches {
+			removeErr := os.Remove(match)
+			if removeErr == nil || os.IsNotExist(removeErr) {
+				continue
+			}
+			err = errors.CombineErrors(err, errors.WithStack(removeErr))
+		}
+	}
+	return errors.WithStack(err)
 }
 
 func loadMetadataFile(path string) (persistedState, error) {

@@ -235,6 +235,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		engine.startDispatchWorkers()
 	}
 	if engine.persist != nil {
+		// Local snapshot persistence is only wired for disk-backed engines. When
+		// persist is nil the prototype intentionally leaves snapshot workers nil
+		// and maybePersistLocalSnapshot becomes a no-op.
 		engine.snapshotReqCh = make(chan snapshotRequest)
 		engine.snapshotResCh = make(chan snapshotResult, 1)
 		engine.snapshotStopCh = make(chan struct{})
@@ -611,7 +614,12 @@ func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
 }
 
 func (e *Engine) maybePersistLocalSnapshot() error {
-	if e.applied == 0 || e.persist == nil || e.snapshotReqCh == nil || e.snapshotInFlight {
+	if e.applied == 0 || e.snapshotInFlight {
+		return nil
+	}
+	if e.persist == nil || e.snapshotReqCh == nil {
+		// Snapshot persistence is optional in this prototype; engines without a
+		// disk-backed etcd storage simply skip local snapshot publication.
 		return nil
 	}
 

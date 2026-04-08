@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -137,4 +140,85 @@ func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
 	payload, err := os.ReadFile(snapshotDataFilePath(dir))
 	require.NoError(t, err)
 	require.Equal(t, legacy.Snapshot.Data, payload)
+}
+
+func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
+	dir := t.TempDir()
+	legacy := persistedState{
+		Snapshot: raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     1,
+				Term:      1,
+			},
+		},
+	}
+	require.NoError(t, saveStateFile(stateFilePath(dir), legacy))
+
+	stale := []string{
+		filepath.Join(dir, stateFileName+".tmp-stale"),
+		filepath.Join(dir, metadataFileName+".tmp-stale"),
+		filepath.Join(dir, entriesFileName+".tmp-stale"),
+		filepath.Join(dir, snapshotDataFileName+".tmp-stale"),
+	}
+	for _, path := range stale {
+		require.NoError(t, os.WriteFile(path, []byte("stale"), defaultFilePerm))
+	}
+
+	_, err := loadLegacyOrSplitState(dir)
+	require.NoError(t, err)
+	for _, path := range stale {
+		_, statErr := os.Stat(path)
+		require.True(t, os.IsNotExist(statErr), path)
+	}
+}
+
+func TestSnapshotBytesReturnsCloseError(t *testing.T) {
+	closeErr := errors.New("close failed")
+	snapshot := &errorSnapshot{
+		data:     []byte("snap"),
+		closeErr: closeErr,
+	}
+
+	_, err := snapshotBytes(snapshot, t.TempDir())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, closeErr))
+	require.Equal(t, 1, snapshot.closeCalls)
+}
+
+func TestSnapshotBytesClosesSnapshotWhenWriteFails(t *testing.T) {
+	writeErr := errors.New("write failed")
+	snapshot := &errorSnapshot{
+		data:     []byte("snap"),
+		writeErr: writeErr,
+		closeErr: errors.New("close failed"),
+	}
+
+	_, err := snapshotBytes(snapshot, t.TempDir())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, writeErr))
+	require.Equal(t, 1, snapshot.closeCalls)
+}
+
+type errorSnapshot struct {
+	data       []byte
+	writeErr   error
+	closeErr   error
+	closeCalls int
+}
+
+func (s *errorSnapshot) WriteTo(w io.Writer) (int64, error) {
+	written, err := w.Write(s.data)
+	if err != nil {
+		return int64(written), err
+	}
+	if s.writeErr != nil {
+		return int64(written), s.writeErr
+	}
+	return int64(written), nil
+}
+
+func (s *errorSnapshot) Close() error {
+	s.closeCalls++
+	return s.closeErr
 }

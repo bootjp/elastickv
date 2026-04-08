@@ -225,21 +225,27 @@ func snapshotBytes(snapshot Snapshot, spoolDir string) (data []byte, err error) 
 		closeErr := errors.WithStack(snapshot.Close())
 		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
 	}
+	snapshotClosed := false
+	closeSnapshot := func() error {
+		if snapshotClosed {
+			return nil
+		}
+		snapshotClosed = true
+		return errors.WithStack(snapshot.Close())
+	}
+	defer func() {
+		err = errors.CombineErrors(err, errors.CombineErrors(closeSnapshot(), spool.Close()))
+	}()
 
 	if _, err := snapshot.WriteTo(spool); err != nil {
-		closeErr := errors.CombineErrors(errors.WithStack(snapshot.Close()), spool.Close())
-		return nil, errors.WithStack(errors.CombineErrors(errors.WithStack(err), closeErr))
+		return nil, errors.WithStack(err)
 	}
-	if err := errors.WithStack(snapshot.Close()); err != nil {
-		return nil, errors.WithStack(errors.CombineErrors(err, spool.Close()))
+	if err := closeSnapshot(); err != nil {
+		return nil, err
 	}
 	data, err = spool.Bytes()
-	closeErr := spool.Close()
 	if err != nil {
-		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
-	}
-	if closeErr != nil {
-		return nil, closeErr
+		return nil, err
 	}
 	return data, nil
 }
@@ -282,6 +288,9 @@ func validateConfState(conf raftpb.ConfState, peers []Peer) error {
 }
 
 func loadLegacyOrSplitState(dataDir string) (persistedState, error) {
+	if err := cleanupReplaceTempFiles(dataDir); err != nil {
+		return persistedState{}, err
+	}
 	state, err := loadStateFiles(dataDir)
 	if err == nil {
 		payload, readErr := os.ReadFile(snapshotDataFilePath(dataDir))
