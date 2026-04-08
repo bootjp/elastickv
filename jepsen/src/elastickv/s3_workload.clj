@@ -6,7 +6,6 @@
    linearizable history of writes."
   (:gen-class)
   (:require [clojure.string :as str]
-            [clojure.tools.logging :refer [warn]]
             [clj-http.client :as http]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
@@ -29,6 +28,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private bucket-name "jepsen-test")
+(def ^:private default-s3-port 9000)
 
 ;; ---------------------------------------------------------------------------
 ;; S3 HTTP helpers
@@ -82,28 +82,6 @@
       (throw (ex-info (str "S3 GET error: HTTP " (:status resp))
                       {:status (:status resp) :body (:body resp)})))))
 
-(defn- s3-delete!
-  "DELETE an object. Returns nil."
-  [base-url k]
-  (http/delete (object-url base-url k)
-               {:throw-exceptions false
-                :conn-timeout     5000
-                :socket-timeout   10000})
-  nil)
-
-(defn- s3-list
-  "List object keys in the test bucket. Returns a set of key strings."
-  [base-url]
-  (let [resp (http/get (str base-url "/" bucket-name "?list-type=2&max-keys=1000")
-                       {:throw-exceptions false
-                        :as               :string
-                        :conn-timeout     5000
-                        :socket-timeout   10000})]
-    (when (= 200 (:status resp))
-      (->> (re-seq #"<Key>([^<]+)</Key>" (:body resp))
-           (map second)
-           set))))
-
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
@@ -111,7 +89,7 @@
 (defrecord S3Client [node->port url]
   client/Client
   (open! [this test node]
-    (let [port (get node->port node 9000)
+    (let [port (get node->port node default-s3-port)
           host (or (:s3-host test) (name node))]
       (assoc this :url (s3-base-url host port))))
 
@@ -170,7 +148,7 @@
         max-writes      (or (:max-writes-per-key opts) 100)
         threads-per-key (or (:threads-per-key opts) 2)
         client          (->S3Client (or (:node->port opts)
-                                        (zipmap default-nodes (repeat 9000)))
+                                        (zipmap default-nodes (repeat default-s3-port)))
                                     nil)]
     {:client    client
      :generator (independent/concurrent-generator
@@ -178,7 +156,7 @@
                   (range key-count)
                   (fn [_k]
                     (->> (gen/mix [(map (fn [v] {:f :write :value v}) (range))
-                                  (repeat {:f :read})])
+                                  (gen/repeat {:f :read})])
                          (gen/limit max-writes))))
      :checker   (independent/checker
                   (checker/compose
@@ -193,7 +171,7 @@
   ([] (elastickv-s3-test {}))
   ([opts]
    (let [nodes      (or (:nodes opts) default-nodes)
-         s3-ports   (or (:s3-ports opts) (repeat (count nodes) (or (:s3-port opts) 9000)))
+         s3-ports   (or (:s3-ports opts) (repeat (count nodes) (or (:s3-port opts) default-s3-port)))
          node->port (or (:node->port opts) (cli/ports->node-map s3-ports nodes))
          local?     (:local opts)
          db         (if local?
@@ -252,7 +230,7 @@
                      (remove str/blank?)
                      (mapv #(Integer/parseInt %))))]
    [nil "--s3-port PORT" "S3 port (applied to all nodes)."
-    :default 9000
+    :default default-s3-port
     :parse-fn #(Integer/parseInt %)]
    [nil "--redis-port PORT" "Redis port."
     :default 6379
