@@ -1174,7 +1174,7 @@ func (e *Engine) handleSnapshotResult(result snapshotResult) error {
 }
 
 func (e *Engine) persistSnapshot(req snapshotRequest) error {
-	payload, err := snapshotBytes(req.snapshot, e.dataDir)
+	payload, err := snapshotBytesAndClose(req.snapshot, e.dataDir)
 	if err != nil {
 		return err
 	}

@@ -216,32 +216,27 @@ func stateMachineSnapshotBytes(fsm StateMachine, spoolDir string) (data []byte, 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	return snapshotBytesAndClose(snapshot, spoolDir)
+}
+
+func snapshotBytesAndClose(snapshot Snapshot, spoolDir string) (data []byte, err error) {
+	defer func() {
+		err = errors.CombineErrors(err, errors.WithStack(snapshot.Close()))
+	}()
 	return snapshotBytes(snapshot, spoolDir)
 }
 
 func snapshotBytes(snapshot Snapshot, spoolDir string) (data []byte, err error) {
 	spool, err := newSnapshotSpool(spoolDir)
 	if err != nil {
-		closeErr := errors.WithStack(snapshot.Close())
-		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
-	}
-	snapshotClosed := false
-	closeSnapshot := func() error {
-		if snapshotClosed {
-			return nil
-		}
-		snapshotClosed = true
-		return errors.WithStack(snapshot.Close())
+		return nil, err
 	}
 	defer func() {
-		err = errors.CombineErrors(err, errors.CombineErrors(closeSnapshot(), spool.Close()))
+		err = errors.CombineErrors(err, spool.Close())
 	}()
 
 	if _, err := snapshot.WriteTo(spool); err != nil {
 		return nil, errors.WithStack(err)
-	}
-	if err := closeSnapshot(); err != nil {
-		return nil, err
 	}
 	data, err = spool.Bytes()
 	if err != nil {

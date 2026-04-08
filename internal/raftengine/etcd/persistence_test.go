@@ -173,20 +173,20 @@ func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
 	}
 }
 
-func TestSnapshotBytesReturnsCloseError(t *testing.T) {
+func TestSnapshotBytesAndCloseReturnsCloseError(t *testing.T) {
 	closeErr := errors.New("close failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
 		closeErr: closeErr,
 	}
 
-	_, err := snapshotBytes(snapshot, t.TempDir())
+	_, err := snapshotBytesAndClose(snapshot, t.TempDir())
 	require.Error(t, err)
 	require.True(t, errors.Is(err, closeErr))
 	require.Equal(t, 1, snapshot.closeCalls)
 }
 
-func TestSnapshotBytesClosesSnapshotWhenWriteFails(t *testing.T) {
+func TestSnapshotBytesAndCloseClosesSnapshotWhenWriteFails(t *testing.T) {
 	writeErr := errors.New("write failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
@@ -194,10 +194,19 @@ func TestSnapshotBytesClosesSnapshotWhenWriteFails(t *testing.T) {
 		closeErr: errors.New("close failed"),
 	}
 
-	_, err := snapshotBytes(snapshot, t.TempDir())
+	_, err := snapshotBytesAndClose(snapshot, t.TempDir())
 	require.Error(t, err)
 	require.True(t, errors.Is(err, writeErr))
 	require.Equal(t, 1, snapshot.closeCalls)
+}
+
+func TestSnapshotBytesDoesNotCloseSnapshot(t *testing.T) {
+	snapshot := &errorSnapshot{data: []byte("snap")}
+
+	data, err := snapshotBytes(snapshot, t.TempDir())
+	require.NoError(t, err)
+	require.Equal(t, []byte("snap"), data)
+	require.Zero(t, snapshot.closeCalls)
 }
 
 type errorSnapshot struct {

@@ -79,7 +79,7 @@ func readStoreSnapshot(storePath string) ([]byte, int64, error) {
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}
-	data, err := snapshotBytes(snapshot, storePath)
+	data, err := snapshotBytesAndClose(snapshot, storePath)
 	if err != nil {
 		return nil, 0, err
 	}
