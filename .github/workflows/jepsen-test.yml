@@ -71,7 +71,7 @@ jobs:
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         run: |
-          ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 5 --concurrency 5 --s3-ports 63901,63902,63903 --host 127.0.0.1
+          ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
       - name: Stop demo cluster
         run: |
           if [ -f /tmp/elastickv-demo.pid ]; then

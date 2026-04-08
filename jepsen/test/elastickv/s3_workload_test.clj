@@ -10,12 +10,16 @@
     (is (= "elastickv-s3-register" (:name test-map)))
     (is (= ["n1" "n2" "n3" "n4" "n5"] (:nodes test-map)))))
 
+(deftest default-concurrency-is-10
+  (let [test-map (workload/elastickv-s3-test {})]
+    (is (= 10 (:concurrency test-map)))))
+
 (deftest custom-options-override-defaults
   (let [test-map (workload/elastickv-s3-test
                    {:time-limit  60
-                    :concurrency 10
+                    :concurrency 20
                     :s3-port     9999})]
-    (is (= 10 (:concurrency test-map)))))
+    (is (= 20 (:concurrency test-map)))))
 
 (deftest host-override-uses-provided-host
   (let [test-map (workload/elastickv-s3-test

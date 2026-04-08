@@ -159,16 +159,22 @@
 (defn s3-register-workload
   "Builds a linearizable-register workload targeting the S3 endpoint.
    Each independent key is an S3 object; the checker verifies linearizability
-   of the write/read history per key."
+   of the write/read history per key.
+
+   threads-per-key controls how many concurrent threads hammer each key
+   simultaneously. The test-level :concurrency divided by threads-per-key
+   determines how many keys are active at once (e.g. concurrency=10,
+   threads-per-key=2 → 5 keys active, each with 2 concurrent threads)."
   [opts]
   (let [key-count       (or (:key-count opts) 10)
         max-writes      (or (:max-writes-per-key opts) 100)
+        threads-per-key (or (:threads-per-key opts) 2)
         client          (->S3Client (or (:node->port opts)
                                         (zipmap default-nodes (repeat 9000)))
                                     nil)]
     {:client    client
      :generator (independent/concurrent-generator
-                  (or (:concurrency opts) 5)
+                  threads-per-key
                   (range key-count)
                   (fn [_k]
                     (->> (gen/mix [(map (fn [v] {:f :write :value v}) (range))
@@ -227,7 +233,7 @@
                                 (:nemesis nemesis-p)
                                 nemesis/noop)
              :final-generator nil
-             :concurrency     (or (:concurrency opts) 5)
+             :concurrency     (or (:concurrency opts) 10)
              :generator       (->> (:generator workload)
                                    (gen/nemesis nemesis-gen)
                                    (gen/stagger (/ rate))
@@ -250,6 +256,9 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--redis-port PORT" "Redis port."
     :default 6379
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--threads-per-key N" "Concurrent threads per S3 object key."
+    :default 2
     :parse-fn #(Integer/parseInt %)]])
 
 (defn- prepare-s3-opts
@@ -261,10 +270,11 @@
                      (cli/ports->node-map s3-ports (:nodes options))
                      (zipmap (:nodes options) (repeat (:s3-port options))))]
     (assoc options
-      :s3-host    (:host options)
-      :node->port node->port
-      :s3-port    (:s3-port options)
-      :redis-port (:redis-port options))))
+      :s3-host         (:host options)
+      :node->port      node->port
+      :s3-port         (:s3-port options)
+      :redis-port      (:redis-port options)
+      :threads-per-key (:threads-per-key options))))
 
 (defn -main
   [& args]
