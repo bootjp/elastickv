@@ -69,6 +69,21 @@ jobs:
               --faults ${{ github.event.inputs['faults'] || github.event.inputs.faults }} \
               --concurrency 10"
 
+      - name: Run S3 Jepsen workload
+        working-directory: jepsen
+        env:
+          HOME: ${{ github.workspace }}/jepsen/tmp-home
+          LEIN_HOME: ${{ github.workspace }}/jepsen/.lein
+          LEIN_JVM_OPTS: -Duser.home=${{ github.workspace }}/jepsen/tmp-home
+        run: |
+          vagrant ssh ctrl -c "cd ~/elastickv/jepsen && \
+            lein run -m elastickv.s3-workload \
+              --nodes n1,n2,n3,n4,n5 \
+              --time-limit ${{ github.event.inputs['time-limit'] || github.event.inputs.time-limit }} \
+              --rate ${{ github.event.inputs['rate'] || github.event.inputs.rate }} \
+              --faults ${{ github.event.inputs['faults'] || github.event.inputs.faults }} \
+              --concurrency 10"
+
       - name: Collect Jepsen artifacts
         if: always()
         working-directory: jepsen
