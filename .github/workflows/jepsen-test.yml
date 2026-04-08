@@ -46,10 +46,11 @@ jobs:
           nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
 
-          echo "Waiting for redis (63791-63793) and dynamo (63801-63803) listeners..."
+          echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
           for i in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
-              && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803; then
+              && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
+              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
               echo "Cluster is up"
               exit 0
             fi
@@ -67,6 +68,10 @@ jobs:
         working-directory: jepsen
         run: |
           ~/lein run -m elastickv.dynamodb-workload --local --time-limit 5 --rate 5 --concurrency 5 --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+      - name: Run S3 Jepsen workload against elastickv
+        working-directory: jepsen
+        run: |
+          ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 5 --concurrency 5 --s3-ports 63901,63902,63903 --host 127.0.0.1
       - name: Stop demo cluster
         run: |
           if [ -f /tmp/elastickv-demo.pid ]; then
