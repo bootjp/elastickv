@@ -563,19 +563,15 @@ func (e *Engine) sendMessages(messages []raftpb.Message) error {
 		if e.transport == nil || e.dispatchCh == nil {
 			continue
 		}
+		if len(e.dispatchCh) >= cap(e.dispatchCh) {
+			e.recordDroppedDispatch(msg)
+			continue
+		}
 		cloned := cloneDispatchMessage(msg)
 		select {
 		case e.dispatchCh <- cloned:
 		default:
-			count := e.dispatchDropCount.Add(1)
-			if shouldLogDispatchEvent(count) {
-				slog.Warn("dropping etcd raft outbound message",
-					"node_id", e.nodeID,
-					"to", msg.To,
-					"type", msg.Type.String(),
-					"drop_count", count,
-				)
-			}
+			e.recordDroppedDispatch(msg)
 		}
 	}
 	return nil
@@ -1080,6 +1076,18 @@ func dispatchQueueSize(maxInflight int) int {
 
 func shouldLogDispatchEvent(count uint64) bool {
 	return count == 1 || count%128 == 0
+}
+
+func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
+	count := e.dispatchDropCount.Add(1)
+	if shouldLogDispatchEvent(count) {
+		slog.Warn("dropping etcd raft outbound message",
+			"node_id", e.nodeID,
+			"to", msg.To,
+			"type", msg.Type.String(),
+			"drop_count", count,
+		)
+	}
 }
 
 func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {

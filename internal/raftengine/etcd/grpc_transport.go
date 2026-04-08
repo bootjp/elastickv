@@ -278,7 +278,10 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
 	var metadata raftpb.Message
 	seenMetadata := false
-	spool, err := newSnapshotSpool(t.spoolDir)
+	t.mu.RLock()
+	spoolDir := t.spoolDir
+	t.mu.RUnlock()
+	spool, err := newSnapshotSpool(spoolDir)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
