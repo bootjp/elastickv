@@ -107,7 +107,9 @@
         :else (let [run! #(fail-on-invalid! (jepsen/run! (test-fn options)))]
                 (if (:local options)
                   (binding [control/*dummy* true] (run!))
-                  (run!)))))
+                  (run!))
+                (shutdown-agents)
+                (System/exit 0))))
     (catch Throwable t
       (warn t "Workload failed")
       (shutdown-agents)
