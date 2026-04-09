@@ -401,6 +401,19 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 	return err
 }
 
+func (e *Engine) CheckServing(ctx context.Context) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if e == nil {
+		return errors.WithStack(errNilEngine)
+	}
+	if e.State() != raftengine.StateLeader {
+		return errors.WithStack(errNotLeader)
+	}
+	return nil
+}
+
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return e.submitRead(ctx, true)
 }

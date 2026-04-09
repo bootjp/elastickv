@@ -12,11 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
-	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -405,8 +404,7 @@ func startRaftServers(
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 		pb.RegisterDistributionServer(gs, distServer)
 		rt.tm.Register(gs)
-		leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
-		raftadmin.Register(gs, rt.raft)
+		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)

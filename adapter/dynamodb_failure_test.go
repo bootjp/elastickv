@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbTypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -40,7 +40,7 @@ func TestDynamoDB_QueryAndScan_SurviveFollowerIsolationAndLeaderTransfer(t *test
 	adminConn, err := grpc.NewClient(nodes[0].grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = adminConn.Close() })
-	admin := raftadminpb.NewRaftAdminClient(adminConn)
+	admin := pb.NewRaftAdminClient(adminConn)
 
 	addVotersAndAwait(t, ctx, 2*time.Second, admin, nodes, []int{1, 2})
 	waitForConfigReplication(t, expectedVoterConfig(nodes), nodes, waitTimeout, waitInterval)
