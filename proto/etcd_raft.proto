@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+service EtcdRaft {
+  rpc Send(EtcdRaftMessage) returns (EtcdRaftAck) {}
+  rpc SendSnapshot(stream EtcdRaftSnapshotChunk) returns (EtcdRaftAck) {}
+}
+
+message EtcdRaftMessage {
+  bytes message = 1;
+}
+
+message EtcdRaftSnapshotChunk {
+  bytes metadata = 1;
+  bytes chunk = 2;
+  bool final = 3;
+}
+
+message EtcdRaftAck {}

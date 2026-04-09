@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +201,58 @@ type etcdFSMAdapter struct {
 
 func (a etcdFSMAdapter) Apply(data []byte) any {
 	return a.fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+}
+
+func (a etcdFSMAdapter) Snapshot() (etcdraftengine.Snapshot, error) {
+	snapshot, err := a.fsm.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return hashicorpSnapshotAdapter{snapshot: snapshot}, nil
+}
+
+func (a etcdFSMAdapter) Restore(r io.Reader) error {
+	return a.fsm.Restore(io.NopCloser(r))
+}
+
+type hashicorpSnapshotAdapter struct {
+	snapshot raft.FSMSnapshot
+}
+
+func (a hashicorpSnapshotAdapter) WriteTo(w io.Writer) (int64, error) {
+	sink := &snapshotSinkAdapter{writer: w}
+	if err := a.snapshot.Persist(sink); err != nil {
+		return sink.written, err
+	}
+	return sink.written, nil
+}
+
+func (a hashicorpSnapshotAdapter) Close() error {
+	a.snapshot.Release()
+	return nil
+}
+
+type snapshotSinkAdapter struct {
+	writer  io.Writer
+	written int64
+}
+
+func (s *snapshotSinkAdapter) ID() string {
+	return "etcd-fsm-adapter"
+}
+
+func (s *snapshotSinkAdapter) Cancel() error {
+	return nil
+}
+
+func (s *snapshotSinkAdapter) Close() error {
+	return nil
+}
+
+func (s *snapshotSinkAdapter) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	s.written += int64(n)
+	return n, err
 }
 
 func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {

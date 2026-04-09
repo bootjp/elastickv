@@ -18,6 +18,11 @@ import (
 const (
 	stateFileName          = "etcd-raft-state.bin"
 	stateFileVersion       = uint32(1)
+	metadataFileName       = "etcd-raft-meta.bin"
+	metadataFileVersion    = uint32(1)
+	entriesFileName        = "etcd-raft-entries.bin"
+	entriesFileVersion     = uint32(1)
+	snapshotDataFileName   = "etcd-fsm-snapshot.bin"
 	defaultDirPerm         = 0o755
 	defaultFilePerm        = 0o600
 	maxPersistedEntries    = uint32(1 << 20)
@@ -27,16 +32,28 @@ const (
 	// and command payload budget so persistence does not reject commands that the
 	// write path already accepted.
 	maxPersistedEntryMessage = uint32(internalutil.GRPCMaxMessageBytes) + persistedEntryHeadroom
-	maxPersistedSnapshot     = uint32(256 << 20)
-	maxPersistedHardState    = uint32(1 << 20)
+	maxPersistedSnapshotMeta = uint32(1 << 20)
+	// Legacy monolithic snapshots may include a full FSM export produced by the
+	// previous HashiCorp raft path, which allowed values up to 256 MiB.
+	maxPersistedLegacySnapshot = maxPersistedSnapshotMeta + uint32(256<<20)
+	maxPersistedHardState      = uint32(1 << 20)
 )
 
-var stateFileMagic = [4]byte{'E', 'K', 'V', 'R'}
+var (
+	stateFileMagic    = [4]byte{'E', 'K', 'V', 'R'}
+	metadataFileMagic = [4]byte{'E', 'K', 'V', 'M'}
+	entriesFileMagic  = [4]byte{'E', 'K', 'V', 'W'}
+)
 
 type persistedState struct {
 	HardState raftpb.HardState
 	Snapshot  raftpb.Snapshot
 	Entries   []raftpb.Entry
+}
+
+type fileFormat struct {
+	magic   [4]byte
+	version uint32
 }
 
 func bootstrapState(nodeID uint64) persistedState {
@@ -55,13 +72,27 @@ func stateFilePath(dataDir string) string {
 	return filepath.Join(dataDir, stateFileName)
 }
 
+func metadataFilePath(dataDir string) string {
+	return filepath.Join(dataDir, metadataFileName)
+}
+
+func entriesFilePath(dataDir string) string {
+	return filepath.Join(dataDir, entriesFileName)
+}
+
+func snapshotDataFilePath(dataDir string) string {
+	return filepath.Join(dataDir, snapshotDataFileName)
+}
+
 func loadOrCreateState(dataDir string, nodeID uint64) (persistedState, error) {
 	if err := os.MkdirAll(dataDir, defaultDirPerm); err != nil {
 		return persistedState{}, errors.WithStack(err)
 	}
+	if err := cleanupReplaceTempFiles(dataDir); err != nil {
+		return persistedState{}, err
+	}
 
-	path := stateFilePath(dataDir)
-	state, err := loadStateFile(path)
+	state, err := loadStateFiles(dataDir)
 	if err == nil {
 		return state, nil
 	}
@@ -69,11 +100,168 @@ func loadOrCreateState(dataDir string, nodeID uint64) (persistedState, error) {
 		return persistedState{}, err
 	}
 
+	legacyPath := stateFilePath(dataDir)
+	legacy, legacyErr := loadStateFile(legacyPath)
+	if legacyErr == nil {
+		if err := saveSplitState(dataDir, legacy); err != nil {
+			return persistedState{}, err
+		}
+		return loadStateFiles(dataDir)
+	}
+	if !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
+		return persistedState{}, legacyErr
+	}
+
 	state = bootstrapState(nodeID)
-	if err := saveStateFile(path, state); err != nil {
+	if err := saveMetadataFile(metadataFilePath(dataDir), state.HardState, state.Snapshot); err != nil {
 		return persistedState{}, err
 	}
 	return state, nil
+}
+
+func loadStateFiles(dataDir string) (persistedState, error) {
+	state, err := loadMetadataFile(metadataFilePath(dataDir))
+	if err != nil {
+		return persistedState{}, err
+	}
+	entries, err := loadEntriesFile(entriesFilePath(dataDir))
+	if err != nil && !os.IsNotExist(errors.UnwrapAll(err)) {
+		return persistedState{}, err
+	}
+	state.Entries = entries
+	return state, nil
+}
+
+func saveSplitState(dataDir string, state persistedState) error {
+	if err := saveMetadataFile(metadataFilePath(dataDir), state.HardState, state.Snapshot); err != nil {
+		return err
+	}
+	if err := rewriteEntriesFile(entriesFilePath(dataDir), state.Entries); err != nil {
+		return err
+	}
+	if len(state.Snapshot.Data) == 0 {
+		return removeFileIfExists(snapshotDataFilePath(dataDir))
+	}
+	return writeAndSyncFile(snapshotDataFilePath(dataDir), state.Snapshot.Data)
+}
+
+func cleanupReplaceTempFiles(dataDir string) error {
+	var err error
+	for _, name := range [...]string{stateFileName, metadataFileName, entriesFileName, snapshotDataFileName} {
+		matches, globErr := filepath.Glob(filepath.Join(dataDir, name+".tmp-*"))
+		if globErr != nil {
+			err = errors.CombineErrors(err, errors.WithStack(globErr))
+			continue
+		}
+		for _, match := range matches {
+			removeErr := os.Remove(match)
+			if removeErr == nil || os.IsNotExist(removeErr) {
+				continue
+			}
+			err = errors.CombineErrors(err, errors.WithStack(removeErr))
+		}
+	}
+	return errors.WithStack(err)
+}
+
+func loadMetadataFile(path string) (persistedState, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return persistedState{}, errors.WithStack(err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	if err := readVersionedHeader(reader, fileFormat{magic: metadataFileMagic, version: metadataFileVersion}, "etcd raft metadata"); err != nil {
+		return persistedState{}, err
+	}
+
+	var state persistedState
+	if err := readMessage(reader, &state.HardState, maxPersistedHardState, "hard state"); err != nil {
+		return persistedState{}, err
+	}
+	if err := readMessage(reader, &state.Snapshot, maxPersistedSnapshotMeta, "snapshot metadata"); err != nil {
+		return persistedState{}, err
+	}
+	state.Snapshot.Data = nil
+	return state, nil
+}
+
+func saveMetadataFile(path string, hardState raftpb.HardState, snapshot raftpb.Snapshot) error {
+	snapshot.Data = nil
+	return replaceFile(path, func(w io.Writer) error {
+		writer := bufio.NewWriter(w)
+		if err := writeVersionedHeader(writer, fileFormat{magic: metadataFileMagic, version: metadataFileVersion}); err != nil {
+			return err
+		}
+		if err := writeMessage(writer, hardState.Marshal); err != nil {
+			return err
+		}
+		if err := writeMessage(writer, snapshot.Marshal); err != nil {
+			return err
+		}
+		if err := writer.Flush(); err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	})
+}
+
+func loadEntriesFile(path string) ([]raftpb.Entry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	if err := readVersionedHeader(reader, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}, "etcd raft entries"); err != nil {
+		return nil, err
+	}
+
+	entries := make([]raftpb.Entry, 0)
+	for {
+		var entry raftpb.Entry
+		ok, err := readOptionalMessage(reader, &entry, maxPersistedEntryMessage, "entry")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return entries, nil
+		}
+		entries = append(entries, entry)
+		if len(entries) > int(maxPersistedEntries) {
+			return nil, errors.WithStack(errors.Newf("persisted entry count %d exceeds limit %d", len(entries), maxPersistedEntries))
+		}
+	}
+}
+
+func rewriteEntriesFile(path string, entries []raftpb.Entry) error {
+	return replaceFile(path, func(w io.Writer) error {
+		writer := bufio.NewWriter(w)
+		if err := writeVersionedHeader(writer, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}); err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := writeMessage(writer, entry.Marshal); err != nil {
+				return err
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	})
+}
+
+func removeFileIfExists(path string) error {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(errors.UnwrapAll(err)) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func loadStateFile(path string) (persistedState, error) {
@@ -84,7 +272,7 @@ func loadStateFile(path string) (persistedState, error) {
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
-	if err := readFileHeader(reader); err != nil {
+	if err := readVersionedHeader(reader, fileFormat{magic: stateFileMagic, version: stateFileVersion}, "etcd raft state"); err != nil {
 		return persistedState{}, err
 	}
 
@@ -92,7 +280,7 @@ func loadStateFile(path string) (persistedState, error) {
 	if err := readMessage(reader, &state.HardState, maxPersistedHardState, "hard state"); err != nil {
 		return persistedState{}, err
 	}
-	if err := readMessage(reader, &state.Snapshot, maxPersistedSnapshot, "snapshot"); err != nil {
+	if err := readMessage(reader, &state.Snapshot, maxPersistedLegacySnapshot, "snapshot"); err != nil {
 		return persistedState{}, err
 	}
 
@@ -120,29 +308,14 @@ func saveStateFile(path string, state persistedState) error {
 	if err != nil {
 		return err
 	}
-	// Phase 1 keeps persistence deliberately simple for bootstrap/replay. Phase 2
-	// is expected to replace this whole-state rewrite with incremental WAL-style
-	// storage before broadening the backend beyond the prototype scope.
-	tmpPath := path + ".tmp"
-	if err := writeAndSyncFile(tmpPath, encoded); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return errors.WithStack(err)
-	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	return nil
+	return writeAndSyncFile(path, encoded)
 }
 
 func encodeStateFile(state persistedState) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
 
-	if err := writeFileHeader(writer); err != nil {
+	if err := writeVersionedHeader(writer, fileFormat{magic: stateFileMagic, version: stateFileVersion}); err != nil {
 		return nil, err
 	}
 	if err := writeMessage(writer, state.HardState.Marshal); err != nil {
@@ -169,49 +342,12 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func persistedStateFromStorage(storage *etcdraft.MemoryStorage) (persistedState, error) {
-	if storage == nil {
-		return persistedState{}, errors.New("memory storage is not configured")
-	}
-
-	hardState, _, err := storage.InitialState()
-	if err != nil {
-		return persistedState{}, errors.WithStack(err)
-	}
-	snapshot, err := storage.Snapshot()
-	if err != nil {
-		return persistedState{}, errors.WithStack(err)
-	}
-
-	firstIndex, err := storage.FirstIndex()
-	if err != nil {
-		return persistedState{}, errors.WithStack(err)
-	}
-	lastIndex, err := storage.LastIndex()
-	if err != nil {
-		return persistedState{}, errors.WithStack(err)
-	}
-
-	var entries []raftpb.Entry
-	if lastIndex >= firstIndex {
-		entries, err = storage.Entries(firstIndex, lastIndex+1, ^uint64(0))
-		if err != nil {
-			return persistedState{}, errors.WithStack(err)
-		}
-		entries = append([]raftpb.Entry(nil), entries...)
-	}
-
-	return persistedState{
-		HardState: hardState,
-		Snapshot:  snapshot,
-		Entries:   entries,
-	}, nil
-}
-
 func newMemoryStorage(state persistedState) (*etcdraft.MemoryStorage, error) {
 	storage := etcdraft.NewMemoryStorage()
-	if !etcdraft.IsEmptySnap(state.Snapshot) {
-		if err := storage.ApplySnapshot(state.Snapshot); err != nil {
+	snapshot := state.Snapshot
+	snapshot.Data = nil
+	if !etcdraft.IsEmptySnap(snapshot) {
+		if err := storage.ApplySnapshot(snapshot); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
@@ -258,30 +394,30 @@ func writeMessage(w io.Writer, marshal func() ([]byte, error)) error {
 	return nil
 }
 
-func readFileHeader(r io.Reader) error {
-	var magic [4]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
+func readVersionedHeader(r io.Reader, format fileFormat, kind string) error {
+	var actual [4]byte
+	if _, err := io.ReadFull(r, actual[:]); err != nil {
 		return errors.WithStack(err)
 	}
-	if magic != stateFileMagic {
-		return errors.New("invalid etcd raft state magic")
+	if actual != format.magic {
+		return errors.WithStack(errors.Newf("invalid %s magic", kind))
 	}
 
-	version, err := readU32(r)
+	got, err := readU32(r)
 	if err != nil {
 		return err
 	}
-	if version != stateFileVersion {
-		return errors.WithStack(errors.Newf("unsupported etcd raft state version %d", version))
+	if got != format.version {
+		return errors.WithStack(errors.Newf("unsupported %s version %d", kind, got))
 	}
 	return nil
 }
 
-func writeFileHeader(w io.Writer) error {
-	if _, err := w.Write(stateFileMagic[:]); err != nil {
+func writeVersionedHeader(w io.Writer, format fileFormat) error {
+	if _, err := w.Write(format.magic[:]); err != nil {
 		return errors.WithStack(err)
 	}
-	return writeU32(w, stateFileVersion)
+	return writeU32(w, format.version)
 }
 
 func uint32Len(n int) (uint32, error) {
@@ -301,20 +437,59 @@ func minEntryCapacity(entryCount uint32) int {
 	return int(entryCount)
 }
 
-func writeAndSyncFile(path string, data []byte) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, defaultFilePerm)
+func replaceFile(path string, write func(io.Writer) error) (err error) {
+	dir := filepath.Dir(path)
+	// Create the replacement file in the destination directory so the final
+	// rename stays on the same filesystem and remains atomic.
+	file, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer file.Close()
-
-	if _, err := file.Write(data); err != nil {
+	if err := file.Chmod(defaultFilePerm); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
 		return errors.WithStack(err)
+	}
+	tmpPath := file.Name()
+	closed := false
+	renamed := false
+	closeFile := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return errors.WithStack(file.Close())
+	}
+	defer func() {
+		err = errors.CombineErrors(err, closeFile())
+		if err != nil && !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := write(file); err != nil {
+		return err
 	}
 	if err := file.Sync(); err != nil {
 		return errors.WithStack(err)
 	}
-	return nil
+	if err := closeFile(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return errors.WithStack(err)
+	}
+	renamed = true
+	return syncDir(dir)
+}
+
+func writeAndSyncFile(path string, data []byte) error {
+	return replaceFile(path, func(w io.Writer) error {
+		if _, err := w.Write(data); err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	})
 }
 
 func syncDir(path string) error {
@@ -331,22 +506,36 @@ type protoMessage interface {
 }
 
 func readMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) error {
-	size, err := readU32(r)
+	ok, err := readOptionalMessage(r, msg, maxSize, kind)
 	if err != nil {
 		return err
 	}
-	if size == 0 {
+	if !ok {
 		return nil
 	}
+	return nil
+}
+
+func readOptionalMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) (bool, error) {
+	size, err := readU32(r)
+	if err != nil {
+		if errors.Is(errors.UnwrapAll(err), io.EOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	if size == 0 {
+		return true, nil
+	}
 	if maxSize > 0 && size > maxSize {
-		return errors.WithStack(errors.Newf("persisted %s size %d exceeds limit %d", kind, size, maxSize))
+		return false, errors.WithStack(errors.Newf("persisted %s size %d exceeds limit %d", kind, size, maxSize))
 	}
 	raw := make([]byte, size)
 	if _, err := io.ReadFull(r, raw); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	if err := msg.Unmarshal(raw); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
-	return nil
+	return true, nil
 }

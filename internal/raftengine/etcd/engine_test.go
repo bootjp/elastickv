@@ -1,14 +1,27 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"io"
+	"net"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/server/v3/mock/mockstorage"
+	"go.etcd.io/etcd/server/v3/storage/wal"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 type testStateMachine struct {
@@ -31,6 +44,122 @@ func (s *testStateMachine) Applied() [][]byte {
 		out[i] = append([]byte(nil), item...)
 	}
 	return out
+}
+
+func (s *testStateMachine) Snapshot() (Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var buf bytes.Buffer
+	count, err := uint32Len(len(s.applied))
+	if err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.BigEndian, count); err != nil {
+		return nil, err
+	}
+	for _, item := range s.applied {
+		size, err := uint32Len(len(item))
+		if err != nil {
+			return nil, err
+		}
+		if err := binary.Write(&buf, binary.BigEndian, size); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(item); err != nil {
+			return nil, err
+		}
+	}
+	return &testSnapshot{data: buf.Bytes()}, nil
+}
+
+func (s *testStateMachine) Restore(r io.Reader) error {
+	var count uint32
+	if err := binary.Read(r, binary.BigEndian, &count); err != nil {
+		return err
+	}
+
+	applied := make([][]byte, 0, count)
+	for range count {
+		var length uint32
+		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+			return err
+		}
+		item := make([]byte, length)
+		if _, err := io.ReadFull(r, item); err != nil {
+			return err
+		}
+		applied = append(applied, item)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = applied
+	return nil
+}
+
+type testSnapshot struct {
+	data []byte
+}
+
+type blockingSnapshotStateMachine struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type blockingSnapshot struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type transportTestNode struct {
+	peer      Peer
+	lis       net.Listener
+	server    *grpc.Server
+	transport *GRPCTransport
+	fsm       *testStateMachine
+	engine    *Engine
+	dir       string
+}
+
+func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
+	n, err := w.Write(s.data)
+	return int64(n), err
+}
+
+func (s *testSnapshot) Close() error {
+	return nil
+}
+
+func (s *blockingSnapshotStateMachine) Apply(data []byte) any {
+	return string(data)
+}
+
+func (s *blockingSnapshotStateMachine) Snapshot() (Snapshot, error) {
+	return &blockingSnapshot{
+		started: s.started,
+		release: s.release,
+	}, nil
+}
+
+func (s *blockingSnapshotStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
+
+func (s *blockingSnapshot) WriteTo(w io.Writer) (int64, error) {
+	select {
+	case <-s.started:
+	default:
+		close(s.started)
+	}
+	<-s.release
+	n, err := w.Write([]byte("snap"))
+	return int64(n), err
+}
+
+func (s *blockingSnapshot) Close() error {
+	return nil
 }
 
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
@@ -136,7 +265,8 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 			},
 		},
 	}
-	require.NoError(t, saveStateFile(stateFilePath(dir), state))
+	require.NoError(t, saveMetadataFile(metadataFilePath(dir), state.HardState, state.Snapshot))
+	require.NoError(t, writeAndSyncFile(snapshotDataFilePath(dir), mustEncodeSnapshotData(t, nil)))
 
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
@@ -150,15 +280,100 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 		require.NoError(t, engine.Close())
 	})
 
-	require.Equal(t, uint64(5), engine.Status().AppliedIndex)
+	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
+}
+
+func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
+	engine := &Engine{
+		readCh: make(chan readRequest, 1),
+		doneCh: make(chan struct{}),
+		status: raftengine.Status{State: raftengine.StateLeader},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.VerifyLeader(context.Background())
+	}()
+
+	select {
+	case req := <-engine.readCh:
+		require.False(t, req.waitApplied)
+		req.done <- readResult{index: 9}
+	case <-time.After(time.Second):
+		t.Fatal("verify leader did not issue read-index request")
+	}
+
+	require.NoError(t, <-errCh)
+}
+
+func TestCancelPendingRequestsRemoveEntries(t *testing.T) {
+	engine := &Engine{
+		pendingProposals: map[uint64]proposalRequest{
+			1: {id: 1, done: make(chan proposalResult, 1)},
+		},
+		pendingReads: map[uint64]readRequest{
+			2: {id: 2, done: make(chan readResult, 1)},
+		},
+	}
+
+	engine.cancelPendingProposal(1)
+	engine.cancelPendingRead(2)
+
+	require.Empty(t, engine.pendingProposals)
+	require.Empty(t, engine.pendingReads)
+}
+
+func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
+	engine := &Engine{
+		startedCh: make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		stepCh:    make(chan raftpb.Message, 1),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: raftpb.MsgHeartbeat})
+	}()
+
+	select {
+	case <-engine.stepCh:
+		t.Fatal("transport message delivered before startup")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(engine.startedCh)
+
+	select {
+	case msg := <-engine.stepCh:
+		require.Equal(t, raftpb.MsgHeartbeat, msg.Type)
+	case <-time.After(time.Second):
+		t.Fatal("transport message was not delivered after startup")
+	}
+
+	require.NoError(t, <-errCh)
+}
+
+func TestEnqueueStepReturnsQueueFull(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: raftpb.MsgHeartbeat}
+
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errStepQueueFull))
 }
 
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),
+		fsm:     &testStateMachine{},
 	}
 
+	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})
 	err := engine.applyReadySnapshot(raftpb.Snapshot{
+		Data: payload,
 		Metadata: raftpb.SnapshotMetadata{
 			ConfState: raftpb.ConfState{Voters: []uint64{1}},
 			Index:     7,
@@ -167,4 +382,554 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, uint64(7), engine.applied)
+	fsm, ok := engine.fsm.(*testStateMachine)
+	require.True(t, ok)
+	require.Equal(t, [][]byte{[]byte("snap")}, fsm.Applied())
+	snapshot, err := engine.storage.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, payload, snapshot.Data)
+}
+
+func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
+	engine := &Engine{
+		nodeID:     1,
+		transport:  &GRPCTransport{},
+		dispatchCh: make(chan dispatchRequest, 1),
+	}
+	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, engine.sendMessages([]raftpb.Message{{
+			Type: raftpb.MsgHeartbeat,
+			To:   2,
+		}}))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sendMessages blocked on a full dispatch queue")
+	}
+}
+
+func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	engine := &Engine{
+		dispatchCh:     make(chan dispatchRequest, 1),
+		dispatchStopCh: make(chan struct{}),
+		dispatchCtx:    ctx,
+		dispatchCancel: cancel,
+	}
+	started := make(chan struct{})
+	engine.dispatchFn = func(ctx context.Context, _ dispatchRequest) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	engine.startDispatchWorkers()
+	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch worker did not start")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		engine.stopDispatchWorkers()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch workers did not stop after cancellation")
+	}
+}
+
+func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	persist := mockstorage.NewStorageRecorder("")
+	engine := &Engine{
+		storage: storage,
+		persist: persist,
+		fsm:     &testStateMachine{},
+		applied: 2,
+	}
+
+	require.NoError(t, engine.maybePersistLocalSnapshot())
+	require.Empty(t, persist.Action())
+}
+
+func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = raftpb.Entry{
+			Type:  raftpb.EntryNormal,
+			Term:  1,
+			Index: uint64(index),
+		}
+	}
+	require.NoError(t, storage.Append(entries))
+
+	persist := mockstorage.NewStorageRecorder("")
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage:        storage,
+		persist:        persist,
+		fsm:            fsm,
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotResCh:  make(chan snapshotResult, 1),
+		snapshotStopCh: make(chan struct{}),
+	}
+	engine.startSnapshotWorker()
+	t.Cleanup(func() {
+		release()
+		engine.stopSnapshotWorker()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, engine.maybePersistLocalSnapshot())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("maybePersistLocalSnapshot blocked on snapshot persistence")
+	}
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot worker did not start")
+	}
+
+	require.Empty(t, persist.Action())
+	release()
+
+	select {
+	case result := <-engine.snapshotResCh:
+		require.NoError(t, engine.handleSnapshotResult(result))
+	case <-time.After(time.Second):
+		t.Fatal("snapshot worker did not finish")
+	}
+
+	actions := persist.Action()
+	require.Len(t, actions, 2)
+	require.Equal(t, "SaveSnap", actions[0].Name)
+	require.Equal(t, "Release", actions[1].Name)
+}
+
+func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = raftpb.Entry{
+			Type:  raftpb.EntryNormal,
+			Term:  1,
+			Index: uint64(index),
+		}
+	}
+	require.NoError(t, storage.Append(entries))
+
+	engine := &Engine{
+		storage:        storage,
+		persist:        mockstorage.NewStorageRecorder(""),
+		fsm:            &testStateMachine{},
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotStopCh: make(chan struct{}),
+		doneCh:         make(chan struct{}),
+	}
+	close(engine.snapshotStopCh)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.maybePersistLocalSnapshot()
+	}()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errClosed)
+		require.False(t, engine.snapshotInFlight)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("maybePersistLocalSnapshot blocked when snapshot worker was stopped")
+	}
+}
+
+func TestCloneDispatchMessageDeepCopy(t *testing.T) {
+	original := raftpb.Message{
+		Type:    raftpb.MsgApp,
+		To:      2,
+		Context: []byte("ctx"),
+		Entries: []raftpb.Entry{{
+			Type:  raftpb.EntryNormal,
+			Term:  3,
+			Index: 4,
+			Data:  []byte("entry"),
+		}},
+		Snapshot: &raftpb.Snapshot{
+			Data: []byte("snapshot"),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{
+					Voters: []uint64{1, 2},
+				},
+				Index: 7,
+				Term:  3,
+			},
+		},
+		Responses: []raftpb.Message{{
+			Type:    raftpb.MsgHeartbeatResp,
+			Context: []byte("resp"),
+		}},
+	}
+
+	cloned := cloneDispatchMessage(original)
+
+	original.Context[0] = 'X'
+	original.Entries[0].Data[0] = 'X'
+	original.Snapshot.Data[0] = 'X'
+	original.Snapshot.Metadata.ConfState.Voters[0] = 99
+	original.Responses[0].Context[0] = 'X'
+
+	require.Equal(t, []byte("ctx"), cloned.Context)
+	require.Equal(t, []byte("entry"), cloned.Entries[0].Data)
+	require.Equal(t, []byte("snapshot"), cloned.Snapshot.Data)
+	require.Equal(t, []uint64{1, 2}, cloned.Snapshot.Metadata.ConfState.Voters)
+	require.Equal(t, []byte("resp"), cloned.Responses[0].Context)
+}
+
+func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Data: []byte("snapshot"),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+				Index:     7,
+				Term:      3,
+			},
+		},
+	}
+
+	req := prepareDispatchRequest(msg)
+	require.NoError(t, req.Close())
+
+	require.NotNil(t, req.msg.Snapshot)
+	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
+
+	msg.Snapshot.Data[0] = 'X'
+	msg.Snapshot.Metadata.ConfState.Voters[0] = 99
+
+	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
+	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.Metadata.ConfState.Voters)
+}
+
+func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     5,
+			Term:      2,
+		},
+	}))
+	require.NoError(t, storage.SetHardState(raftpb.HardState{
+		Term:   2,
+		Commit: 9,
+	}))
+
+	require.Equal(t, uint64(5), maxAppliedIndex(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{Index: 5},
+	}))
+}
+
+func TestOpenRestoresLegacySnapshotState(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
+		HardState: raftpb.HardState{
+			Term:   2,
+			Commit: 6,
+		},
+		Snapshot: raftpb.Snapshot{
+			Data: mustEncodeSnapshotData(t, [][]byte{[]byte("snap")}),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     5,
+				Term:      2,
+			},
+		},
+		Entries: []raftpb.Entry{{
+			Type:  raftpb.EntryNormal,
+			Term:  2,
+			Index: 6,
+			Data:  encodeProposalEnvelope(1, []byte("tail")),
+		}},
+	}))
+
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+}
+
+func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 3)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node.engine != nil {
+				require.NoError(t, node.engine.Close())
+			}
+			if node.server != nil {
+				node.server.Stop()
+			}
+			if node.lis != nil {
+				_ = node.lis.Close()
+			}
+			if node.transport != nil {
+				require.NoError(t, node.transport.Close())
+			}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNodes(ctx, nodes, peers))
+
+	leader := waitForLeaderNode(t, nodes)
+	result, err := leader.engine.Propose(context.Background(), []byte("alpha"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			if got := node.fsm.Applied(); len(got) != 1 || string(got[0]) != "alpha" {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestFollowerStatusTracksLeaderContact(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 3)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node.engine != nil {
+				require.NoError(t, node.engine.Close())
+			}
+			if node.server != nil {
+				node.server.Stop()
+			}
+			if node.lis != nil {
+				_ = node.lis.Close()
+			}
+			if node.transport != nil {
+				require.NoError(t, node.transport.Close())
+			}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNodes(ctx, nodes, peers))
+	leader := waitForLeaderNode(t, nodes)
+
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			if node == leader {
+				continue
+			}
+			status := node.engine.Status()
+			if status.State == raftengine.StateFollower && status.LastContact >= 0 {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
+	t.Helper()
+
+	nodes := make([]*transportTestNode, 0, count)
+	peers := make([]Peer, 0, count)
+	nodeID := uint64(1)
+	for i := range count {
+		lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		peer := Peer{
+			NodeID:  nodeID,
+			ID:      "n" + strconv.Itoa(i+1),
+			Address: lis.Addr().String(),
+		}
+		peers = append(peers, peer)
+		nodes = append(nodes, &transportTestNode{
+			peer: peer,
+			lis:  lis,
+			dir:  t.TempDir(),
+			fsm:  &testStateMachine{},
+		})
+		nodeID++
+	}
+	return nodes, peers
+}
+
+func startTransportTestServers(nodes []*transportTestNode, peers []Peer) {
+	for _, node := range nodes {
+		node.transport = NewGRPCTransport(peers)
+		node.server = grpc.NewServer(internalutil.GRPCServerOptions()...)
+		node.transport.Register(node.server)
+		go func(server *grpc.Server, lis net.Listener) {
+			_ = server.Serve(lis)
+		}(node.server, node.lis)
+	}
+}
+
+func openTransportTestNodes(ctx context.Context, nodes []*transportTestNode, peers []Peer) error {
+	var eg errgroup.Group
+	for _, node := range nodes {
+		eg.Go(func() error {
+			engine, err := Open(ctx, OpenConfig{
+				NodeID:       node.peer.NodeID,
+				LocalID:      node.peer.ID,
+				LocalAddress: node.peer.Address,
+				DataDir:      node.dir,
+				Peers:        peers,
+				Bootstrap:    true,
+				Transport:    node.transport,
+				StateMachine: node.fsm,
+			})
+			if err != nil {
+				return err
+			}
+			node.engine = engine
+			return nil
+		})
+	}
+	return eg.Wait()
+}
+
+func TestSingleNodeWALRotatesSegments(t *testing.T) {
+	oldSegmentSize := wal.SegmentSizeBytes
+	wal.SegmentSizeBytes = 4 * 1024
+	t.Cleanup(func() {
+		wal.SegmentSizeBytes = oldSegmentSize
+	})
+
+	dir := t.TempDir()
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	payload := bytes.Repeat([]byte("a"), 1024)
+	for i := 0; i < 32; i++ {
+		_, err := engine.Propose(context.Background(), payload)
+		require.NoError(t, err)
+	}
+
+	files, err := filepath.Glob(filepath.Join(dir, walDirName, "*.wal"))
+	require.NoError(t, err)
+	require.Greater(t, len(files), 1)
+}
+
+func waitForLeaderNode(t *testing.T, nodes []*transportTestNode) *transportTestNode {
+	t.Helper()
+	var leader *transportTestNode
+	require.Eventually(t, func() bool {
+		leader = nil
+		for _, node := range nodes {
+			if node.engine == nil {
+				return false
+			}
+			if node.engine.State() == raftengine.StateLeader {
+				leader = node
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+	return leader
+}
+
+func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {
+	t.Helper()
+
+	fsm := &testStateMachine{applied: applied}
+	snapshot, err := fsm.Snapshot()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshot.Close())
+	})
+
+	var buf bytes.Buffer
+	_, err = snapshot.WriteTo(&buf)
+	require.NoError(t, err)
+	return buf.Bytes()
 }
