@@ -217,6 +217,13 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	if cfg.Transport != nil {
 		dispatchCtx, dispatchCancel = context.WithCancel(context.Background())
 	}
+	opened := false
+	defer func() {
+		if opened || dispatchCancel == nil {
+			return
+		}
+		dispatchCancel()
+	}()
 
 	engine := &Engine{
 		nodeID:       cfg.NodeID,
@@ -249,13 +256,6 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	engine.initTransport(cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
-	opened := false
-	defer func() {
-		if opened || engine.dispatchCancel == nil {
-			return
-		}
-		engine.dispatchCancel()
-	}()
 
 	go engine.run()
 
