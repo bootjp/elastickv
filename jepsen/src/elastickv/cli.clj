@@ -59,9 +59,10 @@
        vec))
 
 (defn fail-on-invalid!
-  "Raises when Jepsen completed analysis and found the history invalid."
+  "Raises when Jepsen completed analysis and found the history invalid.
+   Treats anything other than true (e.g. false, :unknown) as a failure."
   [result]
-  (when (false? (:valid? result))
+  (when-not (true? (:valid? result))
     (throw (ex-info "Jepsen analysis invalid" {:result result})))
   result)
 
