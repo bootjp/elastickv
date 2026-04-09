@@ -41,6 +41,7 @@ var (
 	errDataDirRequired   = errors.New("etcd raft data dir is required")
 	errStateMachineUnset = errors.New("etcd raft state machine is not configured")
 	errSnapshotRequired  = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull     = errors.New("etcd raft inbound step queue is full")
 	errClusterMismatch   = errors.New("etcd raft persisted cluster does not match configured peers")
 )
 
@@ -656,6 +657,9 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if len(snapshot.Data) == 0 {
 		return errors.WithStack(errSnapshotRequired)
 	}
+	// Snapshot application is intentionally synchronous with the raft loop: the
+	// local FSM must reflect the incoming raft snapshot before Ready can advance
+	// and later committed entries can be applied safely.
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 	if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
@@ -1139,6 +1143,8 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 		return e.currentErrorOrClosed()
 	case e.stepCh <- msg:
 		return nil
+	default:
+		return errors.WithStack(errStepQueueFull)
 	}
 }
 
@@ -1385,6 +1391,9 @@ func (e *Engine) persistSnapshot(req snapshotRequest) error {
 		return err
 	}
 
+	// Keep restore and local snapshot publication serialized end-to-end so a
+	// follower snapshot cannot swap in newer FSM state while an older local
+	// snapshot is still being published to raft storage and disk.
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 

@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -124,6 +127,54 @@ func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 	_, err = transport.receiveSnapshotStream(stream)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errSnapshotMetadataDuplicate))
+}
+
+func TestClientForDeduplicatesConcurrentDial(t *testing.T) {
+	transport := NewGRPCTransport([]Peer{{
+		NodeID:  2,
+		ID:      "n2",
+		Address: "127.0.0.1:65530",
+	}})
+	t.Cleanup(func() {
+		require.NoError(t, transport.Close())
+	})
+
+	oldNewClient := grpcNewClient
+	var callCount atomic.Int32
+	grpcNewClient = func(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+		callCount.Add(1)
+		return oldNewClient(target, opts...)
+	}
+	t.Cleanup(func() {
+		grpcNewClient = oldNewClient
+	})
+
+	const callers = 8
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	clients := make([]pb.EtcdRaftClient, callers)
+	errCh := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			client, err := transport.clientFor(2)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			clients[idx] = client
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(1), callCount.Load())
+	for i := 1; i < callers; i++ {
+		require.Equal(t, clients[0], clients[i])
+	}
 }
 
 type testSendSnapshotServer struct {

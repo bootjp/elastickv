@@ -11,6 +11,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 )
 
@@ -28,6 +29,8 @@ var (
 	errSnapshotStreamShort       = errors.New("etcd raft snapshot stream closed before final chunk")
 )
 
+var grpcNewClient = grpc.NewClient
+
 type MessageHandler func(context.Context, raftpb.Message) error
 
 type GRPCTransport struct {
@@ -40,6 +43,7 @@ type GRPCTransport struct {
 	handler           MessageHandler
 	snapshotChunkSize int
 	spoolDir          string
+	dialGroup         singleflight.Group
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -215,20 +219,37 @@ func (t *GRPCTransport) clientFor(to uint64) (pb.EtcdRaftClient, error) {
 		return client, nil
 	}
 
-	conn, err := grpc.NewClient(peer.Address, internalutil.GRPCDialOptions()...)
+	value, err, _ := t.dialGroup.Do(peer.Address, func() (any, error) {
+		t.mu.RLock()
+		client, ok := t.clients[peer.Address]
+		t.mu.RUnlock()
+		if ok {
+			return client, nil
+		}
+
+		conn, err := grpcNewClient(peer.Address, internalutil.GRPCDialOptions()...)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		client = pb.NewEtcdRaftClient(conn)
+
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if existing, ok := t.clients[peer.Address]; ok {
+			_ = conn.Close()
+			return existing, nil
+		}
+		t.conns[peer.Address] = conn
+		t.clients[peer.Address] = client
+		return client, nil
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	client = pb.NewEtcdRaftClient(conn)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if existing, ok := t.clients[peer.Address]; ok {
-		_ = conn.Close()
-		return existing, nil
+	client, ok = value.(pb.EtcdRaftClient)
+	if !ok {
+		return nil, errors.New("etcd raft transport dial returned unexpected client type")
 	}
-	t.conns[peer.Address] = conn
-	t.clients[peer.Address] = client
 	return client, nil
 }
 
@@ -339,6 +360,9 @@ func readSnapshotChunk(reader *bufio.Reader, chunkSize int) ([]byte, error) {
 	case err == nil:
 		return chunk[:n], nil
 	case errors.Is(err, io.ErrUnexpectedEOF):
+		// io.ReadFull reports ErrUnexpectedEOF on the final short read from an
+		// otherwise healthy stream. Treat that as the last chunk rather than a
+		// corrupted snapshot so the trailing partial payload is still sent.
 		return chunk[:n], io.EOF
 	case errors.Is(err, io.EOF):
 		return nil, io.EOF
@@ -432,6 +456,9 @@ func buildSnapshotMessage(metadata raftpb.Message, spool *snapshotSpool, seenMet
 	if !seenMetadata || metadata.Snapshot == nil {
 		return raftpb.Message{}, errors.WithStack(errSnapshotMetadataNil)
 	}
+	// RawNode.Step still consumes snapshot payloads as an in-memory []byte, so
+	// the transport can only delay materialization until the full stream has
+	// been received and bounded on disk.
 	payload, err := spool.Bytes()
 	if err != nil {
 		return raftpb.Message{}, err

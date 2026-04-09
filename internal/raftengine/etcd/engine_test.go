@@ -14,6 +14,7 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/server/v3/mock/mockstorage"
 	"go.etcd.io/etcd/server/v3/storage/wal"
@@ -350,6 +351,18 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 	}
 
 	require.NoError(t, <-errCh)
+}
+
+func TestEnqueueStepReturnsQueueFull(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: raftpb.MsgHeartbeat}
+
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errStepQueueFull))
 }
 
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
