@@ -110,4 +110,5 @@
                   (run!)))))
     (catch Throwable t
       (warn t "Workload failed")
+      (shutdown-agents)
       (System/exit 1))))
