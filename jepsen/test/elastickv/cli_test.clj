@@ -1,4 +1,4 @@
-(ns elastickv.redis-workload-test
+(ns elastickv.cli-test
   (:require [clojure.test :refer :all]
             [elastickv.cli :as cli]))
 
