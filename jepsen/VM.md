@@ -27,7 +27,7 @@ HOME=$(pwd)/tmp-home LEIN_HOME=$(pwd)/.lein LEIN_JVM_OPTS="-Duser.home=$(pwd)/tm
 ```
 
 The test will:
-- build Linux/amd64 elastickv + raftadmin binaries on the control node,
+- build Linux/amd64 elastickv + the repo-owned `cmd/raftadmin` helper on the control node,
 - deploy them to each VM under `/opt/elastickv/bin`,
 - start the cluster (bootstrap on `n1`, join others),
 - run the Redis append workload with the Jepsen combined nemesis (partitions + process kills by default).

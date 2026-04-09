@@ -70,6 +70,20 @@ type ConfigReader interface {
 	Configuration(ctx context.Context) (Configuration, error)
 }
 
+type HealthReader interface {
+	CheckServing(ctx context.Context) error
+}
+
+type Admin interface {
+	LeaderView
+	StatusReader
+	ConfigReader
+	AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
+	TransferLeadership(ctx context.Context) error
+	TransferLeadershipToServer(ctx context.Context, id string, address string) error
+}
+
 type Engine interface {
 	Proposer
 	LeaderView
