@@ -46,6 +46,11 @@ func TestPersistedEntryLimitExceedsCurrentTransportBudget(t *testing.T) {
 	require.Greater(t, maxPersistedEntryMessage, uint32(internalutil.GRPCMaxMessageBytes))
 }
 
+func TestLegacySnapshotLimitPreservesHistoricalBudget(t *testing.T) {
+	require.GreaterOrEqual(t, maxPersistedLegacySnapshot, uint32(256<<20))
+	require.Greater(t, maxPersistedLegacySnapshot, maxPersistedEntryMessage)
+}
+
 func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
 	path := entriesFilePath(t.TempDir())
 

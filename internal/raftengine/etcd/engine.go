@@ -212,6 +212,11 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	for _, peer := range peers {
 		peerMap[peer.NodeID] = peer
 	}
+	var dispatchCtx context.Context
+	var dispatchCancel context.CancelFunc
+	if cfg.Transport != nil {
+		dispatchCtx, dispatchCancel = context.WithCancel(context.Background())
+	}
 
 	engine := &Engine{
 		nodeID:       cfg.NodeID,
@@ -236,6 +241,8 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 			Servers: configServersForPeers(peers),
 		},
 		applied:          maxAppliedIndex(disk.LocalSnap),
+		dispatchCtx:      dispatchCtx,
+		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 	}
@@ -269,7 +276,6 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// local run loop has completed startup.
 	e.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
 	e.dispatchStopCh = make(chan struct{})
-	e.dispatchCtx, e.dispatchCancel = context.WithCancel(context.Background())
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetHandler(e.handleTransportMessage)
 	e.startDispatchWorkers()

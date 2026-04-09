@@ -99,6 +99,33 @@ func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
 	require.True(t, errors.Is(err, errSnapshotStreamShort))
 }
 
+func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{
+				Index: 7,
+				Term:  3,
+			},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	transport := NewGRPCTransport(nil)
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw, Chunk: []byte("a")},
+			{Metadata: raw, Chunk: []byte("b"), Final: true},
+		},
+	}
+
+	_, err = transport.receiveSnapshotStream(stream)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errSnapshotMetadataDuplicate))
+}
+
 type testSendSnapshotServer struct {
 	chunks []*pb.EtcdRaftSnapshotChunk
 	index  int

@@ -20,11 +20,12 @@ const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
 
 var (
-	errTransportPeerUnknown = errors.New("etcd raft peer is not configured")
-	errTransportHandlerNil  = errors.New("etcd raft transport handler is not configured")
-	errSnapshotMetadataNil  = errors.New("etcd raft snapshot metadata is required")
-	errSnapshotMessageNil   = errors.New("etcd raft snapshot message is required")
-	errSnapshotStreamShort  = errors.New("etcd raft snapshot stream closed before final chunk")
+	errTransportPeerUnknown      = errors.New("etcd raft peer is not configured")
+	errTransportHandlerNil       = errors.New("etcd raft transport handler is not configured")
+	errSnapshotMetadataNil       = errors.New("etcd raft snapshot metadata is required")
+	errSnapshotMetadataDuplicate = errors.New("etcd raft snapshot metadata was sent more than once")
+	errSnapshotMessageNil        = errors.New("etcd raft snapshot message is required")
+	errSnapshotStreamShort       = errors.New("etcd raft snapshot stream closed before final chunk")
 )
 
 type MessageHandler func(context.Context, raftpb.Message) error
@@ -412,7 +413,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
 	if len(chunk.Metadata) > 0 {
 		if seenMetadata {
-			return false, errors.WithStack(errSnapshotMetadataNil)
+			return false, errors.WithStack(errSnapshotMetadataDuplicate)
 		}
 		if err := metadata.Unmarshal(chunk.Metadata); err != nil {
 			return false, errors.WithStack(err)

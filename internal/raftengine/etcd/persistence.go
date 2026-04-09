@@ -33,7 +33,10 @@ const (
 	// write path already accepted.
 	maxPersistedEntryMessage = uint32(internalutil.GRPCMaxMessageBytes) + persistedEntryHeadroom
 	maxPersistedSnapshotMeta = uint32(1 << 20)
-	maxPersistedHardState    = uint32(1 << 20)
+	// Legacy monolithic snapshots may include a full FSM export produced by the
+	// previous HashiCorp raft path, which allowed values up to 256 MiB.
+	maxPersistedLegacySnapshot = maxPersistedSnapshotMeta + uint32(256<<20)
+	maxPersistedHardState      = uint32(1 << 20)
 )
 
 var (
@@ -277,7 +280,7 @@ func loadStateFile(path string) (persistedState, error) {
 	if err := readMessage(reader, &state.HardState, maxPersistedHardState, "hard state"); err != nil {
 		return persistedState{}, err
 	}
-	if err := readMessage(reader, &state.Snapshot, maxPersistedSnapshotMeta+maxPersistedEntryMessage, "snapshot"); err != nil {
+	if err := readMessage(reader, &state.Snapshot, maxPersistedLegacySnapshot, "snapshot"); err != nil {
 		return persistedState{}, err
 	}
 
