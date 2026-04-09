@@ -71,6 +71,17 @@ func TestRPCTimeoutRejectsInvalidEnv(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestUsageErrorForCommand(t *testing.T) {
+	require.EqualError(t, usageError("add_voter"), "usage: raftadmin <addr> add_voter <id> <address> [previous_index]")
+	require.EqualError(t, usageError("remove_server"), "usage: raftadmin <addr> remove_server <id> [previous_index]")
+	require.EqualError(t, usageError("leadership_transfer_to_server"), "usage: raftadmin <addr> leadership_transfer_to_server <id> <address>")
+}
+
+func TestUsageErrorFallback(t *testing.T) {
+	require.EqualError(t, usageError(""), "usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
+	require.EqualError(t, usageError("unknown"), "usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
+}
+
 func captureStdout(t *testing.T, run func()) string {
 	t.Helper()
 

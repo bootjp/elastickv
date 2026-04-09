@@ -33,7 +33,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < minCommandArgs {
-		return usageError()
+		return usageError("")
 	}
 
 	addr := args[0]
@@ -84,7 +84,7 @@ func executeCommand(ctx context.Context, client pb.RaftAdminClient, command stri
 		}
 		return transferLeadership(ctx, client, req)
 	default:
-		return usageError()
+		return usageError(command)
 	}
 }
 
@@ -124,7 +124,7 @@ func printConfiguration(ctx context.Context, client pb.RaftAdminClient) error {
 
 func addVoter(ctx context.Context, client pb.RaftAdminClient, args []string) error {
 	if len(args) < addVoterArgCount || len(args) > addVoterArgCount+1 {
-		return usageError()
+		return usageError("add_voter")
 	}
 	prevIndex, err := parseOptionalUint64(args, addVoterPrevIndex)
 	if err != nil {
@@ -144,7 +144,7 @@ func addVoter(ctx context.Context, client pb.RaftAdminClient, args []string) err
 
 func removeServer(ctx context.Context, client pb.RaftAdminClient, args []string) error {
 	if len(args) < 1 || len(args) > removePrevIndex+1 {
-		return usageError()
+		return usageError("remove_server")
 	}
 	prevIndex, err := parseOptionalUint64(args, removePrevIndex)
 	if err != nil {
@@ -174,7 +174,7 @@ func transferLeadership(ctx context.Context, client pb.RaftAdminClient, req *pb.
 
 func parseTransferTarget(args []string) (*pb.RaftAdminTransferLeadershipRequest, error) {
 	if len(args) != transferArgCount {
-		return nil, usageError()
+		return nil, usageError("leadership_transfer_to_server")
 	}
 	return &pb.RaftAdminTransferLeadershipRequest{
 		TargetId:      args[0],
@@ -216,6 +216,27 @@ func formatState(state pb.RaftAdminState) string {
 	return raw
 }
 
-func usageError() error {
-	return fmt.Errorf("usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
+func usageError(command string) error {
+	return fmt.Errorf("usage: %s", usage(command))
+}
+
+func usage(command string) string {
+	switch command {
+	case "leader":
+		return "raftadmin <addr> leader"
+	case "state":
+		return "raftadmin <addr> state"
+	case "configuration", "config":
+		return "raftadmin <addr> configuration"
+	case "add_voter":
+		return "raftadmin <addr> add_voter <id> <address> [previous_index]"
+	case "remove_server":
+		return "raftadmin <addr> remove_server <id> [previous_index]"
+	case "leadership_transfer":
+		return "raftadmin <addr> leadership_transfer"
+	case "leadership_transfer_to_server":
+		return "raftadmin <addr> leadership_transfer_to_server <id> <address>"
+	default:
+		return "raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+	}
 }
