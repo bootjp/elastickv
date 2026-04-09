@@ -403,6 +403,7 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 
 func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	engine := &Engine{
 		dispatchCh:     make(chan dispatchRequest, 1),
 		dispatchStopCh: make(chan struct{}),

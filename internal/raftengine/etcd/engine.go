@@ -239,31 +239,53 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 	}
-	if engine.transport != nil {
-		// Transport listeners may already be accepting RPCs when Open is called.
-		// Gate inbound delivery on startedCh so messages are not enqueued until the
-		// local run loop has completed startup.
-		engine.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
-		engine.dispatchStopCh = make(chan struct{})
-		engine.dispatchCtx, engine.dispatchCancel = context.WithCancel(context.Background())
-		engine.transport.SetSpoolDir(cfg.DataDir)
-		engine.transport.SetHandler(engine.handleTransportMessage)
-		engine.startDispatchWorkers()
-	}
-	if engine.persist != nil {
-		// Local snapshot persistence is only wired for disk-backed engines. When
-		// persist is nil the prototype intentionally leaves snapshot workers nil
-		// and maybePersistLocalSnapshot becomes a no-op.
-		engine.snapshotReqCh = make(chan snapshotRequest)
-		engine.snapshotResCh = make(chan snapshotResult, 1)
-		engine.snapshotStopCh = make(chan struct{})
-		engine.startSnapshotWorker()
-	}
+	engine.initTransport(cfg)
+	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	opened := false
+	defer func() {
+		if opened || engine.dispatchCancel == nil {
+			return
+		}
+		engine.dispatchCancel()
+	}()
 
 	go engine.run()
 
-	return waitForOpen(ctx, engine, len(peers) == 1)
+	openedEngine, err := waitForOpen(ctx, engine, len(peers) == 1)
+	if err != nil {
+		return nil, err
+	}
+	opened = true
+	return openedEngine, nil
+}
+
+func (e *Engine) initTransport(cfg OpenConfig) {
+	if e.transport == nil {
+		return
+	}
+	// Transport listeners may already be accepting RPCs when Open is called.
+	// Gate inbound delivery on startedCh so messages are not enqueued until the
+	// local run loop has completed startup.
+	e.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
+	e.dispatchStopCh = make(chan struct{})
+	e.dispatchCtx, e.dispatchCancel = context.WithCancel(context.Background())
+	e.transport.SetSpoolDir(cfg.DataDir)
+	e.transport.SetHandler(e.handleTransportMessage)
+	e.startDispatchWorkers()
+}
+
+func (e *Engine) initSnapshotWorker() {
+	if e.persist == nil {
+		return
+	}
+	// Local snapshot persistence is only wired for disk-backed engines. When
+	// persist is nil the prototype intentionally leaves snapshot workers nil
+	// and maybePersistLocalSnapshot becomes a no-op.
+	e.snapshotReqCh = make(chan snapshotRequest)
+	e.snapshotResCh = make(chan snapshotResult, 1)
+	e.snapshotStopCh = make(chan struct{})
+	e.startSnapshotWorker()
 }
 
 func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawNode, error) {

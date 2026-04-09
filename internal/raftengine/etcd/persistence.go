@@ -449,6 +449,7 @@ func replaceFile(path string, write func(io.Writer) error) (err error) {
 	}
 	tmpPath := file.Name()
 	closed := false
+	renamed := false
 	closeFile := func() error {
 		if closed {
 			return nil
@@ -458,7 +459,7 @@ func replaceFile(path string, write func(io.Writer) error) (err error) {
 	}
 	defer func() {
 		err = errors.CombineErrors(err, closeFile())
-		if err != nil {
+		if err != nil && !renamed {
 			_ = os.Remove(tmpPath)
 		}
 	}()
@@ -475,6 +476,7 @@ func replaceFile(path string, write func(io.Writer) error) (err error) {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return errors.WithStack(err)
 	}
+	renamed = true
 	return syncDir(dir)
 }
 
