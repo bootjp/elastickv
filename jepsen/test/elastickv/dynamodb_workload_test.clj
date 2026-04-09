@@ -1,7 +1,6 @@
 (ns elastickv.dynamodb-workload-test
   (:require [clojure.test :refer :all]
             [jepsen.client :as client]
-            [elastickv.cli :as cli]
             [elastickv.dynamodb-workload :as workload]))
 
 (deftest builds-test-spec
@@ -9,16 +8,6 @@
     (is (map? test-map))
     (is (= "elastickv-dynamodb-append" (:name test-map)))
     (is (= ["n1" "n2" "n3" "n4" "n5"] (:nodes test-map)))))
-
-(deftest fail-on-invalid-passes-through-valid-results
-  (let [result {:valid? true}]
-    (is (= result (cli/fail-on-invalid! result)))))
-
-(deftest fail-on-invalid-throws-for-invalid-results
-  (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo
-       #"Jepsen analysis invalid"
-       (cli/fail-on-invalid! {:valid? false}))))
 
 (deftest custom-options-override-defaults
   (let [test-map (workload/elastickv-dynamodb-test

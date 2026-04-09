@@ -59,10 +59,13 @@
        vec))
 
 (defn fail-on-invalid!
-  "Raises when Jepsen completed analysis and found the history invalid."
+  "Raises when Jepsen completed analysis and found the history invalid.
+   jepsen/run! returns the test map with results under :results.
+   Treats anything other than true (e.g. false, :unknown) as a failure."
   [result]
-  (when (false? (:valid? result))
-    (throw (ex-info "Jepsen analysis invalid" {:result result})))
+  (let [valid? (:valid? (:results result))]
+    (when-not (true? valid?)
+      (throw (ex-info "Jepsen analysis invalid" {:result (:results result)}))))
   result)
 
 (defn parse-common-opts
@@ -107,7 +110,10 @@
         :else (let [run! #(fail-on-invalid! (jepsen/run! (test-fn options)))]
                 (if (:local options)
                   (binding [control/*dummy* true] (run!))
-                  (run!)))))
+                  (run!))
+                (shutdown-agents)
+                (System/exit 0))))
     (catch Throwable t
       (warn t "Workload failed")
+      (shutdown-agents)
       (System/exit 1))))
