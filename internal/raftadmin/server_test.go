@@ -262,3 +262,16 @@ func TestCurrentHealthStatusFallsBackToLocalState(t *testing.T) {
 	require.Equal(t, healthpb.HealthCheckResponse_SERVING, currentHealthStatus(context.Background(), stateOnlyEngine{state: raftengine.StateLeader}))
 	require.Equal(t, healthpb.HealthCheckResponse_NOT_SERVING, currentHealthStatus(context.Background(), stateOnlyEngine{state: raftengine.StateFollower}))
 }
+
+func TestHealthPollIntervalHonorsEnv(t *testing.T) {
+	t.Setenv(healthPollIntervalEnv, "900")
+	require.Equal(t, 900*time.Millisecond, healthPollInterval())
+}
+
+func TestHealthPollIntervalFallsBackToDefault(t *testing.T) {
+	t.Setenv(healthPollIntervalEnv, "bad")
+	require.Equal(t, defaultHealthPollInterval, healthPollInterval())
+
+	t.Setenv(healthPollIntervalEnv, "0")
+	require.Equal(t, defaultHealthPollInterval, healthPollInterval())
+}

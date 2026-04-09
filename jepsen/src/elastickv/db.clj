@@ -155,7 +155,8 @@
   (c/on bootstrap-node
     (c/su
       (try (c/exec :pkill :-f "raftadmin") (catch Exception _))
-      (c/exec raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
+      (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
+              raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
 (defrecord ElastickvDB [opts]
   db/DB

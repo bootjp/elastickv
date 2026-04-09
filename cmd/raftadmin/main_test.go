@@ -82,6 +82,42 @@ func TestUsageErrorFallback(t *testing.T) {
 	require.EqualError(t, usageError("unknown"), "usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
 }
 
+func TestAllowInsecurePlaintextLoopbackByDefault(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:50051", "[::1]:50051", "localhost:50051", "passthrough:///bufnet"} {
+		allowed, err := allowInsecurePlaintext(addr)
+		require.NoError(t, err, addr)
+		require.True(t, allowed, addr)
+	}
+}
+
+func TestAllowInsecurePlaintextRemoteRequiresExplicitOptIn(t *testing.T) {
+	allowed, err := allowInsecurePlaintext("10.0.0.12:50051")
+	require.NoError(t, err)
+	require.False(t, allowed)
+
+	t.Setenv(allowInsecureEnv, "true")
+	allowed, err = allowInsecurePlaintext("10.0.0.12:50051")
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
+func TestTransportCredentialsForRemotePlaintextRejectsByDefault(t *testing.T) {
+	_, err := transportCredentialsFor("10.0.0.12:50051")
+	require.EqualError(t, err, "plaintext raftadmin to non-loopback address requires RAFTADMIN_ALLOW_INSECURE=true or RAFTADMIN_TLS=true")
+}
+
+func TestTransportCredentialsForTLSAndInvalidBoolEnv(t *testing.T) {
+	t.Setenv(tlsEnv, "true")
+	creds, err := transportCredentialsFor("10.0.0.12:50051")
+	require.NoError(t, err)
+	require.NotNil(t, creds)
+
+	t.Setenv(tlsEnv, "")
+	t.Setenv(allowInsecureEnv, "maybe")
+	_, err = allowInsecurePlaintext("10.0.0.12:50051")
+	require.Error(t, err)
+}
+
 func captureStdout(t *testing.T, run func()) string {
 	t.Helper()
 

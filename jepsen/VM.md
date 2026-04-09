@@ -32,6 +32,8 @@ The test will:
 - start the cluster (bootstrap on `n1`, join others),
 - run the Redis append workload with the Jepsen combined nemesis (partitions + process kills by default).
 
+The Jepsen bootstrap path uses `RAFTADMIN_ALLOW_INSECURE=true` because the lab gRPC admin channel is plaintext-only.
+
 ## Tear down
 ```bash
 cd jepsen

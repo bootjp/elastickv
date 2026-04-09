@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -22,6 +26,8 @@ const (
 	addVoterPrevIndex        = 2
 	removePrevIndex          = 1
 	timeoutEnv               = "RAFTADMIN_RPC_TIMEOUT_SECONDS"
+	allowInsecureEnv         = "RAFTADMIN_ALLOW_INSECURE"
+	tlsEnv                   = "RAFTADMIN_TLS"
 )
 
 func main() {
@@ -56,11 +62,95 @@ func run(args []string) error {
 }
 
 func dialClient(addr string) (pb.RaftAdminClient, func(), error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds, err := transportCredentialsFor(addr)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, func() {}, errors.Wrap(err, "dial raft admin")
 	}
 	return pb.NewRaftAdminClient(conn), func() { _ = conn.Close() }, nil
+}
+
+func transportCredentialsFor(addr string) (credentials.TransportCredentials, error) {
+	useTLS, err := boolEnv(tlsEnv)
+	if err != nil {
+		return nil, err
+	}
+	if useTLS {
+		return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
+	}
+
+	allowInsecure, err := allowInsecurePlaintext(addr)
+	if err != nil {
+		return nil, err
+	}
+	if !allowInsecure {
+		return nil, errors.New("plaintext raftadmin to non-loopback address requires RAFTADMIN_ALLOW_INSECURE=true or RAFTADMIN_TLS=true")
+	}
+	return insecure.NewCredentials(), nil
+}
+
+func allowInsecurePlaintext(addr string) (bool, error) {
+	allowInsecure, err := boolEnv(allowInsecureEnv)
+	if err != nil {
+		return false, err
+	}
+	if allowInsecure {
+		return true, nil
+	}
+	return isLocalAdminAddr(addr), nil
+}
+
+func boolEnv(name string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return false, nil
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, errors.Errorf("parse %s", name)
+	}
+}
+
+func isLocalAdminAddr(addr string) bool {
+	if strings.HasPrefix(addr, "unix:") {
+		return true
+	}
+	if strings.Contains(addr, "://") {
+		u, err := url.Parse(addr)
+		if err == nil {
+			switch u.Scheme {
+			case "unix", "passthrough":
+				return true
+			}
+			if u.Host != "" {
+				return isLoopbackHost(hostOnly(u.Host))
+			}
+		}
+	}
+	return isLoopbackHost(hostOnly(addr))
+}
+
+func hostOnly(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(addr, "[]")
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func executeCommand(ctx context.Context, client pb.RaftAdminClient, command string, commandArgs []string) error {

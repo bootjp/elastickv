@@ -2,6 +2,9 @@ package raftadmin
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -13,6 +16,7 @@ import (
 
 const (
 	defaultHealthPollInterval = 250 * time.Millisecond
+	healthPollIntervalEnv     = "RAFTADMIN_HEALTH_POLL_INTERVAL_MS"
 )
 
 func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine raftengine.Engine, serviceNames []string) {
@@ -27,15 +31,15 @@ func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine ra
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)
-	go observeLeaderHealth(ctx, engine, healthSrv, serviceNames)
+	go observeLeaderHealth(ctx, engine, healthSrv, serviceNames, healthPollInterval())
 }
 
-func observeLeaderHealth(ctx context.Context, engine raftengine.Engine, healthSrv *health.Server, serviceNames []string) {
+func observeLeaderHealth(ctx context.Context, engine raftengine.Engine, healthSrv *health.Server, serviceNames []string, pollInterval time.Duration) {
 	services := dedupeServices(serviceNames)
 	status := currentHealthStatus(ctx, engine)
 	setHealthStatus(healthSrv, services, status)
 
-	ticker := time.NewTicker(defaultHealthPollInterval)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -51,6 +55,18 @@ func observeLeaderHealth(ctx context.Context, engine raftengine.Engine, healthSr
 			}
 		}
 	}
+}
+
+func healthPollInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(healthPollIntervalEnv))
+	if raw == "" {
+		return defaultHealthPollInterval
+	}
+	millis, err := strconv.Atoi(raw)
+	if err != nil || millis <= 0 {
+		return defaultHealthPollInterval
+	}
+	return time.Duration(millis) * time.Millisecond
 }
 
 func currentHealthStatus(parent context.Context, engine raftengine.Engine) healthpb.HealthCheckResponse_ServingStatus {
