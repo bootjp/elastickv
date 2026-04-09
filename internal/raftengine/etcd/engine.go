@@ -175,8 +175,7 @@ type snapshotResult struct {
 }
 
 type dispatchRequest struct {
-	msg      raftpb.Message
-	snapshot *snapshotSpool
+	msg raftpb.Message
 }
 
 // Open starts the etcd/raft backend.
@@ -636,10 +635,7 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
-	dispatchReq, err := prepareDispatchRequest(msg, e.dataDir)
-	if err != nil {
-		return err
-	}
+	dispatchReq := prepareDispatchRequest(msg)
 	select {
 	case e.dispatchCh <- dispatchReq:
 		return nil
@@ -1314,42 +1310,15 @@ func (e *Engine) dispatchTransport(req dispatchRequest) error {
 	if e.dispatchFn != nil {
 		return e.dispatchFn(ctx, req)
 	}
-	if req.snapshot != nil {
-		return e.transport.DispatchSnapshotSpool(ctx, req.msg, req.snapshot)
-	}
 	return e.transport.Dispatch(ctx, req.msg)
 }
 
-func prepareDispatchRequest(msg raftpb.Message, spoolDir string) (dispatchRequest, error) {
-	if msg.Snapshot == nil || len(msg.Snapshot.Data) == 0 {
-		return dispatchRequest{msg: cloneDispatchMessage(msg)}, nil
-	}
-
-	spool, err := newSnapshotSpool(spoolDir)
-	if err != nil {
-		return dispatchRequest{}, err
-	}
-	if _, err := spool.Write(msg.Snapshot.Data); err != nil {
-		_ = spool.Close()
-		return dispatchRequest{}, err
-	}
-
-	cloned := msg
-	cloned.Entries = cloneDispatchEntries(msg.Entries)
-	cloned.Context = append([]byte(nil), msg.Context...)
-	cloned.Responses = cloneDispatchMessages(msg.Responses)
-	snapshotCopy := *msg.Snapshot
-	snapshotCopy.Data = nil
-	snapshotCopy.Metadata.ConfState = cloneDispatchConfState(msg.Snapshot.Metadata.ConfState)
-	cloned.Snapshot = &snapshotCopy
-	return dispatchRequest{msg: cloned, snapshot: spool}, nil
+func prepareDispatchRequest(msg raftpb.Message) dispatchRequest {
+	return dispatchRequest{msg: cloneDispatchMessage(msg)}
 }
 
 func (r dispatchRequest) Close() error {
-	if r.snapshot == nil {
-		return nil
-	}
-	return r.snapshot.Close()
+	return nil
 }
 
 func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {

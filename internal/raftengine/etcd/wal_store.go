@@ -238,6 +238,9 @@ func snapshotBytes(snapshot Snapshot, spoolDir string) (data []byte, err error) 
 	if _, err := snapshot.WriteTo(spool); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	// The current raftpb snapshot APIs still require a materialized []byte, but
+	// keeping the intermediate WriteTo path on disk avoids growing a second
+	// in-memory buffer while the FSM snapshot is being serialized.
 	data, err = spool.Bytes()
 	if err != nil {
 		return nil, err

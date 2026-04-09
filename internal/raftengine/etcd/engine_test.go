@@ -628,8 +628,8 @@ func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	require.Equal(t, []byte("resp"), cloned.Responses[0].Context)
 }
 
-func TestPrepareDispatchRequestSpoolsSnapshotPayload(t *testing.T) {
-	req, err := prepareDispatchRequest(raftpb.Message{
+func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
+	msg := raftpb.Message{
 		Type: raftpb.MsgSnap,
 		To:   2,
 		Snapshot: &raftpb.Snapshot{
@@ -640,19 +640,19 @@ func TestPrepareDispatchRequestSpoolsSnapshotPayload(t *testing.T) {
 				Term:      3,
 			},
 		},
-	}, t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, req.Close())
-	})
+	}
 
-	require.NotNil(t, req.snapshot)
+	req := prepareDispatchRequest(msg)
+	require.NoError(t, req.Close())
+
 	require.NotNil(t, req.msg.Snapshot)
-	require.Empty(t, req.msg.Snapshot.Data)
+	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
 
-	payload, err := req.snapshot.Bytes()
-	require.NoError(t, err)
-	require.Equal(t, []byte("snapshot"), payload)
+	msg.Snapshot.Data[0] = 'X'
+	msg.Snapshot.Metadata.ConfState.Voters[0] = 99
+
+	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
+	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.Metadata.ConfState.Voters)
 }
 
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
