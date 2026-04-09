@@ -149,11 +149,15 @@
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
 (defn dynamodb-append-workload
-  "Builds the list-append workload map targeting the DynamoDB endpoint."
+  "Builds the list-append workload map targeting the DynamoDB endpoint.
+   max-txn-length defaults to 1 because each micro-op (append/read) is sent
+   as an independent HTTP UpdateItem/GetItem request without DynamoDB
+   TransactWriteItems.  Multi-op transactions would be interleaved, producing
+   false G0 (write cycle) anomalies."
   [opts]
   (let [workload (append/test {:key-count            (or (:key-count opts) 12)
                                :min-txn-length       1
-                               :max-txn-length       (or (:max-txn-length opts) 4)
+                               :max-txn-length       (or (:max-txn-length opts) 1)
                                :max-writes-per-key   (or (:max-writes-per-key opts) 128)
                                :consistency-models   [:strict-serializable]})
         client   (->DynamoDBClient (or (:node->port opts)
