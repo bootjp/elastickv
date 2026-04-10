@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -20,8 +21,8 @@ var errNilEngine = errors.New("raft engine is not configured")
 type Engine struct {
 	raft *raft.Raft
 
-	barrierMu   sync.Mutex
-	barrierTerm uint64 // term of last successful Barrier
+	barrierMu   sync.Mutex    // serialises Barrier execution (slow path only)
+	barrierTerm atomic.Uint64 // term of last successful Barrier (lock-free read)
 }
 
 func New(r *raft.Raft) *Engine {
@@ -187,15 +188,24 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 // It returns true when a Barrier was actually performed (which implies a
 // quorum commit), false when the current term already has a valid Barrier.
 //
-// The method blocks concurrent callers on barrierMu; only one Barrier is
-// in-flight per term, and subsequent callers observe the updated
-// barrierTerm on the fast path.
+// The fast path uses an atomic load of barrierTerm to avoid mutex
+// contention on concurrent reads. Only the slow path (new term detected)
+// acquires barrierMu to serialise a single Barrier per term.
 func (e *Engine) ensureBarrierForTerm(ctx context.Context) (bool, error) {
+	// Fast path: lock-free check using the atomically published barrierTerm.
+	// Stats() is only called on the slow path (term change).
+	term := parseUint(e.raft.Stats()["term"])
+	if e.barrierTerm.Load() >= term {
+		return false, nil
+	}
+
+	// Slow path: acquire the mutex so only one goroutine runs Barrier.
 	e.barrierMu.Lock()
 	defer e.barrierMu.Unlock()
 
-	term := parseUint(e.raft.Stats()["term"])
-	if e.barrierTerm >= term {
+	// Re-check under lock; another goroutine may have completed Barrier.
+	term = parseUint(e.raft.Stats()["term"])
+	if e.barrierTerm.Load() >= term {
 		return false, nil
 	}
 
@@ -216,7 +226,7 @@ func (e *Engine) ensureBarrierForTerm(ctx context.Context) (bool, error) {
 		return false, errors.WithStack(err)
 	}
 
-	e.barrierTerm = term
+	e.barrierTerm.Store(term)
 	return true, nil
 }
 
