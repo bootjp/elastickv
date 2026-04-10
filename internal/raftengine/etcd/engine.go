@@ -132,7 +132,7 @@ type Engine struct {
 	runErr      error
 	closed      bool
 	applied     uint64
-	configIndex uint64
+	configIndex atomic.Uint64
 
 	lastLeaderContactAt   time.Time
 	lastLeaderContactFrom uint64
@@ -281,13 +281,13 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		leaderReady:      make(chan struct{}),
 		config:           configurationFromConfState(peerMap, disk.LocalSnap.Metadata.ConfState),
 		applied:          maxAppliedIndex(disk.LocalSnap),
-		configIndex:      maxAppliedIndex(disk.LocalSnap),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 		pendingConfigs:   map[uint64]adminRequest{},
 	}
+	engine.configIndex.Store(maxAppliedIndex(disk.LocalSnap))
 	engine.initTransport(cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -1088,6 +1088,9 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 		return err
 	}
 
+	// Keep disk publication serialized with snapshot restores. If a newer
+	// follower snapshot restored concurrently while an older config snapshot was
+	// still being written to disk, a restart could regress to the stale payload.
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
@@ -1417,9 +1420,7 @@ func (e *Engine) currentConfiguration() raftengine.Configuration {
 }
 
 func (e *Engine) currentConfigIndex() uint64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.configIndex
+	return e.configIndex.Load()
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
@@ -1449,20 +1450,22 @@ func (e *Engine) resolveAdminPeer(id string, address string) (Peer, error) {
 }
 
 func (e *Engine) setConfigIndex(index uint64) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if index > e.configIndex {
-		e.configIndex = index
+	for {
+		current := e.configIndex.Load()
+		if index <= current {
+			return
+		}
+		if e.configIndex.CompareAndSwap(current, index) {
+			return
+		}
 	}
 }
 
 func (e *Engine) setConfigurationFromConfState(conf raftpb.ConfState, index uint64) {
 	e.mu.Lock()
 	e.config = configurationFromConfState(e.peers, conf)
-	if index > e.configIndex {
-		e.configIndex = index
-	}
 	e.mu.Unlock()
+	e.setConfigIndex(index)
 }
 
 func (e *Engine) nextID() uint64 {
