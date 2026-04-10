@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,6 +113,10 @@ type blockingSnapshot struct {
 	release chan struct{}
 }
 
+type countingSnapshotStateMachine struct {
+	snapshotCalls atomic.Uint32
+}
+
 type transportTestNode struct {
 	peer      Peer
 	lis       net.Listener
@@ -160,6 +165,20 @@ func (s *blockingSnapshot) WriteTo(w io.Writer) (int64, error) {
 
 func (s *blockingSnapshot) Close() error {
 	return nil
+}
+
+func (s *countingSnapshotStateMachine) Apply(data []byte) any {
+	return string(data)
+}
+
+func (s *countingSnapshotStateMachine) Snapshot() (Snapshot, error) {
+	s.snapshotCalls.Add(1)
+	return &testSnapshot{data: []byte("counting")}, nil
+}
+
+func (s *countingSnapshotStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
@@ -612,6 +631,55 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("maybePersistLocalSnapshot blocked when snapshot worker was stopped")
 	}
+}
+
+func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Data: []byte("newer"),
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+			Index:     9,
+			Term:      2,
+		},
+	}))
+
+	fsm := &countingSnapshotStateMachine{}
+	engine := &Engine{
+		storage: storage,
+		fsm:     fsm,
+	}
+
+	require.NoError(t, engine.persistConfigSnapshot(7, raftpb.ConfState{Voters: []uint64{1}}))
+	require.Zero(t, fsm.snapshotCalls.Load())
+}
+
+func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     &testStateMachine{},
+	}
+
+	require.NoError(t, engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}}))
+
+	firstIndex, err := storage.FirstIndex()
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), firstIndex)
 }
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
