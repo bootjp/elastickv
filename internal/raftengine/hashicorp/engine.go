@@ -134,11 +134,14 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 // the current commit index, guaranteeing that a subsequent local read
 // observes the latest committed state (linearizable read). It first
 // ensures that at least one Barrier has been issued since the last
-// leadership transition (Raft §5.4.2), then polls AppliedIndex until
-// the FSM has caught up to CommitIndex.
+// leadership transition (Raft §5.4.2), then records CommitIndex, and
+// finally confirms leadership via a quorum check (VerifyLeader) so that
+// a partitioned leader cannot return stale data. When Barrier was
+// executed in this call, VerifyLeader is skipped because Barrier already
+// implies a quorum commit.
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
-	if err := e.VerifyLeader(ctx); err != nil {
-		return 0, err
+	if e.raft.State() != raft.Leader {
+		return 0, errors.WithStack(raft.ErrNotLeader)
 	}
 
 	// Raft §5.4.2: a leader cannot determine which entries from previous
@@ -146,15 +149,24 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	// Barrier has been issued since the last leadership transition, run one
 	// now so that CommitIndex is authoritative. Subsequent reads in the
 	// same leadership epoch skip the Barrier and use the fast ReadIndex path.
-	if err := e.ensureBarrierForEpoch(ctx); err != nil {
+	performedBarrier, err := e.ensureBarrierForEpoch(ctx)
+	if err != nil {
 		return 0, err
 	}
 
-	// ReadIndex protocol: record the current commit index, then wait for the
-	// FSM to apply up to that point. This avoids the per-read cost of
-	// Barrier (which proposes a no-op log entry through Raft consensus)
-	// while still guaranteeing linearizable reads.
+	// Record CommitIndex before the quorum check. The ReadIndex protocol
+	// requires that the leadership verification happens after the read
+	// index has been determined to prevent a partitioned leader from
+	// returning stale data.
 	commitIndex := e.raft.CommitIndex()
+
+	// When Barrier was just performed it already confirmed leadership via
+	// quorum, so VerifyLeader would be redundant.
+	if !performedBarrier {
+		if err := e.VerifyLeader(ctx); err != nil {
+			return 0, err
+		}
+	}
 
 	// Fast path: FSM is already caught up (common case under normal load).
 	if e.raft.AppliedIndex() >= commitIndex {
@@ -178,13 +190,15 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 
 // ensureBarrierForEpoch issues a single Barrier per leadership epoch so
 // that CommitIndex reflects all entries from previous terms (Raft §5.4.2).
+// It returns true when a Barrier was actually performed (which implies a
+// quorum commit), false when the current epoch already has a valid Barrier.
 //
 // Leadership transitions are detected by draining raft.LeaderCh()
 // (non-blocking) rather than calling the expensive raft.Stats(). The
 // method blocks concurrent callers on barrierMu; only one Barrier is
 // in-flight per epoch, and subsequent callers observe the updated
 // barrierEpoch on the fast path.
-func (e *Engine) ensureBarrierForEpoch(ctx context.Context) error {
+func (e *Engine) ensureBarrierForEpoch(ctx context.Context) (bool, error) {
 	e.barrierMu.Lock()
 	defer e.barrierMu.Unlock()
 
@@ -194,37 +208,41 @@ func (e *Engine) ensureBarrierForEpoch(ctx context.Context) error {
 	e.drainLeaderCh()
 
 	if e.barrierEpoch >= e.leaderEpoch {
-		return nil
+		return false, nil
 	}
 
 	// Re-verify leadership after acquiring the lock; another goroutine
 	// may have caused a leadership change while we waited.
 	if e.raft.State() != raft.Leader {
-		return errors.WithStack(raft.ErrNotLeader)
+		return false, errors.WithStack(raft.ErrNotLeader)
 	}
 
 	timeout, err := timeoutFromContext(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := e.raft.Barrier(timeout).Error(); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
-			return ctxErr
+			return false, ctxErr
 		}
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 
 	e.barrierEpoch = e.leaderEpoch
-	return nil
+	return true, nil
 }
 
 // drainLeaderCh non-blocking drains all pending events from raft.LeaderCh().
 // Any transition (gained or lost) increments leaderEpoch so that the next
-// read triggers a fresh Barrier. Must be called with barrierMu held.
+// read triggers a fresh Barrier. Handles closed channels gracefully.
+// Must be called with barrierMu held.
 func (e *Engine) drainLeaderCh() {
 	for {
 		select {
-		case <-e.leaderCh:
+		case _, ok := <-e.leaderCh:
+			if !ok {
+				return
+			}
 			e.leaderEpoch++
 		default:
 			return
