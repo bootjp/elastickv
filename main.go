@@ -16,7 +16,6 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -49,6 +48,7 @@ var (
 	pprofAddr            = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
 	pprofToken           = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftId               = flag.String("raftId", "", "Node id used by Raft")
+	raftEngineName       = flag.String("raftEngine", string(raftEngineHashicorp), "Raft engine implementation (hashicorp|etcd)")
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
@@ -67,22 +67,14 @@ func main() {
 }
 
 func run() error {
-	if *raftId == "" {
-		return errors.New("flag --raftId is required")
+	cfg, engineType, bootstrapServers, bootstrap, err := resolveRuntimeInputs()
+	if err != nil {
+		return err
 	}
 
 	var lc net.ListenConfig
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map)
-	if err != nil {
-		return err
-	}
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
-	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
-	if err != nil {
-		return err
-	}
-	bootstrap := *raftBootstrap || len(bootstrapServers) > 0
 
 	runtimes, shardGroups, err := buildShardGroups(
 		*raftId,
@@ -91,6 +83,7 @@ func run() error {
 		cfg.multi,
 		bootstrap,
 		bootstrapServers,
+		engineType,
 		func(groupID uint64) kv.ProposalObserver {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
@@ -172,6 +165,29 @@ func run() error {
 		return errors.Wrapf(err, "failed to serve")
 	}
 	return nil
+}
+
+func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raft.Server, bool, error) {
+	if *raftId == "" {
+		return runtimeConfig{}, "", nil, false, errors.New("flag --raftId is required")
+	}
+
+	engineType, err := parseRaftEngineType(*raftEngineName)
+	if err != nil {
+		return runtimeConfig{}, "", nil, false, err
+	}
+
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map)
+	if err != nil {
+		return runtimeConfig{}, "", nil, false, err
+	}
+
+	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
+	if err != nil {
+		return runtimeConfig{}, "", nil, false, err
+	}
+
+	return cfg, engineType, bootstrapServers, *raftBootstrap || len(bootstrapServers) > 0, nil
 }
 
 const snapshotRetainCount = 3
@@ -297,6 +313,7 @@ func buildShardGroups(
 	multi bool,
 	bootstrap bool,
 	bootstrapServers []raft.Server,
+	engineType raftEngineType,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
@@ -311,37 +328,20 @@ func buildShardGroups(
 			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
 		}
 		fsm := kv.NewKvFSM(st)
-		r, tm, closeStores, err := newRaftGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, fsm)
+		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, fsm, engineType)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
 			}
-			if r != nil {
-				_ = r.Shutdown().Error()
-			}
-			if tm != nil {
-				_ = tm.Close()
-			}
 			_ = st.Close()
-			if closeStores != nil {
-				closeStores()
-			}
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
-		engine := hashicorpraftengine.New(r)
-		runtimes = append(runtimes, &raftGroupRuntime{
-			spec:        g,
-			raft:        r,
-			engine:      engine,
-			tm:          tm,
-			store:       st,
-			closeStores: closeStores,
-		})
+		runtimes = append(runtimes, runtime)
 		shardGroups[g.id] = &kv.ShardGroup{
-			Raft:   r,
-			Engine: engine,
+			Raft:   runtime.raft,
+			Engine: runtime.engine,
 			Store:  st,
-			Txn:    kv.NewLeaderProxyWithEngine(engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
+			Txn:    kv.NewLeaderProxyWithEngine(runtime.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
 		}
 	}
 	return runtimes, shardGroups, nil
@@ -403,7 +403,7 @@ func startRaftServers(
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 		pb.RegisterDistributionServer(gs, distServer)
-		rt.tm.Register(gs)
+		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 		reflection.Register(gs)
 

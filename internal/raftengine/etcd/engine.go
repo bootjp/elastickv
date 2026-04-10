@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -19,30 +20,37 @@ import (
 )
 
 const (
-	defaultTickInterval    = 10 * time.Millisecond
-	defaultHeartbeatTick   = 1
-	defaultElectionTick    = 10
-	defaultMaxInflightMsg  = 256
-	defaultMaxSizePerMsg   = 1 << 20
-	defaultDispatchWorkers = 4
-	defaultSnapshotEvery   = 10_000
-	unknownLastContact     = time.Duration(-1)
+	defaultTickInterval      = 10 * time.Millisecond
+	defaultHeartbeatTick     = 1
+	defaultElectionTick      = 10
+	defaultMaxInflightMsg    = 256
+	defaultMaxSizePerMsg     = 1 << 20
+	defaultDispatchWorkers   = 4
+	defaultSnapshotEvery     = 10_000
+	defaultAdminPollInterval = 10 * time.Millisecond
+	unknownLastContact       = time.Duration(-1)
 
-	proposalEnvelopeVersion = byte(0x01)
-	readContextVersion      = byte(0x02)
-	envelopeHeaderSize      = 9
+	proposalEnvelopeVersion  = byte(0x01)
+	readContextVersion       = byte(0x02)
+	confChangeContextVersion = byte(0x03)
+	envelopeHeaderSize       = 9
+	confChangeFixedSize      = 21
 )
 
 var (
-	errNilEngine         = errors.New("raft engine is not configured")
-	errClosed            = errors.New("etcd raft engine is closed")
-	errNotLeader         = errors.New("etcd raft engine is not leader")
-	errNodeIDRequired    = errors.New("etcd raft node id is required")
-	errDataDirRequired   = errors.New("etcd raft data dir is required")
-	errStateMachineUnset = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired  = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull     = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch   = errors.New("etcd raft persisted cluster does not match configured peers")
+	errNilEngine                  = errors.New("raft engine is not configured")
+	errClosed                     = errors.New("etcd raft engine is closed")
+	errNotLeader                  = errors.New("etcd raft engine is not leader")
+	errNodeIDRequired             = errors.New("etcd raft node id is required")
+	errDataDirRequired            = errors.New("etcd raft data dir is required")
+	errStateMachineUnset          = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired           = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull              = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch            = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch        = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
 )
 
 type Snapshot interface {
@@ -95,6 +103,7 @@ type Engine struct {
 
 	proposeCh      chan proposalRequest
 	readCh         chan readRequest
+	adminCh        chan adminRequest
 	stepCh         chan raftpb.Message
 	dispatchCh     chan dispatchRequest
 	dispatchStopCh chan struct{}
@@ -116,13 +125,14 @@ type Engine struct {
 	dispatchWG   sync.WaitGroup
 	snapshotWG   sync.WaitGroup
 
-	mu      sync.RWMutex
-	pending sync.Mutex
-	status  raftengine.Status
-	config  raftengine.Configuration
-	runErr  error
-	closed  bool
-	applied uint64
+	mu          sync.RWMutex
+	pending     sync.Mutex
+	status      raftengine.Status
+	config      raftengine.Configuration
+	runErr      error
+	closed      bool
+	applied     uint64
+	configIndex uint64
 
 	lastLeaderContactAt   time.Time
 	lastLeaderContactFrom uint64
@@ -136,8 +146,32 @@ type Engine struct {
 
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
+	pendingConfigs   map[uint64]adminRequest
 	snapshotInFlight bool
 	dispatchFn       func(context.Context, dispatchRequest) error
+}
+
+type adminAction byte
+
+const (
+	adminActionAddVoter adminAction = iota + 1
+	adminActionRemoveServer
+	adminActionTransferLeadership
+)
+
+type adminRequest struct {
+	ctx       context.Context
+	id        uint64
+	action    adminAction
+	peer      Peer
+	prevIndex uint64
+	done      chan adminResult
+}
+
+type adminResult struct {
+	index uint64
+	peer  Peer
+	err   error
 }
 
 type proposalRequest struct {
@@ -226,32 +260,33 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
-		nodeID:       cfg.NodeID,
-		localID:      cfg.LocalID,
-		localAddress: cfg.LocalAddress,
-		dataDir:      cfg.DataDir,
-		tickInterval: cfg.TickInterval,
-		storage:      disk.Storage,
-		rawNode:      rawNode,
-		persist:      disk.Persist,
-		fsm:          cfg.StateMachine,
-		peers:        peerMap,
-		transport:    cfg.Transport,
-		proposeCh:    make(chan proposalRequest),
-		readCh:       make(chan readRequest),
-		stepCh:       make(chan raftpb.Message, defaultMaxInflightMsg),
-		closeCh:      make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		startedCh:    make(chan struct{}),
-		leaderReady:  make(chan struct{}),
-		config: raftengine.Configuration{
-			Servers: configServersForPeers(peers),
-		},
+		nodeID:           cfg.NodeID,
+		localID:          cfg.LocalID,
+		localAddress:     cfg.LocalAddress,
+		dataDir:          cfg.DataDir,
+		tickInterval:     cfg.TickInterval,
+		storage:          disk.Storage,
+		rawNode:          rawNode,
+		persist:          disk.Persist,
+		fsm:              cfg.StateMachine,
+		peers:            peerMap,
+		transport:        cfg.Transport,
+		proposeCh:        make(chan proposalRequest),
+		readCh:           make(chan readRequest),
+		adminCh:          make(chan adminRequest),
+		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
+		closeCh:          make(chan struct{}),
+		doneCh:           make(chan struct{}),
+		startedCh:        make(chan struct{}),
+		leaderReady:      make(chan struct{}),
+		config:           configurationFromConfState(peerMap, disk.LocalSnap.Metadata.ConfState),
 		applied:          maxAppliedIndex(disk.LocalSnap),
+		configIndex:      maxAppliedIndex(disk.LocalSnap),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
+		pendingConfigs:   map[uint64]adminRequest{},
 	}
 	engine.initTransport(cfg)
 	engine.initSnapshotWorker()
@@ -468,9 +503,105 @@ func (e *Engine) Configuration(ctx context.Context) (raftengine.Configuration, e
 	if e == nil {
 		return raftengine.Configuration{}, errors.WithStack(errNilEngine)
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.config, nil
+	return e.currentConfiguration(), nil
+}
+
+func (e *Engine) AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	peer, err := e.resolveAdminPeer(id, address)
+	if err != nil {
+		return 0, err
+	}
+	result, err := e.submitAdmin(ctx, adminActionAddVoter, peer, prevIndex)
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
+func (e *Engine) RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error) {
+	result, err := e.submitAdmin(ctx, adminActionRemoveServer, Peer{ID: id}, prevIndex)
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
+func (e *Engine) TransferLeadership(ctx context.Context) error {
+	result, err := e.submitAdmin(ctx, adminActionTransferLeadership, Peer{}, 0)
+	if err != nil {
+		return err
+	}
+	return e.waitForLeadershipTransfer(ctx, result.peer)
+}
+
+func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, address string) error {
+	result, err := e.submitAdmin(ctx, adminActionTransferLeadership, Peer{ID: id, Address: address}, 0)
+	if err != nil {
+		return err
+	}
+	return e.waitForLeadershipTransfer(ctx, result.peer)
+}
+
+func (e *Engine) submitAdmin(ctx context.Context, action adminAction, peer Peer, prevIndex uint64) (adminResult, error) {
+	if err := contextErr(ctx); err != nil {
+		return adminResult{}, err
+	}
+	if e == nil {
+		return adminResult{}, errors.WithStack(errNilEngine)
+	}
+	req := adminRequest{
+		ctx:       ctx,
+		id:        e.nextID(),
+		action:    action,
+		peer:      peer,
+		prevIndex: prevIndex,
+		done:      make(chan adminResult, 1),
+	}
+
+	select {
+	case <-ctx.Done():
+		return adminResult{}, errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return adminResult{}, e.currentErrorOrClosed()
+	case e.adminCh <- req:
+	}
+
+	select {
+	case <-ctx.Done():
+		e.cancelPendingConfig(req.id)
+		return adminResult{}, errors.WithStack(ctx.Err())
+	case res := <-req.done:
+		if res.err != nil {
+			return adminResult{}, res.err
+		}
+		return res, nil
+	}
+}
+
+func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) error {
+	if target.NodeID == 0 {
+		return errors.WithStack(errLeadershipTransferTarget)
+	}
+	ticker := time.NewTicker(defaultAdminPollInterval)
+	defer ticker.Stop()
+
+	for {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		status := e.Status()
+		if status.State != raftengine.StateLeader && status.Leader.ID == target.ID {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return errors.WithStack(ctx.Err())
+		case <-e.doneCh:
+			return e.currentErrorOrClosed()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (e *Engine) run() {
@@ -510,7 +641,7 @@ func (e *Engine) startup() error {
 	if e.State() == raftengine.StateLeader {
 		return nil
 	}
-	if len(e.peers) > 1 {
+	if !e.shouldCampaignSingleNode() {
 		return nil
 	}
 	if err := e.rawNode.Campaign(); err != nil {
@@ -529,6 +660,8 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleProposal(req)
 	case req := <-e.readCh:
 		e.handleRead(req)
+	case req := <-e.adminCh:
+		e.handleAdmin(req)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
 	case result := <-e.snapshotResCh:
@@ -566,6 +699,84 @@ func (e *Engine) handleRead(req readRequest) {
 	}
 	e.storePendingRead(req)
 	e.rawNode.ReadIndex(encodeReadContext(req.id))
+}
+
+func (e *Engine) handleAdmin(req adminRequest) {
+	if err := contextErr(req.ctx); err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	if e.State() != raftengine.StateLeader {
+		req.done <- adminResult{err: errors.WithStack(errNotLeader)}
+		return
+	}
+	currentIndex := e.currentConfigIndex()
+	if req.prevIndex != 0 && req.prevIndex != currentIndex {
+		req.done <- adminResult{err: errors.Wrapf(errConfigIndexMismatch, "got %d want %d", req.prevIndex, currentIndex)}
+		return
+	}
+
+	switch req.action {
+	case adminActionAddVoter:
+		e.handleAddVoter(req)
+	case adminActionRemoveServer:
+		e.handleRemoveServer(req)
+	case adminActionTransferLeadership:
+		e.handleTransferLeadership(req)
+	default:
+		req.done <- adminResult{err: errors.New("unknown admin action")}
+	}
+}
+
+func (e *Engine) handleAddVoter(req adminRequest) {
+	contextBytes, err := encodeConfChangeContext(req.id, req.peer)
+	if err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	cc := raftpb.ConfChange{
+		Type:    raftpb.ConfChangeAddNode,
+		NodeID:  req.peer.NodeID,
+		Context: contextBytes,
+	}
+	e.storePendingConfig(req)
+	if err := e.rawNode.ProposeConfChange(cc); err != nil {
+		e.cancelPendingConfig(req.id)
+		req.done <- adminResult{err: errors.WithStack(err)}
+	}
+}
+
+func (e *Engine) handleRemoveServer(req adminRequest) {
+	peer, ok := e.peerForID(req.peer.ID)
+	if !ok {
+		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
+		return
+	}
+	contextBytes, err := encodeConfChangeContext(req.id, peer)
+	if err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	cc := raftpb.ConfChange{
+		Type:    raftpb.ConfChangeRemoveNode,
+		NodeID:  peer.NodeID,
+		Context: contextBytes,
+	}
+	e.storePendingConfig(req)
+	if err := e.rawNode.ProposeConfChange(cc); err != nil {
+		e.cancelPendingConfig(req.id)
+		req.done <- adminResult{err: errors.WithStack(err)}
+	}
+}
+
+func (e *Engine) handleTransferLeadership(req adminRequest) {
+	target, err := e.resolveTransferTarget(req.peer)
+	if err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	e.rawNode.TransferLeader(target.NodeID)
+	req.done <- adminResult{peer: target}
 }
 
 func (e *Engine) drainReady() error {
@@ -621,6 +832,9 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	}
 	e.recordLeaderContact(msg)
 	if err := e.rawNode.Step(msg); err != nil {
+		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
+			return
+		}
 		e.fail(errors.WithStack(err))
 	}
 }
@@ -682,6 +896,7 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 		return errors.WithStack(err)
 	}
 	e.applied = snapshot.Metadata.Index
+	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
 	return nil
 }
 
@@ -754,14 +969,22 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 			if err := cc.Unmarshal(entry.Data); err != nil {
 				return errors.WithStack(err)
 			}
-			e.rawNode.ApplyConfChange(cc)
+			confState := e.rawNode.ApplyConfChange(cc)
+			if err := e.persistConfigSnapshot(entry.Index, *confState); err != nil {
+				return err
+			}
+			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
 			e.applied = entry.Index
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
 			if err := cc.Unmarshal(entry.Data); err != nil {
 				return errors.WithStack(err)
 			}
-			e.rawNode.ApplyConfChange(cc)
+			confState := e.rawNode.ApplyConfChange(cc)
+			if err := e.persistConfigSnapshot(entry.Index, *confState); err != nil {
+				return err
+			}
+			e.applyConfigChangeV2(cc, entry.Index)
 			e.applied = entry.Index
 		default:
 			e.applied = entry.Index
@@ -798,6 +1021,143 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 	}
 }
 
+func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64) {
+	e.applyConfigPeerChange(changeType, nodeID, context)
+	e.setConfigIndex(index)
+	e.resolveConfigChange(index, context)
+}
+
+func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
+	for _, change := range cc.Changes {
+		e.applyConfigPeerChange(change.Type, change.NodeID, cc.Context)
+	}
+	e.setConfigIndex(index)
+	e.resolveConfigChange(index, cc.Context)
+}
+
+func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
+	_, peer, ok := decodeConfChangeContext(context)
+	switch changeType {
+	case raftpb.ConfChangeAddNode:
+		e.applyAddedPeer(nodeID, peer, ok)
+	case raftpb.ConfChangeRemoveNode:
+		e.applyRemovedPeer(nodeID, peer, ok)
+	case raftpb.ConfChangeUpdateNode:
+		e.applyUpdatedPeer(peer, ok)
+	case raftpb.ConfChangeAddLearnerNode:
+		// Phase 3 only exposes voter membership changes. Ignore learner metadata
+		// if it appears in a replayed log; startup validation still rejects joint
+		// consensus snapshots and learner-only cluster states for now.
+	}
+}
+
+func (e *Engine) applyAddedPeer(nodeID uint64, peer Peer, ok bool) {
+	if ok {
+		e.upsertPeer(peer)
+		return
+	}
+	if nodeID == 0 {
+		return
+	}
+	e.upsertPeer(Peer{
+		NodeID:  nodeID,
+		ID:      strconv.FormatUint(nodeID, 10),
+		Address: "",
+	})
+}
+
+func (e *Engine) applyRemovedPeer(nodeID uint64, peer Peer, ok bool) {
+	if ok && peer.NodeID != 0 {
+		e.removePeer(peer.NodeID)
+		return
+	}
+	if nodeID != 0 {
+		e.removePeer(nodeID)
+	}
+}
+
+func (e *Engine) applyUpdatedPeer(peer Peer, ok bool) {
+	if ok {
+		e.upsertPeer(peer)
+	}
+}
+
+func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
+	payload, err := e.snapshotPayload()
+	if err != nil {
+		return err
+	}
+
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
+		return err
+	} else if upToDate {
+		return nil
+	}
+
+	snap, err := e.createConfigSnapshot(index, confState, payload)
+	if err != nil {
+		return err
+	}
+	if err := e.persistCreatedSnapshot(snap); err != nil {
+		return err
+	}
+	return e.compactSnapshot(index)
+}
+
+func (e *Engine) snapshotPayload() ([]byte, error) {
+	snapshot, err := e.fsm.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return snapshotBytesAndClose(snapshot, e.dataDir)
+}
+
+func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return current.Metadata.Index >= index && equalConfState(current.Metadata.ConfState, confState), nil
+}
+
+func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, payload []byte) (raftpb.Snapshot, error) {
+	snap, err := e.storage.CreateSnapshot(index, &confState, payload)
+	if err == nil {
+		return snap, nil
+	}
+	switch {
+	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+		return raftpb.Snapshot{}, nil
+	case errors.Is(err, etcdraft.ErrCompacted):
+		return raftpb.Snapshot{}, nil
+	default:
+		return raftpb.Snapshot{}, errors.WithStack(err)
+	}
+}
+
+func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
+		return nil
+	}
+	if err := e.persist.SaveSnap(snap); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := e.persist.Release(snap); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (e *Engine) compactSnapshot(index uint64) error {
+	if err := e.storage.Compact(index); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
 func (e *Engine) handleReadStates(states []etcdraft.ReadState) {
 	for _, state := range states {
 		id, ok := decodeReadContext(state.RequestCtx)
@@ -829,6 +1189,7 @@ func (e *Engine) refreshStatus() {
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
 	snapshot, _ := e.storage.Snapshot()
+	config := e.currentConfiguration()
 
 	state := translateState(basic.RaftState)
 	leader := e.leaderInfo(basic.Lead)
@@ -842,7 +1203,7 @@ func (e *Engine) refreshStatus() {
 		LastLogIndex:      lastLogIndex,
 		LastSnapshotIndex: snapshot.Metadata.Index,
 		FSMPending:        pendingEntries(basic.Commit, e.applied),
-		NumPeers:          numRemotePeers(e.peers),
+		NumPeers:          numRemoteServers(config.Servers, e.localID),
 		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
 	}
 
@@ -900,12 +1261,15 @@ func (e *Engine) fail(err error) {
 }
 
 func (e *Engine) failPending(err error) {
-	proposals, reads := e.drainPending()
+	proposals, reads, configs := e.drainPending()
 	for _, req := range proposals {
 		req.done <- proposalResult{err: err}
 	}
 	for _, req := range reads {
 		req.done <- readResult{err: err}
+	}
+	for _, req := range configs {
+		req.done <- adminResult{err: err}
 	}
 }
 
@@ -966,6 +1330,31 @@ func (e *Engine) cancelPendingRead(id uint64) {
 	e.pending.Unlock()
 }
 
+func (e *Engine) storePendingConfig(req adminRequest) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	e.pendingConfigs[req.id] = req
+}
+
+func (e *Engine) popPendingConfig(id uint64) (adminRequest, bool) {
+	e.pending.Lock()
+	defer e.pending.Unlock()
+	req, ok := e.pendingConfigs[id]
+	if ok {
+		delete(e.pendingConfigs, id)
+	}
+	return req, ok
+}
+
+func (e *Engine) cancelPendingConfig(id uint64) {
+	if id == 0 {
+		return
+	}
+	e.pending.Lock()
+	delete(e.pendingConfigs, id)
+	e.pending.Unlock()
+}
+
 func (e *Engine) readyReads(applied uint64) []readRequest {
 	e.pending.Lock()
 	defer e.pending.Unlock()
@@ -981,7 +1370,7 @@ func (e *Engine) readyReads(applied uint64) []readRequest {
 	return ready
 }
 
-func (e *Engine) drainPending() ([]proposalRequest, []readRequest) {
+func (e *Engine) drainPending() ([]proposalRequest, []readRequest, []adminRequest) {
 	e.pending.Lock()
 	defer e.pending.Unlock()
 
@@ -995,7 +1384,12 @@ func (e *Engine) drainPending() ([]proposalRequest, []readRequest) {
 		delete(e.pendingReads, id)
 		reads = append(reads, req)
 	}
-	return proposals, reads
+	configs := make([]adminRequest, 0, len(e.pendingConfigs))
+	for id, req := range e.pendingConfigs {
+		delete(e.pendingConfigs, id)
+		configs = append(configs, req)
+	}
+	return proposals, reads, configs
 }
 
 func (e *Engine) currentError() error {
@@ -1011,6 +1405,64 @@ func (e *Engine) currentErrorOrClosed() error {
 		return e.runErr
 	}
 	return errors.WithStack(errClosed)
+}
+
+func (e *Engine) currentConfiguration() raftengine.Configuration {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cfg := raftengine.Configuration{
+		Servers: append([]raftengine.Server(nil), e.config.Servers...),
+	}
+	return cfg
+}
+
+func (e *Engine) currentConfigIndex() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.configIndex
+}
+
+func (e *Engine) shouldCampaignSingleNode() bool {
+	cfg := e.currentConfiguration()
+	return len(cfg.Servers) == 1 && cfg.Servers[0].ID == e.localID
+}
+
+func (e *Engine) resolveAdminPeer(id string, address string) (Peer, error) {
+	if e.transport != nil {
+		if peer, ok := e.transport.peerByIdentity(id, address); ok {
+			return peer, nil
+		}
+	}
+	e.mu.RLock()
+	for _, peer := range e.peers {
+		if id != "" && peer.ID != id {
+			continue
+		}
+		if address != "" && peer.Address != address {
+			continue
+		}
+		e.mu.RUnlock()
+		return peer, nil
+	}
+	e.mu.RUnlock()
+	return normalizePeer(Peer{ID: id, Address: address})
+}
+
+func (e *Engine) setConfigIndex(index uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if index > e.configIndex {
+		e.configIndex = index
+	}
+}
+
+func (e *Engine) setConfigurationFromConfState(conf raftpb.ConfState, index uint64) {
+	e.mu.Lock()
+	e.config = configurationFromConfState(e.peers, conf)
+	if index > e.configIndex {
+		e.configIndex = index
+	}
+	e.mu.Unlock()
 }
 
 func (e *Engine) nextID() uint64 {
@@ -1106,12 +1558,40 @@ func pendingEntries(commitIndex uint64, appliedIndex uint64) uint64 {
 	return commitIndex - appliedIndex
 }
 
-func numRemotePeers(peers map[uint64]Peer) uint64 {
-	count, err := uint32Len(len(peers))
-	if err != nil || count == 0 {
-		return 0
+func configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration {
+	if len(conf.Voters) == 0 {
+		return raftengine.Configuration{}
 	}
-	return uint64(count - 1)
+
+	servers := make([]raftengine.Server, 0, len(conf.Voters))
+	for _, nodeID := range conf.Voters {
+		peer, ok := peers[nodeID]
+		if ok {
+			servers = append(servers, raftengine.Server{
+				ID:       peer.ID,
+				Address:  peer.Address,
+				Suffrage: "voter",
+			})
+			continue
+		}
+		servers = append(servers, raftengine.Server{
+			ID:       strconv.FormatUint(nodeID, 10),
+			Address:  "",
+			Suffrage: "voter",
+		})
+	}
+	return raftengine.Configuration{Servers: servers}
+}
+
+func numRemoteServers(servers []raftengine.Server, localID string) uint64 {
+	var count uint64
+	for _, server := range servers {
+		if server.ID == localID {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func lastContactFor(state raftengine.State, leaderNodeID uint64, lastFrom uint64, lastAt time.Time) time.Duration {
@@ -1276,10 +1756,141 @@ func (e *Engine) leaderInfo(leaderNodeID uint64) raftengine.LeaderInfo {
 	if leaderNodeID == 0 {
 		return raftengine.LeaderInfo{}
 	}
-	if peer, ok := e.peers[leaderNodeID]; ok {
+	e.mu.RLock()
+	peer, ok := e.peers[leaderNodeID]
+	e.mu.RUnlock()
+	if ok {
 		return raftengine.LeaderInfo{ID: peer.ID, Address: peer.Address}
 	}
 	return raftengine.LeaderInfo{ID: strconv.FormatUint(leaderNodeID, 10)}
+}
+
+func (e *Engine) resolveConfigChange(index uint64, context []byte) {
+	id, peer, ok := decodeConfChangeContext(context)
+	if !ok {
+		return
+	}
+	req, ok := e.popPendingConfig(id)
+	if !ok {
+		return
+	}
+	req.done <- adminResult{
+		index: index,
+		peer:  peer,
+	}
+}
+
+func (e *Engine) peerForID(id string) (Peer, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, peer := range e.peers {
+		if peer.ID == id {
+			return peer, true
+		}
+	}
+	if id == e.localID {
+		return Peer{
+			NodeID:  e.nodeID,
+			ID:      e.localID,
+			Address: e.localAddress,
+		}, true
+	}
+	for _, server := range e.config.Servers {
+		if server.ID != id {
+			continue
+		}
+		return Peer{
+			NodeID:  DeriveNodeID(server.ID),
+			ID:      server.ID,
+			Address: server.Address,
+		}, true
+	}
+	return Peer{}, false
+}
+
+func (e *Engine) resolveTransferTarget(target Peer) (Peer, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.config.Servers) == 0 {
+		return Peer{}, errors.WithStack(errLeadershipTransferNotReady)
+	}
+	if target.ID == "" && target.Address == "" {
+		return e.defaultTransferTargetLocked()
+	}
+	return e.namedTransferTargetLocked(target)
+}
+
+func (e *Engine) defaultTransferTargetLocked() (Peer, error) {
+	for _, server := range e.config.Servers {
+		if server.ID == e.localID {
+			continue
+		}
+		return peerFromServer(e.peers, server), nil
+	}
+	return Peer{}, errors.WithStack(errLeadershipTransferNotReady)
+}
+
+func (e *Engine) namedTransferTargetLocked(target Peer) (Peer, error) {
+	for _, server := range e.config.Servers {
+		if target.ID != "" && server.ID != target.ID {
+			continue
+		}
+		if target.Address != "" && server.Address != target.Address {
+			continue
+		}
+		if server.ID == e.localID {
+			return Peer{}, errors.WithStack(errLeadershipTransferTarget)
+		}
+		return peerFromServer(e.peers, server), nil
+	}
+	if target.ID != "" {
+		return Peer{}, errors.Wrapf(errTransportPeerUnknown, "id=%q", target.ID)
+	}
+	return Peer{}, errors.Wrapf(errTransportPeerUnknown, "address=%q", target.Address)
+}
+
+func (e *Engine) upsertPeer(peer Peer) {
+	if peer.NodeID == 0 {
+		peer.NodeID = DeriveNodeID(peer.ID)
+	}
+	if peer.ID == "" {
+		peer.ID = strconv.FormatUint(peer.NodeID, 10)
+	}
+
+	e.mu.Lock()
+	if e.peers == nil {
+		e.peers = make(map[uint64]Peer)
+	}
+	e.peers[peer.NodeID] = peer
+	e.config.Servers = upsertConfigServer(e.peers, e.config.Servers, raftengine.Server{
+		ID:       peer.ID,
+		Address:  peer.Address,
+		Suffrage: "voter",
+	})
+	e.mu.Unlock()
+
+	if e.transport != nil {
+		e.transport.UpsertPeer(peer)
+	}
+}
+
+func (e *Engine) removePeer(nodeID uint64) {
+	if nodeID == 0 {
+		return
+	}
+
+	e.mu.Lock()
+	peer, ok := e.peers[nodeID]
+	if ok {
+		delete(e.peers, nodeID)
+	}
+	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
+	e.mu.Unlock()
+
+	if e.transport != nil {
+		e.transport.RemovePeer(nodeID)
+	}
 }
 
 func encodeProposalEnvelope(id uint64, payload []byte) []byte {
@@ -1446,4 +2057,155 @@ func decodeReadContext(data []byte) (uint64, bool) {
 		return 0, false
 	}
 	return binary.BigEndian.Uint64(data[1:envelopeHeaderSize]), true
+}
+
+func encodeConfChangeContext(id uint64, peer Peer) ([]byte, error) {
+	idLen, err := uint16Len(len(peer.ID))
+	if err != nil {
+		return nil, err
+	}
+	addressLen, err := uint16Len(len(peer.Address))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, confChangeFixedSize+len(peer.ID)+len(peer.Address))
+	out[0] = confChangeContextVersion
+	binary.BigEndian.PutUint64(out[1:9], id)
+	binary.BigEndian.PutUint64(out[9:17], peer.NodeID)
+	binary.BigEndian.PutUint16(out[17:19], idLen)
+	binary.BigEndian.PutUint16(out[19:21], addressLen)
+	offset := confChangeFixedSize
+	copy(out[offset:offset+len(peer.ID)], peer.ID)
+	offset += len(peer.ID)
+	copy(out[offset:offset+len(peer.Address)], peer.Address)
+	return out, nil
+}
+
+func decodeConfChangeContext(data []byte) (uint64, Peer, bool) {
+	if len(data) < confChangeFixedSize || data[0] != confChangeContextVersion {
+		return 0, Peer{}, false
+	}
+	idLen := int(binary.BigEndian.Uint16(data[17:19]))
+	addressLen := int(binary.BigEndian.Uint16(data[19:21]))
+	if len(data) != confChangeFixedSize+idLen+addressLen {
+		return 0, Peer{}, false
+	}
+	offset := confChangeFixedSize
+	peerID := string(data[offset : offset+idLen])
+	offset += idLen
+	address := string(data[offset : offset+addressLen])
+	return binary.BigEndian.Uint64(data[1:9]), Peer{
+		NodeID:  binary.BigEndian.Uint64(data[9:17]),
+		ID:      peerID,
+		Address: address,
+	}, true
+}
+
+func uint16Len(n int) (uint16, error) {
+	if n < 0 || n > 0xffff {
+		return 0, errors.WithStack(errConfChangeContextTooLarge)
+	}
+	return uint16(n), nil
+}
+
+func peerFromServer(peers map[uint64]Peer, server raftengine.Server) Peer {
+	if nodeID, ok := configServerNodeID(peers, server); ok {
+		if peer, ok := peers[nodeID]; ok {
+			return peer
+		}
+		return Peer{
+			NodeID:  nodeID,
+			ID:      server.ID,
+			Address: server.Address,
+		}
+	}
+	return Peer{
+		NodeID:  DeriveNodeID(server.ID),
+		ID:      server.ID,
+		Address: server.Address,
+	}
+}
+
+func upsertConfigServer(peers map[uint64]Peer, servers []raftengine.Server, server raftengine.Server) []raftengine.Server {
+	out := append([]raftengine.Server(nil), servers...)
+	for i := range out {
+		if out[i].ID != server.ID {
+			continue
+		}
+		out[i] = server
+		sortConfigServers(peers, out)
+		return out
+	}
+	out = append(out, server)
+	sortConfigServers(peers, out)
+	return out
+}
+
+func removeConfigServer(peers map[uint64]Peer, servers []raftengine.Server, nodeID uint64, serverID string) []raftengine.Server {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([]raftengine.Server, 0, len(servers))
+	for _, server := range servers {
+		if serverID != "" && server.ID == serverID {
+			continue
+		}
+		if nodeID != 0 && serverNodeID(peers, server) == nodeID {
+			continue
+		}
+		out = append(out, server)
+	}
+	sortConfigServers(peers, out)
+	return out
+}
+
+func sortConfigServers(peers map[uint64]Peer, servers []raftengine.Server) {
+	sort.Slice(servers, func(i, j int) bool {
+		left := serverNodeID(peers, servers[i])
+		right := serverNodeID(peers, servers[j])
+		if left == right {
+			return servers[i].ID < servers[j].ID
+		}
+		return left < right
+	})
+}
+
+func serverNodeID(peers map[uint64]Peer, server raftengine.Server) uint64 {
+	if nodeID, ok := configServerNodeID(peers, server); ok {
+		return nodeID
+	}
+	return DeriveNodeID(server.ID)
+}
+
+func configServerNodeID(peers map[uint64]Peer, server raftengine.Server) (uint64, bool) {
+	for nodeID, peer := range peers {
+		if server.ID != "" && peer.ID == server.ID {
+			return nodeID, true
+		}
+		if server.Address != "" && peer.Address == server.Address {
+			return nodeID, true
+		}
+	}
+	return 0, false
+}
+
+func equalConfState(left raftpb.ConfState, right raftpb.ConfState) bool {
+	return equalUint64s(left.Voters, right.Voters) &&
+		equalUint64s(left.Learners, right.Learners) &&
+		equalUint64s(left.VotersOutgoing, right.VotersOutgoing) &&
+		equalUint64s(left.LearnersNext, right.LearnersNext) &&
+		left.AutoLeave == right.AutoLeave
+}
+
+func equalUint64s(left []uint64, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }

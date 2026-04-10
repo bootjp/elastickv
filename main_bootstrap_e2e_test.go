@@ -277,7 +277,7 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, nil)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, raftEngineHashicorp, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +376,7 @@ func startBoundGRPCServer(
 	relay *adapter.RedisPubSubRelay,
 	listener net.Listener,
 ) error {
-	if rt == nil || rt.raft == nil || rt.tm == nil {
+	if rt == nil || rt.engine == nil {
 		return fmt.Errorf("raft runtime is not ready")
 	}
 	if listener == nil {
@@ -384,13 +384,13 @@ func startBoundGRPCServer(
 	}
 
 	gs := grpc.NewServer()
-	trx := kv.NewTransaction(rt.raft)
+	trx := kv.NewTransactionWithProposer(rt.engine)
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
 	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 	pb.RegisterDistributionServer(gs, distServer)
-	rt.tm.Register(gs)
+	rt.registerGRPC(gs)
 	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 	reflection.Register(gs)
 
