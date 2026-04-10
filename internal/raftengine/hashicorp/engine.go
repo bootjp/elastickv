@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -18,6 +19,9 @@ var errNilEngine = errors.New("raft engine is not configured")
 
 type Engine struct {
 	raft *raft.Raft
+
+	mu          sync.Mutex
+	barrierTerm uint64 // term in which we last successfully ran Barrier
 }
 
 func New(r *raft.Raft) *Engine {
@@ -123,10 +127,19 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 
+	// Raft §5.4.2: a leader cannot determine which entries from previous
+	// terms are committed until it commits an entry in its own term. If no
+	// Barrier has been issued in the current term yet, run one now so that
+	// CommitIndex is authoritative. Subsequent reads in the same term skip
+	// the Barrier and use the fast ReadIndex path.
+	if err := e.ensureBarrierForTerm(ctx); err != nil {
+		return 0, err
+	}
+
 	// ReadIndex protocol: record the current commit index, then wait for the
-	// FSM to apply up to that point. This avoids the cost of Barrier (which
-	// proposes a no-op log entry through Raft consensus) while still
-	// guaranteeing linearizable reads.
+	// FSM to apply up to that point. This avoids the per-read cost of
+	// Barrier (which proposes a no-op log entry through Raft consensus)
+	// while still guaranteeing linearizable reads.
 	commitIndex := e.raft.CommitIndex()
 
 	// Fast path: FSM is already caught up (common case under normal load).
@@ -134,28 +147,50 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 		return commitIndex, nil
 	}
 
-	timeout, err := timeoutFromContext(ctx)
-	if err != nil {
-		return 0, err
-	}
-	deadline := time.Now().Add(timeout)
-
 	ticker := time.NewTicker(readIndexPollInterval)
 	defer ticker.Stop()
 
 	for {
+		if e.raft.AppliedIndex() >= commitIndex {
+			return commitIndex, nil
+		}
 		select {
 		case <-ctx.Done():
 			return 0, errors.WithStack(ctx.Err())
 		case <-ticker.C:
-			if e.raft.AppliedIndex() >= commitIndex {
-				return commitIndex, nil
-			}
-			if time.Now().After(deadline) {
-				return 0, errors.WithStack(context.DeadlineExceeded)
-			}
 		}
 	}
+}
+
+// ensureBarrierForTerm issues a single Barrier per term to guarantee that
+// CommitIndex reflects all entries from previous terms (Raft §5.4.2).
+func (e *Engine) ensureBarrierForTerm(ctx context.Context) error {
+	currentTerm := parseUint(e.raft.Stats()["term"])
+
+	e.mu.Lock()
+	if e.barrierTerm >= currentTerm {
+		e.mu.Unlock()
+		return nil
+	}
+	e.mu.Unlock()
+
+	timeout, err := timeoutFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if err := e.raft.Barrier(timeout).Error(); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return ctxErr
+		}
+		return errors.WithStack(err)
+	}
+
+	e.mu.Lock()
+	if currentTerm > e.barrierTerm {
+		e.barrierTerm = currentTerm
+	}
+	e.mu.Unlock()
+	return nil
 }
 
 func (e *Engine) Status() raftengine.Status {
