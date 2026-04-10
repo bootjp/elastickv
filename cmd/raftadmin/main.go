@@ -114,7 +114,7 @@ func boolEnv(name string) (bool, error) {
 	case "0", "false", "no", "off":
 		return false, nil
 	default:
-		return false, errors.Errorf("parse %s", name)
+		return false, errors.Errorf("invalid boolean value for %s: %q", name, raw)
 	}
 }
 

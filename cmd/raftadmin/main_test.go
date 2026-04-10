@@ -115,7 +115,7 @@ func TestTransportCredentialsForTLSAndInvalidBoolEnv(t *testing.T) {
 	t.Setenv(tlsEnv, "")
 	t.Setenv(allowInsecureEnv, "maybe")
 	_, err = allowInsecurePlaintext("10.0.0.12:50051")
-	require.Error(t, err)
+	require.EqualError(t, err, `invalid boolean value for RAFTADMIN_ALLOW_INSECURE: "maybe"`)
 }
 
 func captureStdout(t *testing.T, run func()) string {

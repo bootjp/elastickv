@@ -16,6 +16,7 @@ import (
 
 const (
 	defaultHealthPollInterval = 250 * time.Millisecond
+	minHealthPollInterval     = 10 * time.Millisecond
 	healthPollIntervalEnv     = "RAFTADMIN_HEALTH_POLL_INTERVAL_MS"
 )
 
@@ -23,14 +24,15 @@ func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine ra
 	if gs == nil {
 		return
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
 
 	pb.RegisterRaftAdminServer(gs, NewServer(engine))
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)
+	if ctx == nil {
+		setHealthStatus(healthSrv, dedupeServices(serviceNames), currentHealthStatus(context.Background(), engine))
+		return
+	}
 	go observeLeaderHealth(ctx, engine, healthSrv, serviceNames, healthPollInterval())
 }
 
@@ -66,7 +68,11 @@ func healthPollInterval() time.Duration {
 	if err != nil || millis <= 0 {
 		return defaultHealthPollInterval
 	}
-	return time.Duration(millis) * time.Millisecond
+	interval := time.Duration(millis) * time.Millisecond
+	if interval < minHealthPollInterval {
+		return minHealthPollInterval
+	}
+	return interval
 }
 
 func currentHealthStatus(parent context.Context, engine raftengine.Engine) healthpb.HealthCheckResponse_ServingStatus {
