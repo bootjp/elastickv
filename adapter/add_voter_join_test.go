@@ -10,9 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
-	"github.com/Jille/raftadmin"
-	raftadminpb "github.com/Jille/raftadmin/proto"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -46,7 +45,7 @@ func TestAddVoterJoinPath_RegistersMemberAndServesAdapterTraffic(t *testing.T) {
 	adminConn, err := grpc.NewClient(nodes[0].grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = adminConn.Close() })
-	admin := raftadminpb.NewRaftAdminClient(adminConn)
+	admin := pb.NewRaftAdminClient(adminConn)
 
 	addVotersAndAwait(t, ctx, rpcTimeout, admin, nodes, []int{1, 2})
 
@@ -113,7 +112,7 @@ func setupAddVoterJoinPathNodes(t *testing.T, ctx context.Context) ([]Node, *ser
 	workers := newServerWorkers(len(ports) * 3)
 	nodes := make([]Node, 0, len(ports))
 	for i := range ports {
-		nodes = append(nodes, startAddVoterJoinNode(t, workers, i, ports[i], lis[i], bootstrapCfg, leaderRedisMap))
+		nodes = append(nodes, startAddVoterJoinNode(t, ctx, workers, i, ports[i], lis[i], bootstrapCfg, leaderRedisMap))
 	}
 	return nodes, workers
 }
@@ -141,6 +140,7 @@ func reserveAddVoterJoinListeners(t *testing.T, ctx context.Context, n int) ([]p
 
 func startAddVoterJoinNode(
 	t *testing.T,
+	ctx context.Context,
 	workers *serverWorkers,
 	idx int,
 	port portsAdress,
@@ -167,12 +167,12 @@ func startAddVoterJoinNode(
 	relay := NewRedisPubSubRelay()
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
+	opsCtx, opsCancel := context.WithCancel(ctx)
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
 	pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock(), relay))
-	leaderhealth.Setup(r, s, []string{"RawKV"})
-	raftadmin.Register(s, r)
+	internalraftadmin.RegisterOperationalServices(opsCtx, s, hashicorpraftengine.New(r), []string{"RawKV"})
 
 	workers.Go(func() error {
 		err := s.Serve(lis.grpc)
@@ -211,6 +211,7 @@ func startAddVoterJoinNode(
 		gs,
 		rd,
 		ds,
+		opsCancel,
 	)
 }
 
@@ -218,7 +219,7 @@ func addVotersAndAwait(
 	t *testing.T,
 	ctx context.Context,
 	rpcTimeout time.Duration,
-	admin raftadminpb.RaftAdminClient,
+	admin pb.RaftAdminClient,
 	nodes []Node,
 	targets []int,
 ) {
@@ -226,20 +227,14 @@ func addVotersAndAwait(
 
 	for _, target := range targets {
 		addCtx, cancelAdd := context.WithTimeout(ctx, rpcTimeout)
-		future, err := admin.AddVoter(addCtx, &raftadminpb.AddVoterRequest{
+		future, err := admin.AddVoter(addCtx, &pb.RaftAdminAddVoterRequest{
 			Id:            strconv.Itoa(target),
 			Address:       nodes[target].grpcAddress,
 			PreviousIndex: 0,
 		})
 		cancelAdd()
 		require.NoError(t, err)
-
-		awaitCtx, cancelAwait := context.WithTimeout(ctx, rpcTimeout)
-		await, err := admin.Await(awaitCtx, future)
-		cancelAwait()
-		require.NoError(t, err)
-		require.Empty(t, await.GetError())
-		require.Greater(t, await.GetIndex(), uint64(0))
+		require.Greater(t, future.GetIndex(), uint64(0))
 	}
 }
 

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
-	"github.com/Jille/raftadmin"
 	internalutil "github.com/bootjp/elastickv/internal"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -28,6 +28,9 @@ import (
 
 func shutdown(nodes []Node) {
 	for _, n := range nodes {
+		if n.opsCancel != nil {
+			n.opsCancel()
+		}
 		n.grpcServer.Stop()
 		if n.grpcService != nil {
 			if err := n.grpcService.Close(); err != nil {
@@ -112,11 +115,12 @@ type Node struct {
 	grpcService   *GRPCServer
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
+	opsCancel     context.CancelFunc
 	raft          *raft.Raft
 	tm            *transport.Manager
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, opsCancel context.CancelFunc) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
@@ -126,6 +130,7 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *ra
 		grpcService:   grpcService,
 		redisServer:   rd,
 		dynamoServer:  ds,
+		opsCancel:     opsCancel,
 		raft:          r,
 		tm:            tm,
 	}
@@ -356,13 +361,12 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		relay := NewRedisPubSubRelay()
 		routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 		gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
+		opsCtx, opsCancel := context.WithCancel(ctx)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
 		pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock(), relay))
-
-		leaderhealth.Setup(r, s, []string{"Example"})
-		raftadmin.Register(s, r)
+		internalraftadmin.RegisterOperationalServices(opsCtx, s, hashicorpraftengine.New(r), []string{"Example"})
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
 		redisAdders = append(redisAdders, port.redisAddress)
@@ -391,6 +395,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			gs,
 			rd,
 			ds,
+			opsCancel,
 		))
 	}
 

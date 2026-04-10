@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -46,17 +49,17 @@ Optional environment:
   ROLLING_DELAY_SECONDS
   SSH_CONNECT_TIMEOUT_SECONDS
   SSH_STRICT_HOST_KEY_CHECKING
-  RAFTADMIN_VERSION
   RAFTADMIN_BIN
   RAFTADMIN_REMOTE_BIN
   RAFTADMIN_RPC_TIMEOUT_SECONDS
+  RAFTADMIN_ALLOW_INSECURE
 
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and S3_PORT.
-  - If RAFTADMIN_BIN is set, it must already be executable on the remote nodes.
+  - If RAFTADMIN_BIN is set, it must already be executable on the local control host.
 EOF
 }
 
@@ -93,9 +96,9 @@ LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
 ROLLING_DELAY_SECONDS="${ROLLING_DELAY_SECONDS:-2}"
 SSH_CONNECT_TIMEOUT_SECONDS="${SSH_CONNECT_TIMEOUT_SECONDS:-10}"
 SSH_STRICT_HOST_KEY_CHECKING="${SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
-RAFTADMIN_VERSION="${RAFTADMIN_VERSION:-v1.2.1}"
 RAFTADMIN_REMOTE_BIN="${RAFTADMIN_REMOTE_BIN:-/tmp/elastickv-raftadmin}"
 RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-5}"
+RAFTADMIN_ALLOW_INSECURE="${RAFTADMIN_ALLOW_INSECURE:-true}"
 NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
@@ -119,7 +122,6 @@ RAFTADMIN_LOCAL_BIN="${RAFTADMIN_BIN:-}"
 RAFTADMIN_TMP_DIR=""
 RAFTADMIN_LINUX_AMD64_BIN=""
 RAFTADMIN_LINUX_ARM64_BIN=""
-RAFTADMIN_MODULE_DIR=""
 
 NODE_IDS=()
 NODE_HOSTS=()
@@ -293,14 +295,9 @@ ensure_local_raftadmin() {
   fi
 
   RAFTADMIN_TMP_DIR="$(mktemp -d)"
-  echo "[rolling-update] preparing raftadmin helper build workspace"
-  RAFTADMIN_MODULE_DIR="$(
-    go mod download -json "github.com/Jille/raftadmin@${RAFTADMIN_VERSION}" |
-      sed -nE 's/^[[:space:]]*"Dir":[[:space:]]*"([^"]+)",?/\1/p' |
-      head -n1
-  )"
-  if [[ -z "$RAFTADMIN_MODULE_DIR" || ! -d "$RAFTADMIN_MODULE_DIR" ]]; then
-    echo "failed to locate raftadmin module source for ${RAFTADMIN_VERSION}" >&2
+  echo "[rolling-update] preparing native raftadmin helper build workspace"
+  if [[ ! -f "${REPO_ROOT}/cmd/raftadmin/main.go" ]]; then
+    echo "failed to locate repo raftadmin helper source at ${REPO_ROOT}/cmd/raftadmin" >&2
     exit 1
   fi
 }
@@ -321,9 +318,9 @@ build_raftadmin_variant() {
     return 0
   fi
 
-  echo "[rolling-update] building raftadmin helper for ${goos}/${goarch}" >&2
+  echo "[rolling-update] building native raftadmin helper for ${goos}/${goarch}" >&2
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-    go build -C "$RAFTADMIN_MODULE_DIR" -o "$out" ./cmd/raftadmin
+    go build -C "$REPO_ROOT" -o "$out" ./cmd/raftadmin
   chmod +x "$out"
   printf '%s\n' "$out"
 }
@@ -412,6 +409,7 @@ update_one_node() {
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
       RAFTADMIN_RPC_TIMEOUT_SECONDS="$RAFTADMIN_RPC_TIMEOUT_SECONDS" \
+      RAFTADMIN_ALLOW_INSECURE="$RAFTADMIN_ALLOW_INSECURE" \
       NODE_ID="$node_id" \
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \

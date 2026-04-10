@@ -102,6 +102,19 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 	return nil
 }
 
+func (e *Engine) CheckServing(ctx context.Context) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if e == nil || e.raft == nil {
+		return errors.WithStack(errNilEngine)
+	}
+	if e.State() != raftengine.StateLeader {
+		return errors.WithStack(raft.ErrNotLeader)
+	}
+	return nil
+}
+
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	if err := e.VerifyLeader(ctx); err != nil {
 		return 0, err
@@ -166,6 +179,78 @@ func (e *Engine) Configuration(ctx context.Context) (raftengine.Configuration, e
 		})
 	}
 	return cfg, nil
+}
+
+func (e *Engine) AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	timeout, err := timeoutFromContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if e == nil || e.raft == nil {
+		return 0, errors.WithStack(errNilEngine)
+	}
+
+	future := e.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), prevIndex, timeout)
+	if err := future.Error(); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return 0, ctxErr
+		}
+		return 0, errors.WithStack(err)
+	}
+	return future.Index(), nil
+}
+
+func (e *Engine) RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error) {
+	timeout, err := timeoutFromContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if e == nil || e.raft == nil {
+		return 0, errors.WithStack(errNilEngine)
+	}
+
+	future := e.raft.RemoveServer(raft.ServerID(id), prevIndex, timeout)
+	if err := future.Error(); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return 0, ctxErr
+		}
+		return 0, errors.WithStack(err)
+	}
+	return future.Index(), nil
+}
+
+func (e *Engine) TransferLeadership(ctx context.Context) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if e == nil || e.raft == nil {
+		return errors.WithStack(errNilEngine)
+	}
+
+	if err := e.raft.LeadershipTransfer().Error(); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return ctxErr
+		}
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, address string) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if e == nil || e.raft == nil {
+		return errors.WithStack(errNilEngine)
+	}
+
+	if err := e.raft.LeadershipTransferToServer(raft.ServerID(id), raft.ServerAddress(address)).Error(); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return ctxErr
+		}
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func timeoutFromContext(ctx context.Context) (time.Duration, error) {

@@ -25,7 +25,7 @@
     (.mkdirs)))
 
 (defn- build-binaries!
-  "Build elastickv server and raftadmin on the control node, targeting linux/amd64."
+  "Build elastickv server and the repo-owned raftadmin helper on the control node."
   []
   (ensure-build-dir!)
   (let [root (-> (io/file "..") .getCanonicalPath)
@@ -37,7 +37,7 @@
                      "GOPATH" "/home/vagrant/go"
                      "GOCACHE" "/home/vagrant/.cache/go-build"})]
     (doseq [[out-cmd args] [["elastickv" ["go" "build" "-o" (str build-dir "/elastickv") "./cmd/server"]]
-                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "github.com/Jille/raftadmin/cmd/raftadmin"]]]]
+                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]]]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
           (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
@@ -155,7 +155,8 @@
   (c/on bootstrap-node
     (c/su
       (try (c/exec :pkill :-f "raftadmin") (catch Exception _))
-      (c/exec raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
+      (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
+              raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
 (defrecord ElastickvDB [opts]
   db/DB
