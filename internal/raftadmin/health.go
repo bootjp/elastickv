@@ -24,20 +24,15 @@ func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine ra
 	if gs == nil {
 		return
 	}
+	if ctx == nil {
+		panic("raftadmin: RegisterOperationalServices requires non-nil context")
+	}
 
 	pb.RegisterRaftAdminServer(gs, NewServer(engine))
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)
-	if ctx == nil {
-		registerStaticHealthService(healthSrv, engine, serviceNames)
-		return
-	}
 	go observeLeaderHealth(ctx, engine, healthSrv, serviceNames, healthPollInterval())
-}
-
-func registerStaticHealthService(healthSrv *health.Server, engine raftengine.Engine, serviceNames []string) {
-	setHealthStatus(healthSrv, dedupeServices(serviceNames), currentHealthStatus(context.Background(), engine))
 }
 
 func observeLeaderHealth(ctx context.Context, engine raftengine.Engine, healthSrv *health.Server, serviceNames []string, pollInterval time.Duration) {

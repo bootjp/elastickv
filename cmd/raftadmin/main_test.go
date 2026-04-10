@@ -3,7 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"os"
 	"testing"
 	"time"
@@ -116,6 +122,50 @@ func TestTransportCredentialsForTLSAndInvalidBoolEnv(t *testing.T) {
 	t.Setenv(allowInsecureEnv, "maybe")
 	_, err = allowInsecurePlaintext("10.0.0.12:50051")
 	require.EqualError(t, err, `invalid boolean value for RAFTADMIN_ALLOW_INSECURE: "maybe"`)
+}
+
+func TestTransportCredentialsForTLSWithCustomCA(t *testing.T) {
+	certPath := writeTestCACert(t)
+	t.Setenv(tlsEnv, "true")
+	t.Setenv(tlsCACertEnv, certPath)
+
+	creds, err := transportCredentialsFor("10.0.0.12:50051")
+	require.NoError(t, err)
+	require.NotNil(t, creds)
+}
+
+func TestTransportCredentialsForTLSWithMissingCA(t *testing.T) {
+	t.Setenv(tlsEnv, "true")
+	t.Setenv(tlsCACertEnv, "/does/not/exist.pem")
+
+	_, err := transportCredentialsFor("10.0.0.12:50051")
+	require.ErrorContains(t, err, "read RAFTADMIN_TLS_CA_CERT")
+}
+
+func writeTestCACert(t *testing.T) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "raftadmin test ca",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	path := t.TempDir() + "/ca.pem"
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	require.NoError(t, os.WriteFile(path, pemBytes, 0o600))
+	return path
 }
 
 func captureStdout(t *testing.T, run func()) string {

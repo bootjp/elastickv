@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/url"
@@ -28,6 +29,7 @@ const (
 	timeoutEnv               = "RAFTADMIN_RPC_TIMEOUT_SECONDS"
 	allowInsecureEnv         = "RAFTADMIN_ALLOW_INSECURE"
 	tlsEnv                   = "RAFTADMIN_TLS"
+	tlsCACertEnv             = "RAFTADMIN_TLS_CA_CERT"
 )
 
 func main() {
@@ -79,7 +81,11 @@ func transportCredentialsFor(addr string) (credentials.TransportCredentials, err
 		return nil, err
 	}
 	if useTLS {
-		return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
+		tlsConfig, err := tlsConfigFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		return credentials.NewTLS(tlsConfig), nil
 	}
 
 	allowInsecure, err := allowInsecurePlaintext(addr)
@@ -90,6 +96,26 @@ func transportCredentialsFor(addr string) (credentials.TransportCredentials, err
 		return nil, errors.New("plaintext raftadmin to non-loopback address requires RAFTADMIN_ALLOW_INSECURE=true or RAFTADMIN_TLS=true")
 	}
 	return insecure.NewCredentials(), nil
+}
+
+func tlsConfigFromEnv() (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	caPath := strings.TrimSpace(os.Getenv(tlsCACertEnv))
+	if caPath == "" {
+		return cfg, nil
+	}
+
+	pemBytes, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read %s", tlsCACertEnv)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, errors.Errorf("parse %s: %q", tlsCACertEnv, caPath)
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
 }
 
 func allowInsecurePlaintext(addr string) (bool, error) {

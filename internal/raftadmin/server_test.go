@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -282,46 +281,12 @@ func TestHealthPollIntervalClampsMinimum(t *testing.T) {
 	require.Equal(t, minHealthPollInterval, healthPollInterval())
 }
 
-func TestRegisterOperationalServicesWithoutContextPublishesStaticHealth(t *testing.T) {
+func TestRegisterOperationalServicesRequiresContext(t *testing.T) {
 	t.Parallel()
 
-	engine := &fakeEngine{
-		status:  raftengine.Status{State: raftengine.StateLeader},
-		serving: true,
-	}
-
-	listener := bufconn.Listen(1024 * 1024)
 	server := grpc.NewServer()
-	pb.RegisterRaftAdminServer(server, NewServer(engine))
-	healthSrv := health.NewServer()
-	healthpb.RegisterHealthServer(server, healthSrv)
-	registerStaticHealthService(healthSrv, engine, []string{"RawKV"})
-	go func() {
-		_ = server.Serve(listener)
-	}()
-	t.Cleanup(server.Stop)
-
-	conn, err := grpc.NewClient(
-		"passthrough:///bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-
-	client := healthpb.NewHealthClient(conn)
-	require.Eventually(t, func() bool {
-		resp, checkErr := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "RawKV"})
-		return checkErr == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
-	}, 5*time.Second, 50*time.Millisecond)
-
-	engine.mu.Lock()
-	engine.serving = false
-	engine.mu.Unlock()
-
-	resp, err := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "RawKV"})
-	require.NoError(t, err)
-	require.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.Status)
+	var nilCtx context.Context
+	require.PanicsWithValue(t, "raftadmin: RegisterOperationalServices requires non-nil context", func() {
+		RegisterOperationalServices(nilCtx, server, &fakeEngine{}, []string{"RawKV"})
+	})
 }
