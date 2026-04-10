@@ -888,6 +888,21 @@ func TestTransferLeadershipToServerMovesLeader(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 }
 
+func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
+	engine := &Engine{
+		pendingConfigs: map[uint64]adminRequest{},
+	}
+
+	maxPending := uint64(defaultMaxPendingConfigs)
+	for id := uint64(1); id <= maxPending; id++ {
+		require.NoError(t, engine.storePendingConfig(adminRequest{id: id}))
+	}
+
+	err := engine.storePendingConfig(adminRequest{id: maxPending + 1})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errTooManyPendingConfigs))
+}
+
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
 	t.Helper()
 

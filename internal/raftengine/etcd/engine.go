@@ -28,6 +28,7 @@ const (
 	defaultDispatchWorkers   = 4
 	defaultSnapshotEvery     = 10_000
 	defaultAdminPollInterval = 10 * time.Millisecond
+	defaultMaxPendingConfigs = 64
 	unknownLastContact       = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
@@ -51,6 +52,7 @@ var (
 	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
+	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
 type Snapshot interface {
@@ -739,7 +741,10 @@ func (e *Engine) handleAddVoter(req adminRequest) {
 		NodeID:  req.peer.NodeID,
 		Context: contextBytes,
 	}
-	e.storePendingConfig(req)
+	if err := e.storePendingConfig(req); err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
 	if err := e.rawNode.ProposeConfChange(cc); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
@@ -762,7 +767,10 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 		NodeID:  peer.NodeID,
 		Context: contextBytes,
 	}
-	e.storePendingConfig(req)
+	if err := e.storePendingConfig(req); err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
 	if err := e.rawNode.ProposeConfChange(cc); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
@@ -1333,10 +1341,14 @@ func (e *Engine) cancelPendingRead(id uint64) {
 	e.pending.Unlock()
 }
 
-func (e *Engine) storePendingConfig(req adminRequest) {
+func (e *Engine) storePendingConfig(req adminRequest) error {
 	e.pending.Lock()
 	defer e.pending.Unlock()
+	if len(e.pendingConfigs) >= defaultMaxPendingConfigs {
+		return errors.WithStack(errTooManyPendingConfigs)
+	}
 	e.pendingConfigs[req.id] = req
+	return nil
 }
 
 func (e *Engine) popPendingConfig(id uint64) (adminRequest, bool) {
