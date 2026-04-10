@@ -367,31 +367,34 @@ func (s *S3Server) resolveAuth(r *http.Request, bucket string) *s3AuthError {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return s.authorizeRequest(r)
 	}
-	// ListBuckets (no bucket) always requires authentication.
-	if bucket == "" {
-		return s.authorizeRequest(r)
+	if s.isAnonymousReadAllowed(r, bucket) {
+		return nil
 	}
-	// ACL query parameter requests always require authentication.
-	if r.URL.Query().Has("acl") {
-		return s.authorizeRequest(r)
+	return s.authorizeRequest(r)
+}
+
+// isAnonymousReadAllowed returns true when the request targets a public-read
+// bucket and the operation is a safe read-only one, allowing unauthenticated
+// access.
+func (s *S3Server) isAnonymousReadAllowed(r *http.Request, bucket string) bool {
+	// ListBuckets (no bucket) and ACL queries always require authentication.
+	if bucket == "" || r.URL.Query().Has("acl") {
+		return false
 	}
 	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
 	// already authenticated; skip the public-bucket metadata read on the hot path.
 	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
-		return s.authorizeRequest(r)
+		return false
 	}
-	// Check if the bucket is public-read and the request is read-only.
-	if isReadOnlyS3Request(r) {
-		readTS := s.readTS()
-		readPin := s.pinReadTS(readTS)
-		defer readPin.Release()
+	if !isReadOnlyS3Request(r) {
+		return false
+	}
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
 
-		meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-		if err == nil && isPublicReadBucket(meta) {
-			return nil
-		}
-	}
-	return s.authorizeRequest(r)
+	meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	return err == nil && isPublicReadBucket(meta)
 }
 
 func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -694,23 +697,29 @@ func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	})
 }
 
+// s3RequestHasBody returns true if the request carries a body.
+// For chunked transfers (ContentLength == -1) it peeks one byte and, if
+// present, restores it so downstream readers are unaffected.
+func s3RequestHasBody(r *http.Request) bool {
+	if r.ContentLength > 0 {
+		return true
+	}
+	if r.ContentLength >= 0 || r.Body == nil {
+		return false
+	}
+	buf := make([]byte, 1)
+	n, readErr := r.Body.Read(buf)
+	if n > 0 {
+		// Restore the peeked byte so the body is not corrupted for any downstream use.
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+		return true
+	}
+	return readErr != nil && !errors.Is(readErr, io.EOF)
+}
+
 func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
 	// ACL specification via XML body is not supported; only the x-amz-acl header is accepted.
-	// Detect a body via ContentLength, and also peek for chunked-encoded bodies (ContentLength == -1).
-	hasBody := r.ContentLength > 0
-	if !hasBody && r.ContentLength < 0 && r.Body != nil {
-		buf := make([]byte, 1)
-		n, readErr := r.Body.Read(buf)
-		if n > 0 {
-			hasBody = true
-			// Restore the peeked byte so the body is not corrupted for any downstream use.
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
-		} else if readErr != nil && !errors.Is(readErr, io.EOF) {
-			// Conservatively treat unexpected read errors as if a body is present.
-			hasBody = true
-		}
-	}
-	if hasBody {
+	if s3RequestHasBody(r) {
 		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "ACL specification via XML body is not supported; use the x-amz-acl header", bucket, "")
 		return
 	}
@@ -2671,8 +2680,13 @@ func isReadOnlyS3Request(r *http.Request) bool {
 		return len(q) == 0
 	}
 
-	// Bucket-level operations.
-	switch r.Method {
+	return isReadOnlyBucketOp(r.Method, q)
+}
+
+// isReadOnlyBucketOp returns true for bucket-level read-only operations
+// (HeadBucket, ListObjectsV2).
+func isReadOnlyBucketOp(method string, q url.Values) bool {
+	switch method {
 	case http.MethodHead:
 		// HeadBucket: no query params (or only "location").
 		return len(q) == 0 || (len(q) == 1 && q.Has("location"))
