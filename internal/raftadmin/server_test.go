@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -291,7 +292,10 @@ func TestRegisterOperationalServicesWithoutContextPublishesStaticHealth(t *testi
 
 	listener := bufconn.Listen(1024 * 1024)
 	server := grpc.NewServer()
-	RegisterOperationalServices(nil, server, engine, []string{"RawKV"})
+	pb.RegisterRaftAdminServer(server, NewServer(engine))
+	healthSrv := health.NewServer()
+	healthpb.RegisterHealthServer(server, healthSrv)
+	registerStaticHealthService(healthSrv, engine, []string{"RawKV"})
 	go func() {
 		_ = server.Serve(listener)
 	}()
