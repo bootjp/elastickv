@@ -2011,7 +2011,7 @@ func TestIsReadOnlyS3Request(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
+
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			req := newS3TestRequest(tc.method, tc.path, nil)

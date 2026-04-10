@@ -14,9 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
-	"github.com/Jille/raftadmin"
 	"github.com/bootjp/elastickv/adapter"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/hashicorp/raft"
@@ -389,11 +388,10 @@ func startBoundGRPCServer(
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
-	pb.RegisterInternalServer(gs, adapter.NewInternal(trx, rt.raft, coordinate.Clock(), relay))
+	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.tm.Register(gs)
-	leaderhealth.Setup(rt.raft, gs, []string{"RawKV"})
-	raftadmin.Register(gs, rt.raft)
+	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 	reflection.Register(gs)
 
 	srv := gs

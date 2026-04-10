@@ -14,13 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	transport "github.com/Jille/raft-grpc-transport"
-	"github.com/Jille/raftadmin"
-	raftadminpb "github.com/Jille/raftadmin/proto"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/kv"
@@ -253,7 +251,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 		return fmt.Errorf("failed to dial leader: %w", err)
 	}
 	defer conn.Close()
-	client := raftadminpb.NewRaftAdminClient(conn)
+	client := pb.NewRaftAdminClient(conn)
 
 	for _, n := range nodes[1:] {
 		if err := joinNodeWithRetry(ctx, client, n); err != nil {
@@ -263,7 +261,7 @@ func joinCluster(ctx context.Context, nodes []config) error {
 	return nil
 }
 
-func joinNodeWithRetry(ctx context.Context, client raftadminpb.RaftAdminClient, n config) error {
+func joinNodeWithRetry(ctx context.Context, client pb.RaftAdminClient, n config) error {
 	for i := range joinRetries {
 		if err := tryJoinNode(ctx, client, n); err == nil {
 			return nil
@@ -294,27 +292,17 @@ func joinRetryCancelResult(ctx context.Context) error {
 	return joinClusterWaitError(errors.WithStack(ctx.Err()))
 }
 
-func tryJoinNode(ctx context.Context, client raftadminpb.RaftAdminClient, n config) error {
+func tryJoinNode(ctx context.Context, client pb.RaftAdminClient, n config) error {
 	slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
 	addCtx, cancelAdd := context.WithTimeout(ctx, joinRPCTimeout)
 	defer cancelAdd()
-	future, err := client.AddVoter(addCtx, &raftadminpb.AddVoterRequest{
+	_, err := client.AddVoter(addCtx, &pb.RaftAdminAddVoterRequest{
 		Id:            n.raftID,
 		Address:       n.address,
 		PreviousIndex: 0,
 	})
 	if err != nil {
 		return errors.WithStack(err)
-	}
-
-	awaitCtx, cancelAwait := context.WithTimeout(ctx, joinRPCTimeout)
-	defer cancelAwait()
-	await, err := client.Await(awaitCtx, future)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if await.GetError() != "" {
-		return errors.New(await.GetError())
 	}
 	slog.Info("Successfully joined node", "id", n.raftID)
 	return nil
@@ -402,7 +390,7 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(ctx context.Context, r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
@@ -412,8 +400,7 @@ func setupGRPC(r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordina
 	pb.RegisterTransactionalKVServer(s, gs)
 	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock(), relay))
 	pb.RegisterDistributionServer(s, distServer)
-	leaderhealth.Setup(r, s, []string{"RawKV"})
-	raftadmin.Register(s, r)
+	internalraftadmin.RegisterOperationalServices(ctx, s, hashicorpraftengine.New(r), []string{"RawKV"})
 	return s, gs
 }
 
@@ -563,7 +550,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(r, st, tm, coordinator, distServer, relay, proposalObserver)
+	s, grpcSvc := setupGRPC(ctx, r, st, tm, coordinator, distServer, relay, proposalObserver)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
