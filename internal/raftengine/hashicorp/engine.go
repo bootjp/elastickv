@@ -18,17 +18,23 @@ const unknownLastContact = time.Duration(-1)
 var errNilEngine = errors.New("raft engine is not configured")
 
 type Engine struct {
-	raft *raft.Raft
+	raft     *raft.Raft
+	leaderCh <-chan bool
 
-	mu          sync.Mutex
-	barrierTerm uint64 // term in which we last successfully ran Barrier
+	barrierMu    sync.Mutex
+	leaderEpoch  uint64 // incremented on every leadership transition
+	barrierEpoch uint64 // epoch of last successful Barrier
 }
 
 func New(r *raft.Raft) *Engine {
 	if r == nil {
 		return nil
 	}
-	return &Engine{raft: r}
+	return &Engine{
+		raft:        r,
+		leaderCh:    r.LeaderCh(),
+		leaderEpoch: 1, // start at 1 so the first read always triggers a Barrier
+	}
 }
 
 func (e *Engine) Close() error {
@@ -107,8 +113,9 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 }
 
 // readIndexPollInterval is the interval between AppliedIndex polls while
-// waiting for the FSM to catch up to the commit index.
-const readIndexPollInterval = 500 * time.Microsecond
+// waiting for the FSM to catch up to the commit index. 10ms balances
+// latency against CPU overhead from polling the atomic AppliedIndex.
+const readIndexPollInterval = 10 * time.Millisecond
 
 func (e *Engine) CheckServing(ctx context.Context) error {
 	if err := contextErr(ctx); err != nil {
@@ -123,6 +130,12 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 	return nil
 }
 
+// LinearizableRead blocks until the local FSM has applied all entries up to
+// the current commit index, guaranteeing that a subsequent local read
+// observes the latest committed state (linearizable read). It first
+// ensures that at least one Barrier has been issued since the last
+// leadership transition (Raft §5.4.2), then polls AppliedIndex until
+// the FSM has caught up to CommitIndex.
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	if err := e.VerifyLeader(ctx); err != nil {
 		return 0, err
@@ -130,10 +143,10 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 
 	// Raft §5.4.2: a leader cannot determine which entries from previous
 	// terms are committed until it commits an entry in its own term. If no
-	// Barrier has been issued in the current term yet, run one now so that
-	// CommitIndex is authoritative. Subsequent reads in the same term skip
-	// the Barrier and use the fast ReadIndex path.
-	if err := e.ensureBarrierForTerm(ctx); err != nil {
+	// Barrier has been issued since the last leadership transition, run one
+	// now so that CommitIndex is authoritative. Subsequent reads in the
+	// same leadership epoch skip the Barrier and use the fast ReadIndex path.
+	if err := e.ensureBarrierForEpoch(ctx); err != nil {
 		return 0, err
 	}
 
@@ -163,21 +176,24 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	}
 }
 
-// ensureBarrierForTerm issues a single Barrier per Raft term so that
-// CommitIndex reflects all entries from previous terms (Raft §5.4.2).
-// The method blocks concurrent callers on the mutex; only one Barrier
-// is in-flight at a time, and subsequent callers observe the updated
-// barrierTerm on the fast path.
-func (e *Engine) ensureBarrierForTerm(ctx context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+// ensureBarrierForEpoch issues a single Barrier per leadership epoch so
+// that CommitIndex reflects all entries from previous terms (Raft §5.4.2).
+//
+// Leadership transitions are detected by draining raft.LeaderCh()
+// (non-blocking) rather than calling the expensive raft.Stats(). The
+// method blocks concurrent callers on barrierMu; only one Barrier is
+// in-flight per epoch, and subsequent callers observe the updated
+// barrierEpoch on the fast path.
+func (e *Engine) ensureBarrierForEpoch(ctx context.Context) error {
+	e.barrierMu.Lock()
+	defer e.barrierMu.Unlock()
 
-	// Read the current term under the lock so that concurrent callers
-	// serialise here instead of each calling the relatively expensive
-	// Stats() independently (Stats allocates a map and converts dozens
-	// of internal variables to strings).
-	currentTerm := parseUint(e.raft.Stats()["term"])
-	if e.barrierTerm >= currentTerm {
+	// Drain any pending leadership transition signals. Each signal
+	// (regardless of gained/lost) increments the epoch, invalidating
+	// the previous Barrier.
+	e.drainLeaderCh()
+
+	if e.barrierEpoch >= e.leaderEpoch {
 		return nil
 	}
 
@@ -198,8 +214,22 @@ func (e *Engine) ensureBarrierForTerm(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 
-	e.barrierTerm = currentTerm
+	e.barrierEpoch = e.leaderEpoch
 	return nil
+}
+
+// drainLeaderCh non-blocking drains all pending events from raft.LeaderCh().
+// Any transition (gained or lost) increments leaderEpoch so that the next
+// read triggers a fresh Barrier. Must be called with barrierMu held.
+func (e *Engine) drainLeaderCh() {
+	for {
+		select {
+		case <-e.leaderCh:
+			e.leaderEpoch++
+		default:
+			return
+		}
+	}
 }
 
 func (e *Engine) Status() raftengine.Status {
