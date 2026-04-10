@@ -166,7 +166,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		if isTxnInternalKey(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
-		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, 0); err != nil {
+		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 			return err
 		}
 	}
@@ -471,7 +471,7 @@ func (f *kvFSM) buildOnePhaseStoreMutations(ctx context.Context, muts []*pb.Muta
 		if isTxnInternalKey(mut.Key) {
 			return nil, errors.WithStack(ErrInvalidRequest)
 		}
-		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, 0); err != nil {
+		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -562,7 +562,7 @@ func (f *kvFSM) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint
 }
 
 func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {
-	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, startTS); err != nil {
+	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, primaryKey, startTS); err != nil {
 		return nil, err
 	}
 
@@ -701,7 +701,7 @@ func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key, primaryKey []byte,
 	return true, nil
 }
 
-func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key []byte, startTS uint64) error {
+func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key, primaryKey []byte, startTS uint64) error {
 	lockBytes, err := f.store.GetAt(ctx, txnLockKey(key), ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -713,7 +713,7 @@ func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key []byte, star
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if startTS != 0 && lock.StartTS == startTS {
+	if startTS != 0 && lock.StartTS == startTS && bytes.Equal(lock.PrimaryKey, primaryKey) {
 		return nil
 	}
 	return NewTxnLockedError(key)

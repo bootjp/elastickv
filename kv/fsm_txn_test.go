@@ -67,6 +67,66 @@ func TestTxnDuplicateMutations_LastWriteWins(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestPrepareAllowsIdempotentRetryForSameStartTSAndPrimary(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(10)
+	primaryKey := []byte("p")
+	key := []byte("k")
+
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}
+
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+}
+
+func TestPrepareRejectsSameStartTSDifferentPrimary(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSM(st).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(10)
+	key := []byte("k")
+
+	first := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("p1"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v1")},
+		},
+	}
+	second := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("p2"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v2")},
+		},
+	}
+
+	require.NoError(t, applyFSMRequest(t, fsm, first))
+	err := applyFSMRequest(t, fsm, second)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnLocked)
+}
+
 func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
 	t.Parallel()
 
