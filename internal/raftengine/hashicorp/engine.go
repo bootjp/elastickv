@@ -109,6 +109,7 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 // readIndexPollInterval is the interval between AppliedIndex polls while
 // waiting for the FSM to catch up to the commit index.
 const readIndexPollInterval = 500 * time.Microsecond
+
 func (e *Engine) CheckServing(ctx context.Context) error {
 	if err := contextErr(ctx); err != nil {
 		return err
@@ -162,17 +163,29 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	}
 }
 
-// ensureBarrierForTerm issues a single Barrier per term to guarantee that
+// ensureBarrierForTerm issues a single Barrier per Raft term so that
 // CommitIndex reflects all entries from previous terms (Raft §5.4.2).
+// The method blocks concurrent callers on the mutex; only one Barrier
+// is in-flight at a time, and subsequent callers observe the updated
+// barrierTerm on the fast path.
 func (e *Engine) ensureBarrierForTerm(ctx context.Context) error {
-	currentTerm := parseUint(e.raft.Stats()["term"])
-
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Read the current term under the lock so that concurrent callers
+	// serialise here instead of each calling the relatively expensive
+	// Stats() independently (Stats allocates a map and converts dozens
+	// of internal variables to strings).
+	currentTerm := parseUint(e.raft.Stats()["term"])
 	if e.barrierTerm >= currentTerm {
-		e.mu.Unlock()
 		return nil
 	}
-	e.mu.Unlock()
+
+	// Re-verify leadership after acquiring the lock; another goroutine
+	// may have caused a leadership change while we waited.
+	if e.raft.State() != raft.Leader {
+		return errors.WithStack(raft.ErrNotLeader)
+	}
 
 	timeout, err := timeoutFromContext(ctx)
 	if err != nil {
@@ -185,11 +198,7 @@ func (e *Engine) ensureBarrierForTerm(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 
-	e.mu.Lock()
-	if currentTerm > e.barrierTerm {
-		e.barrierTerm = currentTerm
-	}
-	e.mu.Unlock()
+	e.barrierTerm = currentTerm
 	return nil
 }
 
