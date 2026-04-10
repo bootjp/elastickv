@@ -1395,6 +1395,7 @@ type txnContext struct {
 	listStates map[string]*listTxnState
 	zsetStates map[string]*zsetTxnState
 	ttlStates  map[string]*ttlTxnState
+	readKeys   map[string][]byte
 	startTS    uint64
 }
 
@@ -1430,10 +1431,42 @@ func stageListDelete(st *listTxnState) {
 	st.appends = nil
 }
 
+func (t *txnContext) trackReadKey(key []byte) {
+	if len(key) == 0 {
+		return
+	}
+	k := string(key)
+	if _, ok := t.readKeys[k]; ok {
+		return
+	}
+	t.readKeys[k] = bytes.Clone(key)
+}
+
+func (t *txnContext) trackTypeReadKeys(key []byte) {
+	for _, readKey := range [][]byte{
+		listMetaKey(key),
+		redisHashKey(key),
+		redisSetKey(key),
+		redisZSetKey(key),
+		redisStreamKey(key),
+		redisHLLKey(key),
+		key,
+		redisTTLKey(key),
+	} {
+		t.trackReadKey(readKey)
+	}
+}
+
 func (t *txnContext) load(key []byte) (*txnValue, error) {
 	k := string(key)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
+	}
+	t.trackReadKey(key)
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		t.trackReadKey(redisTTLKey(userKey))
+	} else if !bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
+		t.trackReadKey(redisTTLKey(key))
 	}
 	tv := &txnValue{}
 	val, err := t.server.readValueAt(key, t.startTS)
@@ -1451,6 +1484,8 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	if st, ok := t.listStates[k]; ok {
 		return st, nil
 	}
+	t.trackReadKey(listMetaKey(key))
+	t.trackReadKey(redisTTLKey(key))
 
 	meta, exists, err := t.server.loadListMetaAt(context.Background(), key, t.startTS)
 	if err != nil {
@@ -1475,6 +1510,7 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	if st, ok := t.zsetStates[k]; ok {
 		return st, nil
 	}
+	t.trackReadKey(redisZSetKey(key))
 	// Check TTL: treat expired keys as non-existent.
 	ttlSt, err := t.loadTTLState(key)
 	if err != nil {
@@ -1505,6 +1541,7 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 	if st, ok := t.ttlStates[k]; ok {
 		return st, nil
 	}
+	t.trackReadKey(redisTTLKey(key))
 	value, err := t.server.ttlAt(context.Background(), key, t.startTS)
 	if err != nil {
 		return nil, err
@@ -1525,6 +1562,7 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 	if typ, ok := t.stagedStringType(k); ok {
 		return typ, nil
 	}
+	t.trackTypeReadKeys(key)
 	return t.server.keyTypeAt(context.Background(), key, t.startTS)
 }
 
@@ -1842,6 +1880,19 @@ func appendValues(buf [][]byte, start, end int) []string {
 	return out
 }
 
+func (t *txnContext) validateReadSet(ctx context.Context) error {
+	for _, key := range t.readKeys {
+		latestTS, exists, err := t.server.store.LatestCommitTS(ctx, key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if exists && latestTS > t.startTS {
+			return errors.WithStack(store.NewWriteConflictError(key))
+		}
+	}
+	return nil
+}
+
 func (t *txnContext) commit() error {
 	elems := t.buildKeyElems()
 
@@ -2006,32 +2057,47 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
-	startTS, err := r.txnStartTS(queue)
-	if err != nil {
-		return nil, err
-	}
-	readPin := r.pinReadTS(startTS)
-	defer readPin.Release()
+	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
 
-	ctx := &txnContext{
-		server:     r,
-		working:    map[string]*txnValue{},
-		listStates: map[string]*listTxnState{},
-		zsetStates: map[string]*zsetTxnState{},
-		ttlStates:  map[string]*ttlTxnState{},
-		startTS:    startTS,
-	}
-
-	results := make([]redisResult, 0, len(queue))
-	for _, cmd := range queue {
-		res, err := ctx.apply(cmd)
+	var results []redisResult
+	err := r.retryRedisWrite(dispatchCtx, func() error {
+		startTS, err := r.txnStartTS(queue)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		results = append(results, res)
-	}
+		readPin := r.pinReadTS(startTS)
+		defer readPin.Release()
 
-	if err := ctx.commit(); err != nil {
+		txn := &txnContext{
+			server:     r,
+			working:    map[string]*txnValue{},
+			listStates: map[string]*listTxnState{},
+			zsetStates: map[string]*zsetTxnState{},
+			ttlStates:  map[string]*ttlTxnState{},
+			readKeys:   map[string][]byte{},
+			startTS:    startTS,
+		}
+
+		nextResults := make([]redisResult, 0, len(queue))
+		for _, cmd := range queue {
+			res, err := txn.apply(cmd)
+			if err != nil {
+				return err
+			}
+			nextResults = append(nextResults, res)
+		}
+
+		if err := txn.validateReadSet(dispatchCtx); err != nil {
+			return err
+		}
+		if err := txn.commit(); err != nil {
+			return err
+		}
+		results = nextResults
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
