@@ -1091,6 +1091,12 @@ func (e *Engine) applyUpdatedPeer(peer Peer, ok bool) {
 }
 
 func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
+	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
+		return err
+	} else if upToDate {
+		return nil
+	}
+
 	payload, err := e.snapshotPayload()
 	if err != nil {
 		return err
@@ -1115,7 +1121,7 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 	if err := e.persistCreatedSnapshot(snap); err != nil {
 		return err
 	}
-	return e.compactSnapshot(index)
+	return nil
 }
 
 func (e *Engine) snapshotPayload() ([]byte, error) {
@@ -1131,7 +1137,13 @@ func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	return current.Metadata.Index >= index && equalConfState(current.Metadata.ConfState, confState), nil
+	if current.Metadata.Index > index {
+		return true, nil
+	}
+	if current.Metadata.Index < index {
+		return false, nil
+	}
+	return equalConfState(current.Metadata.ConfState, confState), nil
 }
 
 func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, payload []byte) (raftpb.Snapshot, error) {
@@ -1157,13 +1169,6 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 		return errors.WithStack(err)
 	}
 	if err := e.persist.Release(snap); err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
-}
-
-func (e *Engine) compactSnapshot(index uint64) error {
-	if err := e.storage.Compact(index); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
 		return errors.WithStack(err)
 	}
 	return nil
