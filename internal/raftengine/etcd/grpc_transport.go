@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -139,7 +140,9 @@ func (t *GRPCTransport) closePeerConnLocked(address string) {
 	}
 	delete(t.conns, address)
 	delete(t.clients, address)
-	_ = conn.Close()
+	if err := conn.Close(); err != nil {
+		slog.Warn("failed to close etcd raft peer connection", "address", address, "error", err)
+	}
 }
 
 func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error {
