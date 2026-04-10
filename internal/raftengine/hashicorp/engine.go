@@ -102,22 +102,48 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 	return nil
 }
 
+// readIndexPollInterval is the interval between AppliedIndex polls while
+// waiting for the FSM to catch up to the commit index.
+const readIndexPollInterval = 500 * time.Microsecond
+
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	if err := e.VerifyLeader(ctx); err != nil {
 		return 0, err
+	}
+
+	// ReadIndex protocol: record the current commit index, then wait for the
+	// FSM to apply up to that point. This avoids the cost of Barrier (which
+	// proposes a no-op log entry through Raft consensus) while still
+	// guaranteeing linearizable reads.
+	commitIndex := e.raft.CommitIndex()
+
+	// Fast path: FSM is already caught up (common case under normal load).
+	if e.raft.AppliedIndex() >= commitIndex {
+		return commitIndex, nil
 	}
 
 	timeout, err := timeoutFromContext(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if err := e.raft.Barrier(timeout).Error(); err != nil {
-		if ctxErr := contextErr(ctx); ctxErr != nil {
-			return 0, ctxErr
+	deadline := time.Now().Add(timeout)
+
+	ticker := time.NewTicker(readIndexPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, errors.WithStack(ctx.Err())
+		case <-ticker.C:
+			if e.raft.AppliedIndex() >= commitIndex {
+				return commitIndex, nil
+			}
+			if time.Now().After(deadline) {
+				return 0, errors.WithStack(context.DeadlineExceeded)
+			}
 		}
-		return 0, errors.WithStack(err)
 	}
-	return e.raft.CommitIndex(), nil
 }
 
 func (e *Engine) Status() raftengine.Status {
