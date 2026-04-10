@@ -135,35 +135,37 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 // executed in this call, VerifyLeader is skipped because Barrier already
 // implies a quorum commit.
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
+	if e == nil || e.raft == nil {
+		return 0, errors.WithStack(errNilEngine)
+	}
 	if e.raft.State() != raft.Leader {
 		return 0, errors.WithStack(raft.ErrNotLeader)
 	}
 
-	// Raft §5.4.2: a leader cannot determine which entries from previous
-	// terms are committed until it commits an entry in its own term. If no
-	// Barrier has been issued in the current term yet, run one now so that
-	// CommitIndex is authoritative. Subsequent reads in the same term skip
-	// the Barrier and use the fast ReadIndex path.
+	// Raft §5.4.2: ensure at least one Barrier has been issued in the
+	// current term so that CommitIndex is authoritative.
 	performedBarrier, err := e.ensureBarrierForTerm(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	// Record CommitIndex before the quorum check. The ReadIndex protocol
-	// requires that the leadership verification happens after the read
-	// index has been determined to prevent a partitioned leader from
-	// returning stale data.
+	// requires the leadership verification to happen after the read index
+	// has been determined. When Barrier was just performed it already
+	// confirmed leadership via quorum, so VerifyLeader is redundant.
 	commitIndex := e.raft.CommitIndex()
-
-	// When Barrier was just performed it already confirmed leadership via
-	// quorum, so VerifyLeader would be redundant.
 	if !performedBarrier {
 		if err := e.VerifyLeader(ctx); err != nil {
 			return 0, err
 		}
 	}
 
-	// Fast path: FSM is already caught up (common case under normal load).
+	return e.waitForApplied(ctx, commitIndex)
+}
+
+// waitForApplied blocks until the FSM has applied all entries up to the
+// given commit index, or the context is cancelled.
+func (e *Engine) waitForApplied(ctx context.Context, commitIndex uint64) (uint64, error) {
 	if e.raft.AppliedIndex() >= commitIndex {
 		return commitIndex, nil
 	}
@@ -193,24 +195,32 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 // acquires barrierMu to serialise a single Barrier per term.
 func (e *Engine) ensureBarrierForTerm(ctx context.Context) (bool, error) {
 	// Fast path: lock-free check using the atomically published barrierTerm.
-	// Stats() is only called on the slow path (term change).
-	term := parseUint(e.raft.Stats()["term"])
+	term, err := parseTermFromStats(e.raft.Stats())
+	if err != nil {
+		return false, err
+	}
 	if e.barrierTerm.Load() >= term {
 		return false, nil
 	}
 
-	// Slow path: acquire the mutex so only one goroutine runs Barrier.
+	return e.executeBarrier(ctx)
+}
+
+// executeBarrier is the slow path of ensureBarrierForTerm: it acquires
+// barrierMu so that only one goroutine runs Barrier per term.
+func (e *Engine) executeBarrier(ctx context.Context) (bool, error) {
 	e.barrierMu.Lock()
 	defer e.barrierMu.Unlock()
 
 	// Re-check under lock; another goroutine may have completed Barrier.
-	term = parseUint(e.raft.Stats()["term"])
+	term, err := parseTermFromStats(e.raft.Stats())
+	if err != nil {
+		return false, err
+	}
 	if e.barrierTerm.Load() >= term {
 		return false, nil
 	}
 
-	// Re-verify leadership after acquiring the lock; another goroutine
-	// may have caused a leadership change while we waited.
 	if e.raft.State() != raft.Leader {
 		return false, errors.WithStack(raft.ErrNotLeader)
 	}
@@ -397,6 +407,20 @@ func parseUint(raw string) uint64 {
 		return 0
 	}
 	return v
+}
+
+var errTermParse = errors.New("failed to determine raft term from stats")
+
+func parseTermFromStats(stats map[string]string) (uint64, error) {
+	raw, ok := stats["term"]
+	if !ok || strings.TrimSpace(raw) == "" {
+		return 0, errors.WithStack(errTermParse)
+	}
+	term := parseUint(raw)
+	if term == 0 {
+		return 0, errors.WithStack(errTermParse)
+	}
+	return term, nil
 }
 
 func lastContact(state raftengine.State, last time.Time) time.Duration {
