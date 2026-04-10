@@ -108,9 +108,9 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 }
 
 // readIndexPollInterval is the interval between AppliedIndex polls while
-// waiting for the FSM to catch up to the commit index. 10ms balances
-// latency against CPU overhead from polling the atomic AppliedIndex.
-const readIndexPollInterval = 10 * time.Millisecond
+// waiting for the FSM to catch up to the commit index. 1ms keeps tail
+// latency low for a KV store while AppliedIndex is an atomic load.
+const readIndexPollInterval = 1 * time.Millisecond
 
 func (e *Engine) CheckServing(ctx context.Context) error {
 	if err := contextErr(ctx); err != nil {
