@@ -1386,9 +1386,11 @@ type listTxnState struct {
 }
 
 type zsetTxnState struct {
-	members map[string]float64
-	exists  bool
-	dirty   bool
+	members     map[string]float64
+	origMembers map[string]float64 // snapshot at load time for diff-based commit
+	exists      bool
+	dirty       bool
+	fromLegacy  bool
 }
 
 type ttlTxnState struct {
@@ -1510,7 +1512,7 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	if st, ok := t.zsetStates[k]; ok {
 		return st, nil
 	}
-	t.trackReadKey(redisZSetKey(key))
+	t.trackReadKey(store.ZSetMetaKey(key))
 	// Check TTL: treat expired keys as non-existent.
 	ttlSt, err := t.loadTTLState(key)
 	if err != nil {
@@ -1518,19 +1520,26 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	}
 	if ttlSt.value != nil && !ttlSt.value.After(time.Now()) {
 		st := &zsetTxnState{
-			members: map[string]float64{},
-			exists:  false,
+			members:     map[string]float64{},
+			origMembers: map[string]float64{},
+			exists:      false,
 		}
 		t.zsetStates[k] = st
 		return st, nil
 	}
-	value, exists, err := t.server.loadZSetAt(context.Background(), key, t.startTS)
+	load, err := t.server.loadZSetMembersMap(context.Background(), key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
+	origMembers := make(map[string]float64, len(load.members))
+	for mk, mv := range load.members {
+		origMembers[mk] = mv
+	}
 	st := &zsetTxnState{
-		members: zsetEntriesToMap(value.Entries),
-		exists:  exists,
+		members:     load.members,
+		origMembers: origMembers,
+		exists:      load.exists,
+		fromLegacy:  load.fromLegacy,
 	}
 	t.zsetStates[k] = st
 	return st, nil
@@ -2031,15 +2040,41 @@ func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
 		if !st.dirty {
 			continue
 		}
+		keyBytes := []byte(k)
 		if len(st.members) == 0 {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey([]byte(k))})
+			// Delete meta + all remaining member/score keys.
+			delElems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, delElems...)
+			if st.fromLegacy {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
+			}
 			continue
 		}
-		payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
-		if err != nil {
-			return nil, err
+		if st.fromLegacy {
+			// Legacy blob → wide-column migration: full write + delete legacy blob.
+			writeElems, err := buildZSetWriteElems(keyBytes, st.members)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, writeElems...)
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
+		} else if len(st.origMembers) == 0 {
+			// Brand-new ZSet: full write.
+			writeElems, err := buildZSetWriteElems(keyBytes, st.members)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, writeElems...)
+		} else {
+			diffElems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, diffElems...)
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey([]byte(k)), Value: payload})
 	}
 	return elems, nil
 }

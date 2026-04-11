@@ -197,12 +197,11 @@ func TestRedisExecLuaCompatRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), conn.int)
 	require.Equal(t, 2, coord.dispatches)
 
-	zset, exists, err := srv.loadZSetAt(ctx, []byte("retry:z"), snapshotTS(coord.clock, st))
+	load, err := srv.loadZSetMembersMap(ctx, []byte("retry:z"), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
-	require.True(t, exists)
-	require.Len(t, zset.Entries, 1)
-	require.Equal(t, "member-1", zset.Entries[0].Member)
-	require.Equal(t, 1.0, zset.Entries[0].Score)
+	require.True(t, load.exists)
+	require.Len(t, load.members, 1)
+	require.Equal(t, 1.0, load.members["member-1"])
 }
 
 func TestRedisEvalRetriesWriteConflict(t *testing.T) {
