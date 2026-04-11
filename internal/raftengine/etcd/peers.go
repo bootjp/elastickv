@@ -3,6 +3,7 @@ package etcd
 import (
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -170,4 +171,49 @@ func confStateForPeers(peers []Peer) raftpb.ConfState {
 		voters = append(voters, peer.NodeID)
 	}
 	return raftpb.ConfState{Voters: voters}
+}
+
+func clonePeerMap(peers map[uint64]Peer) map[uint64]Peer {
+	if len(peers) == 0 {
+		return map[uint64]Peer{}
+	}
+	cloned := make(map[uint64]Peer, len(peers))
+	for nodeID, peer := range peers {
+		cloned[nodeID] = peer
+	}
+	return cloned
+}
+
+func upsertPeerInMap(peers map[uint64]Peer, peer Peer) {
+	if peer.NodeID == 0 {
+		peer.NodeID = DeriveNodeID(peer.ID)
+	}
+	if peer.ID == "" {
+		peer.ID = peer.Address
+	}
+	peers[peer.NodeID] = peer
+}
+
+func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
+	delete(peers, nodeID)
+}
+
+func peerListForConfState(peers map[uint64]Peer, conf raftpb.ConfState) []Peer {
+	if len(conf.Voters) == 0 {
+		return nil
+	}
+	out := make([]Peer, 0, len(conf.Voters))
+	for _, nodeID := range conf.Voters {
+		peer, ok := peers[nodeID]
+		if !ok {
+			out = append(out, Peer{
+				NodeID: nodeID,
+				ID:     strconv.FormatUint(nodeID, 10),
+			})
+			continue
+		}
+		out = append(out, peer)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }

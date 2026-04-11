@@ -132,6 +132,30 @@ go run . \
   --raftId "n1"
 ```
 
+### Running with the etcd/raft backend
+
+The etcd runtime is opt-in:
+
+```bash
+go run . \
+  --raftEngine etcd \
+  --address "127.0.0.1:50051" \
+  --redisAddress "127.0.0.1:6379" \
+  --raftId "n1"
+```
+
+Elastickv writes a `raft-engine` marker into each Raft data directory and refuses
+to reopen a directory with a different backend. Do not point `--raftEngine=etcd`
+at an existing HashiCorp Raft directory, or vice versa. For existing stores, seed
+a fresh etcd data dir with the offline migrator:
+
+```bash
+go run ./cmd/etcd-raft-migrate \
+  --source /var/lib/elastickv/fsm.db \
+  --dest /var/lib/elastickv-etcd/n1 \
+  --peers n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053
+```
+
 ### Starting the Client
 
 To start the client, use this command:

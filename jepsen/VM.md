@@ -22,6 +22,7 @@ cd ~/elastickv/jepsen
 HOME=$(pwd)/tmp-home LEIN_HOME=$(pwd)/.lein LEIN_JVM_OPTS="-Duser.home=$(pwd)/tmp-home" \
   lein run -m elastickv.redis-workload \
   --nodes n1,n2,n3,n4,n5 \
+  --raft-engine etcd \
   --time-limit 60 --rate 10 --concurrency 10 \
   --faults partition,kill,clock
 ```
@@ -31,6 +32,10 @@ The test will:
 - deploy them to each VM under `/opt/elastickv/bin`,
 - start the cluster (bootstrap on `n1`, join others),
 - run the Redis append workload with the Jepsen combined nemesis (partitions + process kills by default).
+
+Use `--raft-engine hashicorp` to exercise the legacy backend instead. Switching an
+existing data directory between engines is intentionally rejected; migrate to a
+fresh etcd data dir first when testing `etcd/raft`.
 
 The Jepsen bootstrap path uses `RAFTADMIN_ALLOW_INSECURE=true` because the lab gRPC admin channel is plaintext-only.
 

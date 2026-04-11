@@ -302,6 +302,48 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
 }
 
+func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	peers := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:7003"},
+	}
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		Peers:        peers,
+		Bootstrap:    true,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.Close())
+
+	persisted, ok, err := LoadPersistedPeers(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, peers, persisted)
+
+	restarted, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, restarted.Close())
+	})
+
+	cfg, err := restarted.Configuration(context.Background())
+	require.NoError(t, err)
+	require.Len(t, cfg.Servers, 3)
+}
+
 func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 	engine := &Engine{
 		readCh: make(chan readRequest, 1),
@@ -680,6 +722,76 @@ func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 	firstIndex, err := storage.FirstIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), firstIndex)
+}
+
+func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	persist := mockstorage.NewStorageRecorder("")
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage: storage,
+		persist: persist,
+		fsm:     fsm,
+		dataDir: t.TempDir(),
+	}
+	t.Cleanup(release)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}})
+	}()
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("config snapshot serialization did not start")
+	}
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		t.Fatal("persistConfigSnapshot returned before snapshot serialization completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	require.Empty(t, persist.Action())
+	release()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("persistConfigSnapshot did not finish after snapshot serialization was released")
+	}
+
+	actions := persist.Action()
+	require.Len(t, actions, 2)
+	require.Equal(t, "SaveSnap", actions[0].Name)
+	require.Equal(t, "Release", actions[1].Name)
+
+	snapshot, err := storage.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), snapshot.Metadata.Index)
+	require.Equal(t, []uint64{1, 2}, snapshot.Metadata.ConfState.Voters)
 }
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {

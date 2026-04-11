@@ -50,6 +50,15 @@ type GRPCTransport struct {
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
 	peerMap := make(map[uint64]Peer, len(peers))
 	for _, peer := range peers {
+		if peer.NodeID == 0 {
+			peer.NodeID = DeriveNodeID(peer.ID)
+		}
+		if peer.ID == "" {
+			peer.ID = peer.Address
+		}
+		if peer.NodeID == 0 || peer.Address == "" {
+			continue
+		}
 		peerMap[peer.NodeID] = peer
 	}
 	return &GRPCTransport{

@@ -855,7 +855,7 @@ Run multiple shard groups per process under the new engine.
 2. Implement fairness and backpressure across groups.
 3. Measure CPU, memory, goroutine count, and tail latency as group count increases.
 4. Validate shard-aware read and write paths, including coordinator routing.
-5. Remove the Phase 4 stopgap where config-change snapshots are published synchronously on the raft loop, or replace it with an ordered async path before broadening the backend beyond the current prototype scope.
+5. Replace the Phase 4 stopgap where config-change snapshots were published synchronously on the raft loop with an ordered async path before broadening the backend beyond the current prototype scope.
 
 ### Exit criteria
 
@@ -878,6 +878,7 @@ Ship migration safely with an explicit rollback plan.
 5. Decide whether migration is:
    - opt-in for new clusters only
    - or a supported migration path for existing clusters
+6. Reject unsafe in-place engine switches on existing data directories, and require explicit offline migration tooling when moving persisted state across engines.
 
 ### Exit criteria
 

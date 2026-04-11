@@ -32,12 +32,14 @@ type raftGroupRuntime struct {
 }
 
 const raftCommitTimeout = 50 * time.Millisecond
+const raftEngineMarkerPerm = 0o600
 
 type raftEngineType string
 
 const (
 	raftEngineHashicorp       raftEngineType = "hashicorp"
 	raftEngineEtcd            raftEngineType = "etcd"
+	raftEngineMarkerFile                     = "raft-engine"
 	etcdTickInterval                         = 10 * time.Millisecond
 	etcdHeartbeatMinTicks                    = 1
 	etcdElectionMinTicks                     = 2
@@ -45,7 +47,11 @@ const (
 	etcdRuntimeMaxInflightMsg                = 256
 )
 
-var ErrUnsupportedRaftEngine = errors.New("unsupported raft engine")
+var (
+	ErrUnsupportedRaftEngine    = errors.New("unsupported raft engine")
+	ErrRaftEngineDataDir        = errors.New("raft data dir belongs to a different raft engine")
+	ErrMixedRaftEngineArtifacts = errors.New("raft data dir contains artifacts for multiple raft engines")
+)
 
 func parseRaftEngineType(raw string) (raftEngineType, error) {
 	switch engineType := raftEngineType(strings.ToLower(strings.TrimSpace(raw))); engineType {
@@ -114,6 +120,109 @@ func groupDataDir(baseDir, raftID string, groupID uint64, multi bool) string {
 		return filepath.Join(baseDir, raftID)
 	}
 	return filepath.Join(baseDir, raftID, fmt.Sprintf("group-%d", groupID))
+}
+
+func ensureRaftEngineDataDir(dir string, engineType raftEngineType) error {
+	if err := os.MkdirAll(dir, raftDirPerm); err != nil {
+		return errors.WithStack(err)
+	}
+
+	markerPath := filepath.Join(dir, raftEngineMarkerFile)
+	if current, ok, err := readRaftEngineMarker(markerPath); err != nil {
+		return err
+	} else if ok {
+		if current != engineType {
+			return errors.Wrapf(ErrRaftEngineDataDir, "%s is initialized for %s, not %s", dir, current, engineType)
+		}
+		return nil
+	}
+
+	detected, ok, err := detectRaftEngineFromDataDir(dir)
+	if err != nil {
+		return err
+	}
+	if ok && detected != engineType {
+		return errors.Wrapf(ErrRaftEngineDataDir, "%s contains %s state, not %s", dir, detected, engineType)
+	}
+	return writeRaftEngineMarker(markerPath, engineType)
+}
+
+func readRaftEngineMarker(path string) (raftEngineType, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, errors.WithStack(err)
+	}
+	engineType, err := parseRaftEngineType(strings.TrimSpace(string(data)))
+	if err != nil {
+		return "", false, errors.Wrapf(err, "invalid raft engine marker %s", path)
+	}
+	return engineType, true, nil
+}
+
+func detectRaftEngineFromDataDir(dir string) (raftEngineType, bool, error) {
+	hashicorpArtifacts, err := hasRaftArtifacts(dir,
+		"raft.db",
+		"logs.dat",
+		"stable.dat",
+	)
+	if err != nil {
+		return "", false, err
+	}
+	etcdArtifacts, err := hasRaftArtifacts(dir,
+		filepath.Join("member", "wal"),
+		filepath.Join("member", "snap"),
+		"etcd-raft-state.bin",
+		"etcd-raft-meta.bin",
+		"etcd-raft-entries.bin",
+		"etcd-fsm-snapshot.bin",
+	)
+	if err != nil {
+		return "", false, err
+	}
+
+	switch {
+	case hashicorpArtifacts && etcdArtifacts:
+		return "", false, errors.Wrapf(ErrMixedRaftEngineArtifacts, "%s", dir)
+	case hashicorpArtifacts:
+		return raftEngineHashicorp, true, nil
+	case etcdArtifacts:
+		return raftEngineEtcd, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func hasRaftArtifacts(dir string, paths ...string) (bool, error) {
+	for _, rel := range paths {
+		if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, errors.WithStack(err)
+		}
+	}
+	return false, nil
+}
+
+func writeRaftEngineMarker(path string, engineType raftEngineType) error {
+	if err := os.WriteFile(path, []byte(string(engineType)+"\n"), raftEngineMarkerPerm); err != nil {
+		return errors.WithStack(err)
+	}
+	return syncDataDir(filepath.Dir(path))
+}
+
+func syncDataDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bootstrap bool, bootstrapServers []raft.Server, fsm raft.FSM) (*raft.Raft, *transport.Manager, func(), error) {
@@ -198,6 +307,11 @@ func newEtcdGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 	}
 
 	peers := etcdPeersFromServers(bootstrapServers)
+	if persistedPeers, ok, err := etcdraftengine.LoadPersistedPeers(dir); err != nil {
+		return nil, nil, errors.WithStack(err)
+	} else if ok {
+		peers = persistedPeers
+	}
 	var transport *etcdraftengine.GRPCTransport
 	if len(peers) > 1 {
 		transport = etcdraftengine.NewGRPCTransport(peers)
@@ -270,6 +384,11 @@ func buildRuntimeForGroup(
 	fsm raft.FSM,
 	engineType raftEngineType,
 ) (*raftGroupRuntime, error) {
+	dir := groupDataDir(baseDir, raftID, group.id, multi)
+	if err := ensureRaftEngineDataDir(dir, engineType); err != nil {
+		return nil, err
+	}
+
 	switch engineType {
 	case raftEngineHashicorp:
 		r, tm, closeStores, err := newRaftGroup(raftID, group, baseDir, multi, bootstrap, bootstrapServers, fsm)
