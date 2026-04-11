@@ -484,7 +484,10 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 				{Op: kv.DelPrefix, Key: nil},
 			},
 		})
-		return err
+		if err != nil {
+			return fmt.Errorf("dispatch del_prefix: %w", err)
+		}
+		return nil
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1106,39 +1109,45 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		if typ != redisTypeNone && typ != redisTypeHash {
-			return wrongTypeError()
-		}
-		value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		current = 0
-		if raw, ok := value[string(cmd.Args[2])]; ok {
-			current, err = strconv.ParseInt(raw, 10, 64)
-			if err != nil {
-				return errors.New("ERR hash value is not an integer")
-			}
-		}
-		current += increment
-		value[string(cmd.Args[2])] = strconv.FormatInt(current, 10)
-		payload, err := marshalHashValue(value)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisHashKey(cmd.Args[1]), Value: payload},
-		})
+		var txnErr error
+		current, txnErr = r.hincrbyTxn(ctx, cmd.Args[1], cmd.Args[2], increment)
+		return txnErr
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	conn.WriteInt64(current)
+}
+
+func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if typ != redisTypeNone && typ != redisTypeHash {
+		return 0, wrongTypeError()
+	}
+	value, err := r.loadHashAt(context.Background(), key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	var current int64
+	if raw, ok := value[string(field)]; ok {
+		current, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, errors.New("ERR hash value is not an integer")
+		}
+	}
+	current += increment
+	value[string(field)] = strconv.FormatInt(current, 10)
+	payload, err := marshalHashValue(value)
+	if err != nil {
+		return 0, err
+	}
+	return current, r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisHashKey(key), Value: payload},
+	})
 }
 
 func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
@@ -1501,8 +1510,12 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	r.zrangeRead(conn, cmd.Args[1], start, stop, opts)
+}
+
+func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, opts zrangeOptions) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1516,7 +1529,7 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
+	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return

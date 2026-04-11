@@ -962,36 +962,6 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteBulk(v)
 }
 
-// getHandleNone handles GET when the local type check returns none.
-// On followers the local MVCC may lag, so we proxy to the leader.
-func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool) {
-	if isLeader {
-		conn.WriteNull()
-		return
-	}
-	// Check TTL on the leader first; if expired the key is logically gone.
-	if r.isLeaderKeyExpired(key) {
-		conn.WriteNull()
-		return
-	}
-	// Check if the key is a string on the leader.
-	v, err := r.tryLeaderGetAt(key, 0)
-	if err == nil {
-		conn.WriteBulk(v)
-		return
-	}
-	if !errors.Is(err, store.ErrKeyNotFound) {
-		conn.WriteError(err.Error())
-		return
-	}
-	// String key not found — check if it exists as a non-string type.
-	if r.tryLeaderNonStringExists(key) {
-		conn.WriteError(wrongTypeMessage)
-		return
-	}
-	conn.WriteNull()
-}
-
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
 func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
 	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)

@@ -606,6 +606,8 @@ func txnIntentFromPBMutation(mut *pb.Mutation, startTS uint64) (txnIntent, error
 		return txnIntent{StartTS: startTS, Op: txnIntentOpPut, Value: mut.Value}, nil
 	case pb.Op_DEL:
 		return txnIntent{StartTS: startTS, Op: txnIntentOpDel, Value: nil}, nil
+	case pb.Op_DEL_PREFIX:
+		return txnIntent{}, errors.WithStack(ErrUnknownRequestType)
 	default:
 		return txnIntent{}, errors.WithStack(ErrUnknownRequestType)
 	}
@@ -749,6 +751,8 @@ func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
 				Op:  store.OpTypeDelete,
 				Key: mut.Key,
 			})
+		case pb.Op_DEL_PREFIX:
+			return nil, ErrUnknownRequestType
 		default:
 			return nil, ErrUnknownRequestType
 		}

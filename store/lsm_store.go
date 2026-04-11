@@ -954,52 +954,8 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	tombstoneVal := encodeValue(nil, true, 0)
-
-	for iter.SeekGE(encodeKey(prefix, math.MaxUint64)); iter.Valid(); {
-		userKey, version, ok := nextScannableUserKey(iter)
-		if !ok {
-			break
-		}
-
-		// Stop when past the prefix boundary.
-		if len(prefix) > 0 && !bytes.HasPrefix(userKey, prefix) {
-			break
-		}
-
-		// Skip excluded prefix.
-		if len(excludePrefix) > 0 && bytes.HasPrefix(userKey, excludePrefix) {
-			if !s.skipToNextUserKey(iter, userKey) {
-				break
-			}
-			continue
-		}
-
-		// Seek to the version visible at commitTS.
-		if !s.seekToVisibleVersion(iter, userKey, version, commitTS) {
-			continue
-		}
-
-		// Check whether this version is already a tombstone or expired.
-		sv, decErr := decodeValue(iter.Value())
-		if decErr != nil {
-			return errors.WithStack(decErr)
-		}
-		if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
-			if !s.skipToNextUserKey(iter, userKey) {
-				break
-			}
-			continue
-		}
-
-		// Write a tombstone at commitTS.
-		if err := batch.Set(encodeKey(userKey, commitTS), tombstoneVal, nil); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if !s.skipToNextUserKey(iter, userKey) {
-			break
-		}
+	if err := s.scanDeletePrefix(iter, batch, prefix, excludePrefix, commitTS); err != nil {
+		return err
 	}
 
 	// Persist lastCommitTS update atomically with the tombstones.
@@ -1020,6 +976,76 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 	s.mtx.Unlock()
 
 	return nil
+}
+
+func (s *pebbleStore) scanDeletePrefix(iter *pebble.Iterator, batch *pebble.Batch, prefix, excludePrefix []byte, commitTS uint64) error {
+	tombstoneVal := encodeValue(nil, true, 0)
+
+	for iter.SeekGE(encodeKey(prefix, math.MaxUint64)); iter.Valid(); {
+		userKey, version, ok := nextScannableUserKey(iter)
+		if !ok {
+			break
+		}
+
+		action := s.classifyDeletePrefixKey(userKey, prefix, excludePrefix)
+		if action == deletePrefixStop {
+			break
+		}
+		if action == deletePrefixSkip {
+			if !s.skipToNextUserKey(iter, userKey) {
+				break
+			}
+			continue
+		}
+
+		needsTombstone, err := s.isVisibleLiveKey(iter, userKey, version, commitTS)
+		if err != nil {
+			return err
+		}
+		if needsTombstone {
+			if err := batch.Set(encodeKey(userKey, commitTS), tombstoneVal, nil); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+		if !s.skipToNextUserKey(iter, userKey) {
+			break
+		}
+	}
+	return nil
+}
+
+type deletePrefixAction int
+
+const (
+	deletePrefixProcess deletePrefixAction = iota
+	deletePrefixSkip
+	deletePrefixStop
+)
+
+func (s *pebbleStore) classifyDeletePrefixKey(userKey, prefix, excludePrefix []byte) deletePrefixAction {
+	if len(prefix) > 0 && !bytes.HasPrefix(userKey, prefix) {
+		return deletePrefixStop
+	}
+	if len(excludePrefix) > 0 && bytes.HasPrefix(userKey, excludePrefix) {
+		return deletePrefixSkip
+	}
+	return deletePrefixProcess
+}
+
+// isVisibleLiveKey checks whether the key has a visible, non-tombstone,
+// non-expired version at commitTS. It advances the iterator as a side effect.
+func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, version, commitTS uint64) (bool, error) {
+	if !s.seekToVisibleVersion(iter, userKey, version, commitTS) {
+		return false, nil
+	}
+	sv, err := decodeValue(iter.Value())
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
+		return false, nil
+	}
+	return true, nil
 }
 
 type pebbleCompactionStats struct {

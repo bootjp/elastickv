@@ -60,9 +60,9 @@ const (
 	transactRetryInitialBackoff = 1 * time.Millisecond
 	transactRetryMaxBackoff     = 10 * time.Millisecond
 	transactRetryBackoffFactor  = 2
-	tableCleanupAsyncTimeout  = 5 * time.Minute
-	itemUpdateLockStripeCount = 256
-	tableLockStripeCount      = 128
+	tableCleanupAsyncTimeout    = 5 * time.Minute
+	itemUpdateLockStripeCount   = 256
+	tableLockStripeCount        = 128
 	batchWriteItemMaxItems      = 25
 	dynamoMaxRequestBodyBytes   = 1 << 20
 

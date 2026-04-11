@@ -521,7 +521,7 @@ func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePref
 	// Collect matching keys first since we cannot modify the tree while iterating.
 	var toDelete [][]byte
 	it := s.tree.Iterator()
-	started := false
+	var started bool
 	if len(prefix) > 0 {
 		started = seekForwardIteratorStart(s.tree, &it, prefix)
 	} else {
