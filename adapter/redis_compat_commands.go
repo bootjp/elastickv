@@ -70,6 +70,9 @@ func (r *RedisServer) info(conn redcon.Conn, _ redcon.Command) {
 
 // SETEX key seconds value — equivalent to SET key value EX seconds
 func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	seconds, err := strconv.ParseInt(string(cmd.Args[2]), 10, 64)
 	if err != nil || seconds <= 0 {
 		conn.WriteError("ERR invalid expire time in 'setex' command")
@@ -88,6 +91,9 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 
 // GETDEL key — get the value and delete the key atomically
 func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	key := cmd.Args[1]
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
@@ -135,6 +141,9 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 
 // SETNX key value — set if not exists, returns 1 on success, 0 on failure
 func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
@@ -179,6 +188,9 @@ func (r *RedisServer) quit(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) typeCmd(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	typ, err := r.keyType(context.Background(), cmd.Args[1])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -188,10 +200,16 @@ func (r *RedisServer) typeCmd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) ttl(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.writeTTL(conn, cmd.Args[1], false)
 }
 
 func (r *RedisServer) pttl(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.writeTTL(conn, cmd.Args[1], true)
 }
 
@@ -223,10 +241,16 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 }
 
 func (r *RedisServer) expire(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.setExpire(conn, cmd, time.Second)
 }
 
 func (r *RedisServer) pexpire(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.setExpire(conn, cmd, time.Millisecond)
 }
 
@@ -452,15 +476,15 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		readTS := r.readTS()
-		elems, err := r.flushAllKeyElems(ctx, readTS)
-		if err != nil {
-			return err
-		}
-		if len(elems) == 0 {
-			return nil
-		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		// Dispatch a single DEL_PREFIX operation. The FSM on each node will
+		// scan locally and write tombstones, avoiding the need to enumerate
+		// all keys here and send them through the Raft log.
+		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.DelPrefix, Key: nil},
+			},
+		})
+		return err
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -520,10 +544,16 @@ func (r *RedisServer) pubsubChannelCounts() map[string]int {
 }
 
 func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.mutateExactSet(conn, "set", cmd.Args[1], cmd.Args[2:], true)
 }
 
 func (r *RedisServer) srem(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.mutateExactSet(conn, "set", cmd.Args[1], cmd.Args[2:], false)
 }
 
@@ -666,6 +696,9 @@ func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, 
 }
 
 func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -694,6 +727,9 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -721,6 +757,9 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var changed int
@@ -753,6 +792,9 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	union := map[string]struct{}{}
 	for _, key := range cmd.Args[1:] {
@@ -785,6 +827,9 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -794,6 +839,9 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:]); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -847,6 +895,9 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 }
 
 func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -876,6 +927,9 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -912,6 +966,9 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var removed int
@@ -978,6 +1035,9 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 }
 
 func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -1006,6 +1066,9 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -1030,6 +1093,9 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	increment, err := strconv.ParseInt(string(cmd.Args[3]), 10, 64)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1076,6 +1142,9 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var current int64
@@ -1114,6 +1183,9 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
@@ -1229,6 +1301,9 @@ func parseZAddPairs(remaining [][]byte) ([]zaddPair, error) {
 }
 
 func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	flags, pairStart, err := parseZAddFlags(cmd.Args)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1295,6 +1370,9 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	increment, err := strconv.ParseFloat(string(cmd.Args[2]), 64)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1403,6 +1481,9 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 }
 
 func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1453,6 +1534,9 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var removed int
@@ -1487,6 +1571,9 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1588,6 +1675,9 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	timeoutSeconds, err := strconv.ParseFloat(string(cmd.Args[len(cmd.Args)-1]), 64)
 	if err != nil || timeoutSeconds < 0 {
 		conn.WriteError("ERR timeout is not a float or out of range")
@@ -1631,6 +1721,9 @@ func (r *RedisServer) lpush(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1673,6 +1766,9 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	index, err := parseInt(cmd.Args[2])
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1790,6 +1886,9 @@ func nextXAddID(stream redisStreamValue, requested string) (string, error) {
 }
 
 func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	req, err := parseXAddRequest(cmd.Args)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1864,6 +1963,9 @@ func parseXTrimMaxLen(args [][]byte) (int, error) {
 }
 
 func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	maxLen, err := parseXTrimMaxLen(cmd.Args)
 	if err != nil {
 		conn.WriteError("ERR syntax error")
@@ -1926,10 +2028,16 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 }
 
 func (r *RedisServer) xrange(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.rangeStream(conn, cmd, false)
 }
 
 func (r *RedisServer) xrevrange(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.rangeStream(conn, cmd, true)
 }
 
@@ -2162,6 +2270,9 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
