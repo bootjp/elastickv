@@ -112,38 +112,49 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
-// zsetMetaExistsAt checks whether the wide-column ZSet meta key exists.
-func (r *RedisServer) zsetMetaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	ok, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS)
+// loadZSetMetaAt loads the ZSetMeta from the wide-column meta key.
+// Returns (meta, true, nil) if found, (zero, false, nil) if not found.
+func (r *RedisServer) loadZSetMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ZSetMeta, bool, error) {
+	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
 	if err != nil {
-		return false, errors.WithStack(err)
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return store.ZSetMeta{}, false, nil
+		}
+		return store.ZSetMeta{}, false, errors.WithStack(err)
 	}
-	return ok, nil
+	meta, err := store.UnmarshalZSetMeta(raw)
+	if err != nil {
+		return store.ZSetMeta{}, false, errors.WithStack(err)
+	}
+	return meta, true, nil
 }
 
-// scanZSetAllMembers scans all member keys for a ZSet and returns sorted entries.
-func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
-	prefix := store.ZSetMemberScanPrefix(key)
+// scanZSetScoreEntries scans the score index with a limit and returns entries
+// in score order. The score index keys are naturally sorted by score then
+// member, so no in-memory sort is needed.
+func (r *RedisServer) scanZSetScoreEntries(ctx context.Context, key []byte, limit int, readTS uint64) ([]redisZSetEntry, error) {
+	prefix := store.ZSetScoreScanPrefix(key)
 	end := store.PrefixEnd(prefix)
-	kvs, err := r.store.ScanAt(ctx, prefix, end, math.MaxInt, readTS)
+	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	entries := make([]redisZSetEntry, 0, len(kvs))
 	ukLen := len(key)
 	for _, kvp := range kvs {
-		member := store.ExtractZSetMember(kvp.Key, ukLen)
+		score, member := store.ExtractZSetScoreAndMember(kvp.Key, ukLen)
 		if member == nil {
 			continue
 		}
-		score, err := store.UnmarshalZSetScore(kvp.Value)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
 		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
 	}
-	sortZSetEntries(entries)
 	return entries, nil
+}
+
+// scanZSetAllMembers scans the score index for a ZSet and returns all entries
+// in score order.
+func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
+	return r.scanZSetScoreEntries(ctx, key, math.MaxInt, readTS)
 }
 
 // zsetLoadResult holds the result of loading a ZSet's members.
@@ -157,7 +168,7 @@ type zsetLoadResult struct {
 // It first checks the wide-column format, then falls back to legacy blob.
 func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS uint64) (zsetLoadResult, error) {
 	// Check wide-column meta first.
-	metaExists, err := r.zsetMetaExistsAt(ctx, key, readTS)
+	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return zsetLoadResult{}, err
 	}
@@ -180,9 +191,9 @@ func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS
 }
 
 // deleteZSetWideColumnElems generates delete operations for all wide-column
-// ZSet keys (meta + members + score index).
+// ZSet keys (meta + members + score index) using prefix deletion.
 func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	metaExists, err := r.zsetMetaExistsAt(ctx, key, readTS)
+	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -190,30 +201,34 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 		return nil, nil
 	}
 
-	elems := []*kv.Elem[kv.OP]{
+	return []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
-	}
+		{Op: kv.DelPrefix, Key: store.ZSetMemberScanPrefix(key)},
+		{Op: kv.DelPrefix, Key: store.ZSetScoreScanPrefix(key)},
+	}, nil
+}
 
-	// Delete all member keys.
-	memPrefix := store.ZSetMemberScanPrefix(key)
-	memKVs, err := r.store.ScanAt(ctx, memPrefix, store.PrefixEnd(memPrefix), math.MaxInt, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
+// buildZSetRemoveEntryElems builds KV operations to remove specific entries
+// from a wide-column ZSet and update (or delete) the meta key.
+func buildZSetRemoveEntryElems(key []byte, entries []redisZSetEntry, currentLen int64) ([]*kv.Elem[kv.OP], error) {
+	newLen := currentLen - int64(len(entries))
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(entries)*2)
+	for _, e := range entries {
+		memberBytes := []byte(e.Member)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, memberBytes)},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, e.Score, memberBytes)},
+		)
 	}
-	for _, kvp := range memKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(kvp.Key)})
+	if newLen <= 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMetaKey(key)})
+	} else {
+		metaBytes, err := store.MarshalZSetMeta(store.ZSetMeta{Len: newLen})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMetaKey(key), Value: metaBytes})
 	}
-
-	// Delete all score-index keys.
-	scrPrefix := store.ZSetScoreScanPrefix(key)
-	scrKVs, err := r.store.ScanAt(ctx, scrPrefix, store.PrefixEnd(scrPrefix), math.MaxInt, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	for _, kvp := range scrKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(kvp.Key)})
-	}
-
 	return elems, nil
 }
 

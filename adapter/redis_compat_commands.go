@@ -1568,7 +1568,7 @@ func (r *RedisServer) persistZSetMembersTxn(ctx context.Context, key []byte, rea
 // loadZSetEntriesSorted loads all ZSet entries in score order,
 // checking wide-column first, then falling back to legacy blob.
 func (r *RedisServer) loadZSetEntriesSorted(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
-	metaExists, err := r.zsetMetaExistsAt(ctx, key, readTS)
+	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1694,27 +1694,57 @@ func (r *RedisServer) zremrangebyrankTxn(ctx context.Context, key []byte, start,
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		load, err := r.loadZSetMembersMap(context.Background(), key, readTS)
+		return r.zremrangebyrankInner(ctx, key, readTS, start, stop, &removed)
+	})
+	return removed, err
+}
+
+func (r *RedisServer) zremrangebyrankInner(ctx context.Context, key []byte, readTS uint64, start, stop int, removed *int) error {
+	// Wide-column path: scan score index with bounded limit.
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if metaExists {
+		s, e := normalizeRankRange(start, stop, int(meta.Len))
+		if e < s {
+			*removed = 0
+			return nil
+		}
+		// Scan only up to e+1 entries (enough to cover the rank range).
+		entries, err := r.scanZSetScoreEntries(ctx, key, e+1, readTS)
 		if err != nil {
 			return err
 		}
-		entries := zsetMapToEntries(load.members)
-		s, e := normalizeRankRange(start, stop, len(entries))
+		s, e = normalizeRankRange(start, stop, len(entries))
 		if e < s {
-			removed = 0
+			*removed = 0
 			return nil
 		}
-		members := make(map[string]float64, len(load.members))
-		for k, v := range load.members {
-			members[k] = v
+		toRemove := entries[s : e+1]
+		elems, err := buildZSetRemoveEntryElems(key, toRemove, meta.Len)
+		if err != nil {
+			return err
 		}
-		for _, entry := range entries[s : e+1] {
-			delete(members, entry.Member)
-		}
-		removed = e - s + 1
-		return r.persistZSetMembersTxn(ctx, key, readTS, load, members)
-	})
-	return removed, err
+		*removed = len(toRemove)
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+	// Legacy blob fallback.
+	load, err := r.loadZSetMembersMap(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	entries := zsetMapToEntries(load.members)
+	s, e := normalizeRankRange(start, stop, len(entries))
+	if e < s {
+		*removed = 0
+		return nil
+	}
+	for _, entry := range entries[s : e+1] {
+		delete(load.members, entry.Member)
+	}
+	*removed = e - s + 1
+	return r.persistZSetMembersTxn(ctx, key, readTS, load, load.members)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
@@ -1759,28 +1789,54 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		load, err := r.loadZSetMembersMap(context.Background(), key, readTS)
+		return r.tryBZPopMinInner(ctx, key, readTS, &result)
+	})
+	return result, err
+}
+
+func (r *RedisServer) tryBZPopMinInner(ctx context.Context, key []byte, readTS uint64, result **bzpopminResult) error {
+	// Wide-column path: scan score index with limit=1.
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if metaExists {
+		entries, err := r.scanZSetScoreEntries(ctx, key, 1, readTS)
 		if err != nil {
 			return err
 		}
-		if !load.exists || len(load.members) == 0 {
-			result = nil
+		if len(entries) == 0 {
+			*result = nil
 			return nil
 		}
-		entries := zsetMapToEntries(load.members)
 		popped := entries[0]
-		members := make(map[string]float64, len(load.members))
-		for k, v := range load.members {
-			members[k] = v
-		}
-		delete(members, popped.Member)
-		if err := r.persistZSetMembersTxn(ctx, key, readTS, load, members); err != nil {
+		elems, err := buildZSetRemoveEntryElems(key, entries, meta.Len)
+		if err != nil {
 			return err
 		}
-		result = &bzpopminResult{key: key, entry: popped}
+		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+			return err
+		}
+		*result = &bzpopminResult{key: key, entry: popped}
 		return nil
-	})
-	return result, err
+	}
+	// Legacy blob fallback.
+	load, err := r.loadZSetMembersMap(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if !load.exists || len(load.members) == 0 {
+		*result = nil
+		return nil
+	}
+	entries := zsetMapToEntries(load.members)
+	popped := entries[0]
+	delete(load.members, popped.Member)
+	if err := r.persistZSetMembersTxn(ctx, key, readTS, load, load.members); err != nil {
+		return err
+	}
+	*result = &bzpopminResult{key: key, entry: popped}
+	return nil
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
