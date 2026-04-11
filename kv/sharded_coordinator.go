@@ -5,6 +5,8 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -148,24 +150,47 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Ele
 		})
 	}
 
-	var maxIndex uint64
-	var firstErr error
+	return c.broadcastToAllGroups(requests)
+}
+
+// broadcastToAllGroups sends the same set of requests to every shard group in
+// parallel and returns the maximum commit index.
+func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*CoordinateResponse, error) {
+	var (
+		maxIndex atomic.Uint64
+		firstErr error
+		errMu    sync.Mutex
+		wg       sync.WaitGroup
+	)
 	for _, g := range c.groups {
-		r, err := g.Txn.Commit(requests)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		go func(g *ShardGroup) {
+			defer wg.Done()
+			r, err := g.Txn.Commit(requests)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				return
 			}
-			continue
-		}
-		if r != nil && r.CommitIndex > maxIndex {
-			maxIndex = r.CommitIndex
-		}
+			if r != nil {
+				for {
+					cur := maxIndex.Load()
+					if r.CommitIndex <= cur || maxIndex.CompareAndSwap(cur, r.CommitIndex) {
+						break
+					}
+				}
+			}
+		}(g)
 	}
+	wg.Wait()
+
 	if firstErr != nil {
 		return nil, errors.WithStack(firstErr)
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
 func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
