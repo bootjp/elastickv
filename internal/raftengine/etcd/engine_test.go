@@ -846,6 +846,86 @@ func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
 	require.Equal(t, uint64(4), engine.currentConfigIndex())
 }
 
+func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     fsm,
+		dataDir: t.TempDir(),
+	}
+	t.Cleanup(release)
+
+	configDone := make(chan error, 1)
+	go func() {
+		configDone <- engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+			{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		})
+	}()
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("config snapshot serialization did not start")
+	}
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- engine.applyReadySnapshot(raftpb.Snapshot{
+			Data: mustEncodeSnapshotData(t, nil),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+				Index:     5,
+				Term:      1,
+			},
+		})
+	}()
+
+	select {
+	case err := <-restoreDone:
+		require.NoError(t, err)
+		t.Fatal("snapshot restore finished before config publication released snapshotMu")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case err := <-configDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("persistConfigState did not finish after snapshot serialization was released")
+	}
+
+	select {
+	case err := <-restoreDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("snapshot restore did not finish after config publication completed")
+	}
+}
+
 func TestEnqueueSnapshotRequestRejectsAsyncConfigSnapshots(t *testing.T) {
 	snapshot := &closeTrackingSnapshot{}
 	engine := &Engine{

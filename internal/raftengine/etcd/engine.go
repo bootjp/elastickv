@@ -1221,10 +1221,33 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 	if e.currentConfigIndex() >= index {
 		return nil
 	}
+
+	// Keep peer metadata publication, FSM snapshot serialization, and raft
+	// snapshot persistence serialized with snapshot restores. Restart logic can
+	// tolerate peer metadata leading the persisted raft snapshot, but not an
+	// interleaving restore that swaps in newer FSM state halfway through the
+	// publication sequence.
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if e.currentConfigIndex() >= index {
+		return nil
+	}
 	if err := writeCurrentPersistedPeers(e.dataDir, index, peers); err != nil {
 		return err
 	}
-	if err := e.persistConfigSnapshot(index, confState); err != nil {
+	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
+		return err
+	} else if upToDate {
+		e.setConfigIndex(index)
+		return nil
+	}
+
+	payload, err := e.snapshotPayload()
+	if err != nil {
+		return err
+	}
+	if err := e.persistConfigSnapshotPayloadLocked(index, confState, payload); err != nil {
 		return err
 	}
 	e.setConfigIndex(index)
@@ -1238,6 +1261,10 @@ func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.Con
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
+}
+
+func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raftpb.ConfState, payload []byte) error {
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
 	} else if upToDate {
