@@ -117,7 +117,7 @@
                       "--redisAddress" redis
                       "--raftId" (name node)
                       "--raftDataDir" data-dir
-                      "--raftEngine" (or raft-engine "hashicorp")
+                      "--raftEngine" (or raft-engine "etcd")
                       "--raftRedisMap" raft-redis-map]
                dynamo (conj "--dynamoAddress" dynamo)
                s3 (conj "--s3Address" s3)

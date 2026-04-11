@@ -1164,6 +1164,10 @@ func applyConfigPeerChangeToMap(peers map[uint64]Peer, changeType raftpb.ConfCha
 	case raftpb.ConfChangeUpdateNode:
 		applyUpdatedPeerToMap(peers, peer, ok)
 	case raftpb.ConfChangeAddLearnerNode:
+		// Persist learner metadata if it appears in a replayed log so a future
+		// learner-aware restart path still has the full peer inventory on disk.
+		// The current runtime still rejects learner conf states during startup.
+		applyAddedPeerToMap(peers, nodeID, peer, ok)
 	}
 }
 
@@ -2094,22 +2098,22 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
-func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	applyConfigPeerChangeToMap(next, changeType, nodeID, context)
-	return peerListForConfState(next, confState)
+	return sortedPeerList(next)
 }
 
-func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, _ raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	for _, change := range cc.Changes {
 		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
 	}
-	return peerListForConfState(next, confState)
+	return sortedPeerList(next)
 }
 
 func (e *Engine) removePeer(nodeID uint64) {

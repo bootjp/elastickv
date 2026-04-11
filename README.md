@@ -31,6 +31,7 @@ Architecture diagrams are available in:
 Deployment/runbook documents:
 
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
+- `docs/etcd_raft_migration_operations.md` (offline HashiCorp-to-etcd cutover runbook and verification checklist)
 - `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
 
 Design documents:
@@ -88,9 +89,13 @@ docker compose up -d
 This section provides sample commands to demonstrate how to use the project. Make sure you have the necessary dependencies installed before running these commands.
 
 ### Starting the Server
-To start the server, use the following command:
+To start a single node with the default `etcd/raft` runtime, use:
 ```bash
-go run cmd/server/demo.go
+go run . \
+  --address "127.0.0.1:50051" \
+  --redisAddress "127.0.0.1:6379" \
+  --raftId "n1" \
+  --raftBootstrap
 ```
 
 ### Migrating Legacy BoltDB Raft Storage
@@ -134,27 +139,31 @@ go run . \
 
 ### Running with the etcd/raft backend
 
-The etcd runtime is opt-in:
+`etcd/raft` is the default backend:
 
 ```bash
 go run . \
-  --raftEngine etcd \
   --address "127.0.0.1:50051" \
   --redisAddress "127.0.0.1:6379" \
   --raftId "n1"
 ```
 
 Elastickv writes a `raft-engine` marker into each Raft data directory and refuses
-to reopen a directory with a different backend. Do not point `--raftEngine=etcd`
-at an existing HashiCorp Raft directory, or vice versa. For existing stores, seed
-a fresh etcd data dir with the offline migrator:
+to reopen a directory with a different backend. Do not point the default etcd
+runtime at an existing HashiCorp Raft directory, or vice versa. Use
+`--raftEngine hashicorp` only for legacy clusters that have not migrated yet.
+
+For existing stores, seed a fresh etcd data dir with the offline migrator:
 
 ```bash
 go run ./cmd/etcd-raft-migrate \
-  --source /var/lib/elastickv/fsm.db \
+  --fsm-store /var/lib/elastickv/n1/fsm.db \
   --dest /var/lib/elastickv-etcd/n1 \
   --peers n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053
 ```
+
+The full cutover procedure, validation, and rollback constraints are documented
+in `docs/etcd_raft_migration_operations.md`.
 
 ### Starting the Client
 

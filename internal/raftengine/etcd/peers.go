@@ -3,7 +3,6 @@ package etcd
 import (
 	"hash/fnv"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -198,21 +197,17 @@ func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
 	delete(peers, nodeID)
 }
 
-func peerListForConfState(peers map[uint64]Peer, conf raftpb.ConfState) []Peer {
-	if len(conf.Voters) == 0 {
+func sortedPeerList(peers map[uint64]Peer) []Peer {
+	if len(peers) == 0 {
 		return nil
 	}
-	out := make([]Peer, 0, len(conf.Voters))
-	for _, nodeID := range conf.Voters {
-		peer, ok := peers[nodeID]
-		if !ok {
-			out = append(out, Peer{
-				NodeID: nodeID,
-				ID:     strconv.FormatUint(nodeID, 10),
-			})
+	out := make([]Peer, 0, len(peers))
+	for _, peer := range peers {
+		normalizedPeer, err := normalizePeer(peer)
+		if err != nil {
 			continue
 		}
-		out = append(out, peer)
+		out = append(out, normalizedPeer)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out

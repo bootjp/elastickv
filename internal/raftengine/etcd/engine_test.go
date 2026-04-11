@@ -926,6 +926,32 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 	}
 }
 
+func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	learner := Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"}
+	context, err := encodeConfChangeContext(17, learner)
+	require.NoError(t, err)
+	next := engine.nextPeersAfterConfigChange(
+		raftpb.ConfChangeAddLearnerNode,
+		learner.NodeID,
+		context,
+		raftpb.ConfState{
+			Voters:   []uint64{1},
+			Learners: []uint64{2},
+		},
+	)
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}, next)
+}
+
 func TestEnqueueSnapshotRequestRejectsAsyncConfigSnapshots(t *testing.T) {
 	snapshot := &closeTrackingSnapshot{}
 	engine := &Engine{

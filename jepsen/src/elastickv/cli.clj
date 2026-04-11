@@ -19,8 +19,8 @@
    [nil "--grpc-port PORT" "gRPC/Raft port."
     :default 50051
     :parse-fn #(Integer/parseInt %)]
-   [nil "--raft-engine ENGINE" "Raft engine implementation (hashicorp or etcd)."
-    :default "hashicorp"]
+   [nil "--raft-engine ENGINE" "Raft engine implementation (etcd or hashicorp)."
+    :default "etcd"]
    [nil "--raft-groups GROUPS" "Comma separated raft groups (groupID=port,...)"
     :parse-fn (fn [s]
                 (->> (str/split s #",")
