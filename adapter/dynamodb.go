@@ -63,7 +63,6 @@ const (
 	tableCleanupAsyncTimeout    = 5 * time.Minute
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
-	tableCleanupDeleteBatchSize = 256
 	batchWriteItemMaxItems      = 25
 	dynamoMaxRequestBodyBytes   = 1 << 20
 
@@ -962,55 +961,17 @@ func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tabl
 		dynamoItemPrefixForTable(tableName, generation),
 		dynamoGSIPrefixForTable(tableName, generation),
 	}
-	for {
-		keys, err := d.scanDeleteCandidateKeysByPrefixes(ctx, prefixes)
-		if err != nil {
-			return err
-		}
-		if len(keys) == 0 {
-			return nil
-		}
-		if err := d.deleteKeysByBatches(ctx, keys); err != nil {
-			return err
-		}
-		if err := waitTransactRetryBackoff(ctx, transactRetryInitialBackoff); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-}
-
-func (d *DynamoDBServer) scanDeleteCandidateKeysByPrefixes(ctx context.Context, prefixes [][]byte) ([][]byte, error) {
-	keys := make([][]byte, 0, len(prefixes)*dynamoScanPageLimit)
+	// Dispatch a single DEL_PREFIX operation per prefix. The FSM on each node
+	// scans and writes tombstones locally, avoiding the enumerate-then-batch-
+	// delete loop that previously required many Raft proposals.
 	for _, prefix := range prefixes {
-		prefixKeys, err := d.scanDeleteCandidateKeys(ctx, prefix)
+		_, err := d.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.DelPrefix, Key: prefix},
+			},
+		})
 		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, prefixKeys...)
-	}
-	return uniqueKeys(keys), nil
-}
-
-func (d *DynamoDBServer) scanDeleteCandidateKeys(ctx context.Context, prefix []byte) ([][]byte, error) {
-	kvs, err := d.scanAllByPrefix(ctx, prefix)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	keys := make([][]byte, 0, len(kvs))
-	for _, kvp := range kvs {
-		if !bytes.HasPrefix(kvp.Key, prefix) {
-			continue
-		}
-		keys = append(keys, kvp.Key)
-	}
-	return keys, nil
-}
-
-func (d *DynamoDBServer) deleteKeysByBatches(ctx context.Context, keys [][]byte) error {
-	for start := 0; start < len(keys); start += tableCleanupDeleteBatchSize {
-		end := min(start+tableCleanupDeleteBatchSize, len(keys))
-		if err := d.dispatchDeleteBatch(ctx, keys[start:end]); err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 	}
 	return nil

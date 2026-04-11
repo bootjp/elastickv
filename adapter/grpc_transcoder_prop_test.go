@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -101,6 +102,12 @@ func applyOps(t interface {
 			mem[string(elem.Key)] = append([]byte(nil), elem.Value...)
 		case kv.Del:
 			delete(mem, string(elem.Key))
+		case kv.DelPrefix:
+			for k := range mem {
+				if len(elem.Key) == 0 || strings.HasPrefix(k, string(elem.Key)) {
+					delete(mem, k)
+				}
+			}
 		default:
 			require.Fail(t, "unknown operation", "op=%v", elem.Op)
 		}

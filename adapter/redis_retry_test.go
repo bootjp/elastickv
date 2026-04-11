@@ -41,6 +41,8 @@ func (c *retryOnceCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationG
 			err = c.store.PutAt(ctx, elem.Key, elem.Value, ts, 0)
 		case kv.Del:
 			err = c.store.DeleteAt(ctx, elem.Key, ts)
+		case kv.DelPrefix:
+			err = c.store.DeletePrefixAt(ctx, elem.Key, nil, ts)
 		}
 		if err != nil {
 			return nil, err

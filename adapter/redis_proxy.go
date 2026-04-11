@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/errors"
-	"github.com/redis/go-redis/v9"
 )
 
 func (r *RedisServer) proxyDBSize() (int, error) {
@@ -17,10 +16,12 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	res, err := cli.DBSize(context.Background()).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.DBSize(ctx).Result()
 	return int(res), errors.WithStack(err)
 }
 
@@ -42,11 +43,13 @@ func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
 		byAddr[addr] = append(byAddr[addr], string(k))
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
 	var total int64
 	for addr, strKeys := range byAddr {
-		cli := redis.NewClient(&redis.Options{Addr: addr})
-		res, err := cli.Del(context.Background(), strKeys...).Result()
-		_ = cli.Close()
+		cli := r.getOrCreateLeaderClient(addr)
+		res, err := cli.Del(ctx, strKeys...).Result()
 		if err != nil {
 			return total, errors.WithStack(err)
 		}
@@ -65,14 +68,16 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 		return errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
 
 	var err error
 	if all {
-		err = cli.FlushAll(context.Background()).Err()
+		err = cli.FlushAll(ctx).Err()
 	} else {
-		err = cli.FlushDB(context.Background()).Err()
+		err = cli.FlushDB(ctx).Err()
 	}
 	return errors.WithStack(err)
 }

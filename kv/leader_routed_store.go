@@ -239,6 +239,13 @@ func (s *LeaderRoutedStore) ApplyMutations(ctx context.Context, mutations []*sto
 	return errors.WithStack(s.local.ApplyMutations(ctx, mutations, startTS, commitTS))
 }
 
+func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS))
+}
+
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {
 	if s == nil || s.local == nil {
 		return 0

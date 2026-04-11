@@ -867,69 +867,120 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 }
 
 func (r *RedisServer) rename(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdRename, cmd.Args[1:])
 }
 
 func (r *RedisServer) llen(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdLLen, cmd.Args[1:])
 }
 
 func (r *RedisServer) lrem(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdLRem, cmd.Args[1:])
 }
 
 func (r *RedisServer) lpop(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdLPop, cmd.Args[1:])
 }
 
 func (r *RedisServer) rpop(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdRPop, cmd.Args[1:])
 }
 
 func (r *RedisServer) rpoplpush(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdRPopLPush, cmd.Args[1:])
 }
 
 func (r *RedisServer) lpos(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdLPos, cmd.Args[1:])
 }
 
 func (r *RedisServer) lset(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdLSet, cmd.Args[1:])
 }
 
 func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdSCard, cmd.Args[1:])
 }
 
 func (r *RedisServer) zcard(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZCard, cmd.Args[1:])
 }
 
 func (r *RedisServer) zcount(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZCount, cmd.Args[1:])
 }
 
 func (r *RedisServer) zrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZRangeByScore, cmd.Args[1:])
 }
 
 func (r *RedisServer) zrevrange(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZRevRange, cmd.Args[1:])
 }
 
 func (r *RedisServer) zrevrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZRevRangeByScore, cmd.Args[1:])
 }
 
 func (r *RedisServer) zscore(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZScore, cmd.Args[1:])
 }
 
 func (r *RedisServer) zpopmin(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZPopMin, cmd.Args[1:])
 }
 
 func (r *RedisServer) zremrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	r.execLuaCompat(conn, cmdZRemRangeByScore, cmd.Args[1:])
 }

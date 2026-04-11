@@ -258,6 +258,11 @@ type RedisServer struct {
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
+	// leaderClients caches go-redis clients per leader address to avoid
+	// creating a new connection pool for every proxied request.
+	leaderClientsMu sync.RWMutex
+	leaderClients   map[string]*redis.Client
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -333,6 +338,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		redisAddr:       redisAddr,
 		relay:           relay,
 		leaderRedis:     leaderRedis,
+		leaderClients:   make(map[string]*redis.Client),
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
@@ -892,6 +898,9 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -927,16 +936,18 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	key := cmd.Args[1]
-	readTS := r.readTS()
-	isLeader := r.coordinator.IsLeaderForKey(key)
+	if r.proxyToLeader(conn, cmd, key) {
+		return
+	}
 
+	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	if typ == redisTypeNone {
-		r.getHandleNone(conn, key, isLeader)
+		conn.WriteNull()
 		return
 	}
 	if typ != redisTypeString {
@@ -944,13 +955,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// When proxying reads to the leader, let the leader choose a safe snapshot.
-	// Our local store watermark may lag behind a just-committed transaction.
-	valueTS := readTS
-	if !isLeader {
-		valueTS = 0
-	}
-	v, err := r.readValueAt(key, valueTS)
+	v, err := r.readValueAt(key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -961,36 +966,6 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	conn.WriteBulk(v)
-}
-
-// getHandleNone handles GET when the local type check returns none.
-// On followers the local MVCC may lag, so we proxy to the leader.
-func (r *RedisServer) getHandleNone(conn redcon.Conn, key []byte, isLeader bool) {
-	if isLeader {
-		conn.WriteNull()
-		return
-	}
-	// Check TTL on the leader first; if expired the key is logically gone.
-	if r.isLeaderKeyExpired(key) {
-		conn.WriteNull()
-		return
-	}
-	// Check if the key is a string on the leader.
-	v, err := r.tryLeaderGetAt(key, 0)
-	if err == nil {
-		conn.WriteBulk(v)
-		return
-	}
-	if !errors.Is(err, store.ErrKeyNotFound) {
-		conn.WriteError(err.Error())
-		return
-	}
-	// String key not found — check if it exists as a non-string type.
-	if r.tryLeaderNonStringExists(key) {
-		conn.WriteError(wrongTypeMessage)
-		return
-	}
-	conn.WriteNull()
 }
 
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
@@ -1330,14 +1305,12 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{
-		Addr: leaderAddr,
-	})
-	defer func() {
-		_ = cli.Close()
-	}()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	keys, err := cli.Keys(context.Background(), string(pattern)).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	keys, err := cli.Keys(ctx, string(pattern)).Result()
 	return keys, errors.WithStack(err)
 }
 
@@ -2346,6 +2319,10 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
+	if !r.coordinator.IsLeaderForKey(key) {
+		return r.proxyLRange(key, startRaw, endRaw)
+	}
+
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
@@ -2356,9 +2333,6 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 	}
 	if typ != redisTypeList {
 		return nil, wrongTypeError()
-	}
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
 	}
 
 	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
@@ -2391,8 +2365,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	start, err := parseInt(startRaw)
 	if err != nil {
@@ -2403,7 +2376,10 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	res, err := cli.LRange(context.Background(), string(key), int64(start), int64(end)).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -2417,15 +2393,17 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	args := make([]any, 0, len(values))
 	for _, v := range values {
 		args = append(args, string(v))
 	}
 
-	res, err := cli.RPush(context.Background(), string(key), args...).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.RPush(ctx, string(key), args...).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -2439,16 +2417,125 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	args := make([]any, 0, len(values))
 	for _, v := range values {
 		args = append(args, string(v))
 	}
 
-	res, err := cli.LPush(context.Background(), string(key), args...).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.LPush(ctx, string(key), args...).Result()
 	return res, errors.WithStack(err)
+}
+
+// getOrCreateLeaderClient returns a cached go-redis client for the given address,
+// creating one if it doesn't exist.
+func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
+	r.leaderClientsMu.RLock()
+	cli, ok := r.leaderClients[addr]
+	r.leaderClientsMu.RUnlock()
+	if ok {
+		return cli
+	}
+
+	r.leaderClientsMu.Lock()
+	defer r.leaderClientsMu.Unlock()
+	// Double-check after acquiring write lock.
+	if cli, ok = r.leaderClients[addr]; ok {
+		return cli
+	}
+	cli = redis.NewClient(&redis.Options{Addr: addr})
+	r.leaderClients[addr] = cli
+	return cli
+}
+
+// leaderClientForKey returns a cached go-redis client connected to the leader
+// for the given key.
+func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
+	leader := r.coordinator.RaftLeaderForKey(key)
+	if leader == "" {
+		return nil, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+	return r.getOrCreateLeaderClient(leaderAddr), nil
+}
+
+// proxyToLeader forwards a Redis command to the leader and writes the
+// response to conn. Returns true if the command was proxied (caller should
+// return immediately), false if this node is the leader.
+func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []byte) bool {
+	if r.coordinator.IsLeaderForKey(key) {
+		return false
+	}
+	cli, err := r.leaderClientForKey(key)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	args := make([]interface{}, len(cmd.Args))
+	for i, a := range cmd.Args {
+		args[i] = a
+	}
+	writeGoRedisResult(conn, cli.Do(ctx, args...))
+	return true
+}
+
+func writeGoRedisResult(conn redcon.Conn, cmd *redis.Cmd) {
+	val, err := cmd.Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			conn.WriteNull()
+		} else {
+			conn.WriteError(err.Error())
+		}
+		return
+	}
+	writeGoRedisValue(conn, val)
+}
+
+func writeGoRedisValue(conn redcon.Conn, val interface{}) {
+	switch v := val.(type) {
+	case string:
+		conn.WriteBulkString(v)
+	case []byte:
+		conn.WriteBulk(v)
+	case int64:
+		conn.WriteInt64(v)
+	case bool:
+		conn.WriteInt(boolToInt(v))
+	case float64:
+		conn.WriteBulkString(strconv.FormatFloat(v, 'f', -1, 64))
+	case []interface{}:
+		writeGoRedisArray(conn, v)
+	case nil:
+		conn.WriteNull()
+	default:
+		conn.WriteBulkString(fmt.Sprint(v))
+	}
+}
+
+func writeGoRedisArray(conn redcon.Conn, arr []interface{}) {
+	conn.WriteArray(len(arr))
+	for _, item := range arr {
+		writeGoRedisValue(conn, item)
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func parseInt(b []byte) (int, error) {
@@ -2512,8 +2599,19 @@ type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64,
 type listProxyFunc func(key []byte, values [][]byte) (int64, error)
 
 func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
+	key := cmd.Args[1]
+	if !r.coordinator.IsLeaderForKey(key) {
+		length, err := proxyFn(key, cmd.Args[2:])
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt64(length)
+		return
+	}
+
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2524,13 +2622,7 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	}
 
 	ctx := context.Background()
-
-	var length int64
-	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
-		length, err = pushFn(ctx, cmd.Args[1], cmd.Args[2:])
-	} else {
-		length, err = proxyFn(cmd.Args[1], cmd.Args[2:])
-	}
+	length, err := pushFn(ctx, key, cmd.Args[2:])
 
 	if err != nil {
 		conn.WriteError(err.Error())
