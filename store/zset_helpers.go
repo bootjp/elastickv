@@ -25,6 +25,12 @@ const (
 	zsetMetaBinarySize  = 8
 	zsetScoreBinarySize = 8
 	zsetUserKeyLenSize  = 4
+
+	// float64SignBitPos is the bit position of the sign bit in IEEE 754 float64.
+	float64SignBitPos = 63
+
+	// maxByteVal is the maximum value of a single byte, used in prefix-end computation.
+	maxByteVal = 0xff
 )
 
 // ZSetMeta stores the cardinality of a sorted set.
@@ -136,10 +142,10 @@ func EncodeSortableFloat64(dst []byte, f float64) {
 		return
 	}
 	bits := math.Float64bits(f)
-	if bits&(1<<63) != 0 { // negative
+	if bits&(1<<float64SignBitPos) != 0 { // negative
 		bits = ^bits
 	} else {
-		bits ^= 1 << 63
+		bits ^= 1 << float64SignBitPos
 	}
 	binary.BigEndian.PutUint64(dst, bits)
 }
@@ -147,8 +153,8 @@ func EncodeSortableFloat64(dst []byte, f float64) {
 // DecodeSortableFloat64 decodes a sortable-encoded float64 from 8 bytes.
 func DecodeSortableFloat64(src []byte) float64 {
 	bits := binary.BigEndian.Uint64(src)
-	if bits&(1<<63) != 0 { // was positive (sign bit set in encoded form)
-		bits ^= 1 << 63
+	if bits&(1<<float64SignBitPos) != 0 { // was positive (sign bit set in encoded form)
+		bits ^= 1 << float64SignBitPos
 	} else {
 		bits = ^bits
 	}
@@ -280,7 +286,7 @@ func PrefixEnd(prefix []byte) []byte {
 	end := make([]byte, len(prefix))
 	copy(end, prefix)
 	for i := len(end) - 1; i >= 0; i-- {
-		if end[i] < 0xff {
+		if end[i] < maxByteVal {
 			end[i]++
 			return end[:i+1]
 		}

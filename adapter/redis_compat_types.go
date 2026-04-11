@@ -18,8 +18,7 @@ const (
 	redisStrPrefix    = "!redis|str|"
 	redisHashPrefix   = "!redis|hash|"
 	redisSetPrefix    = "!redis|set|"
-	redisZSetPrefix = "!redis|zset|" // legacy blob format; kept for migration
-
+	redisZSetPrefix   = "!redis|zset|" // legacy blob format; kept for migration
 	redisHLLPrefix    = "!redis|hll|"
 	redisStreamPrefix = "!redis|stream|"
 	redisTTLPrefix    = "!redis|ttl|"

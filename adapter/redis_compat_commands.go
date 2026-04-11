@@ -1568,7 +1568,7 @@ func (r *RedisServer) persistZSetMembersTxn(ctx context.Context, key []byte, rea
 // loadZSetEntriesSorted loads all ZSet entries in score order,
 // checking wide-column first, then falling back to legacy blob.
 func (r *RedisServer) loadZSetEntriesSorted(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
-	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	metaExists, err := r.zsetMetaExistsAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1679,27 +1679,11 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
-func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
-		return
-	}
-	start, err := parseInt(cmd.Args[2])
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-	stop, err := parseInt(cmd.Args[3])
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
+func (r *RedisServer) zremrangebyrankTxn(ctx context.Context, key []byte, start, stop int) (int, error) {
 	var removed int
-	if err := r.retryRedisWrite(ctx, func() error {
+	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAt(context.Background(), key, readTS)
 		if err != nil {
 			return err
 		}
@@ -1710,7 +1694,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		load, err := r.loadZSetMembersMap(context.Background(), cmd.Args[1], readTS)
+		load, err := r.loadZSetMembersMap(context.Background(), key, readTS)
 		if err != nil {
 			return err
 		}
@@ -1728,8 +1712,30 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 			delete(members, entry.Member)
 		}
 		removed = e - s + 1
-		return r.persistZSetMembersTxn(ctx, cmd.Args[1], readTS, load, members)
-	}); err != nil {
+		return r.persistZSetMembersTxn(ctx, key, readTS, load, members)
+	})
+	return removed, err
+}
+
+func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
+	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
+	start, err := parseInt(cmd.Args[2])
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	stop, err := parseInt(cmd.Args[3])
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	removed, err := r.zremrangebyrankTxn(ctx, cmd.Args[1], start, stop)
+	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}

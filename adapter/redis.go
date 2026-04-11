@@ -2027,6 +2027,34 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 	return elems, nil
 }
 
+func buildZSetStateElems(keyBytes []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
+	switch {
+	case len(st.members) == 0:
+		// Delete meta + all remaining member/score keys.
+		elems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
+		if err != nil {
+			return nil, err
+		}
+		if st.fromLegacy {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
+		}
+		return elems, nil
+	case st.fromLegacy:
+		// Legacy blob → wide-column migration: full write + delete legacy blob.
+		elems, err := buildZSetWriteElems(keyBytes, st.members)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
+		return elems, nil
+	case len(st.origMembers) == 0:
+		// Brand-new ZSet: full write.
+		return buildZSetWriteElems(keyBytes, st.members)
+	default:
+		return buildZSetDiffElems(keyBytes, st.origMembers, st.members)
+	}
+}
+
 func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
 	keys := make([]string, 0, len(t.zsetStates))
 	for k := range t.zsetStates {
@@ -2040,41 +2068,11 @@ func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
 		if !st.dirty {
 			continue
 		}
-		keyBytes := []byte(k)
-		if len(st.members) == 0 {
-			// Delete meta + all remaining member/score keys.
-			delElems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, delElems...)
-			if st.fromLegacy {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
-			}
-			continue
+		stElems, err := buildZSetStateElems([]byte(k), st)
+		if err != nil {
+			return nil, err
 		}
-		if st.fromLegacy {
-			// Legacy blob → wide-column migration: full write + delete legacy blob.
-			writeElems, err := buildZSetWriteElems(keyBytes, st.members)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, writeElems...)
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
-		} else if len(st.origMembers) == 0 {
-			// Brand-new ZSet: full write.
-			writeElems, err := buildZSetWriteElems(keyBytes, st.members)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, writeElems...)
-		} else {
-			diffElems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, diffElems...)
-		}
+		elems = append(elems, stElems...)
 	}
 	return elems, nil
 }
