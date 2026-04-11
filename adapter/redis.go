@@ -2513,8 +2513,19 @@ type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64,
 type listProxyFunc func(key []byte, values [][]byte) (int64, error)
 
 func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
+	key := cmd.Args[1]
+	if !r.coordinator.IsLeaderForKey(key) {
+		length, err := proxyFn(key, cmd.Args[2:])
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt64(length)
+		return
+	}
+
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2525,13 +2536,7 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	}
 
 	ctx := context.Background()
-
-	var length int64
-	if r.coordinator.IsLeaderForKey(cmd.Args[1]) {
-		length, err = pushFn(ctx, cmd.Args[1], cmd.Args[2:])
-	} else {
-		length, err = proxyFn(cmd.Args[1], cmd.Args[2:])
-	}
+	length, err := pushFn(ctx, key, cmd.Args[2:])
 
 	if err != nil {
 		conn.WriteError(err.Error())
