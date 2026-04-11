@@ -55,12 +55,26 @@ func savePersistedPeers(dataDir string, index uint64, peers []Peer) error {
 	if ok && current.Index > index {
 		return nil
 	}
+	return writeCurrentPersistedPeers(dataDir, index, peers)
+}
 
+func writeCurrentPersistedPeers(dataDir string, index uint64, peers []Peer) error {
+	normalized, err := normalizePersistedPeers(peers)
+	if err != nil {
+		return err
+	}
+	return writePersistedPeersFile(peersFilePath(dataDir), persistedPeers{
+		Index: index,
+		Peers: normalized,
+	})
+}
+
+func normalizePersistedPeers(peers []Peer) ([]Peer, error) {
 	normalized := make([]Peer, 0, len(peers))
 	for _, peer := range peers {
 		normalizedPeer, err := normalizePeer(peer)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		normalized = append(normalized, normalizedPeer)
 	}
@@ -70,11 +84,7 @@ func savePersistedPeers(dataDir string, index uint64, peers []Peer) error {
 		}
 		return normalized[i].NodeID < normalized[j].NodeID
 	})
-
-	return writePersistedPeersFile(peersFilePath(dataDir), persistedPeers{
-		Index: index,
-		Peers: normalized,
-	})
+	return normalized, nil
 }
 
 func readPersistedPeersFile(path string) (persistedPeers, error) {

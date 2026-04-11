@@ -103,6 +103,10 @@ type testSnapshot struct {
 	data []byte
 }
 
+type closeTrackingSnapshot struct {
+	closed atomic.Bool
+}
+
 type blockingSnapshotStateMachine struct {
 	started chan struct{}
 	release chan struct{}
@@ -133,6 +137,16 @@ func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (s *testSnapshot) Close() error {
+	return nil
+}
+
+func (s *closeTrackingSnapshot) WriteTo(w io.Writer) (int64, error) {
+	n, err := w.Write([]byte("snapshot"))
+	return int64(n), err
+}
+
+func (s *closeTrackingSnapshot) Close() error {
+	s.closed.Store(true)
 	return nil
 }
 
@@ -793,6 +807,64 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	require.Equal(t, uint64(4), snapshot.Metadata.Index)
 	require.Equal(t, []uint64{1, 2}, snapshot.Metadata.ConfState.Voters)
 }
+
+func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
+	engine := &Engine{}
+	engine.configIndex.Store(9)
+
+	upToDate, err := engine.configSnapshotUpToDate(7, raftpb.ConfState{Voters: []uint64{1}})
+	require.NoError(t, err)
+	require.True(t, upToDate)
+}
+
+func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
+	}
+
+	require.NoError(t, engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
+	require.Equal(t, uint64(4), engine.currentConfigIndex())
+}
+
+func TestEnqueueSnapshotRequestRejectsAsyncConfigSnapshots(t *testing.T) {
+	snapshot := &closeTrackingSnapshot{}
+	engine := &Engine{
+		snapshotReqCh:  make(chan snapshotRequest, 1),
+		snapshotStopCh: make(chan struct{}),
+		doneCh:         make(chan struct{}),
+	}
+
+	err := engine.enqueueSnapshotRequest(snapshotRequest{
+		kind:     snapshotKindConfig,
+		index:    7,
+		snapshot: snapshot,
+	})
+	require.ErrorIs(t, err, errAsyncConfigSnapshot)
+	require.True(t, snapshot.closed.Load())
+	require.False(t, engine.snapshotInFlight)
+	require.Empty(t, engine.snapshotReqCh)
+}
+
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
 		Type:    raftpb.MsgApp,

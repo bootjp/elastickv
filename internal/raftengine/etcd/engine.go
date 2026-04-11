@@ -54,6 +54,7 @@ var (
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
+	errAsyncConfigSnapshot        = errors.New("etcd raft config snapshots must be published synchronously")
 )
 
 type Snapshot interface {
@@ -128,13 +129,15 @@ type Engine struct {
 	dispatchWG   sync.WaitGroup
 	snapshotWG   sync.WaitGroup
 
-	mu          sync.RWMutex
-	pending     sync.Mutex
-	status      raftengine.Status
-	config      raftengine.Configuration
-	runErr      error
-	closed      bool
-	applied     uint64
+	mu      sync.RWMutex
+	pending sync.Mutex
+	status  raftengine.Status
+	config  raftengine.Configuration
+	runErr  error
+	closed  bool
+	applied uint64
+	// configIndex tracks the highest configuration index durably published to
+	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
 
 	lastLeaderContactAt   time.Time
@@ -994,17 +997,26 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 }
 
 func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
+	if req.kind != snapshotKindLocal {
+		if req.snapshot != nil {
+			_ = req.snapshot.Close()
+		}
+		return errors.WithStack(errAsyncConfigSnapshot)
+	}
+
 	select {
 	case <-e.doneCh:
-		_ = req.snapshot.Close()
+		if req.snapshot != nil {
+			_ = req.snapshot.Close()
+		}
 		return e.currentErrorOrClosed()
 	case <-e.snapshotStopCh:
-		_ = req.snapshot.Close()
+		if req.snapshot != nil {
+			_ = req.snapshot.Close()
+		}
 		return e.currentErrorOrClosed()
 	case e.snapshotReqCh <- req:
-		if req.kind == snapshotKindLocal {
-			e.snapshotInFlight = true
-		}
+		e.snapshotInFlight = true
 		return nil
 	}
 }
@@ -1203,10 +1215,20 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 }
 
 func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {
-	if err := savePersistedPeers(e.dataDir, index, peers); err != nil {
+	// Config changes are committed in strictly increasing raft index order. Use
+	// the cached durable config index to avoid re-reading peer metadata from
+	// disk on this hot path.
+	if e.currentConfigIndex() >= index {
+		return nil
+	}
+	if err := writeCurrentPersistedPeers(e.dataDir, index, peers); err != nil {
 		return err
 	}
-	return e.persistConfigSnapshot(index, confState)
+	if err := e.persistConfigSnapshot(index, confState); err != nil {
+		return err
+	}
+	e.setConfigIndex(index)
+	return nil
 }
 
 func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.ConfState, payload []byte) error {
@@ -1241,6 +1263,11 @@ func (e *Engine) snapshotPayload() ([]byte, error) {
 }
 
 func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
+	currentIndex := e.currentConfigIndex()
+	if currentIndex > index {
+		return true, nil
+	}
+
 	current, err := e.storage.Snapshot()
 	if err != nil {
 		return false, errors.WithStack(err)
