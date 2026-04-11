@@ -1077,10 +1077,16 @@ func (e *Engine) applyAddedPeer(nodeID uint64, peer Peer, ok bool) {
 func (e *Engine) applyRemovedPeer(nodeID uint64, peer Peer, ok bool) {
 	if ok && peer.NodeID != 0 {
 		e.removePeer(peer.NodeID)
+		if peer.NodeID == e.nodeID {
+			e.requestShutdown()
+		}
 		return
 	}
 	if nodeID != 0 {
 		e.removePeer(nodeID)
+		if nodeID == e.nodeID {
+			e.requestShutdown()
+		}
 	}
 }
 
@@ -1097,6 +1103,10 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 		return nil
 	}
 
+	// Phase 4 keeps config-snapshot publication synchronous so the conf change
+	// is not considered durable before the updated snapshot metadata can be sent
+	// to a freshly added voter. Before broad rollout, this should move to a
+	// background path that preserves the same ordering guarantee.
 	payload, err := e.snapshotPayload()
 	if err != nil {
 		return err
@@ -1247,6 +1257,12 @@ func (e *Engine) openReady(waitForLeader bool) <-chan struct{} {
 		return e.leaderReady
 	}
 	return e.startedCh
+}
+
+func (e *Engine) requestShutdown() {
+	e.closeOnce.Do(func() {
+		close(e.closeCh)
+	})
 }
 
 func (e *Engine) shutdown() {
