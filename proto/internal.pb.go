@@ -25,8 +25,9 @@ const (
 type Op int32
 
 const (
-	Op_PUT Op = 0
-	Op_DEL Op = 1
+	Op_PUT        Op = 0
+	Op_DEL        Op = 1
+	Op_DEL_PREFIX Op = 2
 )
 
 // Enum value maps for Op.
@@ -34,10 +35,12 @@ var (
 	Op_name = map[int32]string{
 		0: "PUT",
 		1: "DEL",
+		2: "DEL_PREFIX",
 	}
 	Op_value = map[string]int32{
-		"PUT": 0,
-		"DEL": 1,
+		"PUT":        0,
+		"DEL":        1,
+		"DEL_PREFIX": 2,
 	}
 )
 

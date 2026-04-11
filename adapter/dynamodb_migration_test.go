@@ -76,6 +76,8 @@ func (c *localAdapterCoordinator) applyElem(ctx context.Context, elem *kv.Elem[k
 		return c.store.PutAt(ctx, elem.Key, elem.Value, commitTS, 0)
 	case kv.Del:
 		return c.store.DeleteAt(ctx, elem.Key, commitTS)
+	case kv.DelPrefix:
+		return c.store.DeletePrefixAt(ctx, elem.Key, nil, commitTS)
 	default:
 		return nil
 	}

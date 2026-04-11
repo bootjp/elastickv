@@ -133,6 +133,12 @@ type MVCCStore interface {
 	// than startTS. Note: only write-write conflicts are detected (Snapshot
 	// Isolation). Read-write conflicts (write skew) are not prevented.
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
+	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
+	// keys matching prefix at commitTS by writing tombstone versions. An empty
+	// prefix means "all keys". Keys matching excludePrefix are preserved.
+	// No conflict checking is performed; this is intended for bulk operations
+	// such as FLUSHALL where the caller knows no conflict check is needed.
+	DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// Compact removes versions older than minTS that are no longer needed.

@@ -1138,6 +1138,19 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, startTS, commitTS))
 }
 
+// DeletePrefixAt applies a prefix delete to every shard in the store.
+func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		if err := g.Store.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 func (s *ShardStore) LastCommitTS() uint64 {
 	var max uint64
 	for _, g := range s.groups {

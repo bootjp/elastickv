@@ -509,6 +509,49 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	return nil
 }
 
+// DeletePrefixAt deletes all visible keys matching prefix by writing tombstones
+// at commitTS. An empty prefix deletes all keys. Keys matching excludePrefix
+// are preserved.
+func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	commitTS = s.alignCommitTS(commitTS)
+
+	// Collect matching keys first since we cannot modify the tree while iterating.
+	var toDelete [][]byte
+	it := s.tree.Iterator()
+	var started bool
+	if len(prefix) > 0 {
+		started = seekForwardIteratorStart(s.tree, &it, prefix)
+	} else {
+		started = it.First()
+	}
+	for ok := started; ok; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if len(prefix) > 0 && !bytes.HasPrefix(k, prefix) {
+			break
+		}
+		if len(excludePrefix) > 0 && bytes.HasPrefix(k, excludePrefix) {
+			continue
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		if _, visible := visibleValue(versions, commitTS); !visible {
+			continue
+		}
+		toDelete = append(toDelete, k)
+	}
+
+	for _, k := range toDelete {
+		s.deleteVersionLocked(k, commitTS)
+	}
+
+	return nil
+}
+
 // ---- Store / ScanStore methods ----
 
 func (s *mvccStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
