@@ -72,13 +72,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		if reqs.IsTxn {
-			return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
-		}
-		if err := validateDelPrefixOnly(reqs.Elems); err != nil {
-			return nil, err
-		}
-		return c.dispatchDelPrefixBroadcast(reqs.Elems)
+		return c.dispatchDelPrefixBroadcast(reqs.IsTxn, reqs.Elems)
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
@@ -132,33 +126,40 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 	return nil
 }
 
-// dispatchDelPrefixBroadcast sends each DEL_PREFIX element as a separate
-// request to every shard group. Each element gets its own request because the
-// FSM's extractDelPrefix processes only the first DEL_PREFIX mutation per
-// request.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(elems []*Elem[OP]) (*CoordinateResponse, error) {
+// dispatchDelPrefixBroadcast validates and broadcasts DEL_PREFIX operations
+// to every shard group. Each element becomes a separate pb.Request (the FSM's
+// extractDelPrefix processes only the first DEL_PREFIX mutation per request).
+// All requests are batched into a single Commit call per shard group.
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+	if isTxn {
+		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
+	}
+	if err := validateDelPrefixOnly(elems); err != nil {
+		return nil, err
+	}
+
+	requests := make([]*pb.Request, 0, len(elems))
+	for _, elem := range elems {
+		requests = append(requests, &pb.Request{
+			IsTxn:     false,
+			Phase:     pb.Phase_NONE,
+			Ts:        c.clock.Next(),
+			Mutations: []*pb.Mutation{elemToMutation(elem)},
+		})
+	}
+
 	var maxIndex uint64
 	var firstErr error
-	for _, elem := range elems {
-		mut := elemToMutation(elem)
-		ts := c.clock.Next()
-		for _, g := range c.groups {
-			req := &pb.Request{
-				IsTxn:     false,
-				Phase:     pb.Phase_NONE,
-				Ts:        ts,
-				Mutations: []*pb.Mutation{mut},
+	for _, g := range c.groups {
+		r, err := g.Txn.Commit(requests)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
 			}
-			r, err := g.Txn.Commit([]*pb.Request{req})
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			if r.CommitIndex > maxIndex {
-				maxIndex = r.CommitIndex
-			}
+			continue
+		}
+		if r != nil && r.CommitIndex > maxIndex {
+			maxIndex = r.CommitIndex
 		}
 	}
 	if firstErr != nil {

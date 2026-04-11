@@ -58,9 +58,9 @@ func TestHasDelPrefixElem(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "nil element skipped",
+			name:  "nil element skipped",
 			elems: []*Elem[OP]{nil, {Op: DelPrefix}},
-			want: true,
+			want:  true,
 		},
 	}
 
