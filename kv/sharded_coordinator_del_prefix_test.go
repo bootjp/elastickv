@@ -115,6 +115,54 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		require.Equal(t, pb.Op_DEL_PREFIX, req.Mutations[0].Op)
 		require.Empty(t, req.Mutations[0].Key, "nil prefix means all keys")
 	}
+
+	// All groups should receive the same timestamp for a single DEL_PREFIX.
+	require.Equal(t, g1Txn.requests[0].Ts, g2Txn.requests[0].Ts,
+		"same DEL_PREFIX element must use the same timestamp across shards")
+}
+
+// TestShardedCoordinator_DelPrefixRejectsTxn verifies that DEL_PREFIX inside
+// a transactional group is rejected.
+func TestShardedCoordinator_DelPrefixRejectsTxn(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true,
+		Elems: []*Elem[OP]{
+			{Op: DelPrefix, Key: nil},
+		},
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+// TestShardedCoordinator_DelPrefixRejectsMixed verifies that mixing DEL_PREFIX
+// with other operations in the same dispatch is rejected.
+func TestShardedCoordinator_DelPrefixRejectsMixed(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: DelPrefix, Key: nil},
+			{Op: Put, Key: []byte("k"), Value: []byte("v")},
+		},
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidRequest)
 }
 
 // TestShardedCoordinator_DelPrefixWithSpecificPrefix verifies broadcasting
