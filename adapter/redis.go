@@ -2352,6 +2352,11 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, err
 	}
 	if typ == redisTypeNone {
+		// On a follower the local MVCC snapshot may lag behind the leader,
+		// so the key might actually exist. Proxy to the leader.
+		if !r.coordinator.IsLeaderForKey(key) {
+			return r.proxyLRange(key, startRaw, endRaw)
+		}
 		return []string{}, nil
 	}
 	if typ != redisTypeList {
