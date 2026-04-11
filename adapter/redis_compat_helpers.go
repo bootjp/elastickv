@@ -152,7 +152,9 @@ func (r *RedisServer) scanZSetScoreEntries(ctx context.Context, key []byte, limi
 }
 
 // scanZSetAllMembers scans the score index for a ZSet and returns all entries
-// in score order.
+// in score order. An unbounded limit is used because Redis commands like
+// ZRANGE, ZCARD, and ZREM require access to all members; the set size is
+// bounded at write time by available memory, consistent with Redis behavior.
 func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
 	return r.scanZSetScoreEntries(ctx, key, math.MaxInt, readTS)
 }
@@ -193,6 +195,10 @@ func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS
 // deleteZSetWideColumnElems deletes all wide-column ZSet keys. Prefix
 // deletions are dispatched as standalone operations (required by FSM), while
 // the meta key delete is returned for the caller to batch with other elems.
+// deleteZSetWideColumnElems generates delete operations for all wide-column
+// ZSet keys (meta + members + score index). Individual keys are scanned and
+// deleted to preserve atomicity with the caller's transaction — kv.DelPrefix
+// cannot be mixed with other mutations in a single Raft request.
 func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
@@ -202,21 +208,25 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 		return nil, nil
 	}
 
-	// DelPrefix must be sole mutation per request; dispatch separately.
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
+	}
+
+	// Scan member keys and score-index keys for individual deletion.
 	for _, prefix := range [][]byte{
 		store.ZSetMemberScanPrefix(key),
 		store.ZSetScoreScanPrefix(key),
 	} {
-		if err := r.dispatchElems(ctx, false, 0, []*kv.Elem[kv.OP]{
-			{Op: kv.DelPrefix, Key: prefix},
-		}); err != nil {
-			return nil, err
+		kvs, err := r.store.ScanAt(ctx, prefix, store.PrefixEnd(prefix), math.MaxInt, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		for _, kvp := range kvs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(kvp.Key)})
 		}
 	}
 
-	return []*kv.Elem[kv.OP]{
-		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
-	}, nil
+	return elems, nil
 }
 
 // buildZSetRemoveEntryElems builds KV operations to remove specific entries
