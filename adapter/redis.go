@@ -2346,24 +2346,20 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
+	if !r.coordinator.IsLeaderForKey(key) {
+		return r.proxyLRange(key, startRaw, endRaw)
+	}
+
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return nil, err
 	}
 	if typ == redisTypeNone {
-		// On a follower the local MVCC snapshot may lag behind the leader,
-		// so the key might actually exist. Proxy to the leader.
-		if !r.coordinator.IsLeaderForKey(key) {
-			return r.proxyLRange(key, startRaw, endRaw)
-		}
 		return []string{}, nil
 	}
 	if typ != redisTypeList {
 		return nil, wrongTypeError()
-	}
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
 	}
 
 	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
