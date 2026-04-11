@@ -793,7 +793,6 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	require.Equal(t, uint64(4), snapshot.Metadata.Index)
 	require.Equal(t, []uint64{1, 2}, snapshot.Metadata.ConfState.Voters)
 }
-
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
 		Type:    raftpb.MsgApp,

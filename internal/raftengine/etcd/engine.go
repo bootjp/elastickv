@@ -1191,11 +1191,11 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 		return nil
 	}
 
-	snapshot, err := e.fsm.Snapshot()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	payload, err := snapshotBytesAndClose(snapshot, e.dataDir)
+	// Phase 4 keeps config-snapshot publication synchronous so the conf change
+	// is not considered durable before the updated snapshot metadata can be sent
+	// to a freshly added voter. Before broad rollout, this should move to a
+	// background path that preserves the same ordering guarantee.
+	payload, err := e.snapshotPayload()
 	if err != nil {
 		return err
 	}
@@ -1230,6 +1230,14 @@ func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.Con
 		return err
 	}
 	return nil
+}
+
+func (e *Engine) snapshotPayload() ([]byte, error) {
+	snapshot, err := e.fsm.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return snapshotBytesAndClose(snapshot, e.dataDir)
 }
 
 func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
