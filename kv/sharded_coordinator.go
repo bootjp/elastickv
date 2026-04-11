@@ -68,6 +68,13 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
+	// DEL_PREFIX cannot be routed to a single shard because the prefix may
+	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
+	// operation to every shard group so each FSM scans locally.
+	if hasDelPrefixElem(reqs.Elems) {
+		return c.dispatchDelPrefixBroadcast(reqs.Elems)
+	}
+
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		startTS, err := c.nextStartTS(ctx, reqs.Elems)
 		if err != nil {
@@ -95,6 +102,49 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+}
+
+// hasDelPrefixElem returns true if any element is a DelPrefix operation.
+func hasDelPrefixElem(elems []*Elem[OP]) bool {
+	for _, e := range elems {
+		if e != nil && e.Op == DelPrefix {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchDelPrefixBroadcast sends the DEL_PREFIX request to every shard group.
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(elems []*Elem[OP]) (*CoordinateResponse, error) {
+	muts := make([]*pb.Mutation, 0, len(elems))
+	for _, elem := range elems {
+		muts = append(muts, elemToMutation(elem))
+	}
+
+	var maxIndex uint64
+	var firstErr error
+	for _, g := range c.groups {
+		req := &pb.Request{
+			IsTxn:     false,
+			Phase:     pb.Phase_NONE,
+			Ts:        c.clock.Next(),
+			Mutations: muts,
+		}
+		r, err := g.Txn.Commit([]*pb.Request{req})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if r.CommitIndex > maxIndex {
+			maxIndex = r.CommitIndex
+		}
+	}
+	if firstErr != nil {
+		return nil, errors.WithStack(firstErr)
+	}
+	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
 func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
