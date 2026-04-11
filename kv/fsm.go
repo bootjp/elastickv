@@ -158,13 +158,11 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
-	// Check for DEL_PREFIX mutations first: they are handled by the store's
-	// DeletePrefixAt which scans and writes tombstones locally, avoiding the
-	// need to enumerate keys in the Raft log.
-	for _, mut := range r.Mutations {
-		if mut != nil && mut.Op == pb.Op_DEL_PREFIX {
-			return f.handleDelPrefix(ctx, mut.Key, commitTS)
-		}
+	// DEL_PREFIX mutations are handled by the store's DeletePrefixAt which
+	// scans and writes tombstones locally. A DEL_PREFIX request must be the
+	// sole mutation in a request (enforced by the coordinator's toRawRequest).
+	if hasDelPrefix, prefix := extractDelPrefix(r.Mutations); hasDelPrefix {
+		return f.handleDelPrefix(ctx, prefix, commitTS)
 	}
 
 	for _, mut := range r.Mutations {
@@ -187,6 +185,17 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
 	return errors.WithStack(f.store.ApplyMutations(ctx, muts, commitTS, commitTS))
+}
+
+// extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
+// If found, it validates that no other operation types are mixed in.
+func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
+	for _, mut := range muts {
+		if mut != nil && mut.Op == pb.Op_DEL_PREFIX {
+			return true, mut.Key
+		}
+	}
+	return false, nil
 }
 
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal

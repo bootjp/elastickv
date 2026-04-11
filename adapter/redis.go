@@ -258,6 +258,11 @@ type RedisServer struct {
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
+	// leaderClients caches go-redis clients per leader address to avoid
+	// creating a new connection pool for every proxied request.
+	leaderClientsMu sync.RWMutex
+	leaderClients   map[string]*redis.Client
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -333,6 +338,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		redisAddr:       redisAddr,
 		relay:           relay,
 		leaderRedis:     leaderRedis,
+		leaderClients:   make(map[string]*redis.Client),
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
@@ -1299,14 +1305,12 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{
-		Addr: leaderAddr,
-	})
-	defer func() {
-		_ = cli.Close()
-	}()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	keys, err := cli.Keys(context.Background(), string(pattern)).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	keys, err := cli.Keys(ctx, string(pattern)).Result()
 	return keys, errors.WithStack(err)
 }
 
@@ -2361,8 +2365,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	start, err := parseInt(startRaw)
 	if err != nil {
@@ -2373,7 +2376,10 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	res, err := cli.LRange(context.Background(), string(key), int64(start), int64(end)).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -2387,15 +2393,17 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	args := make([]any, 0, len(values))
 	for _, v := range values {
 		args = append(args, string(v))
 	}
 
-	res, err := cli.RPush(context.Background(), string(key), args...).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.RPush(ctx, string(key), args...).Result()
 	return res, errors.WithStack(err)
 }
 
@@ -2409,20 +2417,43 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
 
-	cli := redis.NewClient(&redis.Options{Addr: leaderAddr})
-	defer func() { _ = cli.Close() }()
+	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	args := make([]any, 0, len(values))
 	for _, v := range values {
 		args = append(args, string(v))
 	}
 
-	res, err := cli.LPush(context.Background(), string(key), args...).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	res, err := cli.LPush(ctx, string(key), args...).Result()
 	return res, errors.WithStack(err)
 }
 
-// leaderClientForKey returns a go-redis client connected to the Raft leader
-// for the given key. The caller must close the client.
+// getOrCreateLeaderClient returns a cached go-redis client for the given address,
+// creating one if it doesn't exist.
+func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
+	r.leaderClientsMu.RLock()
+	cli, ok := r.leaderClients[addr]
+	r.leaderClientsMu.RUnlock()
+	if ok {
+		return cli
+	}
+
+	r.leaderClientsMu.Lock()
+	defer r.leaderClientsMu.Unlock()
+	// Double-check after acquiring write lock.
+	if cli, ok = r.leaderClients[addr]; ok {
+		return cli
+	}
+	cli = redis.NewClient(&redis.Options{Addr: addr})
+	r.leaderClients[addr] = cli
+	return cli
+}
+
+// leaderClientForKey returns a cached go-redis client connected to the leader
+// for the given key.
 func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
 	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
@@ -2432,7 +2463,7 @@ func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
 	if !ok || leaderAddr == "" {
 		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
 	}
-	return redis.NewClient(&redis.Options{Addr: leaderAddr}), nil
+	return r.getOrCreateLeaderClient(leaderAddr), nil
 }
 
 // proxyToLeader forwards a Redis command to the leader and writes the
@@ -2447,13 +2478,15 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 		conn.WriteError(err.Error())
 		return true
 	}
-	defer func() { _ = cli.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
 
 	args := make([]interface{}, len(cmd.Args))
 	for i, a := range cmd.Args {
-		args[i] = string(a)
+		args[i] = a
 	}
-	writeGoRedisResult(conn, cli.Do(context.Background(), args...))
+	writeGoRedisResult(conn, cli.Do(ctx, args...))
 	return true
 }
 
@@ -2474,18 +2507,35 @@ func writeGoRedisValue(conn redcon.Conn, val interface{}) {
 	switch v := val.(type) {
 	case string:
 		conn.WriteBulkString(v)
+	case []byte:
+		conn.WriteBulk(v)
 	case int64:
 		conn.WriteInt64(v)
+	case bool:
+		conn.WriteInt(boolToInt(v))
+	case float64:
+		conn.WriteBulkString(strconv.FormatFloat(v, 'f', -1, 64))
 	case []interface{}:
-		conn.WriteArray(len(v))
-		for _, item := range v {
-			writeGoRedisValue(conn, item)
-		}
+		writeGoRedisArray(conn, v)
 	case nil:
 		conn.WriteNull()
 	default:
 		conn.WriteBulkString(fmt.Sprint(v))
 	}
+}
+
+func writeGoRedisArray(conn redcon.Conn, arr []interface{}) {
+	conn.WriteArray(len(arr))
+	for _, item := range arr {
+		writeGoRedisValue(conn, item)
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func parseInt(b []byte) (int, error) {

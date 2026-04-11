@@ -960,20 +960,19 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 
 	// Persist lastCommitTS update atomically with the tombstones.
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	newLastTS := s.lastCommitTS
 	if commitTS > newLastTS {
 		newLastTS = commitTS
 	}
 	if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
-		s.mtx.Unlock()
 		return err
 	}
 	if err := batch.Commit(pebble.Sync); err != nil {
-		s.mtx.Unlock()
 		return errors.WithStack(err)
 	}
 	s.updateLastCommitTS(newLastTS)
-	s.mtx.Unlock()
 
 	return nil
 }
