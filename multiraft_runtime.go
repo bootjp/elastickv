@@ -1,31 +1,62 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	transport "github.com/Jille/raft-grpc-transport"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/internal/raftstore"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc"
 )
 
 type raftGroupRuntime struct {
 	spec   groupSpec
 	raft   *raft.Raft
 	engine raftengine.Engine
-	tm     *transport.Manager
 	store  store.MVCCStore
 
-	closeStores func()
+	registerTransport func(grpc.ServiceRegistrar)
+	closeTransport    func()
+	closeStores       func()
 }
 
 const raftCommitTimeout = 50 * time.Millisecond
+
+type raftEngineType string
+
+const (
+	raftEngineHashicorp       raftEngineType = "hashicorp"
+	raftEngineEtcd            raftEngineType = "etcd"
+	etcdTickInterval                         = 10 * time.Millisecond
+	etcdHeartbeatMinTicks                    = 1
+	etcdElectionMinTicks                     = 2
+	etcdRuntimeMaxSizePerMsg                 = 1 << 20
+	etcdRuntimeMaxInflightMsg                = 256
+)
+
+var ErrUnsupportedRaftEngine = errors.New("unsupported raft engine")
+
+func parseRaftEngineType(raw string) (raftEngineType, error) {
+	switch engineType := raftEngineType(strings.ToLower(strings.TrimSpace(raw))); engineType {
+	case "", raftEngineHashicorp:
+		return raftEngineHashicorp, nil
+	case raftEngineEtcd:
+		return raftEngineEtcd, nil
+	default:
+		return "", errors.Wrapf(ErrUnsupportedRaftEngine, "%q", raw)
+	}
+}
 
 func (r *raftGroupRuntime) Close() {
 	if r == nil {
@@ -35,13 +66,13 @@ func (r *raftGroupRuntime) Close() {
 		_ = r.raft.Shutdown().Error()
 		r.raft = nil
 	}
-	if r.tm != nil {
-		_ = r.tm.Close()
-		r.tm = nil
-	}
 	if r.engine != nil {
 		_ = r.engine.Close()
 		r.engine = nil
+	}
+	if r.closeTransport != nil {
+		r.closeTransport()
+		r.closeTransport = nil
 	}
 	if r.closeStores != nil {
 		r.closeStores()
@@ -51,6 +82,13 @@ func (r *raftGroupRuntime) Close() {
 		_ = r.store.Close()
 		r.store = nil
 	}
+}
+
+func (r *raftGroupRuntime) registerGRPC(server grpc.ServiceRegistrar) {
+	if r == nil || r.registerTransport == nil || server == nil {
+		return
+	}
+	r.registerTransport(server)
 }
 
 func closeRaftStore(raftStore **raftstore.PebbleStore) {
@@ -151,4 +189,114 @@ func newRaftGroup(raftID string, group groupSpec, baseDir string, multi bool, bo
 	}
 
 	return r, tm, closeStores, nil
+}
+
+func newEtcdGroup(raftID string, group groupSpec, baseDir string, multi bool, bootstrap bool, bootstrapServers []raft.Server, fsm raft.FSM) (raftengine.Engine, func(grpc.ServiceRegistrar), error) {
+	dir := groupDataDir(baseDir, raftID, group.id, multi)
+	if err := os.MkdirAll(dir, raftDirPerm); err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	peers := etcdPeersFromServers(bootstrapServers)
+	var transport *etcdraftengine.GRPCTransport
+	if len(peers) > 1 {
+		transport = etcdraftengine.NewGRPCTransport(peers)
+	}
+
+	engine, err := etcdraftengine.Open(context.Background(), etcdraftengine.OpenConfig{
+		LocalID:        raftID,
+		LocalAddress:   group.address,
+		DataDir:        dir,
+		Peers:          peers,
+		Bootstrap:      bootstrap,
+		Transport:      transport,
+		StateMachine:   etcdraftengine.AdaptHashicorpFSM(fsm),
+		TickInterval:   etcdTickInterval,
+		HeartbeatTick:  durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
+		ElectionTick:   durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
+		MaxSizePerMsg:  etcdRuntimeMaxSizePerMsg,
+		MaxInflightMsg: etcdRuntimeMaxInflightMsg,
+	})
+	if err != nil {
+		if transport != nil {
+			_ = transport.Close()
+		}
+		return nil, nil, errors.WithStack(err)
+	}
+
+	var register func(grpc.ServiceRegistrar)
+	if transport != nil {
+		register = transport.Register
+	}
+	return engine, register, nil
+}
+
+func etcdPeersFromServers(servers []raft.Server) []etcdraftengine.Peer {
+	if len(servers) == 0 {
+		return nil
+	}
+	peers := make([]etcdraftengine.Peer, 0, len(servers))
+	for _, server := range servers {
+		peers = append(peers, etcdraftengine.Peer{
+			ID:      string(server.ID),
+			Address: string(server.Address),
+		})
+	}
+	return peers
+}
+
+func durationToTicks(timeout time.Duration, tick time.Duration, min int) int {
+	if tick <= 0 {
+		return min
+	}
+	ticks := int(timeout / tick)
+	if timeout%tick != 0 {
+		ticks++
+	}
+	if ticks < min {
+		return min
+	}
+	return ticks
+}
+
+func buildRuntimeForGroup(
+	raftID string,
+	group groupSpec,
+	baseDir string,
+	multi bool,
+	bootstrap bool,
+	bootstrapServers []raft.Server,
+	st store.MVCCStore,
+	fsm raft.FSM,
+	engineType raftEngineType,
+) (*raftGroupRuntime, error) {
+	switch engineType {
+	case raftEngineHashicorp:
+		r, tm, closeStores, err := newRaftGroup(raftID, group, baseDir, multi, bootstrap, bootstrapServers, fsm)
+		if err != nil {
+			return nil, err
+		}
+		return &raftGroupRuntime{
+			spec:              group,
+			raft:              r,
+			engine:            hashicorpraftengine.New(r),
+			store:             st,
+			registerTransport: tm.Register,
+			closeTransport:    func() { closeTransportManager(&tm) },
+			closeStores:       closeStores,
+		}, nil
+	case raftEngineEtcd:
+		engine, register, err := newEtcdGroup(raftID, group, baseDir, multi, bootstrap, bootstrapServers, fsm)
+		if err != nil {
+			return nil, err
+		}
+		return &raftGroupRuntime{
+			spec:              group,
+			engine:            engine,
+			store:             st,
+			registerTransport: register,
+		}, nil
+	default:
+		return nil, errors.Wrapf(ErrUnsupportedRaftEngine, "%q", engineType)
+	}
 }

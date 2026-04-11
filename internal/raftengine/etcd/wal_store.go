@@ -20,10 +20,6 @@ const (
 	snapDirName = "snap"
 )
 
-var (
-	errBootstrapRequired = errors.New("etcd raft persistent state is missing and bootstrap is disabled")
-)
-
 type diskState struct {
 	Storage   *etcdraft.MemoryStorage
 	Persist   etcdstorage.Storage
@@ -58,9 +54,13 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 		return bootstrapWalState(logger, walDir, snapDir, cfg.StateMachine, peers)
 	}
 	if !cfg.Bootstrap {
-		return nil, errors.WithStack(errBootstrapRequired)
+		return joinWalState(logger, walDir, snapDir)
 	}
 	return bootstrapWalState(logger, walDir, snapDir, cfg.StateMachine, peers)
+}
+
+func joinWalState(logger *zap.Logger, walDir string, snapDir string) (*diskState, error) {
+	return persistBootState(logger, walDir, snapDir, nil, persistedState{})
 }
 
 func bootstrapWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {

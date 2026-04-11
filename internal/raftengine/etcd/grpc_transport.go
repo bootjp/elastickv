@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -84,6 +85,34 @@ func (t *GRPCTransport) SetSpoolDir(dir string) {
 	t.spoolDir = dir
 }
 
+func (t *GRPCTransport) UpsertPeer(peer Peer) {
+	if t == nil || peer.NodeID == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if existing, ok := t.peers[peer.NodeID]; ok && existing.Address != "" && existing.Address != peer.Address {
+		t.closePeerConnLocked(existing.Address)
+	}
+	t.peers[peer.NodeID] = peer
+}
+
+func (t *GRPCTransport) RemovePeer(nodeID uint64) {
+	if t == nil || nodeID == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	peer, ok := t.peers[nodeID]
+	if !ok {
+		return
+	}
+	delete(t.peers, nodeID)
+	t.closePeerConnLocked(peer.Address)
+}
+
 func (t *GRPCTransport) Close() error {
 	if t == nil {
 		return nil
@@ -98,6 +127,22 @@ func (t *GRPCTransport) Close() error {
 		err = errors.CombineErrors(err, errors.WithStack(conn.Close()))
 	}
 	return errors.WithStack(err)
+}
+
+func (t *GRPCTransport) closePeerConnLocked(address string) {
+	if address == "" {
+		return
+	}
+	conn, ok := t.conns[address]
+	if !ok {
+		delete(t.clients, address)
+		return
+	}
+	delete(t.conns, address)
+	delete(t.clients, address)
+	if err := conn.Close(); err != nil {
+		slog.Warn("failed to close etcd raft peer connection", "address", address, "error", err)
+	}
 }
 
 func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error {
@@ -141,7 +186,10 @@ func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) erro
 	if err != nil {
 		return err
 	}
-	return t.handle(stream.Context(), msg)
+	if err := t.handle(stream.Context(), msg); err != nil {
+		return err
+	}
+	return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
 }
 
 func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.EtcdRaftAck, error) {
@@ -389,6 +437,21 @@ func (t *GRPCTransport) peerFor(nodeID uint64) (Peer, error) {
 		return Peer{}, errors.Wrapf(errTransportPeerUnknown, "node_id=%d", nodeID)
 	}
 	return peer, nil
+}
+
+func (t *GRPCTransport) peerByIdentity(id string, address string) (Peer, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, peer := range t.peers {
+		if id != "" && peer.ID != id {
+			continue
+		}
+		if address != "" && peer.Address != address {
+			continue
+		}
+		return peer, true
+	}
+	return Peer{}, false
 }
 
 func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {

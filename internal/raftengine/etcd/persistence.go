@@ -344,10 +344,8 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 
 func newMemoryStorage(state persistedState) (*etcdraft.MemoryStorage, error) {
 	storage := etcdraft.NewMemoryStorage()
-	snapshot := state.Snapshot
-	snapshot.Data = nil
-	if !etcdraft.IsEmptySnap(snapshot) {
-		if err := storage.ApplySnapshot(snapshot); err != nil {
+	if !etcdraft.IsEmptySnap(state.Snapshot) {
+		if err := storage.ApplySnapshot(state.Snapshot); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,6 +113,10 @@ type blockingSnapshot struct {
 	release chan struct{}
 }
 
+type countingSnapshotStateMachine struct {
+	snapshotCalls atomic.Uint32
+}
+
 type transportTestNode struct {
 	peer      Peer
 	lis       net.Listener
@@ -160,6 +165,20 @@ func (s *blockingSnapshot) WriteTo(w io.Writer) (int64, error) {
 
 func (s *blockingSnapshot) Close() error {
 	return nil
+}
+
+func (s *countingSnapshotStateMachine) Apply(data []byte) any {
+	return string(data)
+}
+
+func (s *countingSnapshotStateMachine) Snapshot() (Snapshot, error) {
+	s.snapshotCalls.Add(1)
+	return &testSnapshot{data: []byte("counting")}, nil
+}
+
+func (s *countingSnapshotStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
@@ -363,6 +382,21 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
+}
+
+func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
+	engine := &Engine{
+		rawNode: mustRawNode(t, etcdraft.NewMemoryStorage(), 1),
+	}
+	msg := raftpb.Message{
+		Type: raftpb.MsgAppResp,
+		From: 2,
+		To:   1,
+	}
+
+	engine.handleStep(msg)
+
+	require.NoError(t, engine.currentError())
 }
 
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
@@ -599,6 +633,55 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 	}
 }
 
+func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Data: []byte("newer"),
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+			Index:     9,
+			Term:      2,
+		},
+	}))
+
+	fsm := &countingSnapshotStateMachine{}
+	engine := &Engine{
+		storage: storage,
+		fsm:     fsm,
+	}
+
+	require.NoError(t, engine.persistConfigSnapshot(7, raftpb.ConfState{Voters: []uint64{1}}))
+	require.Zero(t, fsm.snapshotCalls.Load())
+}
+
+func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     &testStateMachine{},
+	}
+
+	require.NoError(t, engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}}))
+
+	firstIndex, err := storage.FirstIndex()
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), firstIndex)
+}
+
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
 		Type:    raftpb.MsgApp,
@@ -729,22 +812,7 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)
-	t.Cleanup(func() {
-		for _, node := range nodes {
-			if node.engine != nil {
-				require.NoError(t, node.engine.Close())
-			}
-			if node.server != nil {
-				node.server.Stop()
-			}
-			if node.lis != nil {
-				_ = node.lis.Close()
-			}
-			if node.transport != nil {
-				require.NoError(t, node.transport.Close())
-			}
-		}
-	})
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -769,22 +837,7 @@ func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
 func TestFollowerStatusTracksLeaderContact(t *testing.T) {
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)
-	t.Cleanup(func() {
-		for _, node := range nodes {
-			if node.engine != nil {
-				require.NoError(t, node.engine.Close())
-			}
-			if node.server != nil {
-				node.server.Stop()
-			}
-			if node.lis != nil {
-				_ = node.lis.Close()
-			}
-			if node.transport != nil {
-				require.NoError(t, node.transport.Close())
-			}
-		}
-	})
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -804,6 +857,121 @@ func TestFollowerStatusTracksLeaderContact(t *testing.T) {
 		}
 		return false
 	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestAddVoterAllowsJoiningNodeToReplicate(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	index, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	require.Greater(t, index, uint64(0))
+
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	result, err := leader.engine.Propose(context.Background(), []byte("alpha"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+
+	require.Eventually(t, func() bool {
+		return len(nodes[1].fsm.Applied()) == 1 && string(nodes[1].fsm.Applied()[0]) == "alpha"
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestRemoveServerUpdatesConfiguration(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	addIndex, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	removeIndex, err := leader.engine.RemoveServer(ctx, nodes[1].peer.ID, addIndex)
+	require.NoError(t, err)
+	require.Greater(t, removeIndex, addIndex)
+
+	waitForConfigSize(t, leader.engine, 1)
+	require.Eventually(t, func() bool {
+		cfg, err := nodes[1].engine.Configuration(context.Background())
+		require.NoError(t, err)
+		return len(cfg.Servers) == 1 && cfg.Servers[0].ID == nodes[0].peer.ID
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return nodes[1].engine.State() == raftengine.StateShutdown
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestTransferLeadershipToServerMovesLeader(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	_, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	_, err = leader.engine.Propose(context.Background(), []byte("seed"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return len(nodes[1].fsm.Applied()) == 1
+	}, 5*time.Second, 20*time.Millisecond)
+
+	transferCtx, transferCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer transferCancel()
+	require.NoError(t, leader.engine.TransferLeadershipToServer(transferCtx, nodes[1].peer.ID, nodes[1].peer.Address))
+
+	require.Eventually(t, func() bool {
+		return nodes[1].engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
+
+	result, err := nodes[1].engine.Propose(context.Background(), []byte("beta"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+	require.Eventually(t, func() bool {
+		applied := nodes[0].fsm.Applied()
+		return len(applied) == 2 && string(applied[1]) == "beta"
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
+	engine := &Engine{
+		pendingConfigs: map[uint64]adminRequest{},
+	}
+
+	maxPending := uint64(defaultMaxPendingConfigs)
+	for id := uint64(1); id <= maxPending; id++ {
+		require.NoError(t, engine.storePendingConfig(adminRequest{id: id}))
+	}
+
+	err := engine.storePendingConfig(adminRequest{id: maxPending + 1})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errTooManyPendingConfigs))
 }
 
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
@@ -844,25 +1012,47 @@ func startTransportTestServers(nodes []*transportTestNode, peers []Peer) {
 	}
 }
 
+func cleanupTransportTestNodes(t *testing.T, nodes []*transportTestNode) {
+	t.Helper()
+	for _, node := range nodes {
+		if node.engine != nil {
+			require.NoError(t, node.engine.Close())
+		}
+		if node.server != nil {
+			node.server.Stop()
+		}
+		if node.lis != nil {
+			_ = node.lis.Close()
+		}
+		if node.transport != nil {
+			require.NoError(t, node.transport.Close())
+		}
+	}
+}
+
+func openTransportTestNode(ctx context.Context, node *transportTestNode, peers []Peer, bootstrap bool) error {
+	engine, err := Open(ctx, OpenConfig{
+		NodeID:       node.peer.NodeID,
+		LocalID:      node.peer.ID,
+		LocalAddress: node.peer.Address,
+		DataDir:      node.dir,
+		Peers:        peers,
+		Bootstrap:    bootstrap,
+		Transport:    node.transport,
+		StateMachine: node.fsm,
+	})
+	if err != nil {
+		return err
+	}
+	node.engine = engine
+	return nil
+}
+
 func openTransportTestNodes(ctx context.Context, nodes []*transportTestNode, peers []Peer) error {
 	var eg errgroup.Group
 	for _, node := range nodes {
 		eg.Go(func() error {
-			engine, err := Open(ctx, OpenConfig{
-				NodeID:       node.peer.NodeID,
-				LocalID:      node.peer.ID,
-				LocalAddress: node.peer.Address,
-				DataDir:      node.dir,
-				Peers:        peers,
-				Bootstrap:    true,
-				Transport:    node.transport,
-				StateMachine: node.fsm,
-			})
-			if err != nil {
-				return err
-			}
-			node.engine = engine
-			return nil
+			return openTransportTestNode(ctx, node, peers, true)
 		})
 	}
 	return eg.Wait()
@@ -918,6 +1108,15 @@ func waitForLeaderNode(t *testing.T, nodes []*transportTestNode) *transportTestN
 	return leader
 }
 
+func waitForConfigSize(t *testing.T, engine *Engine, size int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		cfg, err := engine.Configuration(context.Background())
+		require.NoError(t, err)
+		return len(cfg.Servers) == size
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
 func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {
 	t.Helper()
 
@@ -932,4 +1131,21 @@ func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {
 	_, err = snapshot.WriteTo(&buf)
 	require.NoError(t, err)
 	return buf.Bytes()
+}
+
+func mustRawNode(t *testing.T, storage *etcdraft.MemoryStorage, nodeID uint64) *etcdraft.RawNode {
+	t.Helper()
+	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
+		ID:              nodeID,
+		ElectionTick:    defaultElectionTick,
+		HeartbeatTick:   defaultHeartbeatTick,
+		Storage:         storage,
+		MaxSizePerMsg:   defaultMaxSizePerMsg,
+		MaxInflightMsgs: defaultMaxInflightMsg,
+		CheckQuorum:     true,
+		PreVote:         true,
+		ReadOnlyOption:  etcdraft.ReadOnlySafe,
+	})
+	require.NoError(t, err)
+	return rawNode
 }
