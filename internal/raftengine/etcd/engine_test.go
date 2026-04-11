@@ -952,6 +952,30 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 	}, next)
 }
 
+func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	context, err := encodeConfChangeContext(17, Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"})
+	require.NoError(t, err)
+
+	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+		Context: context,
+		Changes: []raftpb.ConfChangeSingle{
+			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
+			{Type: raftpb.ConfChangeAddNode, NodeID: 3},
+		},
+	}, raftpb.ConfState{Voters: []uint64{1, 2, 3}})
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}, next)
+}
+
 func TestEnqueueSnapshotRequestRejectsAsyncConfigSnapshots(t *testing.T) {
 	snapshot := &closeTrackingSnapshot{}
 	engine := &Engine{

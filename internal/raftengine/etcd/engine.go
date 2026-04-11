@@ -1102,7 +1102,7 @@ func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
 }
 
 func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
-	_, peer, ok := decodeConfChangeContext(context)
+	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
 		e.applyAddedPeer(nodeID, peer, ok)
@@ -1155,7 +1155,7 @@ func (e *Engine) applyUpdatedPeer(peer Peer, ok bool) {
 }
 
 func applyConfigPeerChangeToMap(peers map[uint64]Peer, changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
-	_, peer, ok := decodeConfChangeContext(context)
+	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
 		applyAddedPeerToMap(peers, nodeID, peer, ok)
@@ -1169,6 +1169,17 @@ func applyConfigPeerChangeToMap(peers map[uint64]Peer, changeType raftpb.ConfCha
 		// The current runtime still rejects learner conf states during startup.
 		applyAddedPeerToMap(peers, nodeID, peer, ok)
 	}
+}
+
+func decodeConfChangePeerContext(nodeID uint64, context []byte) (Peer, bool) {
+	_, peer, ok := decodeConfChangeContext(context)
+	if !ok {
+		return Peer{}, false
+	}
+	if nodeID != 0 && peer.NodeID != 0 && peer.NodeID != nodeID {
+		return Peer{}, false
+	}
+	return peer, true
 }
 
 func applyAddedPeerToMap(peers map[uint64]Peer, nodeID uint64, peer Peer, ok bool) {
