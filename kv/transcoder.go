@@ -7,6 +7,9 @@ type OP int
 const (
 	Put OP = iota
 	Del
+	// DelPrefix deletes all visible keys matching the prefix stored in Key.
+	// An empty Key means "all keys". Transaction-internal keys are excluded.
+	DelPrefix
 )
 
 // Elem is an element of a transaction.

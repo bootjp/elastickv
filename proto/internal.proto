@@ -13,6 +13,12 @@ service Internal {
 enum Op {
   PUT = 0;
   DEL = 1;
+  // DEL_PREFIX deletes all visible keys matching the prefix stored in `key`.
+  // An empty key means "all keys". Transaction-internal keys (!txn|) are
+  // always excluded.  This operation is applied locally by the FSM on each
+  // node, so the Raft log contains only a single mutation regardless of how
+  // many keys are deleted.
+  DEL_PREFIX = 2;
 }
 
 message Mutation {

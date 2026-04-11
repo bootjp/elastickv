@@ -158,6 +158,15 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	// Check for DEL_PREFIX mutations first: they are handled by the store's
+	// DeletePrefixAt which scans and writes tombstones locally, avoiding the
+	// need to enumerate keys in the Raft log.
+	for _, mut := range r.Mutations {
+		if mut != nil && mut.Op == pb.Op_DEL_PREFIX {
+			return f.handleDelPrefix(ctx, mut.Key, commitTS)
+		}
+	}
+
 	for _, mut := range r.Mutations {
 		if mut == nil || len(mut.Key) == 0 {
 			return errors.WithStack(ErrInvalidRequest)
@@ -178,6 +187,12 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
 	return errors.WithStack(f.store.ApplyMutations(ctx, muts, commitTS, commitTS))
+}
+
+// handleDelPrefix delegates prefix deletion to the store. Transaction-internal
+// keys are always excluded to preserve transactional integrity.
+func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
+	return errors.WithStack(f.store.DeletePrefixAt(ctx, prefix, txnCommonPrefix, commitTS))
 }
 
 var ErrNotImplemented = errors.New("not implemented")

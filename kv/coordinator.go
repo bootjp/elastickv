@@ -205,6 +205,19 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 				},
 			},
 		}
+
+	case DelPrefix:
+		return &pb.Request{
+			IsTxn: false,
+			Phase: pb.Phase_NONE,
+			Ts:    c.clock.Next(),
+			Mutations: []*pb.Mutation{
+				{
+					Op:  pb.Op_DEL_PREFIX,
+					Key: req.Key,
+				},
+			},
+		}
 	}
 
 	panic("unreachable")
@@ -295,6 +308,11 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 		return &pb.Mutation{
 			Op:  pb.Op_DEL,
 			Key: req.Key,
+		}
+	case DelPrefix:
+		return &pb.Mutation{
+			Op:  pb.Op_DEL_PREFIX,
+			Key: req.Key, // prefix (may be empty for "all keys")
 		}
 	}
 	panic("unreachable")

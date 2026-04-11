@@ -927,6 +927,101 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	return nil
 }
 
+// DeletePrefixAt atomically deletes all visible keys matching prefix by writing
+// tombstone versions at commitTS. An empty prefix deletes all keys. Keys
+// matching excludePrefix are preserved. Uses an iterator-based approach that
+// avoids loading values into caller memory.
+func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	var lowerBound []byte
+	if len(prefix) > 0 {
+		lowerBound = encodeKey(prefix, math.MaxUint64)
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+	})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	tombstoneVal := encodeValue(nil, true, 0)
+
+	for iter.SeekGE(encodeKey(prefix, math.MaxUint64)); iter.Valid(); {
+		userKey, version, ok := nextScannableUserKey(iter)
+		if !ok {
+			break
+		}
+
+		// Stop when past the prefix boundary.
+		if len(prefix) > 0 && !bytes.HasPrefix(userKey, prefix) {
+			break
+		}
+
+		// Skip excluded prefix.
+		if len(excludePrefix) > 0 && bytes.HasPrefix(userKey, excludePrefix) {
+			if !s.skipToNextUserKey(iter, userKey) {
+				break
+			}
+			continue
+		}
+
+		// Seek to the version visible at commitTS.
+		if !s.seekToVisibleVersion(iter, userKey, version, commitTS) {
+			continue
+		}
+
+		// Check whether this version is already a tombstone or expired.
+		sv, decErr := decodeValue(iter.Value())
+		if decErr != nil {
+			return errors.WithStack(decErr)
+		}
+		if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
+			if !s.skipToNextUserKey(iter, userKey) {
+				break
+			}
+			continue
+		}
+
+		// Write a tombstone at commitTS.
+		if err := batch.Set(encodeKey(userKey, commitTS), tombstoneVal, nil); err != nil {
+			return errors.WithStack(err)
+		}
+
+		if !s.skipToNextUserKey(iter, userKey) {
+			break
+		}
+	}
+
+	// Persist lastCommitTS update atomically with the tombstones.
+	s.mtx.Lock()
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
+		s.mtx.Unlock()
+		return err
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		s.mtx.Unlock()
+		return errors.WithStack(err)
+	}
+	s.updateLastCommitTS(newLastTS)
+	s.mtx.Unlock()
+
+	return nil
+}
+
 type pebbleCompactionStats struct {
 	updatedKeys      int
 	deletedVersions  int
