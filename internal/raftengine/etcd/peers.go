@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -171,16 +170,4 @@ func confStateForPeers(peers []Peer) raftpb.ConfState {
 		voters = append(voters, peer.NodeID)
 	}
 	return raftpb.ConfState{Voters: voters}
-}
-
-func configServersForPeers(peers []Peer) []raftengine.Server {
-	servers := make([]raftengine.Server, 0, len(peers))
-	for _, peer := range peers {
-		servers = append(servers, raftengine.Server{
-			ID:       peer.ID,
-			Address:  peer.Address,
-			Suffrage: "voter",
-		})
-	}
-	return servers
 }
