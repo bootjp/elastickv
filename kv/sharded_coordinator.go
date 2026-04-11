@@ -140,12 +140,13 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Ele
 		return nil, err
 	}
 
+	ts := c.clock.Next()
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
-			Ts:        c.clock.Next(),
+			Ts:        ts,
 			Mutations: []*pb.Mutation{elemToMutation(elem)},
 		})
 	}
