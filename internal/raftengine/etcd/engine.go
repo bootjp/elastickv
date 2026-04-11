@@ -1103,14 +1103,9 @@ func (e *Engine) applyAddedPeer(nodeID uint64, peer Peer, ok bool) {
 		e.upsertPeer(peer)
 		return
 	}
-	if nodeID == 0 {
+	if nodeID == 0 || e.hasPeer(nodeID) {
 		return
 	}
-	e.upsertPeer(Peer{
-		NodeID:  nodeID,
-		ID:      strconv.FormatUint(nodeID, 10),
-		Address: "",
-	})
 }
 
 func (e *Engine) applyRemovedPeer(nodeID uint64, peer Peer, ok bool) {
@@ -1169,10 +1164,9 @@ func applyAddedPeerToMap(peers map[uint64]Peer, nodeID uint64, peer Peer, ok boo
 		return
 	}
 	if nodeID != 0 {
-		upsertPeerInMap(peers, Peer{
-			NodeID: nodeID,
-			ID:     strconv.FormatUint(nodeID, 10),
-		})
+		if hasPeerInMap(peers, nodeID) {
+			return
+		}
 	}
 }
 
@@ -2123,6 +2117,13 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
 	}
+}
+
+func (e *Engine) hasPeer(nodeID uint64) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.peers[nodeID]
+	return ok
 }
 
 func encodeProposalEnvelope(id uint64, payload []byte) []byte {

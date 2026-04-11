@@ -216,4 +216,14 @@ func TestEnsureRaftEngineDataDir(t *testing.T) {
 		require.Error(t, err)
 		require.ErrorIs(t, err, ErrMixedRaftEngineArtifacts)
 	})
+
+	t.Run("detects etcd peers metadata artifact", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "etcd-raft-peers.bin"), []byte("placeholder"), 0o600))
+
+		engineType, ok, err := detectRaftEngineFromDataDir(dir)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, raftEngineEtcd, engineType)
+	})
 }

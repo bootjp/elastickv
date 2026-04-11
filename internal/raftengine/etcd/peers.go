@@ -193,6 +193,11 @@ func upsertPeerInMap(peers map[uint64]Peer, peer Peer) {
 	peers[peer.NodeID] = peer
 }
 
+func hasPeerInMap(peers map[uint64]Peer, nodeID uint64) bool {
+	_, ok := peers[nodeID]
+	return ok
+}
+
 func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
 	delete(peers, nodeID)
 }

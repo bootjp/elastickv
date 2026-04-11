@@ -962,6 +962,50 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 	}, next)
 }
 
+func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		},
+	}
+
+	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+		Changes: []raftpb.ConfChangeSingle{
+			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
+		},
+	}, raftpb.ConfState{Voters: []uint64{1, 2}})
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}, next)
+}
+
+func TestApplyAddedPeerWithoutContextPreservesExistingMetadata(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		},
+		config: raftengine.Configuration{
+			Servers: []raftengine.Server{{
+				ID:       "n2",
+				Address:  "127.0.0.1:7002",
+				Suffrage: "voter",
+			}},
+		},
+	}
+
+	engine.applyAddedPeer(2, Peer{}, false)
+
+	require.Equal(t, Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"}, engine.peers[2])
+	require.Equal(t, []raftengine.Server{{
+		ID:       "n2",
+		Address:  "127.0.0.1:7002",
+		Suffrage: "voter",
+	}}, engine.config.Servers)
+}
+
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
 		Type:    raftpb.MsgApp,

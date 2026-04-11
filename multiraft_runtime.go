@@ -177,6 +177,7 @@ func detectRaftEngineFromDataDir(dir string) (raftEngineType, bool, error) {
 		"etcd-raft-state.bin",
 		"etcd-raft-meta.bin",
 		"etcd-raft-entries.bin",
+		"etcd-raft-peers.bin",
 		"etcd-fsm-snapshot.bin",
 	)
 	if err != nil {
