@@ -914,6 +914,9 @@ func TestRemoveServerUpdatesConfiguration(t *testing.T) {
 		require.NoError(t, err)
 		return len(cfg.Servers) == 1 && cfg.Servers[0].ID == nodes[0].peer.ID
 	}, 5*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return nodes[1].engine.State() == raftengine.StateShutdown
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestTransferLeadershipToServerMovesLeader(t *testing.T) {

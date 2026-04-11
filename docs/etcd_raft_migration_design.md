@@ -855,6 +855,7 @@ Run multiple shard groups per process under the new engine.
 2. Implement fairness and backpressure across groups.
 3. Measure CPU, memory, goroutine count, and tail latency as group count increases.
 4. Validate shard-aware read and write paths, including coordinator routing.
+5. Remove the Phase 4 stopgap where config-change snapshots are published synchronously on the raft loop, or replace it with an ordered async path before broadening the backend beyond the current prototype scope.
 
 ### Exit criteria
 
