@@ -1801,26 +1801,34 @@ func (r *RedisServer) tryBZPopMinInner(ctx context.Context, key []byte, readTS u
 		return err
 	}
 	if metaExists {
-		entries, err := r.scanZSetScoreEntries(ctx, key, 1, readTS)
-		if err != nil {
-			return err
-		}
-		if len(entries) == 0 {
-			*result = nil
-			return nil
-		}
-		popped := entries[0]
-		elems, err := buildZSetRemoveEntryElems(key, entries, meta.Len)
-		if err != nil {
-			return err
-		}
-		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
-			return err
-		}
-		*result = &bzpopminResult{key: key, entry: popped}
-		return nil
+		return r.bzPopMinWideColumn(ctx, key, readTS, meta.Len, result)
 	}
 	// Legacy blob fallback.
+	return r.bzPopMinLegacy(ctx, key, readTS, result)
+}
+
+func (r *RedisServer) bzPopMinWideColumn(ctx context.Context, key []byte, readTS uint64, metaLen int64, result **bzpopminResult) error {
+	entries, err := r.scanZSetScoreEntries(ctx, key, 1, readTS)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		*result = nil
+		return nil
+	}
+	popped := entries[0]
+	elems, err := buildZSetRemoveEntryElems(key, entries, metaLen)
+	if err != nil {
+		return err
+	}
+	if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		return err
+	}
+	*result = &bzpopminResult{key: key, entry: popped}
+	return nil
+}
+
+func (r *RedisServer) bzPopMinLegacy(ctx context.Context, key []byte, readTS uint64, result **bzpopminResult) error {
 	load, err := r.loadZSetMembersMap(ctx, key, readTS)
 	if err != nil {
 		return err

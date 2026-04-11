@@ -2029,16 +2029,14 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 
 func buildZSetStateElems(keyBytes []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
 	switch {
+	case len(st.members) == 0 && st.fromLegacy:
+		// Legacy blob removed: just delete the legacy key.
+		return []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: redisZSetKey(keyBytes)},
+		}, nil
 	case len(st.members) == 0:
-		// Delete meta + all remaining member/score keys.
-		elems, err := buildZSetDiffElems(keyBytes, st.origMembers, st.members)
-		if err != nil {
-			return nil, err
-		}
-		if st.fromLegacy {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
-		}
-		return elems, nil
+		// Delete meta + all member/score keys via prefix deletion.
+		return buildZSetDiffElems(keyBytes, st.origMembers, st.members)
 	case st.fromLegacy:
 		// Legacy blob → wide-column migration: full write + delete legacy blob.
 		elems, err := buildZSetWriteElems(keyBytes, st.members)

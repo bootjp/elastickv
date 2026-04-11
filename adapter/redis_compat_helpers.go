@@ -190,8 +190,9 @@ func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS
 	return zsetLoadResult{members: zsetEntriesToMap(value.Entries), exists: true, fromLegacy: true}, nil
 }
 
-// deleteZSetWideColumnElems generates delete operations for all wide-column
-// ZSet keys (meta + members + score index) using prefix deletion.
+// deleteZSetWideColumnElems deletes all wide-column ZSet keys. Prefix
+// deletions are dispatched as standalone operations (required by FSM), while
+// the meta key delete is returned for the caller to batch with other elems.
 func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
@@ -201,10 +202,20 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 		return nil, nil
 	}
 
+	// DelPrefix must be sole mutation per request; dispatch separately.
+	for _, prefix := range [][]byte{
+		store.ZSetMemberScanPrefix(key),
+		store.ZSetScoreScanPrefix(key),
+	} {
+		if err := r.dispatchElems(ctx, false, 0, []*kv.Elem[kv.OP]{
+			{Op: kv.DelPrefix, Key: prefix},
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	return []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
-		{Op: kv.DelPrefix, Key: store.ZSetMemberScanPrefix(key)},
-		{Op: kv.DelPrefix, Key: store.ZSetScoreScanPrefix(key)},
 	}, nil
 }
 

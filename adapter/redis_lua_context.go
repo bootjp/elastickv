@@ -2656,6 +2656,12 @@ func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	}
 	keyBytes := []byte(key)
 	if st.fromLegacy {
+		if len(st.members) == 0 {
+			// Legacy blob removed: just delete the legacy key.
+			return []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: redisZSetKey(keyBytes)},
+			}, nil
+		}
 		// Legacy blob → wide-column migration: full write + delete legacy blob.
 		elems, err := buildZSetWriteElems(keyBytes, st.members)
 		if err != nil {
