@@ -54,7 +54,6 @@ var (
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
-	errAsyncConfigSnapshot        = errors.New("etcd raft config snapshots must be published synchronously")
 )
 
 type Snapshot interface {
@@ -205,22 +204,12 @@ type readResult struct {
 	err   error
 }
 
-type snapshotKind byte
-
-const (
-	snapshotKindLocal snapshotKind = iota + 1
-	snapshotKindConfig
-)
-
 type snapshotRequest struct {
-	kind      snapshotKind
-	index     uint64
-	confState raftpb.ConfState
-	snapshot  Snapshot
+	index    uint64
+	snapshot Snapshot
 }
 
 type snapshotResult struct {
-	kind  snapshotKind
 	index uint64
 	err   error
 }
@@ -989,7 +978,6 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	}
 
 	req := snapshotRequest{
-		kind:     snapshotKindLocal,
 		index:    e.applied,
 		snapshot: snapshot,
 	}
@@ -997,13 +985,6 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 }
 
 func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
-	if req.kind != snapshotKindLocal {
-		if req.snapshot != nil {
-			_ = req.snapshot.Close()
-		}
-		return errors.WithStack(errAsyncConfigSnapshot)
-	}
-
 	select {
 	case <-e.doneCh:
 		if req.snapshot != nil {
@@ -1964,9 +1945,8 @@ func (e *Engine) runSnapshotWorker() {
 			return
 		case req := <-e.snapshotReqCh:
 			result := snapshotResult{
-				kind:  req.kind,
 				index: req.index,
-				err:   e.persistSnapshot(req),
+				err:   e.persistLocalSnapshot(req),
 			}
 			select {
 			case <-e.snapshotStopCh:
@@ -2254,32 +2234,19 @@ func cloneDispatchConfState(conf raftpb.ConfState) raftpb.ConfState {
 }
 
 func (e *Engine) handleSnapshotResult(result snapshotResult) error {
-	if result.kind == snapshotKindLocal {
-		e.snapshotInFlight = false
-	}
+	e.snapshotInFlight = false
 	if result.err != nil {
 		return result.err
-	}
-	if result.kind != snapshotKindLocal {
-		return nil
 	}
 	return e.maybePersistLocalSnapshot()
 }
 
-func (e *Engine) persistSnapshot(req snapshotRequest) error {
+func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 	payload, err := snapshotBytesAndClose(req.snapshot, e.dataDir)
 	if err != nil {
 		return err
 	}
-
-	switch req.kind {
-	case snapshotKindConfig:
-		return e.persistConfigSnapshotPayload(req.index, req.confState, payload)
-	case snapshotKindLocal:
-		return e.persistLocalSnapshotPayload(req.index, payload)
-	default:
-		return errors.New("unknown snapshot request kind")
-	}
+	return e.persistLocalSnapshotPayload(req.index, payload)
 }
 
 func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {

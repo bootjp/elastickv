@@ -103,10 +103,6 @@ type testSnapshot struct {
 	data []byte
 }
 
-type closeTrackingSnapshot struct {
-	closed atomic.Bool
-}
-
 type blockingSnapshotStateMachine struct {
 	started chan struct{}
 	release chan struct{}
@@ -137,16 +133,6 @@ func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (s *testSnapshot) Close() error {
-	return nil
-}
-
-func (s *closeTrackingSnapshot) WriteTo(w io.Writer) (int64, error) {
-	n, err := w.Write([]byte("snapshot"))
-	return int64(n), err
-}
-
-func (s *closeTrackingSnapshot) Close() error {
-	s.closed.Store(true)
 	return nil
 }
 
@@ -974,25 +960,6 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
 	}, next)
-}
-
-func TestEnqueueSnapshotRequestRejectsAsyncConfigSnapshots(t *testing.T) {
-	snapshot := &closeTrackingSnapshot{}
-	engine := &Engine{
-		snapshotReqCh:  make(chan snapshotRequest, 1),
-		snapshotStopCh: make(chan struct{}),
-		doneCh:         make(chan struct{}),
-	}
-
-	err := engine.enqueueSnapshotRequest(snapshotRequest{
-		kind:     snapshotKindConfig,
-		index:    7,
-		snapshot: snapshot,
-	})
-	require.ErrorIs(t, err, errAsyncConfigSnapshot)
-	require.True(t, snapshot.closed.Load())
-	require.False(t, engine.snapshotInFlight)
-	require.Empty(t, engine.snapshotReqCh)
 }
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
