@@ -112,7 +112,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeString {
 			return wrongTypeError()
 		}
-		raw, err := r.readValueAt(redisStrKey(key), readTS)
+		raw, err := r.readRedisStringAt(key, readTS)
 		if err != nil {
 			// Key may have expired or been deleted between type check and read.
 			v = nil
@@ -493,6 +493,8 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 		for _, pair := range kvs {
 			if !isKnownInternalKey(pair.Key) {
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+				// Also delete the associated TTL key to avoid orphaned metadata.
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(pair.Key)})
 			}
 		}
 
@@ -1225,7 +1227,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 
 		current = 0
 		if typ == redisTypeString {
-			raw, err := r.readValueAt(redisStrKey(cmd.Args[1]), readTS)
+			raw, err := r.readRedisStringAt(cmd.Args[1], readTS)
 			if err != nil {
 				return err
 			}

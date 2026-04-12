@@ -696,7 +696,7 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 		return state, nil
 	}
 
-	oldValue, err := r.readValueAt(redisStrKey(key), readTS)
+	oldValue, err := r.readRedisStringAt(key, readTS)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return redisSetState{}, err
 	}
@@ -959,7 +959,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	v, err := r.readValueAt(redisStrKey(key), readTS)
+	v, err := r.readRedisStringAt(key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -1453,9 +1453,16 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		t.trackReadKey(redisTTLKey(userKey))
 	}
 	tv := &txnValue{}
-	val, err := t.server.readValueAt(storageKey, t.startTS)
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return nil, errors.WithStack(err)
+	var val []byte
+	if userKey != nil {
+		// For user string keys, use the fallback-aware reader.
+		val, _ = t.server.readRedisStringAt(key, t.startTS)
+	} else {
+		var err error
+		val, err = t.server.readValueAt(storageKey, t.startTS)
+		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+			return nil, errors.WithStack(err)
+		}
 	}
 	tv.raw = val
 	tv.loaded = true
