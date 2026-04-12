@@ -490,8 +490,10 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 		}
 
 		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		legacyCount := 0
 		for _, pair := range kvs {
 			if !isKnownInternalKey(pair.Key) {
+				legacyCount++
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 				// Also delete the associated TTL key to avoid orphaned metadata.
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(pair.Key)})
@@ -503,7 +505,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 				conn.WriteError(err.Error())
 				return
 			}
-			totalDeleted += len(elems)
+			totalDeleted += legacyCount
 		}
 
 		// Advance cursor past the last key in this batch.

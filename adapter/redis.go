@@ -1454,9 +1454,10 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 	}
 	tv := &txnValue{}
 	var val []byte
-	if userKey != nil {
-		// For user string keys, use the fallback-aware reader.
-		val, _ = t.server.readRedisStringAt(key, t.startTS)
+	isString := !isKnownInternalKey(key) || bytes.HasPrefix(key, []byte(redisStrPrefix))
+	if isString {
+		// For user string keys, use the fallback-aware reader with the bare key.
+		val, _ = t.server.readRedisStringAt(userKey, t.startTS)
 	} else {
 		var err error
 		val, err = t.server.readValueAt(storageKey, t.startTS)
