@@ -293,6 +293,11 @@ for artifact in wal snap etcd-raft-peers.bin; do
     sudo -n mv "${migrate_dest}/data/${artifact}" "${node_dir}/${artifact}"
   fi
 done
+# Fallback: handle legacy member/ directory layout produced by older
+# migration binaries so WAL/snap data is never silently dropped.
+if sudo -n test -d "${migrate_dest}/data/member"; then
+  sudo -n mv "${migrate_dest}/data/member" "${node_dir}/member"
+fi
 sudo -n rm -rf "$migrate_dest"
 
 echo "  archiving hashicorp raft artifacts"

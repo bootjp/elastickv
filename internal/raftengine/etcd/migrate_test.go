@@ -99,6 +99,24 @@ func TestMigrateFSMStoreSeedsEtcdDataDir(t *testing.T) {
 	require.Equal(t, []byte("one"), value)
 }
 
+func TestMigrateFSMStorePersistsSingleNodePeer(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "fsm.db")
+	source, err := store.NewPebbleStore(sourcePath)
+	require.NoError(t, err)
+	require.NoError(t, source.Close())
+
+	destDataDir := filepath.Join(t.TempDir(), "raft")
+	peers := []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"}}
+	_, err = MigrateFSMStore(sourcePath, destDataDir, peers)
+	require.NoError(t, err)
+
+	loaded, ok, err := LoadPersistedPeers(destDataDir)
+	require.NoError(t, err)
+	require.True(t, ok, "persisted peers file must exist after single-node migration")
+	require.Len(t, loaded, 1)
+	require.Equal(t, peers[0].NodeID, loaded[0].NodeID)
+}
+
 func TestMigrateFSMStorePersistsMultiNodePeers(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "fsm.db")
 	source, err := store.NewPebbleStore(sourcePath)
