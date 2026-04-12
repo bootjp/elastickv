@@ -2,6 +2,7 @@ package hashicorp
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,11 +73,8 @@ func MigrateFSMStore(storePath string, destDataDir string, peers []MigrationPeer
 	if err != nil {
 		return nil, err
 	}
-	snapshotData, snapshotBytes, err := readFSMSnapshot(storePath)
+	snapshotBytes, err := seedHashicorpDir(storePath, tempDir, peers)
 	if err != nil {
-		return nil, err
-	}
-	if err := seedHashicorpDir(tempDir, peers, snapshotData); err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, err
 	}
@@ -119,64 +117,84 @@ func ensureMigrationPathAbsent(path string, kind string) error {
 	return nil
 }
 
-func readFSMSnapshot(storePath string) ([]byte, int64, error) {
-	source, err := store.NewPebbleStore(storePath)
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-	defer source.Close()
-
-	snapshot, err := source.Snapshot()
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-	defer snapshot.Close()
-
-	var buf countingBuffer
-	if _, err := snapshot.WriteTo(&buf); err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-	return buf.Bytes(), int64(buf.Len()), nil
-}
-
-type countingBuffer struct {
-	data []byte
-}
-
-func (b *countingBuffer) Write(p []byte) (int, error) {
-	b.data = append(b.data, p...)
-	return len(p), nil
-}
-
-func (b *countingBuffer) Bytes() []byte { return b.data }
-func (b *countingBuffer) Len() int      { return len(b.data) }
-
 // seedHashicorpDir creates the hashicorp raft directory structure inside
 // tempDir with a raft.db stable store and a snapshot containing the FSM data.
-func seedHashicorpDir(tempDir string, peers []MigrationPeer, snapshotData []byte) error {
+// The snapshot is streamed directly from the source PebbleStore to the
+// raft.SnapshotSink to avoid buffering the entire FSM in memory.
+func seedHashicorpDir(storePath string, tempDir string, peers []MigrationPeer) (int64, error) {
 	if err := os.MkdirAll(tempDir, migrationDirPerm); err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 
 	// Create the raft.db PebbleStore with initial stable state.
 	rs, err := raftstore.NewPebbleStore(filepath.Join(tempDir, "raft.db"))
 	if err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 	defer rs.Close()
 
 	// Set initial term to 1. Hashicorp raft reads "CurrentTerm" on startup.
 	if err := rs.SetUint64([]byte("CurrentTerm"), 1); err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 
 	// Create the FileSnapshotStore to hold the FSM snapshot.
 	fss, err := raft.NewFileSnapshotStore(tempDir, 1, os.Stderr)
 	if err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 
 	// Build the raft configuration from peers.
+	configuration := raft.Configuration{Servers: peersToRaftMigrationServers(peers)}
+
+	// Create an in-memory transport (required by FileSnapshotStore.Create but
+	// not used for actual communication during migration).
+	_, transport := raft.NewInmemTransport("")
+
+	// Create a snapshot sink at index=1, term=1.
+	sink, err := fss.Create(raft.SnapshotVersionMax, 1, 1, configuration, 1, transport)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	// Stream FSM snapshot directly to the sink (no in-memory buffering).
+	snapshotBytes, err := streamFSMSnapshotToSink(storePath, sink)
+	if err != nil {
+		_ = sink.Cancel()
+		return 0, err
+	}
+
+	if err := sink.Close(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  created snapshot with %d bytes of FSM data\n", snapshotBytes)
+	return snapshotBytes, nil
+}
+
+// streamFSMSnapshotToSink opens the source PebbleStore, takes a snapshot,
+// and streams it directly to the given io.Writer (typically a raft.SnapshotSink).
+func streamFSMSnapshotToSink(storePath string, w io.Writer) (int64, error) {
+	source, err := store.NewPebbleStore(storePath)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	defer source.Close()
+
+	snapshot, err := source.Snapshot()
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	defer snapshot.Close()
+
+	n, err := snapshot.WriteTo(w)
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	return n, nil
+}
+
+func peersToRaftMigrationServers(peers []MigrationPeer) []raft.Server {
 	servers := make([]raft.Server, 0, len(peers))
 	for _, p := range peers {
 		servers = append(servers, raft.Server{
@@ -185,27 +203,7 @@ func seedHashicorpDir(tempDir string, peers []MigrationPeer, snapshotData []byte
 			Address:  raft.ServerAddress(p.Address),
 		})
 	}
-	configuration := raft.Configuration{Servers: servers}
-
-	// Create an in-memory transport (required by FileSnapshotStore.Create but
-	// not used for actual communication during migration).
-	_, transport := raft.NewInmemTransport("")
-
-	// Create a snapshot at index=1, term=1 with the full FSM data.
-	sink, err := fss.Create(raft.SnapshotVersionMax, 1, 1, configuration, 1, transport)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if _, err := sink.Write(snapshotData); err != nil {
-		_ = sink.Cancel()
-		return errors.WithStack(err)
-	}
-	if err := sink.Close(); err != nil {
-		return errors.WithStack(err)
-	}
-
-	fmt.Fprintf(os.Stderr, "  created snapshot with %d bytes of FSM data\n", len(snapshotData))
-	return nil
+	return servers
 }
 
 func finalizeMigrationDir(tempDir string, destDataDir string) error {
