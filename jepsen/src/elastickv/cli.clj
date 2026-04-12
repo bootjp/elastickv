@@ -47,6 +47,12 @@
    [nil "--concurrency N" "Number of worker threads."
     :default 5
     :parse-fn #(Integer/parseInt %)]
+   [nil "--key-count N" "Number of distinct keys."
+    :default nil
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--max-writes-per-key N" "Maximum writes per key before exhaustion."
+    :default nil
+    :parse-fn #(Integer/parseInt %)]
    ["-h" "--help"]])
 
 (defn ports->node-map

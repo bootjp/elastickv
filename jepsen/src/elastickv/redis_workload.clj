@@ -129,6 +129,9 @@
                      (mapv #(Integer/parseInt %))))]
    [nil "--redis-port PORT" "Redis port (applied to all nodes)."
     :default 6379
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--max-txn-length N" "Maximum number of operations per transaction."
+    :default nil
     :parse-fn #(Integer/parseInt %)]])
 
 (defn- prepare-redis-opts

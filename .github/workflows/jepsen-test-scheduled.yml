@@ -1,11 +1,33 @@
 on:
-  push:
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      time-limit:
+        description: "Workload runtime seconds"
+        required: false
+        default: "600"
+      rate:
+        description: "Ops/sec per worker"
+        required: false
+        default: "50"
+      concurrency:
+        description: "Number of worker threads"
+        required: false
+        default: "20"
+      key-count:
+        description: "Number of distinct keys per workload"
+        required: false
+        default: "50"
+      max-writes-per-key:
+        description: "Maximum writes per key before exhaustion"
+        required: false
+        default: "2000"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-jepsen-test
+  group: ${{ github.workflow }}-${{ github.ref }}-jepsen-scheduled
 
-name: Jepsen Test
+name: Jepsen Scheduled Stress Test
 permissions:
   contents: read
 jobs:
@@ -64,19 +86,45 @@ jobs:
           exit 1
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 3
+        timeout-minutes: 30
         run: |
-          timeout 120 ~/lein run -m elastickv.redis-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
+          timeout 1800 ~/lein run -m elastickv.redis-workload \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --max-txn-length 4 \
+            --ports 63791,63792,63793 \
+            --host 127.0.0.1
       - name: Run DynamoDB Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 3
+        timeout-minutes: 30
         run: |
-          timeout 120 ~/lein run -m elastickv.dynamodb-workload --local --time-limit 5 --rate 5 --concurrency 5 --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+          timeout 1800 ~/lein run -m elastickv.dynamodb-workload --local \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --dynamo-ports 63801,63802,63803 \
+            --host 127.0.0.1
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 3
+        timeout-minutes: 30
         run: |
-          timeout 120 ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+          timeout 1800 ~/lein run -m elastickv.s3-workload --local \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --threads-per-key 4 \
+            --s3-ports 63901,63902,63903 \
+            --host 127.0.0.1
+      - name: Dump demo cluster log on failure
+        if: failure()
+        run: tail -n 500 /tmp/elastickv-demo.log || true
       - name: Stop demo cluster
         if: always()
         run: |
