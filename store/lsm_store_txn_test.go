@@ -558,3 +558,28 @@ func TestPebbleStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
 	err = s.ApplyMutations(ctx, mutations, nil, 10, 30)
 	require.NoError(t, err)
 }
+
+func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=5 (before startTS), k2 committed at TS=20 (after startTS).
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v2"), 20, 0))
+
+	// Reading both k1 and k2: k1 is fine but k2 conflicts.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k3"), Value: []byte("v3")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1"), []byte("k2")}, 10, 30)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrWriteConflict))
+
+	conflictKey, ok := WriteConflictKey(err)
+	assert.True(t, ok)
+	assert.Equal(t, []byte("k2"), conflictKey)
+}

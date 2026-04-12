@@ -288,6 +288,14 @@ func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
 	}
 
+	// Validate read keys on read-only shards (shards that have read keys
+	// but no mutations in this transaction). Without this, a concurrent
+	// write to a read-only shard would go undetected.
+	if err := c.validateReadOnlyShards(groupedReadKeys, gids, startTS); err != nil {
+		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		return nil, err
+	}
+
 	return prepared, nil
 }
 
@@ -602,6 +610,39 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint6
 		grouped[gid] = append(grouped[gid], key)
 	}
 	return grouped
+}
+
+// validateReadOnlyShards checks read-write conflicts on shards that have
+// read keys but no mutations in this transaction. writeGIDs is the set of
+// shards that already received a PREPARE with their readKeys attached.
+func (c *ShardedCoordinator) validateReadOnlyShards(groupedReadKeys map[uint64][][]byte, writeGIDs []uint64, startTS uint64) error {
+	if len(groupedReadKeys) == 0 {
+		return nil
+	}
+	writeSet := make(map[uint64]struct{}, len(writeGIDs))
+	for _, gid := range writeGIDs {
+		writeSet[gid] = struct{}{}
+	}
+	for gid, keys := range groupedReadKeys {
+		if _, isWrite := writeSet[gid]; isWrite {
+			continue
+		}
+		g, ok := c.groups[gid]
+		if !ok {
+			continue
+		}
+		// Send a read-only validation request: no mutations, only readKeys.
+		req := &pb.Request{
+			IsTxn:    true,
+			Phase:    pb.Phase_PREPARE,
+			Ts:       startTS,
+			ReadKeys: keys,
+		}
+		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
