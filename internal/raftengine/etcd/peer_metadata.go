@@ -3,6 +3,7 @@ package etcd
 import (
 	"bufio"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -92,7 +93,11 @@ func readPersistedPeersFile(path string) (persistedPeers, error) {
 	if err != nil {
 		return persistedPeers{}, errors.WithStack(err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Warn("failed to close peers file", "path", path, "err", err)
+		}
+	}()
 
 	reader := bufio.NewReader(file)
 	if err := readVersionedHeader(reader, fileFormat{magic: peersFileMagic, version: peersFileVersion}, "etcd raft peers"); err != nil {
