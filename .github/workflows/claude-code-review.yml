@@ -22,11 +22,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「データロスト防止」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
-            コメントには必ず先頭に [Data Loss] プレフィックスを付けてください。
 
             ## レビュー観点: データロストがないか
             - Write/Delete操作でデータが意図せず失われるパスがないか
@@ -36,6 +34,9 @@ jobs:
             - TTLやExpire処理で意図しないデータ削除が発生しないか
             - スナップショットやバックアップに関連するデータ欠損リスクがないか
 
+            ## 結果の投稿
+            レビュー結果を `gh pr comment` コマンドで必ずPRにコメントとして投稿してください。
+            コメントの先頭に「## [Data Loss] レビュー結果」を付けてください。
             問題がなければ簡潔に「問題なし」と報告してください。
 
   review-concurrency:
@@ -55,11 +56,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「並行性・分散障害」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
-            コメントには必ず先頭に [Concurrency] プレフィックスを付けてください。
 
             ## レビュー観点: 並行性/分散障害
             - Race conditionやデッドロックの可能性がないか
@@ -70,6 +69,9 @@ jobs:
             - フォロワーからリーダーへのプロキシ処理が正しいか
             - コンテキストのキャンセルやタイムアウト処理が適切か
 
+            ## 結果の投稿
+            レビュー結果を `gh pr comment` コマンドで必ずPRにコメントとして投稿してください。
+            コメントの先頭に「## [Concurrency] レビュー結果」を付けてください。
             問題がなければ簡潔に「問題なし」と報告してください。
 
   review-performance:
@@ -89,11 +91,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「性能」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
-            コメントには必ず先頭に [Performance] プレフィックスを付けてください。
 
             ## レビュー観点: 性能
             - 不要なメモリアロケーションやコピーがないか
@@ -104,6 +104,9 @@ jobs:
             - スライスやマップの事前確保(cap指定)が適切か
             - キーのスキャンやイテレーションが効率的か
 
+            ## 結果の投稿
+            レビュー結果を `gh pr comment` コマンドで必ずPRにコメントとして投稿してください。
+            コメントの先頭に「## [Performance] レビュー結果」を付けてください。
             問題がなければ簡潔に「問題なし」と報告してください。
 
   review-consistency:
@@ -123,11 +126,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「データ一貫性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
-            コメントには必ず先頭に [Consistency] プレフィックスを付けてください。
 
             ## レビュー観点: データ一貫性
             - Raftを経由すべき操作がローカルで直接実行されていないか
@@ -138,6 +139,9 @@ jobs:
             - TTLとデータ本体の整合性が保たれているか
             - レプリカ間でのデータ同期が正しく行われるか
 
+            ## 結果の投稿
+            レビュー結果を `gh pr comment` コマンドで必ずPRにコメントとして投稿してください。
+            コメントの先頭に「## [Consistency] レビュー結果」を付けてください。
             問題がなければ簡潔に「問題なし」と報告してください。
 
   review-test-coverage:
@@ -157,11 +161,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「テスト網羅性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
-            コメントには必ず先頭に [Test Coverage] プレフィックスを付けてください。
 
             ## レビュー観点: テスト網羅
             - 追加・変更されたロジックに対応するテストが存在するか
@@ -172,4 +174,7 @@ jobs:
             - 分散環境(マルチノード)でのテストが必要な変更か
             - テストが不足している場合、具体的なテストケースを提案してください
 
+            ## 結果の投稿
+            レビュー結果を `gh pr comment` コマンドで必ずPRにコメントとして投稿してください。
+            コメントの先頭に「## [Test Coverage] レビュー結果」を付けてください。
             問題がなければ簡潔に「問題なし」と報告してください。
