@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"sort"
 
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
@@ -367,9 +366,9 @@ func purgeOldSnapFiles(snapDir string) error {
 		return nil
 	}
 
-	// Sort ascending (oldest first) — snap names are zero-padded hex so
-	// lexicographic order equals chronological order.
-	sort.Strings(snaps)
+	// snaps is already sorted ascending (oldest first) because os.ReadDir
+	// returns entries in directory order which, for zero-padded hex names,
+	// equals chronological order.
 
 	var combined error
 	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
