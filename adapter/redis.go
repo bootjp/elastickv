@@ -1435,12 +1435,12 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
-	// If the key is already an internal Redis key (e.g., !redis|hash|...),
-	// use it as-is. Otherwise, it's a bare user key for a string value —
-	// prefix it with !redis|str|.
+	// If the key is already an internal key (e.g., !redis|hash|...,
+	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
+	// Otherwise, it's a bare user key for a string value — prefix it.
 	storageKey := key
 	userKey := extractRedisInternalUserKey(key)
-	if !bytes.HasPrefix(key, []byte("!")) {
+	if !isKnownInternalKey(key) {
 		storageKey = redisStrKey(key)
 		userKey = key
 	}

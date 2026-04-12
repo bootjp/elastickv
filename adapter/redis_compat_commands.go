@@ -491,7 +491,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 
 		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
 		for _, pair := range kvs {
-			if len(pair.Key) == 0 || pair.Key[0] != '!' {
+			if !isKnownInternalKey(pair.Key) {
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 			}
 		}
