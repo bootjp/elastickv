@@ -259,7 +259,6 @@ set -euo pipefail
 
 node_dir="${DATA_DIR%/}/${NODE_ID}"
 fsm_store="${node_dir}/fsm.db"
-migrate_dest="/tmp/etcd-migrate-${NODE_ID}"
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_dir="${node_dir}/hashicorp-backup-${ts}"
 
@@ -280,17 +279,16 @@ if ! sudo -n test -d "$fsm_store"; then
   exit 1
 fi
 
-# Clean up any leftover temp dir from a previous failed attempt
-sudo -n rm -rf "$migrate_dest"
+migrate_dest="$(sudo -n mktemp -d "/tmp/etcd-migrate-${NODE_ID}-XXXXXX")"
 
 echo "  running etcd-raft-migrate"
 sudo -n "$MIGRATE_BIN" \
   -fsm-store "$fsm_store" \
-  -dest "$migrate_dest" \
+  -dest "${migrate_dest}/data" \
   -peers "$PEERS"
 
 echo "  moving etcd artifacts into place"
-sudo -n mv "${migrate_dest}/member" "${node_dir}/member"
+sudo -n mv "${migrate_dest}/data/member" "${node_dir}/member"
 sudo -n rm -rf "$migrate_dest"
 
 echo "  archiving hashicorp raft artifacts"

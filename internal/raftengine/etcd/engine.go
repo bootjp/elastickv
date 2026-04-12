@@ -27,7 +27,7 @@ const (
 	defaultMaxSizePerMsg     = 1 << 20
 	defaultDispatchWorkers   = 4
 	defaultSnapshotEvery     = 10_000
-	defaultSnapshotQueueSize = 8
+	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
 	defaultMaxPendingConfigs = 64
 	unknownLastContact       = time.Duration(-1)
