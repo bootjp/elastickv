@@ -35,11 +35,13 @@ Using a Delta pattern, writers avoid touching the base metadata and instead writ
 
 ```
 Base Metadata (Existing):
-  !lst|meta|<userKey>                     → [Head(8)][Tail(8)][Len(8)]
+  !lst|meta|<userKey>                          → [Head(8)][Tail(8)][Len(8)]
 
 Delta Key (New):
-  !lst|meta|d|<userKey><commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
+  !lst|meta|d|<userKey>\x00<commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
 ```
+
+> **Note on separator**: The null byte (`\x00`) between `userKey` and the fixed-length suffix prevents prefix-collision bugs where scanning for `userKey = "foo"` would incorrectly include keys for `userKey = "foobar"`.
 
 - `commitTS` is an 8-byte big-endian timestamp pinned by the coordinator before the Delta key is generated (via `kv.OperationGroup.CommitTS` during dispatch), then carried through Raft and used unchanged at apply time.
 - `seqInTxn` is a 4-byte big-endian sequence number within the same transaction (needed if `LPUSH` is called multiple times for the same key in one `MULTI/EXEC`).
@@ -51,9 +53,10 @@ Because the Delta key embeds `commitTS`, the write path must know the final time
 const ListMetaDeltaPrefix = "!lst|meta|d|"
 
 func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-    buf := make([]byte, 0, len(ListMetaDeltaPrefix)+len(userKey)+8+4)
+    buf := make([]byte, 0, len(ListMetaDeltaPrefix)+len(userKey)+1+8+4)
     buf = append(buf, ListMetaDeltaPrefix...)
     buf = append(buf, userKey...)
+    buf = append(buf, 0) // Separator to prevent prefix collisions (e.g. "foo" vs "foobar")
     var ts [8]byte
     binary.BigEndian.PutUint64(ts[:], commitTS)
     buf = append(buf, ts[:]...)
@@ -149,6 +152,8 @@ LRANGE key start stop:
 
 When the number of Deltas is small (< 100), the cost of a Prefix Scan is negligible. Since Delta keys are physically contiguous in the LSM tree, I/O can be performed in a single sequential read.
 
+**`maxDeltaScanLimit` overflow**: If the number of unapplied Deltas exceeds `maxDeltaScanLimit`, `resolveListMeta` cannot aggregate them all in a single scan pass, which would produce an incorrect `ListMeta`. To preserve correctness, `resolveListMeta` must return an error when the scan result is truncated (i.e., when `len(deltas) == maxDeltaScanLimit`). The caller should then either surface the error or trigger an immediate synchronous compaction before retrying. This behaviour is the enforcement backstop for the hard-limit policy described in Section 11.1.
+
 ### 5. Background Compaction
 
 To prevent read latency degradation, a background worker periodically collapses Deltas into the base metadata.
@@ -195,7 +200,7 @@ type ListDeltaCompactor struct {
 
 ```
 Claim Key:
-  !lst|claim|<userKey><seq(8-byte sortable)>  → claimValue binary
+  !lst|claim|<userKey>\x00<seq(8-byte sortable)>  → claimValue binary
 ```
 
 A Claim key shares the same `seq` suffix as the item key (`!lst|itm|`). The existence of a Claim key for an item means it has been popped (reserved).
@@ -206,9 +211,10 @@ const ListClaimPrefix = "!lst|claim|"
 func ListClaimKey(userKey []byte, seq int64) []byte {
     var raw [8]byte
     encodeSortableInt64(raw[:], seq)
-    buf := make([]byte, 0, len(ListClaimPrefix)+len(userKey)+8)
+    buf := make([]byte, 0, len(ListClaimPrefix)+len(userKey)+1+8)
     buf = append(buf, ListClaimPrefix...)
     buf = append(buf, userKey...)
+    buf = append(buf, 0) // Separator to prevent prefix collisions
     buf = append(buf, raw[:]...)
     return buf
 }
@@ -220,17 +226,23 @@ func ListClaimKey(userKey []byte, seq int64) []byte {
 For LPOP:
   1. resolveListMeta(key, readTS) → Effective meta (Determine Head, Len)
   2. candidateSeq = meta.Head
-  3. Loop:
-     a. Check for Claim key at !lst|claim|<key><candidateSeq>
-     b. If exists: candidateSeq++ and retry (Already claimed by another POP)
-     c. If not exists:
+  3. Bulk-scan existing Claim keys in range [candidateSeq, candidateSeq+scanWindow):
+     - scanWindow is a configurable constant (default: 32) that determines how many
+       candidate sequences are checked in one batch.
+     - prefix scan !lst|claim|<key>\x00[candidateSeq … candidateSeq+scanWindow)
+     - collect the set of already-claimed sequences into a local skip-set
+  4. Pick the first sequence in [candidateSeq, candidateSeq+scanWindow) not in skip-set
+  5. If a candidate is found:
         - Get item value from !lst|itm|<key><candidateSeq>
-        - Put !lst|claim|<key><candidateSeq> → {claimerTS} (Write Claim)
-        - Put !lst|meta|d|<key><commitTS><seqInTxn(4)> → {HeadDelta: +1, LenDelta: -1}
+        - Put !lst|claim|<key>\x00<candidateSeq> → {claimerTS} (Write Claim)
+        - Put !lst|meta|d|<key>\x00<commitTS><seqInTxn(4)> → {HeadDelta: +1, LenDelta: -1}
         - Commit via dispatchElems()
-  4. If commit successful: return item value
-     If commit fails (WriteConflictError on claim key): retry from step 3
+     If no candidate found in window: advance window and repeat from step 3
+  6. If commit successful: return item value
+     If commit fails (WriteConflictError on claim key): refresh skip-set and retry from step 3
 ```
+
+This replaces the previous O(N) point-lookup loop with a single range scan per window, reducing latency when many uncompacted Claim keys have accumulated.
 
 #### 6.3. Claim and OCC Interaction
 
@@ -246,10 +258,14 @@ A Claim key acts as a "logical deletion" marker. They are removed during Backgro
 ```
 1. Determine the base meta Head for the target userKey.
 2. Claim keys with a sequence less than Head are no longer needed (Head has already passed them).
-3. Within the compaction transaction:
+3. Within the compaction transaction (bounded to at most `maxKeysPerCompactionTx` deletions
+   to avoid Raft proposal timeouts or LSM performance issues; suggested default: 256,
+   chosen to keep proposal sizes well under the typical 1 MiB Raft entry limit):
    - Advance the base meta Head by the number of claimed items.
    - Delete corresponding Claim and Item keys.
    - Collapse corresponding Deltas.
+4. If more keys remain after the bound is reached, schedule another compaction pass for
+   this userKey on the next compactor tick.
 ```
 
 Read-time strategy for Claim keys:
@@ -304,18 +320,18 @@ func IsListClaimKey(key []byte) bool {
 
 func ExtractListUserKeyFromDelta(key []byte) []byte {
     trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
-    if len(trimmed) < 12 { // 8(commitTS) + 4(seqInTxn)
+    if len(trimmed) < 13 { // 1(separator) + 8(commitTS) + 4(seqInTxn)
         return nil
     }
-    return trimmed[:len(trimmed)-12]
+    return trimmed[:len(trimmed)-13]
 }
 
 func ExtractListUserKeyFromClaim(key []byte) []byte {
     trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
-    if len(trimmed) < 8 { // 8(seq)
+    if len(trimmed) < 9 { // 1(separator) + 8(seq)
         return nil
     }
-    return trimmed[:len(trimmed)-8]
+    return trimmed[:len(trimmed)-9]
 }
 ```
 
@@ -360,6 +376,31 @@ func ExtractListUserKeyFromClaim(key []byte) []byte {
 - Measure write conflict rates (compare before/after Delta introduction).
 - Benchmark `LLEN` / `LRANGE` latency across different Delta accumulation levels.
 
+#### Phase 6: Rolling Upgrade and Zero-Downtime Cutover
+
+The Delta layout is a **new key namespace** (`!lst|meta|d|` and `!lst|claim|`) alongside the existing `!lst|meta|` namespace. Old nodes that do not understand Delta keys will ignore them during reads, leading to stale `Len`/`Head` values. To avoid service interruption, the following strategies are available:
+
+**Option A — Feature flag (recommended for most deployments)**
+
+- Introduce a cluster-wide feature flag (e.g. stored in Raft config or a well-known KV key) that gates Delta writes.
+- During rolling upgrade, all nodes upgrade to the code that *understands* Delta keys but the flag remains disabled.
+- Once all nodes are upgraded and confirmed healthy, the flag is flipped to enable Delta writes.
+- A brief dual-write window (writing both the old base metadata *and* a Delta) can be used if a fallback-to-old-behaviour path must be preserved, then removed once the flag is stable.
+
+**Option B — Blue/Green deployment**
+
+- Stand up a parallel cluster (green) with the new Delta-aware code.
+- Use a proxy (or DNS cutover) to drain traffic from the old cluster (blue) to the new one.
+- After traffic is fully on green, decommission blue.
+- This avoids any mixed-version window at the cost of a temporarily doubled cluster.
+
+**Option C — Dual-write proxy**
+
+- Deploy a thin proxy layer in front of the cluster that intercepts list writes and emits both the legacy `!lst|meta|<key>` write (for backward compat) and the new Delta write.
+- Once all consumers are confirmed to use the Delta-aware read path, remove the legacy write.
+
+**Recommended approach**: Option A (feature flag) is the least operationally complex path for an in-place rolling upgrade. Option B is preferred when a hard cutover with instant rollback capability is required.
+
 ### 10. Trade-offs
 
 | Aspect | Current (Read-Modify-Write) | Delta + Claim Pattern |
@@ -378,11 +419,19 @@ The following points have been finalized.
 
 #### 11.1. Limits on Delta Accumulation
 
-**Decision: No synchronous compaction on the write side.**
+**Decision: Hard limit on unapplied Deltas with fallback to immediate compaction.**
 
-Performing synchronous compaction during a write could cause write conflicts on the base metadata for the compaction transaction itself, introducing retries to what should be a conflict-free `PUSH` path. Read latency degradation due to Delta accumulation will be managed by tuning `scanInterval` and `maxDeltaCount` for Background Compaction.
+Performing synchronous compaction on every write would cause write conflicts on the base metadata for the compaction transaction itself, introducing retries to what should be a conflict-free `PUSH` path. Delta accumulation is therefore managed primarily by tuning `scanInterval` and `maxDeltaCount` for Background Compaction.
 
-If Delta accumulation becomes exceptionally high, a warning log will be emitted on the read side to allow operators to adjust compaction parameters.
+However, relying solely on warning logs is insufficient for production safety. The system uses three distinct limit parameters:
+
+- **`maxDeltaCount`** (default: 64) — the soft threshold at which the Background Compactor schedules the key for compaction and emits a warning log.
+- **`maxDeltaScanLimit`** (default: `maxDeltaCount × 4 = 256`) — the maximum number of Delta entries fetched by a single `ScanAt` call in `resolveListMeta`. This is also the **hard limit**: when `len(deltas) == maxDeltaScanLimit`, the scan was truncated and the result would be incorrect. In that case `resolveListMeta` returns an error instead of a silently wrong `ListMeta`.
+- **`maxDeltaHardLimit`** is an alias for `maxDeltaScanLimit`; they are the same value. The naming distinction in this document merely emphasises the two roles the value plays (scan ceiling vs. correctness guard).
+
+When the hard limit is hit, the caller triggers a synchronous compaction for that key before retrying the operation. This prevents reads from ever returning silently incorrect results.
+
+This two-tier approach avoids the performance cost of synchronous compaction on the hot `PUSH` path while guaranteeing correctness under extreme accumulation.
 
 #### 11.2. POP Conflict Avoidance
 
