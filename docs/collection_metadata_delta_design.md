@@ -68,17 +68,16 @@ Using a Delta pattern, writers avoid touching the base metadata and instead writ
 
 ```
 Base Metadata (Existing):
-  !lst|meta|<userKey>                          → [Head(8)][Tail(8)][Len(8)]
+  !lst|meta|<userKeyLen(4)><userKey>                          → [Head(8)][Tail(8)][Len(8)]
 
 Delta Key (New):
-  !lst|meta|d|<userKey>\x00<commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
+  !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
 ```
 
-> **Note on separator**: The null byte (`\x00`) between `userKey` and the fixed-length suffix prevents prefix-collision bugs where scanning for `userKey = "foo"` would incorrectly include keys for `userKey = "foobar"`.
-
+- `userKeyLen` is a 4-byte big-endian length prefix that unambiguously separates `userKey` from the fixed-length suffix, even when `userKey` contains arbitrary bytes (including null bytes). This is the same approach used by Hash, Set, and ZSet key layouts, ensuring consistency across all collection types and full binary safety.
 - `commitTS` is an 8-byte big-endian timestamp pinned by the coordinator before the Delta key is generated (via `kv.OperationGroup.CommitTS` during dispatch), then carried through Raft and used unchanged at apply time.
 - `seqInTxn` is a 4-byte big-endian sequence number within the same transaction (needed if `LPUSH` is called multiple times for the same key in one `MULTI/EXEC`).
-- Since all Delta keys for a `userKey` share the prefix `!lst|meta|d|<userKey>`, they are physically contiguous in the LSM tree, allowing for fast Prefix Scans.
+- Since all Delta keys for a `userKey` share the prefix `!lst|meta|d|<userKeyLen><userKey>`, they are physically contiguous in the LSM tree, allowing for fast Prefix Scans.
 
 Because the Delta key embeds `commitTS`, the write path must know the final timestamp before emitting the key bytes. This design therefore assumes `CommitTS` is explicitly allocated once during dispatch and reused during Raft apply; it does not rely on the FSM rewriting Delta keys at apply time.
 
@@ -86,10 +85,12 @@ Because the Delta key embeds `commitTS`, the write path must know the final time
 const ListMetaDeltaPrefix = "!lst|meta|d|"
 
 func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-    buf := make([]byte, 0, len(ListMetaDeltaPrefix)+len(userKey)+1+8+4)
+    buf := make([]byte, 0, len(ListMetaDeltaPrefix)+4+len(userKey)+8+4)
     buf = append(buf, ListMetaDeltaPrefix...)
+    var kl [4]byte
+    binary.BigEndian.PutUint32(kl[:], uint32(len(userKey)))
+    buf = append(buf, kl[:]...)
     buf = append(buf, userKey...)
-    buf = append(buf, 0) // Separator to prevent prefix collisions (e.g. "foo" vs "foobar")
     var ts [8]byte
     binary.BigEndian.PutUint64(ts[:], commitTS)
     buf = append(buf, ts[:]...)
@@ -131,7 +132,7 @@ New Flow:
   1. Read !lst|meta|<key>   ← Necessary (for seq calculation), but NOT registered in readSet
   2. Scan !lst|meta|d|<key> ← Read unapplied deltas to recalculate head/len
   3. For each target sequence, check for stale Claim keys:
-     - Scan !lst|claim|<key>\x00[seq …] for sequences being written
+     - Scan !lst|claim|<keyLen><key>[seq …] for sequences being written
      - If a stale Claim key exists (left over from a prior POP on a recycled sequence),
        emit a Del for that Claim key in the same transaction
      ※ Without this step, a subsequent POP would see the stale claim and incorrectly
@@ -163,6 +164,9 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, userKey []byte, readT
     deltas, err := r.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), maxDeltaScanLimit, readTS)
     if err != nil {
         return ListMeta{}, false, err
+    }
+    if len(deltas) == maxDeltaScanLimit {
+        return ListMeta{}, false, ErrDeltaScanTruncated
     }
 
     // 3. Aggregate
@@ -241,10 +245,10 @@ type ListDeltaCompactor struct {
 
 ```
 Claim Key:
-  !lst|claim|<userKey>\x00<seq(8-byte sortable)>  → claimValue binary
+  !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)>  → claimValue binary
 ```
 
-A Claim key shares the same `seq` suffix as the item key (`!lst|itm|`). The existence of a Claim key for an item means it has been popped (reserved).
+A Claim key shares the same `seq` suffix as the item key (`!lst|itm|`). The existence of a Claim key for an item means it has been popped (reserved). Like Delta keys, Claim keys use a `userKeyLen(4)` length prefix for binary safety and consistency with other collection types.
 
 ```go
 const ListClaimPrefix = "!lst|claim|"
@@ -252,10 +256,12 @@ const ListClaimPrefix = "!lst|claim|"
 func ListClaimKey(userKey []byte, seq int64) []byte {
     var raw [8]byte
     encodeSortableInt64(raw[:], seq)
-    buf := make([]byte, 0, len(ListClaimPrefix)+len(userKey)+1+8)
+    buf := make([]byte, 0, len(ListClaimPrefix)+4+len(userKey)+8)
     buf = append(buf, ListClaimPrefix...)
+    var kl [4]byte
+    binary.BigEndian.PutUint32(kl[:], uint32(len(userKey)))
+    buf = append(buf, kl[:]...)
     buf = append(buf, userKey...)
-    buf = append(buf, 0) // Separator to prevent prefix collisions
     buf = append(buf, raw[:]...)
     return buf
 }
@@ -272,13 +278,13 @@ For LPOP:
   3. Bulk-scan existing Claim keys in range [candidateSeq, candidateSeq+scanWindow):
      - scanWindow is a configurable constant (default: 32) that determines how many
        candidate sequences are checked in one batch.
-     - prefix scan !lst|claim|<key>\x00[candidateSeq … candidateSeq+scanWindow)
+     - prefix scan !lst|claim|<keyLen><key>[candidateSeq … candidateSeq+scanWindow)
      - collect the set of already-claimed sequences into a local skip-set
   4. Pick the first sequence in [candidateSeq, candidateSeq+scanWindow) not in skip-set
   5. If a candidate is found:
         - Get item value from !lst|itm|<key><candidateSeq>
-        - Put !lst|claim|<key>\x00<candidateSeq> → {claimerTS} (Write Claim)
-        - Put !lst|meta|d|<key>\x00<commitTS><seqInTxn(4)> → {HeadDelta: +1, LenDelta: -1}
+        - Put !lst|claim|<keyLen><key><candidateSeq> → {claimerTS} (Write Claim)
+        - Put !lst|meta|d|<keyLen><key><commitTS><seqInTxn(4)> → {HeadDelta: +1, LenDelta: -1}
         - Commit via dispatchElems()
      If no candidate found in window: advance window and repeat from step 3
   6. If commit successful: return item value
@@ -294,14 +300,14 @@ For RPOP:
   1. resolveListMeta(key, readTS) → Effective meta (Determine Head, Tail, Len)
   2. candidateSeq = meta.Tail - 1
   3. Bulk-scan existing Claim keys in range (candidateSeq-scanWindow, candidateSeq]:
-     - Reverse range scan of !lst|claim|<key>\x00 within the window
+     - Reverse range scan of !lst|claim|<keyLen><key> within the window
      - collect the set of already-claimed sequences into a local skip-set
   4. Pick the last (highest) sequence in (candidateSeq-scanWindow, candidateSeq]
      not in skip-set
   5. If a candidate is found:
         - Get item value from !lst|itm|<key><candidateSeq>
-        - Put !lst|claim|<key>\x00<candidateSeq> → {claimerTS} (Write Claim)
-        - Put !lst|meta|d|<key>\x00<commitTS><seqInTxn(4)> → {HeadDelta: 0, LenDelta: -1}
+        - Put !lst|claim|<keyLen><key><candidateSeq> → {claimerTS} (Write Claim)
+        - Put !lst|meta|d|<keyLen><key><commitTS><seqInTxn(4)> → {HeadDelta: 0, LenDelta: -1}
         - Commit via dispatchElems()
      If no candidate found in window: retreat window and repeat from step 3
   6. If commit successful: return item value
@@ -419,18 +425,26 @@ func IsListClaimKey(key []byte) bool {
 
 func ExtractListUserKeyFromDelta(key []byte) []byte {
     trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
-    if len(trimmed) < 13 { // 1(separator) + 8(commitTS) + 4(seqInTxn)
+    if len(trimmed) < 4+8+4 { // 4(userKeyLen) + 8(commitTS) + 4(seqInTxn)
         return nil
     }
-    return trimmed[:len(trimmed)-13]
+    ukLen := binary.BigEndian.Uint32(trimmed[:4])
+    if uint32(len(trimmed)) < 4+ukLen+8+4 {
+        return nil
+    }
+    return trimmed[4 : 4+ukLen]
 }
 
 func ExtractListUserKeyFromClaim(key []byte) []byte {
     trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
-    if len(trimmed) < 9 { // 1(separator) + 8(seq)
+    if len(trimmed) < 4+8 { // 4(userKeyLen) + 8(seq)
         return nil
     }
-    return trimmed[:len(trimmed)-9]
+    ukLen := binary.BigEndian.Uint32(trimmed[:4])
+    if uint32(len(trimmed)) < 4+ukLen+8 {
+        return nil
+    }
+    return trimmed[4 : 4+ukLen]
 }
 ```
 
@@ -450,13 +464,13 @@ Field Key (New):
   !hs|fld|<userKeyLen(4)><userKey><fieldName>                      → field value bytes
 
 Delta Key (New):
-  !hs|meta|d|<userKeyLen(4)><userKey>\x00<commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
+  !hs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
 ```
 
 - `userKeyLen` is a 4-byte big-endian length prefix to prevent ambiguity when one `userKey` is a prefix of another (e.g., `"foo"` vs `"foobar"`). This follows the same convention as ZSet wide-column keys.
 - `Len` is the number of fields in the hash (equivalent to `HLEN`).
 - Each field has its own key, so concurrent `HSET` operations on **different fields** do not conflict on data keys.
-- The null-byte separator (`\x00`) in Delta keys prevents prefix collision on the fixed-length suffix, as described in List Section 1.
+- All collection types use the same `userKeyLen(4)` length-prefix approach to prevent prefix collisions and ensure binary safety.
 
 ```go
 const (
@@ -506,7 +520,7 @@ Fixed 8-byte binary (int64 big-endian). Unlike List, Hash metadata only tracks `
    → This read IS registered in the readSet (for OCC on the field key)
 2. Put !hs|fld|<key><field> → value
 3. If field is new (did not exist in step 1):
-     Put !hs|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: +1
+     Put !hs|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: +1
    If field is an update (existed in step 1):
      No delta write needed (LenDelta would be 0)
 ※ !hs|meta|<key> is never read or written → No metadata conflict
@@ -522,7 +536,7 @@ Fixed 8-byte binary (int64 big-endian). Unlike List, Hash metadata only tracks `
 1. Point-read !hs|fld|<key><field> to check existence
 2. If field exists:
      Del !hs|fld|<key><field>
-     Put !hs|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: -1
+     Put !hs|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: -1
    If field does not exist:
      No-op
 ```
@@ -585,7 +599,7 @@ Hash delta compaction follows the same pattern as List (Section 5), but simpler:
 4. In a single transaction:
    - Put `!hs|meta|<key>` (mergedLen).
    - Delete all applied Delta keys.
-5. If `mergedLen == 0`: atomically delete base metadata, all deltas, and all field keys.
+5. If `mergedLen == 0`: update base metadata to `Len = 0` (do NOT delete), delete all deltas and all field keys (see Section 28).
 
 No Claim mechanism is needed because `HDEL` targets named fields, not positional elements. OCC on the field key itself provides mutual exclusion.
 
@@ -617,7 +631,7 @@ Member Key (New):
   !st|mem|<userKeyLen(4)><userKey><member>                         → (empty value)
 
 Delta Key (New):
-  !st|meta|d|<userKeyLen(4)><userKey>\x00<commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
+  !st|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
 ```
 
 - Member keys store an empty value; the member name is embedded in the key itself.
@@ -670,7 +684,7 @@ Fixed 8-byte binary (int64 big-endian). Identical structure to Hash delta.
 1. Point-read !st|mem|<key><member> to check if member already exists
 2. If member is new:
      Put !st|mem|<key><member> → (empty)
-     Put !st|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: +1
+     Put !st|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: +1
    If member already exists:
      No-op (SADD is idempotent for existing members)
 ※ For SADD with multiple members, aggregate LenDelta within the transaction
@@ -683,7 +697,7 @@ Fixed 8-byte binary (int64 big-endian). Identical structure to Hash delta.
 1. Point-read !st|mem|<key><member> to check existence
 2. If member exists:
      Del !st|mem|<key><member>
-     Put !st|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: -1
+     Put !st|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: -1
    If member does not exist:
      No-op
 ※ For SREM with multiple members, aggregate LenDelta similarly
@@ -719,7 +733,7 @@ Identical pattern to Hash compaction (Section 13):
 2. Scan `!st|meta|d|<key>*` → deltas.
 3. Aggregate: `mergedLen = baseMeta.Len + Σ(deltas.LenDelta)`.
 4. Single transaction: Put merged meta + delete applied deltas.
-5. If `mergedLen == 0`: atomically delete base metadata, all deltas, and all member keys.
+5. If `mergedLen == 0`: update base metadata to `Len = 0` (do NOT delete), delete all deltas and all member keys (see Section 28).
 
 No Claim mechanism is needed.
 
@@ -754,7 +768,7 @@ Score Index Key (Existing):
   !zs|scr|<userKeyLen(4)><userKey><sortableScore(8)><member>       → (empty)
 
 Delta Key (New):
-  !zs|meta|d|<userKeyLen(4)><userKey>\x00<commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
+  !zs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
 ```
 
 The only addition is the Delta key namespace `!zs|meta|d|`. Member and score index keys remain unchanged.
@@ -763,13 +777,12 @@ The only addition is the Delta key namespace `!zs|meta|d|`. Member and score ind
 const ZSetMetaDeltaPrefix = "!zs|meta|d|"
 
 func ZSetMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-    buf := make([]byte, 0, len(ZSetMetaDeltaPrefix)+4+len(userKey)+1+8+4)
+    buf := make([]byte, 0, len(ZSetMetaDeltaPrefix)+4+len(userKey)+8+4)
     buf = append(buf, ZSetMetaDeltaPrefix...)
     var kl [4]byte
     binary.BigEndian.PutUint32(kl[:], uint32(len(userKey)))
     buf = append(buf, kl[:]...)
     buf = append(buf, userKey...)
-    buf = append(buf, 0) // Separator
     var ts [8]byte
     binary.BigEndian.PutUint64(ts[:], commitTS)
     buf = append(buf, ts[:]...)
@@ -799,7 +812,7 @@ Fixed 8-byte binary. Score updates that do not change cardinality produce no del
 2. If member is new:
      Put !zs|mem|<key><member> → score (IEEE 754)
      Put !zs|scr|<key><sortableScore><member> → (empty)
-     Put !zs|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: +1
+     Put !zs|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: +1
    If member exists (score update only):
      Del old !zs|scr|<key><oldSortableScore><member>
      Put !zs|scr|<key><newSortableScore><member> → (empty)
@@ -816,7 +829,7 @@ Fixed 8-byte binary. Score updates that do not change cardinality produce no del
 2. If member exists:
      Del !zs|mem|<key><member>
      Del !zs|scr|<key><sortableScore><member>
-     Put !zs|meta|d|<key>\x00<commitTS><seqInTxn> → LenDelta: -1
+     Put !zs|meta|d|<keyLen><key><commitTS><seqInTxn> → LenDelta: -1
    If member does not exist:
      No-op
 ```
@@ -855,7 +868,7 @@ Same pattern as Hash/Set compaction:
 2. Scan `!zs|meta|d|<key>*` → deltas.
 3. Aggregate: `mergedLen = baseMeta.Len + Σ(deltas.LenDelta)`.
 4. Single transaction: Put merged meta + delete applied deltas.
-5. If `mergedLen == 0`: atomically delete base metadata, all deltas, all member keys, and all score index keys.
+5. If `mergedLen == 0`: update base metadata to `Len = 0` (do NOT delete), delete all deltas, all member keys, and all score index keys (see Section 28).
 
 No Claim mechanism is needed. `ZREM` targets specific named members, and OCC on the member key provides mutual exclusion.
 
@@ -896,11 +909,17 @@ The delta accumulation limits from List Section 11.1 apply uniformly to all coll
 
 ### 28. Empty Collection Detection
 
-For all collection types, empty collection deletion is deferred to Background Compaction (same reasoning as List Section 11.3):
+For all collection types, empty collection cleanup is deferred to Background Compaction (same reasoning as Design Decision D3):
 
 - Immediate deletion would require writing to the base metadata, risking inconsistency with concurrent Delta writes.
-- When the compactor detects `Len == 0`, it atomically deletes all keys for that collection (base metadata, deltas, data keys, and for List: claim keys).
+- When the compactor detects `Len == 0`, it performs the following in a single transaction:
+  1. **Update** the base metadata to `Len = 0` (and for List: `Head`/`Tail` reflecting the final state). The base metadata key is **not deleted** — it is retained as a tombstone to prevent concurrent writers from misinterpreting a missing metadata key as a fresh collection and restarting sequence numbering from zero.
+  2. Delete all applied Delta keys.
+  3. Delete all data keys (items for List, fields for Hash, members for Set, member+score keys for ZSet).
+  4. For List: delete all Claim keys.
+- A subsequent write to an empty collection (e.g., `RPUSH` on a list with `Len == 0`) will see the zeroed base metadata and correctly resume sequence numbering from the existing `Head`/`Tail`.
 - During the brief window between compactions, `resolve*Meta()` returns `Len == 0`, ensuring cardinality queries correctly report an empty collection.
+- **Full metadata deletion** may only occur as part of a `DEL` command on the key itself, which is handled outside the delta compaction path and uses the standard transactional `DEL` flow.
 
 ---
 
@@ -1143,13 +1162,13 @@ This mechanism is **not needed for Hash, Set, or ZSet** because their removal op
 
 #### D3. Empty Collection Detection (All Types)
 
-**Decision: Defer to the next Background Compaction.**
+**Decision: Defer cleanup to the next Background Compaction. Update base metadata to `Len = 0` but do NOT delete it.**
 
-Immediate deletion of base metadata or Deltas will not occur even if `Len == 0` after aggregating Deltas.
-Reasoning:
-- Immediate deletion would require writing to the base metadata, risking inconsistency with concurrent Delta writes.
-- When Background Compaction detects `Len == 0`, it will atomically delete the base metadata, all Deltas, and all data keys (items for List, fields for Hash, members for Set, member+score keys for ZSet, and Claim keys for List).
+Immediate cleanup will not occur even if `Len == 0` after aggregating Deltas. When Background Compaction detects `Len == 0`:
+- The base metadata key is **updated** to reflect `Len = 0` (not deleted). This is critical because writers do not register the base metadata in their `readSet`. If the key were deleted, a concurrent writer would see no metadata and incorrectly assume a fresh collection, restarting sequence numbering from zero and causing sequence collisions or data corruption.
+- All applied Deltas, data keys (items, fields, members, score keys), and Claim keys (for List) are deleted.
 - During the brief window between compactions where an empty collection persists, `resolve*Meta()` will return `Len == 0`, ensuring cardinality queries correctly report an empty collection.
+- Full metadata deletion (including the base metadata key) is only performed by the `DEL` command, which follows the standard transactional flow with proper `readSet` registration.
 
 #### D4. Hash/Set Wide-Column Decomposition as Prerequisite
 
