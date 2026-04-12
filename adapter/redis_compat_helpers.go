@@ -278,7 +278,7 @@ func buildZSetWriteElems(key []byte, members map[string]float64) ([]*kv.Elem[kv.
 // origMembers to newMembers. Only the changed/added/removed members are
 // written, plus a meta update.
 func buildZSetDiffElems(key []byte, origMembers, newMembers map[string]float64) ([]*kv.Elem[kv.OP], error) {
-	elems := make([]*kv.Elem[kv.OP], 0)
+	elems := make([]*kv.Elem[kv.OP], 0, (len(origMembers)+len(newMembers))*2+1)
 
 	// Remove members that are gone or have changed score.
 	for member, oldScore := range origMembers {

@@ -274,6 +274,25 @@ func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {
 	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
 }
 
+func TestNormalizeRetryableRedisTxnErrZSetKey(t *testing.T) {
+	t.Parallel()
+
+	for _, internalKey := range [][]byte{
+		store.ZSetMetaKey([]byte("retry:zset")),
+		store.ZSetMemberKey([]byte("retry:zset"), []byte("member")),
+		store.ZSetScoreKey([]byte("retry:zset"), 1.0, []byte("member")),
+	} {
+		err := kv.NewTxnLockedError(internalKey)
+		normalized := normalizeRetryableRedisTxnErr(err)
+
+		require.ErrorIs(t, normalized, kv.ErrTxnLocked)
+		require.ErrorContains(t, normalized, "key: retry:zset")
+		require.NotContains(t, normalized.Error(), store.ZSetMetaPrefix)
+		require.NotContains(t, normalized.Error(), store.ZSetMemberPrefix)
+		require.NotContains(t, normalized.Error(), store.ZSetScorePrefix)
+	}
+}
+
 func TestRetryPolicyForRedisTxnErr(t *testing.T) {
 	t.Parallel()
 
