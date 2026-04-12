@@ -1629,6 +1629,7 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 		return
 	}
 	if opts.reverse {
+		entries = append([]redisZSetEntry(nil), entries...)
 		reverseZSetEntries(entries)
 	}
 	s, e := normalizeRankRange(start, stop, len(entries))
