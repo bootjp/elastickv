@@ -288,7 +288,11 @@ sudo -n "$MIGRATE_BIN" \
   -peers "$PEERS"
 
 echo "  moving etcd artifacts into place"
-sudo -n mv "${migrate_dest}/data/member" "${node_dir}/member"
+for artifact in wal snap etcd-raft-peers.bin; do
+  if sudo -n test -e "${migrate_dest}/data/${artifact}"; then
+    sudo -n mv "${migrate_dest}/data/${artifact}" "${node_dir}/${artifact}"
+  fi
+done
 sudo -n rm -rf "$migrate_dest"
 
 echo "  archiving hashicorp raft artifacts"
