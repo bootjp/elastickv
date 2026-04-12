@@ -22,10 +22,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          review_comment_prefix: "[Data Loss] "
+          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「データロスト防止」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+            コメントには必ず先頭に [Data Loss] プレフィックスを付けてください。
 
             ## レビュー観点: データロストがないか
             - Write/Delete操作でデータが意図せず失われるパスがないか
@@ -54,10 +55,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          review_comment_prefix: "[Concurrency] "
+          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「並行性・分散障害」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+            コメントには必ず先頭に [Concurrency] プレフィックスを付けてください。
 
             ## レビュー観点: 並行性/分散障害
             - Race conditionやデッドロックの可能性がないか
@@ -87,10 +89,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          review_comment_prefix: "[Performance] "
+          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「性能」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+            コメントには必ず先頭に [Performance] プレフィックスを付けてください。
 
             ## レビュー観点: 性能
             - 不要なメモリアロケーションやコピーがないか
@@ -120,10 +123,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          review_comment_prefix: "[Consistency] "
+          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「データ一貫性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+            コメントには必ず先頭に [Consistency] プレフィックスを付けてください。
 
             ## レビュー観点: データ一貫性
             - Raftを経由すべき操作がローカルで直接実行されていないか
@@ -153,10 +157,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          review_comment_prefix: "[Test Coverage] "
+          claude_args: "--allowedTools Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
           prompt: |
             あなたは分散KVSの「テスト網羅性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+            コメントには必ず先頭に [Test Coverage] プレフィックスを付けてください。
 
             ## レビュー観点: テスト網羅
             - 追加・変更されたロジックに対応するテストが存在するか
