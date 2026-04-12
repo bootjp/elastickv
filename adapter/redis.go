@@ -1838,6 +1838,14 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 		iv.deleted = true
 		iv.dirty = true
 	}
+	// Mark legacy bare string key for deletion. We bypass load() here
+	// because load() auto-prefixes bare keys to !redis|str|.
+	bareK := string(key)
+	if _, ok := t.working[bareK]; !ok {
+		t.working[bareK] = &txnValue{}
+	}
+	t.working[bareK].deleted = true
+	t.working[bareK].dirty = true
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 

@@ -460,10 +460,10 @@ func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
 
 // deleteLegacyKeys scans the full keyspace and deletes keys that do not belong
 // to any known internal prefix. Returns the number of user-visible legacy keys
-// deleted. If deleteTTL is true, also deletes associated TTL keys for each
-// legacy key (when called standalone); callers that already cleared TTL keys
-// via DEL_PREFIX should pass false.
-func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, deleteTTL bool) (int, error) {
+// deleted. TTL keys are intentionally NOT deleted because the !redis|ttl|
+// namespace is shared across all Redis types — deleting them could strip
+// expiration from already-migrated or newly-created keys.
+func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64) (int, error) {
 	const batchSize = 1000
 	var totalDeleted int
 	cursor := make([]byte, 0, batchSize)
@@ -476,19 +476,12 @@ func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, delet
 			break
 		}
 
-		capacity := len(kvs)
-		if deleteTTL {
-			capacity *= 2
-		}
-		elems := make([]*kv.Elem[kv.OP], 0, capacity)
+		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
 		legacyCount := 0
 		for _, pair := range kvs {
 			if !isKnownInternalKey(pair.Key) {
 				legacyCount++
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-				if deleteTTL {
-					elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(pair.Key)})
-				}
 			}
 		}
 
@@ -527,7 +520,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
 	defer cancel()
 
-	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS(), true)
+	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS())
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
