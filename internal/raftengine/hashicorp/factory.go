@@ -93,8 +93,7 @@ func (f *Factory) createRaft(dir string, cfg raftengine.FactoryConfig) (*raft.Ra
 
 	fss, err := raft.NewFileSnapshotStore(dir, f.cfg.SnapshotRetainCount, os.Stderr)
 	if err != nil {
-		_ = rs.Close()
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(errors.CombineErrors(err, rs.Close()))
 	}
 
 	tm := transport.New(raft.ServerAddress(cfg.LocalAddress), internalutil.GRPCDialOptions())
@@ -108,9 +107,7 @@ func (f *Factory) createRaft(dir string, cfg raftengine.FactoryConfig) (*raft.Ra
 
 	r, err := raft.NewRaft(c, adaptStateMachineToFSM(cfg.StateMachine), rs, rs, fss, tm.Transport())
 	if err != nil {
-		_ = tm.Close()
-		_ = rs.Close()
-		return nil, nil, nil, errors.WithStack(err)
+		return nil, nil, nil, errors.WithStack(errors.CombineErrors(err, errors.CombineErrors(tm.Close(), rs.Close())))
 	}
 	return r, rs, tm, nil
 }

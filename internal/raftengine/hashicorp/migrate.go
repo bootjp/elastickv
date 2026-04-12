@@ -131,7 +131,11 @@ func seedHashicorpDir(storePath string, tempDir string, peers []MigrationPeer) (
 	if err != nil {
 		return 0, errors.WithStack(err)
 	}
-	defer rs.Close()
+	defer func() {
+		if err := rs.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close raft store: %v\n", err)
+		}
+	}()
 
 	// Set initial term to 1. Hashicorp raft reads "CurrentTerm" on startup.
 	if err := rs.SetUint64([]byte("CurrentTerm"), 1); err != nil {
@@ -150,6 +154,7 @@ func seedHashicorpDir(storePath string, tempDir string, peers []MigrationPeer) (
 	// Create an in-memory transport (required by FileSnapshotStore.Create but
 	// not used for actual communication during migration).
 	_, transport := raft.NewInmemTransport("")
+	defer transport.Close()
 
 	// Create a snapshot sink at index=1, term=1.
 	sink, err := fss.Create(raft.SnapshotVersionMax, 1, 1, configuration, 1, transport)
@@ -179,7 +184,11 @@ func streamFSMSnapshotToSink(storePath string, w io.Writer) (int64, error) {
 	if err != nil {
 		return 0, errors.WithStack(err)
 	}
-	defer source.Close()
+	defer func() {
+		if err := source.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close source store: %v\n", err)
+		}
+	}()
 
 	snapshot, err := source.Snapshot()
 	if err != nil {

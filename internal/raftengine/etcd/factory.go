@@ -58,10 +58,11 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 		MaxInflightMsg: f.cfg.MaxInflightMsg,
 	})
 	if err != nil {
+		var closeErr error
 		if transport != nil {
-			_ = transport.Close()
+			closeErr = transport.Close()
 		}
-		return nil, errors.WithStack(err)
+		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
 	}
 
 	var register func(grpc.ServiceRegistrar)

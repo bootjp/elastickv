@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,15 +55,21 @@ func (r *raftGroupRuntime) Close() {
 		return
 	}
 	if r.engine != nil {
-		_ = r.engine.Close()
+		if err := r.engine.Close(); err != nil {
+			slog.Warn("failed to close raft engine", "error", err)
+		}
 		r.engine = nil
 	}
 	if r.closeFactory != nil {
-		_ = r.closeFactory()
+		if err := r.closeFactory(); err != nil {
+			slog.Warn("failed to close factory resources", "error", err)
+		}
 		r.closeFactory = nil
 	}
 	if r.store != nil {
-		_ = r.store.Close()
+		if err := r.store.Close(); err != nil {
+			slog.Warn("failed to close store", "error", err)
+		}
 		r.store = nil
 	}
 }
