@@ -313,7 +313,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	}
 
-	if err := f.store.ApplyMutations(ctx, storeMuts, nil, startTS, startTS); err != nil {
+	if err := f.store.ApplyMutations(ctx, storeMuts, r.ReadKeys, startTS, startTS); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil

@@ -212,7 +212,7 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
-	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
+	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids, readKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +263,7 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
@@ -277,6 +277,7 @@ func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []
 			Phase:     pb.Phase_PREPARE,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
+			ReadKeys:  readKeys,
 		}
 		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
 			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))

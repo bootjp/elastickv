@@ -479,15 +479,8 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	for _, mut := range mutations {
-		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
-			return NewWriteConflictError(mut.Key)
-		}
-	}
-	for _, key := range readKeys {
-		if latestVer, ok := s.latestVersionLocked(key); ok && latestVer.TS > startTS {
-			return NewWriteConflictError(key)
-		}
+	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
+		return err
 	}
 
 	commitTS = s.alignCommitTS(commitTS)
@@ -511,6 +504,20 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 		)
 	}
 
+	return nil
+}
+
+func (s *mvccStore) checkConflictsLocked(mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
+	for _, mut := range mutations {
+		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
+			return NewWriteConflictError(mut.Key)
+		}
+	}
+	for _, key := range readKeys {
+		if latestVer, ok := s.latestVersionLocked(key); ok && latestVer.TS > startTS {
+			return NewWriteConflictError(key)
+		}
+	}
 	return nil
 }
 
