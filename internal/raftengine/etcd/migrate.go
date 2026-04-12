@@ -96,6 +96,14 @@ func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {
 	if err := closePersist(disk.Persist); err != nil {
 		return err
 	}
+	// Persist the peer list so the engine discovers all cluster members on
+	// first open even when the caller's FactoryConfig.Peers is empty (the
+	// common case during migration, where --raftBootstrapMembers is not
+	// repeated).  Without this file the engine falls back to a single-node
+	// configuration and every node elects itself leader independently.
+	if err := savePersistedPeers(tempDir, state.Snapshot.Metadata.Index, peers); err != nil {
+		return err
+	}
 	return nil
 }
 
