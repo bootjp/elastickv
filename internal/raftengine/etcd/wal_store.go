@@ -347,10 +347,10 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 const defaultMaxSnapFiles = 3
 
 // purgeOldSnapFiles removes old .snap files from snapDir, keeping the most
-// recent maxSnap files. Snap file names encode term and index in hex and sort
-// lexicographically from oldest to newest, matching etcd's Snapshotter
-// convention.
-func purgeOldSnapFiles(snapDir string, maxSnap int) error {
+// recent defaultMaxSnapFiles files. Snap file names encode term and index in
+// hex and sort lexicographically from oldest to newest, matching etcd's
+// Snapshotter convention.
+func purgeOldSnapFiles(snapDir string) error {
 	entries, err := os.ReadDir(snapDir)
 	if err != nil {
 		return errors.WithStack(err)
@@ -363,7 +363,7 @@ func purgeOldSnapFiles(snapDir string, maxSnap int) error {
 		}
 	}
 
-	if len(snaps) <= maxSnap {
+	if len(snaps) <= defaultMaxSnapFiles {
 		return nil
 	}
 
@@ -372,7 +372,7 @@ func purgeOldSnapFiles(snapDir string, maxSnap int) error {
 	sort.Strings(snaps)
 
 	var combined error
-	for _, name := range snaps[:len(snaps)-maxSnap] {
+	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
 		if removeErr := os.Remove(filepath.Join(snapDir, name)); removeErr != nil && !os.IsNotExist(removeErr) {
 			combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
 		}

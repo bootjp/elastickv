@@ -49,12 +49,11 @@ func TestCleanupStaleSnapshotSpoolsNonExistentDir(t *testing.T) {
 }
 
 // createSnapFile creates a fake .snap file with the etcd naming convention.
-func createSnapFile(t *testing.T, dir string, term, index uint64) string {
+func createSnapFile(t *testing.T, dir string, term, index uint64) {
 	t.Helper()
 	name := fmt.Sprintf("%016x-%016x.snap", term, index)
 	path := filepath.Join(dir, name)
 	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o600))
-	return path
 }
 
 func TestPurgeOldSnapFiles(t *testing.T) {
@@ -69,7 +68,7 @@ func TestPurgeOldSnapFiles(t *testing.T) {
 	other := filepath.Join(dir, "db.tmp.12345")
 	require.NoError(t, os.WriteFile(other, []byte("x"), 0o600))
 
-	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
+	require.NoError(t, purgeOldSnapFiles(dir))
 
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -99,7 +98,7 @@ func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
 	createSnapFile(t, dir, 1, 1000)
 	createSnapFile(t, dir, 1, 2000)
 
-	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
+	require.NoError(t, purgeOldSnapFiles(dir))
 
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -108,5 +107,5 @@ func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
 
 func TestPurgeOldSnapFilesEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
+	require.NoError(t, purgeOldSnapFiles(dir))
 }

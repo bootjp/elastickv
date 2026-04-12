@@ -1320,8 +1320,8 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	}
 
 	snapDir := filepath.Join(e.dataDir, snapDirName)
-	if purgeErr := purgeOldSnapFiles(snapDir, defaultMaxSnapFiles); purgeErr != nil {
-		return errors.Wrap(purgeErr, "purge old snap files")
+	if purgeErr := purgeOldSnapFiles(snapDir); purgeErr != nil {
+		slog.Warn("failed to purge old snap files", "error", purgeErr)
 	}
 	return nil
 }
@@ -2268,18 +2268,20 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
 	switch {
 	case err == nil:
+		snapDir := filepath.Join(e.dataDir, snapDirName)
+		if purgeErr := purgeOldSnapFiles(snapDir); purgeErr != nil {
+			slog.Warn("failed to purge old snap files", "error", purgeErr)
+		}
+		return nil
 	case errors.Is(err, etcdraft.ErrCompacted):
+		return nil
 	case errors.Is(err, etcdraft.ErrUnavailable):
+		return nil
 	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+		return nil
 	default:
 		return err
 	}
-
-	snapDir := filepath.Join(e.dataDir, snapDirName)
-	if purgeErr := purgeOldSnapFiles(snapDir, defaultMaxSnapFiles); purgeErr != nil {
-		return errors.Wrap(purgeErr, "purge old snap files")
-	}
-	return nil
 }
 
 func encodeReadContext(id uint64) []byte {
