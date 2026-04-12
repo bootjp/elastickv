@@ -67,10 +67,12 @@ type luaSetState struct {
 }
 
 type luaZSetState struct {
-	loaded  bool
-	exists  bool
-	dirty   bool
-	members map[string]float64
+	loaded      bool
+	exists      bool
+	dirty       bool
+	fromLegacy  bool
+	members     map[string]float64
+	origMembers map[string]float64 // snapshot at load time for diff-based commit
 }
 
 type luaStreamState struct {
@@ -614,6 +616,7 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		st.members = map[string]float64{}
+		st.origMembers = map[string]float64{}
 		return st, nil
 	}
 	if err != nil {
@@ -622,19 +625,26 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	if typ == redisTypeNone {
 		st.loaded = true
 		st.members = map[string]float64{}
+		st.origMembers = map[string]float64{}
 		return st, nil
 	}
 	if typ != redisTypeZSet {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.loadZSetAt(context.Background(), key, c.startTS)
+	load, err := c.server.loadZSetMembersMap(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
 	st.loaded = true
-	st.exists = true
-	st.members = zsetEntriesToMap(value.Entries)
+	st.exists = load.exists
+	st.fromLegacy = load.fromLegacy
+	st.members = load.members
+	// Snapshot for diff-based commit.
+	st.origMembers = make(map[string]float64, len(load.members))
+	for k, v := range load.members {
+		st.origMembers[k] = v
+	}
 	return st, nil
 }
 
@@ -2644,11 +2654,28 @@ func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	if err != nil {
 		return nil, err
 	}
-	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
-	if err != nil {
-		return nil, err
+	keyBytes := []byte(key)
+	if st.fromLegacy {
+		if len(st.members) == 0 {
+			// Legacy blob removed: delete the legacy key and TTL key.
+			return []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: redisZSetKey(keyBytes)},
+				{Op: kv.Del, Key: redisTTLKey(keyBytes)},
+			}, nil
+		}
+		// Legacy blob → wide-column migration: full write + delete legacy blob.
+		elems, err := buildZSetWriteElems(keyBytes, st.members)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(keyBytes)})
+		return elems, nil
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisZSetKey([]byte(key)), Value: payload}}, nil
+	if len(st.origMembers) == 0 && len(st.members) > 0 {
+		// Brand-new ZSet: full write.
+		return buildZSetWriteElems(keyBytes, st.members)
+	}
+	return buildZSetDiffElems(keyBytes, st.origMembers, st.members)
 }
 
 func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {

@@ -1427,11 +1427,14 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	if typ != redisTypeNone && typ != redisTypeZSet {
 		return 0, wrongTypeError()
 	}
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+	load, err := r.loadZSetMembersMap(context.Background(), key, readTS)
 	if err != nil {
 		return 0, err
 	}
-	members := zsetEntriesToMap(value.Entries)
+	members := make(map[string]float64, len(load.members))
+	for k, v := range load.members {
+		members[k] = v
+	}
 	added := 0
 	for _, p := range pairs {
 		old, exists := members[p.member]
@@ -1443,14 +1446,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		}
 		members[p.member] = p.score
 	}
-	value.Entries = zsetMapToEntries(members)
-	payload, err := marshalZSetValue(value)
-	if err != nil {
-		return 0, err
-	}
-	return added, r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
-	})
+	return added, r.persistZSetMembersTxn(ctx, key, readTS, load, members)
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
@@ -1475,22 +1471,18 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeNone && typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
+		load, err := r.loadZSetMembersMap(context.Background(), cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
-		members := zsetEntriesToMap(value.Entries)
+		members := make(map[string]float64, len(load.members))
+		for k, v := range load.members {
+			members[k] = v
+		}
 		member := string(cmd.Args[3])
 		members[member] += increment
 		newScore = members[member]
-		value.Entries = zsetMapToEntries(members)
-		payload, err := marshalZSetValue(value)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisZSetKey(cmd.Args[1]), Value: payload},
-		})
+		return r.persistZSetMembersTxn(ctx, cmd.Args[1], readTS, load, members)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1547,21 +1539,48 @@ func removeZSetMembers(members map[string]float64, rawMembers [][]byte) int {
 	return removed
 }
 
-func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, readTS uint64, entries []redisZSetEntry) error {
-	if len(entries) == 0 {
+func (r *RedisServer) persistZSetMembersTxn(ctx context.Context, key []byte, readTS uint64, load zsetLoadResult, newMembers map[string]float64) error {
+	if len(newMembers) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	payload, err := marshalZSetValue(redisZSetValue{Entries: entries})
-	if err != nil {
-		return err
+	var elems []*kv.Elem[kv.OP]
+	var err error
+	if load.fromLegacy {
+		// Migrate: full write to wide-column + delete legacy blob.
+		elems, err = buildZSetWriteElems(key, newMembers)
+		if err != nil {
+			return err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	} else {
+		elems, err = buildZSetDiffElems(key, load.members, newMembers)
+		if err != nil {
+			return err
+		}
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
-	})
+	return r.dispatchElems(ctx, true, readTS, elems)
+}
+
+// loadZSetEntriesSorted loads all ZSet entries in score order,
+// checking wide-column first, then falling back to legacy blob.
+func (r *RedisServer) loadZSetEntriesSorted(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if metaExists {
+		return r.scanZSetAllMembers(ctx, key, meta.Len, readTS)
+	}
+	// Legacy blob fallback.
+	value, _, err := r.loadZSetAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	return value.Entries, nil
 }
 
 func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
@@ -1604,13 +1623,13 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 		return
 	}
 
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+	entries, err := r.loadZSetEntriesSorted(context.Background(), key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	entries := append([]redisZSetEntry(nil), value.Entries...)
 	if opts.reverse {
+		entries = append([]redisZSetEntry(nil), entries...)
 		reverseZSetEntries(entries)
 	}
 	s, e := normalizeRankRange(start, stop, len(entries))
@@ -1641,21 +1660,92 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
+		load, err := r.loadZSetMembersMap(context.Background(), cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
-		members := zsetEntriesToMap(value.Entries)
+		members := make(map[string]float64, len(load.members))
+		for k, v := range load.members {
+			members[k] = v
+		}
 		removed = removeZSetMembers(members, cmd.Args[2:])
 		if removed == 0 {
 			return nil
 		}
-		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, zsetMapToEntries(members))
+		return r.persistZSetMembersTxn(ctx, cmd.Args[1], readTS, load, members)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zremrangebyrankTxn(ctx context.Context, key []byte, start, stop int) (int, error) {
+	var removed int
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		if err != nil {
+			return err
+		}
+		if typ == redisTypeNone {
+			removed = 0
+			return nil
+		}
+		if typ != redisTypeZSet {
+			return wrongTypeError()
+		}
+		return r.zremrangebyrankInner(ctx, key, readTS, start, stop, &removed)
+	})
+	return removed, err
+}
+
+func (r *RedisServer) zremrangebyrankInner(ctx context.Context, key []byte, readTS uint64, start, stop int, removed *int) error {
+	// Wide-column path: scan score index with bounded limit.
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if metaExists {
+		s, e := normalizeRankRange(start, stop, int(meta.Len))
+		if e < s {
+			*removed = 0
+			return nil
+		}
+		// Scan only up to e+1 entries (enough to cover the rank range).
+		entries, err := r.scanZSetScoreEntries(ctx, key, e+1, readTS)
+		if err != nil {
+			return err
+		}
+		s, e = normalizeRankRange(start, stop, len(entries))
+		if e < s {
+			*removed = 0
+			return nil
+		}
+		toRemove := entries[s : e+1]
+		elems, err := buildZSetRemoveEntryElems(key, toRemove, meta.Len)
+		if err != nil {
+			return err
+		}
+		*removed = len(toRemove)
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+	// Legacy blob fallback.
+	load, err := r.loadZSetMembersMap(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	entries := zsetMapToEntries(load.members)
+	s, e := normalizeRankRange(start, stop, len(entries))
+	if e < s {
+		*removed = 0
+		return nil
+	}
+	for _, entry := range entries[s : e+1] {
+		delete(load.members, entry.Member)
+	}
+	*removed = e - s + 1
+	return r.persistZSetMembersTxn(ctx, key, readTS, load, load.members)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
@@ -1675,34 +1765,8 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	var removed int
-	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		if typ == redisTypeNone {
-			removed = 0
-			return nil
-		}
-		if typ != redisTypeZSet {
-			return wrongTypeError()
-		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		s, e := normalizeRankRange(start, stop, len(value.Entries))
-		if e < s {
-			removed = 0
-			return nil
-		}
-		remaining := append([]redisZSetEntry{}, value.Entries[:s]...)
-		remaining = append(remaining, value.Entries[e+1:]...)
-		removed = e - s + 1
-		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, remaining)
-	}); err != nil {
+	removed, err := r.zremrangebyrankTxn(ctx, cmd.Args[1], start, stop)
+	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -1726,40 +1790,62 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), key, readTS)
-		if err != nil {
-			return err
-		}
-		if len(value.Entries) == 0 {
-			result = nil
-			return nil
-		}
-		popped := value.Entries[0]
-		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-		if err := r.persistBZPopMinResult(ctx, key, readTS, remaining); err != nil {
-			return err
-		}
-		result = &bzpopminResult{key: key, entry: popped}
-		return nil
+		return r.tryBZPopMinInner(ctx, key, readTS, &result)
 	})
 	return result, err
 }
 
-func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, remaining []redisZSetEntry) error {
-	if len(remaining) == 0 {
-		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, elems)
-	}
-	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
+func (r *RedisServer) tryBZPopMinInner(ctx context.Context, key []byte, readTS uint64, result **bzpopminResult) error {
+	// Wide-column path: scan score index with limit=1.
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
-	})
+	if metaExists {
+		return r.bzPopMinWideColumn(ctx, key, readTS, meta.Len, result)
+	}
+	// Legacy blob fallback.
+	return r.bzPopMinLegacy(ctx, key, readTS, result)
+}
+
+func (r *RedisServer) bzPopMinWideColumn(ctx context.Context, key []byte, readTS uint64, metaLen int64, result **bzpopminResult) error {
+	entries, err := r.scanZSetScoreEntries(ctx, key, 1, readTS)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		*result = nil
+		return nil
+	}
+	popped := entries[0]
+	elems, err := buildZSetRemoveEntryElems(key, entries, metaLen)
+	if err != nil {
+		return err
+	}
+	if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		return err
+	}
+	*result = &bzpopminResult{key: key, entry: popped}
+	return nil
+}
+
+func (r *RedisServer) bzPopMinLegacy(ctx context.Context, key []byte, readTS uint64, result **bzpopminResult) error {
+	load, err := r.loadZSetMembersMap(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if !load.exists || len(load.members) == 0 {
+		*result = nil
+		return nil
+	}
+	entries := zsetMapToEntries(load.members)
+	popped := entries[0]
+	delete(load.members, popped.Member)
+	if err := r.persistZSetMembersTxn(ctx, key, readTS, load, load.members); err != nil {
+		return err
+	}
+	*result = &bzpopminResult{key: key, entry: popped}
+	return nil
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {

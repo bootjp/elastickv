@@ -167,18 +167,22 @@ func TestRedisZSetLegacyJSONReadThenRewriteToProto(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, added)
 
-	rawAfterWrite := mustReadRawValue(t, st, storageKey)
-	require.True(t, hasStoredRedisPrefix(rawAfterWrite, storedRedisZSetProtoPrefix))
+	// After a write via wide-column, data is stored in per-member keys with a
+	// ZSetMeta key, not in the legacy blob.
+	readTS := st.LastCommitTS()
+	metaRaw, metaErr := st.GetAt(context.Background(), store.ZSetMetaKey(key), readTS)
+	require.NoError(t, metaErr)
+	meta, metaErr := store.UnmarshalZSetMeta(metaRaw)
+	require.NoError(t, metaErr)
+	require.Equal(t, int64(3), meta.Len)
 
-	decoded, err := unmarshalZSetValue(rawAfterWrite)
+	entries, err := server.scanZSetAllMembers(context.Background(), key, meta.Len, readTS)
 	require.NoError(t, err)
-	require.Equal(t, redisZSetValue{
-		Entries: []redisZSetEntry{
-			{Member: "a", Score: 1},
-			{Member: "b", Score: 2},
-			{Member: "c", Score: 3},
-		},
-	}, decoded)
+	require.Equal(t, []redisZSetEntry{
+		{Member: "a", Score: 1},
+		{Member: "b", Score: 2},
+		{Member: "c", Score: 3},
+	}, entries)
 }
 
 func TestRedisStreamLegacyJSONReadThenRewriteToProto(t *testing.T) {

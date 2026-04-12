@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -25,7 +26,8 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeList, key: store.ListMetaKey(key)},
 		{typ: redisTypeHash, key: redisHashKey(key)},
 		{typ: redisTypeSet, key: redisSetKey(key)},
-		{typ: redisTypeZSet, key: redisZSetKey(key)},
+		{typ: redisTypeZSet, key: store.ZSetMetaKey(key)},
+		{typ: redisTypeZSet, key: redisZSetKey(key)}, // legacy blob fallback
 		{typ: redisTypeStream, key: redisStreamKey(key)},
 		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
 		{typ: redisTypeString, key: redisHLLKey(key)},
@@ -110,6 +112,218 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
+// loadZSetMetaAt loads the ZSetMeta from the wide-column meta key.
+// Returns (meta, true, nil) if found, (zero, false, nil) if not found.
+func (r *RedisServer) loadZSetMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ZSetMeta, bool, error) {
+	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return store.ZSetMeta{}, false, nil
+		}
+		return store.ZSetMeta{}, false, errors.WithStack(err)
+	}
+	meta, err := store.UnmarshalZSetMeta(raw)
+	if err != nil {
+		return store.ZSetMeta{}, false, errors.WithStack(err)
+	}
+	return meta, true, nil
+}
+
+// scanZSetScoreEntries scans the score index with a limit and returns entries
+// in score order. The score index keys are naturally sorted by score then
+// member, so no in-memory sort is needed.
+func (r *RedisServer) scanZSetScoreEntries(ctx context.Context, key []byte, limit int, readTS uint64) ([]redisZSetEntry, error) {
+	prefix := store.ZSetScoreScanPrefix(key)
+	end := store.PrefixEnd(prefix)
+	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	entries := make([]redisZSetEntry, 0, len(kvs))
+	ukLen := len(key)
+	for _, kvp := range kvs {
+		score, member := store.ExtractZSetScoreAndMember(kvp.Key, ukLen)
+		if member == nil {
+			continue
+		}
+		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
+	}
+	return entries, nil
+}
+
+// scanZSetAllMembers scans the score index for a ZSet and returns all entries
+// in score order. The limit is derived from meta.Len to bound memory usage.
+func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, memberCount int64, readTS uint64) ([]redisZSetEntry, error) {
+	return r.scanZSetScoreEntries(ctx, key, int(memberCount), readTS)
+}
+
+// zsetLoadResult holds the result of loading a ZSet's members.
+type zsetLoadResult struct {
+	members    map[string]float64
+	exists     bool
+	fromLegacy bool // true if data was loaded from the legacy blob format
+}
+
+// loadZSetMembersMap loads all members into a map for in-memory operations.
+// It first checks the wide-column format, then falls back to legacy blob.
+func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS uint64) (zsetLoadResult, error) {
+	// Check wide-column meta first.
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return zsetLoadResult{}, err
+	}
+	if metaExists {
+		entries, err := r.scanZSetAllMembers(ctx, key, meta.Len, readTS)
+		if err != nil {
+			return zsetLoadResult{}, err
+		}
+		return zsetLoadResult{members: zsetEntriesToMap(entries), exists: true}, nil
+	}
+	// Fall back to legacy blob format.
+	value, exists, err := r.loadZSetAt(ctx, key, readTS)
+	if err != nil {
+		return zsetLoadResult{}, err
+	}
+	if !exists {
+		return zsetLoadResult{members: map[string]float64{}}, nil
+	}
+	return zsetLoadResult{members: zsetEntriesToMap(value.Entries), exists: true, fromLegacy: true}, nil
+}
+
+// deleteZSetWideColumnElems deletes all wide-column ZSet keys. Prefix
+// deletions are dispatched as standalone operations (required by FSM), while
+// the meta key delete is returned for the caller to batch with other elems.
+// deleteZSetWideColumnElems generates delete operations for all wide-column
+// ZSet keys (meta + members + score index). Individual keys are scanned and
+// deleted to preserve atomicity with the caller's transaction — kv.DelPrefix
+// cannot be mixed with other mutations in a single Raft request.
+func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if !metaExists {
+		return nil, nil
+	}
+
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
+	}
+
+	// Scan the full prefix range to ensure all keys are deleted, including any
+	// orphaned keys from partial writes or meta.Len inconsistencies.
+	scanLimit := math.MaxInt
+
+	// Scan member keys and score-index keys for individual deletion.
+	for _, prefix := range [][]byte{
+		store.ZSetMemberScanPrefix(key),
+		store.ZSetScoreScanPrefix(key),
+	} {
+		kvs, err := r.store.ScanAt(ctx, prefix, store.PrefixEnd(prefix), scanLimit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		for _, kvp := range kvs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(kvp.Key)})
+		}
+	}
+
+	return elems, nil
+}
+
+// buildZSetRemoveEntryElems builds KV operations to remove specific entries
+// from a wide-column ZSet and update (or delete) the meta key.
+func buildZSetRemoveEntryElems(key []byte, entries []redisZSetEntry, currentLen int64) ([]*kv.Elem[kv.OP], error) {
+	newLen := currentLen - int64(len(entries))
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(entries)*2)
+	for _, e := range entries {
+		memberBytes := []byte(e.Member)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, memberBytes)},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, e.Score, memberBytes)},
+		)
+	}
+	if newLen <= 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMetaKey(key)})
+	} else {
+		metaBytes, err := store.MarshalZSetMeta(store.ZSetMeta{Len: newLen})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMetaKey(key), Value: metaBytes})
+	}
+	return elems, nil
+}
+
+// buildZSetWriteElems builds the KV operations for writing a full ZSet
+// from a members map. Generates meta + member + score-index keys.
+func buildZSetWriteElems(key []byte, members map[string]float64) ([]*kv.Elem[kv.OP], error) {
+	metaBytes, err := store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(members))})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(members)*2)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMetaKey(key), Value: metaBytes})
+	for member, score := range members {
+		memberBytes := []byte(member)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMemberKey(key, memberBytes), Value: store.MarshalZSetScore(score)},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, score, memberBytes), Value: nil},
+		)
+	}
+	return elems, nil
+}
+
+// buildZSetDiffElems builds KV operations for an incremental update from
+// origMembers to newMembers. Only the changed/added/removed members are
+// written, plus a meta update.
+func buildZSetDiffElems(key []byte, origMembers, newMembers map[string]float64) ([]*kv.Elem[kv.OP], error) {
+	elems := make([]*kv.Elem[kv.OP], 0, (len(origMembers)+len(newMembers))*2+1)
+
+	// Remove members that are gone or have changed score.
+	for member, oldScore := range origMembers {
+		newScore, exists := newMembers[member]
+		if !exists {
+			memberBytes := []byte(member)
+			elems = append(elems,
+				&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, memberBytes)},
+				&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, memberBytes)},
+			)
+		} else if oldScore != newScore {
+			// Score changed: delete old score index.
+			elems = append(elems,
+				&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))},
+			)
+		}
+	}
+
+	// Add or update members.
+	for member, newScore := range newMembers {
+		oldScore, existed := origMembers[member]
+		if existed && oldScore == newScore {
+			continue // unchanged
+		}
+		memberBytes := []byte(member)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMemberKey(key, memberBytes), Value: store.MarshalZSetScore(newScore)},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, memberBytes), Value: nil},
+		)
+	}
+
+	// Update meta with new length, or delete if empty.
+	if len(newMembers) == 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMetaKey(key)})
+	} else if len(origMembers) != len(newMembers) {
+		metaBytes, err := store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(newMembers))})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMetaKey(key), Value: metaBytes})
+	}
+
+	return elems, nil
+}
+
 func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, error) {
 	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
 	if err != nil {
@@ -174,22 +388,22 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 	elems := []*kv.Elem[kv.OP]{}
 
-	for _, internalKey := range [][]byte{
+	for _, k := range [][]byte{
 		redisStrKey(key),
 		key, // legacy bare string key
 		redisHashKey(key),
 		redisSetKey(key),
 		redisHLLKey(key),
-		redisZSetKey(key),
+		redisZSetKey(key), // legacy blob
 		redisStreamKey(key),
 		redisTTLKey(key),
 	} {
-		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
+		ok, err := r.store.ExistsAt(ctx, k, readTS)
 		if err != nil {
 			return nil, false, errors.WithStack(err)
 		}
 		if ok {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: internalKey})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: k})
 		}
 	}
 
@@ -203,6 +417,13 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
 	}
+
+	// Wide-column ZSet: delete meta + all member keys + all score-index keys.
+	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, zsetElems...)
 
 	return elems, existed, nil
 }

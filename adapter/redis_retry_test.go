@@ -197,12 +197,11 @@ func TestRedisExecLuaCompatRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), conn.int)
 	require.Equal(t, 2, coord.dispatches)
 
-	zset, exists, err := srv.loadZSetAt(ctx, []byte("retry:z"), snapshotTS(coord.clock, st))
+	load, err := srv.loadZSetMembersMap(ctx, []byte("retry:z"), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
-	require.True(t, exists)
-	require.Len(t, zset.Entries, 1)
-	require.Equal(t, "member-1", zset.Entries[0].Member)
-	require.Equal(t, 1.0, zset.Entries[0].Score)
+	require.True(t, load.exists)
+	require.Len(t, load.members, 1)
+	require.Equal(t, 1.0, load.members["member-1"])
 }
 
 func TestRedisEvalRetriesWriteConflict(t *testing.T) {
@@ -273,6 +272,25 @@ func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {
 	require.ErrorContains(t, normalized, "key: retry:list")
 	require.ErrorContains(t, normalized, "timestamp overflow")
 	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
+}
+
+func TestNormalizeRetryableRedisTxnErrZSetKey(t *testing.T) {
+	t.Parallel()
+
+	for _, internalKey := range [][]byte{
+		store.ZSetMetaKey([]byte("retry:zset")),
+		store.ZSetMemberKey([]byte("retry:zset"), []byte("member")),
+		store.ZSetScoreKey([]byte("retry:zset"), 1.0, []byte("member")),
+	} {
+		err := kv.NewTxnLockedError(internalKey)
+		normalized := normalizeRetryableRedisTxnErr(err)
+
+		require.ErrorIs(t, normalized, kv.ErrTxnLocked)
+		require.ErrorContains(t, normalized, "key: retry:zset")
+		require.NotContains(t, normalized.Error(), store.ZSetMetaPrefix)
+		require.NotContains(t, normalized.Error(), store.ZSetMemberPrefix)
+		require.NotContains(t, normalized.Error(), store.ZSetScorePrefix)
+	}
 }
 
 func TestRetryPolicyForRedisTxnErr(t *testing.T) {
