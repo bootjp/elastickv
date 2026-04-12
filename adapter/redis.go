@@ -1904,9 +1904,14 @@ func (t *txnContext) validateReadSet(ctx context.Context) error {
 }
 
 func (t *txnContext) commit() error {
+	commitTS, err := t.server.allocateCommitTS()
+	if err != nil {
+		return err
+	}
+
 	elems := t.buildKeyElems()
 
-	listElems, err := t.buildListElems()
+	listElems, err := t.buildListElems(commitTS)
 	if err != nil {
 		return err
 	}
@@ -1923,7 +1928,7 @@ func (t *txnContext) commit() error {
 		return nil
 	}
 
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS}
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS, CommitTS: commitTS}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
@@ -1973,7 +1978,7 @@ func appendListDeleteOps(elems []*kv.Elem[kv.OP], userKey []byte, meta store.Lis
 	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
 }
 
-func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
+func (t *txnContext) buildListElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	listKeys := make([]string, 0, len(t.listStates))
 	for k := range t.listStates {
 		listKeys = append(listKeys, k)
@@ -1981,6 +1986,8 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 	sort.Strings(listKeys)
 
 	var elems []*kv.Elem[kv.OP]
+	var err error
+	var seqInTxn uint32
 	for _, k := range listKeys {
 		st := t.listStates[k]
 		userKey := []byte(k)
@@ -1988,7 +1995,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		if st.deleted {
 			if meta, ok := listDeleteMeta(st); ok {
 				elems = appendListDeleteOps(elems, userKey, meta)
-				elems = t.appendDeltaClaimDelOps(elems, userKey)
+				elems, err = t.appendDeltaClaimDelOps(elems, userKey)
+				if err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}
@@ -1997,7 +2007,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		}
 		if st.purge {
 			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
-			elems = t.appendDeltaClaimDelOps(elems, userKey)
+			elems, err = t.appendDeltaClaimDelOps(elems, userKey)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		startSeq := st.meta.Head + st.meta.Len
@@ -2009,60 +2022,41 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 			})
 		}
 
-		st.meta.Len += int64(len(st.appends))
+		n := int64(len(st.appends))
+		st.meta.Len += n
 		st.meta.Tail = st.meta.Head + st.meta.Len
-		metaBytes, err := store.MarshalListMeta(st.meta)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(userKey), Value: metaBytes})
-		// Delete existing delta keys to prevent double-counting.
-		elems = t.appendDeltaDelOps(elems, userKey)
+
+		// Emit a Delta key instead of base metadata to avoid dual-path
+		// consistency issues with concurrent standalone RPUSH deltas.
+		delta := store.ListMetaDelta{HeadDelta: 0, LenDelta: n}
+		deltaKey := store.ListMetaDeltaKey(userKey, commitTS, seqInTxn)
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: deltaKey, Value: store.MarshalListMetaDelta(delta)})
+		seqInTxn++
 	}
 	return elems, nil
 }
 
-// listDeltaKeys scans for existing delta keys belonging to userKey.
-// appendDeltaDelOps appends Del ops for all existing delta keys.
-func (t *txnContext) appendDeltaDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
-	for _, dk := range t.listDeltaKeys(userKey) {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-	}
-	return elems
-}
-
 // appendDeltaClaimDelOps appends Del ops for all existing delta and claim keys.
-func (t *txnContext) appendDeltaClaimDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
-	for _, dk := range t.listDeltaAndClaimKeys(userKey) {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-	}
-	return elems
-}
+// Returns an error if any scan fails to prevent orphaned delta/claim keys.
+func (t *txnContext) appendDeltaClaimDelOps(elems []*kv.Elem[kv.OP], userKey []byte) ([]*kv.Elem[kv.OP], error) {
+	ctx := context.Background()
 
-// listDeltaAndClaimKeys scans for existing delta and claim keys for userKey.
-func (t *txnContext) listDeltaAndClaimKeys(userKey []byte) [][]byte {
-	keys := t.listDeltaKeys(userKey)
-	claimPrefix := store.ListClaimScanPrefix(userKey)
-	claims, err := t.server.store.ScanAt(context.Background(), claimPrefix, store.PrefixScanEnd(claimPrefix), maxDeltaScanLimit, t.startTS)
-	if err == nil {
-		for _, c := range claims {
-			keys = append(keys, bytes.Clone(c.Key))
-		}
-	}
-	return keys
-}
-
-func (t *txnContext) listDeltaKeys(userKey []byte) [][]byte {
-	prefix := store.ListMetaDeltaScanPrefix(userKey)
-	deltas, err := t.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), maxDeltaScanLimit, t.startTS)
+	deltaPrefix := store.ListMetaDeltaScanPrefix(userKey)
+	deltaEnd := store.PrefixScanEnd(deltaPrefix)
+	var err error
+	elems, err = scanAndAppendDelOps(ctx, t.server.store, elems, deltaPrefix, deltaEnd, t.startTS)
 	if err != nil {
-		return nil
+		return nil, errors.Wrap(err, "scan delta keys for cleanup")
 	}
-	keys := make([][]byte, 0, len(deltas))
-	for _, d := range deltas {
-		keys = append(keys, bytes.Clone(d.Key))
+
+	claimPrefix := store.ListClaimScanPrefix(userKey)
+	claimEnd := store.PrefixScanEnd(claimPrefix)
+	elems, err = scanAndAppendDelOps(ctx, t.server.store, elems, claimPrefix, claimEnd, t.startTS)
+	if err != nil {
+		return nil, errors.Wrap(err, "scan claim keys for cleanup")
 	}
-	return keys
+
+	return elems, nil
 }
 
 func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
