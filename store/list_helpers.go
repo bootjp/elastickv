@@ -9,14 +9,26 @@ import (
 )
 
 // Wide-column style list storage using per-element keys.
-// Item keys: !lst|itm|<userKey><seq(8-byte sortable binary)>
-// Meta key : !lst|meta|<userKey> -> [Head(8)][Tail(8)][Len(8)]
+// Item keys  : !lst|itm|<userKey><seq(8-byte sortable binary)>
+// Meta key   : !lst|meta|<userKey> -> [Head(8)][Tail(8)][Len(8)]
+// Delta key  : !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> -> [HeadDelta(8)][LenDelta(8)]
+// Claim key  : !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)> -> claimValue
 
 const (
-	ListMetaPrefix = "!lst|meta|"
-	ListItemPrefix = "!lst|itm|"
+	ListMetaPrefix      = "!lst|meta|"
+	ListItemPrefix      = "!lst|itm|"
+	ListMetaDeltaPrefix = "!lst|meta|d|"
+	ListClaimPrefix     = "!lst|claim|"
 
-	listMetaBinarySize = 24
+	listMetaBinarySize      = 24
+	listMetaDeltaBinarySize = 16
+
+	// userKeyLen(4) + commitTS(8) + seqInTxn(4)
+	listDeltaSuffixSize = 4 + 8 + 4
+	// userKeyLen(4) + seq(8)
+	listClaimSuffixSize = 4 + 8
+
+	maxByte = 0xff
 )
 
 type ListMeta struct {
@@ -105,8 +117,10 @@ func encodeSortableInt64(dst []byte, seq int64) {
 	binary.BigEndian.PutUint64(dst, uint64(seq^math.MinInt64)) //nolint:gosec // XOR trick for sortable int64 encoding
 }
 
-// IsListMetaKey Exported helpers for other packages (e.g., Redis adapter).
-func IsListMetaKey(key []byte) bool { return bytes.HasPrefix(key, []byte(ListMetaPrefix)) }
+// IsListMetaKey reports whether key is a list base metadata key (not a delta key).
+func IsListMetaKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(ListMetaPrefix)) && !bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix))
+}
 
 func IsListItemKey(key []byte) bool { return bytes.HasPrefix(key, []byte(ListItemPrefix)) }
 
@@ -125,4 +139,148 @@ func ExtractListUserKey(key []byte) []byte {
 	default:
 		return nil
 	}
+}
+
+// ── Delta Key Helpers ──────────────────────────────────────────────
+
+// ListMetaDelta represents an incremental change to list metadata.
+type ListMetaDelta struct {
+	HeadDelta int64 // LPUSH: negative, LPOP: +1
+	LenDelta  int64 // PUSH: positive, POP: -1
+}
+
+// ListMetaDeltaKey builds a globally-unique Delta key for a list.
+func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	buf := make([]byte, 0, len(ListMetaDeltaPrefix)+listDeltaSuffixSize+len(userKey))
+	buf = append(buf, ListMetaDeltaPrefix...)
+	buf = appendUserKeyLenPrefixed(buf, userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	buf = append(buf, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	buf = append(buf, seq[:]...)
+	return buf
+}
+
+// ListMetaDeltaScanPrefix returns the key prefix for scanning all Delta
+// keys belonging to the given user key.
+func ListMetaDeltaScanPrefix(userKey []byte) []byte {
+	buf := make([]byte, 0, len(ListMetaDeltaPrefix)+4+len(userKey))
+	buf = append(buf, ListMetaDeltaPrefix...)
+	buf = appendUserKeyLenPrefixed(buf, userKey)
+	return buf
+}
+
+// MarshalListMetaDelta encodes a ListMetaDelta into a fixed 16-byte binary.
+func MarshalListMetaDelta(d ListMetaDelta) []byte {
+	buf := make([]byte, listMetaDeltaBinarySize)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(d.HeadDelta)) //nolint:gosec // HeadDelta can be negative
+	binary.BigEndian.PutUint64(buf[8:16], uint64(d.LenDelta)) //nolint:gosec // LenDelta can be negative
+	return buf
+}
+
+// UnmarshalListMetaDelta decodes a ListMetaDelta from the fixed 16-byte binary.
+func UnmarshalListMetaDelta(b []byte) (ListMetaDelta, error) {
+	if len(b) != listMetaDeltaBinarySize {
+		return ListMetaDelta{}, errors.WithStack(errors.Newf("invalid list meta delta length: %d, want %d", len(b), listMetaDeltaBinarySize))
+	}
+	return ListMetaDelta{
+		HeadDelta: int64(binary.BigEndian.Uint64(b[0:8])),  //nolint:gosec // HeadDelta can be negative
+		LenDelta:  int64(binary.BigEndian.Uint64(b[8:16])), //nolint:gosec // LenDelta can be negative
+	}, nil
+}
+
+// IsListMetaDeltaKey reports whether key is a list metadata Delta key.
+func IsListMetaDeltaKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromDelta extracts the user key from a Delta key.
+func ExtractListUserKeyFromDelta(key []byte) []byte {
+	trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
+	if len(trimmed) < listDeltaSuffixSize {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:4])
+	//nolint:gosec // ukLen is bounded by key length check below
+	if uint32(len(trimmed)) < 4+ukLen+8+4 {
+		return nil
+	}
+	return trimmed[4 : 4+ukLen]
+}
+
+// ── Claim Key Helpers ──────────────────────────────────────────────
+
+// ListClaimKey builds a Claim key for a list item sequence.
+func ListClaimKey(userKey []byte, seq int64) []byte {
+	var raw [8]byte
+	encodeSortableInt64(raw[:], seq)
+	buf := make([]byte, 0, len(ListClaimPrefix)+listClaimSuffixSize+len(userKey))
+	buf = append(buf, ListClaimPrefix...)
+	buf = appendUserKeyLenPrefixed(buf, userKey)
+	buf = append(buf, raw[:]...)
+	return buf
+}
+
+// ListClaimScanPrefix returns the key prefix for scanning all Claim
+// keys belonging to the given user key.
+func ListClaimScanPrefix(userKey []byte) []byte {
+	buf := make([]byte, 0, len(ListClaimPrefix)+4+len(userKey))
+	buf = append(buf, ListClaimPrefix...)
+	buf = appendUserKeyLenPrefixed(buf, userKey)
+	return buf
+}
+
+// IsListClaimKey reports whether key is a list Claim key.
+func IsListClaimKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(ListClaimPrefix))
+}
+
+// ExtractListUserKeyFromClaim extracts the user key from a Claim key.
+func ExtractListUserKeyFromClaim(key []byte) []byte {
+	trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
+	if len(trimmed) < listClaimSuffixSize {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:4])
+	//nolint:gosec // ukLen is bounded by key length check below
+	if uint32(len(trimmed)) < 4+ukLen+8 {
+		return nil
+	}
+	return trimmed[4 : 4+ukLen]
+}
+
+// IsListInternalKey reports whether a key belongs to any list namespace.
+func IsListInternalKey(key []byte) bool {
+	return IsListMetaKey(key) || IsListItemKey(key) || IsListMetaDeltaKey(key) || IsListClaimKey(key)
+}
+
+// ── Common helpers ─────────────────────────────────────────────────
+
+// appendUserKeyLenPrefixed appends a 4-byte big-endian length prefix
+// followed by the user key bytes.
+func appendUserKeyLenPrefixed(buf, userKey []byte) []byte {
+	var kl [4]byte
+	//nolint:gosec // userKey length is bounded by practical limits
+	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey)))
+	buf = append(buf, kl[:]...)
+	buf = append(buf, userKey...)
+	return buf
+}
+
+// PrefixScanEnd returns an exclusive upper bound for scanning all keys
+// with the given prefix. It increments the last byte of the prefix.
+func PrefixScanEnd(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+	end := bytes.Clone(prefix)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] < maxByte {
+			end[i]++
+			return end[:i+1]
+		}
+	}
+	return nil
 }
