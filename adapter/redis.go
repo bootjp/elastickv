@@ -114,7 +114,7 @@ const (
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
-	redisFlushLegacyTimeout  = 60 * time.Second
+	redisFlushLegacyTimeout  = 10 * time.Minute
 	redisRelayPublishTimeout = 2 * time.Second
 	redisTraceArgLimit       = 6
 	redisTraceArgMaxLen      = 96
