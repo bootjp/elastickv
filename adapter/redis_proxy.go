@@ -81,3 +81,26 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 	}
 	return errors.WithStack(err)
 }
+
+func (r *RedisServer) proxyFlushLegacy() (int, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	defer cancel()
+
+	res := cli.Do(ctx, "FLUSHLEGACY")
+	if res.Err() != nil {
+		return 0, errors.WithStack(res.Err())
+	}
+	n, err := res.Int()
+	return n, errors.WithStack(err)
+}

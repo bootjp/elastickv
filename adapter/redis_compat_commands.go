@@ -511,7 +511,12 @@ func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, delet
 // do not match any known internal prefix. This is a one-time migration operation.
 func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 	if !r.coordinator.IsLeader() {
-		conn.WriteError("ERR FLUSHLEGACY must be run on the leader")
+		n, err := r.proxyFlushLegacy()
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt(n)
 		return
 	}
 
