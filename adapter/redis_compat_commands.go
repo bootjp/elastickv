@@ -1568,12 +1568,12 @@ func (r *RedisServer) persistZSetMembersTxn(ctx context.Context, key []byte, rea
 // loadZSetEntriesSorted loads all ZSet entries in score order,
 // checking wide-column first, then falling back to legacy blob.
 func (r *RedisServer) loadZSetEntriesSorted(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
-	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
 	if metaExists {
-		return r.scanZSetAllMembers(ctx, key, readTS)
+		return r.scanZSetAllMembers(ctx, key, meta.Len, readTS)
 	}
 	// Legacy blob fallback.
 	value, _, err := r.loadZSetAt(ctx, key, readTS)

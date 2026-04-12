@@ -176,7 +176,7 @@ func TestRedisZSetLegacyJSONReadThenRewriteToProto(t *testing.T) {
 	require.NoError(t, metaErr)
 	require.Equal(t, int64(3), meta.Len)
 
-	entries, err := server.scanZSetAllMembers(context.Background(), key, readTS)
+	entries, err := server.scanZSetAllMembers(context.Background(), key, meta.Len, readTS)
 	require.NoError(t, err)
 	require.Equal(t, []redisZSetEntry{
 		{Member: "a", Score: 1},

@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"math"
 	"sort"
 	"time"
 
@@ -152,11 +151,9 @@ func (r *RedisServer) scanZSetScoreEntries(ctx context.Context, key []byte, limi
 }
 
 // scanZSetAllMembers scans the score index for a ZSet and returns all entries
-// in score order. An unbounded limit is used because Redis commands like
-// ZRANGE, ZCARD, and ZREM require access to all members; the set size is
-// bounded at write time by available memory, consistent with Redis behavior.
-func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, error) {
-	return r.scanZSetScoreEntries(ctx, key, math.MaxInt, readTS)
+// in score order. The limit is derived from meta.Len to bound memory usage.
+func (r *RedisServer) scanZSetAllMembers(ctx context.Context, key []byte, memberCount int64, readTS uint64) ([]redisZSetEntry, error) {
+	return r.scanZSetScoreEntries(ctx, key, int(memberCount), readTS)
 }
 
 // zsetLoadResult holds the result of loading a ZSet's members.
@@ -170,12 +167,12 @@ type zsetLoadResult struct {
 // It first checks the wide-column format, then falls back to legacy blob.
 func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS uint64) (zsetLoadResult, error) {
 	// Check wide-column meta first.
-	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return zsetLoadResult{}, err
 	}
 	if metaExists {
-		entries, err := r.scanZSetAllMembers(ctx, key, readTS)
+		entries, err := r.scanZSetAllMembers(ctx, key, meta.Len, readTS)
 		if err != nil {
 			return zsetLoadResult{}, err
 		}
@@ -200,7 +197,7 @@ func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS
 // deleted to preserve atomicity with the caller's transaction — kv.DelPrefix
 // cannot be mixed with other mutations in a single Raft request.
 func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -212,12 +209,16 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
 	}
 
+	// Use meta.Len to bound the scan. Each member has one member key and one
+	// score-index key, so we expect exactly meta.Len entries per prefix.
+	scanLimit := int(meta.Len)
+
 	// Scan member keys and score-index keys for individual deletion.
 	for _, prefix := range [][]byte{
 		store.ZSetMemberScanPrefix(key),
 		store.ZSetScoreScanPrefix(key),
 	} {
-		kvs, err := r.store.ScanAt(ctx, prefix, store.PrefixEnd(prefix), math.MaxInt, readTS)
+		kvs, err := r.store.ScanAt(ctx, prefix, store.PrefixEnd(prefix), scanLimit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -311,7 +312,7 @@ func buildZSetDiffElems(key []byte, origMembers, newMembers map[string]float64) 
 	// Update meta with new length, or delete if empty.
 	if len(newMembers) == 0 {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMetaKey(key)})
-	} else if len(elems) > 0 {
+	} else if len(origMembers) != len(newMembers) {
 		metaBytes, err := store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(newMembers))})
 		if err != nil {
 			return nil, errors.WithStack(err)
