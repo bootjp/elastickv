@@ -861,9 +861,9 @@ func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMut
 	return nil
 }
 
-func (s *pebbleStore) checkReadConflicts(_ context.Context, readKeys [][]byte, startTS uint64) error {
+func (s *pebbleStore) checkReadConflicts(ctx context.Context, readKeys [][]byte, startTS uint64) error {
 	for _, key := range readKeys {
-		ts, exists, err := s.latestCommitTS(context.Background(), key)
+		ts, exists, err := s.latestCommitTS(ctx, key)
 		if err != nil {
 			return err
 		}

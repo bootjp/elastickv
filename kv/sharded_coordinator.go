@@ -267,6 +267,8 @@ func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
+	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
+
 	for _, gid := range gids {
 		g, err := c.txnGroupForID(gid)
 		if err != nil {
@@ -277,7 +279,7 @@ func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []
 			Phase:     pb.Phase_PREPARE,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
-			ReadKeys:  readKeys,
+			ReadKeys:  groupedReadKeys[gid],
 		}
 		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
 			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
@@ -585,6 +587,21 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 		return 0
 	}
 	return route.GroupID
+}
+
+func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
+	if len(readKeys) == 0 {
+		return nil
+	}
+	grouped := make(map[uint64][][]byte)
+	for _, key := range readKeys {
+		gid := c.engineGroupIDForKey(key)
+		if gid == 0 {
+			continue
+		}
+		grouped[gid] = append(grouped[gid], key)
+	}
+	return grouped
 }
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
