@@ -60,7 +60,7 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 	if err != nil {
 		var closeErr error
 		if transport != nil {
-			closeErr = transport.Close()
+			closeErr = errors.WithStack(transport.Close())
 		}
 		return nil, errors.WithStack(errors.CombineErrors(err, closeErr))
 	}
