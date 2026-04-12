@@ -81,6 +81,8 @@ Delta Key (New):
 
 Because the Delta key embeds `commitTS`, the write path must know the final timestamp before emitting the key bytes. This design therefore assumes `CommitTS` is explicitly allocated once during dispatch and reused during Raft apply; it does not rely on the FSM rewriting Delta keys at apply time.
 
+**HLC Leader Initialization Invariant**: When a new leader is elected, it must initialize its HLC to a value strictly greater than the maximum `commitTS` observed in its Raft log (the applied index's timestamp). This is already guaranteed by the existing `HLC.Update(observedTS)` call on each FSM `Apply`, which advances the local clock past any previously committed timestamp. Without this invariant, a new leader with a lagging wall clock could issue duplicate `commitTS` values, causing Delta key collisions in the LSM tree.
+
 ```go
 const ListMetaDeltaPrefix = "!lst|meta|d|"
 
@@ -276,7 +278,7 @@ For LPOP:
   1. resolveListMeta(key, readTS) → Effective meta (Determine Head, Len)
   2. candidateSeq = meta.Head
   3. Bulk-scan existing Claim keys in range [candidateSeq, candidateSeq+scanWindow):
-     - scanWindow is a configurable constant (default: 32) that determines how many
+     - scanWindow is a configurable constant (default: 128) that determines how many
        candidate sequences are checked in one batch.
      - prefix scan !lst|claim|<keyLen><key>[candidateSeq … candidateSeq+scanWindow)
      - collect the set of already-claimed sequences into a local skip-set
@@ -411,6 +413,8 @@ type listTxnState struct {
 - In `buildListElems()`, replace metadata `Put` with Delta `Put`.
 - In `validateReadSet()`, exclude `!lst|meta|<key>` from the `readSet`, and instead only validate item key conflicts.
 - Increment `seqInTxn` if pushing to the same list multiple times within one transaction.
+
+**Consistency note for metadata reads in MULTI/EXEC**: Commands that read collection cardinality within a transaction (e.g., `LLEN`, `HLEN`) observe the snapshot at `startTS` plus locally accumulated deltas within the transaction. Because the base metadata key is excluded from the `readSet`, concurrent writers may commit deltas between the transaction's `startTS` and its commit. This provides snapshot isolation (not strict serializability) for cardinality reads, which matches Redis's existing `MULTI/EXEC` semantics where commands see the state at execution time, not a globally serialized point. If strict serializability is required for a specific use case, the caller can opt in by explicitly registering the base metadata key in the `readSet`, accepting the higher conflict rate.
 
 ### 8. New Key Helper Functions
 
@@ -611,9 +615,12 @@ No Claim mechanism is needed because `HDEL` targets named fields, not positional
 2. On write to legacy data: atomically migrate in a single transaction:
    - Scan legacy blob, create field keys for each field-value pair
    - Write !hs|meta|<key> with Len
+   - Apply the triggering mutation (HSET/HDEL) to the new wide-column keys
    - Delete legacy !redis|hash|<key>
 3. Subsequent reads/writes use wide-column path exclusively.
 ```
+
+**Concurrent write behavior during migration**: Because the migration and the triggering write are committed as a single atomic transaction, concurrent writers targeting the same key will encounter an OCC write conflict on the legacy blob key (`!redis|hash|<key>`) and retry. On retry, the winner's migration will already be visible, so the retrier takes the wide-column path directly. Concurrent writes to **different** Hash keys are unaffected since they touch separate legacy blobs. Reads during migration use the fallback logic (step 1) and always see a consistent view: either the pre-migration blob or the post-migration wide-column data, never a partial state.
 
 ---
 
@@ -745,9 +752,12 @@ No Claim mechanism is needed.
 2. On write to legacy data: atomically migrate in a single transaction:
    - Deserialize legacy blob, create member keys for each member
    - Write !st|meta|<key> with Len
+   - Apply the triggering mutation (SADD/SREM) to the new member keys
    - Delete legacy !redis|set|<key>
 3. Subsequent reads/writes use wide-column path exclusively.
 ```
+
+Concurrent write behavior follows the same pattern as Hash migration (Section 14): the migration transaction holds an OCC conflict on the legacy blob key, so concurrent writers retry and take the wide-column path.
 
 ---
 
@@ -1169,6 +1179,11 @@ Immediate cleanup will not occur even if `Len == 0` after aggregating Deltas. Wh
 - All applied Deltas, data keys (items, fields, members, score keys), and Claim keys (for List) are deleted.
 - During the brief window between compactions where an empty collection persists, `resolve*Meta()` will return `Len == 0`, ensuring cardinality queries correctly report an empty collection.
 - Full metadata deletion (including the base metadata key) is only performed by the `DEL` command, which follows the standard transactional flow with proper `readSet` registration.
+
+**Lazy reaping of stale tombstones**: To prevent indefinite accumulation of `Len = 0` base metadata keys for transient collections (e.g., short-lived queues created by `RPUSH` and fully drained by `LPOP`), Background Compaction includes a lazy reaping pass. During each compaction cycle, if a base metadata key has `Len = 0`, no associated Deltas, no associated data keys, and the key's last-modified timestamp is older than the MVCC retention window (`ActiveTimestampTracker.Oldest()`), the compactor may safely delete the base metadata key. This is safe because:
+- No in-flight readers can reference the key (it is older than the retention window).
+- No concurrent writers can be active (no Deltas exist, and any new write would create fresh metadata).
+- The `DEL` command path remains the primary mechanism for immediate cleanup; lazy reaping is a secondary safety net.
 
 #### D4. Hash/Set Wide-Column Decomposition as Prerequisite
 
