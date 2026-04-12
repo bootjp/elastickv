@@ -878,6 +878,7 @@ Ship migration safely with an explicit rollback plan.
 5. Decide whether migration is:
    - opt-in for new clusters only
    - or a supported migration path for existing clusters
+6. Reject unsafe in-place engine switches on existing data directories, and require explicit offline migration tooling when moving persisted state across engines.
 
 ### Exit criteria
 

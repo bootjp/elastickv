@@ -129,3 +129,101 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	_, err = shardGroups[2].Store.GetAt(context.Background(), []byte("b"), readTS)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
+
+func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
+	baseDir := t.TempDir()
+	groups := []groupSpec{
+		{id: 1, address: "127.0.0.1:16001"},
+		{id: 2, address: "127.0.0.1:16002"},
+	}
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	openShardStore := func() ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, raftEngineEtcd, nil)
+		require.NoError(t, err)
+		shardStore := kv.NewShardStore(engine, shardGroups)
+		return runtimes, shardGroups, shardStore
+	}
+
+	runtimes, shardGroups, shardStore := openShardStore()
+	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, kv.NewHLC(), shardStore)
+
+	_, err := coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: []byte("b"), Value: []byte("left")},
+			{Op: kv.Put, Key: []byte("x"), Value: []byte("right")},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, shardStore.Close())
+	for _, rt := range runtimes {
+		rt.Close()
+	}
+
+	runtimes, shardGroups, shardStore = openShardStore()
+	t.Cleanup(func() {
+		require.NoError(t, shardStore.Close())
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+	})
+	coord = kv.NewShardedCoordinator(engine, shardGroups, 1, kv.NewHLC(), shardStore)
+
+	readTS := shardStore.LastCommitTS()
+
+	value, err := shardStore.GetAt(context.Background(), []byte("b"), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("left"), value)
+
+	value, err = shardStore.GetAt(context.Background(), []byte("x"), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("right"), value)
+
+	_, err = coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: []byte("c"), Value: []byte("again-left")},
+			{Op: kv.Put, Key: []byte("z"), Value: []byte("again-right")},
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestEnsureRaftEngineDataDir(t *testing.T) {
+	t.Run("writes marker for empty dir", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, ensureRaftEngineDataDir(dir, raftEngineEtcd))
+		data, err := os.ReadFile(filepath.Join(dir, raftEngineMarkerFile))
+		require.NoError(t, err)
+		require.Equal(t, "etcd\n", string(data))
+	})
+
+	t.Run("rejects mismatched existing artifacts", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("not-a-real-db"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrRaftEngineDataDir)
+	})
+
+	t.Run("detects mixed engine artifacts", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("not-a-real-db"), 0o600))
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "member", "wal"), 0o755))
+		_, _, err := detectRaftEngineFromDataDir(dir)
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMixedRaftEngineArtifacts)
+	})
+
+	t.Run("detects etcd peers metadata artifact", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "etcd-raft-peers.bin"), []byte("placeholder"), 0o600))
+
+		engineType, ok, err := detectRaftEngineFromDataDir(dir)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, raftEngineEtcd, engineType)
+	})
+}

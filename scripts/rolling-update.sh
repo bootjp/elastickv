@@ -30,6 +30,7 @@ Optional environment:
   CONTAINER_NAME
   DATA_DIR
   SERVER_ENTRYPOINT
+  RAFT_ENGINE
   RAFT_PORT
   REDIS_PORT
   DYNAMO_PORT
@@ -82,6 +83,7 @@ SSH_USER="${SSH_USER:-${USER:-$(id -un)}}"
 CONTAINER_NAME="${CONTAINER_NAME:-elastickv}"
 DATA_DIR="${DATA_DIR:-/var/lib/elastickv}"
 SERVER_ENTRYPOINT="${SERVER_ENTRYPOINT:-/app}"
+RAFT_ENGINE="${RAFT_ENGINE:-etcd}"
 RAFT_PORT="${RAFT_PORT:-50051}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 DYNAMO_PORT="${DYNAMO_PORT:-8000}"
@@ -397,6 +399,7 @@ update_one_node() {
       CONTAINER_NAME="$CONTAINER_NAME" \
       DATA_DIR="$DATA_DIR" \
       SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
+      RAFT_ENGINE="$RAFT_ENGINE" \
       RAFT_PORT="$RAFT_PORT" \
       REDIS_PORT="$REDIS_PORT" \
       DYNAMO_PORT="$DYNAMO_PORT" \
@@ -673,6 +676,7 @@ run_container() {
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
     --raftId "$NODE_ID" \
+    --raftEngine "$RAFT_ENGINE" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" >/dev/null

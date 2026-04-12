@@ -16,6 +16,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/hashicorp/raft"
@@ -48,11 +49,11 @@ type bootstrapE2ENode struct {
 	eg         *errgroup.Group
 }
 
-func (n *bootstrapE2ENode) raft() *raft.Raft {
+func (n *bootstrapE2ENode) engine() raftengine.Engine {
 	if n == nil || len(n.runtimes) == 0 {
 		return nil
 	}
-	return n.runtimes[0].raft
+	return n.runtimes[0].engine
 }
 
 func (n *bootstrapE2ENode) close() error {
@@ -82,45 +83,89 @@ func (n *bootstrapE2ENode) close() error {
 }
 
 func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
+	for _, engineType := range []raftEngineType{raftEngineHashicorp, raftEngineEtcd} {
+		t.Run(string(engineType), func(t *testing.T) {
+			const (
+				startupAttempts = 5
+				nodeCount       = 4
+				waitTimeout     = 20 * time.Second
+				waitInterval    = 100 * time.Millisecond
+				rpcTimeout      = 2 * time.Second
+			)
+
+			baseDir := t.TempDir()
+			_, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts, engineType)
+			t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
+
+			expected := bootstrapExpectedConfiguration(endpoints)
+			waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
+			leaderIdx := waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
+
+			clients, conns := rawKVClients(t, endpoints)
+			t.Cleanup(func() { closeGRPCConns(conns) })
+
+			writerIdx := (leaderIdx + 1) % len(clients)
+			key := []byte("bootstrap-members-e2e-key")
+			value := []byte("bootstrap-members-e2e-value")
+
+			require.NoError(t, rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout))
+
+			for i := range clients {
+				client := clients[i]
+				require.Eventually(t, func() bool {
+					resp, getErr := rawGetWithTimeout(client, key, rpcTimeout)
+					if getErr != nil {
+						return false
+					}
+					return resp.Exists && bytes.Equal(resp.Value, value)
+				}, waitTimeout, waitInterval)
+			}
+		})
+	}
+}
+
+func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 	const (
 		startupAttempts = 5
-		nodeCount       = 4
+		nodeCount       = 3
 		waitTimeout     = 20 * time.Second
 		waitInterval    = 100 * time.Millisecond
 		rpcTimeout      = 2 * time.Second
 	)
 
 	baseDir := t.TempDir()
-	endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts)
+	clusterDir, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts, raftEngineEtcd)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 
-	expected := bootstrapExpectedServers(endpoints)
+	expected := bootstrapExpectedConfiguration(endpoints)
 	waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
 	leaderIdx := waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
 
 	clients, conns := rawKVClients(t, endpoints)
-	t.Cleanup(func() {
-		for _, conn := range conns {
-			_ = conn.Close()
-		}
-	})
+	defer closeGRPCConns(conns)
 
-	writerIdx := (leaderIdx + 1) % len(clients)
-	key := []byte("bootstrap-members-e2e-key")
-	value := []byte("bootstrap-members-e2e-value")
+	keyA := []byte("bootstrap-etcd-restart-key-a")
+	valueA := []byte("bootstrap-etcd-restart-value-a")
+	require.NoError(t, rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA, rpcTimeout))
+	waitForValueOnAllClients(t, clients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
 
-	require.NoError(t, rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout))
+	require.NoError(t, nodes[leaderIdx].close())
+	restartListeners := bindBootstrapE2EEndpointListeners(t, endpoints[leaderIdx])
+	restartedNode, err := startBootstrapE2ENode(clusterDir, endpoints[leaderIdx], restartListeners, false, "", raftEngineEtcd)
+	require.NoError(t, err)
+	nodes[leaderIdx] = restartedNode
 
-	for i := range clients {
-		client := clients[i]
-		require.Eventually(t, func() bool {
-			resp, getErr := rawGetWithTimeout(client, key, rpcTimeout)
-			if getErr != nil {
-				return false
-			}
-			return resp.Exists && bytes.Equal(resp.Value, value)
-		}, waitTimeout, waitInterval)
-	}
+	waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
+	leaderIdx = waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
+
+	restartedClients, restartedConns := rawKVClients(t, endpoints)
+	defer closeGRPCConns(restartedConns)
+	waitForValueOnAllClients(t, restartedClients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
+
+	keyB := []byte("bootstrap-etcd-restart-key-b")
+	valueB := []byte("bootstrap-etcd-restart-value-b")
+	require.NoError(t, rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB, rpcTimeout))
+	waitForValueOnAllClients(t, restartedClients, keyB, valueB, waitTimeout, waitInterval, rpcTimeout)
 }
 
 func startBootstrapE2ECluster(
@@ -128,7 +173,8 @@ func startBootstrapE2ECluster(
 	baseDir string,
 	nodeCount int,
 	startupAttempts int,
-) ([]bootstrapE2EEndpoint, []*bootstrapE2ENode) {
+	engineType raftEngineType,
+) (string, []bootstrapE2EEndpoint, []*bootstrapE2ENode) {
 	t.Helper()
 
 	var (
@@ -139,9 +185,9 @@ func startBootstrapE2ECluster(
 	for attempt := range startupAttempts {
 		endpoints, listeners := allocateBootstrapE2EEndpoints(t, nodeCount)
 		attemptDir := filepath.Join(baseDir, fmt.Sprintf("attempt-%d", attempt))
-		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints, listeners)
+		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints, listeners, engineType)
 		if err == nil {
-			return endpoints, started
+			return attemptDir, endpoints, started
 		}
 		closeBootstrapE2ENodesIgnoreError(started)
 		closeBootstrapE2EListeners(listeners)
@@ -153,7 +199,7 @@ func startBootstrapE2ECluster(
 	}
 
 	require.NoError(t, lastErr)
-	return nil, nodes
+	return "", nil, nodes
 }
 
 func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EEndpoint, []bootstrapE2EListeners) {
@@ -185,11 +231,28 @@ func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EE
 	return endpoints, listeners
 }
 
-func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint, listeners []bootstrapE2EListeners) ([]*bootstrapE2ENode, error) {
+func bindBootstrapE2EEndpointListeners(t *testing.T, ep bootstrapE2EEndpoint) bootstrapE2EListeners {
+	t.Helper()
+
+	var lc net.ListenConfig
+	grpcL, err := lc.Listen(context.Background(), "tcp", ep.raftAddr)
+	require.NoError(t, err)
+	redisL, err := lc.Listen(context.Background(), "tcp", ep.redisAddr)
+	require.NoError(t, err)
+	dynamoL, err := lc.Listen(context.Background(), "tcp", ep.dynamoAddr)
+	require.NoError(t, err)
+	return bootstrapE2EListeners{
+		grpc:   grpcL,
+		redis:  redisL,
+		dynamo: dynamoL,
+	}
+}
+
+func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint, listeners []bootstrapE2EListeners, engineType raftEngineType) ([]*bootstrapE2ENode, error) {
 	bootstrapMembers := bootstrapMembersArg(endpoints)
 	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
 	for i := range endpoints {
-		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], true, bootstrapMembers)
+		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], true, bootstrapMembers, engineType)
 		if err != nil {
 			return nodes, err
 		}
@@ -247,16 +310,16 @@ func bootstrapMembersArg(endpoints []bootstrapE2EEndpoint) string {
 	return strings.Join(parts, ",")
 }
 
-func bootstrapExpectedServers(endpoints []bootstrapE2EEndpoint) []raft.Server {
-	servers := make([]raft.Server, 0, len(endpoints))
+func bootstrapExpectedConfiguration(endpoints []bootstrapE2EEndpoint) raftengine.Configuration {
+	servers := make([]raftengine.Server, 0, len(endpoints))
 	for _, ep := range endpoints {
-		servers = append(servers, raft.Server{
-			Suffrage: raft.Voter,
-			ID:       raft.ServerID(ep.id),
-			Address:  raft.ServerAddress(ep.raftAddr),
+		servers = append(servers, raftengine.Server{
+			Suffrage: "voter",
+			ID:       ep.id,
+			Address:  ep.raftAddr,
 		})
 	}
-	return servers
+	return raftengine.Configuration{Servers: servers}
 }
 
 func startBootstrapE2ENode(
@@ -265,6 +328,7 @@ func startBootstrapE2ENode(
 	listeners bootstrapE2EListeners,
 	bootstrap bool,
 	bootstrapMembers string,
+	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
 	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "")
 	if err != nil {
@@ -277,7 +341,7 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, raftEngineHashicorp, nil)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, engineType, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -497,25 +561,24 @@ func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {
 	}
 }
 
-func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expected []raft.Server, waitTimeout, waitInterval time.Duration) {
+func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expected raftengine.Configuration, waitTimeout, waitInterval time.Duration) {
 	t.Helper()
 
 	require.Eventually(t, func() bool {
 		for _, n := range nodes {
-			r := n.raft()
-			if r == nil {
+			engine := n.engine()
+			if engine == nil {
 				return false
 			}
-			future := r.GetConfiguration()
-			if err := future.Error(); err != nil {
+			current, err := engine.Configuration(context.Background())
+			if err != nil {
 				return false
 			}
-			current := future.Configuration().Servers
-			if len(current) != len(expected) {
+			if len(current.Servers) != len(expected.Servers) {
 				return false
 			}
-			for _, server := range expected {
-				if !containsRaftServer(current, server) {
+			for _, server := range expected.Servers {
+				if !containsConfigServer(current.Servers, server) {
 					return false
 				}
 			}
@@ -532,11 +595,11 @@ func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode, waitTimeout, w
 		idx := -1
 		leaders := 0
 		for i, n := range nodes {
-			r := n.raft()
-			if r == nil {
+			engine := n.engine()
+			if engine == nil {
 				return false
 			}
-			if r.State() == raft.Leader {
+			if engine.State() == raftengine.StateLeader {
 				idx = i
 				leaders++
 			}
@@ -548,6 +611,26 @@ func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode, waitTimeout, w
 		return true
 	}, waitTimeout, waitInterval)
 	return leaderIdx
+}
+
+func closeGRPCConns(conns []*grpc.ClientConn) {
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func waitForValueOnAllClients(t *testing.T, clients []pb.RawKVClient, key []byte, value []byte, waitTimeout, waitInterval, rpcTimeout time.Duration) {
+	t.Helper()
+	for i := range clients {
+		client := clients[i]
+		require.Eventually(t, func() bool {
+			resp, err := rawGetWithTimeout(client, key, rpcTimeout)
+			if err != nil {
+				return false
+			}
+			return resp.Exists && bytes.Equal(resp.Value, value)
+		}, waitTimeout, waitInterval)
+	}
 }
 
 func rawKVClients(t *testing.T, endpoints []bootstrapE2EEndpoint) ([]pb.RawKVClient, []*grpc.ClientConn) {
@@ -579,7 +662,7 @@ func rawGetWithTimeout(client pb.RawKVClient, key []byte, timeout time.Duration)
 	return client.RawGet(ctx, &pb.RawGetRequest{Key: key})
 }
 
-func containsRaftServer(servers []raft.Server, expected raft.Server) bool {
+func containsConfigServer(servers []raftengine.Server, expected raftengine.Server) bool {
 	for _, s := range servers {
 		if s.ID == expected.ID && s.Address == expected.Address && s.Suffrage == expected.Suffrage {
 			return true
