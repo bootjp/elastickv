@@ -5,6 +5,8 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -68,6 +70,13 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
+	// DEL_PREFIX cannot be routed to a single shard because the prefix may
+	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
+	// operation to every shard group so each FSM scans locally.
+	if hasDelPrefixElem(reqs.Elems) {
+		return c.dispatchDelPrefixBroadcast(reqs.IsTxn, reqs.Elems)
+	}
+
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		startTS, err := c.nextStartTS(ctx, reqs.Elems)
 		if err != nil {
@@ -95,6 +104,94 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+}
+
+// hasDelPrefixElem returns true if any element is a DelPrefix operation.
+func hasDelPrefixElem(elems []*Elem[OP]) bool {
+	for _, e := range elems {
+		if e != nil && e.Op == DelPrefix {
+			return true
+		}
+	}
+	return false
+}
+
+// validateDelPrefixOnly ensures all elements are DelPrefix operations.
+// Mixing DEL_PREFIX with other operations (PUT, DEL) in a single dispatch is
+// not allowed because the FSM handles DEL_PREFIX exclusively.
+func validateDelPrefixOnly(elems []*Elem[OP]) error {
+	for _, e := range elems {
+		if e != nil && e.Op != DelPrefix {
+			return errors.Wrap(ErrInvalidRequest, "DEL_PREFIX cannot be mixed with other operations")
+		}
+	}
+	return nil
+}
+
+// dispatchDelPrefixBroadcast validates and broadcasts DEL_PREFIX operations
+// to every shard group. Each element becomes a separate pb.Request (the FSM's
+// extractDelPrefix processes only the first DEL_PREFIX mutation per request).
+// All requests are batched into a single Commit call per shard group.
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+	if isTxn {
+		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
+	}
+	if err := validateDelPrefixOnly(elems); err != nil {
+		return nil, err
+	}
+
+	ts := c.clock.Next()
+	requests := make([]*pb.Request, 0, len(elems))
+	for _, elem := range elems {
+		requests = append(requests, &pb.Request{
+			IsTxn:     false,
+			Phase:     pb.Phase_NONE,
+			Ts:        ts,
+			Mutations: []*pb.Mutation{elemToMutation(elem)},
+		})
+	}
+
+	return c.broadcastToAllGroups(requests)
+}
+
+// broadcastToAllGroups sends the same set of requests to every shard group in
+// parallel and returns the maximum commit index.
+func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*CoordinateResponse, error) {
+	var (
+		maxIndex atomic.Uint64
+		firstErr error
+		errMu    sync.Mutex
+		wg       sync.WaitGroup
+	)
+	for _, g := range c.groups {
+		wg.Add(1)
+		go func(g *ShardGroup) {
+			defer wg.Done()
+			r, err := g.Txn.Commit(requests)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+			if r != nil {
+				for {
+					cur := maxIndex.Load()
+					if r.CommitIndex <= cur || maxIndex.CompareAndSwap(cur, r.CommitIndex) {
+						break
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, errors.WithStack(firstErr)
+	}
+	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
 func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
