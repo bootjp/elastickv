@@ -18,11 +18,17 @@ func wrongTypeError() error {
 }
 
 func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	// Check list existence via resolveListMeta (handles both base meta and delta-only lists).
+	if listExists, err := r.isListKeyAt(ctx, key, readTS); err != nil {
+		return redisTypeNone, err
+	} else if listExists {
+		return redisTypeList, nil
+	}
+
 	checks := []struct {
 		typ redisValueType
 		key []byte
 	}{
-		{typ: redisTypeList, key: store.ListMetaKey(key)},
 		{typ: redisTypeHash, key: redisHashKey(key)},
 		{typ: redisTypeSet, key: redisSetKey(key)},
 		{typ: redisTypeZSet, key: redisZSetKey(key)},
@@ -123,19 +129,33 @@ func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint6
 }
 
 func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uint64, elems []*kv.Elem[kv.OP]) error {
+	return r.dispatchElemsWithCommitTS(ctx, isTxn, startTS, 0, elems)
+}
+
+// dispatchElemsWithCommitTS dispatches elements with an optional pre-allocated
+// commitTS. When commitTS is 0, the coordinator assigns one automatically.
+// A non-zero commitTS is required by the Delta pattern so that Delta keys
+// (which embed commitTS) can be generated before dispatch.
+func (r *RedisServer) dispatchElemsWithCommitTS(ctx context.Context, isTxn bool, startTS uint64, commitTS uint64, elems []*kv.Elem[kv.OP]) error {
 	if len(elems) == 0 {
 		return nil
 	}
 	// Guard against the MaxUint64 sentinel returned by snapshotTS when no
-	// writes have been committed yet.  The coordinator cannot create a
-	// commitTS larger than MaxUint64, so let it assign its own startTS.
+	// writes have been committed yet. When commitTS is pre-allocated (Delta
+	// pattern), we need a valid non-zero startTS so the coordinator doesn't
+	// clear our commitTS. Use commitTS-1 as a safe startTS in that case.
 	if startTS == ^uint64(0) {
-		startTS = 0
+		if commitTS > 0 {
+			startTS = commitTS - 1
+		} else {
+			startTS = 0
+		}
 	}
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn:   isTxn,
-		StartTS: startTS,
-		Elems:   elems,
+		IsTxn:    isTxn,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems:    elems,
 	})
 	return errors.WithStack(err)
 }
@@ -193,22 +213,52 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		}
 	}
 
-	meta, listExists, err := r.loadListMetaAt(ctx, key, readTS)
+	meta, listExists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
 		return nil, false, err
 	}
 	if listExists {
-		for seq := meta.Head; seq < meta.Tail; seq++ {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+		listDelElems, lerr := r.listDeleteAllElems(ctx, key, meta, readTS)
+		if lerr != nil {
+			return nil, false, lerr
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+		elems = append(elems, listDelElems...)
 	}
 
 	return elems, existed, nil
 }
 
+// listDeleteAllElems generates delete ops for all list artifacts: items, base
+// metadata, delta keys, and claim keys.
+func (r *RedisServer) listDeleteAllElems(ctx context.Context, key []byte, meta store.ListMeta, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for seq := meta.Head; seq < meta.Tail; seq++ {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+
+	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
+	deltas, err := r.store.ScanAt(ctx, deltaPrefix, store.PrefixScanEnd(deltaPrefix), maxDeltaScanLimit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, d := range deltas {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+	}
+
+	claimPrefix := store.ListClaimScanPrefix(key)
+	claims, err := r.store.ScanAt(ctx, claimPrefix, store.PrefixScanEnd(claimPrefix), maxDeltaScanLimit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, c := range claims {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(c.Key)})
+	}
+	return elems, nil
+}
+
 func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint64) ([]string, error) {
-	meta, exists, err := r.loadListMetaAt(ctx, key, readTS)
+	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -232,12 +282,16 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	for _, value := range values {
 		rawValues = append(rawValues, []byte(value))
 	}
-	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues)
+	commitTS, err := r.allocateCommitTS()
+	if err != nil {
+		return err
+	}
+	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues, commitTS)
 	if err != nil {
 		return err
 	}
 	elems = append(elems, ops...)
-	return r.dispatchElems(ctx, true, readTS, elems)
+	return r.dispatchElemsWithCommitTS(ctx, true, readTS, commitTS, elems)
 }
 
 func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {
