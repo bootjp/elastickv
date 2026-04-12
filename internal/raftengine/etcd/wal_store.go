@@ -38,6 +38,10 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	if err := cleanupStaleSnapshotSpools(cfg.DataDir); err != nil {
+		return nil, errors.Wrap(err, "cleanup stale snapshot spools")
+	}
+
 	if wal.Exist(walDir) {
 		return loadWalState(logger, walDir, snapDir, cfg.StateMachine)
 	}
