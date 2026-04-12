@@ -221,7 +221,8 @@ func finalizeMigrationDir(tempDir string, destDataDir string) error {
 		return errors.WithStack(err)
 	}
 	if err := syncDir(filepath.Dir(destDataDir)); err != nil {
-		_ = os.RemoveAll(destDataDir)
+		// Don't remove destDataDir here — the rename succeeded and the data
+		// is already in place. Deleting it would cause total data loss.
 		return err
 	}
 	return nil

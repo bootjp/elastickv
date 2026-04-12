@@ -1,6 +1,7 @@
 package hashicorp
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -166,6 +167,11 @@ func (a *stateMachineFSMAdapter) Snapshot() (raft.FSMSnapshot, error) {
 }
 
 func (a *stateMachineFSMAdapter) Restore(r io.ReadCloser) error {
+	defer func() {
+		if err := r.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close raft restore stream: %v\n", err)
+		}
+	}()
 	return errors.WithStack(a.sm.Restore(r))
 }
 
