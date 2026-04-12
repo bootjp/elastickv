@@ -230,26 +230,45 @@ func (r *RedisServer) listDeleteAllElems(ctx context.Context, key []byte, meta s
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
 
-	// Delete delta keys.
+	// Delete ALL delta keys (loop until exhausted to avoid truncation).
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltas, derr := r.store.ScanAt(ctx, deltaPrefix, store.PrefixScanEnd(deltaPrefix), maxDeltaScanLimit, readTS)
-	if derr != nil {
-		return nil, errors.WithStack(derr)
-	}
-	for _, d := range deltas {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+	deltaEnd := store.PrefixScanEnd(deltaPrefix)
+	elems, err := scanAndAppendDelOps(ctx, r.store, elems, deltaPrefix, deltaEnd, readTS)
+	if err != nil {
+		return nil, err
 	}
 
-	// Delete claim keys.
+	// Delete ALL claim keys (same loop strategy).
 	claimPrefix := store.ListClaimScanPrefix(key)
-	claims, cerr := r.store.ScanAt(ctx, claimPrefix, store.PrefixScanEnd(claimPrefix), maxDeltaScanLimit, readTS)
-	if cerr != nil {
-		return nil, errors.WithStack(cerr)
-	}
-	for _, c := range claims {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(c.Key)})
+	claimEnd := store.PrefixScanEnd(claimPrefix)
+	elems, err = scanAndAppendDelOps(ctx, r.store, elems, claimPrefix, claimEnd, readTS)
+	if err != nil {
+		return nil, err
 	}
 
+	return elems, nil
+}
+
+// scanAndAppendDelOps scans all keys in [start, end) and appends Del ops
+// for each found key. Unlike a single ScanAt with a limit, this loops
+// until all keys are consumed to avoid truncation-related data loss.
+func scanAndAppendDelOps(ctx context.Context, st store.MVCCStore, elems []*kv.Elem[kv.OP], start, end []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	const batchSize = 1000
+	cursor := start
+	for {
+		batch, err := st.ScanAt(ctx, cursor, end, batchSize, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		for _, pair := range batch {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)})
+		}
+		if len(batch) < batchSize {
+			break
+		}
+		// Advance cursor past the last key.
+		cursor = incrementKey(batch[len(batch)-1].Key)
+	}
 	return elems, nil
 }
 

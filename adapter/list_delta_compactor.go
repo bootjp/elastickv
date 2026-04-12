@@ -155,7 +155,8 @@ func (c *ListDeltaCompactor) compactList(ctx context.Context, userKey []byte, re
 		return err
 	}
 
-	// Scan all deltas for this key.
+	// Scan all deltas for this key. If truncated, compact what we have
+	// and let the next tick handle the remainder.
 	prefix := store.ListMetaDeltaScanPrefix(userKey)
 	deltas, err := c.store.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), maxDeltaScanLimit, readTS)
 	if err != nil {

@@ -2266,6 +2266,14 @@ func clampRange(start, end, length int) (int, int) {
 const maxDeltaScanLimit = 10000
 
 // allocateCommitTS pre-allocates a commit timestamp from the HLC.
+// allocateCommitTS pre-allocates a commit timestamp from the leader's HLC.
+// The returned value is passed to OperationGroup.CommitTS so the Coordinator
+// uses it as the Raft-committed transaction timestamp. This ensures:
+//   - The timestamp is monotonically increasing (HLC guarantee).
+//   - The Coordinator observes the timestamp (line 140 of coordinator.go)
+//     so subsequent HLC.Next() calls never issue a smaller value.
+//   - Delta keys embedding this timestamp sort in Raft-commit order because
+//     the FSM applies entries sequentially and the HLC advances on each apply.
 func (r *RedisServer) allocateCommitTS() (uint64, error) {
 	if r.coordinator == nil || r.coordinator.Clock() == nil {
 		return 0, errors.New("coordinator clock not available")
@@ -2274,6 +2282,11 @@ func (r *RedisServer) allocateCommitTS() (uint64, error) {
 }
 
 // resolveListMeta aggregates base metadata + unapplied deltas.
+// Both GetAt and ScanAt use the same readTS, which is an MVCC snapshot
+// timestamp. The underlying store guarantees point-in-time consistency:
+// all reads at the same readTS observe exactly the same committed state.
+// Delta aggregation order does not matter since each delta is an
+// independent additive adjustment (HeadDelta, LenDelta).
 //
 //nolint:unparam // bool result will be used in read-path
 func (r *RedisServer) resolveListMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, bool, error) {
