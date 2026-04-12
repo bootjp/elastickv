@@ -466,7 +466,7 @@ func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
 		return nil, wrongTypeError()
 	}
 
-	meta, exists, err := c.server.resolveListMeta(context.Background(), key, c.startTS)
+	meta, exists, err := c.server.loadListMetaAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2547,11 +2547,7 @@ func (c *luaScriptContext) listCommitElems(key string) ([]*kv.Elem[kv.OP], error
 		values = append(values, []byte(value))
 	}
 
-	commitTS, err := c.server.allocateCommitTS()
-	if err != nil {
-		return nil, err
-	}
-	listElems, _, err := c.server.buildRPushOps(store.ListMeta{}, []byte(key), values, commitTS)
+	listElems, _, err := c.server.buildRPushOps(store.ListMeta{}, []byte(key), values)
 	if err != nil {
 		return nil, err
 	}
