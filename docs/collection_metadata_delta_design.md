@@ -933,6 +933,94 @@ For all collection types, empty collection cleanup is deferred to Background Com
 
 ---
 
+## Implementation Status
+
+> Last updated: 2026-04-13
+
+### List
+
+| Phase | Item | Status |
+|-------|------|--------|
+| L1 | `ListMetaDelta` struct + marshal/unmarshal | ✅ Done |
+| L1 | Delta key helpers (`ListMetaDeltaKey`, `IsListMetaDeltaKey`, etc.) | ✅ Done |
+| L1 | Claim key helpers (`ListClaimKey`, `IsListClaimKey`, etc.) | ✅ Done |
+| L1 | `resolveListMeta()` aggregation | ✅ Done |
+| L1 | `PrefixScanEnd` utility | ✅ Done |
+| L1 | Unit tests for all helpers | ✅ Done |
+| L2 | `buildRPushOps` / `buildLPushOps` → Delta emit | ✅ Done |
+| L2 | `allocateCommitTS` + `dispatchElemsWithCommitTS` | ✅ Done |
+| L2 | Stale Claim key cleanup in PUSH operations | ❌ Not started |
+| L2 | POP commands: Claim mechanism (LPOP/RPOP) | ❌ Not started |
+| L2 | RPOPLPUSH / LMOVE composite transaction | ❌ Not started |
+| L2 | `buildListElems` (MULTI/EXEC): delta cleanup on base meta write | ✅ Done |
+| L2 | `buildListElems` (MULTI/EXEC): full Delta emit (no base meta) | ❌ Not started |
+| L3 | Replace `loadListMetaAt` → `resolveListMeta` in all read paths | ✅ Done |
+| L3 | `rawKeyTypeAt`: delta-only list detection | ✅ Done |
+| L3 | Skip claimed items in `fetchListRange()` | ❌ Not started |
+| L4 | `ListDeltaCompactor`: delta folding | ✅ Done |
+| L4 | Head-side GC (advance Head through contiguous claims) | ❌ Not started |
+| L4 | Tail-side GC (retreat Tail through contiguous claims) | ❌ Not started |
+| L4 | Empty list detection + full deletion | ❌ Not started |
+| L4 | Unified `DeltaCompactor` integration | ❌ Not started |
+| L5 | Existing Redis compatibility tests pass | ✅ Done |
+| L5 | Concurrent RPUSH/LPUSH tests | ✅ Done |
+| L5 | Concurrent POP tests (Claim correctness) | ❌ Blocked by Claim impl |
+| L5 | Jepsen consistency fix (delta double-counting) | ✅ Done |
+| L5 | Delta truncation fix (DEL with >10k deltas) | ✅ Done |
+
+### Hash
+
+| Phase | Item | Status |
+|-------|------|--------|
+| H1 | `HashMeta` / `HashMetaDelta` structs + helpers | ❌ Not started |
+| H1 | Key helpers (`HashMetaKey`, `HashFieldKey`, etc.) | ❌ Not started |
+| H1 | Migration-aware loader (`loadHashMembersMap`) | ❌ Not started |
+| H1 | `buildHashWriteElems` / `buildHashDiffElems` | ❌ Not started |
+| H2 | Per-field key writes + Delta | ❌ Not started |
+| H2 | Legacy → wide-column atomic migration | ❌ Not started |
+| H2 | `resolveHashMeta()` for `HLEN` | ❌ Not started |
+| H3 | Read path: `HGET`, `HGETALL`, `HLEN`, `HEXISTS` | ❌ Not started |
+| H4 | Hash compaction handler | ❌ Not started |
+| H4 | Concurrent `HSET` tests | ❌ Not started |
+
+### Set
+
+| Phase | Item | Status |
+|-------|------|--------|
+| S1 | `SetMeta` / `SetMetaDelta` structs + helpers | ❌ Not started |
+| S1 | Key helpers (`SetMetaKey`, `SetMemberKey`, etc.) | ❌ Not started |
+| S1 | Migration-aware loader | ❌ Not started |
+| S1 | `buildSetWriteElems` / `buildSetDiffElems` | ❌ Not started |
+| S2 | Per-member key writes + Delta | ❌ Not started |
+| S2 | Legacy → wide-column atomic migration | ❌ Not started |
+| S2 | `resolveSetMeta()` for `SCARD` | ❌ Not started |
+| S3 | Read path: `SISMEMBER`, `SMEMBERS`, `SCARD` | ❌ Not started |
+| S4 | Set compaction handler | ❌ Not started |
+| S4 | Concurrent `SADD` tests | ❌ Not started |
+
+### ZSet
+
+| Phase | Item | Status |
+|-------|------|--------|
+| Z1 | `ZSetMetaDelta` struct + helpers | ❌ Not started |
+| Z1 | `resolveZSetMeta()` | ❌ Not started |
+| Z2 | Delta write path (`persistZSetMembersTxn`, etc.) | ❌ Not started |
+| Z3 | Read path: `ZCARD` via delta aggregation | ❌ Not started |
+| Z4 | ZSet compaction handler | ❌ Not started |
+| Z4 | Concurrent `ZADD` tests | ❌ Not started |
+
+### Cross-Type
+
+| Phase | Item | Status |
+|-------|------|--------|
+| X1 | Unified `DeltaCompactor` with `collectionCompactionHandler` | ❌ Not started |
+| X1 | Register handlers for List, Hash, Set, ZSet | ❌ Not started |
+| X1 | Integrate into `FSMCompactor` run loop | ❌ Not started |
+| X2 | Feature flag for rolling upgrade | ❌ Not started |
+| X2 | Zero-downtime cutover strategy | ❌ Not started |
+
+---
+
 ## Transition Plan
 
 ### List
