@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -19,9 +20,9 @@ func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	t.Cleanup(stop)
 
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Raft: r, Store: st, Txn: NewLeaderProxy(r)},
+		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
 	}, 1, NewHLC(), NewShardStore(engine, map[uint64]*ShardGroup{
-		1: {Raft: r, Store: st, Txn: NewLeaderProxy(r)},
+		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
 	}))
 
 	require.NoError(t, coord.VerifyLeader())

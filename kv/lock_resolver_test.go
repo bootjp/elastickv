@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -26,8 +27,8 @@ func setupLockResolverEnv(t *testing.T) (*LockResolver, *ShardStore, map[uint64]
 	r2, stop2 := newSingleRaft(t, "lr-g2", NewKvFSM(st2))
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: r2, Store: st2, Txn: NewLeaderProxy(r2)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		2: {Engine: hashicorpraftengine.New(r2), Store: st2, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r2))},
 	}
 	ss := NewShardStore(engine, groups)
 	lr := NewLockResolver(ss, groups, nil)
@@ -207,7 +208,7 @@ func TestLockResolver_LeaderOnlyExecution(t *testing.T) {
 	defer stop()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r, Store: st, Txn: NewLeaderProxy(r)},
+		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
 	}
 	ss := NewShardStore(engine, groups)
 	lr := NewLockResolver(ss, groups, nil)
@@ -237,7 +238,7 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 	defer stop()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r, Store: st, Txn: NewLeaderProxy(r)},
+		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
 	}
 	ss := NewShardStore(engine, groups)
 	lr := NewLockResolver(ss, groups, nil)

@@ -16,6 +16,9 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -31,9 +34,55 @@ const (
 	heartbeatTimeout           = 200 * time.Millisecond
 	electionTimeout            = 2000 * time.Millisecond
 	leaderLease                = 100 * time.Millisecond
+	raftCommitTimeout          = 50 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
 	dirPerm                    = raftDirPerm
+
+	etcdTickInterval      = 10 * time.Millisecond
+	etcdHeartbeatMinTicks = 1
+	etcdElectionMinTicks  = 2
+	etcdMaxSizePerMsg     = 1 << 20
+	etcdMaxInflightMsg    = 256
 )
+
+const snapshotRetainCount = 3
+
+func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {
+	switch engineType {
+	case raftEngineHashicorp:
+		return hashicorpraftengine.NewFactory(hashicorpraftengine.FactoryConfig{
+			CommitTimeout:       raftCommitTimeout,
+			HeartbeatTimeout:    heartbeatTimeout,
+			ElectionTimeout:     electionTimeout,
+			LeaderLeaseTimeout:  leaderLease,
+			SnapshotRetainCount: snapshotRetainCount,
+		}), nil
+	case raftEngineEtcd:
+		return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+			TickInterval:   etcdTickInterval,
+			HeartbeatTick:  durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
+			ElectionTick:   durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
+			MaxSizePerMsg:  etcdMaxSizePerMsg,
+			MaxInflightMsg: etcdMaxInflightMsg,
+		}), nil
+	default:
+		return nil, errors.Wrapf(ErrUnsupportedRaftEngine, "%q", engineType)
+	}
+}
+
+func durationToTicks(timeout time.Duration, tick time.Duration, min int) int {
+	if tick <= 0 {
+		return min
+	}
+	ticks := int(timeout / tick)
+	if timeout%tick != 0 {
+		ticks++
+	}
+	if ticks < min {
+		return min
+	}
+	return ticks
+}
 
 var (
 	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
@@ -72,6 +121,11 @@ func run() error {
 		return err
 	}
 
+	factory, err := newRaftFactory(engineType)
+	if err != nil {
+		return err
+	}
+
 	var lc net.ListenConfig
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
@@ -83,7 +137,7 @@ func run() error {
 		cfg.multi,
 		bootstrap,
 		bootstrapServers,
-		engineType,
+		factory,
 		func(groupID uint64) kv.ProposalObserver {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
@@ -189,8 +243,6 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raft.Server, bool,
 
 	return cfg, engineType, bootstrapServers, *raftBootstrap || len(bootstrapServers) > 0, nil
 }
-
-const snapshotRetainCount = 3
 
 type runtimeConfig struct {
 	groups       []groupSpec
@@ -313,7 +365,7 @@ func buildShardGroups(
 	multi bool,
 	bootstrap bool,
 	bootstrapServers []raft.Server,
-	engineType raftEngineType,
+	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
@@ -327,8 +379,8 @@ func buildShardGroups(
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
 		}
-		fsm := kv.NewKvFSM(st)
-		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, fsm, engineType)
+		sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSM(st))
+		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
@@ -338,7 +390,6 @@ func buildShardGroups(
 		}
 		runtimes = append(runtimes, runtime)
 		shardGroups[g.id] = &kv.ShardGroup{
-			Raft:   runtime.raft,
 			Engine: runtime.engine,
 			Store:  st,
 			Txn:    kv.NewLeaderProxyWithEngine(runtime.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),

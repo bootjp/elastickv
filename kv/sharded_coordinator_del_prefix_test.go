@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -277,8 +278,8 @@ func TestShardedCoordinator_DelPrefixIntegration(t *testing.T) {
 	t.Cleanup(stop2)
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: r2, Store: s2, Txn: NewLeaderProxy(r2)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: s1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		2: {Engine: hashicorpraftengine.New(r2), Store: s2, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r2))},
 	}
 
 	shardStore := NewShardStore(engine, groups)
@@ -339,7 +340,7 @@ func TestShardedCoordinator_DelPrefixPreservesTxnKeys(t *testing.T) {
 	t.Cleanup(stop1)
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: s1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
 	}
 	shardStore := NewShardStore(engine, groups)
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)

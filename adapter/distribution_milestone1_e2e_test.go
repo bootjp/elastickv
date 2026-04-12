@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -31,8 +32,8 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 	defer stopGroup2()
 
 	groups := map[uint64]*kv.ShardGroup{
-		1: {Raft: group1Raft, Store: group1Store, Txn: kv.NewLeaderProxy(group1Raft)},
-		2: {Raft: group2Raft, Store: group2Store, Txn: kv.NewLeaderProxy(group2Raft)},
+		1: {Engine: hashicorpraftengine.New(group1Raft), Store: group1Store, Txn: kv.NewLeaderProxyWithEngine(hashicorpraftengine.New(group1Raft))},
+		2: {Engine: hashicorpraftengine.New(group2Raft), Store: group2Store, Txn: kv.NewLeaderProxyWithEngine(hashicorpraftengine.New(group2Raft))},
 	}
 	shardStore := kv.NewShardStore(engine, groups)
 	t.Cleanup(func() {

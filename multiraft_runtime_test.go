@@ -5,12 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,31 +26,30 @@ func TestGroupDataDir(t *testing.T) {
 	})
 }
 
-func TestNewRaftGroupBootstrap(t *testing.T) {
+func TestBuildRuntimeForGroupBootstrap(t *testing.T) {
 	baseDir := t.TempDir()
 
-	st := store.NewMVCCStore()
-	fsm := kv.NewKvFSM(st)
+	factory, err := newRaftFactory(raftEngineHashicorp)
+	require.NoError(t, err)
 
-	r, tm, closeStores, err := newRaftGroup(
+	st := store.NewMVCCStore()
+	sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSM(st))
+
+	runtime, err := buildRuntimeForGroup(
 		"n1",
 		groupSpec{id: 1, address: "127.0.0.1:0"},
 		baseDir,
 		true, // multi
 		true, // bootstrap
 		nil,
-		fsm,
+		st,
+		sm,
+		factory,
 	)
 	require.NoError(t, err)
-	require.NotNil(t, r)
-	require.NotNil(t, tm)
-	t.Cleanup(func() {
-		_ = r.Shutdown().Error()
-		_ = tm.Close()
-		if closeStores != nil {
-			closeStores()
-		}
-	})
+	require.NotNil(t, runtime)
+	require.NotNil(t, runtime.engine)
+	t.Cleanup(func() { runtime.Close() })
 
 	dir := groupDataDir(baseDir, "n1", 1, true)
 	_, err = os.Stat(dir)
@@ -59,10 +57,6 @@ func TestNewRaftGroupBootstrap(t *testing.T) {
 
 	_, err = os.Stat(filepath.Join(dir, "raft.db"))
 	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		return r.State() == raft.Leader
-	}, 5*time.Second, 10*time.Millisecond)
 }
 
 func TestParseRaftEngineType(t *testing.T) {
@@ -91,7 +85,9 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 		{id: 2, address: "127.0.0.1:15002"},
 	}
 
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, raftEngineEtcd, nil)
+	factory, err := newRaftFactory(raftEngineEtcd)
+	require.NoError(t, err)
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -142,7 +138,9 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	openShardStore := func() ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
-		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, raftEngineEtcd, nil)
+		factory, err := newRaftFactory(raftEngineEtcd)
+		require.NoError(t, err)
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore

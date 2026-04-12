@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -26,8 +27,8 @@ func setupTwoShardStore(t *testing.T) (*ShardStore, map[uint64]*ShardGroup, func
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(st2))
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: r2, Store: st2, Txn: NewLeaderProxy(r2)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		2: {Engine: hashicorpraftengine.New(r2), Store: st2, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r2))},
 	}
 	shardStore := NewShardStore(engine, groups)
 
@@ -95,7 +96,7 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	defer stop1()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
 	}
 	shardStore := NewShardStore(engine, groups)
 
@@ -231,7 +232,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	defer stop1()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
 	}
 	shardStore := NewShardStore(engine, groups)
 
@@ -260,7 +261,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t 
 	defer stop1()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
 	}
 	shardStore := NewShardStore(engine, groups)
 
@@ -289,7 +290,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *tes
 	defer stop1()
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: st1, Txn: NewLeaderProxy(r1)},
+		1: {Engine: hashicorpraftengine.New(r1), Store: st1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
 	}
 	shardStore := NewShardStore(engine, groups)
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -48,8 +49,8 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 	failTxn := &failingTransactional{err: errors.New("simulated shard2 prepare failure")}
 
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: nil, Store: s2, Txn: failTxn},
+		1: {Engine: hashicorpraftengine.New(r1), Store: s1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		2: {Store: s2, Txn: failTxn},
 	}
 
 	shardStore := NewShardStore(engine, groups)

@@ -32,7 +32,23 @@ func New(r *raft.Raft) *Engine {
 	return &Engine{raft: r}
 }
 
+// RaftInstance returns the underlying hashicorp raft instance. This is
+// provided for backward compatibility during the engine migration; callers
+// should use the Engine interface instead.
+func (e *Engine) RaftInstance() *raft.Raft {
+	if e == nil {
+		return nil
+	}
+	return e.raft
+}
+
 func (e *Engine) Close() error {
+	if e == nil || e.raft == nil {
+		return nil
+	}
+	if err := e.raft.Shutdown().Error(); err != nil {
+		return errors.WithStack(err)
+	}
 	return nil
 }
 
