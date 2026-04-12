@@ -1448,34 +1448,38 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 	}
 }
 
-func (t *txnContext) load(key []byte) (*txnValue, error) {
-	// If the key is already an internal key (e.g., !redis|hash|...,
-	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
-	// Otherwise, it's a bare user key for a string value — prefix it.
-	storageKey := key
-	userKey := extractRedisInternalUserKey(key)
+// resolveLoadKeys determines the storage key and user key for txnContext.load.
+// For bare user keys (not a known internal prefix), the storage key is prefixed
+// and the user key is the original key. For internal keys, the user key is
+// extracted via extractRedisInternalUserKey or store.ExtractZSetUserKey.
+func resolveLoadKeys(key []byte) (storageKey []byte, userKey []byte, internal bool) {
 	if !isKnownInternalKey(key) {
-		storageKey = redisStrKey(key)
-		userKey = key
+		return redisStrKey(key), key, false
 	}
+	uk := extractRedisInternalUserKey(key)
+	if uk == nil && store.IsZSetInternalKey(key) {
+		uk = store.ExtractZSetUserKey(key)
+	}
+	return key, uk, true
+}
+
+func (t *txnContext) load(key []byte) (*txnValue, error) {
+	storageKey, userKey, internal := resolveLoadKeys(key)
 	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
 	t.trackReadKey(storageKey)
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// Track the bare key too for conflict detection on legacy fallback reads.
 		t.trackReadKey(key)
-	}
-	if userKey == nil && store.IsZSetInternalKey(key) {
-		userKey = store.ExtractZSetUserKey(key)
 	}
 	if userKey != nil {
 		t.trackReadKey(redisTTLKey(userKey))
 	}
 	tv := &txnValue{}
 	var val []byte
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// For bare user string keys, use the fallback-aware reader.
 		var err error
 		val, err = t.server.readRedisStringAt(key, t.startTS)
