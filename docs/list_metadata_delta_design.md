@@ -41,9 +41,11 @@ Delta Key (New):
   !lst|meta|d|<userKey><commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
 ```
 
-- `commitTS` is an 8-byte big-endian timestamp determined at Raft apply time.
+- `commitTS` is an 8-byte big-endian timestamp pinned by the coordinator before the Delta key is generated (via `kv.OperationGroup.CommitTS` during dispatch), then carried through Raft and used unchanged at apply time.
 - `seqInTxn` is a 4-byte big-endian sequence number within the same transaction (needed if `LPUSH` is called multiple times for the same key in one `MULTI/EXEC`).
 - Since all Delta keys for a `userKey` share the prefix `!lst|meta|d|<userKey>`, they are physically contiguous in the LSM tree, allowing for fast Prefix Scans.
+
+Because the Delta key embeds `commitTS`, the write path must know the final timestamp before emitting the key bytes. This design therefore assumes `CommitTS` is explicitly allocated once during dispatch and reused during Raft apply; it does not rely on the FSM rewriting Delta keys at apply time.
 
 ```go
 const ListMetaDeltaPrefix = "!lst|meta|d|"
@@ -104,13 +106,20 @@ New Flow:
 In the Delta pattern, the base metadata's `Head`/`Len` alone is insufficient to determine the correct `Tail`. It is necessary to aggregate unapplied Deltas to calculate the effective `Head`/`Len`:
 
 ```go
+// Note: simplified pseudocode illustrating aggregation logic; error handling shown for clarity.
 func (r *RedisServer) resolveListMeta(ctx context.Context, userKey []byte, readTS uint64) (ListMeta, bool, error) {
     // 1. Read base metadata
     baseMeta, exists, err := r.loadListMetaAt(ctx, userKey, readTS)
+    if err != nil {
+        return ListMeta{}, false, err
+    }
 
     // 2. Fetch Deltas via prefix scan
     prefix := ListMetaDeltaScanPrefix(userKey)
-    deltas, err := r.store.ScanAt(ctx, prefix, prefixEnd(prefix), maxDeltaScanLimit, readTS)
+    deltas, err := r.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), maxDeltaScanLimit, readTS)
+    if err != nil {
+        return ListMeta{}, false, err
+    }
 
     // 3. Aggregate
     for _, d := range deltas {
@@ -167,7 +176,8 @@ type ListDeltaCompactor struct {
 }
 ```
 
-- Scan the entire `!lst|meta|d|` prefix every `scanInterval`.
+- Scan the entire `!lst|meta|d|` prefix every `scanInterval`, using a **cursor-based incremental scan** to avoid a single blocking pass over all Deltas. On each tick the compactor advances its cursor by at most `maxKeysPerTick` entries, wrapping around when it reaches the end. This keeps per-tick I/O bounded regardless of total Delta volume.
+- Per-list Delta counters (maintained in memory or as a lightweight side-structure) can be used to prioritise lists that have accumulated many Deltas, so the compactor focuses effort where it matters rather than uniformly sampling every list every interval.
 - If the number of Deltas for a `userKey` exceeds `maxDeltaCount`, mark it for compaction.
 - Compaction is performed as a transaction (`IsTxn: true`), protecting the base metadata read via the `readSet` (using OCC to prevent concurrent compaction conflicts).
 
@@ -242,7 +252,14 @@ A Claim key acts as a "logical deletion" marker. They are removed during Backgro
    - Collapse corresponding Deltas.
 ```
 
-Accumulated Claim keys do not affect read performance (they use the `!lst|claim|` prefix and are outside the metadata scan scope). GC is handled by the Background Compactor.
+Read-time strategy for Claim keys:
+
+- Claim keys are outside the `!lst|meta|` namespace, so they do not affect the metadata-only read path (`resolveListMeta()`).
+- However, `fetchListRange()` must skip logically deleted items. To do that, it performs a **bulk range scan of Claim keys** for the candidate sequence interval being materialized, then filters claimed sequences in memory while assembling the result.
+- This means Claim keys introduce bounded read amplification for list reads: **one additional range scan per fetched window**, not one extra point lookup per item.
+- Background Compaction keeps this bounded by deleting Claim keys whose sequence is below the effective Head and by collapsing old Deltas.
+
+In summary: accumulated Claim keys do not affect metadata-only scans, but they do add a single range scan to `fetchListRange()` until compaction removes obsolete claims.
 
 #### 6.5. RPOPLPUSH / LMOVE
 
