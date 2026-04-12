@@ -310,7 +310,7 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		return preparedOpenState{}, err
 	}
 
-	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers)
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK)
 	if err != nil {
 		return preparedOpenState{}, err
 	}
@@ -1106,6 +1106,10 @@ func (e *Engine) applyAddedPeer(nodeID uint64, peer Peer, ok bool) {
 	if nodeID == 0 || e.hasPeer(nodeID) {
 		return
 	}
+	e.upsertPeer(Peer{
+		NodeID: nodeID,
+		ID:     strconv.FormatUint(nodeID, 10),
+	})
 }
 
 func (e *Engine) applyRemovedPeer(nodeID uint64, peer Peer, ok bool) {
@@ -1163,10 +1167,11 @@ func applyAddedPeerToMap(peers map[uint64]Peer, nodeID uint64, peer Peer, ok boo
 		upsertPeerInMap(peers, peer)
 		return
 	}
-	if nodeID != 0 {
-		if hasPeerInMap(peers, nodeID) {
-			return
-		}
+	if nodeID != 0 && !hasPeerInMap(peers, nodeID) {
+		upsertPeerInMap(peers, Peer{
+			NodeID: nodeID,
+			ID:     strconv.FormatUint(nodeID, 10),
+		})
 	}
 }
 

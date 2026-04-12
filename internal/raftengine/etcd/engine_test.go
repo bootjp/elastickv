@@ -344,6 +344,40 @@ func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
 	require.Len(t, cfg.Servers, 3)
 }
 
+func TestOpenRestoresPlaceholderPersistedPeerMetadata(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, writeCurrentPersistedPeers(dir, 7, []Peer{
+		{NodeID: 1, ID: "1"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
+	require.NoError(t, saveMetadataFile(metadataFilePath(dir), raftpb.HardState{Term: 2, Commit: 7}, raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+			Index:     7,
+			Term:      2,
+		},
+	}))
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	cfg, err := engine.Configuration(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []raftengine.Server{
+		{ID: "n1", Address: "127.0.0.1:7001", Suffrage: "voter"},
+		{ID: "n2", Address: "127.0.0.1:7002", Suffrage: "voter"},
+	}, cfg.Servers)
+}
+
 func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 	engine := &Engine{
 		readCh: make(chan readRequest, 1),
@@ -959,6 +993,7 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 	require.Equal(t, []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 3, ID: "3", Address: ""},
 	}, next)
 }
 

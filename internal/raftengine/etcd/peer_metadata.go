@@ -72,7 +72,7 @@ func writeCurrentPersistedPeers(dataDir string, index uint64, peers []Peer) erro
 func normalizePersistedPeers(peers []Peer) ([]Peer, error) {
 	normalized := make([]Peer, 0, len(peers))
 	for _, peer := range peers {
-		normalizedPeer, err := normalizePeer(peer)
+		normalizedPeer, err := normalizePersistedPeer(peer)
 		if err != nil {
 			return nil, err
 		}
@@ -135,7 +135,7 @@ func readPersistedPeer(reader io.Reader) (Peer, error) {
 	if err != nil {
 		return Peer{}, err
 	}
-	return normalizePeer(Peer{
+	return normalizePersistedPeer(Peer{
 		NodeID:  nodeID,
 		ID:      id,
 		Address: address,
