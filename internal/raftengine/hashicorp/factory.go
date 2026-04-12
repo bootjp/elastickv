@@ -62,7 +62,9 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 
 	if cfg.Bootstrap {
 		if err := bootstrapCluster(r, cfg); err != nil {
-			_ = cleanup()
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: cleanup after bootstrap failure: %v\n", cleanupErr)
+			}
 			return nil, err
 		}
 	}
@@ -117,7 +119,9 @@ func bootstrapCluster(r *raft.Raft, cfg raftengine.FactoryConfig) error {
 	servers := peersToRaftServers(cfg)
 	raftCfg := raft.Configuration{Servers: servers}
 	if err := r.BootstrapCluster(raftCfg).Error(); err != nil {
-		_ = r.Shutdown().Error()
+		if shutdownErr := r.Shutdown().Error(); shutdownErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: raft shutdown after bootstrap failure: %v\n", shutdownErr)
+		}
 		return errors.WithStack(err)
 	}
 	return nil
@@ -188,7 +192,9 @@ func (a *snapshotFSMAdapter) Persist(sink raft.SnapshotSink) error {
 }
 
 func (a *snapshotFSMAdapter) Release() {
-	_ = a.snap.Close()
+	if err := a.snap.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to close snapshot: %v\n", err)
+	}
 }
 
 // closeIfNotNil closes c if it is not nil and returns the error.
