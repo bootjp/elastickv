@@ -134,9 +134,13 @@ var knownInternalPrefixes = [][]byte{
 	[]byte("!ddb|"),
 	[]byte("!s3|"),
 	[]byte("!dist|"),
+	[]byte("!zs|"),
 }
 
 func isKnownInternalKey(key []byte) bool {
+	if len(key) == 0 || key[0] != '!' {
+		return false
+	}
 	for _, prefix := range knownInternalPrefixes {
 		if bytes.HasPrefix(key, prefix) {
 			return true

@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -94,7 +95,8 @@ func (r *RedisServer) proxyFlushLegacy() (int, error) {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	// Use a slightly longer timeout than the leader to account for network latency.
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout+30*time.Second)
 	defer cancel()
 
 	res := cli.Do(ctx, "FLUSHLEGACY")

@@ -1840,6 +1840,8 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	}
 	// Mark legacy bare string key for deletion. We bypass load() here
 	// because load() auto-prefixes bare keys to !redis|str|.
+	// Track the bare key in the read set for conflict detection.
+	t.trackReadKey(key)
 	bareK := string(key)
 	if _, ok := t.working[bareK]; !ok {
 		t.working[bareK] = &txnValue{}
