@@ -29,7 +29,7 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeStream, key: redisStreamKey(key)},
 		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
 		{typ: redisTypeString, key: redisHLLKey(key)},
-		{typ: redisTypeString, key: key},
+		{typ: redisTypeString, key: redisStrKey(key)},
 	}
 	for _, check := range checks {
 		exists, err := r.store.ExistsAt(ctx, check.key, readTS)
@@ -139,7 +139,7 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
 	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: key, Value: bytes.Clone(value)},
+		{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)},
 	}
 	if ttl == nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
@@ -157,12 +157,12 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 	elems := []*kv.Elem[kv.OP]{}
 
-	stringExists, err := r.store.ExistsAt(ctx, key, readTS)
+	stringExists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
 	if stringExists {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStrKey(key)})
 	}
 
 	for _, internalKey := range [][]byte{

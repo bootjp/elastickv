@@ -428,7 +428,7 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.readValueAt(key, c.startTS)
+	value, err := c.server.readValueAt(redisStrKey(key), c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		return st, nil
@@ -2510,7 +2510,7 @@ func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	if err != nil {
 		return nil, err
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte(key), Value: append([]byte(nil), st.value...)}}, nil
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStrKey([]byte(key)), Value: append([]byte(nil), st.value...)}}, nil
 }
 
 func (c *luaScriptContext) listCommitPlan(key string) (luaCommitPlan, error) {

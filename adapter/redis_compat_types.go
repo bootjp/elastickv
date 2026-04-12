@@ -15,6 +15,7 @@ import (
 )
 
 const (
+	redisStrPrefix    = "!redis|str|"
 	redisHashPrefix   = "!redis|hash|"
 	redisSetPrefix    = "!redis|set|"
 	redisZSetPrefix   = "!redis|zset|"
@@ -24,6 +25,7 @@ const (
 )
 
 var redisInternalPrefixes = []string{
+	redisStrPrefix,
 	redisHashPrefix,
 	redisSetPrefix,
 	redisHLLPrefix,
@@ -79,6 +81,10 @@ type redisStreamID struct {
 	seq uint64
 }
 
+func redisStrKey(userKey []byte) []byte {
+	return append([]byte(redisStrPrefix), userKey...)
+}
+
 func redisHashKey(userKey []byte) []byte {
 	return append([]byte(redisHashPrefix), userKey...)
 }
@@ -120,6 +126,8 @@ func isRedisTTLKey(key []byte) bool {
 
 func extractRedisInternalUserKey(key []byte) []byte {
 	switch {
+	case bytes.HasPrefix(key, []byte(redisStrPrefix)):
+		return bytes.TrimPrefix(key, []byte(redisStrPrefix))
 	case bytes.HasPrefix(key, []byte(redisHashPrefix)):
 		return bytes.TrimPrefix(key, []byte(redisHashPrefix))
 	case bytes.HasPrefix(key, []byte(redisSetPrefix)):

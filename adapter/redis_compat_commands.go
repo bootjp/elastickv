@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -112,7 +113,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeString {
 			return wrongTypeError()
 		}
-		raw, err := r.readValueAt(key, readTS)
+		raw, err := r.readValueAt(redisStrKey(key), readTS)
 		if err != nil {
 			// Key may have expired or been deleted between type check and read.
 			v = nil
@@ -458,6 +459,46 @@ func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
 	r.flushDatabase(conn, true)
 }
 
+// flushlegacy deletes old unprefixed Redis string keys that were written before
+// the !redis|str| prefix migration. It scans all keys and deletes those that
+// do not start with "!" (the internal key prefix), which are the legacy bare
+// Redis string keys. This is a one-time migration operation.
+func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
+	if !r.coordinator.IsLeader() {
+		conn.WriteError("ERR FLUSHLEGACY must be run on the leader")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	defer cancel()
+
+	readTS := r.readTS()
+	// Scan all keys up to the "!" boundary. Internal keys start with "!"
+	// (0x21), so scanning [nil, "!") covers all bare user keys.
+	kvs, err := r.store.ScanAt(ctx, nil, []byte("!"), math.MaxInt, readTS)
+	if err != nil {
+		conn.WriteError(fmt.Sprintf("ERR scan: %s", err))
+		return
+	}
+
+	if len(kvs) == 0 {
+		conn.WriteInt(0)
+		return
+	}
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+	for _, pair := range kvs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+	}
+
+	if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteInt(len(elems))
+}
+
 func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 	if !r.coordinator.IsLeader() {
 		if err := r.proxyFlushDatabase(all); err != nil {
@@ -476,12 +517,13 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		// Dispatch a single DEL_PREFIX operation. The FSM on each node will
-		// scan locally and write tombstones, avoiding the need to enumerate
-		// all keys here and send them through the Raft log.
+		// Delete only Redis-related keys. Two DEL_PREFIX operations cover
+		// all Redis namespaces: "!redis|" (str, hash, set, zset, hll,
+		// stream, ttl) and "!lst|" (list meta + items).
 		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.DelPrefix, Key: nil},
+				{Op: kv.DelPrefix, Key: []byte("!redis|")},
+				{Op: kv.DelPrefix, Key: []byte("!lst|")},
 			},
 		})
 		if err != nil {
@@ -1169,7 +1211,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 
 		current = 0
 		if typ == redisTypeString {
-			raw, err := r.readValueAt(cmd.Args[1], readTS)
+			raw, err := r.readValueAt(redisStrKey(cmd.Args[1]), readTS)
 			if err != nil {
 				return err
 			}
@@ -1181,7 +1223,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		current++
 
 		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: cmd.Args[1], Value: []byte(strconv.FormatInt(current, 10))},
+			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: []byte(strconv.FormatInt(current, 10))},
 			{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])},
 		})
 	}); err != nil {
