@@ -177,6 +177,18 @@ func TestClientForDeduplicatesConcurrentDial(t *testing.T) {
 	}
 }
 
+func TestNewGRPCTransportDerivesPeerNodeIDs(t *testing.T) {
+	transport := NewGRPCTransport([]Peer{{
+		ID:      "n2",
+		Address: "127.0.0.1:65530",
+	}})
+
+	peer, err := transport.peerFor(DeriveNodeID("n2"))
+	require.NoError(t, err)
+	require.Equal(t, "n2", peer.ID)
+	require.Equal(t, "127.0.0.1:65530", peer.Address)
+}
+
 type testSendSnapshotServer struct {
 	chunks []*pb.EtcdRaftSnapshotChunk
 	index  int
