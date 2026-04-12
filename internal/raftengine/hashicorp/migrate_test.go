@@ -41,6 +41,22 @@ func TestParsePeers(t *testing.T) {
 		_, err := hashicorpraftengine.ParsePeers("bad-entry")
 		require.Error(t, err)
 	})
+
+	t.Run("empty_id", func(t *testing.T) {
+		_, err := hashicorpraftengine.ParsePeers("=127.0.0.1:7001")
+		require.Error(t, err)
+	})
+
+	t.Run("empty_address", func(t *testing.T) {
+		_, err := hashicorpraftengine.ParsePeers("n1=")
+		require.Error(t, err)
+	})
+
+	t.Run("trailing_commas_skipped", func(t *testing.T) {
+		peers, err := hashicorpraftengine.ParsePeers("n1=127.0.0.1:7001,,")
+		require.NoError(t, err)
+		require.Len(t, peers, 1)
+	})
 }
 
 func TestMigrateFSMStoreValidation(t *testing.T) {
