@@ -22,6 +22,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--allowedTools Read Grep Glob Bash"
           prompt: |
             あなたは分散KVSの「データロスト防止」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
@@ -56,6 +57,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--allowedTools Read Grep Glob Bash"
           prompt: |
             あなたは分散KVSの「並行性・分散障害」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
@@ -91,6 +93,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--allowedTools Read Grep Glob Bash"
           prompt: |
             あなたは分散KVSの「性能」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
@@ -126,6 +129,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--allowedTools Read Grep Glob Bash"
           prompt: |
             あなたは分散KVSの「データ一貫性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
@@ -161,6 +165,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--allowedTools Read Grep Glob Bash"
           prompt: |
             あなたは分散KVSの「テスト網羅性」専門レビュアーです。
             以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
