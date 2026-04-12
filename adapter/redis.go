@@ -1435,13 +1435,23 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
-	k := string(key)
+	// If the key is already an internal Redis key (e.g., !redis|hash|...),
+	// use it as-is. Otherwise, it's a bare user key for a string value —
+	// prefix it with !redis|str|.
+	storageKey := key
+	userKey := extractRedisInternalUserKey(key)
+	if userKey == nil && !isRedisTTLKey(key) {
+		storageKey = redisStrKey(key)
+		userKey = key
+	}
+	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
-	storageKey := redisStrKey(key)
 	t.trackReadKey(storageKey)
-	t.trackReadKey(redisTTLKey(key))
+	if userKey != nil {
+		t.trackReadKey(redisTTLKey(userKey))
+	}
 	tv := &txnValue{}
 	val, err := t.server.readValueAt(storageKey, t.startTS)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
@@ -1566,7 +1576,7 @@ func (t *txnContext) stagedListType(key string) (redisValueType, bool) {
 }
 
 func (t *txnContext) stagedStringType(key string) (redisValueType, bool) {
-	tv, ok := t.working[key]
+	tv, ok := t.working[string(redisStrKey([]byte(key)))]
 	if !ok {
 		return redisTypeNone, false
 	}
@@ -1909,7 +1919,7 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 		if !tv.dirty {
 			continue
 		}
-		storageKey := redisStrKey([]byte(k))
+		storageKey := []byte(k)
 		if tv.deleted {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
 			continue

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -472,31 +471,43 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
 	defer cancel()
 
+	const batchSize = 1000
+	var totalDeleted int
 	readTS := r.readTS()
-	// Scan all keys up to the "!" boundary. Internal keys start with "!"
-	// (0x21), so scanning [nil, "!") covers all bare user keys.
-	kvs, err := r.store.ScanAt(ctx, nil, []byte("!"), math.MaxInt, readTS)
-	if err != nil {
-		conn.WriteError(fmt.Sprintf("ERR scan: %s", err))
-		return
+
+	// Scan in batches to avoid unbounded memory usage and oversized Raft
+	// proposals. Internal keys start with "!" (0x21), so scanning [nil, "!")
+	// covers only bare user keys.
+	var cursor []byte
+	for {
+		kvs, err := r.store.ScanAt(ctx, cursor, []byte("!"), batchSize, readTS)
+		if err != nil {
+			conn.WriteError(fmt.Sprintf("ERR scan: %s", err))
+			return
+		}
+		if len(kvs) == 0 {
+			break
+		}
+
+		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		for _, pair := range kvs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+
+		if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		totalDeleted += len(elems)
+
+		// Advance cursor past the last key in this batch by appending a
+		// zero byte to create a key strictly greater than the last one.
+		lastKey := kvs[len(kvs)-1].Key
+		cursor = make([]byte, len(lastKey)+1)
+		copy(cursor, lastKey)
 	}
 
-	if len(kvs) == 0 {
-		conn.WriteInt(0)
-		return
-	}
-
-	elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
-	for _, pair := range kvs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-	}
-
-	if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	conn.WriteInt(len(elems))
+	conn.WriteInt(totalDeleted)
 }
 
 func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
