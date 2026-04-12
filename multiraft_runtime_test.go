@@ -224,4 +224,31 @@ func TestEnsureRaftEngineDataDir(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, raftEngineEtcd, engineType)
 	})
+
+	t.Run("detects bare wal dir as etcd artifact", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "wal"), 0o755))
+		engineType, ok, err := detectRaftEngineFromDataDir(dir)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, raftEngineEtcd, engineType)
+	})
+
+	t.Run("detects bare snap dir as etcd artifact", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "snap"), 0o755))
+		engineType, ok, err := detectRaftEngineFromDataDir(dir)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, raftEngineEtcd, engineType)
+	})
+
+	t.Run("detects mixed engine artifacts with bare wal", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("dummy"), 0o600))
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "wal"), 0o755))
+		_, _, err := detectRaftEngineFromDataDir(dir)
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMixedRaftEngineArtifacts)
+	})
 }
