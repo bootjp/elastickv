@@ -141,6 +141,9 @@ func EncodeSortableFloat64(dst []byte, f float64) {
 	if len(dst) < zsetScoreBinarySize {
 		return
 	}
+	if f == 0 {
+		f = 0 // normalize -0.0 to +0.0
+	}
 	bits := math.Float64bits(f)
 	if bits&(1<<float64SignBitPos) != 0 { // negative
 		bits = ^bits

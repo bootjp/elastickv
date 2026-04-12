@@ -1466,6 +1466,9 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		// Track the bare key too for conflict detection on legacy fallback reads.
 		t.trackReadKey(key)
 	}
+	if userKey == nil && store.IsZSetInternalKey(key) {
+		userKey = store.ExtractZSetUserKey(key)
+	}
 	if userKey != nil {
 		t.trackReadKey(redisTTLKey(userKey))
 	}
@@ -2652,7 +2655,9 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	ttlKey := key
-	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+	if store.IsZSetInternalKey(key) {
+		ttlKey = store.ExtractZSetUserKey(key)
+	} else if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
 	}
 	expired, err := r.hasExpiredTTLAt(context.Background(), ttlKey, readTS)

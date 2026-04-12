@@ -131,6 +131,9 @@ func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
 	}
+	if store.IsZSetInternalKey(key) {
+		return store.ExtractZSetUserKey(key)
+	}
 	if bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
 		return bytes.TrimPrefix(key, []byte(redisTTLPrefix))
 	}
