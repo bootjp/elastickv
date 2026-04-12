@@ -1428,6 +1428,7 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 		redisStreamKey(key),
 		redisHLLKey(key),
 		redisStrKey(key),
+		key, // legacy bare key for fallback reads
 		redisTTLKey(key),
 	} {
 		t.trackReadKey(readKey)
@@ -1449,15 +1450,22 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		return tv, nil
 	}
 	t.trackReadKey(storageKey)
+	if !isKnownInternalKey(key) {
+		// Track the bare key too for conflict detection on legacy fallback reads.
+		t.trackReadKey(key)
+	}
 	if userKey != nil {
 		t.trackReadKey(redisTTLKey(userKey))
 	}
 	tv := &txnValue{}
 	var val []byte
-	isString := !isKnownInternalKey(key) || bytes.HasPrefix(key, []byte(redisStrPrefix))
-	if isString {
-		// For user string keys, use the fallback-aware reader with the bare key.
-		val, _ = t.server.readRedisStringAt(userKey, t.startTS)
+	if !isKnownInternalKey(key) {
+		// For bare user string keys, use the fallback-aware reader.
+		var err error
+		val, err = t.server.readRedisStringAt(key, t.startTS)
+		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+			return nil, errors.WithStack(err)
+		}
 	} else {
 		var err error
 		val, err = t.server.readValueAt(storageKey, t.startTS)

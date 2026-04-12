@@ -458,32 +458,19 @@ func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
 	r.flushDatabase(conn, true)
 }
 
-// flushlegacy deletes old unprefixed Redis string keys that were written before
-// the !redis|str| prefix migration. It scans all keys and deletes those that
-// do not start with "!" (the internal key prefix), which are the legacy bare
-// Redis string keys. This is a one-time migration operation.
-func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
-	if !r.coordinator.IsLeader() {
-		conn.WriteError("ERR FLUSHLEGACY must be run on the leader")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
-	defer cancel()
-
+// deleteLegacyKeys scans the full keyspace and deletes keys that do not belong
+// to any known internal prefix. Returns the number of user-visible legacy keys
+// deleted. If deleteTTL is true, also deletes associated TTL keys for each
+// legacy key (when called standalone); callers that already cleared TTL keys
+// via DEL_PREFIX should pass false.
+func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, deleteTTL bool) (int, error) {
 	const batchSize = 1000
 	var totalDeleted int
-	readTS := r.readTS()
-
-	// Scan the full keyspace in batches and delete keys that do not start
-	// with "!" (the internal key prefix). This covers legacy bare user keys
-	// regardless of their byte range.
 	var cursor []byte
 	for {
 		kvs, err := r.store.ScanAt(ctx, cursor, nil, batchSize, readTS)
 		if err != nil {
-			conn.WriteError(fmt.Sprintf("ERR scan: %s", err))
-			return
+			return totalDeleted, fmt.Errorf("scan: %w", err)
 		}
 		if len(kvs) == 0 {
 			break
@@ -495,15 +482,15 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 			if !isKnownInternalKey(pair.Key) {
 				legacyCount++
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-				// Also delete the associated TTL key to avoid orphaned metadata.
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(pair.Key)})
+				if deleteTTL {
+					elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(pair.Key)})
+				}
 			}
 		}
 
 		if len(elems) > 0 {
 			if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
-				conn.WriteError(err.Error())
-				return
+				return totalDeleted, err
 			}
 			totalDeleted += legacyCount
 		}
@@ -512,8 +499,30 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 		lastKey := kvs[len(kvs)-1].Key
 		cursor = make([]byte, len(lastKey)+1)
 		copy(cursor, lastKey)
+
+		// Yield briefly between batches to avoid saturating the Raft log.
+		time.Sleep(time.Millisecond)
+	}
+	return totalDeleted, nil
+}
+
+// flushlegacy deletes old unprefixed Redis string keys that were written before
+// the !redis|str| prefix migration. It scans all keys and deletes those that
+// do not match any known internal prefix. This is a one-time migration operation.
+func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
+	if !r.coordinator.IsLeader() {
+		conn.WriteError("ERR FLUSHLEGACY must be run on the leader")
+		return
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	defer cancel()
+
+	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS(), true)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
 	conn.WriteInt(totalDeleted)
 }
 
@@ -527,7 +536,7 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
 	defer cancel()
 
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -549,6 +558,14 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		}
 		return nil
 	}); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	// Also clean up any legacy bare keys so they don't "reappear" via the
+	// fallback read path. TTL keys are already deleted by the !redis| prefix
+	// delete above, so pass deleteTTL=false.
+	if _, err := r.deleteLegacyKeys(ctx, r.readTS(), false); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
