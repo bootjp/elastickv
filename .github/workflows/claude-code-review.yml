@@ -1,0 +1,170 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  review-data-loss:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Review - Data Loss Prevention
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          review_comment_prefix: "[Data Loss] "
+          prompt: |
+            あなたは分散KVSの「データロスト防止」専門レビュアーです。
+            以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+
+            ## レビュー観点: データロストがないか
+            - Write/Delete操作でデータが意図せず失われるパスがないか
+            - WAL(Write-Ahead Log)やRaftログへの書き込みが適切に永続化されているか
+            - エラーハンドリングの欠如によりデータが消失する可能性がないか
+            - トランザクションのコミット/ロールバック処理でデータが失われないか
+            - TTLやExpire処理で意図しないデータ削除が発生しないか
+            - スナップショットやバックアップに関連するデータ欠損リスクがないか
+
+            問題がなければ簡潔に「問題なし」と報告してください。
+
+  review-concurrency:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Review - Concurrency and Distributed Failures
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          review_comment_prefix: "[Concurrency] "
+          prompt: |
+            あなたは分散KVSの「並行性・分散障害」専門レビュアーです。
+            以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+
+            ## レビュー観点: 並行性/分散障害
+            - Race conditionやデッドロックの可能性がないか
+            - Mutex/RWMutexのロック順序が一貫しているか
+            - Raftのリーダー切り替え時に正しく動作するか
+            - ノード障害・ネットワーク分断時の挙動が安全か
+            - goroutineリークやチャネルのブロッキングがないか
+            - フォロワーからリーダーへのプロキシ処理が正しいか
+            - コンテキストのキャンセルやタイムアウト処理が適切か
+
+            問題がなければ簡潔に「問題なし」と報告してください。
+
+  review-performance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Review - Performance
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          review_comment_prefix: "[Performance] "
+          prompt: |
+            あなたは分散KVSの「性能」専門レビュアーです。
+            以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+
+            ## レビュー観点: 性能
+            - 不要なメモリアロケーションやコピーがないか
+            - O(N)以上の計算量を持つ処理がホットパスにないか
+            - バッチ処理可能な操作が逐次処理されていないか
+            - 不要なディスクI/Oやネットワーク通信がないか
+            - ロックの保持時間が長すぎないか
+            - スライスやマップの事前確保(cap指定)が適切か
+            - キーのスキャンやイテレーションが効率的か
+
+            問題がなければ簡潔に「問題なし」と報告してください。
+
+  review-consistency:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Review - Data Consistency
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          review_comment_prefix: "[Consistency] "
+          prompt: |
+            あなたは分散KVSの「データ一貫性」専門レビュアーです。
+            以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+
+            ## レビュー観点: データ一貫性
+            - Raftを経由すべき操作がローカルで直接実行されていないか
+            - 線形化可能性(Linearizability)が維持されているか
+            - リードインデックスの取得とデータ読み取りの一貫性があるか
+            - トランザクション内の読み取り・書き込みセットが正しく管理されているか
+            - キーのプレフィックスやエンコーディングが一貫しているか
+            - TTLとデータ本体の整合性が保たれているか
+            - レプリカ間でのデータ同期が正しく行われるか
+
+            問題がなければ簡潔に「問題なし」と報告してください。
+
+  review-test-coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Review - Test Coverage
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          review_comment_prefix: "[Test Coverage] "
+          prompt: |
+            あなたは分散KVSの「テスト網羅性」専門レビュアーです。
+            以下の観点に絞ってPRの差分をレビューしてください。他の観点には触れないでください。
+
+            ## レビュー観点: テスト網羅
+            - 追加・変更されたロジックに対応するテストが存在するか
+            - エッジケース(空値、境界値、nil、大量データ)がテストされているか
+            - エラーパス・異常系のテストがあるか
+            - 並行アクセスのテストが必要な変更にテストがあるか
+            - 既存テストが変更により壊れていないか
+            - 分散環境(マルチノード)でのテストが必要な変更か
+            - テストが不足している場合、具体的なテストケースを提案してください
+
+            問題がなければ簡潔に「問題なし」と報告してください。
