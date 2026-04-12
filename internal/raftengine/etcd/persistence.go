@@ -146,8 +146,15 @@ func saveSplitState(dataDir string, state persistedState) error {
 }
 
 func cleanupReplaceTempFiles(dataDir string) error {
+	return errors.WithStack(errors.CombineErrors(
+		cleanupReplaceTempFilesForNames(dataDir, stateFileName, metadataFileName, entriesFileName, snapshotDataFileName),
+		cleanupReplaceTempFilesForNames(dataDir, peersFileName),
+	))
+}
+
+func cleanupReplaceTempFilesForNames(dataDir string, names ...string) error {
 	var err error
-	for _, name := range [...]string{stateFileName, metadataFileName, entriesFileName, snapshotDataFileName} {
+	for _, name := range names {
 		matches, globErr := filepath.Glob(filepath.Join(dataDir, name+".tmp-*"))
 		if globErr != nil {
 			err = errors.CombineErrors(err, errors.WithStack(globErr))
@@ -366,8 +373,20 @@ func writeU32(w io.Writer, v uint32) error {
 	return errors.WithStack(binary.Write(w, binary.BigEndian, v))
 }
 
+func writeU64(w io.Writer, v uint64) error {
+	return errors.WithStack(binary.Write(w, binary.BigEndian, v))
+}
+
 func readU32(r io.Reader) (uint32, error) {
 	var v uint32
+	if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return v, nil
+}
+
+func readU64(r io.Reader) (uint64, error) {
+	var v uint64
 	if err := binary.Read(r, binary.BigEndian, &v); err != nil {
 		return 0, errors.WithStack(err)
 	}

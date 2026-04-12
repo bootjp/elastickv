@@ -42,13 +42,32 @@ jobs:
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
-      - name: Launch demo cluster
+      - name: Launch etcd-backed cluster
         run: |
           set -euo pipefail
-          mkdir -p "$GOCACHE" /tmp/go-tmp
+          mkdir -p "$GOCACHE" /tmp/go-tmp /tmp/elastickv-ci
           export GOTMPDIR=/tmp/go-tmp
-          nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
-          echo $! > /tmp/elastickv-demo.pid
+          BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
+          RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
+          RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
+
+          : > /tmp/elastickv-demo.pid
+          for node in 1 2 3; do
+            nohup go run . \
+              --address "127.0.0.1:5005${node}" \
+              --redisAddress "127.0.0.1:6379${node}" \
+              --dynamoAddress "127.0.0.1:6380${node}" \
+              --s3Address "127.0.0.1:6390${node}" \
+              --metricsAddress "" \
+              --pprofAddress "" \
+              --raftId "n${node}" \
+              --raftDataDir "/tmp/elastickv-ci/n${node}" \
+              --raftBootstrapMembers "$BOOTSTRAP_MEMBERS" \
+              --raftRedisMap "$RAFT_REDIS_MAP" \
+              --raftS3Map "$RAFT_S3_MAP" \
+              > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
+            echo $! >> /tmp/elastickv-demo.pid
+          done
 
           echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
           for i in {1..90}; do
@@ -62,7 +81,9 @@ jobs:
           done
 
           echo "Demo cluster failed to start; dumping log:"
-          tail -n 200 /tmp/elastickv-demo.log || true
+          tail -n 200 /tmp/elastickv-demo-n1.log || true
+          tail -n 200 /tmp/elastickv-demo-n2.log || true
+          tail -n 200 /tmp/elastickv-demo-n3.log || true
           exit 1
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
@@ -83,7 +104,8 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/elastickv-demo.pid ]; then
-            pid=$(cat /tmp/elastickv-demo.pid)
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+            while read -r pid; do
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            done < /tmp/elastickv-demo.pid
           fi
