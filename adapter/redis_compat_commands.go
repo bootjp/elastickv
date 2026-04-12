@@ -546,15 +546,17 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		// Delete only Redis-related keys. Two DEL_PREFIX operations cover
+		// Delete only Redis-related keys. Three DEL_PREFIX operations cover
 		// all Redis namespaces: "!redis|" (str, hash, set, zset, hll,
-		// stream, ttl) and "!lst|" (list meta + items).
+		// stream, ttl), "!lst|" (list meta + items), and "!zs|" (zset
+		// wide-column meta/member/score).
 		// Legacy bare keys are NOT deleted here to avoid a full keyspace
 		// scan. Run FLUSHLEGACY first to clean up legacy data.
 		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.DelPrefix, Key: []byte("!redis|")},
 				{Op: kv.DelPrefix, Key: []byte("!lst|")},
+				{Op: kv.DelPrefix, Key: []byte("!zs|")},
 			},
 		})
 		if err != nil {
