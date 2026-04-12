@@ -21,7 +21,7 @@ func TestCleanupStaleSnapshotSpools(t *testing.T) {
 
 	// Create an unrelated file that must not be removed.
 	unrelated := filepath.Join(dir, "keep-me.txt")
-	require.NoError(t, os.WriteFile(unrelated, []byte("data"), 0o644))
+	require.NoError(t, os.WriteFile(unrelated, []byte("data"), 0o600))
 
 	matches, err := filepath.Glob(filepath.Join(dir, snapshotSpoolPattern))
 	require.NoError(t, err)
@@ -44,12 +44,16 @@ func TestCleanupStaleSnapshotSpoolsEmptyDir(t *testing.T) {
 	require.NoError(t, cleanupStaleSnapshotSpools(dir))
 }
 
+func TestCleanupStaleSnapshotSpoolsNonExistentDir(t *testing.T) {
+	require.NoError(t, cleanupStaleSnapshotSpools(filepath.Join(t.TempDir(), "no-such-dir")))
+}
+
 // createSnapFile creates a fake .snap file with the etcd naming convention.
 func createSnapFile(t *testing.T, dir string, term, index uint64) string {
 	t.Helper()
 	name := fmt.Sprintf("%016x-%016x.snap", term, index)
 	path := filepath.Join(dir, name)
-	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o600))
 	return path
 }
 
@@ -63,7 +67,7 @@ func TestPurgeOldSnapFiles(t *testing.T) {
 
 	// Create a non-snap file that must be preserved.
 	other := filepath.Join(dir, "db.tmp.12345")
-	require.NoError(t, os.WriteFile(other, []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("x"), 0o600))
 
 	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
 
