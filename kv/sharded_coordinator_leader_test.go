@@ -19,11 +19,11 @@ func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	r, stop := newSingleRaft(t, "shard-leader", NewKvFSM(st))
 	t.Cleanup(stop)
 
-	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
-	}, 1, NewHLC(), NewShardStore(engine, map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
-	}))
+	re := hashicorpraftengine.New(r)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: re, Store: st, Txn: NewLeaderProxyWithEngine(re)},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
 
 	require.NoError(t, coord.VerifyLeader())
 	require.NoError(t, coord.VerifyLeaderForKey([]byte("b")))

@@ -372,9 +372,11 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	raft2, stop2 := newSingleRaftForS3Test(t, "g2", kv.NewKvFSM(store2))
 	defer stop2()
 
+	engine1 := hashicorpraftengine.New(raft1)
+	engine2 := hashicorpraftengine.New(raft2)
 	groups := map[uint64]*kv.ShardGroup{
-		1: {Engine: hashicorpraftengine.New(raft1), Store: store1, Txn: kv.NewLeaderProxyWithEngine(hashicorpraftengine.New(raft1))},
-		2: {Engine: hashicorpraftengine.New(raft2), Store: store2, Txn: kv.NewLeaderProxyWithEngine(hashicorpraftengine.New(raft2))},
+		1: {Engine: engine1, Store: store1, Txn: kv.NewLeaderProxyWithEngine(engine1)},
+		2: {Engine: engine2, Store: store2, Txn: kv.NewLeaderProxyWithEngine(engine2)},
 	}
 	shardStore := kv.NewShardStore(engine, groups)
 	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), shardStore)

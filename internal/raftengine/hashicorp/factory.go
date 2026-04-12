@@ -52,18 +52,16 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 		return nil, err
 	}
 
-	cleanup := func() {
-		if tm != nil {
-			_ = tm.Close()
-		}
-		if rs != nil {
-			_ = rs.Close()
-		}
+	cleanup := func() error {
+		return errors.CombineErrors(
+			closeIfNotNil(tm),
+			closeIfNotNil(rs),
+		)
 	}
 
 	if cfg.Bootstrap {
 		if err := bootstrapCluster(r, cfg); err != nil {
-			cleanup()
+			_ = cleanup()
 			return nil, err
 		}
 	}
@@ -188,4 +186,12 @@ func (a *snapshotFSMAdapter) Persist(sink raft.SnapshotSink) error {
 
 func (a *snapshotFSMAdapter) Release() {
 	_ = a.snap.Close()
+}
+
+// closeIfNotNil closes c if it is not nil and returns the error.
+func closeIfNotNil(c io.Closer) error {
+	if c == nil {
+		return nil
+	}
+	return errors.WithStack(c.Close())
 }

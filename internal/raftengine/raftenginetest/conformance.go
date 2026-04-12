@@ -138,7 +138,7 @@ func createSingleNode(t *testing.T, factory raftengine.Factory, dir string, sm *
 	t.Cleanup(func() {
 		_ = result.Engine.Close()
 		if result.Close != nil {
-			result.Close()
+			_ = result.Close()
 		}
 	})
 
@@ -229,7 +229,7 @@ func testCloseAndReopen(t *testing.T, factory raftengine.Factory) {
 
 	_ = result1.Engine.Close()
 	if result1.Close != nil {
-		result1.Close()
+		_ = result1.Close()
 	}
 
 	// Second open: verify data persisted
@@ -244,7 +244,7 @@ func testCloseAndReopen(t *testing.T, factory raftengine.Factory) {
 	t.Cleanup(func() {
 		_ = result2.Engine.Close()
 		if result2.Close != nil {
-			result2.Close()
+			_ = result2.Close()
 		}
 	})
 

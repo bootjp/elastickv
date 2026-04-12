@@ -19,7 +19,7 @@ type FactoryResult struct {
 	// Close releases engine-specific resources that are not owned by
 	// Engine.Close (e.g. raft log stores, transport managers). Callers
 	// must still call Engine.Close separately.
-	Close func()
+	Close func() error
 }
 
 // Factory creates raft engine instances. Engine-specific configuration

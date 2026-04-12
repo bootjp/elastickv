@@ -19,7 +19,7 @@ type raftGroupRuntime struct {
 	store  store.MVCCStore
 
 	registerTransport func(grpc.ServiceRegistrar)
-	closeFactory      func() // releases factory-created resources (transport, stores)
+	closeFactory      func() error // releases factory-created resources (transport, stores)
 }
 
 const raftEngineMarkerPerm = 0o600
@@ -58,7 +58,7 @@ func (r *raftGroupRuntime) Close() {
 		r.engine = nil
 	}
 	if r.closeFactory != nil {
-		r.closeFactory()
+		_ = r.closeFactory()
 		r.closeFactory = nil
 	}
 	if r.store != nil {

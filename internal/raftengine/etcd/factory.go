@@ -65,10 +65,10 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 	}
 
 	var register func(grpc.ServiceRegistrar)
-	var closeFunc func()
+	var closeFunc func() error
 	if transport != nil {
 		register = transport.Register
-		closeFunc = func() { _ = transport.Close() }
+		closeFunc = func() error { return errors.WithStack(transport.Close()) }
 	}
 
 	return &raftengine.FactoryResult{

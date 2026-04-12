@@ -109,7 +109,7 @@ func TestMigrateFSMStoreSeedsHashicorpDataDir(t *testing.T) {
 	t.Cleanup(func() {
 		_ = result.Engine.Close()
 		if result.Close != nil {
-			result.Close()
+			_ = result.Close()
 		}
 	})
 
