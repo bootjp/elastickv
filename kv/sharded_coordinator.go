@@ -615,6 +615,10 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint6
 // validateReadOnlyShards checks read-write conflicts on shards that have
 // read keys but no mutations in this transaction. writeGIDs is the set of
 // shards that already received a PREPARE with their readKeys attached.
+//
+// Because these shards have no mutations, we cannot send a PREPARE request
+// (the FSM rejects empty mutation lists). Instead we validate directly
+// against each shard's store by checking LatestCommitTS for each read key.
 func (c *ShardedCoordinator) validateReadOnlyShards(groupedReadKeys map[uint64][][]byte, writeGIDs []uint64, startTS uint64) error {
 	if len(groupedReadKeys) == 0 {
 		return nil
@@ -623,6 +627,7 @@ func (c *ShardedCoordinator) validateReadOnlyShards(groupedReadKeys map[uint64][
 	for _, gid := range writeGIDs {
 		writeSet[gid] = struct{}{}
 	}
+	ctx := context.Background()
 	for gid, keys := range groupedReadKeys {
 		if _, isWrite := writeSet[gid]; isWrite {
 			continue
@@ -631,15 +636,14 @@ func (c *ShardedCoordinator) validateReadOnlyShards(groupedReadKeys map[uint64][
 		if !ok {
 			continue
 		}
-		// Send a read-only validation request: no mutations, only readKeys.
-		req := &pb.Request{
-			IsTxn:    true,
-			Phase:    pb.Phase_PREPARE,
-			Ts:       startTS,
-			ReadKeys: keys,
-		}
-		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
-			return errors.WithStack(err)
+		for _, key := range keys {
+			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			if exists && ts > startTS {
+				return errors.WithStack(store.NewWriteConflictError(key))
+			}
 		}
 	}
 	return nil
