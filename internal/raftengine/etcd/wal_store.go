@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
@@ -338,6 +339,45 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	return snapshot, nil
+}
+
+// defaultMaxSnapFiles is the number of .snap files to retain in the snap
+// directory. etcd itself purges old snap files via fileutil.PurgeFile; the
+// elastickv etcd engine must do this explicitly.
+const defaultMaxSnapFiles = 3
+
+// purgeOldSnapFiles removes old .snap files from snapDir, keeping the most
+// recent maxSnap files. Snap file names encode term and index in hex and sort
+// lexicographically from oldest to newest, matching etcd's Snapshotter
+// convention.
+func purgeOldSnapFiles(snapDir string, maxSnap int) error {
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	var snaps []string
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".snap" {
+			snaps = append(snaps, e.Name())
+		}
+	}
+
+	if len(snaps) <= maxSnap {
+		return nil
+	}
+
+	// Sort ascending (oldest first) — snap names are zero-padded hex so
+	// lexicographic order equals chronological order.
+	sort.Strings(snaps)
+
+	var combined error
+	for _, name := range snaps[:len(snaps)-maxSnap] {
+		if removeErr := os.Remove(filepath.Join(snapDir, name)); removeErr != nil && !os.IsNotExist(removeErr) {
+			combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
+		}
+	}
+	return errors.WithStack(combined)
 }
 
 func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload []byte) (raftpb.Snapshot, error) {

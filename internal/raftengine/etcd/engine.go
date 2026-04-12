@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -1317,6 +1318,11 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if err := e.persist.Release(snap); err != nil {
 		return errors.WithStack(err)
 	}
+
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if purgeErr := purgeOldSnapFiles(snapDir, defaultMaxSnapFiles); purgeErr != nil {
+		return errors.Wrap(purgeErr, "purge old snap files")
+	}
 	return nil
 }
 
@@ -2262,16 +2268,18 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
 	switch {
 	case err == nil:
-		return nil
 	case errors.Is(err, etcdraft.ErrCompacted):
-		return nil
 	case errors.Is(err, etcdraft.ErrUnavailable):
-		return nil
 	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
-		return nil
 	default:
 		return err
 	}
+
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if purgeErr := purgeOldSnapFiles(snapDir, defaultMaxSnapFiles); purgeErr != nil {
+		return errors.Wrap(purgeErr, "purge old snap files")
+	}
+	return nil
 }
 
 func encodeReadContext(id uint64) []byte {

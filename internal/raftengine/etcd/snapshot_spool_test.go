@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,4 +42,67 @@ func TestCleanupStaleSnapshotSpools(t *testing.T) {
 func TestCleanupStaleSnapshotSpoolsEmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, cleanupStaleSnapshotSpools(dir))
+}
+
+// createSnapFile creates a fake .snap file with the etcd naming convention.
+func createSnapFile(t *testing.T, dir string, term, index uint64) string {
+	t.Helper()
+	name := fmt.Sprintf("%016x-%016x.snap", term, index)
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o644))
+	return path
+}
+
+func TestPurgeOldSnapFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create 6 snap files at increasing indices.
+	for i := uint64(1); i <= 6; i++ {
+		createSnapFile(t, dir, 1, i*10000)
+	}
+
+	// Create a non-snap file that must be preserved.
+	other := filepath.Join(dir, "db.tmp.12345")
+	require.NoError(t, os.WriteFile(other, []byte("x"), 0o644))
+
+	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	var snaps []string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".snap" {
+			snaps = append(snaps, e.Name())
+		}
+	}
+
+	// Only the newest 3 should remain.
+	require.Len(t, snaps, 3)
+	require.Equal(t, fmt.Sprintf("%016x-%016x.snap", 1, uint64(40000)), snaps[0])
+	require.Equal(t, fmt.Sprintf("%016x-%016x.snap", 1, uint64(50000)), snaps[1])
+	require.Equal(t, fmt.Sprintf("%016x-%016x.snap", 1, uint64(60000)), snaps[2])
+
+	// Non-snap file preserved.
+	_, err = os.Stat(other)
+	require.NoError(t, err)
+}
+
+func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
+	dir := t.TempDir()
+
+	// Only 2 files — under the limit of 3, nothing should be removed.
+	createSnapFile(t, dir, 1, 1000)
+	createSnapFile(t, dir, 1, 2000)
+
+	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+}
+
+func TestPurgeOldSnapFilesEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, purgeOldSnapFiles(dir, defaultMaxSnapFiles))
 }
