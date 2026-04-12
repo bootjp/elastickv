@@ -68,6 +68,10 @@ func ParsePeers(raw string) ([]MigrationPeer, error) {
 //
 // The source FSM store (fsm.db) is read-only and shared between both engines;
 // this function only creates the hashicorp-specific artifacts.
+//
+// IMPORTANT: The source engine must be fully stopped before running this
+// tool. Running it against a live engine may produce an inconsistent
+// snapshot that is missing recently applied entries.
 func MigrateFSMStore(storePath string, destDataDir string, peers []MigrationPeer) (*MigrationStats, error) {
 	destDataDir, tempDir, err := prepareMigrationDest(storePath, destDataDir, peers)
 	if err != nil {
