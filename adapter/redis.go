@@ -1923,7 +1923,11 @@ func (t *txnContext) commit() error {
 		return nil
 	}
 
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS}
+	readKeys := make([][]byte, 0, len(t.readKeys))
+	for _, k := range t.readKeys {
+		readKeys = append(readKeys, k)
+	}
+	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS, ReadKeys: readKeys}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {

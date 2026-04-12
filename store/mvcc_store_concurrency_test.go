@@ -278,7 +278,7 @@ func TestMVCCConcurrentApplyMutations(t *testing.T) {
 						Value: []byte(fmt.Sprintf("g%d-r%d", goroutineID, i)),
 					},
 				}
-				err := st.ApplyMutations(ctx, mutations, startTS, commitTS)
+				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
 				if err == nil {
 					successCount.Add(1)
 					continue
@@ -349,7 +349,7 @@ func TestMVCCConcurrentApplyMutationsMultiKey(t *testing.T) {
 					{Op: OpTypePut, Key: keyA, Value: []byte(fmt.Sprintf("a-g%d-r%d", goroutineID, i))},
 					{Op: OpTypePut, Key: keyB, Value: []byte(fmt.Sprintf("b-g%d-r%d", goroutineID, i))},
 				}
-				err := st.ApplyMutations(ctx, mutations, startTS, commitTS)
+				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
 				if err == nil {
 					successCount.Add(1)
 					continue

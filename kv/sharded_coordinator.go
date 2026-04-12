@@ -90,7 +90,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.StartTS, reqs.CommitTS, reqs.Elems)
+		return c.dispatchTxn(reqs.StartTS, reqs.CommitTS, reqs.Elems, reqs.ReadKeys)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -193,7 +193,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	grouped, gids, err := c.groupMutations(elems)
 	if err != nil {
 		return nil, err
@@ -209,7 +209,7 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 	}
 
 	if len(gids) == 1 {
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
 	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
@@ -241,13 +241,13 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 	return commitTS, nil
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems),
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

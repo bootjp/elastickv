@@ -272,7 +272,7 @@ func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
 
 			err := s.ApplyMutations(ctx, []*KVPairMutation{
 				{Op: OpTypePut, Key: key, Value: []byte("val")},
-			}, startTS, commitTS)
+			}, nil, startTS, commitTS)
 			r := result{}
 			if err == nil {
 				r.success++

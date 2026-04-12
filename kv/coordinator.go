@@ -75,7 +75,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS)
+		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS, reqs.ReadKeys)
 	}
 
 	return c.dispatchRaw(reqs.Elems)
@@ -122,7 +122,7 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64, readKeys [][]byte) (*CoordinateResponse, error) {
 	primary := primaryKeyForElems(reqs)
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
@@ -144,7 +144,7 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint
 	}
 
 	r, err := c.transactionManager.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primary, reqs),
+		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -258,7 +258,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			commitTS = 0
 		}
 		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems),
+			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
 		}
 	} else {
 		for _, req := range reqs.Elems {
@@ -318,7 +318,7 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP]) *pb.Request {
+func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
 	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
 	for _, req := range reqs {
@@ -329,6 +329,7 @@ func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Ele
 		Phase:     pb.Phase_NONE,
 		Ts:        startTS,
 		Mutations: muts,
+		ReadKeys:  readKeys,
 	}
 }
 

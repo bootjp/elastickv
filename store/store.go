@@ -129,10 +129,11 @@ type MVCCStore interface {
 	// The boolean reports whether the key has any version.
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
-	// It must return ErrWriteConflict if any key has a newer commit timestamp
-	// than startTS. Note: only write-write conflicts are detected (Snapshot
-	// Isolation). Read-write conflicts (write skew) are not prevented.
-	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
+	// It must return ErrWriteConflict if any mutation key or any read key has
+	// a newer commit timestamp than startTS. readKeys carries the transaction's
+	// read set for read-write conflict detection; pass nil when no read set
+	// validation is needed.
+	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.

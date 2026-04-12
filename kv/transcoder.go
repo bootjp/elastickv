@@ -29,4 +29,7 @@ type OperationGroup[T OP] struct {
 	// CommitTS optionally pins the transaction commit timestamp.
 	// Coordinators choose one automatically when this is zero.
 	CommitTS uint64
+	// ReadKeys carries the transaction's read set so the FSM can validate
+	// read-write conflicts atomically with the commit.
+	ReadKeys [][]byte
 }

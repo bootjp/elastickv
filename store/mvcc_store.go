@@ -475,13 +475,18 @@ func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool,
 	return ver.TS, true, nil
 }
 
-func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error {
+func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	for _, mut := range mutations {
 		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
 			return NewWriteConflictError(mut.Key)
+		}
+	}
+	for _, key := range readKeys {
+		if latestVer, ok := s.latestVersionLocked(key); ok && latestVer.TS > startTS {
+			return NewWriteConflictError(key)
 		}
 	}
 

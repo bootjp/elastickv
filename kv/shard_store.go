@@ -1116,7 +1116,7 @@ func cleanupTSWithNow(startTS, now uint64) uint64 {
 //
 // All mutations must belong to the same shard. Cross-shard mutation batches are
 // not supported.
-func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, startTS, commitTS uint64) error {
+func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	if len(mutations) == 0 {
 		return nil
 	}
@@ -1135,7 +1135,7 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 			return errors.WithStack(ErrCrossShardMutationBatchNotSupported)
 		}
 	}
-	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, startTS, commitTS))
+	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.

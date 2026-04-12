@@ -861,6 +861,19 @@ func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMut
 	return nil
 }
 
+func (s *pebbleStore) checkReadConflicts(_ context.Context, readKeys [][]byte, startTS uint64) error {
+	for _, key := range readKeys {
+		ts, exists, err := s.latestCommitTS(context.Background(), key)
+		if err != nil {
+			return err
+		}
+		if exists && ts > startTS {
+			return NewWriteConflictError(key)
+		}
+	}
+	return nil
+}
+
 func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64) error {
 	for _, mut := range mutations {
 		k := encodeKey(mut.Key, commitTS)
@@ -884,7 +897,7 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 	return nil
 }
 
-func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error {
+func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -897,6 +910,9 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	defer b.Close()
 
 	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
+		return err
+	}
+	if err := s.checkReadConflicts(ctx, readKeys, startTS); err != nil {
 		return err
 	}
 

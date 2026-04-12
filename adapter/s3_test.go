@@ -1916,7 +1916,7 @@ func TestS3Server_BackwardCompatibility_NoBucketAclFieldIsPrivate(t *testing.T) 
 	commitTS := coord.Clock().Next()
 	err = st.ApplyMutations(context.Background(), []*store.KVPairMutation{
 		{Op: store.OpTypePut, Key: s3keys.BucketMetaKey("legacy-bucket"), Value: legacyJSON},
-	}, commitTS-1, commitTS)
+	}, nil, commitTS-1, commitTS)
 	require.NoError(t, err)
 
 	// Create a server WITH credentials; the legacy bucket has no acl field.

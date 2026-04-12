@@ -26,7 +26,7 @@ func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
 
-	err = s.ApplyMutations(ctx, mutations, 0, 10)
+	err = s.ApplyMutations(ctx, mutations, nil, 0, 10)
 	require.NoError(t, err)
 
 	// Both keys should be readable at commitTS.
@@ -58,7 +58,7 @@ func TestPebbleStore_ApplyMutations_Delete(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypeDelete, Key: []byte("k1")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 20)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 20)
 	require.NoError(t, err)
 
 	// After the delete, key should be a tombstone.
@@ -82,7 +82,7 @@ func TestPebbleStore_ApplyMutations_PutWithTTL(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1"), ExpireAt: 50},
 	}
-	err = s.ApplyMutations(ctx, mutations, 0, 10)
+	err = s.ApplyMutations(ctx, mutations, nil, 0, 10)
 	require.NoError(t, err)
 
 	// Visible before expiry.
@@ -113,7 +113,7 @@ func TestPebbleStore_ApplyMutations_WriteConflict(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 30)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 30)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrWriteConflict), "expected ErrWriteConflict, got %v", err)
 
@@ -143,7 +143,7 @@ func TestPebbleStore_ApplyMutations_NoConflictWhenStartTSGECommit(t *testing.T) 
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 20)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 20)
 	require.NoError(t, err)
 
 	val, err := s.GetAt(ctx, []byte("k1"), 20)
@@ -164,14 +164,14 @@ func TestPebbleStore_ApplyMutations_UpdatesLastCommitTS(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
 	}
-	require.NoError(t, s.ApplyMutations(ctx, mutations, 0, 100))
+	require.NoError(t, s.ApplyMutations(ctx, mutations, nil, 0, 100))
 	assert.Equal(t, uint64(100), s.LastCommitTS())
 
 	// A second apply with a higher commitTS advances lastCommitTS.
 	mutations2 := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
-	require.NoError(t, s.ApplyMutations(ctx, mutations2, 100, 200))
+	require.NoError(t, s.ApplyMutations(ctx, mutations2, nil, 100, 200))
 	assert.Equal(t, uint64(200), s.LastCommitTS())
 }
 
@@ -191,7 +191,7 @@ func TestPebbleStore_ApplyMutations_Atomicity(t *testing.T) {
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 60)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 60)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrWriteConflict))
 
