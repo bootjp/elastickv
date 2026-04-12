@@ -541,7 +541,7 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -552,6 +552,8 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		// Delete only Redis-related keys. Two DEL_PREFIX operations cover
 		// all Redis namespaces: "!redis|" (str, hash, set, zset, hll,
 		// stream, ttl) and "!lst|" (list meta + items).
+		// Legacy bare keys are NOT deleted here to avoid a full keyspace
+		// scan. Run FLUSHLEGACY first to clean up legacy data.
 		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.DelPrefix, Key: []byte("!redis|")},
@@ -563,14 +565,6 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		}
 		return nil
 	}); err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
-	// Also clean up any legacy bare keys so they don't "reappear" via the
-	// fallback read path. TTL keys are already deleted by the !redis| prefix
-	// delete above, so pass deleteTTL=false.
-	if _, err := r.deleteLegacyKeys(ctx, r.readTS(), false); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
