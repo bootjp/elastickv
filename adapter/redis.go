@@ -1988,6 +1988,7 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		if st.deleted {
 			if meta, ok := listDeleteMeta(st); ok {
 				elems = appendListDeleteOps(elems, userKey, meta)
+				elems = t.appendDeltaClaimDelOps(elems, userKey)
 			}
 			continue
 		}
@@ -1996,6 +1997,7 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		}
 		if st.purge {
 			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
+			elems = t.appendDeltaClaimDelOps(elems, userKey)
 		}
 
 		startSeq := st.meta.Head + st.meta.Len
@@ -2014,8 +2016,53 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 			return nil, errors.WithStack(err)
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(userKey), Value: metaBytes})
+		// Delete existing delta keys to prevent double-counting.
+		elems = t.appendDeltaDelOps(elems, userKey)
 	}
 	return elems, nil
+}
+
+// listDeltaKeys scans for existing delta keys belonging to userKey.
+// appendDeltaDelOps appends Del ops for all existing delta keys.
+func (t *txnContext) appendDeltaDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
+	for _, dk := range t.listDeltaKeys(userKey) {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+	}
+	return elems
+}
+
+// appendDeltaClaimDelOps appends Del ops for all existing delta and claim keys.
+func (t *txnContext) appendDeltaClaimDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
+	for _, dk := range t.listDeltaAndClaimKeys(userKey) {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+	}
+	return elems
+}
+
+// listDeltaAndClaimKeys scans for existing delta and claim keys for userKey.
+func (t *txnContext) listDeltaAndClaimKeys(userKey []byte) [][]byte {
+	keys := t.listDeltaKeys(userKey)
+	claimPrefix := store.ListClaimScanPrefix(userKey)
+	claims, err := t.server.store.ScanAt(context.Background(), claimPrefix, store.PrefixScanEnd(claimPrefix), maxDeltaScanLimit, t.startTS)
+	if err == nil {
+		for _, c := range claims {
+			keys = append(keys, bytes.Clone(c.Key))
+		}
+	}
+	return keys
+}
+
+func (t *txnContext) listDeltaKeys(userKey []byte) [][]byte {
+	prefix := store.ListMetaDeltaScanPrefix(userKey)
+	deltas, err := t.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), maxDeltaScanLimit, t.startTS)
+	if err != nil {
+		return nil
+	}
+	keys := make([][]byte, 0, len(deltas))
+	for _, d := range deltas {
+		keys = append(keys, bytes.Clone(d.Key))
+	}
+	return keys
 }
 
 func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
