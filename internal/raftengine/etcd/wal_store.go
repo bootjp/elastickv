@@ -39,12 +39,12 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, cfg.StateMachine, peers)
+		return loadWalState(logger, walDir, snapDir, cfg.StateMachine)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
 	if legacyErr == nil {
-		return migrateLegacyState(logger, walDir, snapDir, cfg.StateMachine, legacy, peers)
+		return migrateLegacyState(logger, walDir, snapDir, cfg.StateMachine, legacy)
 	}
 	if legacyErr != nil && !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
 		return nil, legacyErr
@@ -72,13 +72,13 @@ func bootstrapWalState(logger *zap.Logger, walDir string, snapDir string, fsm St
 	return persistBootState(logger, walDir, snapDir, fsm, boot)
 }
 
-func loadWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
+func loadWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine) (*diskState, error) {
 	snapshotter := snap.New(logger, snapDir)
 	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
 	if err != nil {
 		return nil, err
 	}
-	if err := restoreSnapshotState(fsm, snapshot, peers); err != nil {
+	if err := restoreSnapshotState(fsm, snapshot); err != nil {
 		return nil, err
 	}
 
@@ -126,13 +126,13 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, peers []Peer) error {
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot) error {
 	if !etcdraft.IsEmptySnap(snapshot) && len(snapshot.Data) > 0 && fsm != nil {
 		if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
 			return errors.WithStack(err)
 		}
 	}
-	return validateConfState(snapshot.Metadata.ConfState, peers)
+	return nil
 }
 
 func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
@@ -143,14 +143,11 @@ func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
 	}
 }
 
-func migrateLegacyState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, state persistedState, peers []Peer) (*diskState, error) {
+func migrateLegacyState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
 	if !etcdraft.IsEmptySnap(state.Snapshot) && len(state.Snapshot.Data) > 0 {
 		if err := fsm.Restore(bytes.NewReader(state.Snapshot.Data)); err != nil {
 			return nil, errors.WithStack(err)
 		}
-	}
-	if err := validateConfState(state.Snapshot.Metadata.ConfState, peers); err != nil {
-		return nil, err
 	}
 	return persistBootState(logger, walDir, snapDir, fsm, state)
 }
@@ -160,7 +157,7 @@ func persistBootState(logger *zap.Logger, walDir string, snapDir string, fsm Sta
 		return nil, err
 	}
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsm, nil)
+		return loadWalState(logger, walDir, snapDir, fsm)
 	}
 
 	w, err := wal.Create(logger, walDir, nil)

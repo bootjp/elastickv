@@ -19,6 +19,8 @@
    [nil "--grpc-port PORT" "gRPC/Raft port."
     :default 50051
     :parse-fn #(Integer/parseInt %)]
+   [nil "--raft-engine ENGINE" "Raft engine implementation (etcd or hashicorp)."
+    :default "etcd"]
    [nil "--raft-groups GROUPS" "Comma separated raft groups (groupID=port,...)"
     :parse-fn (fn [s]
                 (->> (str/split s #",")
@@ -46,6 +48,12 @@
     :parse-fn #(Double/parseDouble %)]
    [nil "--concurrency N" "Number of worker threads."
     :default 5
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--key-count N" "Number of distinct keys."
+    :default nil
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--max-writes-per-key N" "Maximum writes per key before exhaustion."
+    :default nil
     :parse-fn #(Integer/parseInt %)]
    ["-h" "--help"]])
 

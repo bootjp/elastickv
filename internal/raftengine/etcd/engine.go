@@ -27,6 +27,7 @@ const (
 	defaultMaxSizePerMsg     = 1 << 20
 	defaultDispatchWorkers   = 4
 	defaultSnapshotEvery     = 10_000
+	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
 	defaultMaxPendingConfigs = 64
 	unknownLastContact       = time.Duration(-1)
@@ -127,13 +128,15 @@ type Engine struct {
 	dispatchWG   sync.WaitGroup
 	snapshotWG   sync.WaitGroup
 
-	mu          sync.RWMutex
-	pending     sync.Mutex
-	status      raftengine.Status
-	config      raftengine.Configuration
-	runErr      error
-	closed      bool
-	applied     uint64
+	mu      sync.RWMutex
+	pending sync.Mutex
+	status  raftengine.Status
+	config  raftengine.Configuration
+	runErr  error
+	closed  bool
+	applied uint64
+	// configIndex tracks the highest configuration index durably published to
+	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
 
 	lastLeaderContactAt   time.Time
@@ -215,42 +218,36 @@ type dispatchRequest struct {
 	msg raftpb.Message
 }
 
+type preparedOpenState struct {
+	cfg   OpenConfig
+	peers []Peer
+	disk  *diskState
+}
+
 // Open starts the etcd/raft backend.
 //
 // Single-node bootstrap waits for local leadership so callers can use the
 // engine immediately. Multi-node startup returns after the local node is
 // running; leadership is established asynchronously through raft transport.
 func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
-	cfg = normalizeConfig(cfg)
-	if err := validateConfig(cfg); err != nil {
-		return nil, err
-	}
-
-	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers)
+	prepared, err := prepareOpenState(cfg)
 	if err != nil {
 		return nil, err
 	}
-	cfg.NodeID = localPeer.NodeID
-	cfg.LocalID = localPeer.ID
-	cfg.LocalAddress = localPeer.Address
 
-	disk, err := openDiskState(cfg, peers)
+	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage)
 	if err != nil {
-		return nil, err
-	}
-	rawNode, err := newRawNode(cfg, disk.Storage)
-	if err != nil {
-		_ = closePersist(disk.Persist)
+		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
 
-	peerMap := make(map[uint64]Peer, len(peers))
-	for _, peer := range peers {
+	peerMap := make(map[uint64]Peer, len(prepared.peers))
+	for _, peer := range prepared.peers {
 		peerMap[peer.NodeID] = peer
 	}
 	var dispatchCtx context.Context
 	var dispatchCancel context.CancelFunc
-	if cfg.Transport != nil {
+	if prepared.cfg.Transport != nil {
 		dispatchCtx, dispatchCancel = context.WithCancel(context.Background())
 	}
 	opened := false
@@ -262,17 +259,17 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
-		nodeID:           cfg.NodeID,
-		localID:          cfg.LocalID,
-		localAddress:     cfg.LocalAddress,
-		dataDir:          cfg.DataDir,
-		tickInterval:     cfg.TickInterval,
-		storage:          disk.Storage,
+		nodeID:           prepared.cfg.NodeID,
+		localID:          prepared.cfg.LocalID,
+		localAddress:     prepared.cfg.LocalAddress,
+		dataDir:          prepared.cfg.DataDir,
+		tickInterval:     prepared.cfg.TickInterval,
+		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
-		persist:          disk.Persist,
-		fsm:              cfg.StateMachine,
+		persist:          prepared.disk.Persist,
+		fsm:              prepared.cfg.StateMachine,
 		peers:            peerMap,
-		transport:        cfg.Transport,
+		transport:        prepared.cfg.Transport,
 		proposeCh:        make(chan proposalRequest),
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
@@ -281,27 +278,63 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
-		config:           configurationFromConfState(peerMap, disk.LocalSnap.Metadata.ConfState),
-		applied:          maxAppliedIndex(disk.LocalSnap),
+		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
+		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 		pendingConfigs:   map[uint64]adminRequest{},
 	}
-	engine.configIndex.Store(maxAppliedIndex(disk.LocalSnap))
-	engine.initTransport(cfg)
+	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
 
 	go engine.run()
 
-	openedEngine, err := waitForOpen(ctx, engine, len(peers) == 1)
+	openedEngine, err := waitForOpen(ctx, engine, len(prepared.peers) == 1)
 	if err != nil {
 		return nil, err
 	}
 	opened = true
 	return openedEngine, nil
+}
+
+func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
+	cfg, persistedPeers, persistedPeersOK, err := normalizeOpenConfig(cfg)
+	if err != nil {
+		return preparedOpenState{}, err
+	}
+	if err := validateConfig(cfg); err != nil {
+		return preparedOpenState{}, err
+	}
+
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK)
+	if err != nil {
+		return preparedOpenState{}, err
+	}
+	cfg.NodeID = localPeer.NodeID
+	cfg.LocalID = localPeer.ID
+	cfg.LocalAddress = localPeer.Address
+
+	disk, err := openDiskState(cfg, peers)
+	if err != nil {
+		return preparedOpenState{}, err
+	}
+	if err := validateOpenPeers(disk.LocalSnap, peers, persistedPeers, persistedPeersOK); err != nil {
+		_ = closePersist(disk.Persist)
+		return preparedOpenState{}, err
+	}
+	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
+		_ = closePersist(disk.Persist)
+		return preparedOpenState{}, err
+	}
+	return preparedOpenState{
+		cfg:   cfg,
+		peers: peers,
+		disk:  disk,
+	}, nil
 }
 
 func (e *Engine) initTransport(cfg OpenConfig) {
@@ -325,7 +358,7 @@ func (e *Engine) initSnapshotWorker() {
 	// Local snapshot persistence is only wired for disk-backed engines. When
 	// persist is nil the prototype intentionally leaves snapshot workers nil
 	// and maybePersistLocalSnapshot becomes a no-op.
-	e.snapshotReqCh = make(chan snapshotRequest)
+	e.snapshotReqCh = make(chan snapshotRequest, defaultSnapshotQueueSize)
 	e.snapshotResCh = make(chan snapshotResult, 1)
 	e.snapshotStopCh = make(chan struct{})
 	e.startSnapshotWorker()
@@ -954,10 +987,14 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
 	select {
 	case <-e.doneCh:
-		_ = req.snapshot.Close()
+		if req.snapshot != nil {
+			_ = req.snapshot.Close()
+		}
 		return e.currentErrorOrClosed()
 	case <-e.snapshotStopCh:
-		_ = req.snapshot.Close()
+		if req.snapshot != nil {
+			_ = req.snapshot.Close()
+		}
 		return e.currentErrorOrClosed()
 	case e.snapshotReqCh <- req:
 		e.snapshotInFlight = true
@@ -978,7 +1015,8 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return errors.WithStack(err)
 			}
 			confState := e.rawNode.ApplyConfChange(cc)
-			if err := e.persistConfigSnapshot(entry.Index, *confState); err != nil {
+			nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
+			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
 			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
@@ -989,7 +1027,8 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return errors.WithStack(err)
 			}
 			confState := e.rawNode.ApplyConfChange(cc)
-			if err := e.persistConfigSnapshot(entry.Index, *confState); err != nil {
+			nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
+			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
 			e.applyConfigChangeV2(cc, entry.Index)
@@ -1044,7 +1083,7 @@ func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
 }
 
 func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
-	_, peer, ok := decodeConfChangeContext(context)
+	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
 		e.applyAddedPeer(nodeID, peer, ok)
@@ -1064,13 +1103,12 @@ func (e *Engine) applyAddedPeer(nodeID uint64, peer Peer, ok bool) {
 		e.upsertPeer(peer)
 		return
 	}
-	if nodeID == 0 {
+	if nodeID == 0 || e.hasPeer(nodeID) {
 		return
 	}
 	e.upsertPeer(Peer{
-		NodeID:  nodeID,
-		ID:      strconv.FormatUint(nodeID, 10),
-		Address: "",
+		NodeID: nodeID,
+		ID:     strconv.FormatUint(nodeID, 10),
 	})
 }
 
@@ -1096,6 +1134,63 @@ func (e *Engine) applyUpdatedPeer(peer Peer, ok bool) {
 	}
 }
 
+func applyConfigPeerChangeToMap(peers map[uint64]Peer, changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
+	peer, ok := decodeConfChangePeerContext(nodeID, context)
+	switch changeType {
+	case raftpb.ConfChangeAddNode:
+		applyAddedPeerToMap(peers, nodeID, peer, ok)
+	case raftpb.ConfChangeRemoveNode:
+		applyRemovedPeerToMap(peers, nodeID, peer, ok)
+	case raftpb.ConfChangeUpdateNode:
+		applyUpdatedPeerToMap(peers, peer, ok)
+	case raftpb.ConfChangeAddLearnerNode:
+		// Persist learner metadata if it appears in a replayed log so a future
+		// learner-aware restart path still has the full peer inventory on disk.
+		// The current runtime still rejects learner conf states during startup.
+		applyAddedPeerToMap(peers, nodeID, peer, ok)
+	}
+}
+
+func decodeConfChangePeerContext(nodeID uint64, context []byte) (Peer, bool) {
+	_, peer, ok := decodeConfChangeContext(context)
+	if !ok {
+		return Peer{}, false
+	}
+	if nodeID != 0 && peer.NodeID != 0 && peer.NodeID != nodeID {
+		return Peer{}, false
+	}
+	return peer, true
+}
+
+func applyAddedPeerToMap(peers map[uint64]Peer, nodeID uint64, peer Peer, ok bool) {
+	if ok {
+		upsertPeerInMap(peers, peer)
+		return
+	}
+	if nodeID != 0 && !hasPeerInMap(peers, nodeID) {
+		upsertPeerInMap(peers, Peer{
+			NodeID: nodeID,
+			ID:     strconv.FormatUint(nodeID, 10),
+		})
+	}
+}
+
+func applyRemovedPeerToMap(peers map[uint64]Peer, nodeID uint64, peer Peer, ok bool) {
+	if ok && peer.NodeID != 0 {
+		removePeerFromMap(peers, peer.NodeID)
+		return
+	}
+	if nodeID != 0 {
+		removePeerFromMap(peers, nodeID)
+	}
+}
+
+func applyUpdatedPeerToMap(peers map[uint64]Peer, peer Peer, ok bool) {
+	if ok {
+		upsertPeerInMap(peers, peer)
+	}
+}
+
 func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
@@ -1111,13 +1206,60 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 	if err != nil {
 		return err
 	}
+	return e.persistConfigSnapshotPayload(index, confState, payload)
+}
 
+func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {
+	// Config changes are committed in strictly increasing raft index order. Use
+	// the cached durable config index to avoid re-reading peer metadata from
+	// disk on this hot path.
+	if e.currentConfigIndex() >= index {
+		return nil
+	}
+
+	// Keep peer metadata publication, FSM snapshot serialization, and raft
+	// snapshot persistence serialized with snapshot restores. Restart logic can
+	// tolerate peer metadata leading the persisted raft snapshot, but not an
+	// interleaving restore that swaps in newer FSM state halfway through the
+	// publication sequence.
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if e.currentConfigIndex() >= index {
+		return nil
+	}
+	if err := writeCurrentPersistedPeers(e.dataDir, index, peers); err != nil {
+		return err
+	}
+	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
+		return err
+	} else if upToDate {
+		e.setConfigIndex(index)
+		return nil
+	}
+
+	payload, err := e.snapshotPayload()
+	if err != nil {
+		return err
+	}
+	if err := e.persistConfigSnapshotPayloadLocked(index, confState, payload); err != nil {
+		return err
+	}
+	e.setConfigIndex(index)
+	return nil
+}
+
+func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.ConfState, payload []byte) error {
 	// Keep disk publication serialized with snapshot restores. If a newer
 	// follower snapshot restored concurrently while an older config snapshot was
 	// still being written to disk, a restart could regress to the stale payload.
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
+}
+
+func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raftpb.ConfState, payload []byte) error {
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
 	} else if upToDate {
@@ -1143,6 +1285,11 @@ func (e *Engine) snapshotPayload() ([]byte, error) {
 }
 
 func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
+	currentIndex := e.currentConfigIndex()
+	if currentIndex > index {
+		return true, nil
+	}
+
 	current, err := e.storage.Snapshot()
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -1505,12 +1652,35 @@ func (e *Engine) nextID() uint64 {
 	return e.nextRequestID.Add(1)
 }
 
-func normalizeConfig(cfg OpenConfig) OpenConfig {
+func normalizeOpenConfig(cfg OpenConfig) (OpenConfig, persistedPeers, bool, error) {
 	cfg = normalizeIdentity(cfg)
+	peers, ok, err := loadPersistedPeersState(cfg.DataDir)
+	if err != nil {
+		return OpenConfig{}, persistedPeers{}, false, err
+	}
+	if ok {
+		cfg.Peers = peers.Peers
+	}
 	cfg = normalizePeersConfig(cfg)
 	cfg = normalizeTimingConfig(cfg)
 	cfg = normalizeLimitConfig(cfg)
-	return cfg
+	return cfg, peers, ok, nil
+}
+
+func validateOpenPeers(snapshot raftpb.Snapshot, peers []Peer, persisted persistedPeers, persistedOK bool) error {
+	if len(peers) == 0 {
+		return nil
+	}
+	if snapshot.Metadata.Index == 0 || len(snapshot.Metadata.ConfState.Voters) == 0 {
+		return nil
+	}
+	if !persistedOK {
+		return validateConfState(snapshot.Metadata.ConfState, peers)
+	}
+	if persisted.Index > snapshot.Metadata.Index {
+		return nil
+	}
+	return validateConfState(snapshot.Metadata.ConfState, peers)
 }
 
 func normalizeIdentity(cfg OpenConfig) OpenConfig {
@@ -1592,6 +1762,13 @@ func pendingEntries(commitIndex uint64, appliedIndex uint64) uint64 {
 		return 0
 	}
 	return commitIndex - appliedIndex
+}
+
+func maxUint64(left uint64, right uint64) uint64 {
+	if left >= right {
+		return left
+	}
+	return right
 }
 
 func configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration {
@@ -1768,7 +1945,7 @@ func (e *Engine) runSnapshotWorker() {
 		case req := <-e.snapshotReqCh:
 			result := snapshotResult{
 				index: req.index,
-				err:   e.persistSnapshot(req),
+				err:   e.persistLocalSnapshot(req),
 			}
 			select {
 			case <-e.snapshotStopCh:
@@ -1911,6 +2088,24 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
+	e.mu.RLock()
+	next := clonePeerMap(e.peers)
+	e.mu.RUnlock()
+	applyConfigPeerChangeToMap(next, changeType, nodeID, context)
+	return sortedPeerList(next)
+}
+
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, _ raftpb.ConfState) []Peer {
+	e.mu.RLock()
+	next := clonePeerMap(e.peers)
+	e.mu.RUnlock()
+	for _, change := range cc.Changes {
+		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
+	}
+	return sortedPeerList(next)
+}
+
 func (e *Engine) removePeer(nodeID uint64) {
 	if nodeID == 0 {
 		return
@@ -1927,6 +2122,13 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
 	}
+}
+
+func (e *Engine) hasPeer(nodeID uint64) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.peers[nodeID]
+	return ok
 }
 
 func encodeProposalEnvelope(id uint64, payload []byte) []byte {
@@ -2045,12 +2247,15 @@ func (e *Engine) handleSnapshotResult(result snapshotResult) error {
 	return e.maybePersistLocalSnapshot()
 }
 
-func (e *Engine) persistSnapshot(req snapshotRequest) error {
+func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 	payload, err := snapshotBytesAndClose(req.snapshot, e.dataDir)
 	if err != nil {
 		return err
 	}
+	return e.persistLocalSnapshotPayload(req.index, payload)
+}
 
+func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
 	// Keep restore and local snapshot publication serialized end-to-end so a
 	// follower snapshot cannot swap in newer FSM state while an older local
 	// snapshot is still being published to raft storage and disk.
@@ -2061,24 +2266,23 @@ func (e *Engine) persistSnapshot(req snapshotRequest) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if req.index <= current.Metadata.Index {
+	if index <= current.Metadata.Index {
 		return nil
 	}
 
-	_, err = persistLocalSnapshotPayload(e.storage, e.persist, req.index, payload)
-	if err != nil {
-		switch {
-		case errors.Is(err, etcdraft.ErrCompacted):
-			return nil
-		case errors.Is(err, etcdraft.ErrUnavailable):
-			return nil
-		case errors.Is(err, etcdraft.ErrSnapOutOfDate):
-			return nil
-		default:
-			return err
-		}
+	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, etcdraft.ErrCompacted):
+		return nil
+	case errors.Is(err, etcdraft.ErrUnavailable):
+		return nil
+	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+		return nil
+	default:
+		return err
 	}
-	return nil
 }
 
 func encodeReadContext(id uint64) []byte {

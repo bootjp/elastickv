@@ -3,6 +3,7 @@ package etcd
 import (
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -65,7 +66,7 @@ func ParsePeers(raw string) ([]Peer, error) {
 	return peers, nil
 }
 
-func normalizePeers(localNodeID uint64, localID string, localAddress string, peers []Peer) (Peer, []Peer, error) {
+func normalizePeers(localNodeID uint64, localID string, localAddress string, peers []Peer, allowIncomplete bool) (Peer, []Peer, error) {
 	local := Peer{NodeID: localNodeID, ID: localID, Address: localAddress}
 	if len(peers) == 0 {
 		normalizedLocal, err := normalizeLocalPeer(local)
@@ -75,7 +76,7 @@ func normalizePeers(localNodeID uint64, localID string, localAddress string, pee
 		return normalizedLocal, []Peer{normalizedLocal}, nil
 	}
 
-	normalized, resolvedLocal, err := normalizePeerList(local, peers)
+	normalized, resolvedLocal, err := normalizePeerList(local, peers, allowIncomplete)
 	if err != nil {
 		return Peer{}, nil, err
 	}
@@ -96,7 +97,7 @@ func normalizeLocalPeer(local Peer) (Peer, error) {
 	return local, nil
 }
 
-func normalizePeerList(local Peer, peers []Peer) ([]Peer, Peer, error) {
+func normalizePeerList(local Peer, peers []Peer, allowIncomplete bool) ([]Peer, Peer, error) {
 	normalized := make([]Peer, 0, len(peers))
 	seenNodeIDs := make(map[uint64]string, len(peers))
 	seenIDs := make(map[string]struct{}, len(peers))
@@ -104,23 +105,43 @@ func normalizePeerList(local Peer, peers []Peer) ([]Peer, Peer, error) {
 	foundLocal := false
 
 	for _, peer := range peers {
-		normalizedPeer, err := normalizePeer(peer)
+		var normalizedPeer Peer
+		var err error
+		if allowIncomplete {
+			normalizedPeer, err = normalizePersistedPeer(peer)
+		} else {
+			normalizedPeer, err = normalizePeer(peer)
+		}
 		if err != nil {
 			return nil, Peer{}, err
+		}
+		if localMatchesPeer(local, normalizedPeer) {
+			normalizedPeer = mergeLocalPeerIdentity(local, normalizedPeer)
+			resolvedLocal = normalizedPeer
+			foundLocal = true
 		}
 		if err := ensureUniquePeer(normalizedPeer, seenNodeIDs, seenIDs); err != nil {
 			return nil, Peer{}, err
 		}
 		normalized = append(normalized, normalizedPeer)
-		if localMatchesPeer(local, normalizedPeer) {
-			resolvedLocal = normalizedPeer
-			foundLocal = true
-		}
 	}
 	if !foundLocal {
 		return nil, Peer{}, errors.WithStack(errLocalPeerMissing)
 	}
 	return normalized, resolvedLocal, nil
+}
+
+func mergeLocalPeerIdentity(local Peer, peer Peer) Peer {
+	if local.NodeID != 0 {
+		peer.NodeID = local.NodeID
+	}
+	if local.ID != "" {
+		peer.ID = local.ID
+	}
+	if local.Address != "" {
+		peer.Address = local.Address
+	}
+	return peer
 }
 
 func ensureUniquePeer(peer Peer, seenNodeIDs map[uint64]string, seenIDs map[string]struct{}) error {
@@ -151,6 +172,23 @@ func normalizePeer(peer Peer) (Peer, error) {
 	return peer, nil
 }
 
+func normalizePersistedPeer(peer Peer) (Peer, error) {
+	if peer.ID == "" && peer.NodeID == 0 {
+		return Peer{}, errors.WithStack(errPeerIDRequired)
+	}
+	if peer.NodeID == 0 {
+		peer.NodeID = DeriveNodeID(peer.ID)
+	}
+	if peer.ID == "" {
+		if peer.Address != "" {
+			peer.ID = peer.Address
+		} else {
+			peer.ID = strconv.FormatUint(peer.NodeID, 10)
+		}
+	}
+	return peer, nil
+}
+
 func localMatchesPeer(local Peer, peer Peer) bool {
 	switch {
 	case local.NodeID != 0 && peer.NodeID == local.NodeID:
@@ -170,4 +208,54 @@ func confStateForPeers(peers []Peer) raftpb.ConfState {
 		voters = append(voters, peer.NodeID)
 	}
 	return raftpb.ConfState{Voters: voters}
+}
+
+func clonePeerMap(peers map[uint64]Peer) map[uint64]Peer {
+	if len(peers) == 0 {
+		return map[uint64]Peer{}
+	}
+	cloned := make(map[uint64]Peer, len(peers))
+	for nodeID, peer := range peers {
+		cloned[nodeID] = peer
+	}
+	return cloned
+}
+
+func upsertPeerInMap(peers map[uint64]Peer, peer Peer) {
+	if peer.NodeID == 0 {
+		peer.NodeID = DeriveNodeID(peer.ID)
+	}
+	if peer.ID == "" {
+		if peer.Address != "" {
+			peer.ID = peer.Address
+		} else {
+			peer.ID = strconv.FormatUint(peer.NodeID, 10)
+		}
+	}
+	peers[peer.NodeID] = peer
+}
+
+func hasPeerInMap(peers map[uint64]Peer, nodeID uint64) bool {
+	_, ok := peers[nodeID]
+	return ok
+}
+
+func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
+	delete(peers, nodeID)
+}
+
+func sortedPeerList(peers map[uint64]Peer) []Peer {
+	if len(peers) == 0 {
+		return nil
+	}
+	out := make([]Peer, 0, len(peers))
+	for _, peer := range peers {
+		normalizedPeer, err := normalizePersistedPeer(peer)
+		if err != nil {
+			continue
+		}
+		out = append(out, normalizedPeer)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }

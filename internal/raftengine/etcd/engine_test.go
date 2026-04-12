@@ -302,6 +302,82 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
 }
 
+func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	peers := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:7003"},
+	}
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		Peers:        peers,
+		Bootstrap:    true,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.Close())
+
+	persisted, ok, err := LoadPersistedPeers(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, peers, persisted)
+
+	restarted, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, restarted.Close())
+	})
+
+	cfg, err := restarted.Configuration(context.Background())
+	require.NoError(t, err)
+	require.Len(t, cfg.Servers, 3)
+}
+
+func TestOpenRestoresPlaceholderPersistedPeerMetadata(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, writeCurrentPersistedPeers(dir, 7, []Peer{
+		{NodeID: 1, ID: "1"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
+	require.NoError(t, saveMetadataFile(metadataFilePath(dir), raftpb.HardState{Term: 2, Commit: 7}, raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+			Index:     7,
+			Term:      2,
+		},
+	}))
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      dir,
+		StateMachine: &testStateMachine{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	cfg, err := engine.Configuration(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []raftengine.Server{
+		{ID: "n1", Address: "127.0.0.1:7001", Suffrage: "voter"},
+		{ID: "n2", Address: "127.0.0.1:7002", Suffrage: "voter"},
+	}, cfg.Servers)
+}
+
 func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 	engine := &Engine{
 		readCh: make(chan readRequest, 1),
@@ -680,6 +756,289 @@ func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 	firstIndex, err := storage.FirstIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), firstIndex)
+}
+
+func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	persist := mockstorage.NewStorageRecorder("")
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage: storage,
+		persist: persist,
+		fsm:     fsm,
+		dataDir: t.TempDir(),
+	}
+	t.Cleanup(release)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}})
+	}()
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("config snapshot serialization did not start")
+	}
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		t.Fatal("persistConfigSnapshot returned before snapshot serialization completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	require.Empty(t, persist.Action())
+	release()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("persistConfigSnapshot did not finish after snapshot serialization was released")
+	}
+
+	actions := persist.Action()
+	require.Len(t, actions, 2)
+	require.Equal(t, "SaveSnap", actions[0].Name)
+	require.Equal(t, "Release", actions[1].Name)
+
+	snapshot, err := storage.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), snapshot.Metadata.Index)
+	require.Equal(t, []uint64{1, 2}, snapshot.Metadata.ConfState.Voters)
+}
+
+func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
+	engine := &Engine{}
+	engine.configIndex.Store(9)
+
+	upToDate, err := engine.configSnapshotUpToDate(7, raftpb.ConfState{Voters: []uint64{1}})
+	require.NoError(t, err)
+	require.True(t, upToDate)
+}
+
+func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
+	}
+
+	require.NoError(t, engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
+	require.Equal(t, uint64(4), engine.currentConfigIndex())
+}
+
+func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     1,
+			Term:      1,
+		},
+	}))
+	require.NoError(t, storage.Append([]raftpb.Entry{
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+	}))
+
+	fsm := &blockingSnapshotStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(fsm.release)
+	})
+	engine := &Engine{
+		storage: storage,
+		persist: mockstorage.NewStorageRecorder(""),
+		fsm:     fsm,
+		dataDir: t.TempDir(),
+	}
+	t.Cleanup(release)
+
+	configDone := make(chan error, 1)
+	go func() {
+		configDone <- engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+			{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		})
+	}()
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("config snapshot serialization did not start")
+	}
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- engine.applyReadySnapshot(raftpb.Snapshot{
+			Data: mustEncodeSnapshotData(t, nil),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
+				Index:     5,
+				Term:      1,
+			},
+		})
+	}()
+
+	select {
+	case err := <-restoreDone:
+		require.NoError(t, err)
+		t.Fatal("snapshot restore finished before config publication released snapshotMu")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case err := <-configDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("persistConfigState did not finish after snapshot serialization was released")
+	}
+
+	select {
+	case err := <-restoreDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("snapshot restore did not finish after config publication completed")
+	}
+}
+
+func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	learner := Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"}
+	context, err := encodeConfChangeContext(17, learner)
+	require.NoError(t, err)
+	next := engine.nextPeersAfterConfigChange(
+		raftpb.ConfChangeAddLearnerNode,
+		learner.NodeID,
+		context,
+		raftpb.ConfState{
+			Voters:   []uint64{1},
+			Learners: []uint64{2},
+		},
+	)
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}, next)
+}
+
+func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	context, err := encodeConfChangeContext(17, Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"})
+	require.NoError(t, err)
+
+	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+		Context: context,
+		Changes: []raftpb.ConfChangeSingle{
+			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
+			{Type: raftpb.ConfChangeAddNode, NodeID: 3},
+		},
+	}, raftpb.ConfState{Voters: []uint64{1, 2, 3}})
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 3, ID: "3", Address: ""},
+	}, next)
+}
+
+func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		},
+	}
+
+	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+		Changes: []raftpb.ConfChangeSingle{
+			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
+		},
+	}, raftpb.ConfState{Voters: []uint64{1, 2}})
+
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}, next)
+}
+
+func TestApplyAddedPeerWithoutContextPreservesExistingMetadata(t *testing.T) {
+	engine := &Engine{
+		peers: map[uint64]Peer{
+			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		},
+		config: raftengine.Configuration{
+			Servers: []raftengine.Server{{
+				ID:       "n2",
+				Address:  "127.0.0.1:7002",
+				Suffrage: "voter",
+			}},
+		},
+	}
+
+	engine.applyAddedPeer(2, Peer{}, false)
+
+	require.Equal(t, Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"}, engine.peers[2])
+	require.Equal(t, []raftengine.Server{{
+		ID:       "n2",
+		Address:  "127.0.0.1:7002",
+		Suffrage: "voter",
+	}}, engine.config.Servers)
 }
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
