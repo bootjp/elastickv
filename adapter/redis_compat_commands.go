@@ -466,7 +466,7 @@ func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
 func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, deleteTTL bool) (int, error) {
 	const batchSize = 1000
 	var totalDeleted int
-	var cursor []byte
+	cursor := make([]byte, 0, batchSize)
 	for {
 		kvs, err := r.store.ScanAt(ctx, cursor, nil, batchSize, readTS)
 		if err != nil {
@@ -476,7 +476,11 @@ func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64, delet
 			break
 		}
 
-		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		capacity := len(kvs)
+		if deleteTTL {
+			capacity *= 2
+		}
+		elems := make([]*kv.Elem[kv.OP], 0, capacity)
 		legacyCount := 0
 		for _, pair := range kvs {
 			if !isKnownInternalKey(pair.Key) {
