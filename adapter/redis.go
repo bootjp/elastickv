@@ -1440,7 +1440,7 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 	// prefix it with !redis|str|.
 	storageKey := key
 	userKey := extractRedisInternalUserKey(key)
-	if userKey == nil && !isRedisTTLKey(key) {
+	if !bytes.HasPrefix(key, []byte("!")) {
 		storageKey = redisStrKey(key)
 		userKey = key
 	}

@@ -475,12 +475,12 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 	var totalDeleted int
 	readTS := r.readTS()
 
-	// Scan in batches to avoid unbounded memory usage and oversized Raft
-	// proposals. Internal keys start with "!" (0x21), so scanning [nil, "!")
-	// covers only bare user keys.
+	// Scan the full keyspace in batches and delete keys that do not start
+	// with "!" (the internal key prefix). This covers legacy bare user keys
+	// regardless of their byte range.
 	var cursor []byte
 	for {
-		kvs, err := r.store.ScanAt(ctx, cursor, []byte("!"), batchSize, readTS)
+		kvs, err := r.store.ScanAt(ctx, cursor, nil, batchSize, readTS)
 		if err != nil {
 			conn.WriteError(fmt.Sprintf("ERR scan: %s", err))
 			return
@@ -491,17 +491,20 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 
 		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
 		for _, pair := range kvs {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			if len(pair.Key) == 0 || pair.Key[0] != '!' {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			}
 		}
 
-		if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
-			conn.WriteError(err.Error())
-			return
+		if len(elems) > 0 {
+			if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
+			totalDeleted += len(elems)
 		}
-		totalDeleted += len(elems)
 
-		// Advance cursor past the last key in this batch by appending a
-		// zero byte to create a key strictly greater than the last one.
+		// Advance cursor past the last key in this batch.
 		lastKey := kvs[len(kvs)-1].Key
 		cursor = make([]byte, len(lastKey)+1)
 		copy(cursor, lastKey)
