@@ -1194,6 +1194,13 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 			return nil, err
 		}
 
+		// ZSet meta keys use a 4-byte length-prefixed userKey encoding,
+		// so scan the entire prefix and rely on collectUserKeys for filtering.
+		zsetMetaPrefix := []byte(store.ZSetMetaPrefix)
+		if err := mergeScannedKeys(zsetMetaPrefix, prefixScanEnd(zsetMetaPrefix)); err != nil {
+			return nil, err
+		}
+
 		for _, prefix := range redisInternalPrefixes {
 			internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
 			if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
@@ -1291,6 +1298,9 @@ func redisVisibleUserKey(key []byte) []byte {
 	}
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
+	}
+	if store.IsZSetInternalKey(key) {
+		return store.ExtractZSetUserKey(key)
 	}
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		return userKey
