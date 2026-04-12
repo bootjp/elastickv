@@ -112,7 +112,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeString {
 			return wrongTypeError()
 		}
-		raw, err := r.readValueAt(key, readTS)
+		raw, err := r.readRedisStringAt(key, readTS)
 		if err != nil {
 			// Key may have expired or been deleted between type check and read.
 			v = nil
@@ -458,6 +458,76 @@ func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
 	r.flushDatabase(conn, true)
 }
 
+// deleteLegacyKeys scans the full keyspace and deletes keys that do not belong
+// to any known internal prefix. Returns the number of user-visible legacy keys
+// deleted. TTL keys are intentionally NOT deleted because the !redis|ttl|
+// namespace is shared across all Redis types — deleting them could strip
+// expiration from already-migrated or newly-created keys.
+func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64) (int, error) {
+	const batchSize = 1000
+	var totalDeleted int
+	cursor := make([]byte, 0, batchSize)
+	for {
+		kvs, err := r.store.ScanAt(ctx, cursor, nil, batchSize, readTS)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("scan: %w", err)
+		}
+		if len(kvs) == 0 {
+			break
+		}
+
+		elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+		legacyCount := 0
+		for _, pair := range kvs {
+			if !isKnownInternalKey(pair.Key) {
+				legacyCount++
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			}
+		}
+
+		if len(elems) > 0 {
+			if err := r.dispatchElems(ctx, false, readTS, elems); err != nil {
+				return totalDeleted, err
+			}
+			totalDeleted += legacyCount
+		}
+
+		// Advance cursor past the last key in this batch.
+		lastKey := kvs[len(kvs)-1].Key
+		cursor = make([]byte, len(lastKey)+1)
+		copy(cursor, lastKey)
+
+		// Yield briefly between batches to avoid saturating the Raft log.
+		time.Sleep(time.Millisecond)
+	}
+	return totalDeleted, nil
+}
+
+// flushlegacy deletes old unprefixed Redis string keys that were written before
+// the !redis|str| prefix migration. It scans all keys and deletes those that
+// do not match any known internal prefix. This is a one-time migration operation.
+func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
+	if !r.coordinator.IsLeader() {
+		n, err := r.proxyFlushLegacy()
+		if err != nil {
+			conn.WriteError(err.Error())
+			return
+		}
+		conn.WriteInt(n)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	defer cancel()
+
+	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS())
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	conn.WriteInt(totalDeleted)
+}
+
 func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 	if !r.coordinator.IsLeader() {
 		if err := r.proxyFlushDatabase(all); err != nil {
@@ -476,12 +546,17 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		// Dispatch a single DEL_PREFIX operation. The FSM on each node will
-		// scan locally and write tombstones, avoiding the need to enumerate
-		// all keys here and send them through the Raft log.
+		// Delete only Redis-related keys. Three DEL_PREFIX operations cover
+		// all Redis namespaces: "!redis|" (str, hash, set, zset, hll,
+		// stream, ttl), "!lst|" (list meta + items), and "!zs|" (zset
+		// wide-column meta/member/score).
+		// Legacy bare keys are NOT deleted here to avoid a full keyspace
+		// scan. Run FLUSHLEGACY first to clean up legacy data.
 		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.DelPrefix, Key: nil},
+				{Op: kv.DelPrefix, Key: []byte("!redis|")},
+				{Op: kv.DelPrefix, Key: []byte("!lst|")},
+				{Op: kv.DelPrefix, Key: []byte("!zs|")},
 			},
 		})
 		if err != nil {
@@ -1169,7 +1244,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 
 		current = 0
 		if typ == redisTypeString {
-			raw, err := r.readValueAt(cmd.Args[1], readTS)
+			raw, err := r.readRedisStringAt(cmd.Args[1], readTS)
 			if err != nil {
 				return err
 			}
@@ -1181,7 +1256,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		current++
 
 		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: cmd.Args[1], Value: []byte(strconv.FormatInt(current, 10))},
+			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: []byte(strconv.FormatInt(current, 10))},
 			{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])},
 		})
 	}); err != nil {

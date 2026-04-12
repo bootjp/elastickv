@@ -15,6 +15,7 @@ import (
 )
 
 const (
+	redisStrPrefix    = "!redis|str|"
 	redisHashPrefix   = "!redis|hash|"
 	redisSetPrefix    = "!redis|set|"
 	redisZSetPrefix   = "!redis|zset|"
@@ -24,6 +25,7 @@ const (
 )
 
 var redisInternalPrefixes = []string{
+	redisStrPrefix,
 	redisHashPrefix,
 	redisSetPrefix,
 	redisHLLPrefix,
@@ -79,6 +81,10 @@ type redisStreamID struct {
 	seq uint64
 }
 
+func redisStrKey(userKey []byte) []byte {
+	return append([]byte(redisStrPrefix), userKey...)
+}
+
 func redisHashKey(userKey []byte) []byte {
 	return append([]byte(redisHashPrefix), userKey...)
 }
@@ -118,8 +124,35 @@ func isRedisTTLKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(redisTTLPrefix))
 }
 
+// knownInternalPrefixes lists all key namespace prefixes used by internal
+// subsystems. Keys matching any of these prefixes are never legacy Redis
+// string keys and must be preserved by migration operations.
+var knownInternalPrefixes = [][]byte{
+	[]byte("!redis|"),
+	[]byte("!lst|"),
+	[]byte("!txn|"),
+	[]byte("!ddb|"),
+	[]byte("!s3|"),
+	[]byte("!dist|"),
+	[]byte("!zs|"),
+}
+
+func isKnownInternalKey(key []byte) bool {
+	if len(key) == 0 || key[0] != '!' {
+		return false
+	}
+	for _, prefix := range knownInternalPrefixes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func extractRedisInternalUserKey(key []byte) []byte {
 	switch {
+	case bytes.HasPrefix(key, []byte(redisStrPrefix)):
+		return bytes.TrimPrefix(key, []byte(redisStrPrefix))
 	case bytes.HasPrefix(key, []byte(redisHashPrefix)):
 		return bytes.TrimPrefix(key, []byte(redisHashPrefix))
 	case bytes.HasPrefix(key, []byte(redisSetPrefix)):

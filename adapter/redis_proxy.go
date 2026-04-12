@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -80,4 +81,28 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 		err = cli.FlushDB(ctx).Err()
 	}
 	return errors.WithStack(err)
+}
+
+func (r *RedisServer) proxyFlushLegacy() (int, error) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return 0, ErrLeaderNotFound
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+	}
+
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	// Use a slightly longer timeout than the leader to account for network latency.
+	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout+30*time.Second)
+	defer cancel()
+
+	res := cli.Do(ctx, "FLUSHLEGACY")
+	if res.Err() != nil {
+		return 0, errors.WithStack(res.Err())
+	}
+	n, err := res.Int()
+	return n, errors.WithStack(err)
 }
