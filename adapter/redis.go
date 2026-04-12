@@ -1437,6 +1437,7 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 		redisHashKey(key),
 		redisSetKey(key),
 		redisZSetKey(key),
+		store.ZSetMetaKey(key),
 		redisStreamKey(key),
 		redisHLLKey(key),
 		redisStrKey(key),
@@ -2043,9 +2044,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 func buildZSetStateElems(keyBytes []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
 	switch {
 	case len(st.members) == 0 && st.fromLegacy:
-		// Legacy blob removed: just delete the legacy key.
+		// Legacy blob removed: delete the legacy key and TTL key.
 		return []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: redisZSetKey(keyBytes)},
+			{Op: kv.Del, Key: redisTTLKey(keyBytes)},
 		}, nil
 	case len(st.members) == 0:
 		// Delete meta + all member/score keys via prefix deletion.

@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -197,7 +198,7 @@ func (r *RedisServer) loadZSetMembersMap(ctx context.Context, key []byte, readTS
 // deleted to preserve atomicity with the caller's transaction — kv.DelPrefix
 // cannot be mixed with other mutations in a single Raft request.
 func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	meta, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
+	_, metaExists, err := r.loadZSetMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -209,9 +210,9 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 		{Op: kv.Del, Key: store.ZSetMetaKey(key)},
 	}
 
-	// Use meta.Len to bound the scan. Each member has one member key and one
-	// score-index key, so we expect exactly meta.Len entries per prefix.
-	scanLimit := int(meta.Len)
+	// Scan the full prefix range to ensure all keys are deleted, including any
+	// orphaned keys from partial writes or meta.Len inconsistencies.
+	scanLimit := math.MaxInt
 
 	// Scan member keys and score-index keys for individual deletion.
 	for _, prefix := range [][]byte{
