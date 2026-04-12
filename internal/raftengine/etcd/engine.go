@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"io"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -56,21 +55,11 @@ var (
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
-type Snapshot interface {
-	// Snapshot is an owned export handle from the state machine. Callers are
-	// responsible for closing it after WriteTo completes.
-	WriteTo(w io.Writer) (int64, error)
-	Close() error
-}
+// Snapshot is an alias for the shared raftengine.Snapshot interface.
+type Snapshot = raftengine.Snapshot
 
-type StateMachine interface {
-	Apply(data []byte) any
-	// Snapshot should capture a stable export handle quickly. Expensive snapshot
-	// serialization belongs in Snapshot.WriteTo, which the engine can run off
-	// the main raft loop.
-	Snapshot() (Snapshot, error)
-	Restore(r io.Reader) error
-}
+// StateMachine is an alias for the shared raftengine.StateMachine interface.
+type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
 	NodeID         uint64

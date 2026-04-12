@@ -8,6 +8,7 @@ import (
 	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/hashicorp/raft"
@@ -169,7 +170,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 		},
 	}}
 
-	_, _, err := applyRequests(engineFromRaft(r), reqs, observer)
+	_, _, err := applyRequests(hashicorpraftengine.New(r), reqs, observer)
 	require.Error(t, err)
 	require.Equal(t, 1, observer.FailureCount())
 }
@@ -188,7 +189,7 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 		},
 	}}
 
-	_, results, err := applyRequests(engineFromRaft(r), reqs, observer)
+	_, results, err := applyRequests(hashicorpraftengine.New(r), reqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)

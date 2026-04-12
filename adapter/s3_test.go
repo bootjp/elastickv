@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -371,9 +372,11 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	raft2, stop2 := newSingleRaftForS3Test(t, "g2", kv.NewKvFSM(store2))
 	defer stop2()
 
+	engine1 := hashicorpraftengine.New(raft1)
+	engine2 := hashicorpraftengine.New(raft2)
 	groups := map[uint64]*kv.ShardGroup{
-		1: {Raft: raft1, Store: store1, Txn: kv.NewLeaderProxy(raft1)},
-		2: {Raft: raft2, Store: store2, Txn: kv.NewLeaderProxy(raft2)},
+		1: {Engine: engine1, Store: store1, Txn: kv.NewLeaderProxyWithEngine(engine1)},
+		2: {Engine: engine2, Store: store2, Txn: kv.NewLeaderProxyWithEngine(engine2)},
 	}
 	shardStore := kv.NewShardStore(engine, groups)
 	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), shardStore)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/raft"
@@ -69,9 +70,11 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(s2))
 	defer stop2()
 
+	e1 := hashicorpraftengine.New(r1)
+	e2 := hashicorpraftengine.New(r2)
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: r2, Store: s2, Txn: NewLeaderProxy(r2)},
+		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
+		2: {Engine: e2, Store: s2, Txn: NewLeaderProxyWithEngine(e2)},
 	}
 
 	shardStore := NewShardStore(engine, groups)
@@ -121,9 +124,11 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(s2))
 	defer stop2()
 
+	e1 := hashicorpraftengine.New(r1)
+	e2 := hashicorpraftengine.New(r2)
 	groups := map[uint64]*ShardGroup{
-		1: {Raft: r1, Store: s1, Txn: NewLeaderProxy(r1)},
-		2: {Raft: r2, Store: s2, Txn: NewLeaderProxy(r2)},
+		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
+		2: {Engine: e2, Store: s2, Txn: NewLeaderProxyWithEngine(e2)},
 	}
 
 	shardStore := NewShardStore(engine, groups)

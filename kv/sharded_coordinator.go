@@ -18,7 +18,6 @@ import (
 )
 
 type ShardGroup struct {
-	Raft   *raft.Raft
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional

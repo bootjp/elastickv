@@ -341,7 +341,11 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, engineType, nil)
+	factory, err := newRaftFactory(engineType)
+	if err != nil {
+		return nil, err
+	}
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil)
 	if err != nil {
 		return nil, err
 	}
