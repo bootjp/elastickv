@@ -1,0 +1,135 @@
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      time-limit:
+        description: "Workload runtime seconds"
+        required: false
+        default: "600"
+      rate:
+        description: "Ops/sec per worker"
+        required: false
+        default: "50"
+      concurrency:
+        description: "Number of worker threads"
+        required: false
+        default: "20"
+      key-count:
+        description: "Number of distinct keys per workload"
+        required: false
+        default: "50"
+      max-writes-per-key:
+        description: "Maximum writes per key before exhaustion"
+        required: false
+        default: "2000"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-jepsen-scheduled
+
+name: Jepsen Scheduled Stress Test
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/go-build
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Install netcat and graphviz
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz
+      - name: Install Leiningen
+        run: |
+          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
+          chmod +x ~/lein
+          ~/lein version
+      - name: Pre-fetch Go modules
+        run: |
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          GOPATH=$(go env GOPATH)
+          export GOCACHE GOTMPDIR=/tmp/go-tmp
+          go mod download
+      - name: Run Jepsen unit tests
+        working-directory: jepsen
+        run: ~/lein test
+      - name: Launch demo cluster
+        run: |
+          set -euo pipefail
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          export GOTMPDIR=/tmp/go-tmp
+          nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
+          echo $! > /tmp/elastickv-demo.pid
+
+          echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
+          for i in {1..90}; do
+            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
+              && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
+              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
+              echo "Cluster is up"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Demo cluster failed to start; dumping log:"
+          tail -n 200 /tmp/elastickv-demo.log || true
+          exit 1
+      - name: Run Redis Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 30
+        run: |
+          timeout 1800 ~/lein run -m elastickv.redis-workload \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --max-txn-length 4 \
+            --ports 63791,63792,63793 \
+            --host 127.0.0.1
+      - name: Run DynamoDB Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 30
+        run: |
+          timeout 1800 ~/lein run -m elastickv.dynamodb-workload --local \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --dynamo-ports 63801,63802,63803 \
+            --host 127.0.0.1
+      - name: Run S3 Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 30
+        run: |
+          timeout 1800 ~/lein run -m elastickv.s3-workload --local \
+            --time-limit ${{ inputs.time-limit || '600' }} \
+            --rate ${{ inputs.rate || '50' }} \
+            --concurrency ${{ inputs.concurrency || '20' }} \
+            --key-count ${{ inputs.key-count || '50' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '2000' }} \
+            --threads-per-key 4 \
+            --s3-ports 63901,63902,63903 \
+            --host 127.0.0.1
+      - name: Dump demo cluster log on failure
+        if: failure()
+        run: tail -n 500 /tmp/elastickv-demo.log || true
+      - name: Stop demo cluster
+        if: always()
+        run: |
+          if [ -f /tmp/elastickv-demo.pid ]; then
+            pid=$(cat /tmp/elastickv-demo.pid)
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
