@@ -341,8 +341,9 @@ func TestShardedCoordinator_DelPrefixPreservesTxnKeys(t *testing.T) {
 	r1, stop1 := newSingleRaft(t, "dp-txn-g1", NewKvFSM(s1))
 	t.Cleanup(stop1)
 
+	e1 := hashicorpraftengine.New(r1)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r1), Store: s1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
 	}
 	shardStore := NewShardStore(engine, groups)
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)

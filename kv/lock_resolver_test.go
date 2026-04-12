@@ -209,8 +209,9 @@ func TestLockResolver_LeaderOnlyExecution(t *testing.T) {
 	r, stop := newSingleRaft(t, "lr-leader", NewKvFSM(st))
 	defer stop()
 
+	e := hashicorpraftengine.New(r)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
+		1: {Engine: e, Store: st, Txn: NewLeaderProxyWithEngine(e)},
 	}
 	ss := NewShardStore(engine, groups)
 	lr := NewLockResolver(ss, groups, nil)
@@ -239,8 +240,9 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 	r, stop := newSingleRaft(t, "lr-close", NewKvFSM(st))
 	defer stop()
 
+	e := hashicorpraftengine.New(r)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r), Store: st, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r))},
+		1: {Engine: e, Store: st, Txn: NewLeaderProxyWithEngine(e)},
 	}
 	ss := NewShardStore(engine, groups)
 	lr := NewLockResolver(ss, groups, nil)

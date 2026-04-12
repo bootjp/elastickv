@@ -48,8 +48,9 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 	s2 := store.NewMVCCStore()
 	failTxn := &failingTransactional{err: errors.New("simulated shard2 prepare failure")}
 
+	e1 := hashicorpraftengine.New(r1)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: hashicorpraftengine.New(r1), Store: s1, Txn: NewLeaderProxyWithEngine(hashicorpraftengine.New(r1))},
+		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
 		2: {Store: s2, Txn: failTxn},
 	}
 

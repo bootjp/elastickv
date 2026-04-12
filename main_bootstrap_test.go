@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
@@ -65,5 +66,25 @@ func TestResolveBootstrapServers(t *testing.T) {
 	t.Run("only separators are rejected", func(t *testing.T) {
 		_, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, " , , ")
 		require.ErrorIs(t, err, ErrNoBootstrapMembersConfigured)
+	})
+}
+
+func TestDurationToTicks(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero tick returns min", func(t *testing.T) {
+		require.Equal(t, 5, durationToTicks(200*time.Millisecond, 0, 5))
+	})
+
+	t.Run("exact division", func(t *testing.T) {
+		require.Equal(t, 20, durationToTicks(200*time.Millisecond, 10*time.Millisecond, 1))
+	})
+
+	t.Run("remainder rounds up", func(t *testing.T) {
+		require.Equal(t, 21, durationToTicks(205*time.Millisecond, 10*time.Millisecond, 1))
+	})
+
+	t.Run("below min returns min", func(t *testing.T) {
+		require.Equal(t, 10, durationToTicks(50*time.Millisecond, 10*time.Millisecond, 10))
 	})
 }

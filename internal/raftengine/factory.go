@@ -18,7 +18,8 @@ type FactoryResult struct {
 	RegisterTransport func(grpc.ServiceRegistrar)
 	// Close releases engine-specific resources that are not owned by
 	// Engine.Close (e.g. raft log stores, transport managers). Callers
-	// must still call Engine.Close separately.
+	// must call Engine.Close first to ensure the raft instance is fully
+	// shut down before the underlying stores and transports are released.
 	Close func() error
 }
 

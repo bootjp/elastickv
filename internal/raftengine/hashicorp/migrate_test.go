@@ -63,6 +63,14 @@ func TestMigrateFSMStoreValidation(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "at least one peer is required")
 	})
+
+	t.Run("dest_already_exists", func(t *testing.T) {
+		dest := t.TempDir() // already exists
+		peers := []hashicorpraftengine.MigrationPeer{{ID: "n1", Address: "127.0.0.1:7001"}}
+		_, err := hashicorpraftengine.MigrateFSMStore("/some/path", dest, peers)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "already exists")
+	})
 }
 
 func TestMigrateFSMStoreSeedsHashicorpDataDir(t *testing.T) {
