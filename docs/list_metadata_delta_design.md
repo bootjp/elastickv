@@ -216,7 +216,7 @@ For LPOP:
      c. If not exists:
         - Get item value from !lst|itm|<key><candidateSeq>
         - Put !lst|claim|<key><candidateSeq> → {claimerTS} (Write Claim)
-        - Put !lst|meta|d|<key><commitTS><seq> → {HeadDelta: +1, LenDelta: -1}
+        - Put !lst|meta|d|<key><commitTS><seqInTxn(4)> → {HeadDelta: +1, LenDelta: -1}
         - Commit via dispatchElems()
   4. If commit successful: return item value
      If commit fails (WriteConflictError on claim key): retry from step 3
