@@ -583,3 +583,42 @@ func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, []byte("k2"), conflictKey)
 }
+
+func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=20 (after startTS=10).
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	// Both writing and reading k1. The write-write check detects the conflict
+	// before the read-write check runs; either way the result is ErrWriteConflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrWriteConflict))
+}
+
+func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey_NoConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=5 (before startTS=10). No conflict expected.
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
+	require.NoError(t, err)
+}

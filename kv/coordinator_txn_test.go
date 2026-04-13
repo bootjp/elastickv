@@ -116,3 +116,22 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, commitTS, meta.CommitTS)
 }
+
+func TestCoordinateDispatchTxn_ReadKeysInRequest(t *testing.T) {
+	t.Parallel()
+
+	tx := &stubTransactional{}
+	c := &Coordinate{
+		transactionManager: tx,
+		clock:              NewHLC(),
+	}
+
+	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
+	_, err := c.dispatchTxn([]*Elem[OP]{
+		{Op: Put, Key: []byte("k"), Value: []byte("v")},
+	}, 10, 0, readKeys)
+	require.NoError(t, err)
+	require.Len(t, tx.reqs, 1)
+	require.Len(t, tx.reqs[0], 1)
+	require.Equal(t, readKeys, tx.reqs[0][0].ReadKeys)
+}
