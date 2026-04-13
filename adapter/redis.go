@@ -1988,7 +1988,6 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		if st.deleted {
 			if meta, ok := listDeleteMeta(st); ok {
 				elems = appendListDeleteOps(elems, userKey, meta)
-				elems = t.appendDeltaClaimDelOps(elems, userKey)
 			}
 			continue
 		}
@@ -1997,7 +1996,6 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		}
 		if st.purge {
 			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
-			elems = t.appendDeltaClaimDelOps(elems, userKey)
 		}
 
 		startSeq := st.meta.Head + st.meta.Len
@@ -2016,53 +2014,8 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 			return nil, errors.WithStack(err)
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(userKey), Value: metaBytes})
-		// Delete existing delta keys to prevent double-counting.
-		elems = t.appendDeltaDelOps(elems, userKey)
 	}
 	return elems, nil
-}
-
-// listDeltaKeys scans for existing delta keys belonging to userKey.
-// appendDeltaDelOps appends Del ops for all existing delta keys.
-func (t *txnContext) appendDeltaDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
-	for _, dk := range t.listDeltaKeys(userKey) {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-	}
-	return elems
-}
-
-// appendDeltaClaimDelOps appends Del ops for all existing delta and claim keys.
-func (t *txnContext) appendDeltaClaimDelOps(elems []*kv.Elem[kv.OP], userKey []byte) []*kv.Elem[kv.OP] {
-	for _, dk := range t.listDeltaAndClaimKeys(userKey) {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-	}
-	return elems
-}
-
-// listDeltaAndClaimKeys scans for existing delta and claim keys for userKey.
-func (t *txnContext) listDeltaAndClaimKeys(userKey []byte) [][]byte {
-	keys := t.listDeltaKeys(userKey)
-	claimPrefix := store.ListClaimScanPrefix(userKey)
-	claims, err := t.server.store.ScanAt(context.Background(), claimPrefix, store.PrefixScanEnd(claimPrefix), maxDeltaScanLimit, t.startTS)
-	if err == nil {
-		for _, c := range claims {
-			keys = append(keys, bytes.Clone(c.Key))
-		}
-	}
-	return keys
-}
-
-func (t *txnContext) listDeltaKeys(userKey []byte) [][]byte {
-	prefix := store.ListMetaDeltaScanPrefix(userKey)
-	deltas, err := t.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), maxDeltaScanLimit, t.startTS)
-	if err != nil {
-		return nil
-	}
-	keys := make([][]byte, 0, len(deltas))
-	for _, d := range deltas {
-		keys = append(keys, bytes.Clone(d.Key))
-	}
-	return keys
 }
 
 func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
@@ -2189,7 +2142,6 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 	// latency hot path. If needed, add batching/caching at the storage layer.
 	const txnLatestCommitKeysPerCmd = 4
 	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
-	listKeysToScan := make(map[string]struct{})
 	for _, cmd := range queue {
 		if len(cmd.Args) < minKeyedArgs {
 			continue
@@ -2204,36 +2156,12 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 			keys = append(keys, redisZSetKey(key))
 			keys = append(keys, redisTTLKey(key))
 		}
-		// Track list keys for delta timestamp check.
-		switch name {
-		case cmdRPush, cmdLRange, cmdDel, cmdLPush:
-			listKeysToScan[string(cmd.Args[1])] = struct{}{}
-		}
 	}
-
-	keys = r.appendLatestDeltaKeys(ctx, keys, listKeysToScan)
-
 	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
 	if err != nil {
 		return 0, errors.WithStack(err)
 	}
 	return ts, nil
-}
-
-// appendLatestDeltaKeys finds the latest delta key for each list key and
-// appends it to keys so that MaxLatestCommitTS accounts for recent standalone
-// RPUSH operations that write only delta keys (not base metadata).
-func (r *RedisServer) appendLatestDeltaKeys(ctx context.Context, keys [][]byte, listKeys map[string]struct{}) [][]byte {
-	for k := range listKeys {
-		prefix := store.ListMetaDeltaScanPrefix([]byte(k))
-		end := store.PrefixScanEnd(prefix)
-		latest, err := r.store.ReverseScanAt(ctx, prefix, end, 1, ^uint64(0))
-		if err != nil || len(latest) == 0 {
-			continue
-		}
-		keys = append(keys, latest[0].Key)
-	}
-	return keys
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
@@ -2288,60 +2216,6 @@ func clampRange(start, end, length int) (int, int) {
 	return start, end
 }
 
-const maxDeltaScanLimit = 10000
-
-// allocateCommitTS pre-allocates a commit timestamp from the HLC.
-// allocateCommitTS pre-allocates a commit timestamp from the leader's HLC.
-// The returned value is passed to OperationGroup.CommitTS so the Coordinator
-// uses it as the Raft-committed transaction timestamp. This ensures:
-//   - The timestamp is monotonically increasing (HLC guarantee).
-//   - The Coordinator observes the timestamp (line 140 of coordinator.go)
-//     so subsequent HLC.Next() calls never issue a smaller value.
-//   - Delta keys embedding this timestamp sort in Raft-commit order because
-//     the FSM applies entries sequentially and the HLC advances on each apply.
-func (r *RedisServer) allocateCommitTS() (uint64, error) {
-	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return 0, errors.New("coordinator clock not available")
-	}
-	return r.coordinator.Clock().Next(), nil
-}
-
-// resolveListMeta aggregates base metadata + unapplied deltas.
-// Both GetAt and ScanAt use the same readTS, which is an MVCC snapshot
-// timestamp. The underlying store guarantees point-in-time consistency:
-// all reads at the same readTS observe exactly the same committed state.
-// Delta aggregation order does not matter since each delta is an
-// independent additive adjustment (HeadDelta, LenDelta).
-//
-//nolint:unparam // bool result will be used in read-path
-func (r *RedisServer) resolveListMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, bool, error) {
-	baseMeta, exists, err := r.loadListMetaAt(ctx, userKey, readTS)
-	if err != nil {
-		return store.ListMeta{}, false, err
-	}
-
-	prefix := store.ListMetaDeltaScanPrefix(userKey)
-	deltas, err := r.store.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), maxDeltaScanLimit, readTS)
-	if err != nil {
-		return store.ListMeta{}, false, errors.WithStack(err)
-	}
-	if len(deltas) == maxDeltaScanLimit {
-		return store.ListMeta{}, false, errors.New("list delta scan truncated: too many unapplied deltas")
-	}
-
-	for _, d := range deltas {
-		delta, derr := store.UnmarshalListMetaDelta(d.Value)
-		if derr != nil {
-			return store.ListMeta{}, false, errors.WithStack(derr)
-		}
-		baseMeta.Head += delta.HeadDelta
-		baseMeta.Len += delta.LenDelta
-	}
-	baseMeta.Tail = baseMeta.Head + baseMeta.Len
-
-	return baseMeta, exists || len(deltas) > 0, nil
-}
-
 func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
 	val, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
@@ -2358,30 +2232,15 @@ func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uin
 }
 
 func (r *RedisServer) isListKeyAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	// Fast path: check base metadata (point read).
-	_, baseExists, err := r.loadListMetaAt(ctx, key, readTS)
-	if err != nil {
-		return false, err
-	}
-	if baseExists {
-		return true, nil
-	}
-	// Slow path: check for delta-only lists (no base meta, only deltas).
-	prefix := store.ListMetaDeltaScanPrefix(key)
-	deltas, err := r.store.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), 1, readTS)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	return len(deltas) > 0, nil
+	_, exists, err := r.loadListMetaAt(ctx, key, readTS)
+	return exists, err
 }
 
-//nolint:unparam // error return kept for symmetry with buildLPushOps
-func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte, commitTS uint64) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
 	if len(values) == 0 {
 		return nil, meta, nil
 	}
 
-	n := int64(len(values))
 	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
 	seq := meta.Head + meta.Len
 	for _, v := range values {
@@ -2390,28 +2249,26 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 		seq++
 	}
 
-	meta.Len += n
+	meta.Len += int64(len(values))
 	meta.Tail = meta.Head + meta.Len
 
-	delta := store.ListMetaDelta{HeadDelta: 0, LenDelta: n}
-	deltaKey := store.ListMetaDeltaKey(key, commitTS, 0)
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: deltaKey, Value: store.MarshalListMetaDelta(delta)})
+	b, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, meta, errors.WithStack(err)
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
 	return elems, meta, nil
 }
 
 func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
 	readTS := r.readTS()
-	meta, _, err := r.resolveListMeta(ctx, key, readTS)
+	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
 
-	commitTS, err := r.allocateCommitTS()
-	if err != nil {
-		return 0, err
-	}
-
-	ops, newMeta, err := r.buildRPushOps(meta, key, values, commitTS)
+	ops, newMeta, err := r.buildRPushOps(meta, key, values)
 	if err != nil {
 		return 0, err
 	}
@@ -2419,13 +2276,13 @@ func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte
 		return newMeta.Len, nil
 	}
 
-	return newMeta.Len, r.dispatchElemsWithCommitTS(ctx, true, readTS, commitTS, ops)
+	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
 }
 
 // buildLPushOps creates Raft operations to prepend values to the head of a list.
 // This is O(k) where k = len(values), not O(N) where N is the total list length.
 // LPUSH reverses the order of arguments: LPUSH key a b c → [c, b, a, ...existing].
-func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte, commitTS uint64) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
 	if len(values) == 0 {
 		return nil, meta, nil
 	}
@@ -2435,8 +2292,10 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 		return nil, meta, errors.WithStack(errors.New("LPUSH would underflow list Head sequence number"))
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	// LPUSH reverses args, so last arg gets the lowest sequence number.
 	newHead := meta.Head - n
 	for i, v := range values {
+		// values[0]=a, values[1]=b, values[2]=c → seq ordering: c(newHead), b(newHead+1), a(newHead+2)
 		seq := newHead + n - 1 - int64(i)
 		vCopy := bytes.Clone(v)
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listItemKey(key, seq), Value: vCopy})
@@ -2444,26 +2303,25 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 
 	meta.Head = newHead
 	meta.Len += n
+	// Tail stays the same: Tail = oldHead + oldLen = newHead + newLen
 
-	delta := store.ListMetaDelta{HeadDelta: -n, LenDelta: n}
-	deltaKey := store.ListMetaDeltaKey(key, commitTS, 0)
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: deltaKey, Value: store.MarshalListMetaDelta(delta)})
+	b, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, meta, errors.WithStack(err)
+	}
+
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
 	return elems, meta, nil
 }
 
 func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
 	readTS := r.readTS()
-	meta, _, err := r.resolveListMeta(ctx, key, readTS)
+	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
 
-	commitTS, err := r.allocateCommitTS()
-	if err != nil {
-		return 0, err
-	}
-
-	ops, newMeta, err := r.buildLPushOps(meta, key, values, commitTS)
+	ops, newMeta, err := r.buildLPushOps(meta, key, values)
 	if err != nil {
 		return 0, err
 	}
@@ -2471,7 +2329,7 @@ func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte
 		return newMeta.Len, nil
 	}
 
-	return newMeta.Len, r.dispatchElemsWithCommitTS(ctx, true, readTS, commitTS, ops)
+	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
 }
 
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
@@ -2518,7 +2376,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, errors.WithStack(err)
 	}
 
-	meta, exists, err := r.resolveListMeta(context.Background(), key, readTS)
+	meta, exists, err := r.loadListMetaAt(context.Background(), key, readTS)
 	if err != nil {
 		return nil, err
 	}

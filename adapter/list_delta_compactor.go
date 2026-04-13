@@ -16,6 +16,7 @@ const (
 	defaultListCompactorMaxDeltaCount  = 64
 	defaultListCompactorMaxKeysPerTick = 256
 	defaultListCompactorTimeout        = 5 * time.Second
+	maxDeltaScanLimit                  = 10000
 )
 
 // ListDeltaCompactor periodically scans for accumulated list Delta keys
