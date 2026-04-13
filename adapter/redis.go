@@ -2102,9 +2102,9 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 			nextResults = append(nextResults, res)
 		}
 
-		// Read-set validation is performed inside ApplyMutations under the
-		// store's apply lock, so a separate validateReadSet call here would
-		// be redundant and double the LatestCommitTS I/O.
+		if err := txn.validateReadSet(dispatchCtx); err != nil {
+			return err
+		}
 		if err := txn.commit(); err != nil {
 			return err
 		}

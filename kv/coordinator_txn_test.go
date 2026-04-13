@@ -117,7 +117,7 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.Equal(t, commitTS, meta.CommitTS)
 }
 
-func TestCoordinateDispatchTxn_ReadKeysInRequest(t *testing.T) {
+func TestCoordinateDispatchTxn_ReadKeysNotInOnePhaseTxnRequest(t *testing.T) {
 	t.Parallel()
 
 	tx := &stubTransactional{}
@@ -126,6 +126,9 @@ func TestCoordinateDispatchTxn_ReadKeysInRequest(t *testing.T) {
 		clock:              NewHLC(),
 	}
 
+	// Single-shard transactions validate read keys pre-Raft (in the adapter),
+	// so readKeys must NOT be included in the Raft log entry to avoid
+	// post-commit rejections that break realtime ordering.
 	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
@@ -133,5 +136,5 @@ func TestCoordinateDispatchTxn_ReadKeysInRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
-	require.Equal(t, readKeys, tx.reqs[0][0].ReadKeys)
+	require.Nil(t, tx.reqs[0][0].ReadKeys)
 }

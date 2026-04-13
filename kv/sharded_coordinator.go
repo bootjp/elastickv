@@ -246,8 +246,9 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, pr
 	if err != nil {
 		return nil, err
 	}
+	// Single-shard: read-set validated pre-Raft by the adapter.
 	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, nil),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
