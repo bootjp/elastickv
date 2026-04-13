@@ -39,6 +39,7 @@ const (
 	cmdExpire           = "EXPIRE"
 	cmdFlushAll         = "FLUSHALL"
 	cmdFlushDB          = "FLUSHDB"
+	cmdFlushLegacy      = "FLUSHLEGACY"
 	cmdGet              = "GET"
 	cmdGetDel           = "GETDEL"
 	cmdHDel             = "HDEL"
@@ -113,6 +114,7 @@ const (
 const (
 	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
+	redisFlushLegacyTimeout  = 10 * time.Minute
 	redisRelayPublishTimeout = 2 * time.Second
 	redisTraceArgLimit       = 6
 	redisTraceArgMaxLen      = 96
@@ -170,6 +172,7 @@ var argsLen = map[string]int{
 	cmdExpire:           -3,
 	cmdFlushAll:         1,
 	cmdFlushDB:          1,
+	cmdFlushLegacy:      1,
 	cmdGet:              2,
 	cmdGetDel:           2,
 	cmdHDel:             -3,
@@ -358,6 +361,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		cmdExpire:           r.expire,
 		cmdFlushAll:         r.flushall,
 		cmdFlushDB:          r.flushdb,
+		cmdFlushLegacy:      r.flushlegacy,
 		cmdGet:              r.get,
 		cmdGetDel:           r.getdel,
 		cmdHDel:             r.hdel,
@@ -692,7 +696,7 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 		return state, nil
 	}
 
-	oldValue, err := r.readValueAt(key, readTS)
+	oldValue, err := r.readRedisStringAt(key, readTS)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return redisSetState{}, err
 	}
@@ -709,7 +713,7 @@ func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byt
 		}
 		elems = append(elems, delElems...)
 	}
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: bytes.Clone(value)})
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)})
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	} else {
@@ -955,7 +959,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	v, err := r.readValueAt(key, readTS)
+	v, err := r.readRedisStringAt(key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -1423,7 +1427,8 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 		redisZSetKey(key),
 		redisStreamKey(key),
 		redisHLLKey(key),
-		key,
+		redisStrKey(key),
+		key, // legacy bare key for fallback reads
 		redisTTLKey(key),
 	} {
 		t.trackReadKey(readKey)
@@ -1431,20 +1436,42 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
-	k := string(key)
+	// If the key is already an internal key (e.g., !redis|hash|...,
+	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
+	// Otherwise, it's a bare user key for a string value — prefix it.
+	storageKey := key
+	userKey := extractRedisInternalUserKey(key)
+	if !isKnownInternalKey(key) {
+		storageKey = redisStrKey(key)
+		userKey = key
+	}
+	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
-	t.trackReadKey(key)
-	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+	t.trackReadKey(storageKey)
+	if !isKnownInternalKey(key) {
+		// Track the bare key too for conflict detection on legacy fallback reads.
+		t.trackReadKey(key)
+	}
+	if userKey != nil {
 		t.trackReadKey(redisTTLKey(userKey))
-	} else if !bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
-		t.trackReadKey(redisTTLKey(key))
 	}
 	tv := &txnValue{}
-	val, err := t.server.readValueAt(key, t.startTS)
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return nil, errors.WithStack(err)
+	var val []byte
+	if !isKnownInternalKey(key) {
+		// For bare user string keys, use the fallback-aware reader.
+		var err error
+		val, err = t.server.readRedisStringAt(key, t.startTS)
+		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+			return nil, errors.WithStack(err)
+		}
+	} else {
+		var err error
+		val, err = t.server.readValueAt(storageKey, t.startTS)
+		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+			return nil, errors.WithStack(err)
+		}
 	}
 	tv.raw = val
 	tv.loaded = true
@@ -1565,7 +1592,7 @@ func (t *txnContext) stagedListType(key string) (redisValueType, bool) {
 }
 
 func (t *txnContext) stagedStringType(key string) (redisValueType, bool) {
-	tv, ok := t.working[key]
+	tv, ok := t.working[string(redisStrKey([]byte(key)))]
 	if !ok {
 		return redisTypeNone, false
 	}
@@ -1811,6 +1838,16 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 		iv.deleted = true
 		iv.dirty = true
 	}
+	// Mark legacy bare string key for deletion. We bypass load() here
+	// because load() auto-prefixes bare keys to !redis|str|.
+	// Track the bare key in the read set for conflict detection.
+	t.trackReadKey(key)
+	bareK := string(key)
+	if _, ok := t.working[bareK]; !ok {
+		t.working[bareK] = &txnValue{}
+	}
+	t.working[bareK].deleted = true
+	t.working[bareK].dirty = true
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 
@@ -1908,12 +1945,12 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 		if !tv.dirty {
 			continue
 		}
-		key := []byte(k)
+		storageKey := []byte(k)
 		if tv.deleted {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
 			continue
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: tv.raw})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: tv.raw})
 	}
 	return elems
 }

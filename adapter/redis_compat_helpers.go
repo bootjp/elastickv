@@ -29,6 +29,9 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeStream, key: redisStreamKey(key)},
 		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
 		{typ: redisTypeString, key: redisHLLKey(key)},
+		{typ: redisTypeString, key: redisStrKey(key)},
+		// Fallback: check bare key for legacy data written before the
+		// !redis|str| prefix migration.
 		{typ: redisTypeString, key: key},
 	}
 	for _, check := range checks {
@@ -137,9 +140,23 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 	return errors.WithStack(err)
 }
 
+// readRedisStringAt reads a Redis string value, trying the prefixed key first
+// and falling back to the bare key for legacy data written before the
+// !redis|str| prefix migration.
+func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, error) {
+	v, err := r.readValueAt(redisStrKey(key), readTS)
+	if err == nil {
+		return v, nil
+	}
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		return nil, err
+	}
+	return r.readValueAt(key, readTS)
+}
+
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
 	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: key, Value: bytes.Clone(value)},
+		{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)},
 	}
 	if ttl == nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
@@ -157,15 +174,9 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 	elems := []*kv.Elem[kv.OP]{}
 
-	stringExists, err := r.store.ExistsAt(ctx, key, readTS)
-	if err != nil {
-		return nil, false, errors.WithStack(err)
-	}
-	if stringExists {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
-	}
-
 	for _, internalKey := range [][]byte{
+		redisStrKey(key),
+		key, // legacy bare string key
 		redisHashKey(key),
 		redisSetKey(key),
 		redisHLLKey(key),

@@ -154,7 +154,7 @@ func TestRedisDelRetriesWriteConflict(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	require.NoError(t, st.PutAt(ctx, []byte("retry:del"), []byte("v1"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("retry:del")), []byte("v1"), 1, 0))
 
 	coord := newRetryOnceCoordinator(st)
 	coord.clock.Observe(1)
@@ -172,7 +172,7 @@ func TestRedisDelRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), conn.int)
 	require.Equal(t, 2, coord.dispatches)
 
-	exists, err := st.ExistsAt(ctx, []byte("retry:del"), snapshotTS(coord.clock, st))
+	exists, err := st.ExistsAt(ctx, redisStrKey([]byte("retry:del")), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	require.False(t, exists)
 }
@@ -228,7 +228,7 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, "v1", string(conn.bulk))
 	require.Equal(t, 2, coord.dispatches)
 
-	value, err := srv.readValueAt([]byte("retry:lua"), snapshotTS(coord.clock, st))
+	value, err := srv.readValueAt(redisStrKey([]byte("retry:lua")), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), value)
 }

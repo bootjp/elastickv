@@ -140,6 +140,8 @@ func detectRaftEngineFromDataDir(dir string) (raftEngineType, bool, error) {
 		return "", false, err
 	}
 	etcdArtifacts, err := hasRaftArtifacts(dir,
+		"wal",
+		"snap",
 		filepath.Join("member", "wal"),
 		filepath.Join("member", "snap"),
 		"etcd-raft-state.bin",
