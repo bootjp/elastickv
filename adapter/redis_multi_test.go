@@ -168,7 +168,6 @@ func TestRedis_DelList_EmptyAfterDeleteHasNoResidualInternalKeys(t *testing.T) {
 }
 
 func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
-	t.Skip("Known issue: MULTI/EXEC purge path does not clean up old delta keys from prior standalone RPUSH. Tracked for fix.")
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
