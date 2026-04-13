@@ -67,8 +67,8 @@ Using a Delta pattern, writers avoid touching the base metadata and instead writ
 ### 1. Key Layout
 
 ```
-Base Metadata (Existing):
-  !lst|meta|<userKeyLen(4)><userKey>                          → [Head(8)][Tail(8)][Len(8)]
+Base Metadata (Existing — no length prefix):
+  !lst|meta|<userKey>                                         → [Head(8)][Tail(8)][Len(8)]
 
 Delta Key (New):
   !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>  → DeltaEntry binary
@@ -199,7 +199,7 @@ LRANGE key start stop:
 
 When the number of Deltas is small (< 100), the cost of a Prefix Scan is negligible. Since Delta keys are physically contiguous in the LSM tree, I/O can be performed in a single sequential read.
 
-**`maxDeltaScanLimit` overflow**: If the number of unapplied Deltas exceeds `maxDeltaScanLimit`, `resolveListMeta` cannot aggregate them all in a single scan pass, which would produce an incorrect `ListMeta`. To preserve correctness, `resolveListMeta` must return an error when the scan result is truncated (i.e., when `len(deltas) == maxDeltaScanLimit`). The caller should then either surface the error or trigger an immediate synchronous compaction before retrying. This behaviour is the enforcement backstop for the hard-limit policy described in Section 11.1.
+**`maxDeltaScanLimit` overflow**: If the number of unapplied Deltas exceeds `maxDeltaScanLimit`, `resolveListMeta` cannot aggregate them all in a single scan pass, which would produce an incorrect `ListMeta`. To preserve correctness, `resolveListMeta` must return an error when the scan result is truncated (i.e., when `len(deltas) == maxDeltaScanLimit`). The caller should then either surface the error or trigger an immediate synchronous compaction before retrying. This behaviour is the enforcement backstop for the hard-limit policy described in Design Decision D1 (Section 29).
 
 ### 5. Background Compaction
 
@@ -912,7 +912,7 @@ type collectionCompactionHandler interface {
 
 ### 27. Shared Delta Limits
 
-The delta accumulation limits from List Section 11.1 apply uniformly to all collection types:
+The delta accumulation limits from Section 5 (Background Compaction) and Design Decision D1 apply uniformly to all collection types:
 
 - **`maxDeltaCount`** (default: 64) — soft threshold for scheduling compaction.
 - **`maxDeltaScanLimit`** (default: 256) — hard limit; `resolve*Meta()` returns an error when truncated, triggering synchronous compaction.
@@ -1243,8 +1243,7 @@ Performing synchronous compaction on every write would cause write conflicts on 
 However, relying solely on warning logs is insufficient for production safety. The system uses three distinct limit parameters:
 
 - **`maxDeltaCount`** (default: 64) — the soft threshold at which the Background Compactor schedules the key for compaction and emits a warning log.
-- **`maxDeltaScanLimit`** (default: `maxDeltaCount × 4 = 256`) — the maximum number of Delta entries fetched by a single `ScanAt` call in `resolve*Meta()`. This is also the **hard limit**: when `len(deltas) == maxDeltaScanLimit`, the scan was truncated and the result would be incorrect. In that case `resolve*Meta()` returns an error instead of silently wrong metadata.
-- **`maxDeltaHardLimit`** is an alias for `maxDeltaScanLimit`; they are the same value. The naming distinction in this document merely emphasises the two roles the value plays (scan ceiling vs. correctness guard).
+- **`maxDeltaScanLimit`** (default: `maxDeltaCount × 4 = 256`) — the maximum number of Delta entries fetched by a single `ScanAt` call in `resolve*Meta()`. This serves as both the scan ceiling and the **correctness guard**: when `len(deltas) == maxDeltaScanLimit`, the scan was truncated and the result would be incorrect. In that case `resolve*Meta()` returns an error instead of silently wrong metadata.
 
 When the hard limit is hit, the caller triggers a synchronous compaction for that key before retrying the operation. This prevents reads from ever returning silently incorrect results.
 
