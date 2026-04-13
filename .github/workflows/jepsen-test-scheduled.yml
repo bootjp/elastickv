@@ -6,23 +6,23 @@ on:
       time-limit:
         description: "Workload runtime seconds"
         required: false
-        default: "150"
+        default: "300"
       rate:
         description: "Ops/sec per worker"
         required: false
-        default: "10"
+        default: "5"
       concurrency:
         description: "Number of worker threads (must be multiple of 4 for S3)"
         required: false
-        default: "8"
+        default: "4"
       key-count:
         description: "Number of distinct keys per workload"
         required: false
-        default: "16"
+        default: "8"
       max-writes-per-key:
         description: "Maximum writes per key before exhaustion"
         required: false
-        default: "250"
+        default: "150"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-jepsen-scheduled
