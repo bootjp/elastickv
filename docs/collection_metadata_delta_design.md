@@ -85,7 +85,7 @@ Because the Delta key embeds `commitTS`, the write path must know the final time
 
 **Uniqueness guarantee and failure modes**: The `commitTS` uniqueness relies on two invariants:
 
-1. **HLC monotonicity**: The HLC logical counter ensures uniqueness within the same millisecond. The elastickv HLC uses a 48-bit physical (ms) + 16-bit logical layout. If more than 65,535 operations occur within a single millisecond (requiring logical counter overflow), `HLC.Next()` must return an error or block until the wall clock advances. The implementation must not silently wrap the counter, as this would produce duplicate timestamps and Delta key collisions.
+1. **HLC monotonicity**: The HLC logical counter ensures uniqueness within the same millisecond. The elastickv HLC uses a 48-bit physical (ms) + 16-bit logical layout. The elastickv HLC handles logical counter overflow by advancing the wall-clock component by 1ms and resetting the logical counter to 0. This preserves monotonicity and uniqueness but causes the HLC to drift into the future. On leader failover, the new leader's `HLC.Observe()` on FSM Apply will advance past any future-drifted timestamps before issuing new ones, closing the collision window.
 
 2. **Raft single-leader guarantee**: Only the Raft leader issues `commitTS` values. Split-brain scenarios (two leaders issuing timestamps simultaneously) are prevented by Raft's leader election protocol, which guarantees at most one leader per term. A stale leader's proposals will be rejected by the new term's leader. This design explicitly depends on Raft's leader uniqueness — it does not add any additional mechanism for split-brain prevention.
 
@@ -127,6 +127,8 @@ Fixed 16-byte binary (2 x int64 big-endian).
 
 `Tail` is always calculated as `Head + Len` and is not included in the Delta.
 
+**Defensive clamping**: All `resolve*Meta()` functions must clamp the aggregated `Len` to `max(0, Len)` after aggregation. While negative `Len` should not occur under correct Claim/OCC operation, clamping prevents catastrophic failures (underflow in sequence calculation, infinite scan ranges) if a bug allows double-decrement. A clamped result should be logged as a warning for investigation.
+
 ### 3. Write Path (Conflict-Free)
 
 #### For RPUSH
@@ -153,6 +155,8 @@ New Flow:
 **Important**: Delta keys are globally unique due to `commitTS + seqInTxn`, so concurrent writers do not collide, and write-write conflicts are avoided.
 
 **Stale Claim cleanup**: Sequences may be recycled after a POP followed by compaction that resets Head/Tail. If a Claim key from a prior POP still exists for the same sequence number, the PUSH must delete it to prevent future POPs from treating the newly pushed item as already popped.
+
+**OCC protection for Claim cleanup**: The PUSH transaction must register each target sequence's Claim key in its `readSet` (via a point-read or existence check). This ensures that if a concurrent POP writes a Claim to the same sequence between the PUSH's scan and commit, the OCC check detects the conflict and the PUSH retries with fresh state. Without this, a newly pushed item could be immediately shadowed by a concurrent Claim, making it invisible to reads.
 
 #### Item Key Sequence Calculation
 
@@ -212,7 +216,11 @@ When the number of Deltas is small (< 100), the cost of a Prefix Scan is negligi
 
 These estimates should be validated with benchmarks during Phase L5 implementation.
 
+**Critical invariant**: `resolveListMeta()` and the subsequent `fetchListRange()` / Claim scan must all use the **same `readTS`** to preserve snapshot consistency. If different timestamps are used, phantom reads become possible (e.g., items visible in the range scan that are not counted in the metadata, or vice versa). This invariant applies to all collection types.
+
 **`maxDeltaScanLimit` overflow**: If the number of unapplied Deltas exceeds `maxDeltaScanLimit`, `resolveListMeta` cannot aggregate them all in a single scan pass, which would produce an incorrect `ListMeta`. To preserve correctness, `resolveListMeta` must return an error when the scan result is truncated (i.e., when `len(deltas) == maxDeltaScanLimit`). The caller should then either surface the error or trigger an immediate synchronous compaction before retrying. This behaviour is the enforcement backstop for the hard-limit policy described in Design Decision D1 (Section 29).
+
+**Synchronous compaction mutual exclusion**: When `resolve*Meta()` hits the hard limit (256 deltas), it triggers synchronous compaction. If multiple concurrent readers hit this simultaneously, they all attempt compaction, but only one succeeds (OCC conflict on base metadata). To avoid a retry storm, the implementation should use a **per-key mutex or singleflight** mechanism: the first reader to detect truncation acquires the compaction lock, performs compaction, and all waiters retry with the compacted state. This is critical for hot keys under compactor failure.
 
 ### 5. Background Compaction
 
@@ -241,9 +249,12 @@ type ListDeltaCompactor struct {
 }
 ```
 
-- Scan the entire `!lst|meta|d|` prefix every `scanInterval`, using a **cursor-based incremental scan** to avoid a single blocking pass over all Deltas. On each tick the compactor advances its cursor by at most `maxKeysPerTick` entries, wrapping around when it reaches the end. This keeps per-tick I/O bounded regardless of total Delta volume.
+- Scan the entire `!lst|meta|d|` prefix every `scanInterval`, using a **cursor-based incremental scan** to avoid a single blocking pass over all Deltas. On each tick the compactor advances its cursor by at most `maxKeysPerTick` entries (default: 512, chosen to balance scan throughput against per-tick I/O budget), wrapping around when it reaches the end. This keeps per-tick I/O bounded regardless of total Delta volume.
 - Per-list Delta counters (maintained in memory or as a lightweight side-structure) can be used to prioritise lists that have accumulated many Deltas, so the compactor focuses effort where it matters rather than uniformly sampling every list every interval.
 - If the number of Deltas for a `userKey` exceeds `maxDeltaCount`, mark it for compaction.
+
+**Leader transition handling**: The compactor's in-memory cursor position and per-key delta counters must be reset when the node acquires leadership. Without this, a re-elected leader would resume scanning from a stale cursor position, potentially skipping keys that accumulated deltas during the leadership gap. The compactor should detect term changes (via `Status().Term`) and reset state on each new term.
+
 - Compaction is performed as a transaction (`IsTxn: true`), protecting the base metadata read via the `readSet` (using OCC to prevent concurrent compaction conflicts).
 
 #### Compaction Safety
@@ -251,6 +262,8 @@ type ListDeltaCompactor struct {
 - The compaction transaction includes `!lst|meta|<key>` in its `readSet`. If two compactions run simultaneously, one will fail with a write conflict and retry with the latest base metadata, ensuring idempotency.
 - Before deleting Deltas, the worker ensures their `commitTS` is older than `ActiveTimestampTracker.Oldest()` to avoid breaking in-flight reads.
 - Deltas within the MVCC retention window are not deleted to guarantee consistency for historical reads.
+- Claim Key GC and Item key deletion in Section 6.4 must respect the same MVCC retention window constraint. Item keys are deleted via MVCC tombstones (not physical removal), so in-flight readers at older `readTS` values continue to see them. The compactor must not delete Claim or Item keys whose `commitTS` is newer than `ActiveTimestampTracker.Oldest()`.
+- Compaction transactions are safe against concurrent Delta writers because: (a) writers never touch base metadata, so they cannot conflict with the compaction's `readSet`; (b) Deltas committed after the compaction's `readTS` are not visible to the scan and therefore not deleted, preserving them for future reads and compaction passes.
 
 ### 6. POP Operations — Claim Mechanism
 
@@ -329,6 +342,8 @@ For RPOP:
      If commit fails (WriteConflictError on claim key): refresh skip-set and retry from step 3
 ```
 
+**Guard against compacted sequences**: If the RPOP scan window yields no items (all item keys have been physically removed by Claim GC), the POP must re-resolve metadata via `resolveListMeta()` to obtain the current effective Tail. This prevents the POP from endlessly searching deleted sequences or incorrectly returning nil when items exist below the compacted boundary.
+
 **Key differences from LPOP**:
 - RPOP scans backward from `Tail - 1` instead of forward from `Head`.
 - RPOP emits `HeadDelta: 0` (Head does not change), whereas LPOP emits `HeadDelta: +1`.
@@ -343,6 +358,8 @@ Writing to a Claim key is protected by standard OCC:
 - If two `POP` operations attempt to `Put` to the same Claim key sequence simultaneously, the later one will receive a `WriteConflictError` in `ApplyMutations()`.
 - The failing side will skip the claimed sequence and try the next one upon retry.
 - Since base metadata (`!lst|meta|<key>`) is not touched, there is no conflict with `PUSH` operations.
+
+**ABA prevention under compaction**: When compaction advances Head past sequence S (deleting both the Claim and Item at S), and a subsequent PUSH reuses sequence S, the potential ABA scenario is resolved by OCC on the Claim key: if a stale POP (reading from before compaction) attempts to claim S concurrently with the PUSH, the OCC check on `!lst|claim|<key><S>` detects the conflict (either the PUSH's Claim delete or the POP's Claim write triggers a write-write conflict). The compaction visibility window (between compaction commit and reader observation) does not create an ABA risk because all parties use the same MVCC snapshot at their respective `readTS`.
 
 #### 6.4. Claim Key GC
 
@@ -427,11 +444,21 @@ type listTxnState struct {
 - In `validateReadSet()`, exclude `!lst|meta|<key>` from the `readSet`, and instead only validate item key conflicts.
 - Increment `seqInTxn` if pushing to the same list multiple times within one transaction.
 
-**Consistency note for metadata reads in MULTI/EXEC**: Commands that read collection cardinality within a transaction (e.g., `LLEN`, `HLEN`) observe the snapshot at `startTS` plus locally accumulated deltas within the transaction. Because the base metadata key is excluded from the `readSet`, concurrent writers may commit deltas between the transaction's `startTS` and its commit. This provides snapshot isolation (not strict serializability) for cardinality reads, which matches Redis's existing `MULTI/EXEC` semantics where commands see the state at execution time, not a globally serialized point. If strict serializability is required for a specific use case, the caller can opt in by explicitly registering the base metadata key in the `readSet`, accepting the higher conflict rate.
+**Consistency note for metadata reads in MULTI/EXEC**: Commands that read collection cardinality within a transaction (e.g., `LLEN`, `HLEN`) observe the snapshot at `startTS` plus locally accumulated deltas within the transaction. Because the base metadata key is excluded from the `readSet`, concurrent writers may commit deltas between the transaction's `startTS` and its commit. This provides snapshot isolation (not strict serializability) for cardinality reads. Note that Redis's native `MULTI/EXEC` provides serializable isolation (commands execute atomically with no interleaving). This design intentionally weakens the isolation for cardinality reads to snapshot isolation to avoid reintroducing metadata conflicts. Applications that depend on strict serializable cardinality reads within MULTI/EXEC should opt in by registering the base metadata key in the `readSet`, accepting the higher conflict rate.
 
 **Critical: `txnStartTS` must account for Delta key commits.** The `txnStartTS()` function computes `startTS` by calling `maxLatestCommitTS()` on keys involved in the transaction. In the current codebase, this checks only base metadata keys (e.g., `!lst|meta|<key>`). However, standalone RPUSH/LPUSH writes only to Delta keys (`!lst|meta|d|...`) and item keys, **not** to the base metadata key. If `maxLatestCommitTS` does not include the latest Delta key commit timestamp, `startTS` may predate recent standalone writes, causing `resolveListMeta(startTS)` to miss those deltas. When MULTI/EXEC then writes base metadata with a delta cleanup, the missed deltas are erased without their contributions being folded into the base — resulting in data loss.
 
 To fix this, `maxLatestCommitTS()` must additionally reverse-scan each list key's Delta prefix (`!lst|meta|d|<keyLen><key>`) with limit 1 to find the most recent Delta key, and include its `LatestCommitTS` in the maximum. This ensures `startTS ≥ max(all delta commits)` for keys involved in the transaction. The same applies to Hash, Set, and ZSet Delta prefixes when those types are integrated.
+
+**Performance note**: The Delta prefix reverse-scan adds one Pebble iterator creation and seek per collection key in the transaction. For a MULTI/EXEC touching N collection keys, this adds N reverse scans to `txnStartTS`. This cost is bounded and typically small (N < 10 in practice), but should be monitored. If N grows large, caching the latest Delta commitTS per key in memory (updated on each standalone write) can eliminate the scan entirely.
+
+**Dual-path interaction matrix**:
+
+| Standalone Write | MULTI/EXEC Read | MULTI/EXEC Write | Safety |
+|-----------------|-----------------|-------------------|--------|
+| Delta committed before startTS | resolveListMeta sees it | Folded into base meta, delta deleted | Safe |
+| Delta committed after startTS | resolveListMeta misses it | Delta survives, picked up by next read | Safe (requires txnStartTS Delta scan fix) |
+| Delta committed after startTS, NO Delta scan fix | resolveListMeta misses it | Delta erased by cleanup without folding | **DATA LOSS** |
 
 ### 8. New Key Helper Functions
 
@@ -640,13 +667,17 @@ No Claim mechanism is needed because `HDEL` targets named fields, not positional
 **Concurrent write behavior during migration**: Because the migration and the triggering write are committed as a single atomic transaction, concurrent writers targeting the same key will encounter an OCC write conflict on the legacy blob key (`!redis|hash|<key>`) and retry. On retry, the winner's migration will already be visible, so the retrier takes the wide-column path directly. Concurrent writes to **different** Hash keys are unaffected since they touch separate legacy blobs. Reads during migration use the fallback logic (step 1) and always see a consistent view: either the pre-migration blob or the post-migration wide-column data, never a partial state.
 
 **Large collection migration**: If a Hash or Set has a very large number of fields/members (e.g., tens of thousands), the migration transaction may exceed the Raft proposal size limit (typically 1 MiB). To handle this:
-- The migration must enforce a **maximum batch size** (e.g., `maxMigrationKeysPerTx = 1000`).
+- The migration must enforce a **maximum batch size bounded by both count and byte size** (e.g., `maxMigrationKeysPerTx = 1000` or `maxMigrationBytesPerTx = 512 KiB`, whichever is reached first).
 - If the legacy blob contains more keys than the batch limit, the migration writes the first batch of field keys + a **partial metadata marker** indicating migration is in progress.
 - Subsequent writes continue the migration in batches until complete.
 - During partial migration, reads must merge results from both the legacy blob (for unmigrated fields) and the wide-column keys (for migrated fields).
 - The partial migration marker is removed once all fields have been migrated.
 
 This adds complexity to the read path during migration but prevents Raft proposal size violations. The same batched approach applies to Set migration (Section 20).
+
+**Eager migration option**: To avoid the persistent read-path overhead of merging during partial migration, the system may use a background migration worker that completes all batches immediately after the first write triggers migration. This converts the write-driven lazy migration into an eager background task, limiting the merge window to seconds rather than minutes.
+
+**Deduplication rule during partial migration**: When merging results from the legacy blob and wide-column keys, **wide-column keys take precedence** over legacy blob entries for the same field name. This ensures that fields written after partial migration started reflect their latest values. The legacy blob is only deleted atomically in the final migration batch, not updated incrementally.
 
 ---
 
@@ -967,7 +998,7 @@ DEL key (list example):
   2. Delete all item keys: scan !lst|itm|<key>* in batches until exhausted
   3. Delete all delta keys: scan !lst|meta|d|<keyLen><key>* in batches until exhausted
   4. Delete all claim keys: scan !lst|claim|<keyLen><key>* in batches until exhausted
-  5. All deletions are committed in a single transaction with the DEL
+  5. If the total number of keys to delete is small (under `maxKeysPerDelTx = 1000`), all deletions are committed in a single transaction. For large collections, the DEL handler first writes a **tombstone marker** to the base metadata (`Len = -1` or a dedicated flag) indicating deletion is in progress, then performs batched cleanup transactions. During the tombstone phase, all reads return 'key not found'. After all cleanup batches complete, the tombstone marker is removed. This prevents resurrection of partially deleted collections and avoids Raft proposal size violations.
 
 For each scan step, use a cursor-advancing loop:
   cursor = prefix
@@ -1003,6 +1034,7 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
 | L2 | RPOPLPUSH / LMOVE composite transaction | ❌ Not started |
 | L2 | `buildListElems` (MULTI/EXEC): delta cleanup on base meta write | ✅ Done |
 | L2 | `buildListElems` (MULTI/EXEC): full Delta emit (no base meta) | ❌ Not started |
+| L2 | `txnStartTS` Delta prefix scan for MULTI/EXEC startTS | ❌ Not started |
 | L3 | Replace `loadListMetaAt` → `resolveListMeta` in all read paths | ✅ Done |
 | L3 | `rawKeyTypeAt`: delta-only list detection | ✅ Done |
 | L3 | Skip claimed items in `fetchListRange()` | ❌ Not started |
@@ -1108,6 +1140,8 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
   - Detect empty lists and perform full deletion (base + all Deltas + all Claims + all Items).
 - Integrate into the unified `DeltaCompactor` (Section 26).
 - Make compaction thresholds and intervals configurable.
+- Add concurrent compaction test: two simultaneous compactions on the same key, verify one succeeds and the other retries.
+- Add empty collection lifecycle test: create → drain via POP → compactor sets Len=0 → lazy reap tombstone → recreate via RPUSH.
 
 #### Phase L5: Backward Compatibility and Benchmarks
 
@@ -1115,7 +1149,11 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
 - Add concurrent `POP` tests (verify correctness of the Claim mechanism, both LPOP and RPOP).
 - **Jepsen: mixed standalone/MULTI workload** — Run the `redis-append` Jepsen workload which interleaves standalone RPUSH (single-mop, no MULTI) with MULTI/EXEC transactions containing multiple appends and reads. This specifically targets the dual-path consistency risk where standalone writes emit Delta keys and MULTI/EXEC reads/writes interact with them. The workload must pass strict-serializable checking.
 - Measure write conflict rates (compare before/after Delta introduction).
-- Benchmark `LLEN` / `LRANGE` latency across different Delta accumulation levels (0, 10, 64, 256 deltas).
+- Add crash recovery tests: node crash mid-compaction, crash after Claim write but before Delta commit, leader failover with uncommitted Delta proposals.
+- Add DEL large-delta test: create list with >256 deltas, DEL, verify zero orphaned delta/claim keys remain.
+- Add maxDeltaScanLimit overflow integration test: accumulate >256 deltas, verify resolveListMeta returns error, verify sync compaction triggers, verify retry succeeds.
+- Add txnStartTS Delta-awareness test: standalone RPUSH (Delta), then MULTI/EXEC on same key, verify startTS accounts for the Delta, verify no data loss.
+- Benchmark LLEN / LRANGE latency across different Delta accumulation levels (0, 10, 64, 256 deltas). Pass criteria: resolveListMeta < 100μs at 64 deltas on SSD (warm cache), < 500μs at 256 deltas. LRANGE overhead vs baseline < 2x for ranges up to 100 items.
 
 ### Hash
 
@@ -1153,6 +1191,7 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
   - OCC conflict during migration transaction (verify retry correctly completes migration).
   - Large Hash migration exceeding batch limit (verify batched migration produces correct final state).
   - Concurrent reads during partial migration (verify merged legacy+wide-column view is consistent).
+- Add Jepsen workload for Hash: concurrent HSET on different fields + MULTI/EXEC with HLEN reads, verify strict-serializable.
 
 ### Set
 
@@ -1184,6 +1223,8 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
 - Ensure all existing Set tests pass.
 - Add concurrent `SADD` tests for different members.
 - **Migration edge case tests**: same as Hash Phase H4 (crash recovery, OCC retry, batched migration, concurrent read during partial migration).
+- Add Jepsen workload for Set: concurrent SADD/SREM + MULTI/EXEC, verify strict-serializable.
+- Add SRANDMEMBER test with wide-column format: verify random sampling produces uniform distribution across prefix-scanned member keys.
 
 ### ZSet
 
@@ -1210,6 +1251,7 @@ This ensures DEL is complete regardless of Delta accumulation. The same batched-
 - Add ZSet compaction handler to the unified `DeltaCompactor`.
 - Ensure all existing ZSet tests pass (including migration tests from PR #483).
 - Add concurrent `ZADD` tests for different members.
+- Add Jepsen workload for ZSet: concurrent ZADD/ZREM + MULTI/EXEC with ZCARD reads.
 
 ### Cross-Type
 
@@ -1327,6 +1369,8 @@ Immediate cleanup will not occur even if `Len == 0` after aggregating Deltas. Wh
 - No in-flight readers can reference the key (it is older than the retention window).
 - No concurrent writers can be active (no Deltas exist, and any new write would create fresh metadata).
 - The `DEL` command path remains the primary mechanism for immediate cleanup; lazy reaping is a secondary safety net.
+
+To prevent the TOCTOU race (a new Delta appearing between the compactor's check and commit), the lazy reaping transaction must include a `ScanAt` of the Delta prefix as part of its atomic read — if any Deltas are found at commit time that were not present at check time, the OCC mechanism detects the inconsistency and the reaping transaction fails safely. Alternatively, a conservative approach is to gate reaping by `2× MVCC retention window` to ensure no concurrent writer can be active for the target key.
 
 #### D4. Hash/Set Wide-Column Decomposition as Prerequisite
 
