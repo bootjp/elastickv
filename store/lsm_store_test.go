@@ -892,7 +892,7 @@ func TestPebbleStore_ApplyMutations_ValueTooLarge(t *testing.T) {
 	oversized := make([]byte, maxSnapshotValueSize+1)
 	err = s.ApplyMutations(ctx, []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
-	}, 0, 1)
+	}, nil, 0, 1)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrValueTooLarge)
 }
@@ -928,7 +928,7 @@ func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
 	oversized := make([]byte, maxSnapshotValueSize+1)
 	err := s.ApplyMutations(ctx, []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
-	}, 0, 1)
+	}, nil, 0, 1)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrValueTooLarge)
 }

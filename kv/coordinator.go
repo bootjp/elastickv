@@ -143,8 +143,13 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
+	// Read-set validation for single-shard transactions is performed by the
+	// adapter BEFORE Raft submission (validateReadSet). Passing readKeys
+	// into the Raft log would cause the FSM to reject transactions after
+	// they are already committed in the log, forcing retries at a later
+	// timestamp and breaking realtime ordering of appends.
 	r, err := c.transactionManager.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primary, reqs),
+		onePhaseTxnRequest(startTS, commitTS, primary, reqs, nil),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -258,7 +263,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			commitTS = 0
 		}
 		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems),
+			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, nil),
 		}
 	} else {
 		for _, req := range reqs.Elems {
@@ -318,7 +323,7 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP]) *pb.Request {
+func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
 	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
 	for _, req := range reqs {
@@ -329,6 +334,7 @@ func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Ele
 		Phase:     pb.Phase_NONE,
 		Ts:        startTS,
 		Mutations: muts,
+		ReadKeys:  readKeys,
 	}
 }
 

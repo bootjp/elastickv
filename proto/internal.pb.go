@@ -25,8 +25,13 @@ const (
 type Op int32
 
 const (
-	Op_PUT        Op = 0
-	Op_DEL        Op = 1
+	Op_PUT Op = 0
+	Op_DEL Op = 1
+	// DEL_PREFIX deletes all visible keys matching the prefix stored in `key`.
+	// An empty key means "all keys". Transaction-internal keys (!txn|) are
+	// always excluded.  This operation is applied locally by the FSM on each
+	// node, so the Raft log contains only a single mutation regardless of how
+	// many keys are deleted.
 	Op_DEL_PREFIX Op = 2
 )
 
@@ -184,11 +189,16 @@ func (x *Mutation) GetValue() []byte {
 }
 
 type Request struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	IsTxn         bool                   `protobuf:"varint,1,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
-	Phase         Phase                  `protobuf:"varint,2,opt,name=phase,proto3,enum=Phase" json:"phase,omitempty"`
-	Ts            uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`
-	Mutations     []*Mutation            `protobuf:"bytes,4,rep,name=mutations,proto3" json:"mutations,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	IsTxn     bool                   `protobuf:"varint,1,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
+	Phase     Phase                  `protobuf:"varint,2,opt,name=phase,proto3,enum=Phase" json:"phase,omitempty"`
+	Ts        uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`
+	Mutations []*Mutation            `protobuf:"bytes,4,rep,name=mutations,proto3" json:"mutations,omitempty"`
+	// read_keys carries the transaction's read set so that the FSM can validate
+	// read-write conflicts atomically with the commit. Each entry is a storage
+	// key that was read during the transaction; the FSM checks that none of them
+	// were written after ts (the transaction's start timestamp).
+	ReadKeys      [][]byte `protobuf:"bytes,5,rep,name=read_keys,json=readKeys,proto3" json:"read_keys,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -247,6 +257,13 @@ func (x *Request) GetTs() uint64 {
 func (x *Request) GetMutations() []*Mutation {
 	if x != nil {
 		return x.Mutations
+	}
+	return nil
+}
+
+func (x *Request) GetReadKeys() [][]byte {
+	if x != nil {
+		return x.ReadKeys
 	}
 	return nil
 }
@@ -504,12 +521,13 @@ const file_proto_internal_proto_rawDesc = "" +
 	"\bMutation\x12\x13\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x03.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\fR\x05value\"w\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\"\x94\x01\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12'\n" +
-	"\tmutations\x18\x04 \x03(\v2\t.MutationR\tmutations\"3\n" +
+	"\tmutations\x18\x04 \x03(\v2\t.MutationR\tmutations\x12\x1b\n" +
+	"\tread_keys\x18\x05 \x03(\fR\breadKeys\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +
@@ -522,10 +540,12 @@ const file_proto_internal_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
 	"\x14RelayPublishResponse\x12 \n" +
-	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers*\x16\n" +
+	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
-	"\x03DEL\x10\x01*5\n" +
+	"\x03DEL\x10\x01\x12\x0e\n" +
+	"\n" +
+	"DEL_PREFIX\x10\x02*5\n" +
 	"\x05Phase\x12\b\n" +
 	"\x04NONE\x10\x00\x12\v\n" +
 	"\aPREPARE\x10\x01\x12\n" +

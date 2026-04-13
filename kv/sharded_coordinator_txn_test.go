@@ -6,10 +6,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bootjp/elastickv/distribution"
-	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 )
 
 type recordingTransactional struct {
@@ -296,4 +299,259 @@ func TestCommitSecondaryWithRetry_ExhaustsRetries(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Len(t, txn.requests, txnSecondaryCommitRetryAttempts)
+}
+
+// ---------------------------------------------------------------------------
+// groupReadKeysByShardID
+// ---------------------------------------------------------------------------
+
+func TestGroupReadKeysByShardID_NilReturnsNil(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+	require.Nil(t, coord.groupReadKeysByShardID(nil))
+}
+
+func TestGroupReadKeysByShardID_EmptyReturnsNil(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+	require.Nil(t, coord.groupReadKeysByShardID([][]byte{}))
+}
+
+func TestGroupReadKeysByShardID_GroupsByShardID(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}, 2: {}}, 1, NewHLC(), nil)
+
+	grouped := coord.groupReadKeysByShardID([][]byte{
+		[]byte("b"), // shard 1
+		[]byte("c"), // shard 1
+		[]byte("x"), // shard 2
+	})
+	require.Len(t, grouped, 2)
+	require.Len(t, grouped[1], 2)
+	require.Equal(t, []byte("b"), grouped[1][0])
+	require.Equal(t, []byte("c"), grouped[1][1])
+	require.Len(t, grouped[2], 1)
+	require.Equal(t, []byte("x"), grouped[2][0])
+}
+
+func TestGroupReadKeysByShardID_SkipsUnroutableKeys(t *testing.T) {
+	t.Parallel()
+	// Only route "a"-"m" to shard 1. Keys outside this range are unroutable.
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+
+	grouped := coord.groupReadKeysByShardID([][]byte{
+		[]byte("b"),   // routable → shard 1
+		[]byte("zzz"), // unroutable → skipped
+	})
+	require.Len(t, grouped, 1)
+	require.Len(t, grouped[1], 1)
+	require.Equal(t, []byte("b"), grouped[1][0])
+}
+
+// ---------------------------------------------------------------------------
+// validateReadOnlyShards
+// ---------------------------------------------------------------------------
+
+// stubMVCCStore wraps a real MVCCStore to inject controlled LatestCommitTS.
+type stubMVCCStore struct {
+	store.MVCCStore
+	latestTS  map[string]uint64
+	returnErr error
+}
+
+func (s *stubMVCCStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
+	if s.returnErr != nil {
+		return 0, false, s.returnErr
+	}
+	ts, ok := s.latestTS[string(key)]
+	return ts, ok, nil
+}
+
+// noopEngine satisfies raftengine.Engine for unit tests.
+// LinearizableRead returns immediately (simulates an already-up-to-date FSM).
+type noopEngine struct{}
+
+func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
+	return &raftengine.ProposalResult{}, nil
+}
+func (noopEngine) State() raftengine.State                                 { return raftengine.StateLeader }
+func (noopEngine) Leader() raftengine.LeaderInfo                           { return raftengine.LeaderInfo{} }
+func (noopEngine) VerifyLeader(_ context.Context) error                    { return nil }
+func (noopEngine) LinearizableRead(_ context.Context) (uint64, error)      { return 0, nil }
+func (noopEngine) Status() raftengine.Status                               { return raftengine.Status{} }
+func (noopEngine) Configuration(_ context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+func (noopEngine) Close() error { return nil }
+
+func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	readOnlyStore := &stubMVCCStore{latestTS: map[string]uint64{
+		"x": 20, // committed at TS=20
+	}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	// shard 2 is read-only (not in writeGIDs), key "x" committed at 20 > startTS 10
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.Error(t, err)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+}
+
+func TestValidateReadOnlyShards_SkipsWriteShards(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	// shard 1 has a conflicting key, but it's a write shard — should be skipped
+	writeStore := &stubMVCCStore{latestTS: map[string]uint64{
+		"b": 20,
+	}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Store: writeStore, Engine: noopEngine{}},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		1: {[]byte("b")}, // write shard → skipped
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.NoError(t, err)
+}
+
+func TestValidateReadOnlyShards_NoConflictWhenKeyUnchanged(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	readOnlyStore := &stubMVCCStore{latestTS: map[string]uint64{
+		"x": 5, // committed at TS=5 <= startTS=10
+	}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.NoError(t, err)
+}
+
+func TestValidateReadOnlyShards_PropagatesStoreError(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	storeErr := errors.New("disk I/O error")
+	readOnlyStore := &stubMVCCStore{returnErr: storeErr}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.Error(t, err)
+	require.ErrorIs(t, err, storeErr)
+}
+
+func TestValidateReadOnlyShards_EmptyGroupedReadKeys(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+	err := coord.validateReadOnlyShards(context.Background(), nil, []uint64{1}, 10)
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-shard: readKeys routed to PREPARE per shard
+// ---------------------------------------------------------------------------
+
+func TestShardedCoordinatorDispatchTxn_ReadKeysRoutedToPrepareByShard(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1) // shard 1: a-m
+	engine.UpdateRoute([]byte("m"), nil, 2)          // shard 2: m+
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: 10,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")}, // shard 1
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")}, // shard 2
+		},
+		ReadKeys: [][]byte{
+			[]byte("c"), // shard 1 read key
+			[]byte("y"), // shard 2 read key
+		},
+	})
+	require.NoError(t, err)
+
+	// PREPARE for shard 1 should have readKey "c"
+	g1Prepare := g1Txn.requests[0]
+	require.Equal(t, pb.Phase_PREPARE, g1Prepare.Phase)
+	require.Equal(t, [][]byte{[]byte("c")}, g1Prepare.ReadKeys)
+
+	// PREPARE for shard 2 should have readKey "y"
+	g2Prepare := g2Txn.requests[0]
+	require.Equal(t, pb.Phase_PREPARE, g2Prepare.Phase)
+	require.Equal(t, [][]byte{[]byte("y")}, g2Prepare.ReadKeys)
+}
+
+func TestShardedCoordinatorDispatchTxn_SingleShardOmitsReadKeysFromRaftEntry(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		Elems:    []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+		ReadKeys: [][]byte{[]byte("rk1"), []byte("rk2")},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 1)
+	// Single-shard: readKeys are validated pre-Raft by the adapter,
+	// so they must NOT be in the Raft log entry.
+	require.Nil(t, g1Txn.requests[0].ReadKeys)
 }

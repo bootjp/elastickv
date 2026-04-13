@@ -664,7 +664,7 @@ func (s *distributionCoordinatorStub) applyDispatch(
 	startTS uint64,
 	commitTS uint64,
 ) error {
-	if err := s.store.ApplyMutations(ctx, mutations, startTS, commitTS); err != nil {
+	if err := s.store.ApplyMutations(ctx, mutations, nil, startTS, commitTS); err != nil {
 		return err
 	}
 	if s.afterDispatch != nil {

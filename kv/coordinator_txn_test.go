@@ -116,3 +116,6 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, commitTS, meta.CommitTS)
 }
+
+// ReadKeys omission from single-shard Raft entries is tested in
+// TestShardedCoordinatorDispatchTxn_SingleShardOmitsReadKeysFromRaftEntry.

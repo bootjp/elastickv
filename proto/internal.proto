@@ -39,6 +39,11 @@ message Request {
   Phase phase = 2;
   uint64 ts = 3;
   repeated Mutation mutations = 4;
+  // read_keys carries the transaction's read set so that the FSM can validate
+  // read-write conflicts atomically with the commit. Each entry is a storage
+  // key that was read during the transaction; the FSM checks that none of them
+  // were written after ts (the transaction's start timestamp).
+  repeated bytes read_keys = 5;
 }
 
 message RaftCommand {

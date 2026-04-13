@@ -278,7 +278,7 @@ func TestMVCCConcurrentApplyMutations(t *testing.T) {
 						Value: []byte(fmt.Sprintf("g%d-r%d", goroutineID, i)),
 					},
 				}
-				err := st.ApplyMutations(ctx, mutations, startTS, commitTS)
+				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
 				if err == nil {
 					successCount.Add(1)
 					continue
@@ -349,7 +349,7 @@ func TestMVCCConcurrentApplyMutationsMultiKey(t *testing.T) {
 					{Op: OpTypePut, Key: keyA, Value: []byte(fmt.Sprintf("a-g%d-r%d", goroutineID, i))},
 					{Op: OpTypePut, Key: keyB, Value: []byte(fmt.Sprintf("b-g%d-r%d", goroutineID, i))},
 				}
-				err := st.ApplyMutations(ctx, mutations, startTS, commitTS)
+				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
 				if err == nil {
 					successCount.Add(1)
 					continue
@@ -571,4 +571,65 @@ func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 	for err := range errCh {
 		require.NoError(t, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Read-write conflict detection (SSI) for mvccStore
+// ---------------------------------------------------------------------------
+
+func TestMVCCStore_ApplyMutations_ReadConflict(t *testing.T) {
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+
+	// Commit k1 at TS=20.
+	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	// Write k2 but read k1. k1 committed at 20 > startTS=10 → conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrWriteConflict))
+}
+
+func TestMVCCStore_ApplyMutations_ReadConflict_NoConflictWhenUnchanged(t *testing.T) {
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+
+	// Commit k1 at TS=5.
+	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+
+	// startTS=10 >= k1's commit(5) → no conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
+	require.NoError(t, err)
+}
+
+func TestMVCCStore_ApplyMutations_ReadConflict_NonexistentKey(t *testing.T) {
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+
+	// Reading a nonexistent key should not conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
+	}
+	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("ghost")}, 10, 20)
+	require.NoError(t, err)
+}
+
+func TestMVCCStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+
+	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	// nil readKeys → only write-write check; k2 write has no conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err := st.ApplyMutations(ctx, mutations, nil, 10, 30)
+	require.NoError(t, err)
 }

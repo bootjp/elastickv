@@ -129,10 +129,30 @@ type MVCCStore interface {
 	// The boolean reports whether the key has any version.
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
-	// It must return ErrWriteConflict if any key has a newer commit timestamp
-	// than startTS. Note: only write-write conflicts are detected (Snapshot
-	// Isolation). Read-write conflicts (write skew) are not prevented.
-	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, startTS, commitTS uint64) error
+	// It must return ErrWriteConflict if any mutation key or any read key has
+	// a newer commit timestamp than startTS. readKeys carries the transaction's
+	// read set for read-write conflict detection; pass nil when no read set
+	// validation is needed.
+	//
+	// Isolation guarantees vary by transaction topology:
+	//
+	//   Single-shard transactions: read-set validation is performed by the
+	//   adapter layer BEFORE Raft submission (pre-Raft). readKeys is nil in
+	//   the Raft log entry so the FSM does not re-validate. This avoids
+	//   post-commit rejections that would break realtime ordering, but
+	//   introduces a TOCTOU window between the adapter check and the FSM
+	//   apply under applyMu. The window is narrow (single Raft round-trip)
+	//   and matches the isolation level of the previous validateReadSet
+	//   design.
+	//
+	//   Multi-shard (2PC) write shards: readKeys are included in the
+	//   PREPARE Raft entry and validated atomically under the FSM's applyMu
+	//   lock. No TOCTOU window; full SSI.
+	//
+	//   Multi-shard (2PC) read-only shards: validated via a linearizable
+	//   read barrier followed by LatestCommitTS outside the FSM lock. A
+	//   small TOCTOU window exists between the barrier and the check.
+	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.
