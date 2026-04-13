@@ -3,6 +3,7 @@ package etcd
 import (
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/cockroachdb/errors"
 )
@@ -62,6 +63,24 @@ func (s *snapshotSpool) Reader() (io.Reader, error) {
 		return nil, errors.WithStack(err)
 	}
 	return s.file, nil
+}
+
+// cleanupStaleSnapshotSpools removes orphaned snapshot spool files left behind
+// by a previous engine instance that crashed before Close could run.
+func cleanupStaleSnapshotSpools(dir string) error {
+	matches, err := filepath.Glob(filepath.Join(dir, snapshotSpoolPattern))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	var combined error
+	for _, match := range matches {
+		removeErr := os.Remove(match)
+		if removeErr == nil || os.IsNotExist(removeErr) {
+			continue
+		}
+		combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
+	}
+	return errors.WithStack(combined)
 }
 
 func (s *snapshotSpool) Close() error {

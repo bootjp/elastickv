@@ -38,6 +38,10 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	if err := cleanupStaleSnapshotSpools(cfg.DataDir); err != nil {
+		return nil, errors.Wrap(err, "cleanup stale snapshot spools")
+	}
+
 	if wal.Exist(walDir) {
 		return loadWalState(logger, walDir, snapDir, cfg.StateMachine)
 	}
@@ -334,6 +338,45 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	return snapshot, nil
+}
+
+// defaultMaxSnapFiles is the number of .snap files to retain in the snap
+// directory. etcd itself purges old snap files via fileutil.PurgeFile; the
+// elastickv etcd engine must do this explicitly.
+const defaultMaxSnapFiles = 3
+
+// purgeOldSnapFiles removes old .snap files from snapDir, keeping the most
+// recent defaultMaxSnapFiles files. Snap file names encode term and index in
+// hex and sort lexicographically from oldest to newest, matching etcd's
+// Snapshotter convention.
+func purgeOldSnapFiles(snapDir string) error {
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	var snaps []string
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".snap" {
+			snaps = append(snaps, e.Name())
+		}
+	}
+
+	if len(snaps) <= defaultMaxSnapFiles {
+		return nil
+	}
+
+	// snaps is already sorted ascending (oldest first) because os.ReadDir
+	// returns entries in directory order which, for zero-padded hex names,
+	// equals chronological order.
+
+	var combined error
+	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
+		if removeErr := os.Remove(filepath.Join(snapDir, name)); removeErr != nil && !os.IsNotExist(removeErr) {
+			combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
+		}
+	}
+	return errors.WithStack(combined)
 }
 
 func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
