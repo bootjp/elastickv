@@ -83,6 +83,12 @@ Because the Delta key embeds `commitTS`, the write path must know the final time
 
 **HLC Leader Initialization Invariant**: When a new leader is elected, it must initialize its HLC to a value strictly greater than the maximum `commitTS` observed in its Raft log (the applied index's timestamp). This is already guaranteed by the existing `HLC.Update(observedTS)` call on each FSM `Apply`, which advances the local clock past any previously committed timestamp. Without this invariant, a new leader with a lagging wall clock could issue duplicate `commitTS` values, causing Delta key collisions in the LSM tree.
 
+**Uniqueness guarantee and failure modes**: The `commitTS` uniqueness relies on two invariants:
+
+1. **HLC monotonicity**: The HLC logical counter ensures uniqueness within the same millisecond. The elastickv HLC uses a 48-bit physical (ms) + 16-bit logical layout. If more than 65,535 operations occur within a single millisecond (requiring logical counter overflow), `HLC.Next()` must return an error or block until the wall clock advances. The implementation must not silently wrap the counter, as this would produce duplicate timestamps and Delta key collisions.
+
+2. **Raft single-leader guarantee**: Only the Raft leader issues `commitTS` values. Split-brain scenarios (two leaders issuing timestamps simultaneously) are prevented by Raft's leader election protocol, which guarantees at most one leader per term. A stale leader's proposals will be rejected by the new term's leader. This design explicitly depends on Raft's leader uniqueness — it does not add any additional mechanism for split-brain prevention.
+
 ```go
 const ListMetaDeltaPrefix = "!lst|meta|d|"
 
@@ -198,6 +204,13 @@ LRANGE key start stop:
 ```
 
 When the number of Deltas is small (< 100), the cost of a Prefix Scan is negligible. Since Delta keys are physically contiguous in the LSM tree, I/O can be performed in a single sequential read.
+
+**Expected performance characteristics**: With `maxDeltaCount = 64` (soft limit before compaction triggers):
+- `resolveListMeta` (LLEN): 1 point read (base meta) + 1 prefix scan (≤64 entries, ~16 bytes each ≈ 1 KiB). Expected latency: **< 100μs** on SSD-backed Pebble.
+- `LRANGE` with Claim keys: `resolveListMeta` + 1 item range scan + 1 Claim range scan per window. The Claim scan is bounded by `scanWindow` (default 128 keys). Total additional cost vs. current LRANGE: **one extra range scan per call**.
+- Under compactor failure (delta count approaching `maxDeltaScanLimit = 256`): `resolveListMeta` scans up to 256 × 16 bytes ≈ 4 KiB. Still a single sequential I/O, but latency may increase to **~500μs**. The hard limit error at 256 prevents unbounded degradation.
+
+These estimates should be validated with benchmarks during Phase L5 implementation.
 
 **`maxDeltaScanLimit` overflow**: If the number of unapplied Deltas exceeds `maxDeltaScanLimit`, `resolveListMeta` cannot aggregate them all in a single scan pass, which would produce an incorrect `ListMeta`. To preserve correctness, `resolveListMeta` must return an error when the scan result is truncated (i.e., when `len(deltas) == maxDeltaScanLimit`). The caller should then either surface the error or trigger an immediate synchronous compaction before retrying. This behaviour is the enforcement backstop for the hard-limit policy described in Design Decision D1 (Section 29).
 
@@ -416,6 +429,10 @@ type listTxnState struct {
 
 **Consistency note for metadata reads in MULTI/EXEC**: Commands that read collection cardinality within a transaction (e.g., `LLEN`, `HLEN`) observe the snapshot at `startTS` plus locally accumulated deltas within the transaction. Because the base metadata key is excluded from the `readSet`, concurrent writers may commit deltas between the transaction's `startTS` and its commit. This provides snapshot isolation (not strict serializability) for cardinality reads, which matches Redis's existing `MULTI/EXEC` semantics where commands see the state at execution time, not a globally serialized point. If strict serializability is required for a specific use case, the caller can opt in by explicitly registering the base metadata key in the `readSet`, accepting the higher conflict rate.
 
+**Critical: `txnStartTS` must account for Delta key commits.** The `txnStartTS()` function computes `startTS` by calling `maxLatestCommitTS()` on keys involved in the transaction. In the current codebase, this checks only base metadata keys (e.g., `!lst|meta|<key>`). However, standalone RPUSH/LPUSH writes only to Delta keys (`!lst|meta|d|...`) and item keys, **not** to the base metadata key. If `maxLatestCommitTS` does not include the latest Delta key commit timestamp, `startTS` may predate recent standalone writes, causing `resolveListMeta(startTS)` to miss those deltas. When MULTI/EXEC then writes base metadata with a delta cleanup, the missed deltas are erased without their contributions being folded into the base — resulting in data loss.
+
+To fix this, `maxLatestCommitTS()` must additionally reverse-scan each list key's Delta prefix (`!lst|meta|d|<keyLen><key>`) with limit 1 to find the most recent Delta key, and include its `LatestCommitTS` in the maximum. This ensures `startTS ≥ max(all delta commits)` for keys involved in the transaction. The same applies to Hash, Set, and ZSet Delta prefixes when those types are integrated.
+
 ### 8. New Key Helper Functions
 
 ```go
@@ -621,6 +638,15 @@ No Claim mechanism is needed because `HDEL` targets named fields, not positional
 ```
 
 **Concurrent write behavior during migration**: Because the migration and the triggering write are committed as a single atomic transaction, concurrent writers targeting the same key will encounter an OCC write conflict on the legacy blob key (`!redis|hash|<key>`) and retry. On retry, the winner's migration will already be visible, so the retrier takes the wide-column path directly. Concurrent writes to **different** Hash keys are unaffected since they touch separate legacy blobs. Reads during migration use the fallback logic (step 1) and always see a consistent view: either the pre-migration blob or the post-migration wide-column data, never a partial state.
+
+**Large collection migration**: If a Hash or Set has a very large number of fields/members (e.g., tens of thousands), the migration transaction may exceed the Raft proposal size limit (typically 1 MiB). To handle this:
+- The migration must enforce a **maximum batch size** (e.g., `maxMigrationKeysPerTx = 1000`).
+- If the legacy blob contains more keys than the batch limit, the migration writes the first batch of field keys + a **partial metadata marker** indicating migration is in progress.
+- Subsequent writes continue the migration in batches until complete.
+- During partial migration, reads must merge results from both the legacy blob (for unmigrated fields) and the wide-column keys (for migrated fields).
+- The partial migration marker is removed once all fields have been migrated.
+
+This adds complexity to the read path during migration but prevents Raft proposal size violations. The same batched approach applies to Set migration (Section 20).
 
 ---
 
@@ -931,6 +957,29 @@ For all collection types, empty collection cleanup is deferred to Background Com
 - During the brief window between compactions, `resolve*Meta()` returns `Len == 0`, ensuring cardinality queries correctly report an empty collection.
 - **Full metadata deletion** may only occur as part of a `DEL` command on the key itself, which is handled outside the delta compaction path and uses the standard transactional `DEL` flow.
 
+#### DEL Command: Complete Delta/Claim Cleanup
+
+The `DEL` command must delete **all** Delta and Claim keys for the target collection, not just those visible within `maxDeltaScanLimit`. Because the compactor may have fallen behind, the number of accumulated Delta keys could exceed the scan limit. The DEL handler must therefore use a **batched loop scan** (not a single bounded scan):
+
+```
+DEL key (list example):
+  1. Delete base metadata key: !lst|meta|<key>
+  2. Delete all item keys: scan !lst|itm|<key>* in batches until exhausted
+  3. Delete all delta keys: scan !lst|meta|d|<keyLen><key>* in batches until exhausted
+  4. Delete all claim keys: scan !lst|claim|<keyLen><key>* in batches until exhausted
+  5. All deletions are committed in a single transaction with the DEL
+
+For each scan step, use a cursor-advancing loop:
+  cursor = prefix
+  loop:
+    batch = ScanAt(cursor, prefixEnd, batchSize=1000, readTS)
+    append Del ops for each key in batch
+    if len(batch) < batchSize: break
+    cursor = incrementKey(batch[-1].Key)
+```
+
+This ensures DEL is complete regardless of Delta accumulation. The same batched-loop pattern applies to Hash (`!hs|meta|d|`, `!hs|fld|`), Set (`!st|meta|d|`, `!st|mem|`), and ZSet (`!zs|meta|d|`) collections. Without this, a DEL on a list with >256 accumulated deltas would leave orphaned delta keys, causing the list to "resurrect" on subsequent reads via `resolve*Meta()`.
+
 ---
 
 ## Implementation Status
@@ -1064,8 +1113,9 @@ For all collection types, empty collection cleanup is deferred to Background Com
 
 - Ensure all existing Redis compatibility tests (`redis_test.go`, `redis_txn_test.go`) pass.
 - Add concurrent `POP` tests (verify correctness of the Claim mechanism, both LPOP and RPOP).
+- **Jepsen: mixed standalone/MULTI workload** — Run the `redis-append` Jepsen workload which interleaves standalone RPUSH (single-mop, no MULTI) with MULTI/EXEC transactions containing multiple appends and reads. This specifically targets the dual-path consistency risk where standalone writes emit Delta keys and MULTI/EXEC reads/writes interact with them. The workload must pass strict-serializable checking.
 - Measure write conflict rates (compare before/after Delta introduction).
-- Benchmark `LLEN` / `LRANGE` latency across different Delta accumulation levels.
+- Benchmark `LLEN` / `LRANGE` latency across different Delta accumulation levels (0, 10, 64, 256 deltas).
 
 ### Hash
 
@@ -1098,6 +1148,11 @@ For all collection types, empty collection cleanup is deferred to Background Com
 - Ensure all existing Hash tests pass.
 - Add concurrent `HSET` tests for different fields.
 - Benchmark `HLEN` latency across delta levels.
+- **Migration edge case tests**:
+  - Crash recovery during migration (verify partial migration marker is handled on restart).
+  - OCC conflict during migration transaction (verify retry correctly completes migration).
+  - Large Hash migration exceeding batch limit (verify batched migration produces correct final state).
+  - Concurrent reads during partial migration (verify merged legacy+wide-column view is consistent).
 
 ### Set
 
@@ -1128,6 +1183,7 @@ For all collection types, empty collection cleanup is deferred to Background Com
 - Add Set compaction handler to the unified `DeltaCompactor`.
 - Ensure all existing Set tests pass.
 - Add concurrent `SADD` tests for different members.
+- **Migration edge case tests**: same as Hash Phase H4 (crash recovery, OCC retry, batched migration, concurrent read during partial migration).
 
 ### ZSet
 
