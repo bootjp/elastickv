@@ -2189,6 +2189,7 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 	// latency hot path. If needed, add batching/caching at the storage layer.
 	const txnLatestCommitKeysPerCmd = 4
 	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
+	listKeysToScan := make(map[string]struct{})
 	for _, cmd := range queue {
 		if len(cmd.Args) < minKeyedArgs {
 			continue
@@ -2203,12 +2204,36 @@ func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Comm
 			keys = append(keys, redisZSetKey(key))
 			keys = append(keys, redisTTLKey(key))
 		}
+		// Track list keys for delta timestamp check.
+		switch name {
+		case cmdRPush, cmdLRange, cmdDel, cmdLPush:
+			listKeysToScan[string(cmd.Args[1])] = struct{}{}
+		}
 	}
+
+	keys = r.appendLatestDeltaKeys(ctx, keys, listKeysToScan)
+
 	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
 	if err != nil {
 		return 0, errors.WithStack(err)
 	}
 	return ts, nil
+}
+
+// appendLatestDeltaKeys finds the latest delta key for each list key and
+// appends it to keys so that MaxLatestCommitTS accounts for recent standalone
+// RPUSH operations that write only delta keys (not base metadata).
+func (r *RedisServer) appendLatestDeltaKeys(ctx context.Context, keys [][]byte, listKeys map[string]struct{}) [][]byte {
+	for k := range listKeys {
+		prefix := store.ListMetaDeltaScanPrefix([]byte(k))
+		end := store.PrefixScanEnd(prefix)
+		latest, err := r.store.ReverseScanAt(ctx, prefix, end, 1, ^uint64(0))
+		if err != nil || len(latest) == 0 {
+			continue
+		}
+		keys = append(keys, latest[0].Key)
+	}
+	return keys
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
