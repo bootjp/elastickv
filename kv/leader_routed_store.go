@@ -232,11 +232,11 @@ func (s *LeaderRoutedStore) LatestCommitTS(ctx context.Context, key []byte) (uin
 	return s.proxyRawLatestCommitTS(ctx, key)
 }
 
-func (s *LeaderRoutedStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, startTS, commitTS uint64) error {
+func (s *LeaderRoutedStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
-	return errors.WithStack(s.local.ApplyMutations(ctx, mutations, startTS, commitTS))
+	return errors.WithStack(s.local.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {

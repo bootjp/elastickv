@@ -68,7 +68,7 @@ func TestMVCCStore_ApplyMutations_WriteConflict(t *testing.T) {
 
 	err := st.ApplyMutations(ctx, []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k"), Value: []byte("v2")},
-	}, 10, 30)
+	}, nil, 10, 30)
 	require.ErrorIs(t, err, ErrWriteConflict)
 }
 
@@ -80,7 +80,7 @@ func TestMVCCStore_ApplyMutations_UnknownOp(t *testing.T) {
 
 	err := st.ApplyMutations(ctx, []*KVPairMutation{
 		{Op: OpType(99), Key: []byte("k"), Value: []byte("v")},
-	}, 10, 20)
+	}, nil, 10, 20)
 	require.ErrorIs(t, err, ErrUnknownOp)
 }
 

@@ -90,7 +90,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.StartTS, reqs.CommitTS, reqs.Elems)
+		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.Elems, reqs.ReadKeys)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -193,7 +193,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	grouped, gids, err := c.groupMutations(elems)
 	if err != nil {
 		return nil, err
@@ -212,7 +212,7 @@ func (c *ShardedCoordinator) dispatchTxn(startTS uint64, commitTS uint64, elems 
 		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
 	}
 
-	prepared, err := c.prewriteTxn(startTS, commitTS, primaryKey, grouped, gids)
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -246,8 +246,9 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, pr
 	if err != nil {
 		return nil, err
 	}
+	// Single-shard: read-set validated pre-Raft by the adapter.
 	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems),
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, nil),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -263,9 +264,11 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
+
+	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
 
 	for _, gid := range gids {
 		g, err := c.txnGroupForID(gid)
@@ -277,12 +280,21 @@ func (c *ShardedCoordinator) prewriteTxn(startTS, commitTS uint64, primaryKey []
 			Phase:     pb.Phase_PREPARE,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
+			ReadKeys:  groupedReadKeys[gid],
 		}
 		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
 			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 			return nil, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
+	}
+
+	// Validate read keys on read-only shards (shards that have read keys
+	// but no mutations in this transaction). Without this, a concurrent
+	// write to a read-only shard would go undetected.
+	if err := c.validateReadOnlyShards(ctx, groupedReadKeys, gids, startTS); err != nil {
+		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		return nil, err
 	}
 
 	return prepared, nil
@@ -584,6 +596,81 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 		return 0
 	}
 	return route.GroupID
+}
+
+func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
+	if len(readKeys) == 0 {
+		return nil
+	}
+	grouped := make(map[uint64][][]byte)
+	for _, key := range readKeys {
+		gid := c.engineGroupIDForKey(key)
+		if gid == 0 {
+			continue
+		}
+		grouped[gid] = append(grouped[gid], key)
+	}
+	return grouped
+}
+
+// validateReadOnlyShards checks read-write conflicts on shards that have
+// read keys but no mutations in this transaction. writeGIDs is the set of
+// shards that already received a PREPARE with their readKeys attached.
+//
+// Because these shards have no mutations, we cannot send a PREPARE request
+// (the FSM rejects empty mutation lists). Instead we issue a linearizable
+// read barrier on each read-only shard's Raft group (ensuring the local
+// FSM has applied all committed log entries) and then check LatestCommitTS
+// against the local store.
+//
+// NOTE: This check is performed outside the FSM's applyMu lock, so there
+// is a small TOCTOU window between the linearizable read barrier and the
+// LatestCommitTS check. A concurrent write that commits in this window may
+// go undetected. Full SSI for read-only shards in multi-shard transactions
+// would require a dedicated "read-validate" FSM request phase. For
+// single-shard transactions and write-shard read keys, validation is fully
+// atomic under applyMu.
+func (c *ShardedCoordinator) validateReadOnlyShards(ctx context.Context, groupedReadKeys map[uint64][][]byte, writeGIDs []uint64, startTS uint64) error {
+	if len(groupedReadKeys) == 0 {
+		return nil
+	}
+	writeSet := make(map[uint64]struct{}, len(writeGIDs))
+	for _, gid := range writeGIDs {
+		writeSet[gid] = struct{}{}
+	}
+	for gid, keys := range groupedReadKeys {
+		if _, isWrite := writeSet[gid]; isWrite {
+			continue
+		}
+		if err := c.validateReadKeysOnShard(ctx, gid, keys, startTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid uint64, keys [][]byte, startTS uint64) error {
+	g, ok := c.groups[gid]
+	if !ok {
+		return nil
+	}
+	// Linearizable read barrier: wait until the shard's FSM has applied
+	// all Raft-committed entries so LatestCommitTS reflects the latest
+	// committed state. Without this, a concurrent write that is committed
+	// in Raft but not yet applied locally would be invisible.
+	if _, err := linearizableReadEngineCtx(ctx, engineForGroup(g)); err != nil {
+		return errors.WithStack(err)
+	}
+	for _, key := range keys {
+		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if exists && ts > startTS {
+			return errors.WithStack(store.NewWriteConflictError(key))
+		}
+	}
+	return nil
 }
 
 var _ Coordinator = (*ShardedCoordinator)(nil)

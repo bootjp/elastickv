@@ -184,7 +184,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	}
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
-	return errors.WithStack(f.store.ApplyMutations(ctx, muts, commitTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutations(ctx, muts, nil, commitTS, commitTS))
 }
 
 // extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
@@ -313,18 +313,18 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	}
 
-	if err := f.store.ApplyMutations(ctx, storeMuts, startTS, startTS); err != nil {
+	if err := f.store.ApplyMutations(ctx, storeMuts, r.ReadKeys, startTS, startTS); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
 }
 
 // handleOnePhaseTxnRequest applies a single-shard transaction atomically.
-// The isolation level is Snapshot Isolation (SI): only write-write conflicts
-// are detected via ApplyMutations. Read-write conflicts (write skew) are NOT
-// prevented because the read-set is not tracked. Callers requiring
-// Serializable Snapshot Isolation (SSI) must implement read-set validation
-// at a higher layer.
+// Write-write conflicts are always checked under the store's apply lock.
+// r.ReadKeys is passed through to ApplyMutations for read-write conflict
+// detection; for single-shard transactions it is typically nil because the
+// adapter validates the read set pre-Raft (see kv/coordinator.go), while
+// multi-shard PREPARE requests carry per-shard read keys.
 func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {
@@ -350,7 +350,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, startTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
@@ -419,7 +419,7 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 // The secondary-shard LatestCommitTS scan is intentionally deferred to the
 // write-conflict path so the hot (first-time) commit path pays no extra cost.
 func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
-	err := f.store.ApplyMutations(ctx, storeMuts, applyStartTS, commitTS)
+	err := f.store.ApplyMutations(ctx, storeMuts, nil, applyStartTS, commitTS)
 	if err == nil {
 		return nil
 	}
@@ -436,7 +436,7 @@ func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMut
 			return errors.WithStack(lErr)
 		}
 		if exists && latestTS >= commitTS {
-			return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, commitTS, commitTS))
+			return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, nil, commitTS, commitTS))
 		}
 	}
 	return errors.WithStack(err)
@@ -475,7 +475,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, startTS, abortTS))
+	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, nil, startTS, abortTS))
 }
 
 func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

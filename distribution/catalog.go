@@ -627,7 +627,7 @@ func (s *CatalogStore) applySaveMutations(ctx context.Context, plan savePlan, mu
 	if err != nil {
 		return err
 	}
-	if err := s.store.ApplyMutations(ctx, mutations, plan.readTS, commitTS); err != nil {
+	if err := s.store.ApplyMutations(ctx, mutations, nil, plan.readTS, commitTS); err != nil {
 		if errors.Is(err, store.ErrWriteConflict) {
 			return errors.WithStack(ErrCatalogVersionMismatch)
 		}

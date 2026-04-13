@@ -26,7 +26,7 @@ func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
 
-	err = s.ApplyMutations(ctx, mutations, 0, 10)
+	err = s.ApplyMutations(ctx, mutations, nil, 0, 10)
 	require.NoError(t, err)
 
 	// Both keys should be readable at commitTS.
@@ -58,7 +58,7 @@ func TestPebbleStore_ApplyMutations_Delete(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypeDelete, Key: []byte("k1")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 20)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 20)
 	require.NoError(t, err)
 
 	// After the delete, key should be a tombstone.
@@ -82,7 +82,7 @@ func TestPebbleStore_ApplyMutations_PutWithTTL(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1"), ExpireAt: 50},
 	}
-	err = s.ApplyMutations(ctx, mutations, 0, 10)
+	err = s.ApplyMutations(ctx, mutations, nil, 0, 10)
 	require.NoError(t, err)
 
 	// Visible before expiry.
@@ -113,7 +113,7 @@ func TestPebbleStore_ApplyMutations_WriteConflict(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 30)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 30)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrWriteConflict), "expected ErrWriteConflict, got %v", err)
 
@@ -143,7 +143,7 @@ func TestPebbleStore_ApplyMutations_NoConflictWhenStartTSGECommit(t *testing.T) 
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 20)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 20)
 	require.NoError(t, err)
 
 	val, err := s.GetAt(ctx, []byte("k1"), 20)
@@ -164,14 +164,14 @@ func TestPebbleStore_ApplyMutations_UpdatesLastCommitTS(t *testing.T) {
 	mutations := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
 	}
-	require.NoError(t, s.ApplyMutations(ctx, mutations, 0, 100))
+	require.NoError(t, s.ApplyMutations(ctx, mutations, nil, 0, 100))
 	assert.Equal(t, uint64(100), s.LastCommitTS())
 
 	// A second apply with a higher commitTS advances lastCommitTS.
 	mutations2 := []*KVPairMutation{
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
-	require.NoError(t, s.ApplyMutations(ctx, mutations2, 100, 200))
+	require.NoError(t, s.ApplyMutations(ctx, mutations2, nil, 100, 200))
 	assert.Equal(t, uint64(200), s.LastCommitTS())
 }
 
@@ -191,7 +191,7 @@ func TestPebbleStore_ApplyMutations_Atomicity(t *testing.T) {
 		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
 		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
 	}
-	err = s.ApplyMutations(ctx, mutations, 10, 60)
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 60)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrWriteConflict))
 
@@ -463,4 +463,162 @@ func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
 	val, err = s.GetAt(ctx, []byte("k2"), 12)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("k2v8"), val)
+}
+
+// ---------------------------------------------------------------------------
+// Read-write conflict detection (SSI)
+// ---------------------------------------------------------------------------
+
+func TestPebbleStore_ApplyMutations_ReadConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Commit k1 at TS=20.
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	// A transaction that started at TS=10 writes k2 but reads k1.
+	// k1 was committed at TS=20 > startTS=10 → read-write conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrWriteConflict))
+
+	conflictKey, ok := WriteConflictKey(err)
+	assert.True(t, ok)
+	assert.Equal(t, []byte("k1"), conflictKey)
+
+	// k2 should NOT have been written.
+	_, err = s.GetAt(ctx, []byte("k2"), 30)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+func TestPebbleStore_ApplyMutations_ReadConflict_NoConflictWhenReadKeyUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Commit k1 at TS=5.
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+
+	// Transaction starts at TS=10. k1 was committed at TS=5 <= startTS=10 → no conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
+	require.NoError(t, err)
+
+	val, err := s.GetAt(ctx, []byte("k2"), 20)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v2"), val)
+}
+
+func TestPebbleStore_ApplyMutations_ReadConflict_NonexistentReadKey(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Reading a key that doesn't exist should not cause a conflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("nonexistent")}, 10, 20)
+	require.NoError(t, err)
+
+	val, err := s.GetAt(ctx, []byte("k1"), 20)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v1"), val)
+}
+
+func TestPebbleStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Passing nil readKeys should behave as before (write-write only).
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 30)
+	require.NoError(t, err)
+}
+
+func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=5 (before startTS), k2 committed at TS=20 (after startTS).
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v2"), 20, 0))
+
+	// Reading both k1 and k2: k1 is fine but k2 conflicts.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k3"), Value: []byte("v3")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1"), []byte("k2")}, 10, 30)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrWriteConflict))
+
+	conflictKey, ok := WriteConflictKey(err)
+	assert.True(t, ok)
+	assert.Equal(t, []byte("k2"), conflictKey)
+}
+
+func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=20 (after startTS=10).
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+
+	// Both writing and reading k1. The write-write check detects the conflict
+	// before the read-write check runs; either way the result is ErrWriteConflict.
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrWriteConflict))
+}
+
+func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey_NoConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// k1 committed at TS=5 (before startTS=10). No conflict expected.
+	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v2")},
+	}
+	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
+	require.NoError(t, err)
 }
