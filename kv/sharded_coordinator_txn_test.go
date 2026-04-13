@@ -6,12 +6,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
 )
 
 type recordingTransactional struct {

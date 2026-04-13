@@ -209,7 +209,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	}
 
 	if len(gids) == 1 {
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
 	}
 
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
@@ -241,7 +241,7 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 	return commitTS, nil
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
@@ -642,25 +642,32 @@ func (c *ShardedCoordinator) validateReadOnlyShards(ctx context.Context, grouped
 		if _, isWrite := writeSet[gid]; isWrite {
 			continue
 		}
-		g, ok := c.groups[gid]
-		if !ok {
-			continue
+		if err := c.validateReadKeysOnShard(ctx, gid, keys, startTS); err != nil {
+			return err
 		}
-		// Linearizable read barrier: wait until the shard's FSM has applied
-		// all Raft-committed entries so LatestCommitTS reflects the latest
-		// committed state. Without this, a concurrent write that is committed
-		// in Raft but not yet applied locally would be invisible.
-		if _, err := linearizableReadEngineCtx(ctx, engineForGroup(g)); err != nil {
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid uint64, keys [][]byte, startTS uint64) error {
+	g, ok := c.groups[gid]
+	if !ok {
+		return nil
+	}
+	// Linearizable read barrier: wait until the shard's FSM has applied
+	// all Raft-committed entries so LatestCommitTS reflects the latest
+	// committed state. Without this, a concurrent write that is committed
+	// in Raft but not yet applied locally would be invisible.
+	if _, err := linearizableReadEngineCtx(ctx, engineForGroup(g)); err != nil {
+		return errors.WithStack(err)
+	}
+	for _, key := range keys {
+		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		if err != nil {
 			return errors.WithStack(err)
 		}
-		for _, key := range keys {
-			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			if exists && ts > startTS {
-				return errors.WithStack(store.NewWriteConflictError(key))
-			}
+		if exists && ts > startTS {
+			return errors.WithStack(store.NewWriteConflictError(key))
 		}
 	}
 	return nil

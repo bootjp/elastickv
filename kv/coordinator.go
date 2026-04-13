@@ -75,7 +75,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS, reqs.ReadKeys)
+		return c.dispatchTxn(reqs.Elems, reqs.StartTS, reqs.CommitTS)
 	}
 
 	return c.dispatchRaw(reqs.Elems)
@@ -122,7 +122,7 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64, readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
 	primary := primaryKeyForElems(reqs)
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)

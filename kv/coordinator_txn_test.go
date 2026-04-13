@@ -36,7 +36,7 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, startTS, 0, nil)
+	}, startTS, 0)
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -52,7 +52,7 @@ func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: nil, Value: []byte("v")},
-	}, 1, 0, nil)
+	}, 1, 0)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -70,7 +70,7 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("b"), Value: []byte("v1")},
 		{Op: Del, Key: []byte("x")},
-	}, startTS, 0, nil)
+	}, startTS, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, tx.commits)
 	require.Len(t, tx.reqs, 1)
@@ -107,7 +107,7 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitTS := uint64(25)
 	_, err := c.dispatchTxn([]*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, startTS, commitTS, nil)
+	}, startTS, commitTS)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
@@ -117,24 +117,5 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.Equal(t, commitTS, meta.CommitTS)
 }
 
-func TestCoordinateDispatchTxn_ReadKeysNotInOnePhaseTxnRequest(t *testing.T) {
-	t.Parallel()
-
-	tx := &stubTransactional{}
-	c := &Coordinate{
-		transactionManager: tx,
-		clock:              NewHLC(),
-	}
-
-	// Single-shard transactions validate read keys pre-Raft (in the adapter),
-	// so readKeys must NOT be included in the Raft log entry to avoid
-	// post-commit rejections that break realtime ordering.
-	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
-	_, err := c.dispatchTxn([]*Elem[OP]{
-		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, 10, 0, readKeys)
-	require.NoError(t, err)
-	require.Len(t, tx.reqs, 1)
-	require.Len(t, tx.reqs[0], 1)
-	require.Nil(t, tx.reqs[0][0].ReadKeys)
-}
+// ReadKeys omission from single-shard Raft entries is tested in
+// TestShardedCoordinatorDispatchTxn_SingleShardOmitsReadKeysFromRaftEntry.
