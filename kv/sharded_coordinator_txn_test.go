@@ -6,13 +6,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
-
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 type recordingTransactional struct {
@@ -383,11 +382,11 @@ type noopEngine struct{}
 func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
-func (noopEngine) State() raftengine.State                                 { return raftengine.StateLeader }
-func (noopEngine) Leader() raftengine.LeaderInfo                           { return raftengine.LeaderInfo{} }
-func (noopEngine) VerifyLeader(_ context.Context) error                    { return nil }
-func (noopEngine) LinearizableRead(_ context.Context) (uint64, error)      { return 0, nil }
-func (noopEngine) Status() raftengine.Status                               { return raftengine.Status{} }
+func (noopEngine) State() raftengine.State                            { return raftengine.StateLeader }
+func (noopEngine) Leader() raftengine.LeaderInfo                      { return raftengine.LeaderInfo{} }
+func (noopEngine) VerifyLeader(_ context.Context) error               { return nil }
+func (noopEngine) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
+func (noopEngine) Status() raftengine.Status                          { return raftengine.Status{} }
 func (noopEngine) Configuration(_ context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
@@ -498,7 +497,7 @@ func TestShardedCoordinatorDispatchTxn_ReadKeysRoutedToPrepareByShard(t *testing
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1) // shard 1: a-m
-	engine.UpdateRoute([]byte("m"), nil, 2)          // shard 2: m+
+	engine.UpdateRoute([]byte("m"), nil, 2)         // shard 2: m+
 
 	g1Txn := &recordingTransactional{}
 	g2Txn := &recordingTransactional{}
