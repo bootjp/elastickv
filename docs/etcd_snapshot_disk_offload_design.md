@@ -109,8 +109,8 @@ After:  Data = [magic:4][version:1][index:8][crc32c:4]
 |---------|--------|-------|
 | magic   | 4 byte | `EKVT` (ElasticKV Token) |
 | version | 1 byte | `0x01` |
-| index   | 8 byte | applied log index of the snapshot (little-endian uint64) |
-| crc32c  | 4 byte | CRC32C checksum of the `.fsm` file payload (all bytes preceding the footer) (little-endian uint32) |
+| index   | 8 byte | applied log index of the snapshot (big-endian uint64) |
+| crc32c  | 4 byte | CRC32C checksum of the `.fsm` file payload (all bytes preceding the footer) (big-endian uint32) |
 
 The magic prefix distinguishes the new format from legacy payloads (see Migration section).
 Embedding the CRC32C in the token allows integrity verification at the metadata level,
@@ -136,7 +136,7 @@ before the file is even opened.
   ├── lastCommitTS: 8 bytes  (little-endian uint64)
   └── entries:      variable [keyLen:8][key][valLen:8][val] repeated
 [footer]
-  └── crc32c:       4 bytes  CRC32C of all bytes preceding this field (little-endian uint32)
+  └── crc32c:       4 bytes  CRC32C of all bytes preceding this field (big-endian uint32)
 ```
 
 The CRC32C is computed incrementally as data is written, so no second pass over the file
@@ -201,10 +201,10 @@ maybePersistLocalSnapshot()
   → storageIndex := storage.Snapshot().Metadata.Index
   → fsmSnap := fsm.Snapshot()
   → crc32c, err := writeFSMSnapshotFile(fsmSnap, fsmSnapDir, storageIndex)
-      → os.CreateTemp() → {fsmSnapDir}/{storageIndex}.fsm.tmp
+      → os.CreateTemp() → {fsmSnapDir}/{storageIndex:016x}.fsm.tmp
       → crcWriter := newCRC32CWriter(tmpFile)
       → fsmSnap.WriteTo(crcWriter)                              # stream to disk + compute CRC
-      → binary.Write(tmpFile, binary.LittleEndian, crcWriter.Sum32()) # append CRC footer
+      → binary.Write(tmpFile, binary.BigEndian, crcWriter.Sum32()) # append CRC footer
       → tmpFile.Sync()
       → os.Rename(tmp, final)                                   # atomic commit
       → syncDir(fsmSnapDir)                                     # persist directory entry
@@ -286,7 +286,7 @@ func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) e
         return errors.WithStack(err)
     }
     var footer uint32
-    if err := binary.Read(f, binary.LittleEndian, &footer); err != nil {
+    if err := binary.Read(f, binary.BigEndian, &footer); err != nil {
         return errors.WithStack(err)
     }
     computed := h.Sum32()
@@ -369,16 +369,17 @@ receiveSnapshotStream()
   → validate token.Index == snap.Metadata.Index
     # a mismatch indicates a misrouted or corrupted snapshot; return
     # ErrFSMSnapshotIndexMismatch immediately before writing any data
-  → result, err := snapReceiveGroup.Do(strconv.FormatUint(index, 10), func() {
-        → os.CreateTemp() → {fsmSnapDir}/{index}.fsm.tmp
+  → result, err := snapReceiveGroup.Do(fmt.Sprintf("%016x", index), func() {
+        → os.CreateTemp() → {fsmSnapDir}/{index:016x}.fsm.tmp
         → stream remaining chunks to tmpFile (with bufio.NewWriterSize)
         → tmpFile.Sync()
         → verify CRC of tmpPath against footer and tokenCRC
           # footer is authoritative; return ErrFSMSnapshotFileCRC if mismatch
-        → os.Rename(tmpPath, {fsmSnapDir}/{index}.fsm)  # atomic commit on success
-        → syncDir(fsmSnapDir)                           # flush directory entry
-        → return token
+        → os.Rename(tmpPath, {fsmSnapDir}/{index:016x}.fsm)  # atomic commit on success
+        → syncDir(fsmSnapDir)                                # flush directory entry
+        → return token  # []byte — the 17-byte token built from the received header
     })
+  → token := result.([]byte)  # extract from singleflight result
   → raftpb.Message{Snapshot: {Data: token}}
   → handler(msg)
       → applyReadySnapshot(snap)
@@ -440,9 +441,9 @@ function:
 4. Returns typed errors distinguishing file corruption (`ErrFSMSnapshotFileCRC`) from
    token corruption (`ErrFSMSnapshotTokenCRC`).
 
-A standalone `verifyFSMSnapshotFile(path, tokenCRC)` is still provided for contexts where
-the FSM must not be modified (e.g., startup cleanup health-checking orphan files), but it
-is **never called in sequence with a subsequent restore**.
+A standalone `verifyFSMSnapshotFile(path, tokenCRC)` is still provided for use in
+`receiveSnapshotStream` (verify the temp file before atomic rename) and future background
+health-check tasks, but it is **never called in sequence with a subsequent restore**.
 
 ### Verification Points
 
@@ -451,7 +452,7 @@ is **never called in sequence with a subsequent restore**.
 | **On restart** | `restoreSnapshotState` | `openAndRestoreFSMSnapshot` (single pass) |
 | **After follower receive** | `receiveSnapshotStream` | `verifyFSMSnapshotFile` on tmp before rename |
 | **On follower apply** | `applyReadySnapshot` | `openAndRestoreFSMSnapshot` (single pass; no extra verify) |
-| **Startup orphan check** | `cleanupStaleFSMSnaps` | `verifyFSMSnapshotFile` (read-only, no restore) |
+| **Startup orphan check** | `cleanupStaleFSMSnaps` | Index-based only; no CRC scan (deferred to restore time) |
 | **Background health check** *(future)* | background task | `verifyFSMSnapshotFile` |
 
 ### Error Types and Recovery
@@ -469,7 +470,7 @@ var (
 | Error | Meaning | Recovery |
 |-------|---------|---------|
 | `ErrFSMSnapshotFileCRC` | On-disk file is corrupt; footer ≠ computed | Delete file; WAL replay from `FirstIndex` |
-| `ErrFSMSnapshotTokenCRC` | File is intact (footer == computed) but token differs | Rewrite token from file's actual CRC; no WAL replay needed |
+| `ErrFSMSnapshotTokenCRC` | File is intact (footer == computed) but token differs | Read footer CRC from file; call `Snapshotter.SaveSnap` with `encodeSnapshotToken(index, fileCRC)`; restore from the intact file without WAL replay |
 | `ErrFSMSnapshotNotFound` | `.fsm` file missing for a valid token | WAL replay from `FirstIndex` |
 
 ---
@@ -507,7 +508,7 @@ var (
 writeFSMSnapshotFile():
   1. os.CreateTemp(fsmSnapDir, "*.fsm.tmp")         # write to temp file
   2. snapshot.WriteTo(crcWriter)                     # stream FSM + accumulate CRC
-  3. binary.Write(tmpFile, binary.LittleEndian, crcWriter.Sum32()) # append CRC footer
+  3. binary.Write(tmpFile, binary.BigEndian, crcWriter.Sum32()) # append CRC footer
   4. tmpFile.Sync()                                  # flush to durable storage
   5. os.Rename(tmp, final)                           # atomic commit
   6. syncDir(fsmSnapDir)                             # persist directory entry
@@ -523,7 +524,7 @@ The receiver path (`receiveSnapshotStream`) follows the same sequence and also c
 | `.fsm` exists, snap not yet saved | Snap points to previous index; next snapshot overwrites |
 | snap(token) exists, `.fsm` missing | `ErrFSMSnapshotNotFound` → WAL replay from `FirstIndex` |
 | `.fsm` footer CRC mismatch | `ErrFSMSnapshotFileCRC` → delete file; WAL replay |
-| `.fsm` footer ok, token CRC differs | `ErrFSMSnapshotTokenCRC` → rewrite token; restore from file |
+| `.fsm` footer ok, token CRC differs | `ErrFSMSnapshotTokenCRC` → `Snapshotter.SaveSnap` with corrected token; restore from file; no WAL replay |
 
 ### Startup Cleanup
 
@@ -642,7 +643,7 @@ dangerous scenario. To prevent it, the rollout must proceed as follows:
    // snapshot — not on every periodic creation — so peak memory is still improved.
    if isSnapshotToken(msg.Snapshot.Data) {
        tok, _ := decodeSnapshotToken(msg.Snapshot.Data)
-       path := filepath.Join(fsmSnapDir, strconv.FormatUint(tok.Index, 10)+".fsm")
+       path := filepath.Join(fsmSnapDir, fmt.Sprintf("%016x.fsm", tok.Index))
        payload, err := readFSMSnapshotPayload(path) // streams file, returns []byte
        if err != nil {
            return errors.WithStack(err)
@@ -685,6 +686,54 @@ transition window: `raftpb.Snapshot.Data` = token AND a copy of the full legacy 
 stored in an auxiliary file. The legacy binary would then decode the full payload
 normally. This dual-write mode is a forward compatibility bridge and can be removed after
 the fleet has been fully upgraded.
+
+### Zero-Downtime Cutover Runbook
+
+For a Raft cluster, the standard zero-downtime approach is a **rolling upgrade**: replace
+one node at a time, verify health, then proceed to the next. The feature flag provides
+the safety valve at each step. Below is the recommended procedure for a 3-node cluster
+(`nodeA`, `nodeB`, `nodeC`).
+
+**Phase 1 rollout (safe in mixed clusters):**
+
+```
+1. Deploy Phase 1 binary to nodeA; restart.
+   - nodeA starts writing .fsm files locally.
+   - nodeA's Dispatch fallback reads .fsm → bytes for any legacy-receiver MsgSnap.
+   - Verify: cluster healthy, no error logs for ErrFSMSnapshotFileCRC.
+
+2. Repeat for nodeB, then nodeC.
+   - All nodes now write .fsm files. Mixed Phase 1 / legacy is safe throughout.
+
+3. Run for at least one full snapshot cycle per node before proceeding to Phase 2.
+   Confirm: each node's fsm-snap/ directory contains a valid .fsm file.
+```
+
+**Phase 2 rollout (requires all nodes on Phase 1 first):**
+
+```
+4. Deploy Phase 2 binary to all nodes with DisableFSMSnapshotToken=true.
+   - Nodes use file streaming internally but Dispatch still reconstructs full payload
+     (feature flag active). This is a no-op from the wire perspective.
+   - Verify: cluster healthy.
+
+5. Enable token mode on nodeA: set DisableFSMSnapshotToken=false (hot reload or restart).
+   - nodeA now sends token-format MsgSnap; all receivers must be Phase 2 (they are).
+   - Monitor for one snapshot cycle. Verify follower applies succeed.
+
+6. Enable on nodeB, then nodeC.
+   - All nodes now use full token-mode streaming.
+
+7. Remove the DisableFSMSnapshotToken flag from config (it now defaults to false).
+```
+
+**Rollback at any step:**
+
+| Step | Rollback action |
+|------|----------------|
+| During Phase 1 rollout | Redeploy legacy binary; stop node first; delete `fsm-snap/`; restart (WAL replay) |
+| Phase 2 deployed, flag still enabled | Redeploy Phase 1 binary; no fsm-snap cleanup needed |
+| Phase 2 deployed, flag disabled on some nodes | Re-enable `DisableFSMSnapshotToken=true` on flag-disabled nodes first; then redeploy Phase 1 binaries |
 
 ---
 
