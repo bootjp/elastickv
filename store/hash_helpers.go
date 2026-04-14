@@ -10,11 +10,15 @@ import (
 
 // Hash wide-column key layout:
 //
-//	Base Metadata: !hs|meta|<userKeyLen(4)><userKey>               → [Len(8)]
-//	Field Key:     !hs|fld|<userKeyLen(4)><userKey><fieldName>     → field value bytes
+//	Base Metadata: !hs|meta|b|<userKeyLen(4)><userKey>               → [Len(8)]
+//	Field Key:     !hs|fld|<userKeyLen(4)><userKey><fieldName>       → field value bytes
 //	Delta Key:     !hs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
+//
+// Note: the base prefix ("!hs|meta|b|") and delta prefix ("!hs|meta|d|") differ
+// at the trailing discriminator byte ('b' vs 'd') so that IsHashMetaKey and
+// IsHashMetaDeltaKey produce unambiguous results without ordering constraints.
 const (
-	HashMetaPrefix      = "!hs|meta|"
+	HashMetaPrefix      = "!hs|meta|b|"
 	HashFieldPrefix     = "!hs|fld|"
 	HashMetaDeltaPrefix = "!hs|meta|d|"
 

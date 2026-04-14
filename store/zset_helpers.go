@@ -10,12 +10,16 @@ import (
 
 // ZSet wide-column key layout:
 //
-//	Base Metadata: !zs|meta|<userKeyLen(4)><userKey>                               → [Len(8)]
-//	Member Key:    !zs|mem|<userKeyLen(4)><userKey><member>                         → [Score(8)] IEEE 754
-//	Score Index:   !zs|scr|<userKeyLen(4)><userKey><sortableScore(8)><member>       → (empty)
-//	Delta Key:     !zs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>   → [LenDelta(8)]
+//	Base Metadata: !zs|meta|b|<userKeyLen(4)><userKey>                               → [Len(8)]
+//	Member Key:    !zs|mem|<userKeyLen(4)><userKey><member>                           → [Score(8)] IEEE 754
+//	Score Index:   !zs|scr|<userKeyLen(4)><userKey><sortableScore(8)><member>         → (empty)
+//	Delta Key:     !zs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>     → [LenDelta(8)]
+//
+// Note: the base prefix ("!zs|meta|b|") and delta prefix ("!zs|meta|d|") differ
+// at the trailing discriminator byte ('b' vs 'd') so that IsZSetMetaKey and
+// IsZSetMetaDeltaKey produce unambiguous results without ordering constraints.
 const (
-	ZSetMetaPrefix      = "!zs|meta|"
+	ZSetMetaPrefix      = "!zs|meta|b|"
 	ZSetMemberPrefix    = "!zs|mem|"
 	ZSetScorePrefix     = "!zs|scr|"
 	ZSetMetaDeltaPrefix = "!zs|meta|d|"

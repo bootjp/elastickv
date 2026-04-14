@@ -10,11 +10,15 @@ import (
 
 // Set wide-column key layout:
 //
-//	Base Metadata: !st|meta|<userKeyLen(4)><userKey>                 → [Len(8)]
-//	Member Key:    !st|mem|<userKeyLen(4)><userKey><member>           → (empty value)
+//	Base Metadata: !st|meta|b|<userKeyLen(4)><userKey>                 → [Len(8)]
+//	Member Key:    !st|mem|<userKeyLen(4)><userKey><member>             → (empty value)
 //	Delta Key:     !st|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
+//
+// Note: the base prefix ("!st|meta|b|") and delta prefix ("!st|meta|d|") differ
+// at the trailing discriminator byte ('b' vs 'd') so that IsSetMetaKey and
+// IsSetMetaDeltaKey produce unambiguous results without ordering constraints.
 const (
-	SetMetaPrefix      = "!st|meta|"
+	SetMetaPrefix      = "!st|meta|b|"
 	SetMemberPrefix    = "!st|mem|"
 	SetMetaDeltaPrefix = "!st|meta|d|"
 

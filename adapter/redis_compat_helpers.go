@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"math"
 	"sort"
 	"time"
 
@@ -13,10 +12,20 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// maxWideScanLimit is the upper bound used when scanning all fields/members of
-// a wide-column hash or set.  It is intentionally large – wide-column keys are
-// per-field/member so the real cap is the number of items in the collection.
-const maxWideScanLimit = math.MaxInt32
+// maxWideColumnItems is the maximum number of fields/members a single
+// wide-column collection (Hash, Set, ZSet, or List) may contain.
+// Operations that would materialize more than this many items are rejected
+// to prevent unbounded memory growth (OOM).
+const maxWideColumnItems = 100_000
+
+// maxWideScanLimit is passed to ScanAt when loading an entire collection.
+// It is set to maxWideColumnItems+1 so that receiving exactly limit results
+// indicates the collection is over the cap and the caller can return an error
+// instead of silently truncating.
+const maxWideScanLimit = maxWideColumnItems + 1
+
+// ErrCollectionTooLarge is returned when a collection exceeds maxWideColumnItems.
+var ErrCollectionTooLarge = errors.New("collection too large")
 
 const wrongTypeMessage = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
@@ -159,6 +168,9 @@ func (r *RedisServer) loadHashFieldsAt(ctx context.Context, key []byte, readTS u
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if len(kvs) > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "hash %q exceeds %d fields", key, maxWideColumnItems)
+	}
 	result := make(redisHashValue, len(kvs))
 	for _, kv := range kvs {
 		field := store.ExtractHashFieldName(kv.Key, key)
@@ -200,6 +212,9 @@ func (r *RedisServer) loadSetMembersAt(ctx context.Context, key []byte, readTS u
 	kvs, err := r.store.ScanAt(ctx, prefix, end, maxWideScanLimit, readTS)
 	if err != nil {
 		return redisSetValue{}, errors.WithStack(err)
+	}
+	if len(kvs) > maxWideColumnItems {
+		return redisSetValue{}, errors.Wrapf(ErrCollectionTooLarge, "set %q exceeds %d members", key, maxWideColumnItems)
 	}
 	members := make([]string, 0, len(kvs))
 	for _, kv := range kvs {
@@ -315,6 +330,9 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if !listExists {
 		return nil, nil
 	}
+	if meta.Len > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, int(meta.Len)+setWideColOverhead)
 	for seq := meta.Head; seq < meta.Tail; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
@@ -340,6 +358,9 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	fieldKVs, err := r.store.ScanAt(ctx, fieldPrefix, fieldEnd, maxWideScanLimit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if len(fieldKVs) > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "collection exceeds %d fields/members", maxWideColumnItems)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs))
 	for _, pair := range fieldKVs {
