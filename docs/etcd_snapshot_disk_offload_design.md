@@ -391,17 +391,19 @@ receiveSnapshotStream()
   # Validate that the token index matches raftpb.SnapshotMetadata.Index to
   # reject corrupted or misrouted messages before any disk I/O.
   → if index != msg.Snapshot.Metadata.Index: reject with error
-  → result, token, err := snapReceiveGroup.Do(fmt.Sprintf("%016x", index), func() (any, error) {
+  # singleflight.Group.Do signature: Do(key string, fn func() (any, error)) (v any, err error, shared bool)
+  → v, err, _ := snapReceiveGroup.Do(fmt.Sprintf("%016x", index), func() (any, error) {
         → os.CreateTemp() → {fsmSnapDir}/{fmt.Sprintf("%016x", index)}.fsm.tmp
         → stream remaining chunks to tmpFile (with bufio.NewWriterSize)
         → tmpFile.Sync()
         → verify CRC of tmpPath against footer and tokenCRC
-          # footer is authoritative; return ErrFSMSnapshotFileCRC if mismatch
+          # footer is authoritative; return nil, ErrFSMSnapshotFileCRC if mismatch
         → os.Rename(tmpPath, {fsmSnapDir}/{fmt.Sprintf("%016x", index)}.fsm)  # atomic commit on success
         → syncDir(fsmSnapDir)                           # flush directory entry
-        → return token
+        → return encodedToken, nil  # encodedToken is the 17-byte token []byte
     })
-  → token = result.([]byte)   # extract from singleflight result
+  → if err != nil: return err
+  → token := v.([]byte)   # type-assert the singleflight result to []byte
   → raftpb.Message{Snapshot: {Data: token}}
   → handler(msg)
       → applyReadySnapshot(snap)
@@ -670,8 +672,10 @@ ambiguity when a mixed-version cluster is operating.
 |----------------|-----------------|---------|
 | Legacy (no token) | Legacy | Unchanged — existing path |
 | Legacy (no token) | New | `isSnapshotToken` → false → `bytes.NewReader` fallback |
-| New (token) | Legacy | Legacy node does not understand the token; restores from the 17-byte payload as if it were FSM data → **corrupt FSM** |
-| New (token) | New | Token path → `.fsm` file |
+| Phase 1 (bridge mode) | Legacy | `Dispatch` reads `.fsm` → `[]byte` → `sendSnapshot`; legacy receiver sees full payload → safe |
+| Phase 1 (bridge mode) | Phase 1+ | Same as above (bridge mode always uses old wire format) |
+| Phase 2 (token send) | Legacy | Legacy node receives 17-byte token; restore fails → **unsafe; requires all nodes on Phase 2** |
+| Phase 2 (token send) | Phase 2 | Token path → `.fsm` file streaming → safe |
 
 ### Rolling Upgrade Strategy
 
@@ -687,35 +691,34 @@ dangerous scenario. To prevent it, the rollout must proceed as follows:
    File streaming (Phase 2) is deferred until all nodes are on Phase 1.
 
    ```go
-   // Phase 1 Dispatch fallback: token is in MemoryStorage but receiver may be legacy.
-   // Open the .fsm file and stream it directly via sendSnapshotReaderChunks to avoid
-   // materializing the full payload into memory. This requires the receiver to be at
-   // least Phase 1 (i.e., it runs receiveSnapshotStream which handles both formats).
-   // A truly pre-Phase-1 legacy receiver cannot handle this path; see note below.
+   // Phase 1 Dispatch bridge mode: MemoryStorage holds a token, but the receiver
+   // may be a pre-Phase-1 legacy node that expects a full FSM payload in
+   // msg.Snapshot.Data. Read the .fsm file back into []byte and use the
+   // existing sendSnapshot path to preserve wire compatibility.
    if isSnapshotToken(msg.Snapshot.Data) {
        tok, _ := decodeSnapshotToken(msg.Snapshot.Data)
        path := filepath.Join(fsmSnapDir, fmt.Sprintf("%016x.fsm", tok.Index))
-       f, err := os.Open(path)
+       payload, err := readFSMSnapshotPayload(path) // reads file, returns []byte
        if err != nil {
            return errors.WithStack(err)
        }
-       defer f.Close()
-       return sendSnapshotReaderChunks(stream, header, f) // stream without []byte alloc
+       msg.Snapshot.Data = payload // restore full bytes for legacy wire format
    }
-   // fall through to legacy sendSnapshot path (receiver is pre-Phase-1)
+   // sendSnapshot uses the existing chunked send path; all receivers understand it
+   return sendSnapshot(msg)
    ```
 
-   > **Memory trade-off note**: `sendSnapshotReaderChunks` streams the `.fsm` file
-   > directly without materializing it to `[]byte`, preserving the memory benefit. This
-   > path requires the receiver to run `receiveSnapshotStream`. If the cluster contains
-   > genuine pre-Phase-1 nodes that do not have `receiveSnapshotStream`, the operator
-   > must materialize via `readFSMSnapshotPayload` instead — accepting that the memory
-   > spike is re-introduced for that specific send. In practice this case should not
-   > arise when the Phase 1 rollout is done correctly (all nodes updated before Phase 2
-   > is enabled). Phase 2 eliminates the fallback entirely.
+   > **Memory trade-off**: `readFSMSnapshotPayload` materializes the `.fsm` file to
+   > `[]byte`, which re-introduces a memory allocation at send time. However:
+   > - The allocation is **transient** (freed after the send completes) — not permanently
+   >   held in MemoryStorage as it was before this change.
+   > - It occurs only when a **slow follower** needs a snapshot, not on every periodic
+   >   snapshot creation; in a healthy cluster this is rare.
+   > - **Phase 2 eliminates this entirely** by replacing the bridge mode with file
+   >   streaming to all nodes.
 
-   With this fallback, mixed Phase 1 / legacy clusters are safe. Memory allocation
-   during snapshot creation is eliminated; the send path streams from disk.
+   With this bridge, mixed Phase 1 / legacy clusters are fully safe: every receiver
+   always gets a standard full-payload `MsgSnap` regardless of version.
 
 2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Phase 2
    replaces the Phase 1 fallback with true file streaming; once any node begins sending
@@ -789,19 +792,27 @@ config-change, and bootstrap). Follower send/receive is unchanged.
   - `writeFSMSnapshotFile` (write with CRC footer + syncDir)
   - `openAndRestoreFSMSnapshot` (single-pass verify+restore via TeeReader)
   - `verifyFSMSnapshotFile` (read-only CRC check for orphan detection)
-- Update `Dispatch`: if `isSnapshotToken(msg.Snapshot.Data)`, open the `.fsm` file and
-  stream via `sendSnapshotReaderChunks` (no `[]byte` allocation); this requires the
-  receiver to run `receiveSnapshotStream` (i.e., be at Phase 1 or newer)
+  - `readFSMSnapshotPayload` (read `.fsm` file back to `[]byte` for bridge-mode send)
+  - `fsmSnapPath(fsmSnapDir string, index uint64) string` (canonical zero-padded hex path helper)
+  - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token with CRC)
+  - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`,
+    `ErrFSMSnapshotIndexMismatch`, etc.
+- Update `persistLocalSnapshot` → `writeFSMSnapshotFile` + token
+- Update `persistConfigSnapshot`, `persistConfigState`, and `persistConfigSnapshotPayload` → same
+- Update `stateMachineSnapshotBytes` (bootstrap) → `writeFSMSnapshotFile` + token
+- Update `restoreSnapshotState` → `openAndRestoreFSMSnapshot`
+- Update `Dispatch` (bridge mode): if `isSnapshotToken(msg.Snapshot.Data)`, call
+  `readFSMSnapshotPayload` to reconstruct `[]byte` payload; use old `sendSnapshot` path
+  so all receivers (including legacy) receive a standard full-payload `MsgSnap`
 - Replace `purgeOldSnapFiles` with `purgeOldSnapshotFiles(snapDir, fsmSnapDir)`
 - Add `cleanupStaleFSMSnaps(snapDir, fsmSnapDir)` (index-based orphan removal)
 - Capture `storageIndex` before `fsm.Snapshot()` in `maybePersistLocalSnapshot`
 - All existing tests must continue to pass
 
-**Effect**: eliminates memory spikes during local snapshot creation; reduces
-`MemoryStorage` resident memory; all snapshot creation paths are consistent.
-Mixed Phase 1 clusters are safe: Dispatch streams from the `.fsm` file via
-`sendSnapshotReaderChunks` without materializing to `[]byte`. Requires all nodes in the
-cluster to be at Phase 1 or newer before any Phase 1 node becomes leader.
+**Effect**: eliminates memory spikes during **local snapshot creation**; reduces
+`MemoryStorage` resident memory. A transient allocation still occurs when a slow follower
+needs a snapshot send (bridge mode), but it is freed after the send and does not persist.
+Phase 2 eliminates this last allocation by switching to file streaming.
 
 ### Phase 2: Streaming Follower Send/Receive
 
