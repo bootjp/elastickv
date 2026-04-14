@@ -194,6 +194,9 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 }
 
 func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	grouped, gids, err := c.groupMutations(elems)
 	if err != nil {
 		return nil, err
@@ -209,7 +212,21 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	}
 
 	if len(gids) == 1 {
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
+		// Only use the single-shard (one-phase) path when every read key also
+		// belongs to the same shard as the mutations. If any read key belongs
+		// to a different shard, the 2PC path must be used so that
+		// validateReadOnlyShards validates those shards via a linearizable
+		// read barrier, preserving SSI.
+		canOptimize := true
+		for _, rk := range readKeys {
+			if c.engineGroupIDForKey(rk) != gids[0] {
+				canOptimize = false
+				break
+			}
+		}
+		if canOptimize {
+			return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		}
 	}
 
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
@@ -241,14 +258,15 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 	return commitTS, nil
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
-	// Single-shard: read-set validated pre-Raft by the adapter.
+	// ReadKeys are included in the Raft log entry so the FSM validates
+	// read-write conflicts atomically under applyMu.
 	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, nil),
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
