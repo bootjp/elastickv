@@ -194,6 +194,9 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 }
 
 func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	grouped, gids, err := c.groupMutations(elems)
 	if err != nil {
 		return nil, err

@@ -259,6 +259,9 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	var requests []*pb.Request
 	if reqs.IsTxn {
+		if len(reqs.ReadKeys) > maxReadKeys {
+			return nil, errors.WithStack(ErrInvalidRequest)
+		}
 		primary := primaryKeyForElems(reqs.Elems)
 		if len(primary) == 0 {
 			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
