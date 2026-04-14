@@ -492,8 +492,32 @@ var (
 | Error | Meaning | Recovery |
 |-------|---------|---------|
 | `ErrFSMSnapshotFileCRC` | On-disk file is corrupt; footer ≠ computed | Delete file; WAL replay from `FirstIndex` |
-| `ErrFSMSnapshotTokenCRC` | Footer and token disagree (detected before restore) | Log the mismatch; request a fresh snapshot from the leader; do not auto-rewrite the token (the mismatch may indicate the token references the wrong file version) |
+| `ErrFSMSnapshotTokenCRC` | Footer and token disagree (detected before restore) | Delete the corrupt `.fsm` file; request a fresh snapshot from the leader; do not auto-rewrite the token (see note below) |
 | `ErrFSMSnapshotNotFound` | `.fsm` file missing for a valid token | WAL replay from `FirstIndex` |
+
+> **`ErrFSMSnapshotTokenCRC` — infinite-loop and source-of-truth considerations**
+>
+> When the engine encounters `ErrFSMSnapshotTokenCRC` it must:
+>
+> 1. **Delete** the suspect `.fsm` file before requesting a new snapshot. If the file is
+>    not deleted, the same mismatch will recur on every apply attempt.
+> 2. **Request a fresh snapshot from the leader** by calling `ReportSnapshot` with
+>    `SnapshotFailure`, which prompts etcd-raft to ask the leader to send another
+>    snapshot. This is not a free-form "request" — it uses the existing Raft mechanism,
+>    which has built-in backoff and retry limits.
+> 3. **Avoid infinite loops**: if `ErrFSMSnapshotTokenCRC` recurs after N consecutive
+>    fresh snapshots (suggested threshold: 3), the engine should log a critical alert and
+>    stop retrying automatically. Persistent recurrence indicates a leader-side issue
+>    (corrupt `.snap` token in the leader's MemoryStorage) that requires operator
+>    intervention.
+> 4. **Single-node or degraded cluster**: if the leader is the only source of truth and
+>    its `.snap` token is persistently corrupt, no amount of re-requesting will help. The
+>    operator must use the rollback procedure (stop node, delete `fsm-snap/`, restart for
+>    WAL replay) to recover. This is documented in the Zero-Downtime Cutover Runbook.
+>
+> Auto-rewriting the token from the file footer is not implemented because the mismatch
+> could indicate the token references a different snapshot version than the file contains;
+> rewriting would silently accept potentially incorrect state.
 
 ---
 
