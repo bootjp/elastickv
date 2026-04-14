@@ -922,18 +922,52 @@ func (r *RedisServer) lset(conn redcon.Conn, cmd redcon.Command) {
 	r.execLuaCompat(conn, cmdLSet, cmd.Args[1:])
 }
 
-func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+// collectionCardinal handles SCARD/ZCARD: checks type, uses the delta-aggregated
+// metadata for wide-column collections (O(1)), and falls back to the Lua
+// compatibility path for legacy blob-encoded collections.
+func (r *RedisServer) collectionCardinal(
+	conn redcon.Conn,
+	cmd redcon.Command,
+	expectedType redisValueType,
+	resolveMeta func(context.Context, []byte, uint64) (int64, bool, error),
+	legacyCmd string,
+) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.execLuaCompat(conn, cmdSCard, cmd.Args[1:])
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if typ == redisTypeNone {
+		conn.WriteInt(0)
+		return
+	}
+	if typ != expectedType {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+	count, exists, err := resolveMeta(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if exists {
+		conn.WriteInt64(count)
+		return
+	}
+	// Legacy blob fallback.
+	r.execLuaCompat(conn, legacyCmd, cmd.Args[1:])
+}
+
+func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+	r.collectionCardinal(conn, cmd, redisTypeSet, r.resolveSetMeta, cmdSCard)
 }
 
 func (r *RedisServer) zcard(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
-		return
-	}
-	r.execLuaCompat(conn, cmdZCard, cmd.Args[1:])
+	r.collectionCardinal(conn, cmd, redisTypeZSet, r.resolveZSetMeta, cmdZCard)
 }
 
 func (r *RedisServer) zcount(conn redcon.Conn, cmd redcon.Command) {

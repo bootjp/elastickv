@@ -124,12 +124,42 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	return err
 }
 
+// normalizeWideColumnKey extracts the logical user key from any wide-column
+// internal key (hash/set meta, delta, or field/member). Returns (key, true) when
+// the input is a recognised wide-column key, (nil, false) otherwise.
+// Delta prefixes are checked before meta prefixes because delta keys share the
+// meta prefix as a leading substring.
+func normalizeWideColumnKey(key []byte) ([]byte, bool) {
+	if store.IsHashMetaDeltaKey(key) {
+		return store.ExtractHashUserKeyFromDelta(key), true
+	}
+	if store.IsHashMetaKey(key) {
+		return store.ExtractHashUserKeyFromMeta(key), true
+	}
+	if store.IsHashFieldKey(key) {
+		return store.ExtractHashUserKeyFromField(key), true
+	}
+	if store.IsSetMetaDeltaKey(key) {
+		return store.ExtractSetUserKeyFromDelta(key), true
+	}
+	if store.IsSetMetaKey(key) {
+		return store.ExtractSetUserKeyFromMeta(key), true
+	}
+	if store.IsSetMemberKey(key) {
+		return store.ExtractSetUserKeyFromMember(key), true
+	}
+	return nil, false
+}
+
 func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if userKey := kv.ExtractTxnUserKey(key); userKey != nil {
 		key = userKey
 	}
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
+	}
+	if wideKey, ok := normalizeWideColumnKey(key); ok {
+		return wideKey
 	}
 	if bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
 		return bytes.TrimPrefix(key, []byte(redisTTLPrefix))

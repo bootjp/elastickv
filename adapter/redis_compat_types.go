@@ -135,6 +135,8 @@ var knownInternalPrefixes = [][]byte{
 	[]byte("!s3|"),
 	[]byte("!dist|"),
 	[]byte("!zs|"),
+	[]byte("!hs|"),
+	[]byte("!st|"),
 }
 
 func isKnownInternalKey(key []byte) bool {
