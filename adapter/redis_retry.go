@@ -124,9 +124,26 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	return err
 }
 
+// normalizeZSetWideColumnKey extracts the logical user key from a ZSet wide-column key.
+func normalizeZSetWideColumnKey(key []byte) ([]byte, bool) {
+	if store.IsZSetMetaDeltaKey(key) {
+		return store.ExtractZSetUserKeyFromDelta(key), true
+	}
+	if store.IsZSetMetaKey(key) {
+		return store.ExtractZSetUserKeyFromMeta(key), true
+	}
+	if store.IsZSetMemberKey(key) {
+		return store.ExtractZSetUserKeyFromMember(key), true
+	}
+	if store.IsZSetScoreKey(key) {
+		return store.ExtractZSetUserKeyFromScore(key), true
+	}
+	return nil, false
+}
+
 // normalizeWideColumnKey extracts the logical user key from any wide-column
-// internal key (hash/set meta, delta, or field/member). Returns (key, true) when
-// the input is a recognised wide-column key, (nil, false) otherwise.
+// internal key (hash/set/zset meta, delta, field, member, or score index).
+// Returns (key, true) when the input is a recognised wide-column key, (nil, false) otherwise.
 // Delta prefixes are checked before meta prefixes because delta keys share the
 // meta prefix as a leading substring.
 func normalizeWideColumnKey(key []byte) ([]byte, bool) {
@@ -148,7 +165,7 @@ func normalizeWideColumnKey(key []byte) ([]byte, bool) {
 	if store.IsSetMemberKey(key) {
 		return store.ExtractSetUserKeyFromMember(key), true
 	}
-	return nil, false
+	return normalizeZSetWideColumnKey(key)
 }
 
 func normalizeRetryableRedisTxnKey(key []byte) []byte {

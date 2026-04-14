@@ -270,3 +270,42 @@ func ExtractZSetUserKeyFromDelta(key []byte) []byte {
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
 }
+
+// ExtractZSetUserKeyFromMeta extracts the logical user key from a zset meta key.
+func ExtractZSetUserKeyFromMeta(key []byte) []byte {
+	trimmed := bytes.TrimPrefix(key, []byte(ZSetMetaPrefix))
+	if len(trimmed) < wideColKeyLenSize {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
+		return nil
+	}
+	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+}
+
+// ExtractZSetUserKeyFromMember extracts the logical user key from a zset member key.
+func ExtractZSetUserKeyFromMember(key []byte) []byte {
+	trimmed := bytes.TrimPrefix(key, []byte(ZSetMemberPrefix))
+	if len(trimmed) < wideColKeyLenSize {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
+		return nil
+	}
+	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+}
+
+// ExtractZSetUserKeyFromScore extracts the logical user key from a zset score index key.
+func ExtractZSetUserKeyFromScore(key []byte) []byte {
+	trimmed := bytes.TrimPrefix(key, []byte(ZSetScorePrefix))
+	if len(trimmed) < wideColKeyLenSize {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
+		return nil
+	}
+	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+}

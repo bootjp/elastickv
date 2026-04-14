@@ -185,18 +185,30 @@ func TestRedisZSetLegacyJSONReadThenRewriteToProto(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, added)
 
-	rawAfterWrite := mustReadRawValue(t, st, storageKey)
-	require.True(t, hasStoredRedisPrefix(rawAfterWrite, storedRedisZSetProtoPrefix))
+	// After migration-on-write the legacy blob is deleted; wide-column member + score keys are used instead.
+	readTS := server.readTS()
+	_, err = st.GetAt(context.Background(), storageKey, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "legacy blob should be deleted after wide-column migration")
 
-	decoded, err := unmarshalZSetValue(rawAfterWrite)
+	// loadZSetAt should aggregate all wide-column members including the migrated ones.
+	got, gotExists, err := server.loadZSetAt(context.Background(), key, readTS)
 	require.NoError(t, err)
+	require.True(t, gotExists)
 	require.Equal(t, redisZSetValue{
 		Entries: []redisZSetEntry{
 			{Member: "a", Score: 1},
 			{Member: "b", Score: 2},
 			{Member: "c", Score: 3},
 		},
-	}, decoded)
+	}, got)
+
+	// Each member key and score index key must be present in the store.
+	for _, entry := range got.Entries {
+		_, err = st.GetAt(context.Background(), store.ZSetMemberKey(key, []byte(entry.Member)), readTS)
+		require.NoError(t, err, "member key %q should exist after migration", entry.Member)
+		_, err = st.GetAt(context.Background(), store.ZSetScoreKey(key, entry.Score, []byte(entry.Member)), readTS)
+		require.NoError(t, err, "score key %q should exist after migration", entry.Member)
+	}
 }
 
 func TestRedisStreamLegacyJSONReadThenRewriteToProto(t *testing.T) {

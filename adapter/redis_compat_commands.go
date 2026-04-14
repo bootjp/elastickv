@@ -1128,6 +1128,49 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 	return elems, nil
 }
 
+// buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no legacy
+// blob exists.  The base meta key is also written with the migrated count so
+// that resolveZSetMeta works correctly after migration.
+func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Each entry → member key + score index key; plus legacy blob deletion + base meta.
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)*2+setWideColOverhead) //nolint:mnd // 2 ops per entry (member + score index)
+	for _, entry := range value.Entries {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey(key, []byte(entry.Member)),
+				Value: store.MarshalZSetScore(entry.Score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey(key, entry.Score, []byte(entry.Member)),
+				Value: []byte{},
+			},
+		)
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	// Write a base meta so that resolveZSetMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaKey(key),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries))}),
+	})
+	return elems, nil
+}
+
 // buildHashFieldElems iterates over field-value pairs in args, records whether each field is
 // new vs. existing, appends Put operations to elems, and returns the updated elems and new-field count.
 func (r *RedisServer) buildHashFieldElems(ctx context.Context, key []byte, args [][]byte, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, error) {
@@ -1796,6 +1839,37 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(added)
 }
 
+// applyZAddPair processes one ZADD pair against the wide-column store: reads the
+// existing member score (if any), checks the ZADD flags, emits del-old-score /
+// put-member / put-score-index ops, and returns the updated elems, the add count
+// (0 or 1), and the length delta (0 or +1).
+func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
+	memberKey := store.ZSetMemberKey(key, []byte(p.member))
+	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	var oldScore float64
+	memberExists := false
+	if getErr == nil {
+		memberExists = true
+		oldScore, _ = store.UnmarshalZSetScore(raw)
+	} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+		return nil, 0, 0, cockerrors.WithStack(getErr)
+	}
+	if !flags.allows(memberExists, oldScore, p.score) {
+		return elems, 0, 0, nil
+	}
+	if memberExists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(p.member))})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(p.score)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, p.score, []byte(p.member)), Value: []byte{}},
+	)
+	if memberExists {
+		return elems, 0, 0, nil
+	}
+	return elems, 1, 1, nil
+}
+
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
@@ -1805,30 +1879,108 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	if typ != redisTypeNone && typ != redisTypeZSet {
 		return 0, wrongTypeError()
 	}
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+
+	commitTS := r.coordinator.Clock().Next()
+	// Capacity: each pair may produce 3 ops (del old score + put member + put score index),
+	// plus migration elems and a delta key.
+	elems := make([]*kv.Elem[kv.OP], 0, len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
+
+	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
-	members := zsetEntriesToMap(value.Entries)
+	elems = append(elems, migrationElems...)
+
 	added := 0
+	lenDelta := int64(0)
 	for _, p := range pairs {
-		old, exists := members[p.member]
-		if !flags.allows(exists, old, p.score) {
-			continue
+		var c int
+		var d int64
+		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems)
+		if err != nil {
+			return 0, err
 		}
-		if !exists {
-			added++
-		}
-		members[p.member] = p.score
+		added += c
+		lenDelta += d
 	}
-	value.Entries = zsetMapToEntries(members)
-	payload, err := marshalZSetValue(value)
+
+	if len(elems) == 0 {
+		return 0, nil
+	}
+
+	if lenDelta != 0 {
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
+	}
+
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	return added, cockerrors.WithStack(dispatchErr)
+}
+
+// zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
+// Returns the new score after applying increment.
+func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return 0, err
 	}
-	return added, r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+	if typ != redisTypeNone && typ != redisTypeZSet {
+		return 0, wrongTypeError()
+	}
+
+	memberKey := store.ZSetMemberKey(key, []byte(member))
+	commitTS := r.coordinator.Clock().Next()
+
+	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
+	if migErr != nil {
+		return 0, migErr
+	}
+
+	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	var oldScore float64
+	memberExists := false
+	if getErr == nil {
+		memberExists = true
+		oldScore, _ = store.UnmarshalZSetScore(raw)
+	} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+		return 0, cockerrors.WithStack(getErr)
+	}
+
+	newScore := oldScore + increment
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+3) //nolint:mnd // del old score + put member + put score index
+	elems = append(elems, migrationElems...)
+	if memberExists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(newScore)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, []byte(member)), Value: []byte{}},
+	)
+	if !memberExists {
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
+	}
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
 	})
+	return newScore, cockerrors.WithStack(dispatchErr)
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
@@ -1845,30 +1997,9 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var newScore float64
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		if typ != redisTypeNone && typ != redisTypeZSet {
-			return wrongTypeError()
-		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		members := zsetEntriesToMap(value.Entries)
-		member := string(cmd.Args[3])
-		members[member] += increment
-		newScore = members[member]
-		value.Entries = zsetMapToEntries(members)
-		payload, err := marshalZSetValue(value)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisZSetKey(cmd.Args[1]), Value: payload},
-		})
+		var txnErr error
+		newScore, txnErr = r.zincrbyTxn(ctx, cmd.Args[1], string(cmd.Args[3]), increment)
+		return txnErr
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2114,7 +2245,17 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 		}
 		popped := value.Entries[0]
 		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-		if err := r.persistBZPopMinResult(ctx, key, readTS, remaining); err != nil {
+
+		// Detect wide-column storage.
+		memberPrefix := store.ZSetMemberScanPrefix(key)
+		memberEnd := store.PrefixScanEnd(memberPrefix)
+		probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+		if probeErr != nil {
+			return cockerrors.WithStack(probeErr)
+		}
+		isWide := len(probeKVs) > 0
+
+		if err := r.persistBZPopMinResult(ctx, key, readTS, popped, remaining, isWide); err != nil {
 			return err
 		}
 		result = &bzpopminResult{key: key, entry: popped}
@@ -2123,7 +2264,7 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 	return result, err
 }
 
-func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, remaining []redisZSetEntry) error {
+func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, popped redisZSetEntry, remaining []redisZSetEntry, isWide bool) error {
 	if len(remaining) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
@@ -2131,6 +2272,24 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
+	if isWide {
+		// Wide-column: delete the popped member key + score index, emit delta -1.
+		commitTS := r.coordinator.Clock().Next()
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
+		elems := []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
+			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
+			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
+		}
+		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    elems,
+		})
+		return cockerrors.WithStack(dispatchErr)
+	}
+	// Legacy blob: write back all remaining entries.
 	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
 	if err != nil {
 		return err

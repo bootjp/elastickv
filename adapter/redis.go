@@ -1306,6 +1306,21 @@ func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[s
 	return keyset
 }
 
+// zsetWideColumnVisibleUserKey handles the ZSet-specific part of wide-column key mapping.
+// Returns (nil, true) for internal-only keys and (userKey, true) for visible keys.
+func zsetWideColumnVisibleUserKey(key []byte) (userKey []byte, isWide bool) {
+	if store.IsZSetMetaDeltaKey(key) || store.IsZSetMetaKey(key) {
+		return nil, true
+	}
+	if store.IsZSetMemberKey(key) {
+		return store.ExtractZSetUserKeyFromMember(key), true
+	}
+	if store.IsZSetScoreKey(key) {
+		return store.ExtractZSetUserKeyFromScore(key), true
+	}
+	return nil, false
+}
+
 // wideColumnVisibleUserKey maps a wide-column internal key to its visible user
 // key, or returns (nil, true) for internal-only keys (meta/delta), and
 // (nil, false) if the key is not a wide-column key at all.
@@ -1323,7 +1338,7 @@ func wideColumnVisibleUserKey(key []byte) (userKey []byte, isWide bool) {
 	if store.IsSetMemberKey(key) {
 		return store.ExtractSetUserKeyFromMember(key), true
 	}
-	return nil, false
+	return zsetWideColumnVisibleUserKey(key)
 }
 
 func redisVisibleUserKey(key []byte) []byte {
@@ -1431,9 +1446,11 @@ type listTxnState struct {
 }
 
 type zsetTxnState struct {
-	members map[string]float64
-	exists  bool
-	dirty   bool
+	members     map[string]float64 // current (potentially modified) state
+	origMembers map[string]float64 // original state at load time (for wide-column diff)
+	isWide      bool               // true if loaded from wide-column !zs|mem| storage
+	exists      bool
+	dirty       bool
 }
 
 type ttlTxnState struct {
@@ -1579,19 +1596,38 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	}
 	if ttlSt.value != nil && !ttlSt.value.After(time.Now()) {
 		st := &zsetTxnState{
-			members: map[string]float64{},
-			exists:  false,
+			members:     map[string]float64{},
+			origMembers: map[string]float64{},
+			exists:      false,
 		}
 		t.zsetStates[k] = st
 		return st, nil
 	}
+
+	// Detect wide-column storage by probing the !zs|mem| prefix.
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberEnd := store.PrefixScanEnd(memberPrefix)
+	probeKVs, probeErr := t.server.store.ScanAt(context.Background(), memberPrefix, memberEnd, 1, t.startTS)
+	if probeErr != nil {
+		return nil, errors.WithStack(probeErr)
+	}
+	isWide := len(probeKVs) > 0
+
 	value, exists, err := t.server.loadZSetAt(context.Background(), key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
+	members := zsetEntriesToMap(value.Entries)
+	// Snapshot the original members for wide-column diff at commit time.
+	origMembers := make(map[string]float64, len(members))
+	for m, s := range members {
+		origMembers[m] = s
+	}
 	st := &zsetTxnState{
-		members: zsetEntriesToMap(value.Entries),
-		exists:  exists,
+		members:     members,
+		origMembers: origMembers,
+		isWide:      isWide,
+		exists:      exists,
 	}
 	t.zsetStates[k] = st
 	return st, nil
@@ -1971,7 +2007,7 @@ func (t *txnContext) commit() error {
 	// the coordinator assigns it during Dispatch.
 	commitTS := t.server.coordinator.Clock().Next()
 	listElems := t.buildListElems(commitTS)
-	zsetElems, err := t.buildZSetElems()
+	zsetElems, err := t.buildZSetElems(commitTS)
 	if err != nil {
 		return err
 	}
@@ -2101,7 +2137,7 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 	return elems
 }
 
-func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
+func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	keys := make([]string, 0, len(t.zsetStates))
 	for k := range t.zsetStates {
 		keys = append(keys, k)
@@ -2109,22 +2145,75 @@ func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
 	sort.Strings(keys)
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+	seqInTxn := uint32(0)
 	for _, k := range keys {
 		st := t.zsetStates[k]
 		if !st.dirty {
 			continue
 		}
+		key := []byte(k)
+		if st.isWide {
+			wideElems, lenDelta := buildZSetWideElems(key, st)
+			elems = append(elems, wideElems...)
+			if lenDelta != 0 {
+				deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
+				elems = append(elems, &kv.Elem[kv.OP]{
+					Op:    kv.Put,
+					Key:   store.ZSetMetaDeltaKey(key, commitTS, seqInTxn),
+					Value: deltaVal,
+				})
+				seqInTxn++
+			}
+			continue
+		}
+		// Legacy blob path.
 		if len(st.members) == 0 {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey([]byte(k))})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
 			continue
 		}
 		payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey([]byte(k)), Value: payload})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload})
 	}
 	return elems, nil
+}
+
+// buildZSetWideElems computes the minimal set of ops to transition from st.origMembers to
+// st.members in wide-column format. Returns the ops and the net length delta.
+func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64) {
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+len(st.origMembers))
+	var lenDelta int64
+
+	// Deletions: members removed or score changed (old score index must be removed).
+	for member, oldScore := range st.origMembers {
+		newScore, inNew := st.members[member]
+		if !inNew {
+			// Fully removed.
+			elems = append(elems,
+				&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(member))},
+				&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))},
+			)
+			lenDelta--
+		} else if newScore != oldScore {
+			// Score updated: delete old score index.
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))})
+		}
+	}
+
+	// Insertions / updates.
+	for member, newScore := range st.members {
+		_, wasOrig := st.origMembers[member]
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMemberKey(key, []byte(member)), Value: store.MarshalZSetScore(newScore)},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, []byte(member)), Value: []byte{}},
+		)
+		if !wasOrig {
+			lenDelta++
+		}
+	}
+	return elems, lenDelta
 }
 
 func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {

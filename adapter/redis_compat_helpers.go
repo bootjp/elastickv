@@ -46,8 +46,8 @@ func normalizeStartTS(ts uint64) uint64 {
 	return ts
 }
 
-// detectWideColumnType checks for the presence of wide-column hash or set keys
-// and returns the corresponding redis type, or redisTypeNone if neither is found.
+// detectWideColumnType checks for the presence of wide-column hash, set, or zset keys
+// and returns the corresponding redis type, or redisTypeNone if none is found.
 func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	hashFieldPrefix := store.HashFieldScanPrefix(key)
 	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
@@ -66,6 +66,15 @@ func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, read
 	}
 	if len(setMemberKVs) > 0 {
 		return redisTypeSet, nil
+	}
+	zsetMemberPrefix := store.ZSetMemberScanPrefix(key)
+	zsetMemberEnd := store.PrefixScanEnd(zsetMemberPrefix)
+	zsetMemberKVs, err := r.store.ScanAt(ctx, zsetMemberPrefix, zsetMemberEnd, 1, readTS)
+	if err != nil {
+		return redisTypeNone, errors.WithStack(err)
+	}
+	if len(zsetMemberKVs) > 0 {
+		return redisTypeZSet, nil
 	}
 	return redisTypeNone, nil
 }
@@ -238,7 +247,44 @@ func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, re
 	return val, err
 }
 
+// loadZSetMembersAt scans all wide-column !zs|mem| keys and returns them as a redisZSetValue
+// sorted by (score, member), matching the ordering produced by the legacy blob path.
+func (r *RedisServer) loadZSetMembersAt(ctx context.Context, key []byte, readTS uint64) (redisZSetValue, error) {
+	prefix := store.ZSetMemberScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	kvs, err := r.store.ScanAt(ctx, prefix, end, maxWideScanLimit, readTS)
+	if err != nil {
+		return redisZSetValue{}, errors.WithStack(err)
+	}
+	entries := make([]redisZSetEntry, 0, len(kvs))
+	for _, kv := range kvs {
+		member := store.ExtractZSetMemberName(kv.Key, key)
+		if member == nil {
+			continue
+		}
+		score, scoreErr := store.UnmarshalZSetScore(kv.Value)
+		if scoreErr != nil {
+			return redisZSetValue{}, errors.WithStack(scoreErr)
+		}
+		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
+	}
+	sortZSetEntries(entries)
+	return redisZSetValue{Entries: entries}, nil
+}
+
 func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64) (redisZSetValue, bool, error) {
+	// Wide-column path: check !zs|mem| prefix first.
+	prefix := store.ZSetMemberScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	kvs, err := r.store.ScanAt(ctx, prefix, end, 1, readTS)
+	if err != nil {
+		return redisZSetValue{}, false, errors.WithStack(err)
+	}
+	if len(kvs) > 0 {
+		val, loadErr := r.loadZSetMembersAt(ctx, key, readTS)
+		return val, true, loadErr
+	}
+	// Legacy blob fallback.
 	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -409,7 +455,37 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	}
 	elems = append(elems, setElems...)
 
+	// Wide-column zset cleanup: delete all !zs|mem|, !zs|scr|, meta, and delta keys.
+	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, zsetElems...)
+
 	return elems, existed, nil
+}
+
+// deleteZSetWideColumnElems returns delete operations for all ZSet wide-column keys:
+// member keys (!zs|mem|), score index keys (!zs|scr|), the meta key, and all delta keys.
+func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	memberElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.ZSetMemberScanPrefix(key), store.ZSetMetaKey(key), store.ZSetMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, err
+	}
+	// deleteWideColumnElems covers member + meta + delta. Also scan score index keys.
+	scorePrefix := store.ZSetScoreScanPrefix(key)
+	scoreEnd := store.PrefixScanEnd(scorePrefix)
+	scoreKVs, scanErr := r.store.ScanAt(ctx, scorePrefix, scoreEnd, maxWideScanLimit, readTS)
+	if scanErr != nil {
+		return nil, errors.WithStack(scanErr)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(memberElems)+len(scoreKVs))
+	elems = append(elems, memberElems...)
+	for _, pair := range scoreKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+	}
+	return elems, nil
 }
 
 func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint64) ([]string, error) {
