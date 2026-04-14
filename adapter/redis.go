@@ -1398,17 +1398,24 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 		}
 		return nil
 	})
-	// A non-nil err here means one or more commands within the transaction
-	// returned a Redis-level error. Individual results are still available
-	// on each cmd, which is the correct Redis EXEC semantics (array of
-	// per-command results, some of which may be error replies).
-	// Only bail if we have no per-command results at all (fatal error).
+	// Transaction aborted (WATCH conflict or server-side nil EXEC reply):
+	// Redis protocol requires a Null array reply (*-1), not an error array.
+	if errors.Is(err, redis.TxFailedErr) || errors.Is(err, redis.Nil) {
+		conn.WriteNull()
+		return
+	}
+	// Fatal transport error (context timeout, network failure): return a
+	// single error reply. Per-command results are unreliable in this case.
+	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		conn.WriteError(err.Error())
+		return
+	}
+	// For any other non-nil err (individual command errors within the
+	// transaction), individual results are still available on each cmd,
+	// which is the correct Redis EXEC semantics — an array of per-command
+	// responses where some entries may be error replies.
 	if len(cmds) == 0 {
-		if err != nil {
-			conn.WriteError(err.Error())
-		} else {
-			conn.WriteArray(0)
-		}
+		conn.WriteArray(0)
 		return
 	}
 	conn.WriteArray(len(cmds))
