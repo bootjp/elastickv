@@ -2588,8 +2588,8 @@ func (r *RedisServer) checkListKeyType(ctx context.Context, key []byte, readTS u
 }
 
 // listPopClaimOnce executes one attempt of a pop-with-claim transaction.
-// Returns (nil, nil) for a missing key, ([]string{}, nil) for an empty list,
-// and the popped values otherwise.
+// Returns (nil, nil) for a missing key or an empty list, and the popped
+// values otherwise.
 func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count int, left bool, readTS uint64) ([]string, error) {
 	found, typeErr := r.checkListKeyType(ctx, key, readTS)
 	if typeErr != nil || !found {
@@ -2601,7 +2601,8 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 		return nil, metaErr
 	}
 	if !exists || meta.Len == 0 {
-		return []string{}, nil
+		// count >= 1 on an empty list: Redis returns nil (same as missing key).
+		return nil, nil
 	}
 
 	n := int64(count)
