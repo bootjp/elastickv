@@ -280,7 +280,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	if !reqs.IsTxn {
-		var requests []*pb.Request
+		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
 			requests = append(requests, c.toRawRequest(req))
 		}
