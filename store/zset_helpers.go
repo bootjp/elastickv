@@ -269,7 +269,7 @@ func ExtractZSetUserKeyFromDelta(key []byte) []byte {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
+	if ukLen > uint32(len(trimmed)-wideColKeyLenSize-deltaKeyTSSize-deltaKeySeqSize) { //nolint:gosec // minLen check above guarantees non-negative subtraction
 		return nil
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]

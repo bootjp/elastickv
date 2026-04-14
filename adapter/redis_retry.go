@@ -130,6 +130,12 @@ func normalizeRetryableRedisTxnErr(err error) error {
 // Delta prefixes are checked before meta prefixes because delta keys share the
 // meta prefix as a leading substring.
 func normalizeWideColumnKey(key []byte) ([]byte, bool) {
+	if store.IsListMetaDeltaKey(key) {
+		return store.ExtractListUserKeyFromDelta(key), true
+	}
+	if store.IsListClaimKey(key) {
+		return store.ExtractListUserKeyFromClaim(key), true
+	}
 	if store.IsHashMetaDeltaKey(key) {
 		return store.ExtractHashUserKeyFromDelta(key), true
 	}

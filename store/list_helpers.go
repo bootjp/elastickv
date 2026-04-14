@@ -133,7 +133,7 @@ func ExtractListUserKeyFromDelta(key []byte) []byte {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
+	if ukLen > uint32(len(trimmed)-wideColKeyLenSize-deltaKeyTSSize-deltaKeySeqSize) { //nolint:gosec // len check above guarantees non-negative subtraction
 		return nil
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
@@ -146,7 +146,7 @@ func ExtractListUserKeyFromClaim(key []byte) []byte {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(sortableInt64Bytes) { //nolint:gosec // constants fit in uint32
+	if ukLen > uint32(len(trimmed)-wideColKeyLenSize-sortableInt64Bytes) { //nolint:gosec // len check above guarantees non-negative subtraction
 		return nil
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]

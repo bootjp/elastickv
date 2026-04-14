@@ -1317,6 +1317,9 @@ func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[s
 // key, or returns (nil, true) for internal-only keys (meta/delta), and
 // (nil, false) if the key is not a wide-column key at all.
 func wideColumnVisibleUserKey(key []byte) (userKey []byte, isWide bool) {
+	if store.IsListMetaDeltaKey(key) || store.IsListClaimKey(key) {
+		return nil, true
+	}
 	if store.IsHashMetaDeltaKey(key) || store.IsHashMetaKey(key) {
 		return nil, true
 	}
