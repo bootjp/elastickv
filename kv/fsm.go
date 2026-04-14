@@ -320,11 +320,11 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 }
 
 // handleOnePhaseTxnRequest applies a single-shard transaction atomically.
-// Write-write conflicts are always checked under the store's apply lock.
-// r.ReadKeys is passed through to ApplyMutations for read-write conflict
-// detection; for single-shard transactions it is typically nil because the
-// adapter validates the read set pre-Raft (see kv/coordinator.go), while
-// multi-shard PREPARE requests carry per-shard read keys.
+// Both write-write and read-write conflicts are checked under the store's
+// applyMu lock via ApplyMutations. r.ReadKeys carries the transaction's read
+// set (populated by the coordinator from OperationGroup.ReadKeys), so the
+// FSM validates read-write conflicts atomically with the commit, eliminating
+// the TOCTOU window that existed when validation was only done pre-Raft.
 func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	meta, muts, err := extractTxnMeta(r.Mutations)
 	if err != nil {

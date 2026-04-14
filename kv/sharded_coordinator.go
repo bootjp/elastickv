@@ -209,7 +209,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	}
 
 	if len(gids) == 1 {
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems)
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
@@ -241,14 +241,15 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 	return commitTS, nil
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
-	// Single-shard: read-set validated pre-Raft by the adapter.
+	// ReadKeys are included in the Raft log entry so the FSM validates
+	// read-write conflicts atomically under applyMu.
 	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, nil),
+		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

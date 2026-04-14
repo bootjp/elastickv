@@ -136,14 +136,11 @@ type MVCCStore interface {
 	//
 	// Isolation guarantees vary by transaction topology:
 	//
-	//   Single-shard transactions: read-set validation is performed by the
-	//   adapter layer BEFORE Raft submission (pre-Raft). readKeys is nil in
-	//   the Raft log entry so the FSM does not re-validate. This avoids
-	//   post-commit rejections that would break realtime ordering, but
-	//   introduces a TOCTOU window between the adapter check and the FSM
-	//   apply under applyMu. The window is narrow (single Raft round-trip)
-	//   and matches the isolation level of the previous validateReadSet
-	//   design.
+	//   Single-shard transactions: readKeys are included in the Raft log entry
+	//   and validated atomically under the FSM's applyMu lock alongside
+	//   write-write conflict detection. The adapter's pre-Raft validateReadSet
+	//   call is kept as a fast-fail optimization but the FSM check is
+	//   authoritative. No TOCTOU window; full SSI.
 	//
 	//   Multi-shard (2PC) write shards: readKeys are included in the
 	//   PREPARE Raft entry and validated atomically under the FSM's applyMu

@@ -531,7 +531,7 @@ func TestShardedCoordinatorDispatchTxn_ReadKeysRoutedToPrepareByShard(t *testing
 	require.Equal(t, [][]byte{[]byte("y")}, g2Prepare.ReadKeys)
 }
 
-func TestShardedCoordinatorDispatchTxn_SingleShardOmitsReadKeysFromRaftEntry(t *testing.T) {
+func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -550,7 +550,9 @@ func TestShardedCoordinatorDispatchTxn_SingleShardOmitsReadKeysFromRaftEntry(t *
 	})
 	require.NoError(t, err)
 	require.Len(t, g1Txn.requests, 1)
-	// Single-shard: readKeys are validated pre-Raft by the adapter,
-	// so they must NOT be in the Raft log entry.
-	require.Nil(t, g1Txn.requests[0].ReadKeys)
+	// Single-shard: readKeys must be included in the Raft log entry so the
+	// FSM can validate read-write conflicts atomically under applyMu,
+	// eliminating the TOCTOU window that exists between the adapter's
+	// pre-Raft validateReadSet call and FSM application.
+	require.Equal(t, [][]byte{[]byte("rk1"), []byte("rk2")}, g1Txn.requests[0].ReadKeys)
 }
