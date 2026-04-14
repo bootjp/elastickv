@@ -257,30 +257,9 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	cli := pb.NewInternalClient(conn)
 
-	var requests []*pb.Request
-	if reqs.IsTxn {
-		if len(reqs.ReadKeys) > maxReadKeys {
-			return nil, errors.WithStack(ErrInvalidRequest)
-		}
-		primary := primaryKeyForElems(reqs.Elems)
-		if len(primary) == 0 {
-			return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
-		}
-		// When StartTS is absent (leader will assign it), also clear CommitTS
-		// so the leader assigns both timestamps consistently. A caller-provided
-		// CommitTS without a StartTS would produce an invalid txn where
-		// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
-		commitTS := reqs.CommitTS
-		if reqs.StartTS == 0 {
-			commitTS = 0
-		}
-		requests = []*pb.Request{
-			onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
-		}
-	} else {
-		for _, req := range reqs.Elems {
-			requests = append(requests, c.toRawRequest(req))
-		}
+	requests, err := c.buildRedirectRequests(reqs)
+	if err != nil {
+		return nil, err
 	}
 
 	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
@@ -296,6 +275,34 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
+	}, nil
+}
+
+func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+	if !reqs.IsTxn {
+		var requests []*pb.Request
+		for _, req := range reqs.Elems {
+			requests = append(requests, c.toRawRequest(req))
+		}
+		return requests, nil
+	}
+	if len(reqs.ReadKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+	primary := primaryKeyForElems(reqs.Elems)
+	if len(primary) == 0 {
+		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
+	}
+	// When StartTS is absent (leader will assign it), also clear CommitTS
+	// so the leader assigns both timestamps consistently. A caller-provided
+	// CommitTS without a StartTS would produce an invalid txn where
+	// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
+	commitTS := reqs.CommitTS
+	if reqs.StartTS == 0 {
+		commitTS = 0
+	}
+	return []*pb.Request{
+		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
 	}, nil
 }
 

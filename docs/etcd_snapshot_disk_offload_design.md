@@ -159,7 +159,9 @@ with the raft snapshot metadata. The two values must always agree; a mismatch in
 - **footer ≠ computed**: the `.fsm` file is corrupt on disk → delete and attempt WAL
   replay; do not trust the token.
 - **footer == computed, token ≠ computed**: the `.snap` metadata is corrupt → the file
-  itself is trustworthy; the snap file should be rewritten from the file's actual CRC.
+  itself may be trustworthy, but the mismatch could also indicate the token points to the
+  wrong file version; **do not auto-rewrite**; log the discrepancy and request a fresh
+  snapshot from the leader (safe path).
 - **footer ≠ computed AND token ≠ computed**: both are corrupt → WAL replay only.
 
 This distinction is implemented in `verifyFSMSnapshotFile`, which returns typed errors
@@ -270,6 +272,31 @@ func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) e
     }
     defer f.Close()
 
+    // --- Fail fast: read footer before restoring FSM state ---
+    // The tokenCRC (from the .snap metadata) is verified against the on-disk footer
+    // BEFORE fsm.Restore is called. This prevents the FSM from being mutated when
+    // the token is stale or corrupt, avoiding any state-change side-effects.
+    footerOffset := info.Size() - 4
+    if _, err := f.Seek(footerOffset, io.SeekStart); err != nil {
+        return errors.WithStack(err)
+    }
+    var footer uint32
+    if err := binary.Read(f, binary.BigEndian, &footer); err != nil {
+        return errors.WithStack(err)
+    }
+    if footer != tokenCRC {
+        // Footer and token disagree before we even start restoring. We cannot safely
+        // determine which is correct without computing the full CRC (which requires
+        // restoring). Return ErrFSMSnapshotTokenCRC and let the caller request a fresh
+        // snapshot from the leader.
+        return errors.Wrapf(ErrFSMSnapshotTokenCRC,
+            "path=%s footer=%08x token=%08x", path, footer, tokenCRC)
+    }
+    // Seek back to start for the restore + CRC verification pass.
+    if _, err := f.Seek(0, io.SeekStart); err != nil {
+        return errors.WithStack(err)
+    }
+
     payloadSize := info.Size() - 4
     h := crc32.New(crc32cTable)
     // Tee: data flows to both the CRC accumulator and fsm.Restore simultaneously.
@@ -283,24 +310,21 @@ func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) e
     if _, err := io.Copy(io.Discard, br); err != nil {
         return errors.WithStack(err)
     }
-    var footer uint32
-    if err := binary.Read(f, binary.BigEndian, &footer); err != nil {
-        return errors.WithStack(err)
-    }
     computed := h.Sum32()
     if computed != footer {
         return errors.Wrapf(ErrFSMSnapshotFileCRC,
             "path=%s footer=%08x computed=%08x", path, footer, computed)
     }
-    if computed != tokenCRC {
-        return errors.Wrapf(ErrFSMSnapshotTokenCRC,
-            "path=%s token=%08x computed=%08x", path, tokenCRC, computed)
-    }
+    // footer == tokenCRC was already verified above; computed == footer is now also
+    // confirmed, so all three values agree. No second tokenCRC comparison needed.
     return nil
 }
 ```
 
 Key properties:
+- **Token fail-fast before restore**: the footer is read via `Seek` and compared to
+  `tokenCRC` before `fsm.Restore` is called, so a corrupt token never causes FSM
+  mutation.
 - **Single read pass**: `io.TeeReader` feeds data to both `fsm.Restore` and the CRC hash
   simultaneously; no second scan.
 - **`bufio.NewReaderSize(tee, 1<<20)`**: the 1 MiB read-ahead buffer amortizes the
@@ -468,7 +492,7 @@ var (
 | Error | Meaning | Recovery |
 |-------|---------|---------|
 | `ErrFSMSnapshotFileCRC` | On-disk file is corrupt; footer ≠ computed | Delete file; WAL replay from `FirstIndex` |
-| `ErrFSMSnapshotTokenCRC` | File is intact (footer == computed) but token differs | Rewrite token from file's actual CRC; no WAL replay needed |
+| `ErrFSMSnapshotTokenCRC` | Footer and token disagree (detected before restore) | Log the mismatch; request a fresh snapshot from the leader; do not auto-rewrite the token (the mismatch may indicate the token references the wrong file version) |
 | `ErrFSMSnapshotNotFound` | `.fsm` file missing for a valid token | WAL replay from `FirstIndex` |
 
 ---
@@ -522,7 +546,7 @@ The receiver path (`receiveSnapshotStream`) follows the same sequence and also c
 | `.fsm` exists, snap not yet saved | Snap points to previous index; next snapshot overwrites |
 | snap(token) exists, `.fsm` missing | `ErrFSMSnapshotNotFound` → WAL replay from `FirstIndex` |
 | `.fsm` footer CRC mismatch | `ErrFSMSnapshotFileCRC` → delete file; WAL replay |
-| `.fsm` footer ok, token CRC differs | `ErrFSMSnapshotTokenCRC` → rewrite token; restore from file |
+| `.fsm` footer ok, token CRC differs | `ErrFSMSnapshotTokenCRC` → log + request fresh snapshot from leader; no auto-rewrite |
 
 ### Startup Cleanup
 
@@ -638,8 +662,40 @@ dangerous scenario. To prevent it, the rollout must proceed as follows:
    same full payload they always have. Mixed Phase 1 / legacy clusters are therefore safe.
    File streaming (Phase 2) is deferred until all nodes are on Phase 1.
 
-2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Once
-   any node begins sending token-format `MsgSnap`, all receivers must be at Phase 2.
+   ```go
+   // Phase 1 Dispatch fallback: token is in MemoryStorage but receiver may be legacy.
+   // Open the .fsm file and stream it directly via sendSnapshotReaderChunks to avoid
+   // materializing the full payload into memory. This requires the receiver to be at
+   // least Phase 1 (i.e., it runs receiveSnapshotStream which handles both formats).
+   // A truly pre-Phase-1 legacy receiver cannot handle this path; see note below.
+   if isSnapshotToken(msg.Snapshot.Data) {
+       tok, _ := decodeSnapshotToken(msg.Snapshot.Data)
+       path := filepath.Join(fsmSnapDir, fmt.Sprintf("%016x.fsm", tok.Index))
+       f, err := os.Open(path)
+       if err != nil {
+           return errors.WithStack(err)
+       }
+       defer f.Close()
+       return sendSnapshotReaderChunks(stream, header, f) // stream without []byte alloc
+   }
+   // fall through to legacy sendSnapshot path (receiver is pre-Phase-1)
+   ```
+
+   > **Memory trade-off note**: `sendSnapshotReaderChunks` streams the `.fsm` file
+   > directly without materializing it to `[]byte`, preserving the memory benefit. This
+   > path requires the receiver to run `receiveSnapshotStream`. If the cluster contains
+   > genuine pre-Phase-1 nodes that do not have `receiveSnapshotStream`, the operator
+   > must materialize via `readFSMSnapshotPayload` instead — accepting that the memory
+   > spike is re-introduced for that specific send. In practice this case should not
+   > arise when the Phase 1 rollout is done correctly (all nodes updated before Phase 2
+   > is enabled). Phase 2 eliminates the fallback entirely.
+
+   With this fallback, mixed Phase 1 / legacy clusters are safe. Memory allocation
+   during snapshot creation is eliminated; the send path streams from disk.
+
+2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Phase 2
+   replaces the Phase 1 fallback with true file streaming; once any node begins sending
+   token-format `MsgSnap` without reconstructing, all receivers must be at Phase 2.
 
 3. **Feature flag (recommended)**: add a `DisableFSMSnapshotToken` config field (default
    `false`). When set to `true`, `Dispatch` falls back to the legacy `sendSnapshot` path
@@ -709,12 +765,9 @@ config-change, and bootstrap). Follower send/receive is unchanged.
   - `writeFSMSnapshotFile` (write with CRC footer + syncDir)
   - `openAndRestoreFSMSnapshot` (single-pass verify+restore via TeeReader)
   - `verifyFSMSnapshotFile` (read-only CRC check for orphan detection)
-  - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token with CRC)
-  - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`, etc.
-- Update `persistLocalSnapshot` → `writeFSMSnapshotFile` + token
-- Update `persistConfigSnapshot`, `persistConfigState`, and `persistConfigSnapshotPayload` → same
-- Update `stateMachineSnapshotBytes` (bootstrap) → `writeFSMSnapshotFile` + token
-- Update `restoreSnapshotState` → `openAndRestoreFSMSnapshot`
+- Update `Dispatch`: if `isSnapshotToken(msg.Snapshot.Data)`, open the `.fsm` file and
+  stream via `sendSnapshotReaderChunks` (no `[]byte` allocation); this requires the
+  receiver to run `receiveSnapshotStream` (i.e., be at Phase 1 or newer)
 - Replace `purgeOldSnapFiles` with `purgeOldSnapshotFiles(snapDir, fsmSnapDir)`
 - Add `cleanupStaleFSMSnaps(snapDir, fsmSnapDir)` (index-based orphan removal)
 - Capture `storageIndex` before `fsm.Snapshot()` in `maybePersistLocalSnapshot`
@@ -722,6 +775,9 @@ config-change, and bootstrap). Follower send/receive is unchanged.
 
 **Effect**: eliminates memory spikes during local snapshot creation; reduces
 `MemoryStorage` resident memory; all snapshot creation paths are consistent.
+Mixed Phase 1 clusters are safe: Dispatch streams from the `.fsm` file via
+`sendSnapshotReaderChunks` without materializing to `[]byte`. Requires all nodes in the
+cluster to be at Phase 1 or newer before any Phase 1 node becomes leader.
 
 ### Phase 2: Streaming Follower Send/Receive
 

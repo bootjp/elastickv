@@ -211,22 +211,13 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, err
 	}
 
-	if len(gids) == 1 {
+	if len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0]) {
 		// Only use the single-shard (one-phase) path when every read key also
 		// belongs to the same shard as the mutations. If any read key belongs
 		// to a different shard, the 2PC path must be used so that
 		// validateReadOnlyShards validates those shards via a linearizable
 		// read barrier, preserving SSI.
-		canOptimize := true
-		for _, rk := range readKeys {
-			if c.engineGroupIDForKey(rk) != gids[0] {
-				canOptimize = false
-				break
-			}
-		}
-		if canOptimize {
-			return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
-		}
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
@@ -256,6 +247,16 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)
 	}
 	return commitTS, nil
+}
+
+// allReadKeysInShard reports whether every key in readKeys belongs to gid.
+func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) bool {
+	for _, rk := range readKeys {
+		if c.engineGroupIDForKey(rk) != gid {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
