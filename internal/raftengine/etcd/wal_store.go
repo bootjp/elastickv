@@ -61,7 +61,11 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 	if err := cleanupStaleSnapshotSpools(dataDir); err != nil {
 		return errors.Wrap(err, "cleanup stale snapshot spools")
 	}
-	if err := cleanupStaleFSMSnaps(snapDir, fsmSnapDir, false); err != nil {
+	// Startup CRC verification is disabled by default: for GiB-scale snapshots
+	// reading the entire file to compute a checksum can add seconds to recovery
+	// time. Orphan removal (index-based) still runs unconditionally. CRC
+	// integrity is enforced at restore time by openAndRestoreFSMSnapshot.
+	if err := cleanupStaleFSMSnaps(snapDir, fsmSnapDir, true); err != nil {
 		return errors.Wrap(err, "cleanup stale fsm snapshots")
 	}
 	return nil

@@ -350,6 +350,39 @@ func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {
 	return nil
 }
 
+// limitedReadCloser pairs an io.Reader (typically a LimitReader over a file)
+// with the underlying io.Closer so the file descriptor is released after streaming.
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// openFSMSnapshotPayloadReader opens the .fsm file at path and returns a
+// ReadCloser over exactly the payload bytes (file size minus the 4-byte CRC
+// footer). The caller must call Close() to release the file descriptor.
+//
+// This is the streaming counterpart to readFSMSnapshotPayload: no large buffer
+// is allocated, so it is suitable for bridge-mode forwarding of GiB-scale
+// snapshots.
+func openFSMSnapshotPayloadReader(path string) (io.ReadCloser, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, statFSMFileError(err)
+	}
+	if info.Size() < fsmMinFileSize {
+		return nil, errors.WithStack(ErrFSMSnapshotTooSmall)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	payloadSize := info.Size() - fsmFooterSize
+	return &limitedReadCloser{
+		Reader: io.LimitReader(f, payloadSize),
+		Closer: f,
+	}, nil
+}
+
 // statFSMFileError converts an os.Stat error to the appropriate typed error.
 func statFSMFileError(err error) error {
 	if os.IsNotExist(err) {

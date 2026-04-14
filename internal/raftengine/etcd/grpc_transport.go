@@ -45,8 +45,13 @@ type GRPCTransport struct {
 	snapshotChunkSize int
 	spoolDir          string
 	fsmSnapDir        string
-	readFSMPayload    func(index uint64) ([]byte, error)
-	dialGroup         singleflight.Group
+	// readFSMPayload is the fallback bridge callback that materialises the full
+	// FSM payload into memory. Used only when openFSMPayload is not set.
+	readFSMPayload func(index uint64) ([]byte, error)
+	// openFSMPayload is the preferred bridge callback that opens the .fsm file
+	// for streaming without allocating a large buffer.
+	openFSMPayload func(index uint64) (io.ReadCloser, error)
+	dialGroup      singleflight.Group
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -112,6 +117,18 @@ func (t *GRPCTransport) SetFSMPayloadReader(fn func(index uint64) ([]byte, error
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.readFSMPayload = fn
+}
+
+// SetFSMPayloadOpener registers the callback used by the bridge mode to stream
+// FSM snapshot payloads directly from disk without materialising the full
+// payload in memory.
+func (t *GRPCTransport) SetFSMPayloadOpener(fn func(index uint64) (io.ReadCloser, error)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.openFSMPayload = fn
 }
 
 func (t *GRPCTransport) UpsertPeer(peer Peer) {
@@ -192,11 +209,55 @@ func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message
 	ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
 	defer cancel()
 
+	// Prefer streaming when the snapshot holds a token and an opener is wired.
+	// This avoids materialising the full FSM payload in memory on the sender.
+	if msg.Snapshot != nil && isSnapshotToken(msg.Snapshot.Data) {
+		t.mu.RLock()
+		openFn := t.openFSMPayload
+		t.mu.RUnlock()
+		if openFn != nil {
+			tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			return t.streamFSMSnapshot(ctx, msg, tok.Index, openFn)
+		}
+	}
+
+	// Fallback: materialise the payload (no opener wired, or non-token snapshot).
 	patched, err := t.applyBridgeMode(msg)
 	if err != nil {
 		return err
 	}
 	return t.sendSnapshot(ctx, patched)
+}
+
+// streamFSMSnapshot streams the .fsm payload file directly to the peer using
+// chunked gRPC without loading the full content into memory.
+func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Message, index uint64, openFn func(uint64) (io.ReadCloser, error)) error {
+	rc, err := openFn(index)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	header, err := snapshotMessageHeader(msg)
+	if err != nil {
+		return err
+	}
+	client, err := t.clientFor(msg.To)
+	if err != nil {
+		return err
+	}
+	stream, err := client.SendSnapshot(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := sendSnapshotReaderChunks(stream, header, rc, t.chunkSize()); err != nil {
+		return err
+	}
+	_, err = stream.CloseAndRecv()
+	return errors.WithStack(err)
 }
 
 // applyBridgeMode implements the Phase 1 bridge: when MemoryStorage holds a
@@ -449,7 +510,15 @@ func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []by
 	current, err := readSnapshotChunk(buffered, chunkSize)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header, Final: true})
+			// The entire payload fit in one read (or reader was empty).
+			// current may be nil for an empty reader, or the full payload for
+			// a small snapshot. Include it so the receiver does not get an
+			// empty snapshot.Data.
+			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
+				Metadata: header,
+				Chunk:    current,
+				Final:    true,
+			})
 		}
 		return errors.WithStack(err)
 	}

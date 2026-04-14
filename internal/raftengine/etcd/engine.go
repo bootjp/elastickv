@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"sort"
@@ -341,6 +342,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
+	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
 	e.startDispatchWorkers()
 }
@@ -1279,6 +1281,16 @@ func (e *Engine) readFSMPayloadLocked(index uint64) ([]byte, error) {
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 	return readFSMSnapshotPayload(fsmSnapPath(e.fsmSnapDir, index))
+}
+
+// openFSMPayloadLocked opens the .fsm payload file for the given index while
+// holding snapshotMu. The lock is released once the file descriptor is obtained;
+// Unix semantics guarantee the fd remains readable even if purgeOldSnapshotFiles
+// subsequently unlinks the file. The caller must close the returned ReadCloser.
+func (e *Engine) openFSMPayloadLocked(index uint64) (io.ReadCloser, error) {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return openFSMSnapshotPayloadReader(fsmSnapPath(e.fsmSnapDir, index))
 }
 
 // snapshotPayload takes a FSM snapshot for the given index, writes it to the

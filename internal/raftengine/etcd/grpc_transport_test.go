@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -293,3 +294,55 @@ func TestApplyBridgeModeReaderError(t *testing.T) {
 	_, err := transport.applyBridgeMode(msg)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 }
+
+// TestSendSnapshotReaderChunksSmallPayloadPreservesData is a regression test
+// for a bug where a payload smaller than one chunk size was silently dropped.
+// readSnapshotChunk returns (data, io.EOF) for a short final read, and the old
+// code treated that the same as an empty reader, sending an empty chunk.
+func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
+	payload := []byte("tiny payload under one chunk")
+	header := []byte("header-bytes")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), defaultSnapshotChunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 1)
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, payload, client.chunks[0].Chunk)
+	require.True(t, client.chunks[0].Final)
+}
+
+func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
+	header := []byte("header-bytes")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(nil), defaultSnapshotChunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 1)
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Empty(t, client.chunks[0].Chunk)
+	require.True(t, client.chunks[0].Final)
+}
+
+// testSnapshotSendClient captures chunks sent via sendSnapshotReaderChunks / sendSnapshotChunks.
+type testSnapshotSendClient struct {
+	chunks []*pb.EtcdRaftSnapshotChunk
+}
+
+func (c *testSnapshotSendClient) Send(chunk *pb.EtcdRaftSnapshotChunk) error {
+	c.chunks = append(c.chunks, chunk)
+	return nil
+}
+
+func (c *testSnapshotSendClient) CloseAndRecv() (*pb.EtcdRaftAck, error) {
+	return &pb.EtcdRaftAck{}, nil
+}
+
+func (*testSnapshotSendClient) Header() (metadata.MD, error) { return nil, nil }
+func (*testSnapshotSendClient) Trailer() metadata.MD         { return nil }
+func (*testSnapshotSendClient) CloseSend() error             { return nil }
+func (*testSnapshotSendClient) Context() context.Context     { return context.Background() }
+func (*testSnapshotSendClient) SendMsg(any) error            { return nil }
+func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
