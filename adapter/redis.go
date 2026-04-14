@@ -2193,8 +2193,22 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	}
 	// txnStartTS is only called on the leader (followers proxy MULTI/EXEC via
 	// proxyTransactionToLeader before reaching runTransaction). The leader's
-	// HLC clock is authoritative — Observe the max key timestamp first so the
-	// clock never goes backwards, then take the next monotonic tick.
+	// HLC clock is authoritative — Observe the highest known committed
+	// timestamp before issuing the next tick so the clock never goes backwards.
+	//
+	// store.LastCommitTS() covers the leader-election case: when a new leader
+	// is elected its in-memory HLC starts from wall-clock time (zero logical),
+	// which may be lower than the previous leader's last commit timestamp
+	// (stored in the MVCC layer and applied via FSM). Without this Observe
+	// call the new leader could issue a startTS below already-committed
+	// versions, causing spurious write-conflict retries. The FSM conflict check
+	// would still catch any real violations, but observing LastCommitTS here
+	// avoids the unnecessary retry loop.
+	if r.store != nil {
+		if storeTS := r.store.LastCommitTS(); storeTS > maxTS {
+			maxTS = storeTS
+		}
+	}
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
