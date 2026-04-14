@@ -1484,6 +1484,13 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	if st, ok := t.listStates[k]; ok {
 		return st, nil
 	}
+	// Track listMetaKey (length/tail-pointer) and redisTTLKey as read
+	// dependencies. Individual list element keys (listItemKey) are NOT tracked
+	// because every list write operation (RPUSH, DEL) updates listMetaKey;
+	// a stale element read is therefore always detected via a stale meta read.
+	// A hypothetical LSET (in-place element mutation without touching meta)
+	// would require tracking individual element keys, but LSET is not
+	// currently supported.
 	t.trackReadKey(listMetaKey(key))
 	t.trackReadKey(redisTTLKey(key))
 
