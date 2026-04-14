@@ -2133,13 +2133,28 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Bound maxTS by the store's global last applied timestamp.
+	// On follower nodes the HLC wall clock can advance beyond the follower's
+	// replicated state: Clock().Next() may return a timestamp higher than the
+	// leader's latest commit for a key, causing the FSM's conflict check
+	// (latestVer.TS > startTS) to pass even when the follower read a stale
+	// version. Including LastCommitTS() ensures startTS reflects what the
+	// follower has actually applied, so any unreplicated leader commits will
+	// still be detected as conflicts.
+	if r.store != nil {
+		if storeTS := r.store.LastCommitTS(); storeTS > maxTS {
+			maxTS = storeTS
+		}
+	}
+
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
-	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return maxTS + 1, nil
-	}
-	return r.coordinator.Clock().Next(), nil
+	// Return maxTS+1 (bounded by applied store state) rather than
+	// Clock().Next() (wall-clock-based) to prevent startTS from exceeding the
+	// follower's replicated state and masking write-write conflicts in the FSM.
+	return maxTS + 1, nil
 }
 
 func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) (uint64, error) {
