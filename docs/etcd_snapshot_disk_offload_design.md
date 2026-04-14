@@ -107,7 +107,7 @@ After:  Data = [magic:4][version:1][index:8][crc32c:4]
 
 | Field   | Size   | Value |
 |---------|--------|-------|
-| magic   | 4 byte | `EKVR` (ElasticKV Reference) |
+| magic   | 4 byte | `EKVT` (ElasticKV Token) |
 | version | 1 byte | `0x01` |
 | index   | 8 byte | applied log index of the snapshot (little-endian uint64) |
 | crc32c  | 4 byte | CRC32C checksum of the entire `.fsm` file (little-endian uint32) |
@@ -115,6 +115,18 @@ After:  Data = [magic:4][version:1][index:8][crc32c:4]
 The magic prefix distinguishes the new format from legacy payloads (see Migration section).
 Embedding the CRC32C in the token allows integrity verification at the metadata level,
 before the file is even opened.
+
+> **Magic allocation note**: The existing persistence layer already uses `EKVR` (state
+> file), `EKVM` (metadata file), and `EKVW` (entries file) as defined in
+> `internal/raftengine/etcd/persistence.go`. `EKVT` is chosen to avoid collision with
+> any of these. The full registry is:
+>
+> | Magic  | File |
+> |--------|------|
+> | `EKVR` | `etcd-raft-state.bin` |
+> | `EKVM` | `etcd-raft-meta.bin` |
+> | `EKVW` | `etcd-raft-entries.bin` |
+> | `EKVT` | `raftpb.Snapshot.Data` token (this design) |
 
 ### `.fsm` File Format
 
@@ -192,7 +204,7 @@ maybePersistLocalSnapshot()
       → os.CreateTemp() → {fsmSnapDir}/{storageIndex}.fsm.tmp
       → crcWriter := newCRC32CWriter(tmpFile)
       → fsmSnap.WriteTo(crcWriter)                              # stream to disk + compute CRC
-      → binary.Write(tmpFile, LittleEndian, crcWriter.Sum32()) # append CRC footer
+      → binary.Write(tmpFile, binary.LittleEndian, crcWriter.Sum32()) # append CRC footer
       → tmpFile.Sync()
       → os.Rename(tmp, final)                                   # atomic commit
       → syncDir(fsmSnapDir)                                     # persist directory entry
@@ -246,8 +258,11 @@ func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) e
     if err != nil {
         return errors.WithStack(err)
     }
-    if info.Size() < 4 {
-        return errors.Wrapf(ErrFSMSnapshotFileCRC, "file too small: %d bytes", info.Size())
+    // Minimum valid .fsm: 8 bytes Pebble magic + 8 bytes lastCommitTS + 4 bytes CRC footer = 20 bytes.
+    const minFSMFileSize = 20
+    if info.Size() < minFSMFileSize {
+        return errors.Wrapf(ErrFSMSnapshotTooSmall,
+            "file too small: %d bytes (minimum %d)", info.Size(), minFSMFileSize)
     }
     f, err := os.Open(path)
     if err != nil {
@@ -461,7 +476,7 @@ var (
 | File | Change |
 |------|--------|
 | `internal/raftengine/etcd/wal_store.go` | Remove `snapshotBytes`; add `writeFSMSnapshotFile`; update `restoreSnapshotState` and `stateMachineSnapshotBytes` (bootstrap) |
-| `internal/raftengine/etcd/engine.go` | Update `persistLocalSnapshot`, `persistConfigSnapshot`, and `persistConfigSnapshotPayload` to use `writeFSMSnapshotFile` + token; add `fsmSnapDir` and `snapReceiveGroup` fields |
+| `internal/raftengine/etcd/engine.go` | Update `persistLocalSnapshot`, `persistConfigSnapshot`, `persistConfigState`, and `persistConfigSnapshotPayload` to use `writeFSMSnapshotFile` + token; add `fsmSnapDir` and `snapReceiveGroup` fields |
 | `internal/raftengine/etcd/grpc_transport.go` | Detect token in `Dispatch` → file-streaming send; update `receiveSnapshotStream` to write chunks to file with `singleflight` serialization and `syncDir` |
 | `internal/raftengine/etcd/snapshot_spool.go` | Remove `snapshotSpool` (Phase 3) |
 
@@ -481,7 +496,7 @@ var (
 writeFSMSnapshotFile():
   1. os.CreateTemp(fsmSnapDir, "*.fsm.tmp")         # write to temp file
   2. snapshot.WriteTo(crcWriter)                     # stream FSM + accumulate CRC
-  3. binary.Write(tmpFile, LE, crcWriter.Sum32())    # append CRC footer
+  3. binary.Write(tmpFile, binary.LittleEndian, crcWriter.Sum32()) # append CRC footer
   4. tmpFile.Sync()                                  # flush to durable storage
   5. os.Rename(tmp, final)                           # atomic commit
   6. syncDir(fsmSnapDir)                             # persist directory entry
@@ -551,7 +566,7 @@ If the first 4 bytes of `raftpb.Snapshot.Data` equal `EKVR`, the payload is trea
 token. Any other prefix is treated as a legacy FSM payload.
 
 ```go
-const snapshotTokenMagic = [4]byte{'E', 'K', 'V', 'R'}
+const snapshotTokenMagic = [4]byte{'E', 'K', 'V', 'T'}
 
 func isSnapshotToken(data []byte) bool {
     if len(data) < 4 {
@@ -574,6 +589,62 @@ If a node begins writing `.fsm` files and then rolls back to the previous binary
 **When a follower receives a legacy-format MsgSnap:**
 - `isSnapshotToken` returns false → restore via `bytes.NewReader` (no CRC check)
 - Compatible with rolling upgrades where not all nodes have been updated yet
+
+---
+
+## Rolling Upgrade and Zero-Downtime Cutover
+
+### Compatibility Matrix
+
+The `isSnapshotToken` magic check provides the compatibility bridge. Because `EKVT` is
+a prefix that can never appear in a valid legacy FSM payload (Pebble snapshots start with
+`EKVPBBL1`; gob-encoded legacy payloads start with gob framing bytes), there is no
+ambiguity when a mixed-version cluster is operating.
+
+| Sender version | Receiver version | Outcome |
+|----------------|-----------------|---------|
+| Legacy (no token) | Legacy | Unchanged — existing path |
+| Legacy (no token) | New | `isSnapshotToken` → false → `bytes.NewReader` fallback |
+| New (token) | Legacy | Legacy node does not understand the token; restores from the 17-byte payload as if it were FSM data → **corrupt FSM** |
+| New (token) | New | Token path → `.fsm` file |
+
+### Rolling Upgrade Strategy
+
+The third case — a new-format leader sending a token to a legacy follower — is the only
+dangerous scenario. To prevent it, the rollout must proceed as follows:
+
+1. **Deploy Phase 1 to all nodes before Phase 2.** Phase 1 changes only local snapshot
+   creation and restore; it does not change what is sent over the wire. A Phase 1 node
+   still sends full `[]byte` payloads in `MsgSnap` and can receive them. Mixed Phase 1 /
+   legacy clusters are safe.
+
+2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Once
+   any node begins sending token-format `MsgSnap`, all receivers must be at Phase 2.
+
+3. **Feature flag (recommended)**: add a `DisableFSMSnapshotToken` config field (default
+   `false`). When set to `true`, `Dispatch` falls back to the legacy `sendSnapshot` path
+   even if the local MemoryStorage contains a token. This allows operators to:
+   - Deploy Phase 2 binaries cluster-wide with the flag enabled.
+   - Verify stability, then disable the flag on each node progressively.
+   - Roll back safely by re-enabling the flag without restarting.
+
+### Rollback Safety
+
+If a rollback to the pre-Phase 1 binary is required after Phase 1 has created `.fsm`
+files:
+- The legacy binary reads the `.snap` file and finds `Data` = a 17-byte token starting
+  with `EKVT`.
+- `fsm.Restore` will attempt to interpret 17 bytes as a Pebble snapshot and fail with a
+  decode error (the Pebble magic `EKVPBBL1` is not present).
+- **Mitigation**: Before rolling back, stop the node and manually delete `fsm-snap/`; the
+  legacy binary will then fall back to WAL replay from the compacted snapshot index.
+  Document this procedure in the runbook.
+
+Alternatively, Phase 1 can write a **dual-format** `.snap` file during a configurable
+transition window: `raftpb.Snapshot.Data` = token AND a copy of the full legacy payload
+stored in an auxiliary file. The legacy binary would then decode the full payload
+normally. This dual-write mode is a forward compatibility bridge and can be removed after
+the fleet has been fully upgraded.
 
 ---
 
@@ -621,7 +692,7 @@ config-change, and bootstrap). Follower send/receive is unchanged.
   - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token with CRC)
   - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`, etc.
 - Update `persistLocalSnapshot` → `writeFSMSnapshotFile` + token
-- Update `persistConfigSnapshot` / `persistConfigSnapshotPayload` → same
+- Update `persistConfigSnapshot`, `persistConfigState`, and `persistConfigSnapshotPayload` → same
 - Update `stateMachineSnapshotBytes` (bootstrap) → `writeFSMSnapshotFile` + token
 - Update `restoreSnapshotState` → `openAndRestoreFSMSnapshot`
 - Replace `purgeOldSnapFiles` with `purgeOldSnapshotFiles(snapDir, fsmSnapDir)`
