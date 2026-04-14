@@ -2531,29 +2531,42 @@ func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte
 //
 // Returns the popped values (len ≤ count) or nil if the list does not exist.
 func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta store.ListMeta, n int64, left bool, readTS uint64) ([]string, []*kv.Elem[kv.OP], error) {
-	// Each item: Del(item) + Put(claim); capacity leaves room for the delta key appended by the caller.
-	elems := make([]*kv.Elem[kv.OP], 0, int(n)*2+1) //nolint:mnd // 2 ops per item (del item + put claim)
-	values := make([]string, 0, int(n))
+	// Build the [start, end) scan range covering exactly the n items to pop.
+	// n is already clamped to meta.Len by the caller, so no overflow is possible.
+	var startKey, endKey []byte
+	if left {
+		startKey = listItemKey(key, meta.Head)
+		endKey = listItemKey(key, meta.Head+n)
+	} else {
+		startKey = listItemKey(key, meta.Tail-n)
+		endKey = listItemKey(key, meta.Tail)
+	}
 
-	for i := int64(0); i < n; i++ {
-		var seq int64
-		if left {
-			seq = meta.Head + i
-		} else {
-			seq = meta.Tail - 1 - i
+	var kvps []*store.KVPair
+	var scanErr error
+	if left {
+		kvps, scanErr = r.store.ScanAt(ctx, startKey, endKey, int(n), readTS)
+	} else {
+		kvps, scanErr = r.store.ReverseScanAt(ctx, startKey, endKey, int(n), readTS)
+	}
+	if scanErr != nil {
+		return nil, nil, errors.WithStack(scanErr)
+	}
+
+	// Each item: Del(item) + Put(claim); capacity leaves room for the delta key appended by the caller.
+	elems := make([]*kv.Elem[kv.OP], 0, len(kvps)*2+1) //nolint:mnd // 2 ops per item (del item + put claim)
+	values := make([]string, 0, len(kvps))
+
+	for _, pair := range kvps {
+		seq, ok := store.ExtractListItemSeq(pair.Key, key)
+		if !ok {
+			continue
 		}
-		itemKey := listItemKey(key, seq)
-		raw, getErr := r.store.GetAt(ctx, itemKey, readTS)
-		if getErr != nil && !errors.Is(getErr, store.ErrKeyNotFound) {
-			return nil, nil, errors.WithStack(getErr)
-		}
-		if getErr == nil {
-			values = append(values, string(raw))
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey})
-		}
-		// Always claim the sequence number so that Head advances past holes in
-		// sparse lists. Without this, a hole at Head would block all future pops.
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
+		values = append(values, string(pair.Value))
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}},
+		)
 	}
 	return values, elems, nil
 }

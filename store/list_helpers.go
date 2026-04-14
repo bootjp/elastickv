@@ -266,6 +266,21 @@ func encodeSortableInt64(dst []byte, seq int64) {
 	binary.BigEndian.PutUint64(dst, uint64(seq^math.MinInt64)) //nolint:gosec // XOR trick for sortable int64 encoding
 }
 
+// ExtractListItemSeq extracts the sequence number encoded in a list item key.
+// Returns (seq, true) on success; (0, false) if key is not a valid item key for userKey.
+func ExtractListItemSeq(itemKey, userKey []byte) (int64, bool) {
+	prefix := append([]byte(ListItemPrefix), userKey...) //nolint:gocritic // one-shot prefix build; not a loop
+	if !bytes.HasPrefix(itemKey, prefix) {
+		return 0, false
+	}
+	rest := itemKey[len(prefix):]
+	if len(rest) != sortableInt64Bytes {
+		return 0, false
+	}
+	encoded := binary.BigEndian.Uint64(rest)
+	return int64(encoded) ^ math.MinInt64, true //nolint:gosec // XOR trick for sortable int64 decoding; mirrors encodeSortableInt64
+}
+
 // IsListMetaKey Exported helpers for other packages (e.g., Redis adapter).
 func IsListMetaKey(key []byte) bool { return bytes.HasPrefix(key, []byte(ListMetaPrefix)) }
 
