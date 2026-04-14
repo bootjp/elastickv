@@ -195,7 +195,6 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 		return 0, errors.WithStack(err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		committed = true
 		return 0, errors.WithStack(err)
 	}
 	committed = true
@@ -342,14 +341,15 @@ func statFSMFileError(err error) error {
 }
 
 // readFSMSnapshotPayload reads the .fsm file payload (all bytes except the
-// 4-byte CRC footer) into memory. Used by the Phase 1 bridge mode in Dispatch
-// to reconstruct the full FSM bytes for legacy receivers.
+// 4-byte CRC footer) into memory, verifying the CRC32C footer before returning.
+// Used by the Phase 1 bridge mode in Dispatch to reconstruct the full FSM bytes
+// for legacy receivers.
 func readFSMSnapshotPayload(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if info.Size() < fsmFooterSize {
+	if info.Size() < fsmMinFileSize {
 		return nil, errors.WithStack(ErrFSMSnapshotTooSmall)
 	}
 
@@ -361,8 +361,18 @@ func readFSMSnapshotPayload(path string) ([]byte, error) {
 
 	payloadSize := info.Size() - fsmFooterSize
 	data := make([]byte, payloadSize)
-	if _, err := io.ReadFull(f, data); err != nil {
+	h := crc32.New(crc32cTable)
+	tr := io.TeeReader(io.LimitReader(f, payloadSize), h)
+	if _, err := io.ReadFull(tr, data); err != nil {
 		return nil, errors.WithStack(err)
+	}
+
+	var footer uint32
+	if err := binary.Read(f, binary.BigEndian, &footer); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if h.Sum32() != footer {
+		return nil, errors.Wrapf(ErrFSMSnapshotFileCRC, "path=%s", path)
 	}
 	return data, nil
 }
