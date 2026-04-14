@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -1957,6 +1958,9 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	}
 
 	newScore := oldScore + increment
+	if math.IsNaN(newScore) {
+		return 0, errors.New("ERR resulting score is not a number (NaN)")
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+3) //nolint:mnd // del old score + put member + put score index
 	elems = append(elems, migrationElems...)
 	if memberExists {

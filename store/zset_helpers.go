@@ -84,6 +84,11 @@ func UnmarshalZSetScore(b []byte) (float64, error) {
 // For negative floats: XOR all bits to reverse the order.
 // This produces a byte sequence that sorts correctly with standard byte comparison.
 func EncodeSortableFloat64(f float64) [8]byte {
+	// Normalize -0.0 → +0.0 so both map to the same score key, matching
+	// Redis's treatment of 0 and -0 as equal in sorted sets.
+	if f == 0 {
+		f = 0.0
+	}
 	bits := math.Float64bits(f)
 	if bits>>63 == 0 {
 		// Positive (or +0): flip the sign bit
