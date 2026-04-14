@@ -2544,18 +2544,16 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 		}
 		itemKey := listItemKey(key, seq)
 		raw, getErr := r.store.GetAt(ctx, itemKey, readTS)
-		if errors.Is(getErr, store.ErrKeyNotFound) {
-			// Sparse list — stop here.
-			break
-		}
-		if getErr != nil {
+		if getErr != nil && !errors.Is(getErr, store.ErrKeyNotFound) {
 			return nil, nil, errors.WithStack(getErr)
 		}
-		values = append(values, string(raw))
-		elems = append(elems,
-			&kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey},
-			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}},
-		)
+		if getErr == nil {
+			values = append(values, string(raw))
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey})
+		}
+		// Always claim the sequence number so that Head advances past holes in
+		// sparse lists. Without this, a hole at Head would block all future pops.
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
 	}
 	return values, elems, nil
 }
@@ -2565,7 +2563,7 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 // (zero, false, nil) when the key does not exist or the list is empty,
 // and (zero, false, err) on error (including wrong-type error).
 func (r *RedisServer) resolveListPopMeta(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
-	typ, typErr := r.keyTypeAt(context.Background(), key, readTS)
+	typ, typErr := r.keyTypeAt(ctx, key, readTS)
 	if typErr != nil {
 		return store.ListMeta{}, false, typErr
 	}
@@ -2612,8 +2610,12 @@ func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, l
 			return buildErr
 		}
 
-		n = int64(len(values))
-		if n == 0 {
+		// n is the number of sequence positions claimed (including any holes).
+		// HeadDelta and LenDelta must use n, not len(values), so that Head
+		// advances past holes and the metadata stays consistent with Tail.
+		// The transaction must proceed even when len(values)==0 so that
+		// Head is updated past the hole and future pops are not stuck.
+		if len(elems) == 0 {
 			popped = nil
 			return nil
 		}
@@ -2621,7 +2623,7 @@ func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, l
 		commitTS := r.coordinator.Clock().Next()
 		var headDelta int64
 		if left {
-			headDelta = n // head advances by n for LPOP
+			headDelta = n // head advances by n positions for LPOP
 		}
 		delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: headDelta, LenDelta: -n})
 		elems = append(elems, &kv.Elem[kv.OP]{

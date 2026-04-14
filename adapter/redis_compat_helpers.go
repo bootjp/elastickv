@@ -13,7 +13,7 @@ import (
 )
 
 // maxWideColumnItems is the maximum number of fields/members a single
-// wide-column collection (Hash, Set, or ZSet) may contain.
+// wide-column collection (Hash, Set, ZSet, or List) may contain.
 // Operations that would materialize more than this many items are rejected
 // to prevent unbounded memory growth (OOM).
 const maxWideColumnItems = 100_000
@@ -392,12 +392,17 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	for _, pair := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
-	// Delete all claim keys.
+	// Delete all claim keys. Use maxWideScanLimit to guard against OOM; a list
+	// that has accumulated more claim keys than maxWideColumnItems is too large
+	// to delete atomically and should be rejected.
 	claimPrefix := store.ListClaimScanPrefix(key)
 	claimEnd := store.PrefixScanEnd(claimPrefix)
 	claimKVs, claimScanErr := r.store.ScanAt(ctx, claimPrefix, claimEnd, maxWideScanLimit, readTS)
 	if claimScanErr != nil {
 		return nil, errors.WithStack(claimScanErr)
+	}
+	if len(claimKVs) > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q has more than %d claim keys", key, maxWideColumnItems)
 	}
 	for _, pair := range claimKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
