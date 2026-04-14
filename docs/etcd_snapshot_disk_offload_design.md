@@ -110,7 +110,7 @@ After:  Data = [magic:4][version:1][index:8][crc32c:4]
 | magic   | 4 byte | `EKVT` (ElasticKV Token) |
 | version | 1 byte | `0x01` |
 | index   | 8 byte | applied log index of the snapshot (little-endian uint64) |
-| crc32c  | 4 byte | CRC32C checksum of the entire `.fsm` file (little-endian uint32) |
+| crc32c  | 4 byte | CRC32C checksum of the `.fsm` file payload (all bytes preceding the footer) (little-endian uint32) |
 
 The magic prefix distinguishes the new format from legacy payloads (see Migration section).
 Embedding the CRC32C in the token allows integrity verification at the metadata level,
@@ -274,7 +274,15 @@ func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) e
     h := crc32.New(crc32cTable)
     // Tee: data flows to both the CRC accumulator and fsm.Restore simultaneously.
     tee := io.TeeReader(io.LimitReader(f, payloadSize), h)
-    if err := fsm.Restore(bufio.NewReaderSize(tee, 1<<20)); err != nil {
+    br := bufio.NewReaderSize(tee, 1<<20)
+    if err := fsm.Restore(br); err != nil {
+        return errors.WithStack(err)
+    }
+    // Drain any bytes that fsm.Restore left unread (e.g. if it stopped on an
+    // internal end-of-stream marker before consuming the full payload).
+    // Without this, h would have accumulated fewer bytes than the file contains,
+    // producing a spurious CRC mismatch even for a valid file.
+    if _, err := io.Copy(io.Discard, br); err != nil {
         return errors.WithStack(err)
     }
     var footer uint32
@@ -562,7 +570,7 @@ The existing `purgeOldSnapFiles` function is removed and replaced entirely.
 
 ## Migration (Legacy Format Compatibility)
 
-If the first 4 bytes of `raftpb.Snapshot.Data` equal `EKVR`, the payload is treated as a
+If the first 4 bytes of `raftpb.Snapshot.Data` equal `EKVT`, the payload is treated as a
 token. Any other prefix is treated as a legacy FSM payload.
 
 ```go
@@ -737,7 +745,7 @@ removes three-read-pass anti-pattern on the receive side.
 | Test | What it verifies |
 |------|-----------------|
 | `TestTokenRoundTrip` | `encodeSnapshotToken` / `decodeSnapshotToken` round-trip for boundary values (`0`, `MaxUint64`, `MaxUint32`) |
-| `TestTokenMagicRejection` | `isSnapshotToken` returns false for non-`EKVR` prefixes; `decodeSnapshotToken` returns `ErrFSMSnapshotTokenInvalid` for lengths 0–16 and wrong magic |
+| `TestTokenMagicRejection` | `isSnapshotToken` returns false for non-`EKVT` prefixes; `decodeSnapshotToken` returns `ErrFSMSnapshotTokenInvalid` for lengths 0–16 and wrong magic |
 | `TestCRCWriterMatchesStdlib` | `crc32CWriter.Sum32()` matches `crc32.Checksum` for identical bytes; incremental writes accumulate correctly |
 | `TestOpenAndRestoreFSMSnapshotGoodFile` | Correct file restores FSM state without error |
 | `TestOpenAndRestoreFSMSnapshotBadFooter` | Footer byte flipped → `ErrFSMSnapshotFileCRC` |
@@ -757,7 +765,7 @@ removes three-read-pass anti-pattern on the receive side.
 | `TestReceiveWrongCRCInFooter` | Correct length, corrupted footer → verify rejects before rename |
 | `TestReceiveTokenCRCMismatchesFileCRC` | Token carries wrong CRC, file footer is self-consistent → `ErrFSMSnapshotTokenCRC` in `openAndRestoreFSMSnapshot` |
 | `TestConcurrentReceiveSameIndex` | Two goroutines receiving the same index via `singleflight`; only one `.fsm` committed; no torn file |
-| `TestLegacyFormatFallbackOnRestore` | `snap.Data` without `EKVR` prefix → `bytes.NewReader` path; no `.fsm` file opened |
+| `TestLegacyFormatFallbackOnRestore` | `snap.Data` without `EKVT` prefix → `bytes.NewReader` path; no `.fsm` file opened |
 | `TestLegacyFormatFallbackOnSend` | Non-token `MsgSnap` → old `sendSnapshot` path; no file opened from `fsmSnapDir` |
 | `TestSyncDirCalledAfterRename` | Both `writeFSMSnapshotFile` and `receiveSnapshotStream` call `syncDir` after rename (verified via mock or filesystem hook) |
 | Conformance `SnapshotRestoreAfterRestart` | Propose 10,001 entries, close engine, reopen; assert FSM state recovered from `.fsm` snapshot (not WAL replay) |
