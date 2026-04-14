@@ -138,15 +138,38 @@ This is the same algorithm used by etcd's `Snapshotter`
 range of several GB/s with negligible CPU overhead. The Go standard library exposes it as
 `hash/crc32.MakeTable(crc32.Castagnoli)`.
 
+### CRC Authority
+
+The **on-disk footer is the authoritative checksum**. The CRC embedded in the token is a
+*transmission integrity check* — it is derived from the file at write time and travels
+with the raft snapshot metadata. The two values must always agree; a mismatch indicates:
+
+- **footer ≠ computed**: the `.fsm` file is corrupt on disk → delete and attempt WAL
+  replay; do not trust the token.
+- **footer == computed, token ≠ computed**: the `.snap` metadata is corrupt → the file
+  itself is trustworthy; the snap file should be rewritten from the file's actual CRC.
+- **footer ≠ computed AND token ≠ computed**: both are corrupt → WAL replay only.
+
+This distinction is implemented in `verifyFSMSnapshotFile`, which returns typed errors
+(`ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`) to allow callers to take the correct
+recovery action.
+
 ---
 
 ## Flow Changes
 
 ### 1. Local Snapshot Creation
 
+> **Scope note**: This flow applies to **all three snapshot creation paths**: local
+> periodic snapshots (`persistLocalSnapshot`), config-change snapshots
+> (`persistConfigSnapshot`), and bootstrap (`stateMachineSnapshotBytes`). All three must
+> be migrated in Phase 1; leaving any path on the legacy `snapshotBytesAndClose` route
+> re-introduces the memory problem and breaks the token invariant.
+
 **Before:**
 ```
 maybePersistLocalSnapshot()
+  → storageIndex := storage.Snapshot().Metadata.Index   # record current index
   → fsm.Snapshot()
   → snapshotBytesAndClose()
       → spool.WriteTo()        # write to temp file on disk
@@ -158,18 +181,26 @@ maybePersistLocalSnapshot()
 **After:**
 ```
 maybePersistLocalSnapshot()
-  → fsm.Snapshot()
-  → writeFSMSnapshotFile(snapshot, fsmSnapDir, index)
-      → os.CreateTemp() → {fsmSnapDir}/{index}.fsm.tmp
+  # Capture the MemoryStorage index BEFORE calling fsm.Snapshot() so the
+  # staleness check in persistLocalSnapshotPayload uses the same baseline.
+  # If a follower restore advances storage between Snapshot() and
+  # persistLocalSnapshotPayload, the index <= current.Metadata.Index guard
+  # will correctly discard the stale file.
+  → storageIndex := storage.Snapshot().Metadata.Index
+  → fsmSnap := fsm.Snapshot()
+  → crc32c, err := writeFSMSnapshotFile(fsmSnap, fsmSnapDir, storageIndex)
+      → os.CreateTemp() → {fsmSnapDir}/{storageIndex}.fsm.tmp
       → crcWriter := newCRC32CWriter(tmpFile)
-      → snapshot.WriteTo(crcWriter)                               # stream to disk + compute CRC
-      → binary.Write(tmpFile, LittleEndian, crcWriter.Sum32())   # append CRC footer
-      → tmpFile.Sync() → os.Rename(tmp, final)                   # atomic commit
+      → fsmSnap.WriteTo(crcWriter)                              # stream to disk + compute CRC
+      → binary.Write(tmpFile, LittleEndian, crcWriter.Sum32()) # append CRC footer
+      → tmpFile.Sync()
+      → os.Rename(tmp, final)                                   # atomic commit
+      → syncDir(fsmSnapDir)                                     # persist directory entry
       → return crcWriter.Sum32()
-  → token := encodeSnapshotToken(index, crc32c)  # 17 bytes
-  → persist.SaveSnap(snap{Data: token})          # small snap file
-  → storage.CreateSnapshot(_, _, token)          # MemoryStorage: 17 bytes only
-  → purgeOldFSMSnapFiles(fsmSnapDir)
+  → token := encodeSnapshotToken(storageIndex, crc32c)  # 17 bytes
+  → persist.SaveSnap(snap{Data: token})                 # small snap file
+  → storage.CreateSnapshot(_, _, token)                 # MemoryStorage: 17 bytes only
+  → purgeOldSnapshotFiles(snapDir, fsmSnapDir)          # coordinated purge (see Retention)
 ```
 
 **Memory impact:**
@@ -177,6 +208,11 @@ maybePersistLocalSnapshot()
 - Resident: FSM data size → 17 bytes
 
 ### 2. Restore on Restart
+
+Restore uses a **single-pass** helper `openAndRestoreFSMSnapshot` that opens the file
+once, verifies the CRC while streaming data to the FSM, and never reads the file a second
+time. This eliminates the double-read that would result from a separate verify pass
+followed by a restore pass.
 
 **Before:**
 ```
@@ -192,18 +228,66 @@ loadWalState()
   → snapshotter.LoadNewestAvailable()
   → restoreSnapshotState(fsm, snap, fsmSnapDir)
       → if isSnapshotToken(snap.Data):
-            index, expectedCRC := decodeSnapshotToken(snap.Data)
+            index, tokenCRC := decodeSnapshotToken(snap.Data)
             path := fsmSnapPath(fsmSnapDir, index)
-            verifyFSMSnapshotFile(path, expectedCRC)          # fail fast on corruption
-            f := os.Open(path)
-            fsm.Restore(newCRC32CStripFooterReader(f))        # exclude footer from stream
+            openAndRestoreFSMSnapshot(fsm, path, tokenCRC)
+              # single pass: open fd → stream payload through CRC accumulator
+              #              → call fsm.Restore → compare computed vs footer vs tokenCRC
+              # returns ErrFSMSnapshotFileCRC or ErrFSMSnapshotTokenCRC on mismatch
          else:
-            fsm.Restore(bytes.NewReader(snap.Data))           # legacy format fallback
+            fsm.Restore(bytes.NewReader(snap.Data))  # legacy format fallback
 ```
 
-`verifyFSMSnapshotFile` reads the file sequentially, computes the CRC incrementally, and
-compares it against both the on-disk footer and the `expectedCRC` from the token. A
-mismatch returns `ErrFSMSnapshotCRCMismatch` and aborts startup.
+`openAndRestoreFSMSnapshot` keeps a single open file descriptor for the full operation:
+
+```go
+func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) error {
+    info, err := os.Stat(path)
+    if err != nil {
+        return errors.WithStack(err)
+    }
+    if info.Size() < 4 {
+        return errors.Wrapf(ErrFSMSnapshotFileCRC, "file too small: %d bytes", info.Size())
+    }
+    f, err := os.Open(path)
+    if err != nil {
+        return errors.WithStack(err)
+    }
+    defer f.Close()
+
+    payloadSize := info.Size() - 4
+    h := crc32.New(crc32cTable)
+    // Tee: data flows to both the CRC accumulator and fsm.Restore simultaneously.
+    tee := io.TeeReader(io.LimitReader(f, payloadSize), h)
+    if err := fsm.Restore(bufio.NewReaderSize(tee, 1<<20)); err != nil {
+        return errors.WithStack(err)
+    }
+    var footer uint32
+    if err := binary.Read(f, binary.LittleEndian, &footer); err != nil {
+        return errors.WithStack(err)
+    }
+    computed := h.Sum32()
+    if computed != footer {
+        return errors.Wrapf(ErrFSMSnapshotFileCRC,
+            "path=%s footer=%08x computed=%08x", path, footer, computed)
+    }
+    if computed != tokenCRC {
+        return errors.Wrapf(ErrFSMSnapshotTokenCRC,
+            "path=%s token=%08x computed=%08x", path, tokenCRC, computed)
+    }
+    return nil
+}
+```
+
+Key properties:
+- **Single read pass**: `io.TeeReader` feeds data to both `fsm.Restore` and the CRC hash
+  simultaneously; no second scan.
+- **`bufio.NewReaderSize(tee, 1<<20)`**: the 1 MiB read-ahead buffer amortizes the
+  per-entry small reads that `writePebbleSnapshotEntries` / the restore loop issues,
+  matching the throughput of the former `bytes.Reader` path.
+- **Single open fd**: the file descriptor is held across the full verify+restore
+  operation, eliminating the TOCTOU window between a separate verify and a subsequent
+  restore open.
 
 ### 3. Sending MsgSnap to a Follower
 
@@ -228,10 +312,22 @@ sendMessages()
             sendSnapshot(msg)   # legacy format fallback
 ```
 
-The `.fsm` file is sent including its CRC footer. The receiver stores the full file and
-performs CRC verification after all chunks arrive.
+The `.fsm` file is sent **including its CRC footer** as the final 4 bytes. The receiver
+stores the full file and verifies the CRC before committing.
 
 ### 4. Receiving and Applying MsgSnap on a Follower
+
+Two concurrency concerns are addressed here:
+
+1. **Concurrent receive for the same index**: a leader retry or simultaneous MsgSnap
+   delivery could cause two goroutines to write `{index}.fsm` at the same time. A
+   `singleflight.Group` keyed on the snapshot index serializes receive operations for the
+   same index; only the first completes, the second reuses its result.
+
+2. **TOCTOU between verify and apply**: verify and restore use the same open file
+   descriptor via `openAndRestoreFSMSnapshot` (see §2), eliminating the window where the
+   file could be replaced between a standalone verify call and a subsequent open for
+   restore.
 
 **Before:**
 ```
@@ -246,24 +342,31 @@ receiveSnapshotStream()
 **After:**
 ```
 receiveSnapshotStream()
-  → receive header chunk → parse token → extract index, expectedCRC
-  → os.CreateTemp() → {fsmSnapDir}/{index}.fsm.tmp
-  → stream remaining chunks to tmpFile
-  → tmpFile.Sync()
-  → verifyFSMSnapshotFile(tmpPath, expectedCRC)              # verify before committing
-  → os.Rename(tmpPath, {fsmSnapDir}/{index}.fsm)             # atomic commit on success
+  → receive header chunk → parse token → extract index, tokenCRC
+  → result, err := snapReceiveGroup.Do(strconv.FormatUint(index, 10), func() {
+        → os.CreateTemp() → {fsmSnapDir}/{index}.fsm.tmp
+        → stream remaining chunks to tmpFile (with bufio.NewWriterSize)
+        → tmpFile.Sync()
+        → verify CRC of tmpPath against footer and tokenCRC
+          # footer is authoritative; return ErrFSMSnapshotFileCRC if mismatch
+        → os.Rename(tmpPath, {fsmSnapDir}/{index}.fsm)  # atomic commit on success
+        → syncDir(fsmSnapDir)                           # flush directory entry
+        → return token
+    })
   → raftpb.Message{Snapshot: {Data: token}}
   → handler(msg)
       → applyReadySnapshot(snap)
-          → index, expectedCRC := decodeSnapshotToken(snap.Data)
-          → verifyFSMSnapshotFile(path, expectedCRC)         # second check before apply
-          → fsm.Restore(newCRC32CStripFooterReader(f))
+          → index, tokenCRC := decodeSnapshotToken(snap.Data)
+          → openAndRestoreFSMSnapshot(fsm, path, tokenCRC)
+            # single-pass verify+restore; no second verifyFSMSnapshotFile call needed
+            # the file was already committed atomically by receiveSnapshotStream
 ```
 
-**Why verify immediately after receive:**
-- Detects in-transit bit errors before the file is applied to the FSM
-- Prevents a corrupt file from overwriting a healthy FSM state
-- On failure, report `SnapshotFailure` to prompt the leader to retry
+**Why the second `verifyFSMSnapshotFile` call is removed from `applyReadySnapshot`:**
+After `receiveSnapshotStream` has verified, atomically renamed, and `syncDir`'d the file,
+no other process modifies `.fsm` files between that point and `applyReadySnapshot`. The
+`openAndRestoreFSMSnapshot` call already recomputes the CRC as a by-product of streaming
+data to `fsm.Restore`, so integrity is confirmed without an extra full-file scan.
 
 ---
 
@@ -297,74 +400,51 @@ func (c *crc32CWriter) Sum32() uint32 { return c.h.Sum32() }
 Passing `crc32CWriter` to `snapshot.WriteTo` computes the CRC without any changes to the
 existing `WriteTo` implementation.
 
-### Reading: Streaming Verification
+### Reading: Single-Pass Verify and Restore
 
-`verifyFSMSnapshotFile` uses `stat` to determine the file size, then reads
-`(size - 4)` bytes through a CRC accumulator, and compares the result against the
-4-byte footer and the `expectedCRC` from the token. No second read pass is required.
+Rather than a standalone `verifyFSMSnapshotFile` followed by a separate `fsm.Restore`,
+all read paths use `openAndRestoreFSMSnapshot` (see §2: Restore on Restart). This
+function:
 
-```go
-func verifyFSMSnapshotFile(path string, expectedCRC uint32) error {
-    info, err := os.Stat(path)
-    if err != nil {
-        return errors.WithStack(err)
-    }
-    if info.Size() < 4 {
-        return errors.Wrapf(ErrFSMSnapshotCRCMismatch, "file too small: %d bytes", info.Size())
-    }
-    f, err := os.Open(path)
-    if err != nil {
-        return errors.WithStack(err)
-    }
-    defer f.Close()
+1. Opens the file once and holds the fd for the entire operation.
+2. Uses `io.TeeReader` to feed data simultaneously to the CRC accumulator and
+   `fsm.Restore`.
+3. Reads the 4-byte footer after `fsm.Restore` returns and checks `computed == footer`
+   and `computed == tokenCRC`.
+4. Returns typed errors distinguishing file corruption (`ErrFSMSnapshotFileCRC`) from
+   token corruption (`ErrFSMSnapshotTokenCRC`).
 
-    h := crc32.New(crc32cTable)
-    if _, err := io.Copy(h, io.LimitReader(f, info.Size()-4)); err != nil {
-        return errors.WithStack(err)
-    }
-    var footer uint32
-    if err := binary.Read(f, binary.LittleEndian, &footer); err != nil {
-        return errors.WithStack(err)
-    }
-    computed := h.Sum32()
-    if computed != footer {
-        return errors.Wrapf(ErrFSMSnapshotCRCMismatch,
-            "path=%s footer=%08x computed=%08x", path, footer, computed)
-    }
-    if computed != expectedCRC {
-        return errors.Wrapf(ErrFSMSnapshotCRCMismatch,
-            "path=%s token=%08x computed=%08x", path, expectedCRC, computed)
-    }
-    return nil
-}
-```
-
-`newCRC32CStripFooterReader` wraps the open file and exposes only the first
-`(size - 4)` bytes to the FSM's `Restore` call so the footer is not interpreted as
-key-value data.
+A standalone `verifyFSMSnapshotFile(path, tokenCRC)` is still provided for contexts where
+the FSM must not be modified (e.g., startup cleanup health-checking orphan files), but it
+is **never called in sequence with a subsequent restore**.
 
 ### Verification Points
 
-| When | Location | What is checked |
-|------|----------|-----------------|
-| **On restart** | `restoreSnapshotState` | file CRC ↔ footer ↔ token CRC |
-| **After follower receive** | `receiveSnapshotStream` | file CRC ↔ footer ↔ token CRC |
-| **Before follower apply** | `applyReadySnapshot` | token CRC ↔ file CRC (second check) |
-| **Background health check** *(future)* | background task | periodic re-computation of file CRC |
+| When | Location | Mechanism |
+|------|----------|-----------|
+| **On restart** | `restoreSnapshotState` | `openAndRestoreFSMSnapshot` (single pass) |
+| **After follower receive** | `receiveSnapshotStream` | `verifyFSMSnapshotFile` on tmp before rename |
+| **On follower apply** | `applyReadySnapshot` | `openAndRestoreFSMSnapshot` (single pass; no extra verify) |
+| **Startup orphan check** | `cleanupStaleFSMSnaps` | `verifyFSMSnapshotFile` (read-only, no restore) |
+| **Background health check** *(future)* | background task | `verifyFSMSnapshotFile` |
 
-### Error Handling
+### Error Types and Recovery
 
 ```go
 var (
-    ErrFSMSnapshotCRCMismatch  = errors.New("fsm snapshot: CRC32C mismatch")
-    ErrFSMSnapshotNotFound     = errors.New("fsm snapshot: file not found")
+    ErrFSMSnapshotFileCRC   = errors.New("fsm snapshot: file CRC32C mismatch (file corrupt)")
+    ErrFSMSnapshotTokenCRC  = errors.New("fsm snapshot: token CRC32C mismatch (metadata corrupt)")
+    ErrFSMSnapshotNotFound  = errors.New("fsm snapshot: file not found")
+    ErrFSMSnapshotTooSmall  = errors.New("fsm snapshot: file too small to contain footer")
     ErrFSMSnapshotTokenInvalid = errors.New("fsm snapshot: token format invalid")
 )
 ```
 
-- `ErrFSMSnapshotCRCMismatch`: log `{path, expected, actual}` and abort the operation.
-  - On startup: attempt WAL replay from `FirstIndex` before giving up.
-  - On follower receive: report `SnapshotFailure`; the leader will retry.
+| Error | Meaning | Recovery |
+|-------|---------|---------|
+| `ErrFSMSnapshotFileCRC` | On-disk file is corrupt; footer ≠ computed | Delete file; WAL replay from `FirstIndex` |
+| `ErrFSMSnapshotTokenCRC` | File is intact (footer == computed) but token differs | Rewrite token from file's actual CRC; no WAL replay needed |
+| `ErrFSMSnapshotNotFound` | `.fsm` file missing for a valid token | WAL replay from `FirstIndex` |
 
 ---
 
@@ -374,16 +454,16 @@ var (
 
 | File | Contents |
 |------|----------|
-| `internal/raftengine/etcd/fsm_snapshot_file.go` | FSM snapshot file read/write, CRC32C computation and verification, token encode/decode |
+| `internal/raftengine/etcd/fsm_snapshot_file.go` | `crc32CWriter`, `openAndRestoreFSMSnapshot`, `verifyFSMSnapshotFile`, `writeFSMSnapshotFile`, token encode/decode, error types |
 
 ### Changes to Existing Files
 
 | File | Change |
 |------|--------|
-| `internal/raftengine/etcd/wal_store.go` | Remove `snapshotBytes`; add `writeFSMSnapshotFile`; update `restoreSnapshotState` to handle token format |
-| `internal/raftengine/etcd/engine.go` | Replace payload retrieval in `persistLocalSnapshot` with `writeFSMSnapshotFile`; add `fsmSnapDir` field |
-| `internal/raftengine/etcd/grpc_transport.go` | Detect token in `Dispatch` → route to file-streaming send path; update `receiveSnapshotStream` to write chunks to file |
-| `internal/raftengine/etcd/snapshot_spool.go` | Repurpose or remove `snapshotSpool` |
+| `internal/raftengine/etcd/wal_store.go` | Remove `snapshotBytes`; add `writeFSMSnapshotFile`; update `restoreSnapshotState` and `stateMachineSnapshotBytes` (bootstrap) |
+| `internal/raftengine/etcd/engine.go` | Update `persistLocalSnapshot`, `persistConfigSnapshot`, and `persistConfigSnapshotPayload` to use `writeFSMSnapshotFile` + token; add `fsmSnapDir` and `snapReceiveGroup` fields |
+| `internal/raftengine/etcd/grpc_transport.go` | Detect token in `Dispatch` → file-streaming send; update `receiveSnapshotStream` to write chunks to file with `singleflight` serialization and `syncDir` |
+| `internal/raftengine/etcd/snapshot_spool.go` | Remove `snapshotSpool` (Phase 3) |
 
 ### Code Removed
 
@@ -407,35 +487,61 @@ writeFSMSnapshotFile():
   6. syncDir(fsmSnapDir)                             # persist directory entry
 ```
 
-`persist.SaveSnap(snap{Data: token})` is called only after the rename succeeds.
-Because the `.fsm` file is committed before the token is written to the WAL or snap
-file, the following crash scenarios are all safely recoverable:
+`persist.SaveSnap(snap{Data: token})` is called **only after step 6 succeeds**.
+The receiver path (`receiveSnapshotStream`) follows the same sequence and also calls
+`syncDir(fsmSnapDir)` after rename.
 
 | State at crash | Recovery |
 |----------------|----------|
-| Only `.fsm.tmp` exists | Deleted by startup cleanup (treated as orphan) |
+| Only `.fsm.tmp` exists | Deleted by startup cleanup (orphan) |
 | `.fsm` exists, snap not yet saved | Snap points to previous index; next snapshot overwrites |
-| snap(token) exists, `.fsm` missing | Token dereferences a missing file → error → WAL replay fallback |
-| `.fsm` CRC mismatch | Treated as corrupt orphan; deleted at startup; WAL replay fallback |
+| snap(token) exists, `.fsm` missing | `ErrFSMSnapshotNotFound` → WAL replay from `FirstIndex` |
+| `.fsm` footer CRC mismatch | `ErrFSMSnapshotFileCRC` → delete file; WAL replay |
+| `.fsm` footer ok, token CRC differs | `ErrFSMSnapshotTokenCRC` → rewrite token; restore from file |
 
 ### Startup Cleanup
 
-Similar to `cleanupStaleSnapshotSpools`, a new `cleanupStaleFSMSnaps(fsmSnapDir)` removes
-any `*.fsm.tmp` files left by a previously crashed process. `.fsm` files whose CRC does
-not match any live token are also removed, since WAL replay can reconstruct the FSM
-without them.
+`cleanupStaleFSMSnaps(snapDir, fsmSnapDir)` runs at engine open time and:
+
+1. Removes all `*.fsm.tmp` (orphans from a previous crash).
+2. Enumerates all live snap tokens by reading `*.snap` files in `snapDir`.
+3. Removes any `.fsm` file whose index does not correspond to a live token — this handles
+   the case where a `.fsm` was written but the corresponding `.snap` was never saved
+   (upgrade crash), as well as files left over after purge ordering bugs in older versions.
+4. For each remaining `.fsm` file, calls `verifyFSMSnapshotFile` and removes files where
+   `ErrFSMSnapshotFileCRC` is returned (corrupt files cannot be used for restore).
+
+This index-based orphan detection is stricter than a CRC-only check: a file with a valid
+CRC but no matching token is still an orphan and must be removed.
 
 ---
 
 ## File Retention Policy
 
+### Coordinated Purge
+
+Snap files and FSM files **must always be purged together** in a single function.
+Calling them independently risks deleting a `.fsm` file while its token `.snap` still
+exists, which makes the node unrecoverable if the WAL has already been compacted.
+
+```go
+// purgeOldSnapshotFiles removes old snap and fsm files in tandem, always deleting
+// the snap file BEFORE its corresponding fsm file. This ordering guarantees that
+// no live token can ever reference a deleted fsm file.
+func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
+    // 1. List all snap files sorted oldest-first.
+    // 2. Keep the newest defaultMaxSnapFiles (3); mark the rest for deletion.
+    // 3. For each file to delete:
+    //    a. os.Remove(snapFile)      ← snap first
+    //    b. os.Remove(fsmFile)       ← fsm second
+    //    A crash between a and b leaves a .fsm with no token: treated as orphan on
+    //    next startup and removed by cleanupStaleFSMSnaps.
+    // 4. syncDir(snapDir) and syncDir(fsmSnapDir).
+}
 ```
-purgeOldFSMSnapFiles(fsmSnapDir):
-  - Retain the same count as snap files: defaultMaxSnapFiles = 3
-  - Match .fsm files to snap files by index; delete in tandem
-  - Always delete the snap file before its corresponding .fsm file
-    (reverse order risks leaving a token that points to a deleted file)
-```
+
+`purgeOldSnapshotFiles` is the **only** call site for deleting either type of file.
+The existing `purgeOldSnapFiles` function is removed and replaced entirely.
 
 ---
 
@@ -460,6 +566,11 @@ func isSnapshotToken(data []byte) bool {
 - The next snapshot creation writes a new-format `.fsm` file with CRC
 - No manual migration step is required
 
+**Orphan `.fsm` files during upgrade rollback:**
+If a node begins writing `.fsm` files and then rolls back to the previous binary, the
+`.fsm` files have no corresponding token in the legacy `.snap` files.
+`cleanupStaleFSMSnaps` removes them by walking live tokens, so rollback is safe.
+
 **When a follower receives a legacy-format MsgSnap:**
 - `isSnapshotToken` returns false → restore via `bytes.NewReader` (no CRC check)
 - Compatible with rolling upgrades where not all nodes have been updated yet
@@ -473,6 +584,9 @@ func isSnapshotToken(data []byte) bool {
 - **Peak memory**: spikes caused by snapshot creation drop to near zero
 - **Resident memory**: `MemoryStorage` snapshot footprint reduced to 17 bytes
 - **I/O**: eliminates the spool → Bytes → SaveSnap double-write; total disk I/O decreases
+- **Single-pass restore**: `io.TeeReader` combines CRC verification and FSM restore into
+  one sequential scan, eliminating the double-read present in a naive verify-then-restore
+  design
 - **gRPC send**: existing `sendSnapshotReaderChunks` accepts `io.Reader` as-is
 - **No upstream dependency**: no changes to etcd-raft protobuf or library code
 
@@ -480,9 +594,12 @@ func isSnapshotToken(data []byte) bool {
 
 | Risk | Mitigation |
 |------|-----------|
-| `.fsm` and snap file inconsistency | `persist.SaveSnap` is called only after successful rename; ordering is strict |
-| Disk space increase | `.fsm` files are roughly the same size as the former `.snap` payloads; net usage is unchanged |
-| Increased code complexity | `isSnapshotToken` branch is small; legacy path is preserved intact |
+| `.fsm` and snap file inconsistency | `persist.SaveSnap` only after `syncDir`; single `purgeOldSnapshotFiles` function enforces deletion ordering |
+| Stale local snapshot overwriting newer follower state | `storageIndex` captured before `fsm.Snapshot()`; `persistLocalSnapshotPayload` staleness guard uses the same baseline |
+| Concurrent follower receive for same index | `singleflight.Group` keyed on index in `receiveSnapshotStream` |
+| TOCTOU between verify and restore | `openAndRestoreFSMSnapshot` holds a single fd across the entire verify+restore operation |
+| `Metadata.Index` diverging from `.fsm` content in config snapshots | `persistConfigSnapshot` migrated in Phase 1; FSM snapshot taken with the same index used as the file name and token |
+| Disk space increase | `.fsm` files are the same size as the former `.snap` payloads; net usage unchanged |
 | CRC false negatives | CRC32C has a 1-in-2³² collision rate; adequate for accidental corruption detection |
 
 ---
@@ -491,35 +608,96 @@ func isSnapshotToken(data []byte) bool {
 
 ### Phase 1: Local Snapshot Disk Offload
 
-Scope: local creation and local restore only. Follower send/receive is unchanged.
+Scope: local creation and local restore for **all three snapshot paths** (periodic,
+config-change, and bootstrap). Follower send/receive is unchanged.
+
+**Implementation tasks:**
 
 - Create `fsm_snapshot_file.go`:
-  - `crc32CWriter` (streaming CRC computation)
-  - `writeFSMSnapshotFile` (write with CRC footer)
-  - `verifyFSMSnapshotFile` (CRC verification)
-  - `newCRC32CStripFooterReader` (expose payload without footer)
-  - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token including CRC)
-- Update `persistLocalSnapshot` to use `writeFSMSnapshotFile` + token
-- Update `restoreSnapshotState` to handle token format with CRC verification
+  - `crc32CWriter` (streaming CRC writer)
+  - `writeFSMSnapshotFile` (write with CRC footer + syncDir)
+  - `openAndRestoreFSMSnapshot` (single-pass verify+restore via TeeReader)
+  - `verifyFSMSnapshotFile` (read-only CRC check for orphan detection)
+  - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token with CRC)
+  - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`, etc.
+- Update `persistLocalSnapshot` → `writeFSMSnapshotFile` + token
+- Update `persistConfigSnapshot` / `persistConfigSnapshotPayload` → same
+- Update `stateMachineSnapshotBytes` (bootstrap) → `writeFSMSnapshotFile` + token
+- Update `restoreSnapshotState` → `openAndRestoreFSMSnapshot`
+- Replace `purgeOldSnapFiles` with `purgeOldSnapshotFiles(snapDir, fsmSnapDir)`
+- Add `cleanupStaleFSMSnaps(snapDir, fsmSnapDir)` (index-based orphan removal)
+- Capture `storageIndex` before `fsm.Snapshot()` in `maybePersistLocalSnapshot`
 - All existing tests must continue to pass
 
-**Effect**: eliminates memory spikes during local snapshot creation; reduces `MemoryStorage` resident memory
+**Effect**: eliminates memory spikes during local snapshot creation; reduces
+`MemoryStorage` resident memory; all snapshot creation paths are consistent.
 
 ### Phase 2: Streaming Follower Send/Receive
 
 Scope: update `GRPCTransport` MsgSnap paths to use file streaming.
 
-- `Dispatch`: detect token → open file → `sendSnapshotFileChunks`
-- `receiveSnapshotStream`: write chunks to temp file → verify CRC → atomic rename
+**Implementation tasks:**
+
+- `Dispatch`: detect token → open `.fsm` file → `sendSnapshotFileChunks`
+- `receiveSnapshotStream`:
+  - Write chunks to temp file (with `bufio.NewWriterSize`)
+  - `verifyFSMSnapshotFile` on tmp before rename
+  - `syncDir(fsmSnapDir)` after rename
+  - `singleflight.Group` keyed on index to serialize concurrent receives
+- `applyReadySnapshot`: use `openAndRestoreFSMSnapshot` (no extra verify call)
 - Test legacy-format compatibility paths
 
-**Effect**: eliminates memory spikes during large snapshot transfers to followers
+**Effect**: eliminates memory spikes during large snapshot transfers to followers;
+removes three-read-pass anti-pattern on the receive side.
 
 ### Phase 3: Cleanup
 
 - Remove `snapshotBytesAndClose`, `snapshotBytes`, and `snapshotSpool`
+- Remove standalone `purgeOldSnapFiles` (replaced by `purgeOldSnapshotFiles`)
 - Resolve `maxSnapshotPayloadBytes`
 - Update documentation
+
+---
+
+## Required Tests
+
+### P0 — Must have before Phase 1 merge
+
+| Test | What it verifies |
+|------|-----------------|
+| `TestTokenRoundTrip` | `encodeSnapshotToken` / `decodeSnapshotToken` round-trip for boundary values (`0`, `MaxUint64`, `MaxUint32`) |
+| `TestTokenMagicRejection` | `isSnapshotToken` returns false for non-`EKVR` prefixes; `decodeSnapshotToken` returns `ErrFSMSnapshotTokenInvalid` for lengths 0–16 and wrong magic |
+| `TestCRCWriterMatchesStdlib` | `crc32CWriter.Sum32()` matches `crc32.Checksum` for identical bytes; incremental writes accumulate correctly |
+| `TestOpenAndRestoreFSMSnapshotGoodFile` | Correct file restores FSM state without error |
+| `TestOpenAndRestoreFSMSnapshotBadFooter` | Footer byte flipped → `ErrFSMSnapshotFileCRC` |
+| `TestOpenAndRestoreFSMSnapshotTokenMismatch` | File footer ok, wrong `tokenCRC` → `ErrFSMSnapshotTokenCRC` |
+| `TestOpenAndRestoreFSMSnapshotTooSmall` | File shorter than 4 bytes → `ErrFSMSnapshotTooSmall` |
+| `TestStripFooterReaderBoundary` | `io.TeeReader` with `LimitReader(size-4)` exposes exactly the payload; footer bytes not passed to FSM |
+| `TestCrashAfterTmpBeforeRename` | A leftover `*.fsm.tmp` is deleted by `cleanupStaleFSMSnaps`; no `.fsm` is promoted |
+| `TestSnapSavedOnlyAfterRename` | `WriteTo` error → no `.snap` token written, no `.fsm` final file committed |
+| `TestPurgeOldSnapshotFilesOrdering` | `purgeOldSnapshotFiles` always removes `.snap` before `.fsm`; verified by intercepting `os.Remove` calls |
+| `TestCleanupStaleFSMSnapsIndexBased` | Orphan `.fsm` with no matching live token is removed even when its CRC is valid |
+
+### P1 — High value, ship in Phase 2 or immediately after
+
+| Test | What it verifies |
+|------|-----------------|
+| `TestReceiveTruncatedFile` | Stream ending mid-file → `ErrFSMSnapshotFileCRC`; no `.fsm` committed |
+| `TestReceiveWrongCRCInFooter` | Correct length, corrupted footer → verify rejects before rename |
+| `TestReceiveTokenCRCMismatchesFileCRC` | Token carries wrong CRC, file footer is self-consistent → `ErrFSMSnapshotTokenCRC` in `openAndRestoreFSMSnapshot` |
+| `TestConcurrentReceiveSameIndex` | Two goroutines receiving the same index via `singleflight`; only one `.fsm` committed; no torn file |
+| `TestLegacyFormatFallbackOnRestore` | `snap.Data` without `EKVR` prefix → `bytes.NewReader` path; no `.fsm` file opened |
+| `TestLegacyFormatFallbackOnSend` | Non-token `MsgSnap` → old `sendSnapshot` path; no file opened from `fsmSnapDir` |
+| `TestSyncDirCalledAfterRename` | Both `writeFSMSnapshotFile` and `receiveSnapshotStream` call `syncDir` after rename (verified via mock or filesystem hook) |
+| Conformance `SnapshotRestoreAfterRestart` | Propose 10,001 entries, close engine, reopen; assert FSM state recovered from `.fsm` snapshot (not WAL replay) |
+
+### P2 — Nice to have
+
+| Test | What it verifies |
+|------|-----------------|
+| `FuzzTokenEncodeDecode` | `decodeSnapshotToken` never panics on arbitrary 17-byte input; round-trips for valid tokens |
+| `FuzzOpenAndRestoreFSMSnapshot` | Arbitrary file content → only typed errors returned, never panics |
+| `TestConcurrentSnapshotAndEngineClose` | Snapshot worker crash on engine close leaves no torn file |
 
 ---
 
