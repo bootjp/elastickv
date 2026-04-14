@@ -2558,90 +2558,94 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 	return values, elems, nil
 }
 
-// resolveListPopMeta returns the list metadata for a pop operation.
-// Returns (meta, true, nil) when the list exists and is non-empty,
-// (zero, false, nil) when the key does not exist or the list is empty,
-// and (zero, false, err) on error (including wrong-type error).
-func (r *RedisServer) resolveListPopMeta(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
+// checkListKeyType verifies the key is a list. Returns (keyFound, error).
+// Writes wrongTypeError if the key exists but is not a list.
+func (r *RedisServer) checkListKeyType(ctx context.Context, key []byte, readTS uint64) (found bool, err error) {
 	typ, typErr := r.keyTypeAt(ctx, key, readTS)
 	if typErr != nil {
-		return store.ListMeta{}, false, typErr
+		return false, typErr
 	}
 	if typ == redisTypeNone {
-		return store.ListMeta{}, false, nil
+		return false, nil
 	}
 	if typ != redisTypeList {
-		return store.ListMeta{}, false, wrongTypeError()
+		return false, wrongTypeError()
 	}
+	return true, nil
+}
+
+// listPopClaimOnce executes one attempt of a pop-with-claim transaction.
+// Returns (nil, nil) for a missing key, ([]string{}, nil) for an empty list,
+// and the popped values otherwise.
+func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count int, left bool, readTS uint64) ([]string, error) {
+	found, typeErr := r.checkListKeyType(ctx, key, readTS)
+	if typeErr != nil || !found {
+		return nil, typeErr
+	}
+
 	meta, exists, metaErr := r.resolveListMeta(ctx, key, readTS)
 	if metaErr != nil {
-		return store.ListMeta{}, false, metaErr
+		return nil, metaErr
 	}
 	if !exists || meta.Len == 0 {
-		return store.ListMeta{}, false, nil
+		return []string{}, nil
 	}
-	return meta, true, nil
+
+	n := int64(count)
+	if n > meta.Len {
+		n = meta.Len
+	}
+
+	values, elems, buildErr := r.buildListPopElems(ctx, key, meta, n, left, readTS)
+	if buildErr != nil {
+		return nil, buildErr
+	}
+
+	// n is the number of sequence positions claimed (including any holes).
+	// HeadDelta and LenDelta must use n, not len(values), so that Head
+	// advances past holes and the metadata stays consistent with Tail.
+	commitTS := r.coordinator.Clock().Next()
+	var headDelta int64
+	if left {
+		headDelta = n // head advances by n positions for LPOP
+	}
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: headDelta, LenDelta: -n})
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ListMetaDeltaKey(key, commitTS, 0),
+		Value: delta,
+	})
+
+	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	if dispErr != nil {
+		return nil, errors.WithStack(dispErr)
+	}
+	return values, nil
 }
 
 func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, left bool) ([]string, error) {
+	// count=0: Redis returns an empty array if the key exists as a list, nil otherwise.
 	if count <= 0 {
-		return nil, nil
+		readTS := r.readTS()
+		found, err := r.checkListKeyType(ctx, key, readTS)
+		if err != nil || !found {
+			return nil, err
+		}
+		return []string{}, nil
 	}
 
 	var popped []string
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		meta, ok, metaErr := r.resolveListPopMeta(ctx, key, readTS)
-		if metaErr != nil {
-			return metaErr
+		result, popErr := r.listPopClaimOnce(ctx, key, count, left, r.readTS())
+		if popErr != nil {
+			return popErr
 		}
-		if !ok {
-			popped = nil
-			return nil
-		}
-
-		n := int64(count)
-		if n > meta.Len {
-			n = meta.Len
-		}
-
-		values, elems, buildErr := r.buildListPopElems(ctx, key, meta, n, left, readTS)
-		if buildErr != nil {
-			return buildErr
-		}
-
-		// n is the number of sequence positions claimed (including any holes).
-		// HeadDelta and LenDelta must use n, not len(values), so that Head
-		// advances past holes and the metadata stays consistent with Tail.
-		// The transaction must proceed even when len(values)==0 so that
-		// Head is updated past the hole and future pops are not stuck.
-		if len(elems) == 0 {
-			popped = nil
-			return nil
-		}
-
-		commitTS := r.coordinator.Clock().Next()
-		var headDelta int64
-		if left {
-			headDelta = n // head advances by n positions for LPOP
-		}
-		delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: headDelta, LenDelta: -n})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.ListMetaDeltaKey(key, commitTS, 0),
-			Value: delta,
-		})
-
-		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
-			CommitTS: commitTS,
-			Elems:    elems,
-		})
-		if dispErr != nil {
-			return errors.WithStack(dispErr)
-		}
-		popped = values
+		popped = result
 		return nil
 	})
 	return popped, err
