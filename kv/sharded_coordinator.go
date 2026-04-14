@@ -211,25 +211,19 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, err
 	}
 
-	if len(gids) == 1 {
-		// Only use the single-shard (one-phase) path when every read key also
-		// belongs to the same shard as the mutations. If any read key belongs
-		// to a different shard, the 2PC path must be used so that
-		// validateReadOnlyShards validates those shards via a linearizable
-		// read barrier, preserving SSI.
-		canOptimize := true
-		for _, rk := range readKeys {
-			if c.engineGroupIDForKey(rk) != gids[0] {
-				canOptimize = false
-				break
-			}
-		}
-		if canOptimize {
-			return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
-		}
+	if len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0]) {
+		// Fast path: all mutations and read keys are in a single shard.
+		// Use the one-phase path without allocating a grouped-read-keys map.
+		// If any read key belongs to a different shard the 2PC path is required
+		// so that validateReadOnlyShards can issue a linearizable read barrier,
+		// preserving SSI.
+		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
+	// Multi-shard path: group read keys by shard now. The result is passed
+	// directly to prewriteTxn to avoid a second iteration inside that function.
+	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +252,18 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint6
 	return commitTS, nil
 }
 
+// allReadKeysInShard returns true when every key in readKeys belongs to gid.
+// It performs a single O(n) pass without allocating a map, making it suitable
+// for the single-shard fast path in dispatchTxn.
+func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) bool {
+	for _, rk := range readKeys {
+		if c.engineGroupIDForKey(rk) != gid {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
@@ -282,11 +288,9 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
-
-	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
 
 	for _, gid := range gids {
 		g, err := c.txnGroupForID(gid)
