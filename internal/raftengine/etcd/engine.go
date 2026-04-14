@@ -340,6 +340,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
+	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
 	e.startDispatchWorkers()
 }
@@ -1198,21 +1199,21 @@ func applyUpdatedPeerToMap(peers map[uint64]Peer, peer Peer, ok bool) {
 }
 
 func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
+	// Fast path (lock-free): avoid unnecessary FSM snapshot when config is already current.
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
 	} else if upToDate {
 		return nil
 	}
 
-	// Phase 4 keeps config-snapshot publication synchronous so the conf change
-	// is not considered durable before the updated snapshot metadata can be sent
-	// to a freshly added voter. Before broad rollout, this should move to a
-	// background path that preserves the same ordering guarantee.
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
 	payload, err := e.snapshotPayload(index)
 	if err != nil {
 		return err
 	}
-	return e.persistConfigSnapshotPayload(index, confState, payload)
+	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
 }
 
 func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {
@@ -1255,16 +1256,6 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 	return nil
 }
 
-func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.ConfState, payload []byte) error {
-	// Keep disk publication serialized with snapshot restores. If a newer
-	// follower snapshot restored concurrently while an older config snapshot was
-	// still being written to disk, a restart could regress to the stale payload.
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
-	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
-}
-
 func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raftpb.ConfState, payload []byte) error {
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
@@ -1280,6 +1271,14 @@ func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raft
 		return err
 	}
 	return nil
+}
+
+// readFSMPayloadLocked reads the FSM snapshot payload for the given index while
+// holding snapshotMu, preventing concurrent purge from removing the file.
+func (e *Engine) readFSMPayloadLocked(index uint64) ([]byte, error) {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return readFSMSnapshotPayload(fsmSnapPath(e.fsmSnapDir, index))
 }
 
 // snapshotPayload takes a FSM snapshot for the given index, writes it to the

@@ -365,3 +365,115 @@ func TestParseSnapFileIndex(t *testing.T) {
 	require.Equal(t, uint64(0), parseSnapFileIndex("badname.snap"))
 	require.Equal(t, uint64(0), parseSnapFileIndex("nohyphen.snap"))
 }
+
+// --- readFSMSnapshotPayload tests ---
+
+func TestReadFSMSnapshotPayloadGoodFile(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("read payload test data here")
+	crc, path := writeFSMFileForTest(t, dir, 5, payload)
+	require.NotZero(t, crc)
+
+	got, err := readFSMSnapshotPayload(path)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestReadFSMSnapshotPayloadBadCRC(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("good payload data")
+	_, path := writeFSMFileForTest(t, dir, 6, payload)
+
+	// Corrupt the first byte of the payload.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	_, err = f.Write([]byte{0xFF})
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, err = readFSMSnapshotPayload(path)
+	require.ErrorIs(t, err, ErrFSMSnapshotFileCRC)
+}
+
+func TestReadFSMSnapshotPayloadTooSmall(t *testing.T) {
+	dir := t.TempDir()
+	path := fsmSnapPath(dir, 7)
+	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03, 0x04}, 0o600))
+
+	_, err := readFSMSnapshotPayload(path)
+	require.ErrorIs(t, err, ErrFSMSnapshotTooSmall)
+}
+
+func TestReadFSMSnapshotPayloadFileNotFound(t *testing.T) {
+	_, err := readFSMSnapshotPayload("/nonexistent/path/snapshot.fsm")
+	require.Error(t, err)
+}
+
+// --- verifyFSMSnapshotFile tests ---
+
+func TestVerifyFSMSnapshotFileGood(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("verify test payload data")
+	crc, path := writeFSMFileForTest(t, dir, 10, payload)
+
+	// tokenCRC=0 skips token comparison (startup orphan check mode).
+	require.NoError(t, verifyFSMSnapshotFile(path, 0))
+	// tokenCRC matching the footer: full verification.
+	require.NoError(t, verifyFSMSnapshotFile(path, crc))
+}
+
+func TestVerifyFSMSnapshotFileTokenMismatch(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("verify token mismatch payload")
+	crc, path := writeFSMFileForTest(t, dir, 11, payload)
+
+	wrongCRC := crc ^ 0xFFFFFFFF
+	err := verifyFSMSnapshotFile(path, wrongCRC)
+	require.ErrorIs(t, err, ErrFSMSnapshotTokenCRC)
+}
+
+func TestVerifyFSMSnapshotFileBadFooter(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("verify bad footer payload data")
+	_, path := writeFSMFileForTest(t, dir, 12, payload)
+
+	// Corrupt one byte of the payload so the computed CRC differs from the footer.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	_, err = f.Write([]byte{0xFF})
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	err = verifyFSMSnapshotFile(path, 0)
+	require.ErrorIs(t, err, ErrFSMSnapshotFileCRC)
+}
+
+func TestVerifyFSMSnapshotFileTooSmall(t *testing.T) {
+	dir := t.TempDir()
+	path := fsmSnapPath(dir, 13)
+	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02}, 0o600))
+
+	err := verifyFSMSnapshotFile(path, 0)
+	require.ErrorIs(t, err, ErrFSMSnapshotTooSmall)
+}
+
+func TestVerifyFSMSnapshotFileNotFound(t *testing.T) {
+	err := verifyFSMSnapshotFile("/nonexistent/path/42.fsm", 0)
+	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
+}
+
+func TestWriteFSMSnapshotFileEmptyPayload(t *testing.T) {
+	dir := t.TempDir()
+	// An empty snapshot writes only the 4-byte CRC footer.
+	snap := &testSnapshot{data: []byte{}}
+
+	crc, err := writeFSMSnapshotFile(snap, dir, 200)
+	require.NoError(t, err)
+	// Empty payload: crc32c("") == 0x00000000, which is a valid (zero) checksum.
+	_ = crc // zero is allowed for empty input
+
+	path := fsmSnapPath(dir, 200)
+	info, statErr := os.Stat(path)
+	require.NoError(t, statErr)
+	require.Equal(t, int64(4), info.Size()) // only the footer
+}

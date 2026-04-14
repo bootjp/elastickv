@@ -45,6 +45,7 @@ type GRPCTransport struct {
 	snapshotChunkSize int
 	spoolDir          string
 	fsmSnapDir        string
+	readFSMPayload    func(index uint64) ([]byte, error)
 	dialGroup         singleflight.Group
 }
 
@@ -102,6 +103,15 @@ func (t *GRPCTransport) SetFSMSnapDir(dir string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.fsmSnapDir = dir
+}
+
+func (t *GRPCTransport) SetFSMPayloadReader(fn func(index uint64) ([]byte, error)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.readFSMPayload = fn
 }
 
 func (t *GRPCTransport) UpsertPeer(peer Peer) {
@@ -199,9 +209,9 @@ func (t *GRPCTransport) applyBridgeMode(msg raftpb.Message) (raftpb.Message, err
 		return msg, nil
 	}
 	t.mu.RLock()
-	fsmSnapDir := t.fsmSnapDir
+	readFn := t.readFSMPayload
 	t.mu.RUnlock()
-	if fsmSnapDir == "" {
+	if readFn == nil {
 		return msg, nil
 	}
 
@@ -209,7 +219,7 @@ func (t *GRPCTransport) applyBridgeMode(msg raftpb.Message) (raftpb.Message, err
 	if err != nil {
 		return msg, errors.WithStack(err)
 	}
-	payload, err := readFSMSnapshotPayload(fsmSnapPath(fsmSnapDir, tok.Index))
+	payload, err := readFn(tok.Index)
 	if err != nil {
 		return msg, errors.WithStack(err)
 	}

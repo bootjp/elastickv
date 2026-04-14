@@ -32,6 +32,9 @@ const (
 
 	// fsmRestoreReadAhead is the bufio read-ahead size used when restoring .fsm files.
 	fsmRestoreReadAhead = 1 << 20 // 1 MiB
+
+	// fsmWriteBufSize is the bufio.Writer buffer size used when writing .fsm files.
+	fsmWriteBufSize = 1 << 20 // 1 MiB
 )
 
 var (
@@ -182,20 +185,9 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 		}
 	}()
 
-	crcWriter := newCRC32CWriter(tmpFile)
-	if _, err := snapshot.WriteTo(crcWriter); err != nil {
-		return 0, errors.WithStack(err)
-	}
-
-	checksum := crcWriter.Sum32()
-	if err := binary.Write(tmpFile, binary.BigEndian, checksum); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return 0, errors.WithStack(err)
+	checksum, err := writeFSMSnapshotPayload(snapshot, tmpFile)
+	if err != nil {
+		return 0, err
 	}
 	committed = true
 
@@ -207,6 +199,32 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 		return 0, errors.WithStack(err)
 	}
 
+	return checksum, nil
+}
+
+// writeFSMSnapshotPayload streams the snapshot into f, appends the CRC32C
+// footer, flushes the bufio buffer, and syncs+closes the file. On success the
+// file handle is closed and the caller must not use it again.
+func writeFSMSnapshotPayload(snapshot Snapshot, f *os.File) (uint32, error) {
+	bw := bufio.NewWriterSize(f, fsmWriteBufSize)
+	crcWriter := newCRC32CWriter(bw)
+	if _, err := snapshot.WriteTo(crcWriter); err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	checksum := crcWriter.Sum32()
+	if err := binary.Write(bw, binary.BigEndian, checksum); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := bw.Flush(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := f.Sync(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if err := f.Close(); err != nil {
+		return 0, errors.WithStack(err)
+	}
 	return checksum, nil
 }
 

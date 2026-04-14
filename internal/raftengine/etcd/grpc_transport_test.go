@@ -228,3 +228,68 @@ func (*testSendSnapshotServer) SendMsg(any) error {
 func (*testSendSnapshotServer) RecvMsg(any) error {
 	return nil
 }
+
+// --- applyBridgeMode tests ---
+
+func TestApplyBridgeModePassesNonTokenUnchanged(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	// Non-token payload must pass through unchanged.
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: []byte("legacy full payload")},
+	}
+	patched, err := transport.applyBridgeMode(msg)
+	require.NoError(t, err)
+	require.Equal(t, []byte("legacy full payload"), patched.Snapshot.Data)
+}
+
+func TestApplyBridgeModeNoReaderIsNoop(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	// A token with no readFSMPayload callback set → passthrough.
+	token := encodeSnapshotToken(42, 0xDEADBEEF)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: token},
+	}
+	patched, err := transport.applyBridgeMode(msg)
+	require.NoError(t, err)
+	require.Equal(t, token, patched.Snapshot.Data)
+}
+
+func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	payload := []byte("bridge mode payload data 12345")
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 42, payload)
+
+	transport := NewGRPCTransport(nil)
+	transport.SetFSMPayloadReader(func(index uint64) ([]byte, error) {
+		return readFSMSnapshotPayload(fsmSnapPath(fsmSnapDir, index))
+	})
+
+	token := encodeSnapshotToken(42, crc)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{
+			Data:     token,
+			Metadata: raftpb.SnapshotMetadata{Index: 42},
+		},
+	}
+	patched, err := transport.applyBridgeMode(msg)
+	require.NoError(t, err)
+	require.Equal(t, payload, patched.Snapshot.Data)
+	// Metadata must be preserved.
+	require.Equal(t, uint64(42), patched.Snapshot.Metadata.Index)
+}
+
+func TestApplyBridgeModeReaderError(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+	transport.SetFSMPayloadReader(func(_ uint64) ([]byte, error) {
+		return nil, ErrFSMSnapshotNotFound
+	})
+
+	token := encodeSnapshotToken(99, 0xABCD)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: token},
+	}
+	_, err := transport.applyBridgeMode(msg)
+	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
+}
