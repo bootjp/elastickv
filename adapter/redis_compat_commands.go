@@ -839,6 +839,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return err
 		}
 
+		startTS := ensureValidStartTS(readTS, r.coordinator.Clock())
 		commitTS := r.coordinator.Clock().Next()
 		elems := make([]*kv.Elem[kv.OP], 0, len(members)+setWideColOverhead)
 
@@ -882,7 +883,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
@@ -1166,6 +1167,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 			return wrongTypeError()
 		}
 
+		startTS := ensureValidStartTS(readTS, r.coordinator.Clock())
 		commitTS := r.coordinator.Clock().Next()
 		elems := make([]*kv.Elem[kv.OP], 0, len(args)/redisPairWidth+setWideColOverhead)
 
@@ -1199,7 +1201,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
@@ -1299,6 +1301,7 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 
 // hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTS uint64) (int, error) {
+	startTS := ensureValidStartTS(readTS, r.coordinator.Clock())
 	commitTS := r.coordinator.Clock().Next()
 	elems := make([]*kv.Elem[kv.OP], 0, len(fields)+1)
 	removed := 0
@@ -1324,7 +1327,7 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	})
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -1532,7 +1535,7 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
-func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, startTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
 	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
@@ -1552,7 +1555,7 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -1569,6 +1572,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 		return 0, wrongTypeError()
 	}
 
+	startTS := ensureValidStartTS(readTS, r.coordinator.Clock())
 	commitTS := r.coordinator.Clock().Next()
 	fieldKey := store.HashFieldKey(key, field)
 
@@ -1579,7 +1583,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 
 	// If a legacy blob exists, migrate it atomically with the increment.
 	if len(legacyValue) > 0 {
-		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, increment)
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, startTS, commitTS, current, isNewField, increment)
 	}
 
 	current += increment
@@ -1596,7 +1600,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})

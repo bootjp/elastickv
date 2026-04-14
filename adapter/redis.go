@@ -2377,7 +2377,11 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 			return err
 		}
 
-		// Pre-allocate commitTS so we can embed it in the Delta key.
+		// Pre-allocate startTS and commitTS so the commitTS can be embedded
+		// in the Delta key and the coordinator will not regenerate it.
+		// ensureValidStartTS guarantees startTS > 0 so the coordinator keeps
+		// the caller-provided commitTS instead of assigning a new one.
+		startTS := ensureValidStartTS(readTS, r.coordinator.Clock())
 		commitTS := r.coordinator.Clock().Next()
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
@@ -2391,7 +2395,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		// Dispatch with the pre-allocated commitTS.
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    ops,
 		})

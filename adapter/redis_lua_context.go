@@ -2431,7 +2431,11 @@ func (c *luaScriptContext) commit() error {
 	}
 	sort.Strings(keys)
 
-	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
+	// Pre-allocate startTS and commitTS so the commitTS can be embedded in
+	// Delta key bytes before dispatch, and the coordinator will not clear it.
+	// ensureValidStartTS guarantees startTS > 0 so the coordinator keeps the
+	// caller-provided commitTS instead of assigning a new one.
+	startTS := ensureValidStartTS(c.startTS, c.server.coordinator.Clock())
 	commitTS := c.server.coordinator.Clock().Next()
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
@@ -2449,10 +2453,6 @@ func (c *luaScriptContext) commit() error {
 	}
 	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
-	startTS := c.startTS
-	if startTS == ^uint64(0) {
-		startTS = 0
-	}
 	_, err := c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,

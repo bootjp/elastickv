@@ -55,6 +55,20 @@ func normalizeStartTS(ts uint64) uint64 {
 	return ts
 }
 
+// ensureValidStartTS returns a non-zero start timestamp suitable for Dispatch
+// when a pre-allocated commitTS will be embedded into delta keys. If the
+// snapshot readTS is the uninitialised sentinel (^uint64(0)), normalizeStartTS
+// returns 0, which causes the coordinator to clear the caller-provided
+// commitTS and generate a new one — making the embedded timestamp wrong.
+// Obtaining a fresh startTS from the clock before allocating commitTS ensures
+// startTS > 0 so the coordinator keeps commitTS as-is.
+func ensureValidStartTS(readTS uint64, clk interface{ Next() uint64 }) uint64 {
+	if ts := normalizeStartTS(readTS); ts != 0 {
+		return ts
+	}
+	return clk.Next()
+}
+
 // detectWideColumnType checks for the presence of wide-column hash or set keys
 // and returns the corresponding redis type, or redisTypeNone if neither is found.
 func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
@@ -365,13 +379,14 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	if len(fieldKVs) > maxWideColumnItems {
 		return nil, errors.Wrapf(ErrCollectionTooLarge, "collection exceeds %d fields/members", maxWideColumnItems)
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs))
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs)+setWideColOverhead)
 	for _, pair := range fieldKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
-	if len(fieldKVs) == 0 {
-		return elems, nil
-	}
+	// Always delete the meta key and delta keys even when fieldKVs is empty:
+	// a collection can have zero field/member keys but still hold a base meta
+	// key and uncompacted delta keys (e.g. after all members were removed via
+	// HDEL/SREM). Skipping these would leak internal state.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
 	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
