@@ -366,6 +366,9 @@ receiveSnapshotStream()
 ```
 receiveSnapshotStream()
   → receive header chunk → parse token → extract index, tokenCRC
+  → validate token.Index == snap.Metadata.Index
+    # a mismatch indicates a misrouted or corrupted snapshot; return
+    # ErrFSMSnapshotIndexMismatch immediately before writing any data
   → result, err := snapReceiveGroup.Do(strconv.FormatUint(index, 10), func() {
         → os.CreateTemp() → {fsmSnapDir}/{index}.fsm.tmp
         → stream remaining chunks to tmpFile (with bufio.NewWriterSize)
@@ -531,11 +534,16 @@ The receiver path (`receiveSnapshotStream`) follows the same sequence and also c
 3. Removes any `.fsm` file whose index does not correspond to a live token — this handles
    the case where a `.fsm` was written but the corresponding `.snap` was never saved
    (upgrade crash), as well as files left over after purge ordering bugs in older versions.
-4. For each remaining `.fsm` file, calls `verifyFSMSnapshotFile` and removes files where
-   `ErrFSMSnapshotFileCRC` is returned (corrupt files cannot be used for restore).
 
-This index-based orphan detection is stricter than a CRC-only check: a file with a valid
-CRC but no matching token is still an orphan and must be removed.
+CRC integrity of the retained `.fsm` files is **not** verified at startup. For GiB-scale
+snapshots on slow storage, a full read-pass over every `.fsm` file would unacceptably
+delay engine recovery. Instead, CRC verification happens lazily in
+`openAndRestoreFSMSnapshot` at the moment the snapshot is actually applied. If a file is
+corrupt, the engine detects it at restore time and can request a fresh snapshot from the
+leader.
+
+This index-based orphan detection is stricter than a CRC-only startup scan: a file with
+a valid CRC but no matching token is still an orphan and must be removed.
 
 ---
 
@@ -621,13 +629,37 @@ ambiguity when a mixed-version cluster is operating.
 The third case — a new-format leader sending a token to a legacy follower — is the only
 dangerous scenario. To prevent it, the rollout must proceed as follows:
 
-1. **Deploy Phase 1 to all nodes before Phase 2.** Phase 1 changes only local snapshot
-   creation and restore; it does not change what is sent over the wire. A Phase 1 node
-   still sends full `[]byte` payloads in `MsgSnap` and can receive them. Mixed Phase 1 /
-   legacy clusters are safe.
+1. **Deploy Phase 1 to all nodes before Phase 2.** Phase 1 stores a 17-byte token in
+   `MemoryStorage` instead of the full FSM payload. This means a Phase 1 leader **would**
+   send a token in `MsgSnap` to a lagging follower, which a legacy follower cannot
+   understand. To remain backward-compatible, Phase 1 **must** therefore also include a
+   `Dispatch`-side fallback that reconstructs a full-payload `MsgSnap` when using the
+   legacy send path:
 
-2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Once
-   any node begins sending token-format `MsgSnap`, all receivers must be at Phase 2.
+   ```go
+   // Phase 1 Dispatch fallback: token is in MemoryStorage but receiver may be legacy.
+   // Read the .fsm file back to bytes only when a slow follower actually needs a
+   // snapshot — not on every periodic creation — so peak memory is still improved.
+   if isSnapshotToken(msg.Snapshot.Data) {
+       tok, _ := decodeSnapshotToken(msg.Snapshot.Data)
+       path := filepath.Join(fsmSnapDir, strconv.FormatUint(tok.Index, 10)+".fsm")
+       payload, err := readFSMSnapshotPayload(path) // streams file, returns []byte
+       if err != nil {
+           return errors.WithStack(err)
+       }
+       msg.Snapshot.Data = payload // full bytes → safe for legacy receivers
+   }
+   // fall through to legacy sendSnapshot path
+   ```
+
+   With this fallback, mixed Phase 1 / legacy clusters are safe. The memory allocation
+   occurs only when a slow follower needs a snapshot send, not during periodic local
+   snapshot creation, so the worst-case spike is unchanged but the common-case (no
+   lagging followers) is fully eliminated.
+
+2. **Deploy Phase 2 to all nodes simultaneously, or use the feature flag below.** Phase 2
+   replaces the Phase 1 fallback with true file streaming; once any node begins sending
+   token-format `MsgSnap` without reconstructing, all receivers must be at Phase 2.
 
 3. **Feature flag (recommended)**: add a `DisableFSMSnapshotToken` config field (default
    `false`). When set to `true`, `Dispatch` falls back to the legacy `sendSnapshot` path
@@ -688,7 +720,8 @@ the fleet has been fully upgraded.
 ### Phase 1: Local Snapshot Disk Offload
 
 Scope: local creation and local restore for **all three snapshot paths** (periodic,
-config-change, and bootstrap). Follower send/receive is unchanged.
+config-change, and bootstrap) **plus** a `Dispatch`-side fallback for backward
+compatibility with legacy followers.
 
 **Implementation tasks:**
 
@@ -697,12 +730,17 @@ config-change, and bootstrap). Follower send/receive is unchanged.
   - `writeFSMSnapshotFile` (write with CRC footer + syncDir)
   - `openAndRestoreFSMSnapshot` (single-pass verify+restore via TeeReader)
   - `verifyFSMSnapshotFile` (read-only CRC check for orphan detection)
+  - `readFSMSnapshotPayload` (read `.fsm` file back to `[]byte` for legacy send)
   - `encodeSnapshotToken` / `decodeSnapshotToken` (17-byte token with CRC)
-  - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`, etc.
+  - Error types: `ErrFSMSnapshotFileCRC`, `ErrFSMSnapshotTokenCRC`,
+    `ErrFSMSnapshotIndexMismatch`, etc.
 - Update `persistLocalSnapshot` → `writeFSMSnapshotFile` + token
 - Update `persistConfigSnapshot`, `persistConfigState`, and `persistConfigSnapshotPayload` → same
 - Update `stateMachineSnapshotBytes` (bootstrap) → `writeFSMSnapshotFile` + token
 - Update `restoreSnapshotState` → `openAndRestoreFSMSnapshot`
+- Update `Dispatch`: if `isSnapshotToken(msg.Snapshot.Data)` and using the legacy send
+  path, call `readFSMSnapshotPayload` to reconstruct the full payload before sending
+  (ensures legacy followers receive a valid FSM byte stream)
 - Replace `purgeOldSnapFiles` with `purgeOldSnapshotFiles(snapDir, fsmSnapDir)`
 - Add `cleanupStaleFSMSnaps(snapDir, fsmSnapDir)` (index-based orphan removal)
 - Capture `storageIndex` before `fsm.Snapshot()` in `maybePersistLocalSnapshot`
@@ -710,14 +748,18 @@ config-change, and bootstrap). Follower send/receive is unchanged.
 
 **Effect**: eliminates memory spikes during local snapshot creation; reduces
 `MemoryStorage` resident memory; all snapshot creation paths are consistent.
+Mixed Phase 1 / legacy clusters remain safe because the Dispatch fallback reconstructs
+the full payload on demand (only when a slow follower actually needs a snapshot).
 
 ### Phase 2: Streaming Follower Send/Receive
 
-Scope: update `GRPCTransport` MsgSnap paths to use file streaming.
+Scope: update `GRPCTransport` MsgSnap paths to use file streaming; remove the
+Phase 1 `readFSMSnapshotPayload` fallback from `Dispatch`.
 
 **Implementation tasks:**
 
 - `Dispatch`: detect token → open `.fsm` file → `sendSnapshotFileChunks`
+  (replaces the Phase 1 `readFSMSnapshotPayload` fallback entirely)
 - `receiveSnapshotStream`:
   - Write chunks to temp file (with `bufio.NewWriterSize`)
   - `verifyFSMSnapshotFile` on tmp before rename
