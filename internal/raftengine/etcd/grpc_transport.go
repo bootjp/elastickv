@@ -44,6 +44,7 @@ type GRPCTransport struct {
 	handler           MessageHandler
 	snapshotChunkSize int
 	spoolDir          string
+	fsmSnapDir        string
 	dialGroup         singleflight.Group
 }
 
@@ -92,6 +93,15 @@ func (t *GRPCTransport) SetSpoolDir(dir string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.spoolDir = dir
+}
+
+func (t *GRPCTransport) SetFSMSnapDir(dir string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fsmSnapDir = dir
 }
 
 func (t *GRPCTransport) UpsertPeer(peer Peer) {
@@ -158,11 +168,59 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 	if t == nil {
 		return nil
 	}
-	if msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0) {
-		ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
-		defer cancel()
-		return t.sendSnapshot(ctx, msg)
+	if isSnapshotMsg(msg) {
+		return t.dispatchSnapshot(ctx, msg)
 	}
+	return t.dispatchRegular(ctx, msg)
+}
+
+func isSnapshotMsg(msg raftpb.Message) bool {
+	return msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0)
+}
+
+func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message) error {
+	ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
+	defer cancel()
+
+	patched, err := t.applyBridgeMode(msg)
+	if err != nil {
+		return err
+	}
+	return t.sendSnapshot(ctx, patched)
+}
+
+// applyBridgeMode implements the Phase 1 bridge: when MemoryStorage holds a
+// token, the .fsm file is read back into []byte so all receivers (including
+// legacy nodes that predate Phase 2) get a standard full-payload MsgSnap.
+// This allocation is transient — freed after the send — and only occurs when
+// a slow follower needs a snapshot, not on every periodic creation.
+func (t *GRPCTransport) applyBridgeMode(msg raftpb.Message) (raftpb.Message, error) {
+	if msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+		return msg, nil
+	}
+	t.mu.RLock()
+	fsmSnapDir := t.fsmSnapDir
+	t.mu.RUnlock()
+	if fsmSnapDir == "" {
+		return msg, nil
+	}
+
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	if err != nil {
+		return msg, errors.WithStack(err)
+	}
+	payload, err := readFSMSnapshotPayload(fsmSnapPath(fsmSnapDir, tok.Index))
+	if err != nil {
+		return msg, errors.WithStack(err)
+	}
+
+	snapCopy := *msg.Snapshot
+	snapCopy.Data = payload
+	msg.Snapshot = &snapCopy
+	return msg, nil
+}
+
+func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message) error {
 	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
 	defer cancel()
 
@@ -479,6 +537,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	t.mu.RLock()
 	spoolDir := t.spoolDir
 	t.mu.RUnlock()
+
 	spool, err := newSnapshotSpool(spoolDir)
 	if err != nil {
 		return raftpb.Message{}, err
