@@ -20,6 +20,10 @@ const (
 	// per collection type per compaction tick. It bounds per-tick I/O while
 	// still catching hot keys.
 	deltaCompactorTickScanLimit = 4096
+
+	// cursorNextByte is appended to the last-scanned key to produce an
+	// exclusive lower bound that skips past it on the next tick.
+	cursorNextByte = byte(0x00)
 )
 
 // DeltaCompactor folds accumulated delta keys into their corresponding base
@@ -35,6 +39,13 @@ type DeltaCompactor struct {
 	maxCount int
 	interval time.Duration
 	timeout  time.Duration
+	// cursors tracks the exclusive lower bound for the next scan of each
+	// collection type (keyed by collectionDeltaHandler.typeName). This allows
+	// each tick to resume where the previous one stopped, ensuring that keys
+	// later in the lexicographic range are eventually reached even when the
+	// prefix contains more than deltaCompactorTickScanLimit delta keys.
+	// A nil or missing cursor means "start from the beginning of the prefix".
+	cursors map[string][]byte
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -87,6 +98,7 @@ func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCo
 		maxCount: defaultDeltaCompactorMaxDeltaCount,
 		interval: defaultDeltaCompactorScanInterval,
 		timeout:  defaultDeltaCompactorTimeout,
+		cursors:  make(map[string][]byte),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -152,13 +164,38 @@ func (c *DeltaCompactor) allHandlers() []collectionDeltaHandler {
 	}
 }
 
+// scanDeltaPrefix scans the delta prefix for h starting from the stored
+// cursor position, updates the cursor for the next tick, and returns the
+// scanned KVPairs.
+func (c *DeltaCompactor) scanDeltaPrefix(ctx context.Context, h collectionDeltaHandler, readTS uint64) ([]*store.KVPair, error) {
+	// Build the effective start key: one byte past the cursor so we do not
+	// re-scan the key we stopped at last tick.
+	start := h.prefix
+	if cur := c.cursors[h.typeName]; len(cur) > 0 {
+		start = append(bytes.Clone(cur), cursorNextByte)
+	}
+
+	end := store.PrefixScanEnd(h.prefix)
+	kvs, err := c.st.ScanAt(ctx, start, end, deltaCompactorTickScanLimit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	// Advance or reset the cursor for the next tick.
+	if len(kvs) == deltaCompactorTickScanLimit {
+		c.cursors[h.typeName] = bytes.Clone(kvs[len(kvs)-1].Key)
+	} else {
+		delete(c.cursors, h.typeName)
+	}
+	return kvs, nil
+}
+
 // compactHandler scans the delta prefix for h, groups entries by userKey,
 // and compacts any key that has accumulated enough deltas.
 func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHandler, readTS uint64) error {
-	end := store.PrefixScanEnd(h.prefix)
-	kvs, err := c.st.ScanAt(ctx, h.prefix, end, deltaCompactorTickScanLimit, readTS)
+	kvs, err := c.scanDeltaPrefix(ctx, h, readTS)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	// Count deltas per userKey and collect their KVPairs.
