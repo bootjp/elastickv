@@ -123,6 +123,9 @@ func (c *Coordinate) nextStartTS() uint64 {
 }
 
 func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	primary := primaryKeyForElems(reqs)
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
@@ -230,6 +233,10 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 }
 
 var ErrInvalidRequest = errors.New("invalid request")
+
+// maxReadKeys caps the number of keys that may appear in a transaction's read
+// set. Exceeding this limit is rejected to prevent unbounded memory growth.
+const maxReadKeys = 10_000
 var ErrLeaderNotFound = errors.New("leader not found")
 
 func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {

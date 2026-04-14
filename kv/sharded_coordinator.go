@@ -209,7 +209,21 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	}
 
 	if len(gids) == 1 {
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		// Only use the single-shard (one-phase) path when every read key also
+		// belongs to the same shard as the mutations. If any read key belongs
+		// to a different shard, the 2PC path must be used so that
+		// validateReadOnlyShards validates those shards via a linearizable
+		// read barrier, preserving SSI.
+		canOptimize := true
+		for _, rk := range readKeys {
+			if c.engineGroupIDForKey(rk) != gids[0] {
+				canOptimize = false
+				break
+			}
+		}
+		if canOptimize {
+			return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		}
 	}
 
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, readKeys)
