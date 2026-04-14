@@ -155,14 +155,21 @@ func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([
 }
 
 func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
-	v, err := s.GetAt(ctx, key, ts)
-	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return false, nil
-		}
-		return false, err
+	if s == nil || s.local == nil {
+		return false, nil
 	}
-	return v != nil, nil
+	if s.leaderOKForKey(ctx, key) {
+		ok, err := s.local.ExistsAt(ctx, key, ts)
+		return ok, errors.WithStack(err)
+	}
+	// Via proxy path: RawGet returns a nil Value for a key that exists with an
+	// empty value because proto3 strips zero-valued bytes fields on the wire.
+	// Determine existence from the error alone, not from whether Value is non-nil.
+	_, err := s.proxyRawGet(ctx, key, ts)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	return err == nil, errors.WithStack(err)
 }
 
 func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {

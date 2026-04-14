@@ -64,12 +64,21 @@ func TestRedisHashLegacyJSONReadThenRewriteToProto(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, added)
 
-	rawAfterWrite := mustReadRawValue(t, st, storageKey)
-	require.True(t, hasStoredRedisPrefix(rawAfterWrite, storedRedisHashProtoPrefix))
+	// After migration-on-write the legacy blob is deleted; wide-column field keys are used instead.
+	readTS := server.readTS()
+	_, err = st.GetAt(context.Background(), storageKey, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "legacy blob should be deleted after wide-column migration")
 
-	decoded, err := unmarshalHashValue(rawAfterWrite)
+	// loadHashAt should aggregate all wide-column fields including the migrated one.
+	got, err := server.loadHashAt(context.Background(), key, readTS)
 	require.NoError(t, err)
-	require.Equal(t, redisHashValue{"field": "old", "next": "new"}, decoded)
+	require.Equal(t, redisHashValue{"field": "old", "next": "new"}, got)
+
+	// Each field key must be present in the store.
+	for _, field := range []string{"field", "next"} {
+		_, err = st.GetAt(context.Background(), store.HashFieldKey(key, []byte(field)), readTS)
+		require.NoError(t, err, "field key %q should exist after migration", field)
+	}
 }
 
 func TestRedisSetLegacyJSONReadThenRewriteToProto(t *testing.T) {
@@ -95,12 +104,21 @@ func TestRedisSetLegacyJSONReadThenRewriteToProto(t *testing.T) {
 	require.Empty(t, conn.err)
 	require.Equal(t, int64(1), conn.int)
 
-	rawAfterWrite := mustReadRawValue(t, st, storageKey)
-	require.True(t, hasStoredRedisPrefix(rawAfterWrite, storedRedisSetProtoPrefix))
+	// After migration-on-write the legacy blob is deleted; wide-column member keys are used instead.
+	readTS := server.readTS()
+	_, err = st.GetAt(context.Background(), storageKey, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "legacy blob should be deleted after wide-column migration")
 
-	decoded, err := unmarshalSetValue(rawAfterWrite)
+	// loadSetAt should aggregate all wide-column members including the migrated ones.
+	got, err := server.loadSetAt(context.Background(), "set", key, readTS)
 	require.NoError(t, err)
-	require.Equal(t, redisSetValue{Members: []string{"a", "b", "c"}}, decoded)
+	require.Equal(t, redisSetValue{Members: []string{"a", "b", "c"}}, got)
+
+	// Each member key must be present in the store.
+	for _, member := range []string{"a", "b", "c"} {
+		_, err = st.GetAt(context.Background(), store.SetMemberKey(key, []byte(member)), readTS)
+		require.NoError(t, err, "member key %q should exist after migration", member)
+	}
 }
 
 func TestRedisHLLLegacyJSONReadThenRewriteToProto(t *testing.T) {

@@ -195,11 +195,14 @@ func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
 	require.Equal(t, []any{"new1", "new2"}, rangeRes)
 
 	readTS := nodes[1].redisServer.readTS()
-	metaRaw, err := nodes[1].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte("list-del-rpush")), readTS)
+
+	// With the Delta pattern, RPUSH inside a MULTI/EXEC emits a delta key
+	// rather than updating the base metadata key directly.  Verify the
+	// effective metadata via resolveListMeta which aggregates deltas.
+	resolvedMeta, resolvedExists, err := nodes[1].redisServer.resolveListMeta(ctx, []byte("list-del-rpush"), readTS)
 	require.NoError(t, err)
-	meta, err := store.UnmarshalListMeta(metaRaw)
-	require.NoError(t, err)
-	require.Equal(t, int64(2), meta.Len)
+	require.True(t, resolvedExists)
+	require.Equal(t, int64(2), resolvedMeta.Len)
 
 	kvs, err := nodes[1].redisServer.store.ScanAt(
 		ctx,

@@ -1161,6 +1161,40 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 	return [][]byte{}, nil
 }
 
+// mergeInternalNamespaces scans all internal key namespaces (list, hash, set, and
+// other internal prefixes) for keys that match pattern and merges them into the
+// caller's keyset via mergeScannedKeys. Called only when the pattern is bounded
+// (start != nil) because unbounded scans already cover the full keyspace.
+func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, mergeScannedKeys func([]byte, []byte) error) error {
+	metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
+	if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
+		return err
+	}
+	itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
+	if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
+		return err
+	}
+	for _, prefix := range redisInternalPrefixes {
+		internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
+		if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
+			return err
+		}
+	}
+	// Wide-column hash/set keys embed the user-key as
+	// <prefix><4-byte-len><userKey><field|member>, so the binary length
+	// prefix makes straightforward bounds-based scanning non-trivial.
+	// Use the user-key prefix as the lower bound and scan to the end of each
+	// namespace; collectUserKeys filters false positives by pattern.
+	hashFieldStart := store.HashFieldScanPrefix(start)
+	hashFieldEnd := prefixScanEnd([]byte(store.HashFieldPrefix))
+	if err := mergeScannedKeys(hashFieldStart, hashFieldEnd); err != nil {
+		return err
+	}
+	setMemberStart := store.SetMemberScanPrefix(start)
+	setMemberEnd := prefixScanEnd([]byte(store.SetMemberPrefix))
+	return mergeScannedKeys(setMemberStart, setMemberEnd)
+}
+
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 	start, end := patternScanBounds(pattern)
 	keyset := map[string][]byte{}
@@ -1184,21 +1218,8 @@ func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
 	// and map them back to logical user keys.  For unbounded patterns
 	// (e.g. "*"), the full-keyspace scan already covers everything.
 	if start != nil {
-		metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
-		if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
+		if err := r.mergeInternalNamespaces(start, pattern, mergeScannedKeys); err != nil {
 			return nil, err
-		}
-
-		itemStart, itemEnd := listPatternScanBounds(store.ListItemPrefix, pattern)
-		if err := mergeScannedKeys(itemStart, itemEnd); err != nil {
-			return nil, err
-		}
-
-		for _, prefix := range redisInternalPrefixes {
-			internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
-			if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
-				return nil, err
-			}
 		}
 	}
 
@@ -1285,12 +1306,35 @@ func (r *RedisServer) collectUserKeys(kvs []*store.KVPair, pattern []byte) map[s
 	return keyset
 }
 
+// wideColumnVisibleUserKey maps a wide-column internal key to its visible user
+// key, or returns (nil, true) for internal-only keys (meta/delta), and
+// (nil, false) if the key is not a wide-column key at all.
+func wideColumnVisibleUserKey(key []byte) (userKey []byte, isWide bool) {
+	// Check delta prefixes before meta prefixes (delta starts with meta prefix).
+	if store.IsHashMetaDeltaKey(key) || store.IsHashMetaKey(key) {
+		return nil, true
+	}
+	if store.IsHashFieldKey(key) {
+		return store.ExtractHashUserKeyFromField(key), true
+	}
+	if store.IsSetMetaDeltaKey(key) || store.IsSetMetaKey(key) {
+		return nil, true
+	}
+	if store.IsSetMemberKey(key) {
+		return store.ExtractSetUserKeyFromMember(key), true
+	}
+	return nil, false
+}
+
 func redisVisibleUserKey(key []byte) []byte {
 	if bytes.HasPrefix(key, redisTxnKeyPrefix) || isRedisTTLKey(key) {
 		return nil
 	}
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
+	}
+	if userKey, isWide := wideColumnVisibleUserKey(key); isWide {
+		return userKey
 	}
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		return userKey
@@ -1377,12 +1421,13 @@ type txnContext struct {
 }
 
 type listTxnState struct {
-	meta       store.ListMeta
-	metaExists bool
-	appends    [][]byte
-	deleted    bool
-	purge      bool
-	purgeMeta  store.ListMeta
+	meta           store.ListMeta
+	metaExists     bool
+	appends        [][]byte
+	deleted        bool
+	purge          bool
+	purgeMeta      store.ListMeta
+	existingDeltas [][]byte // delta key bytes present at load time; deleted on purge/delete
 }
 
 type zsetTxnState struct {
@@ -1484,25 +1529,34 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	if st, ok := t.listStates[k]; ok {
 		return st, nil
 	}
-	// Track listMetaKey (length/tail-pointer) and redisTTLKey as read
-	// dependencies. Individual list element keys (listItemKey) are NOT tracked
-	// because every list write operation (RPUSH, DEL) updates listMetaKey;
-	// a stale element read is therefore always detected via a stale meta read.
-	// A hypothetical LSET (in-place element mutation without touching meta)
-	// would require tracking individual element keys, but LSET is not
-	// currently supported.
-	t.trackReadKey(listMetaKey(key))
+	// With the Delta pattern we no longer read-modify-write the single base
+	// meta key, so there is no OCC conflict to track on it.
 	t.trackReadKey(redisTTLKey(key))
 
-	meta, exists, err := t.server.loadListMetaAt(context.Background(), key, t.startTS)
+	ctx := context.Background()
+	meta, exists, err := t.server.resolveListMeta(ctx, key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
 
+	// Capture existing delta keys so they can be deleted if the list is later
+	// purged or deleted within this transaction.
+	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
+	deltaEnd := store.PrefixScanEnd(deltaPrefix)
+	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, t.startTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	existingDeltas := make([][]byte, 0, len(deltaKVs))
+	for _, kv := range deltaKVs {
+		existingDeltas = append(existingDeltas, kv.Key)
+	}
+
 	st := &listTxnState{
-		meta:       meta,
-		metaExists: exists,
-		appends:    [][]byte{},
+		meta:           meta,
+		metaExists:     exists,
+		appends:        [][]byte{},
+		existingDeltas: existingDeltas,
 	}
 	t.listStates[k] = st
 	return st, nil
@@ -1913,10 +1967,10 @@ func (t *txnContext) validateReadSet(ctx context.Context) error {
 func (t *txnContext) commit() error {
 	elems := t.buildKeyElems()
 
-	listElems, err := t.buildListElems()
-	if err != nil {
-		return err
-	}
+	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
+	// the coordinator assigns it during Dispatch.
+	commitTS := t.server.coordinator.Clock().Next()
+	listElems := t.buildListElems(commitTS)
 	zsetElems, err := t.buildZSetElems()
 	if err != nil {
 		return err
@@ -1934,7 +1988,13 @@ func (t *txnContext) commit() error {
 	for _, k := range t.readKeys {
 		readKeys = append(readKeys, k)
 	}
-	group := &kv.OperationGroup[kv.OP]{IsTxn: true, Elems: elems, StartTS: t.startTS, ReadKeys: readKeys}
+	group := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		Elems:    elems,
+		StartTS:  t.startTS,
+		CommitTS: commitTS,
+		ReadKeys: readKeys,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
@@ -1984,7 +2044,7 @@ func appendListDeleteOps(elems []*kv.Elem[kv.OP], userKey []byte, meta store.Lis
 	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(userKey)})
 }
 
-func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
+func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 	listKeys := make([]string, 0, len(t.listStates))
 	for k := range t.listStates {
 		listKeys = append(listKeys, k)
@@ -1992,6 +2052,7 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 	sort.Strings(listKeys)
 
 	var elems []*kv.Elem[kv.OP]
+	var seqInTxn uint32
 	for _, k := range listKeys {
 		st := t.listStates[k]
 		userKey := []byte(k)
@@ -2000,6 +2061,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 			if meta, ok := listDeleteMeta(st); ok {
 				elems = appendListDeleteOps(elems, userKey, meta)
 			}
+			// Delete existing delta keys so they don't survive the logical delete.
+			for _, dk := range st.existingDeltas {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+			}
 			continue
 		}
 		if len(st.appends) == 0 {
@@ -2007,6 +2072,10 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 		}
 		if st.purge {
 			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
+			// Delete existing delta keys so they don't accumulate after DEL+RPUSH.
+			for _, dk := range st.existingDeltas {
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+			}
 		}
 
 		startSeq := st.meta.Head + st.meta.Len
@@ -2018,15 +2087,18 @@ func (t *txnContext) buildListElems() ([]*kv.Elem[kv.OP], error) {
 			})
 		}
 
-		st.meta.Len += int64(len(st.appends))
-		st.meta.Tail = st.meta.Head + st.meta.Len
-		metaBytes, err := store.MarshalListMeta(st.meta)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(userKey), Value: metaBytes})
+		// Emit a Delta key instead of updating the base metadata key.
+		// Each list key in this transaction gets a unique seqInTxn.
+		n := int64(len(st.appends))
+		deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: n})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
+			Value: deltaVal,
+		})
+		seqInTxn++
 	}
-	return elems, nil
+	return elems
 }
 
 func (t *txnContext) buildZSetElems() ([]*kv.Elem[kv.OP], error) {
@@ -2247,7 +2319,12 @@ func (r *RedisServer) isListKeyAt(ctx context.Context, key []byte, readTS uint64
 	return exists, err
 }
 
-func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+// buildRPushOps creates operations to append values to the tail of a list using
+// the Delta pattern. Instead of writing to the base metadata key (causing OCC
+// conflicts), it emits a single ListMetaDelta key with LenDelta = len(values).
+// commitTS must be pre-allocated via dispatchElemsWithCommitTS; seqInTxn
+// disambiguates multiple push operations in the same transaction.
+func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]byte, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
 	if len(values) == 0 {
 		return nil, meta, nil
 	}
@@ -2260,40 +2337,65 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 		seq++
 	}
 
+	// Emit a Delta key instead of writing the base meta key.
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: int64(len(values))})
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta})
+
 	meta.Len += int64(len(values))
 	meta.Tail = meta.Head + meta.Len
-
-	b, err := store.MarshalListMeta(meta)
-	if err != nil {
-		return nil, meta, errors.WithStack(err)
-	}
-
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
 	return elems, meta, nil
 }
 
-func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
-	readTS := r.readTS()
-	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
-	if err != nil {
-		return 0, err
-	}
+// listPushBuildFn is the type for functions that build list push operations.
+type listPushBuildFn func(meta store.ListMeta, key []byte, values [][]byte, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], store.ListMeta, error)
 
-	ops, newMeta, err := r.buildRPushOps(meta, key, values)
-	if err != nil {
-		return 0, err
-	}
-	if len(ops) == 0 {
-		return newMeta.Len, nil
-	}
+// listPushCore is the shared retry loop for RPUSH and LPUSH. The caller supplies
+// a buildFn that assembles the specific operations (RPUSH appends to tail, LPUSH
+// prepends to head).
+func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]byte, buildFn listPushBuildFn) (int64, error) {
+	var newLen int64
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		meta, _, err := r.resolveListMeta(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
 
-	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
+		// Pre-allocate commitTS so we can embed it in the Delta key.
+		commitTS := r.coordinator.Clock().Next()
+		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
+		if err != nil {
+			return err
+		}
+		if len(ops) == 0 {
+			newLen = updatedMeta.Len
+			return nil
+		}
+
+		// Dispatch with the pre-allocated commitTS.
+		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    ops,
+		})
+		if dispErr != nil {
+			return errors.WithStack(dispErr)
+		}
+		newLen = updatedMeta.Len
+		return nil
+	})
+	return newLen, err
 }
 
-// buildLPushOps creates Raft operations to prepend values to the head of a list.
-// This is O(k) where k = len(values), not O(N) where N is the total list length.
-// LPUSH reverses the order of arguments: LPUSH key a b c → [c, b, a, ...existing].
-func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
+func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
+	return r.listPushCore(ctx, key, values, r.buildRPushOps)
+}
+
+// buildLPushOps creates operations to prepend values to the head of a list using
+// the Delta pattern. LPUSH reverses the order of arguments:
+// LPUSH key a b c → [c, b, a, ...existing].
+func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]byte, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], store.ListMeta, error) {
 	if len(values) == 0 {
 		return nil, meta, nil
 	}
@@ -2312,35 +2414,17 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listItemKey(key, seq), Value: vCopy})
 	}
 
+	// Emit a Delta key instead of writing the base meta key.
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -n, LenDelta: n})
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta})
+
 	meta.Head = newHead
 	meta.Len += n
-	// Tail stays the same: Tail = oldHead + oldLen = newHead + newLen
-
-	b, err := store.MarshalListMeta(meta)
-	if err != nil {
-		return nil, meta, errors.WithStack(err)
-	}
-
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: listMetaKey(key), Value: b})
 	return elems, meta, nil
 }
 
 func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
-	readTS := r.readTS()
-	meta, _, err := r.loadListMetaAt(ctx, key, readTS)
-	if err != nil {
-		return 0, err
-	}
-
-	ops, newMeta, err := r.buildLPushOps(meta, key, values)
-	if err != nil {
-		return 0, err
-	}
-	if len(ops) == 0 {
-		return newMeta.Len, nil
-	}
-
-	return newMeta.Len, r.dispatchElems(ctx, true, readTS, ops)
+	return r.listPushCore(ctx, key, values, r.buildLPushOps)
 }
 
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {
@@ -2387,7 +2471,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, errors.WithStack(err)
 	}
 
-	meta, exists, err := r.loadListMetaAt(context.Background(), key, readTS)
+	meta, exists, err := r.resolveListMeta(context.Background(), key, readTS)
 	if err != nil {
 		return nil, err
 	}
