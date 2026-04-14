@@ -198,29 +198,23 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		return err
 	}
 
-	// Count deltas per userKey and collect their KVPairs.
-	type entry struct {
-		deltaKVs []*store.KVPair
-	}
-	byKey := make(map[string]*entry)
+	// Group deltas per userKey.
+	byKey := make(map[string][]*store.KVPair)
 	for _, kv := range kvs {
 		uk := h.extractUserKey(kv.Key)
 		if uk == nil {
 			continue
 		}
 		k := string(uk)
-		if byKey[k] == nil {
-			byKey[k] = &entry{}
-		}
-		byKey[k].deltaKVs = append(byKey[k].deltaKVs, kv)
+		byKey[k] = append(byKey[k], kv)
 	}
 
-	for ukStr, e := range byKey {
-		if len(e.deltaKVs) < c.maxCount {
+	for ukStr, deltaKVs := range byKey {
+		if len(deltaKVs) < c.maxCount {
 			continue
 		}
 		userKey := []byte(ukStr)
-		elems, buildErr := h.buildElems(ctx, userKey, e.deltaKVs, readTS)
+		elems, buildErr := h.buildElems(ctx, userKey, deltaKVs, readTS)
 		if buildErr != nil {
 			c.logger.WarnContext(ctx, "delta compactor: failed to build elems",
 				"type", h.typeName, "key", ukStr, "error", buildErr)
@@ -231,7 +225,7 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 				"type", h.typeName, "key", ukStr, "error", err)
 		} else {
 			c.logger.InfoContext(ctx, "delta compactor: compacted",
-				"type", h.typeName, "key", ukStr, "delta_count", len(e.deltaKVs))
+				"type", h.typeName, "key", ukStr, "delta_count", len(deltaKVs))
 		}
 	}
 	return nil

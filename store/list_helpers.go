@@ -269,11 +269,17 @@ func encodeSortableInt64(dst []byte, seq int64) {
 // ExtractListItemSeq extracts the sequence number encoded in a list item key.
 // Returns (seq, true) on success; (0, false) if key is not a valid item key for userKey.
 func ExtractListItemSeq(itemKey, userKey []byte) (int64, bool) {
-	prefix := append([]byte(ListItemPrefix), userKey...) //nolint:gocritic // one-shot prefix build; not a loop
+	// Check the static prefix and userKey separately to avoid allocating a
+	// combined prefix slice on every call (this function is called inside loops).
+	prefix := []byte(ListItemPrefix)
 	if !bytes.HasPrefix(itemKey, prefix) {
 		return 0, false
 	}
 	rest := itemKey[len(prefix):]
+	if !bytes.HasPrefix(rest, userKey) {
+		return 0, false
+	}
+	rest = rest[len(userKey):]
 	if len(rest) != sortableInt64Bytes {
 		return 0, false
 	}
