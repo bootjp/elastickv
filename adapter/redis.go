@@ -1185,14 +1185,21 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 	// prefix makes straightforward bounds-based scanning non-trivial.
 	// Use the user-key prefix as the lower bound and scan to the end of each
 	// namespace; collectUserKeys filters false positives by pattern.
-	hashFieldStart := store.HashFieldScanPrefix(start)
-	hashFieldEnd := prefixScanEnd([]byte(store.HashFieldPrefix))
-	if err := mergeScannedKeys(hashFieldStart, hashFieldEnd); err != nil {
-		return err
+	type wideColNS struct {
+		startFn func([]byte) []byte
+		prefix  string
 	}
-	setMemberStart := store.SetMemberScanPrefix(start)
-	setMemberEnd := prefixScanEnd([]byte(store.SetMemberPrefix))
-	return mergeScannedKeys(setMemberStart, setMemberEnd)
+	for _, ns := range []wideColNS{
+		{store.HashFieldScanPrefix, store.HashFieldPrefix},
+		{store.SetMemberScanPrefix, store.SetMemberPrefix},
+	} {
+		nsStart := ns.startFn(start)
+		nsEnd := prefixScanEnd([]byte(ns.prefix))
+		if err := mergeScannedKeys(nsStart, nsEnd); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
@@ -1545,6 +1552,9 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if len(deltaKVs) == store.MaxDeltaScanLimit {
+		return nil, errors.WithStack(ErrDeltaScanTruncated)
 	}
 	existingDeltas := make([][]byte, 0, len(deltaKVs))
 	for _, kv := range deltaKVs {
@@ -2036,6 +2046,14 @@ func listDeleteMeta(st *listTxnState) (store.ListMeta, bool) {
 	}
 }
 
+// appendDeltaDeletes appends Del operations for each delta key in deltaKeys.
+func appendDeltaDeletes(elems []*kv.Elem[kv.OP], deltaKeys [][]byte) []*kv.Elem[kv.OP] {
+	for _, dk := range deltaKeys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+	}
+	return elems
+}
+
 func appendListDeleteOps(elems []*kv.Elem[kv.OP], userKey []byte, meta store.ListMeta) []*kv.Elem[kv.OP] {
 	for seq := meta.Head; seq < meta.Tail; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(userKey, seq)})
@@ -2061,9 +2079,7 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 				elems = appendListDeleteOps(elems, userKey, meta)
 			}
 			// Delete existing delta keys so they don't survive the logical delete.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
+			elems = appendDeltaDeletes(elems, st.existingDeltas)
 			continue
 		}
 		if len(st.appends) == 0 {
@@ -2072,9 +2088,7 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 		if st.purge {
 			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
 			// Delete existing delta keys so they don't accumulate after DEL+RPUSH.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
+			elems = appendDeltaDeletes(elems, st.existingDeltas)
 		}
 
 		startSeq := st.meta.Head + st.meta.Len

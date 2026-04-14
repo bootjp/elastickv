@@ -240,47 +240,9 @@ const maxReadKeys = 10_000
 
 var ErrLeaderNotFound = errors.New("leader not found")
 
-func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
-	if len(reqs.Elems) == 0 {
-		return nil, ErrInvalidRequest
-	}
-
-	addr := leaderAddrFromEngine(c.engine)
-	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
-	}
-
-	conn, err := c.connCache.ConnFor(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	cli := pb.NewInternalClient(conn)
-
-	requests, err := c.buildRedirectRequests(reqs)
-	if err != nil {
-		return nil, err
-	}
-
-	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
-	defer cancel()
-	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	if !r.Success {
-		return nil, ErrInvalidRequest
-	}
-
-	return &CoordinateResponse{
-		CommitIndex: r.CommitIndex,
-	}, nil
-}
-
 func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	if !reqs.IsTxn {
-		requests := make([]*pb.Request, 0, len(reqs.Elems))
+		var requests []*pb.Request
 		for _, req := range reqs.Elems {
 			requests = append(requests, c.toRawRequest(req))
 		}
@@ -303,6 +265,43 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	}
 	return []*pb.Request{
 		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
+	}, nil
+}
+
+func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if len(reqs.Elems) == 0 {
+		return nil, ErrInvalidRequest
+	}
+
+	addr := leaderAddrFromEngine(c.engine)
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	conn, err := c.connCache.ConnFor(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	requests, err := c.buildRedirectRequests(reqs)
+	if err != nil {
+		return nil, err
+	}
+
+	cli := pb.NewInternalClient(conn)
+	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
+	defer cancel()
+	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	if !r.Success {
+		return nil, ErrInvalidRequest
+	}
+
+	return &CoordinateResponse{
+		CommitIndex: r.CommitIndex,
 	}, nil
 }
 

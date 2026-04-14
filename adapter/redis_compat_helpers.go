@@ -344,6 +344,9 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if scanErr != nil {
 		return nil, errors.WithStack(scanErr)
 	}
+	if len(deltaKVs) == store.MaxDeltaScanLimit {
+		return nil, errors.WithStack(ErrDeltaScanTruncated)
+	}
 	for _, pair := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
@@ -374,6 +377,9 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
 	if scanErr != nil {
 		return nil, errors.WithStack(scanErr)
+	}
+	if len(deltaKVs) == store.MaxDeltaScanLimit {
+		return nil, errors.WithStack(ErrDeltaScanTruncated)
 	}
 	for _, pair := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
