@@ -1345,8 +1345,12 @@ func redisVisibleUserKey(key []byte) []byte {
 	if bytes.HasPrefix(key, redisTxnKeyPrefix) || isRedisTTLKey(key) {
 		return nil
 	}
-	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
+	// List item keys are visible; meta, delta, and claim keys are internal-only.
+	if store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
+	}
+	if store.IsListMetaKey(key) || store.IsListMetaDeltaKey(key) || store.IsListClaimKey(key) {
+		return nil
 	}
 	if userKey, isWide := wideColumnVisibleUserKey(key); isWide {
 		return userKey
@@ -2514,6 +2518,131 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 
 func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
 	return r.listPushCore(ctx, key, values, r.buildLPushOps)
+}
+
+// listPopClaim implements LPOP (left=true) or RPOP (left=false) using the
+// Claim pattern to avoid write-write conflicts on the list metadata key.
+// For each item popped it emits:
+//   - Del(listItemKey) — removes the item value
+//   - Put(listClaimKey, empty) — uniqueness guard; conflicts if another txn
+//     claims the same sequence number concurrently
+//
+// A single ListMetaDelta with {HeadDelta, LenDelta} is emitted for the whole batch.
+//
+// Returns the popped values (len ≤ count) or nil if the list does not exist.
+func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta store.ListMeta, n int64, left bool, readTS uint64) ([]string, []*kv.Elem[kv.OP], error) {
+	// Each item: Del(item) + Put(claim); capacity leaves room for the delta key appended by the caller.
+	elems := make([]*kv.Elem[kv.OP], 0, int(n)*2+1) //nolint:mnd // 2 ops per item (del item + put claim)
+	values := make([]string, 0, int(n))
+
+	for i := int64(0); i < n; i++ {
+		var seq int64
+		if left {
+			seq = meta.Head + i
+		} else {
+			seq = meta.Tail - 1 - i
+		}
+		itemKey := listItemKey(key, seq)
+		raw, getErr := r.store.GetAt(ctx, itemKey, readTS)
+		if errors.Is(getErr, store.ErrKeyNotFound) {
+			// Sparse list — stop here.
+			break
+		}
+		if getErr != nil {
+			return nil, nil, errors.WithStack(getErr)
+		}
+		values = append(values, string(raw))
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}},
+		)
+	}
+	return values, elems, nil
+}
+
+// resolveListPopMeta returns the list metadata for a pop operation.
+// Returns (meta, true, nil) when the list exists and is non-empty,
+// (zero, false, nil) when the key does not exist or the list is empty,
+// and (zero, false, err) on error (including wrong-type error).
+func (r *RedisServer) resolveListPopMeta(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
+	typ, typErr := r.keyTypeAt(context.Background(), key, readTS)
+	if typErr != nil {
+		return store.ListMeta{}, false, typErr
+	}
+	if typ == redisTypeNone {
+		return store.ListMeta{}, false, nil
+	}
+	if typ != redisTypeList {
+		return store.ListMeta{}, false, wrongTypeError()
+	}
+	meta, exists, metaErr := r.resolveListMeta(ctx, key, readTS)
+	if metaErr != nil {
+		return store.ListMeta{}, false, metaErr
+	}
+	if !exists || meta.Len == 0 {
+		return store.ListMeta{}, false, nil
+	}
+	return meta, true, nil
+}
+
+func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, left bool) ([]string, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+
+	var popped []string
+	err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		meta, ok, metaErr := r.resolveListPopMeta(ctx, key, readTS)
+		if metaErr != nil {
+			return metaErr
+		}
+		if !ok {
+			popped = nil
+			return nil
+		}
+
+		n := int64(count)
+		if n > meta.Len {
+			n = meta.Len
+		}
+
+		values, elems, buildErr := r.buildListPopElems(ctx, key, meta, n, left, readTS)
+		if buildErr != nil {
+			return buildErr
+		}
+
+		n = int64(len(values))
+		if n == 0 {
+			popped = nil
+			return nil
+		}
+
+		commitTS := r.coordinator.Clock().Next()
+		var headDelta int64
+		if left {
+			headDelta = n // head advances by n for LPOP
+		}
+		delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: headDelta, LenDelta: -n})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ListMetaDeltaKey(key, commitTS, 0),
+			Value: delta,
+		})
+
+		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    elems,
+		})
+		if dispErr != nil {
+			return errors.WithStack(dispErr)
+		}
+		popped = values
+		return nil
+	})
+	return popped, err
 }
 
 func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store.ListMeta, startIdx, endIdx int64, readTS uint64) ([]string, error) {

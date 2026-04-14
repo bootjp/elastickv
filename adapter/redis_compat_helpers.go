@@ -367,7 +367,8 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 	return r.dispatchElems(ctx, false, 0, elems)
 }
 
-// deleteListElems returns delete operations for all list keys (items, meta, deltas).
+// deleteListElems returns delete operations for all list keys: item keys, the base
+// meta key, all delta keys, and all claim keys.
 func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	meta, listExists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
@@ -381,6 +382,7 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
+	// Delete all delta keys.
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
 	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
@@ -388,6 +390,16 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 		return nil, errors.WithStack(scanErr)
 	}
 	for _, pair := range deltaKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+	}
+	// Delete all claim keys.
+	claimPrefix := store.ListClaimScanPrefix(key)
+	claimEnd := store.PrefixScanEnd(claimPrefix)
+	claimKVs, claimScanErr := r.store.ScanAt(ctx, claimPrefix, claimEnd, maxWideScanLimit, readTS)
+	if claimScanErr != nil {
+		return nil, errors.WithStack(claimScanErr)
+	}
+	for _, pair := range claimKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
 	return elems, nil

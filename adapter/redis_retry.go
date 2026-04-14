@@ -175,6 +175,12 @@ func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
 	}
+	if store.IsListMetaDeltaKey(key) {
+		return store.ExtractListUserKeyFromDelta(key)
+	}
+	if store.IsListClaimKey(key) {
+		return store.ExtractListUserKeyFromClaim(key)
+	}
 	if wideKey, ok := normalizeWideColumnKey(key); ok {
 		return wideKey
 	}
