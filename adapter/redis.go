@@ -1348,15 +1348,73 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	results, err := r.runTransaction(state.queue)
+	queue := state.queue
 	state.inTxn = false
 	state.queue = nil
+
+	// Always execute MULTI/EXEC on the leader so that reads and writes within
+	// the transaction see consistent, up-to-date data. Serving transactions
+	// on followers risks reading stale MVCC state and producing write cycles.
+	if !r.coordinator.IsLeader() {
+		r.proxyTransactionToLeader(conn, queue)
+		return
+	}
+
+	results, err := r.runTransaction(queue)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 
 	r.writeResults(conn, results)
+}
+
+// proxyTransactionToLeader forwards a MULTI/EXEC transaction to the leader
+// node and writes the EXEC response array back to conn.
+func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.Command) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		conn.WriteError(ErrLeaderNotFound.Error())
+		return
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+		return
+	}
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	cmds := make([]*redis.Cmd, 0, len(queue))
+	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, cmd := range queue {
+			args := make([]interface{}, len(cmd.Args))
+			for i, a := range cmd.Args {
+				args[i] = a
+			}
+			cmds = append(cmds, pipe.Do(ctx, args...))
+		}
+		return nil
+	})
+	// A non-nil err here means one or more commands within the transaction
+	// returned a Redis-level error. Individual results are still available
+	// on each cmd, which is the correct Redis EXEC semantics (array of
+	// per-command results, some of which may be error replies).
+	// Only bail if we have no per-command results at all (fatal error).
+	if len(cmds) == 0 {
+		if err != nil {
+			conn.WriteError(err.Error())
+		} else {
+			conn.WriteArray(0)
+		}
+		return
+	}
+	conn.WriteArray(len(cmds))
+	for _, cmd := range cmds {
+		writeGoRedisResult(conn, cmd)
+	}
 }
 
 type txnValue struct {
