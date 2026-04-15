@@ -4430,7 +4430,11 @@ func nextTransactRetryBackoff(current time.Duration) time.Duration {
 var errTableGenerationChanged = errors.New("table generation changed")
 
 func (d *DynamoDBServer) verifyTableGeneration(ctx context.Context, tableName string, expectedGeneration uint64) error {
-	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	// Use consistentReadLatestTS to always read the latest committed schema.
+	// Using a stale snapshotTS can cause false "table not found" results when
+	// this node's LastCommitTS is behind the table creation timestamp, which
+	// would erroneously trigger cleanupCommittedKeys and delete live item data.
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, consistentReadLatestTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}
