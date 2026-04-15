@@ -2064,11 +2064,47 @@ func (d *DynamoDBServer) mergeReadItemsFromSourceSchema(
 	return mergeMigratingReadItems(schema.PrimaryKey, orderKey, items, sourceItems)
 }
 
+// consistentReadLatestTS is a read timestamp used by follower nodes for
+// ConsistentRead=true reads.  The value is far above any realistic HLC
+// timestamp (~Unix-nanosecond range, ≪ 10^19), so reading at this TS from
+// the leader's Pebble store returns the most recently committed version of
+// any key.  It avoids the noStartTS sentinel (^uint64(0)) used by the
+// coordinator.
+const consistentReadLatestTS = ^uint64(0) - 1
+
 func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
 	if consistentRead != nil && *consistentRead {
-		return d.nextTxnReadTS()
+		return d.nextConsistentReadTS()
 	}
 	return snapshotTS(d.coordinator.Clock(), d.store)
+}
+
+// nextConsistentReadTS returns a read timestamp suitable for ConsistentRead=true
+// reads.  On the leader, it returns store.LastCommitTS() — every version at or
+// below that timestamp is guaranteed visible in Pebble.  On a follower, the
+// local LastCommitTS() may lag behind the leader's; since consistent reads are
+// proxied to the leader via proxyRawGet, we use consistentReadLatestTS so the
+// leader reads the most recently committed version rather than the stale
+// follower timestamp.
+func (d *DynamoDBServer) nextConsistentReadTS() uint64 {
+	maxTS := uint64(0)
+	if d.store != nil {
+		maxTS = d.store.LastCommitTS()
+	}
+	clock := d.coordinator.Clock()
+	if clock != nil && maxTS > 0 {
+		clock.Observe(maxTS)
+	}
+	// On a follower, LastCommitTS() is stale relative to the leader.
+	// Return a large sentinel so that proxyRawGet asks the leader for
+	// the absolute latest committed version of the requested key.
+	if d.coordinator != nil && !d.coordinator.IsLeader() {
+		return consistentReadLatestTS
+	}
+	if maxTS == 0 {
+		return 1
+	}
+	return maxTS
 }
 
 func validateGSIReadOptions(
