@@ -16,7 +16,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-const defaultSnapshotChunkSize = 1 << 20
+const defaultSnapshotChunkSize = 16 << 20
 
 const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
