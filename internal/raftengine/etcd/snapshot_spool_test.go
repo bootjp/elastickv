@@ -49,8 +49,7 @@ func TestCleanupStaleSnapshotSpoolsNonExistentDir(t *testing.T) {
 }
 
 // createSnapFile creates a fake .snap file with the etcd naming convention.
-// term is always 1 in the test suite; the parameter is retained to keep the
-// file name format explicit.
+// term is always 1 in the test suite.
 func createSnapFile(t *testing.T, dir string, index uint64) {
 	t.Helper()
 	const term = uint64(1)

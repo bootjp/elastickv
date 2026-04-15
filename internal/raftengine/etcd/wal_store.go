@@ -184,11 +184,41 @@ func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
 
 func migrateLegacyState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
 	if !etcdraft.IsEmptySnap(state.Snapshot) && len(state.Snapshot.Data) > 0 {
-		if err := fsm.Restore(bytes.NewReader(state.Snapshot.Data)); err != nil {
-			return nil, errors.WithStack(err)
+		token, err := restoreAndOffloadLegacySnapshot(fsm, fsmSnapDir, state.Snapshot)
+		if err != nil {
+			return nil, err
 		}
+		state.Snapshot.Data = token
 	}
 	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, state)
+}
+
+// restoreAndOffloadLegacySnapshot restores the FSM from a legacy full-payload
+// snapshot and, when fsmSnapDir is non-empty, eagerly converts the payload to
+// the disk-offloaded EKVT token format so the WAL no longer carries GiB-scale
+// blobs after the first startup following a HashiCorp → etcd migration.
+// Returns the token bytes (or the original Data slice when fsmSnapDir is empty).
+func restoreAndOffloadLegacySnapshot(fsm StateMachine, fsmSnapDir string, snap raftpb.Snapshot) ([]byte, error) {
+	if err := fsm.Restore(bytes.NewReader(snap.Data)); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if fsmSnapDir == "" {
+		return snap.Data, nil
+	}
+	index := snap.Metadata.Index
+	fsmSnap, err := fsm.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	crc32c, writeErr := writeFSMSnapshotFile(fsmSnap, fsmSnapDir, index)
+	closeErr := fsmSnap.Close()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, errors.WithStack(closeErr)
+	}
+	return encodeSnapshotToken(index, crc32c), nil
 }
 
 func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
