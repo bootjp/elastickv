@@ -224,6 +224,9 @@ type BatchAllocator struct {
 }
 
 func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
+    if batchSize <= 0 {
+        panic("batchSize must be positive")
+    }
     ch := make(chan struct{})
     close(ch) // initially "ready"; no ongoing refill
     return &BatchAllocator{tso: tso, batchSize: batchSize, refillDone: ch}
@@ -256,6 +259,14 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             case <-ctx.Done():
                 return 0, ctx.Err()
             }
+        }
+
+        // Double-check under the lock: another goroutine may have completed
+        // a refill while we were waiting to acquire refillMu, in which case
+        // the window is no longer exhausted and we should retry the fast path.
+        if b.next.Load() < b.limit.Load() {
+            b.refillMu.Unlock()
+            continue
         }
 
         // This goroutine won: set up the signal channel and start refilling.
@@ -380,7 +391,12 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                     continue
                 }
                 go func(gid uint64, eng raftengine.Engine) {
-                    if _, err := eng.Propose(ctx, payload); err != nil {
+                    // Bound each proposal to one renewal interval so that
+                    // goroutines from slow or partitioned groups do not
+                    // accumulate indefinitely and exhaust resources.
+                    pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+                    defer cancel()
+                    if _, err := eng.Propose(pctx, payload); err != nil {
                         c.logger().WarnContext(ctx, "hlc lease renewal failed",
                             slog.Uint64("group_id", gid),
                             slog.Int64("ceiling_ms", ceilingMs),
