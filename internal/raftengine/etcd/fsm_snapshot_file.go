@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -175,8 +176,9 @@ func (c *crc32CWriter) Sum32() uint32 { return c.h.Sum32() }
 //  2. snapshot.WriteTo → stream FSM payload + accumulate CRC
 //  3. binary.Write   → append 4-byte CRC footer
 //  4. Sync           → flush to durable storage
-//  5. os.Rename      → atomic commit (tmp → final)
-//  6. syncDir        → persist directory entry
+//  5. Close          → release fd before rename
+//  6. os.Rename      → atomic commit (tmp → final)
+//  7. syncDir        → persist directory entry
 //
 // Returns the CRC32C of the payload (excluding the footer) so the caller can
 // embed it in the raftpb.Snapshot.Data token.
@@ -192,9 +194,11 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 	tmpPath := tmpFile.Name()
 	finalPath := fsmSnapPath(fsmSnapDir, index)
 
-	committed := false
+	// closed tracks whether the caller has closed tmpFile so the defer
+	// does not attempt a second close (double-close on failure paths).
+	closed := false
 	defer func() {
-		if !committed {
+		if !closed {
 			_ = tmpFile.Close()
 			_ = os.Remove(tmpPath)
 		}
@@ -204,7 +208,14 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 	if err != nil {
 		return 0, err
 	}
-	committed = true
+
+	// Close before rename: required on Windows, and best practice on Unix to
+	// ensure all buffered data is visible to the rename target.
+	closed = true
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, errors.WithStack(err)
+	}
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -218,8 +229,9 @@ func writeFSMSnapshotFile(snapshot Snapshot, fsmSnapDir string, index uint64) (u
 }
 
 // writeFSMSnapshotPayload streams the snapshot into f, appends the CRC32C
-// footer, flushes the bufio buffer, and syncs+closes the file. On success the
-// file handle is closed and the caller must not use it again.
+// footer, flushes the bufio buffer, and syncs the file. The caller is
+// responsible for closing f; this function intentionally does not call
+// f.Close() so that ownership of the file descriptor remains unambiguous.
 func writeFSMSnapshotPayload(snapshot Snapshot, f *os.File) (uint32, error) {
 	bw := bufio.NewWriterSize(f, fsmWriteBufSize)
 	crcWriter := newCRC32CWriter(bw)
@@ -235,9 +247,6 @@ func writeFSMSnapshotPayload(snapshot Snapshot, f *os.File) (uint32, error) {
 		return 0, errors.WithStack(err)
 	}
 	if err := f.Sync(); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if err := f.Close(); err != nil {
 		return 0, errors.WithStack(err)
 	}
 	return checksum, nil
@@ -441,6 +450,12 @@ func statFSMFileError(err error) error {
 // 4-byte CRC footer) into memory, verifying the CRC32C footer before returning.
 // Used by the Phase 1 bridge mode in Dispatch to reconstruct the full FSM bytes
 // for legacy receivers.
+//
+// Memory note: each call allocates up to fsmMaxInMemPayload (1 GiB). Concurrent
+// callers (e.g. multiple dispatch workers) can each hold that budget simultaneously.
+// Prefer openFSMSnapshotPayloadReader (the streaming path) when available — the
+// engine registers SetFSMPayloadOpener so this in-memory path is only reached
+// for legacy receivers that predate Phase 2 or when the opener is not wired.
 func readFSMSnapshotPayload(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -612,6 +627,10 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	if len(snaps) <= defaultMaxSnapFiles {
 		return nil
 	}
+	// Sort explicitly: os.ReadDir returns lexicographic order on most systems,
+	// but relying on that implicitly is fragile. Snap filenames are zero-padded
+	// hex, so lexicographic == chronological order (oldest first).
+	sort.Strings(snaps)
 
 	var combined error
 	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
