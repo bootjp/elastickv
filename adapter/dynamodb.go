@@ -4407,16 +4407,26 @@ func buildConditionCheckLockRequest(
 	current map[string]attributeValue,
 	found bool,
 ) (*kv.OperationGroup[kv.OP], [][]byte, error) {
-	elems := make([]*kv.Elem[kv.OP], 0, 1)
-	if found {
-		payload, err := encodeStoredDynamoItem(current)
-		if err != nil {
-			return nil, nil, errors.WithStack(err)
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: itemKey, Value: payload})
-	} else {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey})
+	if !found {
+		// Item does not exist: no write is needed.
+		// Include itemKey in ReadKeys only so OCC conflict detection fires
+		// if a concurrent writer commits to this key between our startTS and commitTS.
+		// Writing a Del tombstone here would shadow any concurrently committed Put
+		// at a higher timestamp, causing G-single-item-realtime anomalies.
+		// Return nil cleanup since nothing was written by this condition check.
+		return &kv.OperationGroup[kv.OP]{
+				IsTxn:   true,
+				StartTS: 0,
+				Elems:   nil,
+			},
+			nil,
+			nil
 	}
+	payload, err := encodeStoredDynamoItem(current)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: itemKey, Value: payload}}
 	return &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: 0,
