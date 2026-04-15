@@ -190,41 +190,53 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
 ┌──────────────────────────────────────────────────────┐
 │  BatchAllocator                                        │
 │                                                        │
-│  current window: [base ... base + batchSize)           │
-│  next pointer:   atomic counter within window          │
+│  current window: batchBase ... batchBase + batchSize   │
+│  hot path:       CAS on offset counter (lock-free)     │
 │                                                        │
-│  when next >= base + batchSize:                        │
+│  when offset >= batchSize:                             │
 │    → call TSOAllocator.NextBatch() for a new window    │
 │    → single Raft round-trip amortised over batchSize   │
 └──────────────────────────────────────────────────────┘
 ```
 
-The hot path holds a mutex for a single counter increment (no network I/O).
-The slow path releases the mutex **before** calling `NextBatch`, so the
-network round-trip does not block concurrent callers. Waiters block on a
-channel rather than spinning, respecting context cancellation.
+The hot path is **lock-free**: a single `atomic.Uint64` (`offset`) tracks the
+current position within the window. Callers increment it via CAS without ever
+acquiring a mutex. A split-atomic race between `batchBase` and `offset` is
+avoided by always writing `batchBase` **before** resetting `offset` to zero;
+because Go's `sync/atomic` operations are sequentially consistent, any goroutine
+that reads `offset < batchSize` is guaranteed to also observe the updated
+`batchBase`.
 
-Using a single mutex over the window state avoids the split-atomic race that
-arises when `next` and `limit` are updated as two separate atomic stores —
-a concurrent reader could observe `next` from the old window and `limit` from
-the new window and incorrectly pass the fast-path check.
+The slow path (window exhausted) uses a lightweight mutex **only** for refill
+coordination. The network call to `NextBatch` is always made outside the lock,
+so I/O never blocks concurrent callers. Waiters block on a closed channel rather
+than spinning, and all waits respect context cancellation.
 
 ```go
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
 // serves them locally without a Raft round-trip until the window is exhausted.
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
 //
-// Correctness invariant: the mutex is released before every network call so
-// that concurrent Next() callers are never blocked on I/O. Only the counter
-// increment (a single integer add) is performed under the lock on the hot path.
+// Concurrency model:
+//   Hot path  – lock-free CAS on offset; no mutex acquired.
+//   Slow path – mutex guards only the refill handoff; I/O is always outside it.
+//
+// Ordering invariant: batchBase is stored before offset is reset to 0 so that
+// readers observing offset < batchSize always see the matching base value
+// (guaranteed by Go's sequentially-consistent atomics).
 type BatchAllocator struct {
-    tso        TSOAllocator
-    batchSize  int
+    tso       TSOAllocator
+    batchSize int
 
-    mu         sync.Mutex
-    base       uint64       // next slot to serve
-    limit      uint64       // exclusive upper bound of current window
-    refillDone chan struct{} // non-nil while a refill is in progress; closed on completion
+    // batchBase is the starting timestamp of the current window.
+    // It is written under mu before offset is reset, making the pair coherent.
+    batchBase atomic.Uint64
+    // offset counts consumed slots in [0, batchSize). When offset >= batchSize
+    // the window is exhausted and a refill is needed.
+    offset atomic.Uint64
+
+    mu         sync.Mutex    // guards refill coordination only, not the hot path
+    refillDone chan struct{}  // non-nil while a refill is in progress; closed on completion
 }
 
 func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
@@ -234,7 +246,9 @@ func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
     if batchSize <= 0 {
         panic("batchSize must be positive")
     }
-    return &BatchAllocator{tso: tso, batchSize: batchSize}
+    b := &BatchAllocator{tso: tso, batchSize: batchSize}
+    b.offset.Store(uint64(batchSize)) // window starts exhausted; first call triggers refill
+    return b
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
@@ -243,32 +257,37 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             return 0, err
         }
 
-        b.mu.Lock()
-
-        // Fast path: window has capacity.
-        if b.base < b.limit {
-            ts := b.base
-            b.base++
-            b.mu.Unlock()
-            return ts, nil
+        // Fast path: try to claim a slot in the current window (lock-free).
+        off := b.offset.Load()
+        if off < uint64(b.batchSize) {
+            if b.offset.CompareAndSwap(off, off+1) {
+                // batchBase is stable for the lifetime of this window and was
+                // written before offset was reset, so this load is safe.
+                return b.batchBase.Load() + off, nil
+            }
+            continue // CAS lost; another goroutine claimed this slot; retry
         }
 
-        // Slow path: window exhausted.
+        // Slow path: window exhausted; trigger or await a refill.
+        b.mu.Lock()
+        // Re-check under lock: a concurrent goroutine may have just refilled.
+        if b.offset.Load() < uint64(b.batchSize) {
+            b.mu.Unlock()
+            continue
+        }
         if b.refillDone != nil {
-            // A refill is already in progress; wait for it without blocking
-            // other goroutines (lock released before select).
+            // A refill is already in progress; wait for it without holding the lock.
             ch := b.refillDone
             b.mu.Unlock()
             select {
             case <-ch:
-                continue // refill done; re-check the window
+                continue
             case <-ctx.Done():
                 return 0, ctx.Err()
             }
         }
 
-        // This goroutine starts the refill. Create a signal channel and
-        // release the lock before the network call.
+        // This goroutine drives the refill.
         ch := make(chan struct{})
         b.refillDone = ch
         b.mu.Unlock()
@@ -276,13 +295,14 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
         // Network I/O: no lock held.
         newBase, err := b.tso.NextBatch(ctx, b.batchSize)
 
-        // Re-acquire to install the new window, then clear the in-progress flag.
         b.mu.Lock()
         if err == nil {
-            b.base = newBase
-            b.limit = newBase + uint64(b.batchSize)
+            // Write batchBase before resetting offset so readers always see
+            // a consistent (base, offset) pair (ordering invariant above).
+            b.batchBase.Store(newBase)
+            b.offset.Store(0) // open the new window
         }
-        b.refillDone = nil // clear before close so waiters retry correctly
+        b.refillDone = nil // clear before close so waiters retry the fast path
         b.mu.Unlock()
         close(ch) // unblock all waiters
 
