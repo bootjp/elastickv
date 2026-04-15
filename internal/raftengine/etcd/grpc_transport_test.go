@@ -239,7 +239,7 @@ func TestApplyBridgeModePassesNonTokenUnchanged(t *testing.T) {
 	msg := raftpb.Message{
 		Snapshot: &raftpb.Snapshot{Data: []byte("legacy full payload")},
 	}
-	patched, err := transport.applyBridgeMode(msg)
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
 	require.NoError(t, err)
 	require.Equal(t, []byte("legacy full payload"), patched.Snapshot.Data)
 }
@@ -252,7 +252,7 @@ func TestApplyBridgeModeNoReaderIsNoop(t *testing.T) {
 	msg := raftpb.Message{
 		Snapshot: &raftpb.Snapshot{Data: token},
 	}
-	patched, err := transport.applyBridgeMode(msg)
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
 	require.NoError(t, err)
 	require.Equal(t, token, patched.Snapshot.Data)
 }
@@ -274,7 +274,7 @@ func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
 			Metadata: raftpb.SnapshotMetadata{Index: 42},
 		},
 	}
-	patched, err := transport.applyBridgeMode(msg)
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
 	require.NoError(t, err)
 	require.Equal(t, payload, patched.Snapshot.Data)
 	// Metadata must be preserved.
@@ -291,7 +291,7 @@ func TestApplyBridgeModeReaderError(t *testing.T) {
 	msg := raftpb.Message{
 		Snapshot: &raftpb.Snapshot{Data: token},
 	}
-	_, err := transport.applyBridgeMode(msg)
+	_, err := transport.applyBridgeMode(context.Background(), msg)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 }
 

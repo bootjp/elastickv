@@ -21,6 +21,11 @@ const defaultSnapshotChunkSize = 16 << 20
 const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
 
+// defaultBridgeMaterializeLimit caps the number of bridge-mode snapshot
+// materializations that may hold memory concurrently. Each call allocates up
+// to fsmMaxInMemPayload; limiting concurrency bounds the aggregate allocation.
+const defaultBridgeMaterializeLimit = 1
+
 var (
 	errTransportPeerUnknown      = errors.New("etcd raft peer is not configured")
 	errTransportHandlerNil       = errors.New("etcd raft transport handler is not configured")
@@ -52,6 +57,10 @@ type GRPCTransport struct {
 	// for streaming without allocating a large buffer.
 	openFSMPayload func(index uint64) (io.ReadCloser, error)
 	dialGroup      singleflight.Group
+	// bridgeSem limits concurrent bridge-mode snapshot materializations so
+	// that aggregate in-memory allocation stays bounded even when multiple
+	// dispatch workers run simultaneously.
+	bridgeSem chan struct{}
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -73,6 +82,7 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		clients:           make(map[string]pb.EtcdRaftClient),
 		conns:             make(map[string]*grpc.ClientConn),
 		snapshotChunkSize: defaultSnapshotChunkSize,
+		bridgeSem:         make(chan struct{}, defaultBridgeMaterializeLimit),
 	}
 }
 
@@ -225,7 +235,7 @@ func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message
 	}
 
 	// Fallback: materialise the payload (no opener wired, or non-token snapshot).
-	patched, err := t.applyBridgeMode(msg)
+	patched, err := t.applyBridgeMode(ctx, msg)
 	if err != nil {
 		return err
 	}
@@ -269,7 +279,10 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 // legacy nodes that predate Phase 2) get a standard full-payload MsgSnap.
 // This allocation is transient — freed after the send — and only occurs when
 // a slow follower needs a snapshot, not on every periodic creation.
-func (t *GRPCTransport) applyBridgeMode(msg raftpb.Message) (raftpb.Message, error) {
+//
+// bridgeSem caps the number of concurrent materializations so that aggregate
+// in-memory allocation stays bounded across all dispatch workers.
+func (t *GRPCTransport) applyBridgeMode(ctx context.Context, msg raftpb.Message) (raftpb.Message, error) {
 	if msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
 		return msg, nil
 	}
@@ -284,6 +297,16 @@ func (t *GRPCTransport) applyBridgeMode(msg raftpb.Message) (raftpb.Message, err
 	if err != nil {
 		return msg, errors.WithStack(err)
 	}
+
+	// Acquire the bridge semaphore before allocating the payload buffer.
+	// Block until a slot is available or the dispatch context is cancelled.
+	select {
+	case t.bridgeSem <- struct{}{}:
+		defer func() { <-t.bridgeSem }()
+	case <-ctx.Done():
+		return msg, errors.WithStack(ctx.Err())
+	}
+
 	payload, err := readFn(tok.Index)
 	if err != nil {
 		return msg, errors.WithStack(err)

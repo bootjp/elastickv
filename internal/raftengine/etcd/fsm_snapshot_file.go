@@ -63,7 +63,7 @@ var (
 	ErrFSMSnapshotNotFound = errors.New("fsm snapshot: file not found")
 
 	// ErrFSMSnapshotTooSmall is returned when the file is shorter than the
-	// minimum valid .fsm size (at least 1 byte payload + 4 bytes CRC footer).
+	// minimum valid .fsm size (0 or more bytes payload + 4 bytes CRC footer).
 	ErrFSMSnapshotTooSmall = errors.New("fsm snapshot: file too small to contain footer")
 
 	// ErrFSMSnapshotTokenInvalid is returned when the token bytes cannot be
