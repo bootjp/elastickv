@@ -15,6 +15,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// hlcCeilingFromHLC returns the physical ceiling stored in hlc, or 0 if nil.
+func hlcCeilingFromHLC(hlc *HLC) int64 {
+	if hlc == nil {
+		return 0
+	}
+	return hlc.PhysicalCeiling()
+}
+
 type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
@@ -248,13 +256,31 @@ func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	return &kvFSMSnapshot{
-		snapshot: snapshot,
+		snapshot:  snapshot,
+		ceilingMs: hlcCeilingFromHLC(f.hlc),
 	}, nil
 }
 
 func (f *kvFSM) Restore(r io.ReadCloser) error {
 	defer r.Close()
-	return errors.WithStack(f.store.Restore(r))
+
+	// Read the potential 16-byte header (magic + ceiling ms).
+	var hdr [hlcSnapshotHeaderLen]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if bytes.Equal(hdr[:8], hlcSnapshotMagic[:]) {
+		// New format: restore ceiling, then restore store from remaining bytes.
+		ceilingMs := int64(binary.BigEndian.Uint64(hdr[8:])) //nolint:gosec // ceiling is a Unix ms timestamp encoded as uint64
+		if f.hlc != nil && ceilingMs > 0 {
+			f.hlc.SetPhysicalCeiling(ceilingMs)
+		}
+		return errors.WithStack(f.store.Restore(io.NopCloser(r)))
+	}
+
+	// Old format (no magic): re-prepend the 16 bytes we already consumed.
+	return errors.WithStack(f.store.Restore(io.NopCloser(io.MultiReader(bytes.NewReader(hdr[:]), r))))
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {

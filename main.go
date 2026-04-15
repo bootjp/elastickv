@@ -190,6 +190,10 @@ func run() error {
 	eg.Go(func() error {
 		return compactor.Run(runCtx)
 	})
+	eg.Go(func() error {
+		coordinate.RunHLCLeaseRenewal(runCtx)
+		return nil
+	})
 
 	runner := runtimeServerRunner{
 		ctx:             runCtx,

@@ -823,6 +823,42 @@ func primaryKeyAndKeyMutations(muts []*pb.Mutation) ([]byte, []*pb.Mutation) {
 	return primary, keys
 }
 
+// RunHLCLeaseRenewal periodically proposes a new physical ceiling to the
+// default shard group's Raft cluster while this node is the leader of that
+// group. This mirrors the single-shard Coordinate.RunHLCLeaseRenewal behaviour,
+// ensuring the shared HLC ceiling is maintained in multi-shard deployments.
+//
+// RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
+func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
+	group, ok := c.groups[c.defaultGroup]
+	if !ok || group.Engine == nil {
+		c.logger().WarnContext(ctx, "hlc lease renewal: default shard group not found or has no engine",
+			slog.Uint64("default_group", c.defaultGroup),
+		)
+		return
+	}
+	ticker := time.NewTicker(hlcRenewalInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if group.Engine.State() != raftengine.StateLeader {
+				continue
+			}
+			ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+			if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+				c.logger().WarnContext(ctx, "hlc lease renewal failed",
+					slog.Uint64("group_id", c.defaultGroup),
+					slog.Int64("ceiling_ms", ceilingMs),
+					slog.Any("err", err),
+				)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {
 	out := make([]*pb.Mutation, 0, len(muts))
 	seen := map[string]struct{}{}
