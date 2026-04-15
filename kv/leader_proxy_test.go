@@ -38,7 +38,7 @@ func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "lp-local", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "lp-local", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
 	p := NewLeaderProxy(r)
@@ -101,7 +101,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		ldb := raft.NewInmemStore()
 		sdb := raft.NewInmemStore()
 		fss := raft.NewInmemSnapshotStore()
-		r, err := raft.NewRaft(c, NewKvFSM(store.NewMVCCStore()), ldb, sdb, fss, leaderTrans)
+		r, err := raft.NewRaft(c, NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()), ldb, sdb, fss, leaderTrans)
 		require.NoError(t, err)
 		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
 		t.Cleanup(func() { _ = r.Shutdown().Error() })
@@ -118,7 +118,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		ldb := raft.NewInmemStore()
 		sdb := raft.NewInmemStore()
 		fss := raft.NewInmemSnapshotStore()
-		r, err := raft.NewRaft(c, NewKvFSM(store.NewMVCCStore()), ldb, sdb, fss, followerTrans)
+		r, err := raft.NewRaft(c, NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()), ldb, sdb, fss, followerTrans)
 		require.NoError(t, err)
 		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
 		t.Cleanup(func() { _ = r.Shutdown().Error() })

@@ -1371,6 +1371,8 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 
 // proxyTransactionToLeader forwards a MULTI/EXEC transaction to the leader
 // node and writes the EXEC response array back to conn.
+//
+//nolint:cyclop // inherent complexity of MULTI/EXEC proxy; refactoring would obscure the protocol flow
 func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.Command) {
 	leaderAddr, ok := r.resolveLeaderRedisAddr(conn)
 	if !ok {

@@ -36,7 +36,7 @@ func (o *stubProposalObserver) FailureCount() int {
 func TestFSMApplyBatchKeepsPerRequestResults(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	cmd := &pb.RaftCommand{
@@ -92,7 +92,7 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 	})
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "raw-batch", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "raw-batch", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
 	tm := NewTransaction(r)
@@ -158,7 +158,7 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 
 func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "proposal-fail", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "proposal-fail", NewKvFSMWithHLC(st, NewHLC()))
 	stop()
 
 	observer := &stubProposalObserver{}
@@ -177,7 +177,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 
 func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "proposal-business-error", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "proposal-business-error", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
 	observer := &stubProposalObserver{}
@@ -263,7 +263,7 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      t.TempDir(),
-		StateMachine: etcdFSMAdapter{fsm: NewKvFSM(st)},
+		StateMachine: etcdFSMAdapter{fsm: NewKvFSMWithHLC(st, NewHLC())},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

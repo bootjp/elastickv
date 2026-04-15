@@ -22,9 +22,9 @@ func setupLockResolverEnv(t *testing.T) (*LockResolver, *ShardStore, map[uint64]
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "lr-g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "lr-g1", NewKvFSMWithHLC(st1, NewHLC()))
 	st2 := store.NewMVCCStore()
-	r2, stop2 := newSingleRaft(t, "lr-g2", NewKvFSM(st2))
+	r2, stop2 := newSingleRaft(t, "lr-g2", NewKvFSMWithHLC(st2, NewHLC()))
 
 	e1 := hashicorpraftengine.New(r1)
 	e2 := hashicorpraftengine.New(r2)
@@ -206,7 +206,7 @@ func TestLockResolver_LeaderOnlyExecution(t *testing.T) {
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "lr-leader", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "lr-leader", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
 	e := hashicorpraftengine.New(r)
@@ -237,7 +237,7 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "lr-close", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "lr-close", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
 	e := hashicorpraftengine.New(r)

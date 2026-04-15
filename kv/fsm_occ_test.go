@@ -16,7 +16,7 @@ func TestValidateConflictsDetectsStaleWrite(t *testing.T) {
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v1"), 50, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v2")}}
@@ -27,7 +27,7 @@ func TestValidateConflictsDetectsStaleWrite(t *testing.T) {
 func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	// First write commits at ts=100.
@@ -77,7 +77,7 @@ func TestOnePhaseTxnDetectsWriteConflict(t *testing.T) {
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v1"), 100, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	// One-phase txn with startTS < latest commit (100) should be rejected.
@@ -115,7 +115,7 @@ func TestOnePhaseTxnDetectsReadWriteConflictViaReadKeys(t *testing.T) {
 	// Concurrent write: "rk" committed at ts=100, after T_a's startTS=90.
 	require.NoError(t, st.PutAt(ctx, []byte("rk"), []byte("concurrent"), 100, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	// T_a one-phase txn: startTS=90, writes "wk", reads "rk" (stale).
@@ -147,7 +147,7 @@ func TestOnePhaseTxnAllowsReadKeyWhenNoConflict(t *testing.T) {
 	// "rk" committed at ts=80, before T_a's startTS=100 — not stale.
 	require.NoError(t, st.PutAt(ctx, []byte("rk"), []byte("old"), 80, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	req := &pb.Request{
@@ -178,7 +178,7 @@ func TestOnePhaseTxnNilReadKeysSkipsReadWriteValidation(t *testing.T) {
 	// "rk" committed at ts=200 — would trigger a conflict if tracked.
 	require.NoError(t, st.PutAt(ctx, []byte("rk"), []byte("newer"), 200, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	// nil ReadKeys: read-write check is skipped entirely.
@@ -211,7 +211,7 @@ func TestOnePhaseTxnTOCTOUScenario(t *testing.T) {
 	// Initial value seen by T_a.
 	require.NoError(t, st.PutAt(ctx, []byte("balance"), []byte("100"), 50, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	// T_b commits a newer version while T_a is in flight.
@@ -247,7 +247,7 @@ func TestPrepareRequestDetectsReadWriteConflictViaReadKeys(t *testing.T) {
 	// "rk" committed at ts=100, after T_a's startTS=90.
 	require.NoError(t, st.PutAt(ctx, []byte("rk"), []byte("concurrent"), 100, 0))
 
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	req := &pb.Request{

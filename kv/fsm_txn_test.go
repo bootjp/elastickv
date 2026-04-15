@@ -33,7 +33,7 @@ func TestTxnDuplicateMutations_LastWriteWins(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -71,7 +71,7 @@ func TestPrepareAllowsIdempotentRetryForSameStartTSAndPrimary(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -96,7 +96,7 @@ func TestPrepareRejectsSameStartTSDifferentPrimary(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -132,7 +132,7 @@ func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(13)
@@ -183,7 +183,7 @@ func TestCommitIsIdempotentOnSecondaryShardWhenKeyAlreadyCommitted(t *testing.T)
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(15)
@@ -255,7 +255,7 @@ func TestCommitPropagatesSecondaryShardLatestCommitTSError(t *testing.T) {
 	require.NoError(t, underlying.PutAt(ctx, userKey, []byte("other"), commitTS+1, 0))
 
 	errorStore := erroringLatestCommitStore{MVCCStore: underlying, key: userKey}
-	fsm, ok := NewKvFSM(errorStore).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(errorStore, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	commit := &pb.Request{
@@ -276,7 +276,7 @@ func TestCommitRejectsMissingPrimaryKey(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(12)
@@ -302,7 +302,7 @@ func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(11)
@@ -346,7 +346,7 @@ func TestPrepareClampsHugeLockTTL(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(12)
@@ -379,7 +379,7 @@ func TestOnePhaseTxnCommitsWithoutTxnArtifacts(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(15)

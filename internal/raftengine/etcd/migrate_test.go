@@ -87,7 +87,7 @@ func TestMigrateFSMStoreSeedsEtcdDataDir(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      destDataDir,
-		StateMachine: kvFSMAdapter{fsm: kv.NewKvFSM(destStore)},
+		StateMachine: kvFSMAdapter{fsm: kv.NewKvFSMWithHLC(destStore, kv.NewHLC())},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

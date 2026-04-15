@@ -339,7 +339,11 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 
 	for i := range n {
 		st := store.NewMVCCStore()
-		fsm := kv.NewKvFSM(st)
+		// Share a single HLC between the FSM and the coordinator so the FSM can
+		// advance physicalCeiling (via HLC lease Raft entries) and the coordinator
+		// reads it inside Next() to floor timestamps above the previous leader's window.
+		hlc := kv.NewHLC()
+		fsm := kv.NewKvFSMWithHLC(st, hlc)
 
 		port := ports[i]
 		grpcSock := lis[i].grpc
@@ -357,11 +361,12 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 
 		s := grpc.NewServer(internalutil.GRPCServerOptions()...)
 		trx := kv.NewTransaction(r)
-		coordinator := kv.NewCoordinator(trx, r)
+		coordinator := kv.NewCoordinator(trx, r, kv.WithHLC(hlc))
 		relay := NewRedisPubSubRelay()
 		routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 		gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
 		opsCtx, opsCancel := context.WithCancel(ctx)
+		go coordinator.RunHLCLeaseRenewal(opsCtx)
 		tm.Register(s)
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)

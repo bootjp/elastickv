@@ -131,6 +131,10 @@ func run() error {
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
 
+	// Create the shared HLC before building shard groups so every FSM can update
+	// physicalCeiling when HLC lease entries are applied to the Raft log.
+	clock := kv.NewHLC()
+
 	runtimes, shardGroups, err := buildShardGroups(
 		*raftId,
 		*raftDir,
@@ -142,6 +146,7 @@ func run() error {
 		func(groupID uint64) kv.ProposalObserver {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
+		clock,
 	)
 	if err != nil {
 		return err
@@ -151,7 +156,6 @@ func run() error {
 	defer cleanup.Run()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	clock := kv.NewHLC()
 	readTracker := kv.NewActiveTimestampTracker()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
@@ -185,6 +189,10 @@ func run() error {
 	)
 	eg.Go(func() error {
 		return compactor.Run(runCtx)
+	})
+	eg.Go(func() error {
+		coordinate.RunHLCLeaseRenewal(runCtx)
+		return nil
 	})
 
 	runner := runtimeServerRunner{
@@ -379,6 +387,7 @@ func buildShardGroups(
 	bootstrapServers []raft.Server,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
+	clock *kv.HLC,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
@@ -391,7 +400,9 @@ func buildShardGroups(
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
 		}
-		sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSM(st))
+		// Each shard FSM shares the same HLC so any shard's lease renewal advances
+		// the global physicalCeiling. The logical counter remains in-memory only.
+		sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSMWithHLC(st, clock))
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory)
 		if err != nil {
 			for _, rt := range runtimes {
