@@ -4000,38 +4000,56 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 	// Real DynamoDB rejects requests with multiple operations on the same item.
 	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		tableName, err := transactWriteItemTableName(item)
-		if err != nil {
+		if err := d.processTransactWriteItem(ctx, item, readTS, reqs, schemaCache, seenItemKeys, tableGenerations, &cleanup); err != nil {
 			return nil, nil, nil, err
 		}
-		schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		// Reject duplicate item keys to match real DynamoDB behavior.
-		itemKeyStr, err := transactWriteItemPrimaryKeyStr(schema, item)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		compositeKey := tableName + "\x00" + itemKeyStr
-		if _, dup := seenItemKeys[compositeKey]; dup {
-			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
-				"Transaction request cannot include multiple operations on one item")
-		}
-		seenItemKeys[compositeKey] = struct{}{}
-		plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		reqs.Elems = append(reqs.Elems, plan.elems...)
-		reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
-		if !plan.writes {
-			continue
-		}
-		tableGenerations[tableName] = schema.Generation
-		cleanup = append(cleanup, plan.cleanup...)
 	}
 	return reqs, tableGenerations, cleanup, nil
+}
+
+// processTransactWriteItem validates and plans a single item within a
+// TransactWriteItems request, appending the resulting ops to reqs and cleanup.
+func (d *DynamoDBServer) processTransactWriteItem(
+	ctx context.Context,
+	item transactWriteItem,
+	readTS uint64,
+	reqs *kv.OperationGroup[kv.OP],
+	schemaCache map[string]*dynamoTableSchema,
+	seenItemKeys map[string]struct{},
+	tableGenerations map[string]uint64,
+	cleanup *[][]byte,
+) error {
+	tableName, err := transactWriteItemTableName(item)
+	if err != nil {
+		return err
+	}
+	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
+	if err != nil {
+		return err
+	}
+	// Reject duplicate item keys to match real DynamoDB behavior.
+	itemKeyStr, err := transactWriteItemPrimaryKeyStr(schema, item)
+	if err != nil {
+		return err
+	}
+	compositeKey := tableName + "\x00" + itemKeyStr
+	if _, dup := seenItemKeys[compositeKey]; dup {
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+			"Transaction request cannot include multiple operations on one item")
+	}
+	seenItemKeys[compositeKey] = struct{}{}
+	plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
+	if err != nil {
+		return err
+	}
+	reqs.Elems = append(reqs.Elems, plan.elems...)
+	reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
+	if !plan.writes {
+		return nil
+	}
+	tableGenerations[tableName] = schema.Generation
+	*cleanup = append(*cleanup, plan.cleanup...)
+	return nil
 }
 
 // transactWriteItemPrimaryKeyStr returns a canonical JSON string of the item's
@@ -4055,7 +4073,18 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
-	b, err := json.Marshal(keyAttrs)
+	// Normalize numeric attribute values so that equivalent numbers (e.g. "10"
+	// and "10.0") produce the same canonical key string and are reliably detected
+	// as duplicates during JSON marshalling.
+	normalized := make(map[string]attributeValue, len(keyAttrs))
+	for k, v := range keyAttrs {
+		if v.N != nil {
+			n := canonicalNumberString(*v.N)
+			v.N = &n
+		}
+		normalized[k] = v
+	}
+	b, err := json.Marshal(normalized)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to serialize transact item key")
 	}
@@ -4063,9 +4092,9 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 }
 
 type transactWriteItemPlan struct {
-	elems    []*kv.Elem[kv.OP]
-	cleanup  [][]byte
-	writes   bool
+	elems   []*kv.Elem[kv.OP]
+	cleanup [][]byte
+	writes  bool
 	// readKeys contains the raw storage keys that were read during plan
 	// construction.  They are propagated into OperationGroup.ReadKeys so the
 	// FSM can validate read-write conflicts atomically at commit time,

@@ -113,7 +113,7 @@ const (
 )
 
 const (
-	redisDispatchTimeout = 10 * time.Second
+	redisDispatchTimeout     = 10 * time.Second
 	redisFlushLegacyTimeout  = 10 * time.Minute
 	redisRelayPublishTimeout = 2 * time.Second
 	redisTraceArgLimit       = 6
@@ -2181,10 +2181,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		startTS, err := r.txnStartTS()
-		if err != nil {
-			return err
-		}
+		startTS := r.txnStartTS()
 		readPin := r.pinReadTS(startTS)
 		defer readPin.Release()
 
@@ -2223,7 +2220,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return results, nil
 }
 
-func (r *RedisServer) txnStartTS() (uint64, error) {
+func (r *RedisServer) txnStartTS() uint64 {
 	// store.LastCommitTS() is the authoritative safe-snapshot watermark: it is
 	// updated atomically only AFTER the corresponding Pebble batch commit, so
 	// every version with commitTS ≤ store.LastCommitTS() is guaranteed visible
@@ -2244,6 +2241,10 @@ func (r *RedisServer) txnStartTS() (uint64, error) {
 	//
 	// The Observe call still advances the HLC so that dispatchTxn's clock.Next()
 	// produces a commitTS strictly greater than maxTS (leader-election safety).
+	//
+	// When maxTS is 0 (empty store) we return 1 so the coordinator treats this
+	// as a valid startTS and does not override it with clock.Next() — which
+	// could be ahead of unapplied Raft entries and reintroduce the anomaly.
 	var maxTS uint64
 	if r.store != nil {
 		maxTS = r.store.LastCommitTS()
@@ -2252,9 +2253,9 @@ func (r *RedisServer) txnStartTS() (uint64, error) {
 		r.coordinator.Clock().Observe(maxTS)
 	}
 	if maxTS == 0 {
-		return 1, nil
+		return 1
 	}
-	return maxTS, nil
+	return maxTS
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
