@@ -2198,19 +2198,28 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// txnStartTS is only called on the leader (followers proxy MULTI/EXEC via
-	// proxyTransactionToLeader before reaching runTransaction). The leader's
-	// HLC clock is authoritative — Observe the highest known committed
-	// timestamp before issuing the next tick so the clock never goes backwards.
+	// store.LastCommitTS() is the authoritative safe-snapshot watermark: it is
+	// updated atomically only AFTER the corresponding Pebble batch commit, so
+	// every version with commitTS ≤ store.LastCommitTS() is guaranteed visible
+	// in the store when we read.
 	//
-	// store.LastCommitTS() covers the leader-election case: when a new leader
-	// is elected its in-memory HLC starts from wall-clock time (zero logical),
-	// which may be lower than the previous leader's last commit timestamp
-	// (stored in the MVCC layer and applied via FSM). Without this Observe
-	// call the new leader could issue a startTS below already-committed
-	// versions, causing spurious write-conflict retries. The FSM conflict check
-	// would still catch any real violations, but observing LastCommitTS here
-	// avoids the unnecessary retry loop.
+	// We must NOT return clock.Next() here.  clock.Next() can be AHEAD of
+	// store.LastCommitTS() because concurrent dispatchTxn calls advance the HLC
+	// before their Raft entry is applied.  If startTS = clock.Next() = T, a
+	// concurrent transaction that already called clock.Next() to obtain
+	// commitTS = T-1 and is still in the Raft pipeline will satisfy
+	//   latestTS(key) = T-1  ≤  T = startTS
+	// causing the FSM conflict check (latestTS > startTS) to silently pass even
+	// though we read stale data.  This allows two concurrent RPUSHes to pick the
+	// same sequence number, with the second overwriting the first — a lost write.
+	//
+	// Returning maxTS (= store.LastCommitTS() in practice, or the per-key
+	// Pebble-read value in the narrow window before lastCommitTS is updated)
+	// closes this gap: any concurrent commit at > maxTS triggers a
+	// WriteConflict and a retry via retryRedisWrite.
+	//
+	// The Observe call still advances the HLC so that dispatchTxn's clock.Next()
+	// produces a commitTS strictly greater than maxTS (leader-election safety).
 	if r.store != nil {
 		if storeTS := r.store.LastCommitTS(); storeTS > maxTS {
 			maxTS = storeTS
@@ -2219,10 +2228,7 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
-	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return maxTS + 1, nil
-	}
-	return r.coordinator.Clock().Next(), nil
+	return maxTS, nil
 }
 
 func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) (uint64, error) {
