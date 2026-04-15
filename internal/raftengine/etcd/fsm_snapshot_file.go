@@ -398,6 +398,37 @@ func openFSMSnapshotPayloadReader(path string) (io.ReadCloser, error) {
 	}, nil
 }
 
+// openFSMSnapshotFile opens the .fsm file at path and returns the *os.File.
+// Used by callers that need to control the lock scope separately from the stat
+// (e.g. engine.openFSMPayloadLocked).
+func openFSMSnapshotFile(path string) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, statFSMFileError(err)
+	}
+	return f, nil
+}
+
+// openFSMPayloadFromFD wraps an already-open .fsm file descriptor in a
+// ReadCloser scoped to the payload bytes (file size minus the 4-byte CRC
+// footer). The size is obtained via fstat on the open fd (no path lookup).
+// On any error the file is closed before returning.
+func openFSMPayloadFromFD(f *os.File) (io.ReadCloser, error) {
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, errors.WithStack(err)
+	}
+	if info.Size() < fsmMinFileSize {
+		_ = f.Close()
+		return nil, errors.WithStack(ErrFSMSnapshotTooSmall)
+	}
+	return &limitedReadCloser{
+		Reader: io.LimitReader(f, info.Size()-fsmFooterSize),
+		Closer: f,
+	}, nil
+}
+
 // statFSMFileError converts an os.Stat error to the appropriate typed error.
 func statFSMFileError(err error) error {
 	if os.IsNotExist(err) {

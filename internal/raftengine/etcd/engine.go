@@ -1283,14 +1283,20 @@ func (e *Engine) readFSMPayloadLocked(index uint64) ([]byte, error) {
 	return readFSMSnapshotPayload(fsmSnapPath(e.fsmSnapDir, index))
 }
 
-// openFSMPayloadLocked opens the .fsm payload file for the given index while
-// holding snapshotMu. The lock is released once the file descriptor is obtained;
-// Unix semantics guarantee the fd remains readable even if purgeOldSnapshotFiles
-// subsequently unlinks the file. The caller must close the returned ReadCloser.
+// openFSMPayloadLocked opens the .fsm payload file for the given index, holding
+// snapshotMu only for the duration of os.Open. Once the file descriptor is
+// obtained, Unix semantics guarantee it remains readable even after
+// purgeOldSnapshotFiles unlinks the file, so the lock can be released before
+// the fstat call. The caller must close the returned ReadCloser.
 func (e *Engine) openFSMPayloadLocked(index uint64) (io.ReadCloser, error) {
+	path := fsmSnapPath(e.fsmSnapDir, index)
 	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-	return openFSMSnapshotPayloadReader(fsmSnapPath(e.fsmSnapDir, index))
+	f, err := openFSMSnapshotFile(path)
+	e.snapshotMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return openFSMPayloadFromFD(f)
 }
 
 // snapshotPayload takes a FSM snapshot for the given index, writes it to the
