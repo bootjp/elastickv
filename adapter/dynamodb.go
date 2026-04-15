@@ -4315,8 +4315,10 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
 	if !found {
-		// Item does not exist at readTS; still track the key so the FSM can
-		// detect a concurrent write that creates the item after our snapshot.
+		// Item does not exist at readTS. Track the key so a concurrent create
+		// after our snapshot can be detected if the overall transaction
+		// includes write elems and therefore reaches FSM validation. In a
+		// pure no-op transaction, these read keys may not be validated.
 		return &transactWriteItemPlan{readKeys: [][]byte{itemKey}}, nil
 	}
 	req, err := buildItemDeleteRequestWithSource(currentLocation)
