@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -24,6 +26,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"github.com/hashicorp/raft"
 )
 
 const (
@@ -123,6 +126,7 @@ type DynamoDBServer struct {
 	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
+	leaderDynamo    map[raft.ServerAddress]string
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -135,6 +139,18 @@ func WithDynamoDBRequestObserver(observer monitoring.DynamoDBRequestObserver) Dy
 func WithDynamoDBActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
 		server.readTracker = tracker
+	}
+}
+
+// WithDynamoDBLeaderMap configures the Raft-address-to-DynamoDB-address mapping
+// used to forward requests from followers to the current leader.
+// The format mirrors the raftRedisMap / raftS3Map convention.
+func WithDynamoDBLeaderMap(m map[raft.ServerAddress]string) DynamoDBServerOption {
+	return func(server *DynamoDBServer) {
+		server.leaderDynamo = make(map[raft.ServerAddress]string, len(m))
+		for k, v := range m {
+			server.leaderDynamo[k] = v
+		}
 	}
 }
 
@@ -264,8 +280,39 @@ func (d *DynamoDBServer) Stop() {
 	}
 }
 
+// proxyToLeader forwards the HTTP request to the current DynamoDB leader when
+// this node is not the Raft leader.  Returns true if the request was proxied
+// (caller must not write a response), false if the request should be handled
+// locally.
+func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if len(d.leaderDynamo) == 0 || d.coordinator == nil {
+		return false
+	}
+	if d.coordinator.IsLeader() {
+		return false
+	}
+	leader := d.coordinator.RaftLeader()
+	if leader == "" {
+		return false
+	}
+	targetAddr, ok := d.leaderDynamo[leader]
+	if !ok || strings.TrimSpace(targetAddr) == "" {
+		return false
+	}
+	target := &url.URL{Scheme: "http", Host: targetAddr}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
+		writeDynamoError(rw, http.StatusServiceUnavailable, dynamoErrInternal, "leader proxy error: "+err.Error())
+	}
+	proxy.ServeHTTP(w, r)
+	return true
+}
+
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	if d.serveHealthz(w, r) {
+		return
+	}
+	if d.proxyToLeader(w, r) {
 		return
 	}
 
