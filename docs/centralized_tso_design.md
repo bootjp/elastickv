@@ -224,9 +224,16 @@ func (s *tsoSnapshot) Close() error { return nil }
 
 The hot path is **lock-free** via `atomic.Pointer[windowSnapshot]`.
 Each `windowSnapshot` is an **immutable** struct published atomically on refill:
-`base` is never written after the pointer is stored, so reading `w.base` after a
-successful CAS on `w.offset` is always safe — there is no window where an old
-offset could be combined with a new base.
+`base` is never written after the pointer is stored, so reading `w.base` after
+claiming a slot via `w.offset.Add(1)` is always safe — there is no window where
+an old offset could be combined with a new base.
+
+The hot path uses `w.offset.Add(1)` rather than a CAS loop. Under high
+contention, `Add` is more efficient: every goroutine obtains a unique offset
+in a single atomic operation with no retry, whereas a CAS loop retries until
+it wins. Goroutines that receive an out-of-bounds offset (≥ size) fall through
+to the slow path; they hold a pointer to the old struct, which is safe because
+the struct is never mutated after publish.
 
 This eliminates the split-atomic race that would arise from storing `batchBase`
 and `offset` as two separate atomics: a goroutine that loads the new `batchBase`
@@ -242,11 +249,11 @@ mutated after it is published.
 ```go
 // windowSnapshot is an immutable description of one timestamp batch window.
 // base is set once when the struct is created and never modified; it is safe
-// to read concurrently with CAS operations on offset.
+// to read concurrently with atomic Add operations on offset.
 type windowSnapshot struct {
-    base uint64        // first timestamp in this window (immutable after publish)
-    size int           // number of slots in this window (immutable after publish)
-    offset atomic.Uint64 // next slot to claim; callers CAS from off to off+1
+    base uint64          // first timestamp in this window (immutable after publish)
+    size int             // number of slots in this window (immutable after publish)
+    offset atomic.Uint64 // slot counter; callers do Add(1) to claim a slot
 }
 
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
@@ -254,8 +261,8 @@ type windowSnapshot struct {
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
 //
 // Concurrency model:
-//   Hot path  – lock-free CAS on w.offset inside an immutable windowSnapshot;
-//               no mutex acquired on the common case.
+//   Hot path  – lock-free Add(1) on w.offset inside an immutable windowSnapshot;
+//               no mutex acquired on the common case; no CAS retry loop.
 //   Slow path – mutex guards refill handoff only; I/O is always outside it.
 //               Goroutines that loaded the old window pointer before the swap
 //               continue using it safely (the struct is never mutated).
@@ -289,17 +296,17 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             return 0, err
         }
 
-        // Fast path: try to claim a slot in the current window (lock-free).
-        // We load the pointer once; all reads and CAS operate on the *same*
-        // struct, so base cannot change between the CAS and the base read.
+        // Fast path: claim a slot in the current window via atomic Add (lock-free).
+        // We load the pointer once; Add and base read operate on the *same* struct,
+        // so base cannot change after the Add — it is immutable for the window's
+        // lifetime. Add(1) is preferred over CAS because it never retries: every
+        // caller receives a unique offset in one atomic operation.
         if w := b.win.Load(); w != nil {
-            off := w.offset.Load()
+            off := w.offset.Add(1) - 1 // claim slot; off is the 0-based index
             if off < uint64(w.size) {
-                if w.offset.CompareAndSwap(off, off+1) {
-                    return w.base + off, nil // base is immutable; safe to read here
-                }
-                continue // CAS lost to another goroutine; retry
+                return w.base + off, nil // base is immutable; safe to read here
             }
+            // off >= size: this window is exhausted; fall through to slow path.
         }
 
         // Slow path: window is nil or exhausted; trigger or await a refill.
@@ -336,11 +343,18 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
         // The window is published inside the defer, under the mutex, before ch
         // is closed, so waiters that wake on <-ch are guaranteed to see the new
         // window on their next fast-path attempt.
-        var newBase uint64
+        // success is set to true only after NextBatch returns without error.
+        // Using an explicit flag (rather than checking retErr == nil in the defer)
+        // guards against the panic case: if NextBatch panics, retErr is still nil
+        // (zero value) but success remains false, so no zero-base window is published.
+        var (
+            newBase uint64
+            success bool
+        )
         err := func() (retErr error) {
             defer func() {
                 b.mu.Lock()
-                if retErr == nil {
+                if success {
                     // Publish a fresh immutable window. Any goroutine that loaded
                     // the previous pointer before this Store continues to use it
                     // safely — the old struct is never mutated after publish.
@@ -351,6 +365,7 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
                 close(ch) // unblock all waiters after window is visible
             }()
             newBase, retErr = b.tso.NextBatch(ctx, b.batchSize)
+            success = (retErr == nil)
             return
         }()
 
