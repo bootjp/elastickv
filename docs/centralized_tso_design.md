@@ -166,12 +166,10 @@ func (f *TSOStateMachine) Snapshot() (raft.FSMSnapshot, error) {
 }
 
 // Restore deserialises the ceiling and updates the shared HLC.
-func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
-    defer func() {
-        if err := r.Close(); err != nil {
-            slog.Warn("tso restore: failed to close snapshot reader", slog.Any("err", err))
-        }
-    }()
+// The signature uses io.Reader (not io.ReadCloser) to align with the
+// project's internal raftengine.StateMachine interface; the caller owns
+// the reader and is responsible for closing it.
+func (f *TSOStateMachine) Restore(r io.Reader) error {
     var buf [8]byte
     if _, err := io.ReadFull(r, buf[:]); err != nil {
         return err
@@ -182,6 +180,25 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
     }
     return nil
 }
+
+// tsoSnapshot is the raft.FSMSnapshot produced by TSOStateMachine.Snapshot().
+// It serialises the HLC physical ceiling as 8 big-endian bytes — the entire
+// persisted state of the TSO Raft group.
+type tsoSnapshot struct {
+    ceiling int64
+}
+
+func (s *tsoSnapshot) Persist(sink raft.SnapshotSink) error {
+    var buf [8]byte
+    binary.BigEndian.PutUint64(buf[:], uint64(s.ceiling))
+    if _, err := sink.Write(buf[:]); err != nil {
+        _ = sink.Cancel()
+        return err
+    }
+    return sink.Close()
+}
+
+func (s *tsoSnapshot) Release() {}
 ```
 
 ### 3.5 Batch Allocator
@@ -190,53 +207,63 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
 ┌──────────────────────────────────────────────────────┐
 │  BatchAllocator                                        │
 │                                                        │
-│  current window: batchBase ... batchBase + batchSize   │
-│  hot path:       CAS on offset counter (lock-free)     │
+│  current window: atomic.Pointer[windowSnapshot]        │
+│  hot path:       CAS on offset inside immutable struct │
 │                                                        │
-│  when offset >= batchSize:                             │
+│  when offset >= size:                                  │
 │    → call TSOAllocator.NextBatch() for a new window    │
 │    → single Raft round-trip amortised over batchSize   │
 └──────────────────────────────────────────────────────┘
 ```
 
-The hot path is **lock-free**: a single `atomic.Uint64` (`offset`) tracks the
-current position within the window. Callers increment it via CAS without ever
-acquiring a mutex. A split-atomic race between `batchBase` and `offset` is
-avoided by always writing `batchBase` **before** resetting `offset` to zero;
-because Go's `sync/atomic` operations are sequentially consistent, any goroutine
-that reads `offset < batchSize` is guaranteed to also observe the updated
-`batchBase`.
+The hot path is **lock-free** via `atomic.Pointer[windowSnapshot]`.
+Each `windowSnapshot` is an **immutable** struct published atomically on refill:
+`base` is never written after the pointer is stored, so reading `w.base` after a
+successful CAS on `w.offset` is always safe — there is no window where an old
+offset could be combined with a new base.
+
+This eliminates the split-atomic race that would arise from storing `batchBase`
+and `offset` as two separate atomics: a goroutine that loads the new `batchBase`
+before the old `offset` is overwritten would silently return an out-of-range
+timestamp.
 
 The slow path (window exhausted) uses a lightweight mutex **only** for refill
 coordination. The network call to `NextBatch` is always made outside the lock,
-so I/O never blocks concurrent callers. Waiters block on a closed channel rather
-than spinning, and all waits respect context cancellation.
+so I/O never blocks concurrent callers. Goroutines that still hold a pointer to
+the old `windowSnapshot` continue to use it safely — the struct is never
+mutated after it is published.
 
 ```go
+// windowSnapshot is an immutable description of one timestamp batch window.
+// base is set once when the struct is created and never modified; it is safe
+// to read concurrently with CAS operations on offset.
+type windowSnapshot struct {
+    base uint64        // first timestamp in this window (immutable after publish)
+    size int           // number of slots in this window (immutable after publish)
+    offset atomic.Uint64 // next slot to claim; callers CAS from off to off+1
+}
+
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
 // serves them locally without a Raft round-trip until the window is exhausted.
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
 //
 // Concurrency model:
-//   Hot path  – lock-free CAS on offset; no mutex acquired.
-//   Slow path – mutex guards only the refill handoff; I/O is always outside it.
-//
-// Ordering invariant: batchBase is stored before offset is reset to 0 so that
-// readers observing offset < batchSize always see the matching base value
-// (guaranteed by Go's sequentially-consistent atomics).
+//   Hot path  – lock-free CAS on w.offset inside an immutable windowSnapshot;
+//               no mutex acquired on the common case.
+//   Slow path – mutex guards refill handoff only; I/O is always outside it.
+//               Goroutines that loaded the old window pointer before the swap
+//               continue using it safely (the struct is never mutated).
 type BatchAllocator struct {
     tso       TSOAllocator
     batchSize int
 
-    // batchBase is the starting timestamp of the current window.
-    // It is written under mu before offset is reset, making the pair coherent.
-    batchBase atomic.Uint64
-    // offset counts consumed slots in [0, batchSize). When offset >= batchSize
-    // the window is exhausted and a refill is needed.
-    offset atomic.Uint64
+    // win holds the current batch window. A new *windowSnapshot is stored
+    // atomically on every refill; the old pointer remains valid for any
+    // goroutine that loaded it before the swap.
+    win atomic.Pointer[windowSnapshot]
 
-    mu         sync.Mutex    // guards refill coordination only, not the hot path
-    refillDone chan struct{}  // non-nil while a refill is in progress; closed on completion
+    mu         sync.Mutex   // guards refill coordination only, not the hot path
+    refillDone chan struct{} // non-nil while a refill is in progress; closed on completion
 }
 
 func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
@@ -246,9 +273,8 @@ func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
     if batchSize <= 0 {
         panic("batchSize must be positive")
     }
-    b := &BatchAllocator{tso: tso, batchSize: batchSize}
-    b.offset.Store(uint64(batchSize)) // window starts exhausted; first call triggers refill
-    return b
+    return &BatchAllocator{tso: tso, batchSize: batchSize}
+    // win is nil; the first Next() call triggers an immediate refill.
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
@@ -258,25 +284,27 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
         }
 
         // Fast path: try to claim a slot in the current window (lock-free).
-        off := b.offset.Load()
-        if off < uint64(b.batchSize) {
-            if b.offset.CompareAndSwap(off, off+1) {
-                // batchBase is stable for the lifetime of this window and was
-                // written before offset was reset, so this load is safe.
-                return b.batchBase.Load() + off, nil
+        // We load the pointer once; all reads and CAS operate on the *same*
+        // struct, so base cannot change between the CAS and the base read.
+        if w := b.win.Load(); w != nil {
+            off := w.offset.Load()
+            if off < uint64(w.size) {
+                if w.offset.CompareAndSwap(off, off+1) {
+                    return w.base + off, nil // base is immutable; safe to read here
+                }
+                continue // CAS lost to another goroutine; retry
             }
-            continue // CAS lost; another goroutine claimed this slot; retry
         }
 
-        // Slow path: window exhausted; trigger or await a refill.
+        // Slow path: window is nil or exhausted; trigger or await a refill.
         b.mu.Lock()
-        // Re-check under lock: a concurrent goroutine may have just refilled.
-        if b.offset.Load() < uint64(b.batchSize) {
+        // Re-check under lock: another goroutine may have installed a new window.
+        if w := b.win.Load(); w != nil && w.offset.Load() < uint64(w.size) {
             b.mu.Unlock()
             continue
         }
         if b.refillDone != nil {
-            // A refill is already in progress; wait for it without holding the lock.
+            // A refill is already in flight; wait without holding the lock.
             ch := b.refillDone
             b.mu.Unlock()
             select {
@@ -287,7 +315,7 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             }
         }
 
-        // This goroutine drives the refill.
+        // This goroutine is responsible for the refill.
         ch := make(chan struct{})
         b.refillDone = ch
         b.mu.Unlock()
@@ -297,12 +325,12 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
 
         b.mu.Lock()
         if err == nil {
-            // Write batchBase before resetting offset so readers always see
-            // a consistent (base, offset) pair (ordering invariant above).
-            b.batchBase.Store(newBase)
-            b.offset.Store(0) // open the new window
+            // Publish a fresh immutable window. Any goroutine that loaded the
+            // previous pointer before this Store continues to use it safely.
+            w := &windowSnapshot{base: newBase, size: b.batchSize}
+            b.win.Store(w)
         }
-        b.refillDone = nil // clear before close so waiters retry the fast path
+        b.refillDone = nil // clear before close so waiters re-enter the fast path
         b.mu.Unlock()
         close(ch) // unblock all waiters
 
