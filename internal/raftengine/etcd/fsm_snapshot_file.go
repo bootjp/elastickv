@@ -480,14 +480,22 @@ func cleanupStaleFSMSnaps(snapDir, fsmSnapDir string, disableStartupCRCCheck boo
 }
 
 func removeFSMTmpOrphans(fsmSnapDir string) error {
-	tmps, err := filepath.Glob(filepath.Join(fsmSnapDir, "*.fsm.tmp"))
+	// Use os.ReadDir + strings.HasSuffix instead of filepath.Glob to avoid
+	// misinterpretation of special characters (e.g. '[', ']') in fsmSnapDir
+	// that glob treats as pattern syntax.
+	entries, err := os.ReadDir(fsmSnapDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return errors.WithStack(err)
 	}
 	var combined error
-	for _, tmp := range tmps {
-		if removeErr := os.Remove(tmp); removeErr != nil && !os.IsNotExist(removeErr) {
-			combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".fsm.tmp") {
+			if removeErr := os.Remove(filepath.Join(fsmSnapDir, e.Name())); removeErr != nil && !os.IsNotExist(removeErr) {
+				combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
+			}
 		}
 	}
 	return errors.WithStack(combined)
@@ -618,6 +626,9 @@ func purgeSnapPair(snapDir, fsmSnapDir, snapName string) error {
 }
 
 func syncDirIfExists(dir string) error {
+	if dir == "" {
+		return nil
+	}
 	if err := syncDir(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
