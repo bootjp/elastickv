@@ -239,7 +239,11 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() {
+		if closeErr := rc.Close(); closeErr != nil {
+			slog.Warn("failed to close FSM snapshot reader", "index", index, "error", closeErr)
+		}
+	}()
 
 	header, err := snapshotMessageHeader(msg)
 	if err != nil {

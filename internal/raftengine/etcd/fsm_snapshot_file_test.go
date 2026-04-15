@@ -194,9 +194,9 @@ func TestOpenAndRestoreFSMSnapshotTokenMismatch(t *testing.T) {
 
 func TestOpenAndRestoreFSMSnapshotTooSmall(t *testing.T) {
 	dir := t.TempDir()
-	// Write a file with fewer than 5 bytes.
+	// Write a file with fewer than fsmFooterSize (4) bytes.
 	path := fsmSnapPath(dir, 99)
-	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03, 0x04}, 0o600))
+	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03}, 0o600))
 
 	fsm := &dummyFSM{}
 	err := openAndRestoreFSMSnapshot(fsm, path, 0)
@@ -398,7 +398,7 @@ func TestReadFSMSnapshotPayloadBadCRC(t *testing.T) {
 func TestReadFSMSnapshotPayloadTooSmall(t *testing.T) {
 	dir := t.TempDir()
 	path := fsmSnapPath(dir, 7)
-	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03, 0x04}, 0o600))
+	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03}, 0o600))
 
 	_, err := readFSMSnapshotPayload(path)
 	require.ErrorIs(t, err, ErrFSMSnapshotTooSmall)

@@ -24,8 +24,9 @@ const (
 	// fsmFooterSize is the size of the CRC32C footer appended to each .fsm file.
 	fsmFooterSize = 4
 
-	// fsmMinFileSize is the minimum valid .fsm size: at least 1 byte payload + 4 bytes CRC footer.
-	fsmMinFileSize = fsmFooterSize + 1
+	// fsmMinFileSize is the minimum valid .fsm size: 0 bytes payload + 4 bytes CRC footer.
+	// A state machine with empty state writes only the 4-byte CRC footer, which is valid.
+	fsmMinFileSize = fsmFooterSize
 
 	// snapshotTokenMagicLen is the number of magic bytes at the start of a token.
 	snapshotTokenMagicLen = 4
@@ -516,9 +517,9 @@ func removeStaleFSMFile(fsmSnapDir, name string, liveIndexes map[uint64]bool, di
 	if disableStartupCRCCheck {
 		return
 	}
-	if verifyErr := verifyFSMSnapshotFile(fsmPath, 0); errors.Is(verifyErr, ErrFSMSnapshotFileCRC) {
-		slog.Warn("removing corrupt fsm snapshot", "path", fsmPath, "error", verifyErr)
-		removeWithWarn(fsmPath, "corrupt fsm snapshot")
+	if verifyErr := verifyFSMSnapshotFile(fsmPath, 0); verifyErr != nil && !errors.Is(verifyErr, ErrFSMSnapshotNotFound) {
+		slog.Warn("removing invalid fsm snapshot", "path", fsmPath, "error", verifyErr)
+		removeWithWarn(fsmPath, "invalid fsm snapshot")
 	}
 }
 
