@@ -830,6 +830,20 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 	conn.WriteInt(changed)
 }
 
+// setMemberExists reports whether a member exists in the set at readTS,
+// checking the wide-column store first and falling back to the legacy member
+// map when a migration is in progress (wide-column keys don't exist yet).
+func (r *RedisServer) setMemberExists(ctx context.Context, memberKey []byte, member []byte, legacyMembers map[string]struct{}, readTS uint64) (bool, error) {
+	exists, err := r.store.ExistsAt(ctx, memberKey, readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	if !exists && legacyMembers != nil {
+		_, exists = legacyMembers[string(member)]
+	}
+	return exists, nil
+}
+
 // mutateExactSetWide handles SADD/SREM for the wide-column set path.
 func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, key []byte, members [][]byte, add bool) {
 	var changed int
@@ -843,7 +857,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		commitTS := r.coordinator.Clock().Next()
 		elems := make([]*kv.Elem[kv.OP], 0, len(members)+setWideColOverhead)
 
-		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
+		migrationElems, legacyMembers, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
 		if migErr != nil {
 			return migErr
 		}
@@ -853,9 +867,9 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		lenDelta := int64(0)
 		for _, member := range members {
 			memberKey := store.SetMemberKey(key, member)
-			exists, existsErr := r.store.ExistsAt(ctx, memberKey, readTS)
+			exists, existsErr := r.setMemberExists(ctx, memberKey, member, legacyMembers, readTS)
 			if existsErr != nil {
-				return cockerrors.WithStack(existsErr)
+				return existsErr
 			}
 			var c int
 			var d int64
@@ -1061,20 +1075,23 @@ func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 }
 
 // buildHashLegacyMigrationElems returns ops that atomically migrate a legacy
-// !redis|hash| blob to wide-column !hs|fld| keys.  Returns nil if no legacy
-// blob exists.  The base meta key is also written with the migrated count so
-// that resolveHashMeta works correctly after migration.
-func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+// !redis|hash| blob to wide-column !hs|fld| keys.  Returns nil elems if no
+// legacy blob exists.  The base meta key is also written with the migrated
+// count so that resolveHashMeta works correctly after migration.
+// The returned redisHashValue (may be nil) must be used by the caller to
+// correctly determine field existence — wide-column keys don't exist yet at
+// readTS, so ExistsAt would incorrectly count all legacy fields as new.
+func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], redisHashValue, error) {
 	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, cockerrors.WithStack(err)
+		return nil, nil, cockerrors.WithStack(err)
 	}
 	value, err := unmarshalHashValue(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(value)+setWideColOverhead)
 	for field, val := range value {
@@ -1092,26 +1109,31 @@ func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []b
 		Key:   store.HashMetaKey(key),
 		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
 	})
-	return elems, nil
+	return elems, value, nil
 }
 
 // buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
-// !redis|set| blob to wide-column !st|mem| keys.  Returns nil if no legacy
-// blob exists.
-func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+// !redis|set| blob to wide-column !st|mem| keys. Returns nil elems if no
+// legacy blob exists.
+// The returned member set (may be nil) must be used by the caller to
+// correctly determine member existence — wide-column keys don't exist yet at
+// readTS, so ExistsAt would incorrectly count all legacy members as new.
+func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], map[string]struct{}, error) {
 	raw, err := r.store.GetAt(ctx, redisSetKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, cockerrors.WithStack(err)
+		return nil, nil, cockerrors.WithStack(err)
 	}
 	value, err := unmarshalSetValue(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	legacyMembers := make(map[string]struct{}, len(value.Members))
 	elems := make([]*kv.Elem[kv.OP], 0, len(value.Members)+setWideColOverhead)
 	for _, member := range value.Members {
+		legacyMembers[member] = struct{}{}
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.SetMemberKey(key, []byte(member)),
@@ -1126,12 +1148,16 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 		Key:   store.SetMetaKey(key),
 		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
 	})
-	return elems, nil
+	return elems, legacyMembers, nil
 }
 
-// buildHashFieldElems iterates over field-value pairs in args, records whether each field is
-// new vs. existing, appends Put operations to elems, and returns the updated elems and new-field count.
-func (r *RedisServer) buildHashFieldElems(ctx context.Context, key []byte, args [][]byte, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, error) {
+// buildHashFieldElems iterates over field-value pairs in args, records whether
+// each field is new vs. existing, appends Put operations to elems, and returns
+// the updated elems and the count of newly-added fields.
+// legacyFields must be set when a legacy blob migration is in progress; it is
+// used to detect fields that already existed in the blob (which have no
+// wide-column key yet at readTS, so ExistsAt would otherwise miscount them).
+func (r *RedisServer) buildHashFieldElems(ctx context.Context, key []byte, args [][]byte, readTS uint64, elems []*kv.Elem[kv.OP], legacyFields redisHashValue) ([]*kv.Elem[kv.OP], int, error) {
 	newFields := 0
 	for i := 0; i < len(args); i += redisPairWidth {
 		field := args[i]
@@ -1140,6 +1166,11 @@ func (r *RedisServer) buildHashFieldElems(ctx context.Context, key []byte, args 
 		exists, existsErr := r.store.ExistsAt(ctx, fieldKey, readTS)
 		if existsErr != nil {
 			return nil, 0, cockerrors.WithStack(existsErr)
+		}
+		// During migration the wide-column key doesn't exist yet; fall back to
+		// the legacy blob to avoid inflating the field count.
+		if !exists && legacyFields != nil {
+			_, exists = legacyFields[string(field)]
 		}
 		if !exists {
 			newFields++
@@ -1172,14 +1203,14 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		elems := make([]*kv.Elem[kv.OP], 0, len(args)/redisPairWidth+setWideColOverhead)
 
 		// Atomically migrate any legacy blob on first wide-column write.
-		migrationElems, err := r.buildHashLegacyMigrationElems(ctx, key, readTS)
+		migrationElems, legacyFields, err := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, migrationElems...)
 
 		var newFields int
-		elems, newFields, err = r.buildHashFieldElems(ctx, key, args, readTS, elems)
+		elems, newFields, err = r.buildHashFieldElems(ctx, key, args, readTS, elems, legacyFields)
 		if err != nil {
 			return err
 		}
@@ -1536,7 +1567,9 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
 func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, startTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
-	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
+	// Legacy value is ignored here — isNewField was already computed from it
+	// before calling this function, so the delta is correct regardless.
+	migrationElems, _, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
 	}

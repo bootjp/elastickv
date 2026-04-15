@@ -18,6 +18,10 @@ import (
 // to prevent unbounded memory growth (OOM).
 const maxWideColumnItems = 100_000
 
+// scanCursorAdvance is appended to the last key of a scan page to advance the
+// cursor past it for the next page fetch.
+const scanCursorAdvance = byte(0x00)
+
 // maxWideScanLimit is passed to ScanAt when loading an entire collection.
 // It is set to maxWideColumnItems+1 so that receiving exactly limit results
 // indicates the collection is over the cap and the caller can return an error
@@ -335,6 +339,29 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 	return r.dispatchElems(ctx, false, 0, elems)
 }
 
+// scanAllDeltaKeys scans every delta key under deltaPrefix using paginated
+// reads, returning the complete set. Unlike a single bounded ScanAt, it never
+// truncates — deletion must be complete to avoid orphaned delta keys.
+// Each page is bounded by MaxDeltaScanLimit; delta keys are key-only (no
+// large values), so total memory is proportional to key count × key size.
+func (r *RedisServer) scanAllDeltaKeys(ctx context.Context, deltaPrefix []byte, readTS uint64) ([]*store.KVPair, error) {
+	cursor := deltaPrefix
+	end := store.PrefixScanEnd(deltaPrefix)
+	var all []*store.KVPair
+	for {
+		page, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		all = append(all, page...)
+		if len(page) < store.MaxDeltaScanLimit {
+			break
+		}
+		cursor = append(bytes.Clone(page[len(page)-1].Key), scanCursorAdvance)
+	}
+	return all, nil
+}
+
 // deleteListElems returns delete operations for all list keys (items, meta, deltas).
 func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	meta, listExists, err := r.resolveListMeta(ctx, key, readTS)
@@ -352,14 +379,9 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
+	deltaKVs, scanErr := r.scanAllDeltaKeys(ctx, store.ListMetaDeltaScanPrefix(key), readTS)
 	if scanErr != nil {
-		return nil, errors.WithStack(scanErr)
-	}
-	if len(deltaKVs) == store.MaxDeltaScanLimit {
-		return nil, errors.WithStack(ErrDeltaScanTruncated)
+		return nil, scanErr
 	}
 	for _, pair := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
@@ -388,13 +410,9 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	// key and uncompacted delta keys (e.g. after all members were removed via
 	// HDEL/SREM). Skipping these would leak internal state.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
+	deltaKVs, scanErr := r.scanAllDeltaKeys(ctx, deltaPrefix, readTS)
 	if scanErr != nil {
-		return nil, errors.WithStack(scanErr)
-	}
-	if len(deltaKVs) == store.MaxDeltaScanLimit {
-		return nil, errors.WithStack(ErrDeltaScanTruncated)
+		return nil, scanErr
 	}
 	for _, pair := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
