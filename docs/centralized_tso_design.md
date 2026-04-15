@@ -214,7 +214,7 @@ func (s *tsoSnapshot) Close() error { return nil }
 │  BatchAllocator                                        │
 │                                                        │
 │  current window: atomic.Pointer[windowSnapshot]        │
-│  hot path:       CAS on offset inside immutable struct │
+│  hot path:       atomic Add on offset inside immutable struct │
 │                                                        │
 │  when offset >= size:                                  │
 │    → call TSOAllocator.NextBatch() for a new window    │
@@ -485,7 +485,12 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                     // accumulate indefinitely and exhaust resources.
                     pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
                     defer cancel()
-                    if _, err := eng.Propose(pctx, payload); err != nil {
+                    if _, err := eng.Propose(pctx, payload); err != nil &&
+                        !errors.Is(err, context.Canceled) &&
+                        !errors.Is(err, context.DeadlineExceeded) {
+                        // Suppress context-cancellation noise: these are
+                        // expected on shutdown or proposal timeout and do not
+                        // indicate a problem with the Raft group.
                         c.logger().WarnContext(ctx, "hlc lease renewal failed",
                             slog.Uint64("group_id", gid),
                             slog.Int64("ceiling_ms", ceilingMs),
