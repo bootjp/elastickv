@@ -7506,9 +7506,24 @@ func cloneAttributeValue(in attributeValue) attributeValue {
 	return out
 }
 
+// globalLastCommitTSProvider is the interface satisfied by stores (e.g.
+// LeaderRoutedStore) that can proxy the leader's LastCommitTS.  Defined as a
+// local interface so DynamoDBServer avoids a hard dependency on the concrete
+// kv type.
+type globalLastCommitTSProvider interface {
+	GlobalLastCommitTS(ctx context.Context) uint64
+}
+
 func (d *DynamoDBServer) nextTxnReadTS() uint64 {
+	// On a follower the local store.LastCommitTS() may lag behind the leader.
+	// Use GlobalLastCommitTS so ConsistentRead snapshots and transaction
+	// start timestamps are aligned with the leader's committed watermark,
+	// preventing stale pre-reads that cause false Jepsen anomalies and
+	// unnecessary WriteConflict retries on every follower request.
 	maxTS := uint64(0)
-	if d.store != nil {
+	if p, ok := d.store.(globalLastCommitTSProvider); ok {
+		maxTS = p.GlobalLastCommitTS(context.Background())
+	} else if d.store != nil {
 		maxTS = d.store.LastCommitTS()
 	}
 
