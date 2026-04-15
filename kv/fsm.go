@@ -266,7 +266,13 @@ func (f *kvFSM) Restore(r io.ReadCloser) error {
 
 	// Read the potential 16-byte header (magic + ceiling ms).
 	var hdr [hlcSnapshotHeaderLen]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+	n, err := io.ReadFull(r, hdr[:])
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// Small (or empty) old-format snapshot: fewer than hlcSnapshotHeaderLen
+			// bytes were available. Treat the partial read as legacy store data.
+			return errors.WithStack(f.store.Restore(io.NopCloser(io.MultiReader(bytes.NewReader(hdr[:n]), r))))
+		}
 		return errors.WithStack(err)
 	}
 
