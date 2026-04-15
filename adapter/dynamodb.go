@@ -94,11 +94,12 @@ var dynamoOperationTargets = map[string]string{
 }
 
 const (
-	dynamoErrValidation        = "ValidationException"
-	dynamoErrInternal          = "InternalServerError"
-	dynamoErrConditionalFailed = "ConditionalCheckFailedException"
-	dynamoErrResourceNotFound  = "ResourceNotFoundException"
-	dynamoErrResourceInUse     = "ResourceInUseException"
+	dynamoErrValidation          = "ValidationException"
+	dynamoErrInternal            = "InternalServerError"
+	dynamoErrConditionalFailed   = "ConditionalCheckFailedException"
+	dynamoErrTransactionCanceled = "TransactionCanceledException"
+	dynamoErrResourceNotFound    = "ResourceNotFoundException"
+	dynamoErrResourceInUse       = "ResourceInUseException"
 )
 
 const (
@@ -4040,6 +4041,13 @@ func (d *DynamoDBServer) processTransactWriteItem(
 	seenItemKeys[compositeKey] = struct{}{}
 	plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
 	if err != nil {
+		// Real DynamoDB wraps per-item condition failures in
+		// TransactionCanceledException rather than surfacing the raw
+		// ConditionalCheckFailedException to the caller.
+		var apiErr *dynamoAPIError
+		if errors.As(err, &apiErr) && apiErr.errorType == dynamoErrConditionalFailed {
+			return newDynamoAPIError(http.StatusBadRequest, dynamoErrTransactionCanceled, apiErr.message)
+		}
 		return err
 	}
 	reqs.Elems = append(reqs.Elems, plan.elems...)

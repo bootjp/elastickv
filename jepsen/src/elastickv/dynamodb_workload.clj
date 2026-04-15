@@ -116,29 +116,69 @@
     (when-let [lv (get-in resp [:Item val-attr :L])]
       (mapv #(Long/parseLong (:N %)) lv))))
 
+(defn- list-attr
+  "Convert a Clojure vector of longs to a DynamoDB {:L [...]} attribute."
+  [vs]
+  {:L (mapv (fn [n] {:N (str n)}) vs)})
+
 (defn- dynamo-transact-write!
-  "Atomically write all append micro-ops as a single TransactWriteItems call.
-   Multiple appends to the same key within one transaction are merged into one
-   UpdateItem entry so they are applied atomically — real DynamoDB rejects
-   requests with two operations on the same item (ValidationException), and
-   elastickv enforces the same constraint server-side."
-  [ddb writes]
+  "Atomically write all append micro-ops as a single TransactWriteItems call,
+   with optimistic concurrency control based on the pre-read snapshot.
+
+   For each key k that was written:
+   - Adds a ConditionExpression asserting the current DynamoDB value matches
+     snapshot[k] (nil → attribute_not_exists; list → #v = :cv).
+   If any pre-read value has changed since the snapshot was taken, the server
+   returns TransactionCanceledException and the caller returns :fail to Jepsen.
+
+   For each key k that was read but NOT written:
+   - Adds a ConditionCheck entry asserting the same invariant.
+
+   Multiple appends to the same key are merged into one UpdateItem (real
+   DynamoDB rejects two operations on the same item)."
+  [ddb writes snapshot]
   ;; Group values by key, preserving append order within each key.
-  (let [by-key (reduce (fn [acc [_ k v]]
-                         (update acc k (fnil conj []) v))
-                       (array-map)
-                       writes)]
+  (let [by-key     (reduce (fn [acc [_ k v]]
+                             (update acc k (fnil conj []) v))
+                           (array-map)
+                           writes)
+        write-keys (set (keys by-key))
+        ;; Keys that appear in snapshot but are not written — need ConditionCheck.
+        read-only  (remove write-keys (keys snapshot))
+        ;; Build ConditionCheck items for read-only keys.
+        checks
+        (mapv (fn [k]
+                (let [v (get snapshot k)]
+                  {:ConditionCheck
+                   (merge {:TableName table-name
+                           :Key       {pk-attr {:S (str k)}}}
+                          (if (nil? v)
+                            {:ConditionExpression      "attribute_not_exists(#pk)"
+                             :ExpressionAttributeNames {"#pk" pk-attr}}
+                            {:ConditionExpression       "#v = :cv"
+                             :ExpressionAttributeNames  {"#v" val-attr}
+                             :ExpressionAttributeValues {":cv" (list-attr v)}}))}))
+              read-only)
+        ;; Build UpdateItem items for written keys with a snapshot condition.
+        updates
+        (mapv (fn [[k vs]]
+                (let [v (get snapshot k)
+                      ;; Base attribute values shared by all update variants.
+                      attr-vals (merge {":empty" {:L []}
+                                        ":val"   (list-attr vs)}
+                                       (when-not (nil? v) {":cv" (list-attr v)}))]
+                  {:Update
+                   (merge {:TableName                 table-name
+                           :Key                       {pk-attr {:S (str k)}}
+                           :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
+                           :ExpressionAttributeNames  {"#v" val-attr}
+                           :ExpressionAttributeValues attr-vals}
+                          (if (nil? v)
+                            {:ConditionExpression "attribute_not_exists(#v)"}
+                            {:ConditionExpression "#v = :cv"}))}))
+              by-key)]
     (ddb-invoke! ddb :TransactWriteItems
-                 {:TransactItems
-                  (mapv (fn [[k vs]]
-                          {:Update
-                           {:TableName                 table-name
-                            :Key                       {pk-attr {:S (str k)}}
-                            :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
-                            :ExpressionAttributeNames  {"#v" val-attr}
-                            :ExpressionAttributeValues {":empty" {:L []}
-                                                        ":val"   {:L (mapv (fn [v] {:N (str v)}) vs)}}}})
-                        by-key)})))
+                 {:TransactItems (into checks updates)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
@@ -196,7 +236,7 @@
                                                     (into (or base []) pending))])))
                                mops)
                   writes (filterv (fn [[f _ _]] (= f :append)) mops)]
-              (when (seq writes) (dynamo-transact-write! ddb writes))
+              (when (seq writes) (dynamo-transact-write! ddb writes snapshot))
               (assoc op :type :ok :value value')))))
 
       (catch clojure.lang.ExceptionInfo e
@@ -210,11 +250,18 @@
                     :cognitect.anomalies/unavailable} category))
             (assoc op :type :info :error :network-error)
 
-            ;; Retryable DynamoDB server-side errors
+            ;; Retryable DynamoDB server-side errors.
             (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"
-                         "TransactionCanceledException"} err-type)
+                         "InternalServerError"} err-type)
             (assoc op :type :info :error (str err-type))
+
+            ;; OCC snapshot conflict: transaction definitely was not committed.
+            ;; We added ConditionExpressions to TransactWriteItems; if a
+            ;; concurrent write changed a pre-read key, the server returns
+            ;; TransactionCanceledException.  The operation is a definite
+            ;; abort — return :fail so Jepsen excludes it from the history.
+            (= "TransactionCanceledException" err-type)
+            (assoc op :type :fail :error (str err-type))
 
             ;; Definite API-level failures
             (= "ValidationException" err-type)
