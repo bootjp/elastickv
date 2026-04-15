@@ -4024,6 +4024,7 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 			return nil, nil, nil, err
 		}
 		reqs.Elems = append(reqs.Elems, plan.elems...)
+		reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
 		if !plan.writes {
 			continue
 		}
@@ -4062,9 +4063,15 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 }
 
 type transactWriteItemPlan struct {
-	elems   []*kv.Elem[kv.OP]
-	cleanup [][]byte
-	writes  bool
+	elems    []*kv.Elem[kv.OP]
+	cleanup  [][]byte
+	writes   bool
+	// readKeys contains the raw storage keys that were read during plan
+	// construction.  They are propagated into OperationGroup.ReadKeys so the
+	// FSM can validate read-write conflicts atomically at commit time,
+	// preventing lost-update and G0 anomalies on concurrent transactions that
+	// read the same item at a stale timestamp.
+	readKeys [][]byte
 }
 
 func (d *DynamoDBServer) buildTransactWriteItemPlan(
@@ -4122,9 +4129,10 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   req.Elems,
-		cleanup: cleanup,
-		writes:  true,
+		elems:    req.Elems,
+		cleanup:  cleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4165,9 +4173,10 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   req.Elems,
-		cleanup: cleanup,
-		writes:  true,
+		elems:    req.Elems,
+		cleanup:  cleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4177,6 +4186,10 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 	in transactDeleteInput,
 	readTS uint64,
 ) (*transactWriteItemPlan, error) {
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
@@ -4194,15 +4207,18 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
 	if !found {
-		return &transactWriteItemPlan{}, nil
+		// Item does not exist at readTS; still track the key so the FSM can
+		// detect a concurrent write that creates the item after our snapshot.
+		return &transactWriteItemPlan{readKeys: [][]byte{itemKey}}, nil
 	}
 	req, err := buildItemDeleteRequestWithSource(currentLocation)
 	if err != nil {
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:  req.Elems,
-		writes: true,
+		elems:    req.Elems,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4244,9 +4260,10 @@ func (d *DynamoDBServer) buildTransactConditionCheckPlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   lockReq.Elems,
-		cleanup: lockCleanup,
-		writes:  true,
+		elems:    lockReq.Elems,
+		cleanup:  lockCleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
