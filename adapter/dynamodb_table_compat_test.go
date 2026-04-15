@@ -986,14 +986,26 @@ func TestDynamoDB_TransactWriteItems_MixedActions(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	// "guard" is a separate sentinel item used only by the ConditionCheck so that
+	// no single item is targeted by two different actions in the same transaction
+	// (which real DynamoDB forbids and our duplicate-key validation enforces).
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]ddbTypes.AttributeValue{
+			"id": &ddbTypes.AttributeValueMemberS{Value: "guard"},
+		},
+	})
+	require.NoError(t, err)
 
 	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []ddbTypes.TransactWriteItem{
 			{
+				// Check that the guard item exists — exercises ConditionCheck in a
+				// mixed transaction without colliding with any write target.
 				ConditionCheck: &ddbTypes.ConditionCheck{
 					TableName: aws.String(table),
 					Key: map[string]ddbTypes.AttributeValue{
-						"id": &ddbTypes.AttributeValueMemberS{Value: "2"},
+						"id": &ddbTypes.AttributeValueMemberS{Value: "guard"},
 					},
 					ConditionExpression: aws.String("attribute_exists(#id)"),
 					ExpressionAttributeNames: map[string]string{
