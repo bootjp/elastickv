@@ -194,42 +194,39 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
 └──────────────────────────────────────────────────────┘
 ```
 
-The hot path (serving from an existing window) uses atomics and is fully
-lock-free. The slow path (window exhausted) elects exactly one goroutine to
-call `NextBatch` while others **block on a channel** — not busy-wait — so
-there is no CPU waste during the Raft round-trip. Context cancellation is
-supported on both paths.
+The hot path holds a mutex for a single counter increment (no network I/O).
+The slow path releases the mutex **before** calling `NextBatch`, so the
+network round-trip does not block concurrent callers. Waiters block on a
+channel rather than spinning, respecting context cancellation.
+
+Using a single mutex over the window state avoids the split-atomic race that
+arises when `next` and `limit` are updated as two separate atomic stores —
+a concurrent reader could observe `next` from the old window and `limit` from
+the new window and incorrectly pass the fast-path check.
 
 ```go
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
 // serves them locally without a Raft round-trip until the window is exhausted.
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
 //
-// Design:
-//   - Fast path: CAS on `next`; no lock, no allocation.
-//   - Slow path: the "winner" (CAS on `refilling`) performs the network call
-//     with NO lock held, then closes `refillDone` to wake all waiters.
-//   - Waiters block on `refillDone` with a select that also respects ctx.Done(),
-//     eliminating both CPU waste and unresponsive shutdown.
+// Correctness invariant: the mutex is released before every network call so
+// that concurrent Next() callers are never blocked on I/O. Only the counter
+// increment (a single integer add) is performed under the lock on the hot path.
 type BatchAllocator struct {
-    tso       TSOAllocator
-    batchSize int
+    tso        TSOAllocator
+    batchSize  int
 
-    next  atomic.Uint64 // next slot to serve
-    limit atomic.Uint64 // exclusive upper bound of current window
-
-    refillMu   sync.Mutex    // protects refilling + refillDone
-    refilling  bool
-    refillDone chan struct{}  // closed when the current refill completes
+    mu         sync.Mutex
+    base       uint64       // next slot to serve
+    limit      uint64       // exclusive upper bound of current window
+    refillDone chan struct{} // non-nil while a refill is in progress; closed on completion
 }
 
 func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
     if batchSize <= 0 {
         panic("batchSize must be positive")
     }
-    ch := make(chan struct{})
-    close(ch) // initially "ready"; no ongoing refill
-    return &BatchAllocator{tso: tso, batchSize: batchSize, refillDone: ch}
+    return &BatchAllocator{tso: tso, batchSize: batchSize}
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
@@ -238,59 +235,52 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             return 0, err
         }
 
-        // Fast path: reserve a slot atomically.
-        curr := b.next.Load()
-        if curr < b.limit.Load() {
-            if b.next.CompareAndSwap(curr, curr+1) {
-                return curr, nil
-            }
-            continue // CAS lost; retry
+        b.mu.Lock()
+
+        // Fast path: window has capacity.
+        if b.base < b.limit {
+            ts := b.base
+            b.base++
+            b.mu.Unlock()
+            return ts, nil
         }
 
         // Slow path: window exhausted.
-        b.refillMu.Lock()
-        if b.refilling {
-            // Another goroutine is already refilling; wait on its channel.
+        if b.refillDone != nil {
+            // A refill is already in progress; wait for it without blocking
+            // other goroutines (lock released before select).
             ch := b.refillDone
-            b.refillMu.Unlock()
+            b.mu.Unlock()
             select {
             case <-ch:
-                continue // refill done; retry fast path
+                continue // refill done; re-check the window
             case <-ctx.Done():
                 return 0, ctx.Err()
             }
         }
 
-        // Double-check under the lock: another goroutine may have completed
-        // a refill while we were waiting to acquire refillMu, in which case
-        // the window is no longer exhausted and we should retry the fast path.
-        if b.next.Load() < b.limit.Load() {
-            b.refillMu.Unlock()
-            continue
-        }
+        // This goroutine starts the refill. Create a signal channel and
+        // release the lock before the network call.
+        ch := make(chan struct{})
+        b.refillDone = ch
+        b.mu.Unlock()
 
-        // This goroutine won: set up the signal channel and start refilling.
-        b.refilling = true
-        b.refillDone = make(chan struct{})
-        ch := b.refillDone
-        b.refillMu.Unlock()
-
-        // Network I/O with no lock held.
+        // Network I/O: no lock held.
         newBase, err := b.tso.NextBatch(ctx, b.batchSize)
 
-        b.refillMu.Lock()
-        b.refilling = false
+        // Re-acquire to install the new window, then clear the in-progress flag.
+        b.mu.Lock()
         if err == nil {
-            b.next.Store(newBase + 1)
-            b.limit.Store(newBase + uint64(b.batchSize))
+            b.base = newBase
+            b.limit = newBase + uint64(b.batchSize)
         }
-        b.refillMu.Unlock()
+        b.refillDone = nil // clear before close so waiters retry correctly
+        b.mu.Unlock()
         close(ch) // unblock all waiters
 
         if err != nil {
             return 0, err
         }
-        return newBase, nil
     }
 }
 ```
@@ -378,6 +368,14 @@ updated.
 // node currently leads. Proposals are fire-and-forget goroutines: the main
 // loop never waits for them, so a slow or unresponsive Raft group cannot
 // delay the next renewal cycle or block graceful shutdown.
+//
+// Implementation notes:
+//   - c.groups is populated at construction and never mutated afterwards,
+//     so iteration without a lock is safe. If dynamic shard membership is
+//     added in the future, this loop must be protected by a sync.RWMutex.
+//   - Each goroutine uses a per-proposal timeout (hlcRenewalInterval) to
+//     bound its lifetime. In steady state the number of in-flight goroutines
+//     is at most len(c.groups), which is typically small (O(10)).
 func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
     timer := time.NewTimer(hlcRenewalInterval)
     defer timer.Stop()
