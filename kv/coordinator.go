@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"log/slog"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -49,6 +50,7 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 		transactionManager: txm,
 		engine:             engine,
 		clock:              NewHLC(),
+		log:                slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -78,6 +80,7 @@ type Coordinate struct {
 	engine             raftengine.Engine
 	clock              *HLC
 	connCache          GRPCConnCache
+	log                *slog.Logger
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -168,7 +171,12 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 				continue
 			}
 			ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-			_ = c.ProposeHLCLease(ctx, ceilingMs)
+			if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
+				c.log.WarnContext(ctx, "hlc lease renewal failed",
+					slog.Int64("ceiling_ms", ceilingMs),
+					slog.Any("err", err),
+				)
+			}
 		case <-ctx.Done():
 			return
 		}
