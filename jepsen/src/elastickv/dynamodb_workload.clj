@@ -91,6 +91,24 @@
         (when list-val
           (mapv (fn [elem] (Long/parseLong (:N elem))) list-val))))))
 
+(defn- dynamo-transact-write!
+  "Atomically write multiple append operations via a single TransactWriteItems
+   request.  All list_append mutations are applied atomically so that a
+   concurrent reader never observes a partial set of writes from the same
+   transaction (which would produce spurious G0 write-cycle anomalies)."
+  [url writes]
+  (dynamo-request url "DynamoDB_20120810.TransactWriteItems"
+                  {:TransactItems
+                   (mapv (fn [[_ k v]]
+                           {:Update
+                            {:TableName                 table-name
+                             :Key                       {pk-attr {:S (str k)}}
+                             :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
+                             :ExpressionAttributeNames  {"#v" val-attr}
+                             :ExpressionAttributeValues {":empty" {:L []}
+                                                         ":val"   {:L [{:N (str v)}]}}}})
+                         writes)}))
+
 (defrecord DynamoDBClient [node->port url]
   client/Client
   (open! [this test node]
@@ -110,13 +128,28 @@
     (try
       (case (:f op)
         :txn
-        (let [value' (mapv (fn [[f k v :as mop]]
-                             (case f
-                               :append (do (dynamo-append! url k v)
-                                           mop)
-                               :r      [f k (dynamo-read url k)]))
-                           (:value op))]
-          (assoc op :type :ok :value value')))
+        (let [mops (:value op)]
+          (if (= 1 (count mops))
+            ;; Single micro-op: send as individual UpdateItem / GetItem.
+            (let [[f k v :as mop] (first mops)]
+              (assoc op :type :ok
+                        :value [(case f
+                                  :append (do (dynamo-append! url k v) mop)
+                                  :r      [f k (dynamo-read url k)])]))
+            ;; Multi-op: reads are individual GetItem (consistent snapshot),
+            ;; writes are batched into one TransactWriteItems for atomicity.
+            ;; Executing reads before writes mirrors snapshot-isolation
+            ;; semantics and prevents G0 write-cycle anomalies.
+            (let [writes (filterv (fn [[f _ _]] (= f :append)) mops)
+                  reads  (filterv (fn [[f _ _]] (= f :r))      mops)
+                  read-results (into {} (map (fn [[_ k _]] [k (dynamo-read url k)]) reads))
+                  _ (when (seq writes) (dynamo-transact-write! url writes))
+                  value' (mapv (fn [[f k v :as mop]]
+                                 (case f
+                                   :append mop
+                                   :r      [f k (get read-results k)]))
+                               mops)]
+              (assoc op :type :ok :value value')))))
       (catch clojure.lang.ExceptionInfo e
         (let [data (ex-data e)
               err-type (:type data)]
@@ -150,14 +183,13 @@
 
 (defn dynamodb-append-workload
   "Builds the list-append workload map targeting the DynamoDB endpoint.
-   max-txn-length defaults to 1 because each micro-op (append/read) is sent
-   as an independent HTTP UpdateItem/GetItem request without DynamoDB
-   TransactWriteItems.  Multi-op transactions would be interleaved, producing
-   false G0 (write cycle) anomalies."
+   Multi-op write transactions are executed atomically via TransactWriteItems
+   to prevent G0 write-cycle anomalies.  Reads within a transaction are sent
+   as individual ConsistentRead GetItem calls before the atomic write batch."
   [opts]
   (let [workload (append/test {:key-count            (or (:key-count opts) 12)
                                :min-txn-length       1
-                               :max-txn-length       (or (:max-txn-length opts) 1)
+                               :max-txn-length       (or (:max-txn-length opts) 4)
                                :max-writes-per-key   (or (:max-writes-per-key opts) 128)
                                :consistency-models   [:strict-serializable]})
         client   (->DynamoDBClient (or (:node->port opts)
@@ -234,6 +266,9 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--redis-port PORT" "Redis port."
     :default 6379
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--max-txn-length N" "Maximum number of micro-ops per transaction."
+    :default nil
     :parse-fn #(Integer/parseInt %)]])
 
 (defn- prepare-dynamo-opts
