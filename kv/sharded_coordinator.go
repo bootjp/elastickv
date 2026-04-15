@@ -837,22 +837,26 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 		)
 		return
 	}
-	ticker := time.NewTicker(hlcRenewalInterval)
-	defer ticker.Stop()
+	// Use a Timer rather than a Ticker so the next renewal is scheduled
+	// relative to the completion of the previous one. This prevents a burst
+	// of back-to-back proposals if Propose stalls (e.g. waiting for Raft
+	// quorum during a slow leader election).
+	timer := time.NewTimer(hlcRenewalInterval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
-			if group.Engine.State() != raftengine.StateLeader {
-				continue
+		case <-timer.C:
+			if group.Engine.State() == raftengine.StateLeader {
+				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+				if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+					c.logger().WarnContext(ctx, "hlc lease renewal failed",
+						slog.Uint64("group_id", c.defaultGroup),
+						slog.Int64("ceiling_ms", ceilingMs),
+						slog.Any("err", err),
+					)
+				}
 			}
-			ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-			if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
-				c.logger().WarnContext(ctx, "hlc lease renewal failed",
-					slog.Uint64("group_id", c.defaultGroup),
-					slog.Int64("ceiling_ms", ceilingMs),
-					slog.Any("err", err),
-				)
-			}
+			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
