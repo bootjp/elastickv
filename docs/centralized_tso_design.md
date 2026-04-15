@@ -221,15 +221,26 @@ type BatchAllocator struct {
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
     for {
-        ts := b.next.Add(1) - 1   // atomically reserve a slot
-        if ts < b.limit.Load() {
-            return ts, nil         // fast path: within window, no lock needed
+        // Respect context cancellation on every iteration to avoid an
+        // infinite spin loop if the TSO leader is unreachable.
+        if err := ctx.Err(); err != nil {
+            return 0, err
         }
 
-        // Slow path: window exhausted. Elect one goroutine to refill.
+        // Fast path: load-then-CAS to avoid unnecessary atomic increments
+        // when the window is already exhausted.
+        currNext := b.next.Load()
+        currLimit := b.limit.Load()
+        if currNext < currLimit {
+            if b.next.CompareAndSwap(currNext, currNext+1) {
+                return currNext, nil // served without any lock
+            }
+            continue // lost the CAS race; retry
+        }
+
+        // Slow path: window exhausted. Elect one goroutine to refill via CAS.
         if b.refilling.CompareAndSwap(false, true) {
-            // This goroutine won the CAS: perform the network call with no
-            // lock held so other goroutines are not blocked during I/O.
+            // Winner: perform the network call with no lock held.
             newBase, err := b.tso.NextBatch(ctx, b.batchSize)
             if err != nil {
                 b.refilling.Store(false)
@@ -241,8 +252,7 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
             return newBase, nil
         }
 
-        // Another goroutine is refilling; yield and retry once the new
-        // window is installed.
+        // Another goroutine is refilling; yield and retry.
         runtime.Gosched()
     }
 }
@@ -360,12 +370,22 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                     }
                 }(gid, group.Engine)
             }
-            // Reset the timer immediately after launching goroutines so the
-            // next renewal interval starts counting from now, not from when
-            // the slowest shard group responds. wg.Wait() is retained only
-            // to bound goroutine accumulation across iterations.
+            // Reset the timer immediately so the next renewal interval starts
+            // counting from now, independent of proposal latency.
             timer.Reset(hlcRenewalInterval)
-            wg.Wait()
+
+            // Wait for all proposals in a background goroutine so that
+            // ctx.Done() can still be handled immediately. Without this,
+            // wg.Wait() inside the select case would block graceful shutdown
+            // if any Raft group is unresponsive.
+            done := make(chan struct{})
+            go func() { wg.Wait(); close(done) }()
+            select {
+            case <-done:
+                // all proposals completed normally
+            case <-ctx.Done():
+                return // shutdown: don't wait for slow shards
+            }
         case <-ctx.Done():
             return
         }
