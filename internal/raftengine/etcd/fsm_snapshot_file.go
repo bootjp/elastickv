@@ -454,6 +454,13 @@ func cleanupStaleFSMSnaps(snapDir, fsmSnapDir string, disableStartupCRCCheck boo
 	if err != nil {
 		return err
 	}
+	if liveIndexes == nil {
+		// snapDir does not exist: cannot determine the authoritative live token
+		// set. Skip FSM orphan removal to avoid deleting all .fsm files based
+		// on incomplete information (e.g. misconfigured path or first-boot race).
+		slog.Warn("snapshot directory not found; skipping FSM orphan cleanup", "snap_dir", snapDir)
+		return nil
+	}
 
 	return removeStaleFSMFiles(fsmSnapDir, liveIndexes, disableStartupCRCCheck)
 }
