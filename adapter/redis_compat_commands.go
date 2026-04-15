@@ -1422,7 +1422,7 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 	}
 	// Wide-column rewrite: write per-field keys and a new base meta.
 	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.
-	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(value)+setWideColOverhead)
 	for field, val := range value {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,

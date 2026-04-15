@@ -374,7 +374,7 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if meta.Len > maxWideColumnItems {
 		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, int(meta.Len)+setWideColOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, int(meta.Len)+store.MaxDeltaScanLimit+1)
 	for seq := meta.Head; seq < meta.Tail; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
 	}
@@ -401,7 +401,7 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	if len(fieldKVs) > maxWideColumnItems {
 		return nil, errors.Wrapf(ErrCollectionTooLarge, "collection exceeds %d fields/members", maxWideColumnItems)
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs)+setWideColOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs)+store.MaxDeltaScanLimit+1)
 	for _, pair := range fieldKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
