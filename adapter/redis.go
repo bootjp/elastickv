@@ -1372,14 +1372,8 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 // proxyTransactionToLeader forwards a MULTI/EXEC transaction to the leader
 // node and writes the EXEC response array back to conn.
 func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.Command) {
-	leader := r.coordinator.RaftLeader()
-	if leader == "" {
-		conn.WriteError(ErrLeaderNotFound.Error())
-		return
-	}
-	leaderAddr, ok := r.leaderRedis[leader]
-	if !ok || leaderAddr == "" {
-		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+	leaderAddr, ok := r.resolveLeaderRedisAddr(conn)
+	if !ok {
 		return
 	}
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -1387,6 +1381,32 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
+	cmds, err := r.execTxPipeline(ctx, cli, queue)
+	if handleProxyTxnError(conn, err) {
+		return
+	}
+	writeProxyCmdsResult(conn, cmds)
+}
+
+// resolveLeaderRedisAddr looks up the Redis address of the current Raft leader,
+// writes an error reply to conn on failure and returns ("", false).
+func (r *RedisServer) resolveLeaderRedisAddr(conn redcon.Conn) (string, bool) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		conn.WriteError(ErrLeaderNotFound.Error())
+		return "", false
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+		return "", false
+	}
+	return leaderAddr, true
+}
+
+// execTxPipeline sends queue as a single TxPipelined batch and returns the
+// per-command result handles together with any pipeline-level error.
+func (r *RedisServer) execTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
 	cmds := make([]*redis.Cmd, 0, len(queue))
 	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, cmd := range queue {
@@ -1398,26 +1418,30 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 		}
 		return nil
 	})
+	return cmds, err
+}
+
+// handleProxyTxnError writes the appropriate reply for terminal pipeline errors
+// and returns true when the caller should return early without writing results.
+func handleProxyTxnError(conn redcon.Conn, err error) bool {
 	// Transaction aborted (WATCH conflict or server-side nil EXEC reply):
 	// Redis protocol requires a Null array reply (*-1), not an error array.
 	if errors.Is(err, redis.TxFailedErr) || errors.Is(err, redis.Nil) {
 		conn.WriteNull()
-		return
+		return true
 	}
-	// Fatal transport error (context timeout, network failure): return a
-	// single error reply. Per-command results are unreliable in this case.
+	// Fatal transport error: per-command results are unreliable.
 	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 		conn.WriteError(err.Error())
-		return
+		return true
 	}
-	// For any other non-nil err (individual command errors within the
-	// transaction), individual results are still available on each cmd,
-	// which is the correct Redis EXEC semantics — an array of per-command
-	// responses where some entries may be error replies.
-	if len(cmds) == 0 {
-		conn.WriteArray(0)
-		return
-	}
+	return false
+}
+
+// writeProxyCmdsResult writes an EXEC-style array reply for the given pipeline
+// command handles. For any other non-nil per-command errors, each cmd carries
+// its own result, which is the correct Redis EXEC semantics.
+func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
 	conn.WriteArray(len(cmds))
 	for _, cmd := range cmds {
 		writeGoRedisResult(conn, cmd)
