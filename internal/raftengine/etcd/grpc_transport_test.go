@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -227,4 +228,357 @@ func (*testSendSnapshotServer) SendMsg(any) error {
 
 func (*testSendSnapshotServer) RecvMsg(any) error {
 	return nil
+}
+
+// --- applyBridgeMode tests ---
+
+func TestApplyBridgeModePassesNonTokenUnchanged(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	// Non-token payload must pass through unchanged.
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: []byte("legacy full payload")},
+	}
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, []byte("legacy full payload"), patched.Snapshot.Data)
+}
+
+func TestApplyBridgeModeNoReaderIsNoop(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	// A token with no readFSMPayload callback set → passthrough.
+	token := encodeSnapshotToken(42, 0xDEADBEEF)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: token},
+	}
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, token, patched.Snapshot.Data)
+}
+
+func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	payload := []byte("bridge mode payload data 12345")
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 42, payload)
+
+	transport := NewGRPCTransport(nil)
+	transport.SetFSMPayloadReader(func(index uint64) ([]byte, error) {
+		return readFSMSnapshotPayload(fsmSnapPath(fsmSnapDir, index))
+	})
+
+	token := encodeSnapshotToken(42, crc)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{
+			Data:     token,
+			Metadata: raftpb.SnapshotMetadata{Index: 42},
+		},
+	}
+	patched, err := transport.applyBridgeMode(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, payload, patched.Snapshot.Data)
+	// Metadata must be preserved.
+	require.Equal(t, uint64(42), patched.Snapshot.Metadata.Index)
+}
+
+func TestApplyBridgeModeReaderError(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+	transport.SetFSMPayloadReader(func(_ uint64) ([]byte, error) {
+		return nil, ErrFSMSnapshotNotFound
+	})
+
+	token := encodeSnapshotToken(99, 0xABCD)
+	msg := raftpb.Message{
+		Snapshot: &raftpb.Snapshot{Data: token},
+	}
+	_, err := transport.applyBridgeMode(context.Background(), msg)
+	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
+}
+
+// TestSendSnapshotReaderChunksSmallPayloadPreservesData is a regression test
+// for a bug where a payload smaller than one chunk size was silently dropped.
+// readSnapshotChunk returns (data, io.EOF) for a short final read, and the old
+// code treated that the same as an empty reader, sending an empty chunk.
+func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
+	payload := []byte("tiny payload under one chunk")
+	header := []byte("header-bytes")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), defaultSnapshotChunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 1)
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, payload, client.chunks[0].Chunk)
+	require.True(t, client.chunks[0].Final)
+}
+
+func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
+	header := []byte("header-bytes")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(nil), defaultSnapshotChunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 1)
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Empty(t, client.chunks[0].Chunk)
+	require.True(t, client.chunks[0].Final)
+}
+
+// testSnapshotSendClient captures chunks sent via sendSnapshotReaderChunks / sendSnapshotChunks.
+type testSnapshotSendClient struct {
+	chunks []*pb.EtcdRaftSnapshotChunk
+}
+
+func (c *testSnapshotSendClient) Send(chunk *pb.EtcdRaftSnapshotChunk) error {
+	c.chunks = append(c.chunks, chunk)
+	return nil
+}
+
+func (c *testSnapshotSendClient) CloseAndRecv() (*pb.EtcdRaftAck, error) {
+	return &pb.EtcdRaftAck{}, nil
+}
+
+func (*testSnapshotSendClient) Header() (metadata.MD, error) { return nil, nil }
+func (*testSnapshotSendClient) Trailer() metadata.MD         { return nil }
+func (*testSnapshotSendClient) CloseSend() error             { return nil }
+func (*testSnapshotSendClient) Context() context.Context     { return context.Background() }
+func (*testSnapshotSendClient) SendMsg(any) error            { return nil }
+func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
+
+// testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
+// SendSnapshot calls to a pre-wired testSnapshotSendClient.
+type testEtcdRaftClient struct {
+	stream *testSnapshotSendClient
+}
+
+func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
+	return &pb.EtcdRaftAck{}, nil
+}
+
+func (c *testEtcdRaftClient) SendSnapshot(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendSnapshotClient, error) {
+	return c.stream, nil
+}
+
+// injectClient pre-populates the transport's client cache for the given peer
+// address so calls to clientFor return the mock without dialling.
+func injectClient(t *testing.T, transport *GRPCTransport, address string, client pb.EtcdRaftClient) {
+	t.Helper()
+	transport.mu.Lock()
+	transport.clients[address] = client
+	transport.mu.Unlock()
+}
+
+// --- sendSnapshotReaderChunks multi-chunk tests ---
+
+func TestSendSnapshotReaderChunksMultiChunk(t *testing.T) {
+	// 12-byte payload with chunkSize=4 → 3 chunks.
+	chunkSize := 4
+	payload := []byte("1234abcd5678")
+	header := []byte("meta")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 3)
+
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+
+	require.Empty(t, client.chunks[1].Metadata)
+	require.Equal(t, []byte("abcd"), client.chunks[1].Chunk)
+	require.False(t, client.chunks[1].Final)
+
+	require.Empty(t, client.chunks[2].Metadata)
+	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
+	require.True(t, client.chunks[2].Final)
+}
+
+func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
+	// 8-byte payload with chunkSize=4 → exactly 2 chunks.
+	chunkSize := 4
+	payload := []byte("12345678")
+	header := []byte("hdr")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 2)
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+
+	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
+	require.True(t, client.chunks[1].Final)
+}
+
+// --- streamFSMSnapshot tests ---
+
+func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("stream fsm snapshot payload data for test")
+	crc, _ := writeFSMFileForTest(t, dir, 55, payload)
+
+	sendClient := &testSnapshotSendClient{}
+	transport := NewGRPCTransport([]Peer{{NodeID: 3, Address: "host:2"}})
+	injectClient(t, transport, "host:2", &testEtcdRaftClient{stream: sendClient})
+
+	openFn := func(index uint64) (io.ReadCloser, error) {
+		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
+	}
+
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   3,
+		Snapshot: &raftpb.Snapshot{
+			Data:     encodeSnapshotToken(55, crc),
+			Metadata: raftpb.SnapshotMetadata{Index: 55, Term: 2},
+		},
+	}
+
+	err := transport.streamFSMSnapshot(context.Background(), msg, 55, openFn)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, sendClient.chunks)
+
+	// Metadata must appear only in the first chunk.
+	require.NotEmpty(t, sendClient.chunks[0].Metadata)
+	for _, c := range sendClient.chunks[1:] {
+		require.Empty(t, c.Metadata)
+	}
+
+	// Reconstruct and compare the streamed payload.
+	var got []byte
+	for _, c := range sendClient.chunks {
+		got = append(got, c.Chunk...)
+	}
+	require.Equal(t, payload, got)
+	require.True(t, sendClient.chunks[len(sendClient.chunks)-1].Final)
+}
+
+func TestStreamFSMSnapshotFileNotFound(t *testing.T) {
+	dir := t.TempDir()
+
+	sendClient := &testSnapshotSendClient{}
+	transport := NewGRPCTransport([]Peer{{NodeID: 4, Address: "host:3"}})
+	injectClient(t, transport, "host:3", &testEtcdRaftClient{stream: sendClient})
+
+	openFn := func(index uint64) (io.ReadCloser, error) {
+		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
+	}
+
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   4,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: 999, Term: 1},
+		},
+	}
+
+	err := transport.streamFSMSnapshot(context.Background(), msg, 999, openFn)
+	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
+	require.Empty(t, sendClient.chunks)
+}
+
+// --- dispatchSnapshot routing tests ---
+
+func TestDispatchSnapshotTokenRoutesToStream(t *testing.T) {
+	// When snapshot.Data is a token and openFSMPayload is set, dispatchSnapshot
+	// must route to streamFSMSnapshot (chunked streaming path) — not bridge mode.
+	dir := t.TempDir()
+	payload := []byte("dispatch token route test payload data 12345")
+	crc, _ := writeFSMFileForTest(t, dir, 42, payload)
+
+	sendClient := &testSnapshotSendClient{}
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: "fake:1"}})
+	injectClient(t, transport, "fake:1", &testEtcdRaftClient{stream: sendClient})
+	transport.SetFSMPayloadOpener(func(index uint64) (io.ReadCloser, error) {
+		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
+	})
+
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Data:     encodeSnapshotToken(42, crc),
+			Metadata: raftpb.SnapshotMetadata{Index: 42, Term: 1},
+		},
+	}
+
+	err := transport.dispatchSnapshot(context.Background(), msg)
+	require.NoError(t, err)
+
+	// Chunks must carry the FSM payload (not the raw token bytes).
+	var got []byte
+	for _, c := range sendClient.chunks {
+		got = append(got, c.Chunk...)
+	}
+	require.Equal(t, payload, got)
+}
+
+func TestDispatchSnapshotNonTokenRoutesToBridge(t *testing.T) {
+	// When snapshot.Data is NOT a token (legacy full payload), dispatchSnapshot
+	// must forward it unchanged via the bridge (sendSnapshot) path.
+	legacy := []byte("legacy full fsm payload not a token")
+
+	sendClient := &testSnapshotSendClient{}
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: "fake:1"}})
+	injectClient(t, transport, "fake:1", &testEtcdRaftClient{stream: sendClient})
+
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Data:     legacy,
+			Metadata: raftpb.SnapshotMetadata{Index: 1, Term: 1},
+		},
+	}
+
+	err := transport.dispatchSnapshot(context.Background(), msg)
+	require.NoError(t, err)
+
+	// The legacy payload must reach the receiver unmodified.
+	var got []byte
+	for _, c := range sendClient.chunks {
+		got = append(got, c.Chunk...)
+	}
+	require.Equal(t, legacy, got)
+}
+
+func TestDispatchSnapshotTokenNoOpenerFallsBackToBridge(t *testing.T) {
+	// Token snapshot with NO openFSMPayload set → falls back to bridge mode.
+	// Without a readFSMPayload either, applyBridgeMode is a passthrough, so
+	// the raw token bytes are sent. This verifies the fallback branch is taken.
+	dir := t.TempDir()
+	payload := []byte("bridge fallback test payload data here")
+	crc, _ := writeFSMFileForTest(t, dir, 77, payload)
+	token := encodeSnapshotToken(77, crc)
+
+	sendClient := &testSnapshotSendClient{}
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: "fake:1"}})
+	injectClient(t, transport, "fake:1", &testEtcdRaftClient{stream: sendClient})
+	// No SetFSMPayloadOpener / SetFSMPayloadReader → passthrough bridge.
+
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Data:     token,
+			Metadata: raftpb.SnapshotMetadata{Index: 77, Term: 1},
+		},
+	}
+
+	err := transport.dispatchSnapshot(context.Background(), msg)
+	require.NoError(t, err)
+
+	// Token bytes forwarded as-is (no opener wired).
+	var got []byte
+	for _, c := range sendClient.chunks {
+		got = append(got, c.Chunk...)
+	}
+	require.Equal(t, token, got)
 }

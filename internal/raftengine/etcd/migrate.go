@@ -89,7 +89,7 @@ func readStoreSnapshot(storePath string) ([]byte, int64, error) {
 func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {
 	state := bootstrapStateForPeers(peers, snapshotData)
 	logger := zap.NewNop()
-	disk, err := persistBootState(logger, filepath.Join(tempDir, walDirName), filepath.Join(tempDir, snapDirName), nil, state)
+	disk, err := persistBootState(logger, filepath.Join(tempDir, walDirName), filepath.Join(tempDir, snapDirName), filepath.Join(tempDir, fsmSnapDirName), nil, state)
 	if err != nil {
 		return err
 	}

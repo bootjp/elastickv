@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"sort"
@@ -83,6 +84,7 @@ type Engine struct {
 	localID      string
 	localAddress string
 	dataDir      string
+	fsmSnapDir   string
 	tickInterval time.Duration
 
 	storage   *etcdraft.MemoryStorage
@@ -253,6 +255,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		localID:          prepared.cfg.LocalID,
 		localAddress:     prepared.cfg.LocalAddress,
 		dataDir:          prepared.cfg.DataDir,
+		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
@@ -337,6 +340,9 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
+	e.transport.SetFSMSnapDir(e.fsmSnapDir)
+	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
+	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
 	e.startDispatchWorkers()
 }
@@ -920,9 +926,22 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	// and later committed entries can be applied safely.
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
-	if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
-		return errors.WithStack(err)
+
+	if isSnapshotToken(snapshot.Data) {
+		tok, err := decodeSnapshotToken(snapshot.Data)
+		if err != nil {
+			return err
+		}
+		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
+			return errors.WithStack(err)
+		}
+	} else {
+		// Legacy format: full FSM payload in snapshot.Data.
+		if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
+			return errors.WithStack(err)
+		}
 	}
+
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1182,21 +1201,21 @@ func applyUpdatedPeerToMap(peers map[uint64]Peer, peer Peer, ok bool) {
 }
 
 func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
+	// Fast path (lock-free): avoid unnecessary FSM snapshot when config is already current.
 	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
 		return err
 	} else if upToDate {
 		return nil
 	}
 
-	// Phase 4 keeps config-snapshot publication synchronous so the conf change
-	// is not considered durable before the updated snapshot metadata can be sent
-	// to a freshly added voter. Before broad rollout, this should move to a
-	// background path that preserves the same ordering guarantee.
-	payload, err := e.snapshotPayload()
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	payload, err := e.snapshotPayload(index)
 	if err != nil {
 		return err
 	}
-	return e.persistConfigSnapshotPayload(index, confState, payload)
+	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
 }
 
 func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {
@@ -1228,7 +1247,7 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 		return nil
 	}
 
-	payload, err := e.snapshotPayload()
+	payload, err := e.snapshotPayload(index)
 	if err != nil {
 		return err
 	}
@@ -1237,16 +1256,6 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 	}
 	e.setConfigIndex(index)
 	return nil
-}
-
-func (e *Engine) persistConfigSnapshotPayload(index uint64, confState raftpb.ConfState, payload []byte) error {
-	// Keep disk publication serialized with snapshot restores. If a newer
-	// follower snapshot restored concurrently while an older config snapshot was
-	// still being written to disk, a restart could regress to the stale payload.
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
-	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
 }
 
 func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raftpb.ConfState, payload []byte) error {
@@ -1266,12 +1275,55 @@ func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raft
 	return nil
 }
 
-func (e *Engine) snapshotPayload() ([]byte, error) {
+// readFSMPayloadLocked reads the FSM snapshot payload for the given index while
+// holding snapshotMu, preventing concurrent purge from removing the file.
+func (e *Engine) readFSMPayloadLocked(index uint64) ([]byte, error) {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return readFSMSnapshotPayload(fsmSnapPath(e.fsmSnapDir, index))
+}
+
+// openFSMPayloadLocked opens the .fsm payload file for the given index, holding
+// snapshotMu only for the duration of os.Open. Once the file descriptor is
+// obtained, Unix semantics guarantee it remains readable even after
+// purgeOldSnapshotFiles unlinks the file, so the lock can be released before
+// the fstat call. The caller must close the returned ReadCloser.
+func (e *Engine) openFSMPayloadLocked(index uint64) (io.ReadCloser, error) {
+	path := fsmSnapPath(e.fsmSnapDir, index)
+	e.snapshotMu.Lock()
+	f, err := openFSMSnapshotFile(path)
+	e.snapshotMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return openFSMPayloadFromFD(f)
+}
+
+// snapshotPayload takes a FSM snapshot for the given index, writes it to the
+// .fsm file on disk, and returns the 17-byte token for raftpb.Snapshot.Data.
+// If fsmSnapDir is not set (e.g., engines created directly in unit tests),
+// falls back to the legacy in-memory []byte path.
+func (e *Engine) snapshotPayload(index uint64) ([]byte, error) {
+	if e.fsmSnapDir == "" {
+		snapshot, err := e.fsm.Snapshot()
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return snapshotBytesAndClose(snapshot, e.dataDir)
+	}
 	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return snapshotBytesAndClose(snapshot, e.dataDir)
+	crc32c, writeErr := writeFSMSnapshotFile(snapshot, e.fsmSnapDir, index)
+	closeErr := snapshot.Close()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, errors.WithStack(closeErr)
+	}
+	return encodeSnapshotToken(index, crc32c), nil
 }
 
 func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
@@ -1320,7 +1372,7 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	}
 
 	snapDir := filepath.Join(e.dataDir, snapDirName)
-	if purgeErr := purgeOldSnapFiles(snapDir); purgeErr != nil {
+	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 		slog.Warn("failed to purge old snap files", "error", purgeErr)
 	}
 	return nil
@@ -2243,11 +2295,24 @@ func (e *Engine) handleSnapshotResult(result snapshotResult) error {
 }
 
 func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
-	payload, err := snapshotBytesAndClose(req.snapshot, e.dataDir)
-	if err != nil {
-		return err
+	if e.fsmSnapDir == "" {
+		// No fsmSnapDir set (in-memory or test engine): use the legacy path.
+		payload, err := snapshotBytesAndClose(req.snapshot, e.dataDir)
+		if err != nil {
+			return err
+		}
+		return e.persistLocalSnapshotPayload(req.index, payload)
 	}
-	return e.persistLocalSnapshotPayload(req.index, payload)
+	crc32c, writeErr := writeFSMSnapshotFile(req.snapshot, e.fsmSnapDir, req.index)
+	closeErr := req.snapshot.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return errors.WithStack(closeErr)
+	}
+	token := encodeSnapshotToken(req.index, crc32c)
+	return e.persistLocalSnapshotPayload(req.index, token)
 }
 
 func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
@@ -2269,7 +2334,7 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	switch {
 	case err == nil:
 		snapDir := filepath.Join(e.dataDir, snapDirName)
-		if purgeErr := purgeOldSnapFiles(snapDir); purgeErr != nil {
+		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 			slog.Warn("failed to purge old snap files", "error", purgeErr)
 		}
 		return nil
