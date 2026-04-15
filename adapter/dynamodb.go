@@ -7396,6 +7396,9 @@ func (d *DynamoDBServer) nextTxnReadTS() uint64 {
 	if clock != nil && maxTS > 0 {
 		clock.Observe(maxTS)
 	}
+	if maxTS == 0 {
+		return 1
+	}
 	return maxTS
 }
 
