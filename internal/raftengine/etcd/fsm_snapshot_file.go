@@ -261,20 +261,22 @@ func writeFSMSnapshotPayload(snapshot Snapshot, f *os.File) (uint32, error) {
 // Returns typed errors (ErrFSMSnapshotFileCRC, ErrFSMSnapshotTokenCRC, etc.) to
 // allow the caller to take the correct recovery action.
 func openAndRestoreFSMSnapshot(fsm StateMachine, path string, tokenCRC uint32) error {
-	info, err := os.Stat(path)
+	// Open before stat so the size and file content are guaranteed to be
+	// from the same inode (no TOCTOU between os.Stat and os.Open).
+	f, err := os.Open(path)
 	if err != nil {
 		return statFSMFileError(err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return errors.WithStack(err)
 	}
 	if info.Size() < fsmMinFileSize {
 		return errors.Wrapf(ErrFSMSnapshotTooSmall,
 			"file too small: %d bytes (minimum %d)", info.Size(), fsmMinFileSize)
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer f.Close()
 
 	// Fail fast: read footer and compare to tokenCRC before calling fsm.Restore,
 	// so a corrupt token never causes FSM state mutation.
@@ -337,20 +339,22 @@ func restoreAndComputeCRC(f *os.File, fileSize int64, fsm StateMachine) (uint32,
 // verifyFSMSnapshotFile performs a read-only CRC check without restoring the FSM.
 // Used for startup orphan detection. Pass tokenCRC=0 to skip the token comparison.
 func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {
-	info, err := os.Stat(path)
+	// Open before stat to eliminate the TOCTOU window between path lookup
+	// and file open (consistent with openAndRestoreFSMSnapshot).
+	f, err := os.Open(path)
 	if err != nil {
 		return statFSMFileError(err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return errors.WithStack(err)
 	}
 	if info.Size() < fsmMinFileSize {
 		return errors.Wrapf(ErrFSMSnapshotTooSmall,
 			"file too small: %d bytes (minimum %d)", info.Size(), fsmMinFileSize)
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer f.Close()
 
 	payloadSize := info.Size() - fsmFooterSize
 	h := crc32.New(crc32cTable)
@@ -389,22 +393,13 @@ type limitedReadCloser struct {
 // is allocated, so it is suitable for bridge-mode forwarding of GiB-scale
 // snapshots.
 func openFSMSnapshotPayloadReader(path string) (io.ReadCloser, error) {
-	info, err := os.Stat(path)
+	// Open before stat: eliminates the TOCTOU window between path lookup and
+	// open; file size is obtained via fstat on the open fd.
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, statFSMFileError(err)
 	}
-	if info.Size() < fsmMinFileSize {
-		return nil, errors.WithStack(ErrFSMSnapshotTooSmall)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	payloadSize := info.Size() - fsmFooterSize
-	return &limitedReadCloser{
-		Reader: io.LimitReader(f, payloadSize),
-		Closer: f,
-	}, nil
+	return openFSMPayloadFromFD(f)
 }
 
 // openFSMSnapshotFile opens the .fsm file at path and returns the *os.File.
@@ -457,19 +452,21 @@ func statFSMFileError(err error) error {
 // engine registers SetFSMPayloadOpener so this in-memory path is only reached
 // for legacy receivers that predate Phase 2 or when the opener is not wired.
 func readFSMSnapshotPayload(path string) ([]byte, error) {
-	info, err := os.Stat(path)
+	// Open before stat: eliminates the TOCTOU window between path lookup and
+	// open so size and content are guaranteed to be from the same inode.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, statFSMFileError(err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if info.Size() < fsmMinFileSize {
 		return nil, errors.WithStack(ErrFSMSnapshotTooSmall)
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer f.Close()
 
 	payloadSize := info.Size() - fsmFooterSize
 	if payloadSize > fsmMaxInMemPayload {
