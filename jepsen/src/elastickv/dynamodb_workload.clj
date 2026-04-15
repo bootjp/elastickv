@@ -37,11 +37,13 @@
 
 (defn- make-ddb-client
   "Returns a cognitect/aws-api DynamoDB client pointed at http://host:port.
-   Dummy credentials are provided explicitly so the SDK never attempts
-   credential resolution from the environment (which would fail in CI)."
+   Dummy credentials and a fixed region are provided explicitly so the SDK
+   never attempts credential or region resolution from the environment
+   (which would fail in CI or local runs without AWS config)."
   [host port]
   (aws/client
     {:api                  :dynamodb
+     :region               "us-east-1"
      :credentials-provider (creds/basic-credentials-provider
                              {:access-key-id     "dummy"
                               :secret-access-key "dummy"})
@@ -172,8 +174,10 @@
                                   :append (do (dynamo-append! ddb k v) mop)
                                   :r      [f k (dynamo-read ddb k)])]))
 
-            ;; ---- Multi-op: snapshot isolation + read-your-own-writes ----
-            ;; 1. Pre-read a consistent snapshot for every key accessed.
+            ;; ---- Multi-op: pre-read + read-your-own-writes ----
+            ;; 1. Pre-read every key before applying any writes.  Each read is
+            ;;    an independent ConsistentRead GetItem; they do NOT form an
+            ;;    atomic multi-key snapshot (timestamps may differ per key).
             ;; 2. Simulate micro-ops in order; track local appends so that
             ;;    a :r after an :append in the same txn sees the append (RYOW).
             ;; 3. Dispatch all writes atomically via TransactWriteItems,

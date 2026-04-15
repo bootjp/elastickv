@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"math"
@@ -112,8 +113,7 @@ const (
 )
 
 const (
-	redisLatestCommitTimeout = 5 * time.Second
-	redisDispatchTimeout     = 10 * time.Second
+	redisDispatchTimeout = 10 * time.Second
 	redisFlushLegacyTimeout  = 10 * time.Minute
 	redisRelayPublishTimeout = 2 * time.Second
 	redisTraceArgLimit       = 6
@@ -1418,22 +1418,31 @@ func (r *RedisServer) execTxPipeline(ctx context.Context, cli *redis.Client, que
 		}
 		return nil
 	})
-	return cmds, err
+	return cmds, errors.WithStack(err)
 }
 
 // handleProxyTxnError writes the appropriate reply for terminal pipeline errors
 // and returns true when the caller should return early without writing results.
 func handleProxyTxnError(conn redcon.Conn, err error) bool {
-	// Transaction aborted (WATCH conflict or server-side nil EXEC reply):
-	// Redis protocol requires a Null array reply (*-1), not an error array.
-	if errors.Is(err, redis.TxFailedErr) || errors.Is(err, redis.Nil) {
-		conn.WriteNull()
+	// Transaction aborted (WATCH conflict): Redis protocol requires a Null
+	// array reply (*-1\r\n), not a null bulk string or an error.
+	// redis.Nil is a per-command nil response and must NOT be treated as an
+	// EXEC abort — only redis.TxFailedErr signals that.
+	if errors.Is(err, redis.TxFailedErr) {
+		conn.WriteArray(-1)
 		return true
 	}
-	// Fatal transport error: per-command results are unreliable.
-	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-		conn.WriteError(err.Error())
-		return true
+	// Fatal transport / context error: per-command results are unreliable.
+	if err != nil {
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) ||
+			errors.Is(err, io.EOF) ||
+			errors.Is(err, io.ErrUnexpectedEOF) ||
+			errors.As(err, &netErr) {
+			conn.WriteError(err.Error())
+			return true
+		}
 	}
 	return false
 }
@@ -2172,7 +2181,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		startTS, err := r.txnStartTS(queue)
+		startTS, err := r.txnStartTS()
 		if err != nil {
 			return err
 		}
@@ -2214,14 +2223,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return results, nil
 }
 
-func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisLatestCommitTimeout)
-	defer cancel()
-
-	maxTS, err := r.maxLatestCommitTS(ctx, queue)
-	if err != nil {
-		return 0, err
-	}
+func (r *RedisServer) txnStartTS() (uint64, error) {
 	// store.LastCommitTS() is the authoritative safe-snapshot watermark: it is
 	// updated atomically only AFTER the corresponding Pebble batch commit, so
 	// every version with commitTS ≤ store.LastCommitTS() is guaranteed visible
@@ -2237,17 +2239,14 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	// though we read stale data.  This allows two concurrent RPUSHes to pick the
 	// same sequence number, with the second overwriting the first — a lost write.
 	//
-	// Returning maxTS (= store.LastCommitTS() in practice, or the per-key
-	// Pebble-read value in the narrow window before lastCommitTS is updated)
-	// closes this gap: any concurrent commit at > maxTS triggers a
-	// WriteConflict and a retry via retryRedisWrite.
+	// Using store.LastCommitTS() directly closes this gap: any concurrent commit
+	// at > maxTS triggers a WriteConflict and a retry via retryRedisWrite.
 	//
 	// The Observe call still advances the HLC so that dispatchTxn's clock.Next()
 	// produces a commitTS strictly greater than maxTS (leader-election safety).
+	var maxTS uint64
 	if r.store != nil {
-		if storeTS := r.store.LastCommitTS(); storeTS > maxTS {
-			maxTS = storeTS
-		}
+		maxTS = r.store.LastCommitTS()
 	}
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
@@ -2256,39 +2255,6 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 		return 1, nil
 	}
 	return maxTS, nil
-}
-
-func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) (uint64, error) {
-	if r.store == nil {
-		return 0, nil
-	}
-
-	// NOTE: This currently calls LatestCommitTS for each (unique) key involved in
-	// the transaction. kv.MaxLatestCommitTS deduplicates keys and performs the
-	// lookups in parallel, but very large transactions can still make this a
-	// latency hot path. If needed, add batching/caching at the storage layer.
-	const txnLatestCommitKeysPerCmd = 4
-	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
-	for _, cmd := range queue {
-		if len(cmd.Args) < minKeyedArgs {
-			continue
-		}
-		name := strings.ToUpper(string(cmd.Args[0]))
-		switch name {
-		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange, cmdExpire, cmdPExpire, cmdZIncrBy:
-			key := cmd.Args[1]
-			keys = append(keys, key)
-			// Also account for list metadata keys to avoid stale typing decisions.
-			keys = append(keys, listMetaKey(key))
-			keys = append(keys, redisZSetKey(key))
-			keys = append(keys, redisTTLKey(key))
-		}
-	}
-	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
-	if err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return ts, nil
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
