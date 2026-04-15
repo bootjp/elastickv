@@ -162,21 +162,25 @@ func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
-	ticker := time.NewTicker(hlcRenewalInterval)
-	defer ticker.Stop()
+	// Use a Timer rather than a Ticker so the next renewal is scheduled
+	// relative to the completion of the previous one. This prevents a burst
+	// of back-to-back proposals if ProposeHLCLease stalls (e.g. waiting for
+	// Raft quorum during a slow leader election).
+	timer := time.NewTimer(hlcRenewalInterval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
-			if !c.IsLeader() {
-				continue
+		case <-timer.C:
+			if c.IsLeader() {
+				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
+					c.log.WarnContext(ctx, "hlc lease renewal failed",
+						slog.Int64("ceiling_ms", ceilingMs),
+						slog.Any("err", err),
+					)
+				}
 			}
-			ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-			if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
-				c.log.WarnContext(ctx, "hlc lease renewal failed",
-					slog.Int64("ceiling_ms", ceilingMs),
-					slog.Any("err", err),
-				)
-			}
+			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
