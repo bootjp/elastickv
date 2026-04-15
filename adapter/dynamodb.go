@@ -281,9 +281,10 @@ func (d *DynamoDBServer) Stop() {
 }
 
 // proxyToLeader forwards the HTTP request to the current DynamoDB leader when
-// this node is not the Raft leader.  Returns true if the request was proxied
-// (caller must not write a response), false if the request should be handled
-// locally.
+// this node is not the Raft leader.  Returns true if the request was handled
+// (either proxied or an error response was written), false if the request
+// should be handled locally (i.e. this node is the leader or no leader map is
+// configured).
 func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
 	if len(d.leaderDynamo) == 0 || d.coordinator == nil {
 		return false
@@ -291,13 +292,18 @@ func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) b
 	if d.coordinator.IsLeader() {
 		return false
 	}
+	// This node is a follower.  All requests must be forwarded to the leader to
+	// preserve linearizability — serving reads or writes locally on a follower
+	// causes stale-read anomalies (G2-item-realtime).
 	leader := d.coordinator.RaftLeader()
 	if leader == "" {
-		return false
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "no raft leader currently available")
+		return true
 	}
 	targetAddr, ok := d.leaderDynamo[leader]
 	if !ok || strings.TrimSpace(targetAddr) == "" {
-		return false
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "leader dynamo address not found")
+		return true
 	}
 	target := &url.URL{Scheme: "http", Host: targetAddr}
 	proxy := httputil.NewSingleHostReverseProxy(target)
