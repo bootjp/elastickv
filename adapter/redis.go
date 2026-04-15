@@ -2228,6 +2228,9 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
+	if maxTS == 0 {
+		return 1, nil
+	}
 	return maxTS, nil
 }
 
