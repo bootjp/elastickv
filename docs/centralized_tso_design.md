@@ -158,7 +158,10 @@ func (f *TSOStateMachine) Apply(log *raft.Log) interface{} {
 
 // Snapshot serialises the ceiling as 8 big-endian bytes.
 func (f *TSOStateMachine) Snapshot() (raft.FSMSnapshot, error) {
-    ceiling := f.hlc.PhysicalCeiling()
+    var ceiling int64
+    if f.hlc != nil {
+        ceiling = f.hlc.PhysicalCeiling()
+    }
     return &tsoSnapshot{ceiling: ceiling}, nil
 }
 
@@ -174,7 +177,9 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
         return err
     }
     ceiling := int64(binary.BigEndian.Uint64(buf[:]))
-    f.hlc.SetPhysicalCeiling(ceiling)
+    if f.hlc != nil && ceiling > 0 {
+        f.hlc.SetPhysicalCeiling(ceiling)
+    }
     return nil
 }
 ```
@@ -223,6 +228,9 @@ type BatchAllocator struct {
 }
 
 func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
+    if tso == nil {
+        panic("tso must not be nil")
+    }
     if batchSize <= 0 {
         panic("batchSize must be positive")
     }
