@@ -87,7 +87,7 @@ func initTestRafts(t *testing.T, cfg raft.Configuration, trans []*raft.InmemTran
 		if i == 0 {
 			rfsm = fsm
 		} else {
-			rfsm = NewKvFSM(store.NewMVCCStore())
+			rfsm = NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC())
 		}
 		r, err := raft.NewRaft(c, rfsm, ldb, sdb, fss, trans[i])
 		if err != nil {
@@ -128,13 +128,13 @@ func TestShardRouterCommit(t *testing.T) {
 
 	// group 1
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1))
+	r1, stop1 := newTestRaft(t, "1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
 	router.Register(1, NewTransaction(r1), s1)
 
 	// group 2
 	s2 := store.NewMVCCStore()
-	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2))
+	r2, stop2 := newTestRaft(t, "2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 	router.Register(2, NewTransaction(r2), s2)
 
@@ -168,13 +168,13 @@ func TestShardRouterSplitAndMerge(t *testing.T) {
 
 	// group 1
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newTestRaft(t, "1", NewKvFSM(s1))
+	r1, stop1 := newTestRaft(t, "1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
 	router.Register(1, NewTransaction(r1), s1)
 
 	// group 2 (will be used after split)
 	s2 := store.NewMVCCStore()
-	r2, stop2 := newTestRaft(t, "2", NewKvFSM(s2))
+	r2, stop2 := newTestRaft(t, "2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 	router.Register(2, NewTransaction(r2), s2)
 

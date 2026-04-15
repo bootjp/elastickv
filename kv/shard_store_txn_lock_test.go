@@ -21,10 +21,10 @@ func setupTwoShardStore(t *testing.T) (*ShardStore, map[uint64]*ShardGroup, func
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 
 	st2 := store.NewMVCCStore()
-	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(st2))
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(st2, NewHLC()))
 
 	e1 := hashicorpraftengine.New(r1)
 	e2 := hashicorpraftengine.New(r2)
@@ -94,7 +94,7 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
 	e1 := hashicorpraftengine.New(r1)
@@ -231,7 +231,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
 	e1 := hashicorpraftengine.New(r1)
@@ -261,7 +261,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t 
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
 	e1 := hashicorpraftengine.New(r1)
@@ -291,7 +291,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *tes
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	st1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(st1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
 	e1 := hashicorpraftengine.New(r1)

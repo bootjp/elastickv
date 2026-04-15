@@ -15,7 +15,7 @@ import (
 
 func TestSnapshot(t *testing.T) {
 	store := store3.NewMVCCStore()
-	fsm := NewKvFSM(store)
+	fsm := NewKvFSMWithHLC(store, NewHLC())
 
 	mutation := pb.Request{
 		IsTxn: false,
@@ -49,7 +49,7 @@ func TestSnapshot(t *testing.T) {
 	assert.NoError(t, err)
 
 	store2 := store3.NewMVCCStore()
-	fsm2 := NewKvFSM(store2)
+	fsm2 := NewKvFSMWithHLC(store2, NewHLC())
 
 	kvFSMSnap, ok := snapshot.(*kvFSMSnapshot)
 	assert.True(t, ok)

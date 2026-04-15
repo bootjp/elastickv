@@ -13,7 +13,7 @@ func TestCoordinateDispatch_RawPut(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm := NewKvFSM(st)
+	fsm := NewKvFSMWithHLC(st, NewHLC())
 	r, stop := newSingleRaft(t, "dispatch-raw-put", fsm)
 	t.Cleanup(stop)
 
@@ -39,7 +39,7 @@ func TestCoordinateDispatch_RawDel(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm := NewKvFSM(st)
+	fsm := NewKvFSMWithHLC(st, NewHLC())
 	r, stop := newSingleRaft(t, "dispatch-raw-del", fsm)
 	t.Cleanup(stop)
 
@@ -72,7 +72,7 @@ func TestCoordinateDispatch_TxnOnePhase(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm := NewKvFSM(st)
+	fsm := NewKvFSMWithHLC(st, NewHLC())
 	r, stop := newSingleRaft(t, "dispatch-txn", fsm)
 	t.Cleanup(stop)
 
@@ -129,7 +129,7 @@ func TestCoordinateDispatch_TxnAssignsStartTS(t *testing.T) {
 
 	tx := &stubTransactional{}
 	st := store.NewMVCCStore()
-	fsm := NewKvFSM(st)
+	fsm := NewKvFSMWithHLC(st, NewHLC())
 	r, stop := newSingleRaft(t, "dispatch-ts-assign", fsm)
 	t.Cleanup(stop)
 
@@ -161,7 +161,7 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 
 	tx := &stubTransactional{}
 	st := store.NewMVCCStore()
-	fsm := NewKvFSM(st)
+	fsm := NewKvFSMWithHLC(st, NewHLC())
 	r, stop := newSingleRaft(t, "dispatch-raw-tm", fsm)
 	t.Cleanup(stop)
 

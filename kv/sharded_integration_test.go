@@ -63,11 +63,11 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(s1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
 
 	s2 := store.NewMVCCStore()
-	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(s2))
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 
 	e1 := hashicorpraftengine.New(r1)
@@ -117,11 +117,11 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "g1", NewKvFSM(s1))
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
 
 	s2 := store.NewMVCCStore()
-	r2, stop2 := newSingleRaft(t, "g2", NewKvFSM(s2))
+	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 
 	e1 := hashicorpraftengine.New(r1)

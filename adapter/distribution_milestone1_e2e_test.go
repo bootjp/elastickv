@@ -23,12 +23,13 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 	engine.UpdateRoute([]byte(""), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
+	hlc := kv.NewHLC()
 	group1Store := store.NewMVCCStore()
-	group1Raft, stopGroup1 := newSingleRaftForDistributionE2E(t, "group-1", kv.NewKvFSM(group1Store))
+	group1Raft, stopGroup1 := newSingleRaftForDistributionE2E(t, "group-1", kv.NewKvFSMWithHLC(group1Store, hlc))
 	defer stopGroup1()
 
 	group2Store := store.NewMVCCStore()
-	group2Raft, stopGroup2 := newSingleRaftForDistributionE2E(t, "group-2", kv.NewKvFSM(group2Store))
+	group2Raft, stopGroup2 := newSingleRaftForDistributionE2E(t, "group-2", kv.NewKvFSMWithHLC(group2Store, hlc))
 	defer stopGroup2()
 
 	group1Engine := hashicorpraftengine.New(group1Raft)
@@ -41,7 +42,7 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 	t.Cleanup(func() {
 		require.NoError(t, shardStore.Close())
 	})
-	coordinator := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), shardStore)
+	coordinator := kv.NewShardedCoordinator(engine, groups, 1, hlc, shardStore)
 
 	catalog := distribution.NewCatalogStore(group1Store)
 	initial, err := distribution.EnsureCatalogSnapshot(ctx, catalog, engine)

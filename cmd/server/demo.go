@@ -495,7 +495,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 	cleanup.Add(func() { st.Close() })
-	fsm := kv.NewKvFSM(st)
+	hlc := kv.NewHLC()
+	fsm := kv.NewKvFSMWithHLC(st, hlc)
 	readTracker := kv.NewActiveTimestampTracker()
 
 	// Config
@@ -523,7 +524,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
 	engine := hashicorpraftengine.New(r)
 	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
-	coordinator := kv.NewCoordinatorWithEngine(trx, engine)
+	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
@@ -587,6 +588,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
+	eg.Go(func() error { coordinator.RunHLCLeaseRenewal(ctx); return nil })
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(func() error { return compactor.Run(ctx) })
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))

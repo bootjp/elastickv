@@ -61,7 +61,7 @@ func TestFSMAbort_PrepareThenAbort(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -113,7 +113,7 @@ func TestFSMAbort_RejectsAlreadyCommittedTxn(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -147,7 +147,7 @@ func TestFSMAbort_LockCleanup(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(100)
@@ -180,7 +180,7 @@ func TestFSMAbort_IntentCleanup(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(100)
@@ -213,7 +213,7 @@ func TestFSMAbort_RollbackRecord(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(50)
@@ -242,7 +242,7 @@ func TestFSMAbort_NonPrimaryOnlyDoesNotWriteRollback(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(50)
@@ -272,7 +272,7 @@ func TestFSMAbort_AbortTSMustBeGreaterThanStartTS(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -296,7 +296,7 @@ func TestFSMAbort_SecondAbortSameTimestampConflicts(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -328,7 +328,7 @@ func TestFSMAbort_MissingPrimaryKeyReturnsError(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
@@ -353,7 +353,7 @@ func TestFSMAbort_EmptyMutationsReturnsError(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	fsm, ok := NewKvFSM(st).(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	startTS := uint64(10)
