@@ -36,6 +36,12 @@ const (
 
 	// fsmWriteBufSize is the bufio.Writer buffer size used when writing .fsm files.
 	fsmWriteBufSize = 1 << 20 // 1 MiB
+
+	// fsmMaxInMemPayload is the maximum payload size that readFSMSnapshotPayload
+	// will materialise into memory. Larger snapshots must use the streaming path
+	// (openFSMSnapshotPayloadReader) to avoid OOM. 1 GiB is chosen as a generous
+	// upper bound; real FSM payloads for this workload are typically much smaller.
+	fsmMaxInMemPayload = int64(1 << 30) // 1 GiB
 )
 
 var (
@@ -62,6 +68,10 @@ var (
 	// ErrFSMSnapshotTokenInvalid is returned when the token bytes cannot be
 	// decoded (wrong length or magic prefix).
 	ErrFSMSnapshotTokenInvalid = errors.New("fsm snapshot: token format invalid")
+
+	// ErrFSMSnapshotTooLarge is returned when the payload exceeds fsmMaxInMemPayload.
+	// Callers should switch to the streaming path (openFSMSnapshotPayloadReader).
+	ErrFSMSnapshotTooLarge = errors.New("fsm snapshot: payload exceeds maximum in-memory size limit")
 )
 
 // snapshotToken holds the decoded fields of a 17-byte raftpb.Snapshot.Data token.
@@ -416,6 +426,10 @@ func readFSMSnapshotPayload(path string) ([]byte, error) {
 	defer f.Close()
 
 	payloadSize := info.Size() - fsmFooterSize
+	if payloadSize > fsmMaxInMemPayload {
+		return nil, errors.Wrapf(ErrFSMSnapshotTooLarge,
+			"payload %d bytes exceeds limit %d; use streaming path instead", payloadSize, fsmMaxInMemPayload)
+	}
 	data := make([]byte, payloadSize)
 	h := crc32.New(crc32cTable)
 	tr := io.TeeReader(io.LimitReader(f, payloadSize), h)
