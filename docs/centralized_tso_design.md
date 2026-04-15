@@ -194,10 +194,11 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
 └──────────────────────────────────────────────────────┘
 ```
 
-The hot path (serving from an existing window) must never block on network I/O.
-The implementation uses an atomic counter for the common case and a CAS-based
-`refilling` flag so that exactly one goroutine performs the `NextBatch` call
-while others spin, and **the network call is made with no lock held**.
+The hot path (serving from an existing window) uses atomics and is fully
+lock-free. The slow path (window exhausted) elects exactly one goroutine to
+call `NextBatch` while others **block on a channel** — not busy-wait — so
+there is no CPU waste during the Raft round-trip. Context cancellation is
+supported on both paths.
 
 ```go
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
@@ -205,55 +206,80 @@ while others spin, and **the network call is made with no lock held**.
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
 //
 // Design:
-//   - `next` and `limit` are atomics; the fast path is fully lock-free.
-//   - When the window is exhausted, a CAS on `refilling` elects exactly one
-//     goroutine to call NextBatch. The winner performs the network call with
-//     NO lock held. Other goroutines yield via runtime.Gosched() until the
-//     new window is installed.
+//   - Fast path: CAS on `next`; no lock, no allocation.
+//   - Slow path: the "winner" (CAS on `refilling`) performs the network call
+//     with NO lock held, then closes `refillDone` to wake all waiters.
+//   - Waiters block on `refillDone` with a select that also respects ctx.Done(),
+//     eliminating both CPU waste and unresponsive shutdown.
 type BatchAllocator struct {
     tso       TSOAllocator
     batchSize int
 
-    next      atomic.Uint64 // next slot to serve; monotonically increasing
-    limit     atomic.Uint64 // exclusive upper bound of the current window
-    refilling atomic.Bool   // true while a NextBatch call is in flight
+    next  atomic.Uint64 // next slot to serve
+    limit atomic.Uint64 // exclusive upper bound of current window
+
+    refillMu   sync.Mutex    // protects refilling + refillDone
+    refilling  bool
+    refillDone chan struct{}  // closed when the current refill completes
+}
+
+func NewBatchAllocator(tso TSOAllocator, batchSize int) *BatchAllocator {
+    ch := make(chan struct{})
+    close(ch) // initially "ready"; no ongoing refill
+    return &BatchAllocator{tso: tso, batchSize: batchSize, refillDone: ch}
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
     for {
-        // Respect context cancellation on every iteration to avoid an
-        // infinite spin loop if the TSO leader is unreachable.
         if err := ctx.Err(); err != nil {
             return 0, err
         }
 
-        // Fast path: load-then-CAS to avoid unnecessary atomic increments
-        // when the window is already exhausted.
-        currNext := b.next.Load()
-        currLimit := b.limit.Load()
-        if currNext < currLimit {
-            if b.next.CompareAndSwap(currNext, currNext+1) {
-                return currNext, nil // served without any lock
+        // Fast path: reserve a slot atomically.
+        curr := b.next.Load()
+        if curr < b.limit.Load() {
+            if b.next.CompareAndSwap(curr, curr+1) {
+                return curr, nil
             }
-            continue // lost the CAS race; retry
+            continue // CAS lost; retry
         }
 
-        // Slow path: window exhausted. Elect one goroutine to refill via CAS.
-        if b.refilling.CompareAndSwap(false, true) {
-            // Winner: perform the network call with no lock held.
-            newBase, err := b.tso.NextBatch(ctx, b.batchSize)
-            if err != nil {
-                b.refilling.Store(false)
-                return 0, err
+        // Slow path: window exhausted.
+        b.refillMu.Lock()
+        if b.refilling {
+            // Another goroutine is already refilling; wait on its channel.
+            ch := b.refillDone
+            b.refillMu.Unlock()
+            select {
+            case <-ch:
+                continue // refill done; retry fast path
+            case <-ctx.Done():
+                return 0, ctx.Err()
             }
+        }
+
+        // This goroutine won: set up the signal channel and start refilling.
+        b.refilling = true
+        b.refillDone = make(chan struct{})
+        ch := b.refillDone
+        b.refillMu.Unlock()
+
+        // Network I/O with no lock held.
+        newBase, err := b.tso.NextBatch(ctx, b.batchSize)
+
+        b.refillMu.Lock()
+        b.refilling = false
+        if err == nil {
             b.next.Store(newBase + 1)
             b.limit.Store(newBase + uint64(b.batchSize))
-            b.refilling.Store(false)
-            return newBase, nil
         }
+        b.refillMu.Unlock()
+        close(ch) // unblock all waiters
 
-        // Another goroutine is refilling; yield and retry.
-        runtime.Gosched()
+        if err != nil {
+            return 0, err
+        }
+        return newBase, nil
     }
 }
 ```
@@ -338,13 +364,9 @@ updated.
 
 ```go
 // RunHLCLeaseRenewal proposes a ceiling renewal to every shard group this
-// node currently leads, in parallel. Because all FSMs on the node share a
-// single HLC instance, any committed ceiling advances the node-wide clock
-// floor, preventing timestamp collisions after a leader election.
-//
-// The timer is reset immediately after launching goroutines (before waiting
-// for them to complete) so that a slow Raft group cannot delay the next
-// renewal cycle and potentially allow the HLC lease window to expire.
+// node currently leads. Proposals are fire-and-forget goroutines: the main
+// loop never waits for them, so a slow or unresponsive Raft group cannot
+// delay the next renewal cycle or block graceful shutdown.
 func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
     timer := time.NewTimer(hlcRenewalInterval)
     defer timer.Stop()
@@ -353,14 +375,11 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
         case <-timer.C:
             ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
             payload := marshalHLCLeaseRenew(ceilingMs)
-            var wg sync.WaitGroup
             for gid, group := range c.groups {
                 if group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
                     continue
                 }
-                wg.Add(1)
                 go func(gid uint64, eng raftengine.Engine) {
-                    defer wg.Done()
                     if _, err := eng.Propose(ctx, payload); err != nil {
                         c.logger().WarnContext(ctx, "hlc lease renewal failed",
                             slog.Uint64("group_id", gid),
@@ -370,22 +389,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                     }
                 }(gid, group.Engine)
             }
-            // Reset the timer immediately so the next renewal interval starts
-            // counting from now, independent of proposal latency.
             timer.Reset(hlcRenewalInterval)
-
-            // Wait for all proposals in a background goroutine so that
-            // ctx.Done() can still be handled immediately. Without this,
-            // wg.Wait() inside the select case would block graceful shutdown
-            // if any Raft group is unresponsive.
-            done := make(chan struct{})
-            go func() { wg.Wait(); close(done) }()
-            select {
-            case <-done:
-                // all proposals completed normally
-            case <-ctx.Done():
-                return // shutdown: don't wait for slow shards
-            }
         case <-ctx.Done():
             return
         }
