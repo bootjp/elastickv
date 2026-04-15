@@ -143,21 +143,31 @@ Node-3 ──┘         │
 ### 3.4 TSO FSM
 
 ```go
-// TSOStateMachine is a minimal FSM that only tracks the HLC physical ceiling.
-// Its entire persisted state is a single int64 ceiling value.
+// TSOStateMachine implements raftengine.StateMachine. It is a minimal FSM
+// that only tracks the HLC physical ceiling; its entire persisted state is a
+// single int64 ceiling value.
+//
+// Interface mapping (raftengine.StateMachine vs raw raft.FSM):
+//   Apply([]byte)             ← engine strips log envelope, passes raw payload
+//   Snapshot() (Snapshot, _) ← returns raftengine.Snapshot (WriteTo/Close)
+//   Restore(io.Reader)        ← caller owns and closes the reader
 type TSOStateMachine struct {
     hlc *HLC
 }
 
-func (f *TSOStateMachine) Apply(log *raft.Log) interface{} {
-    if len(log.Data) == 0 || log.Data[0] != raftEncodeHLCLease {
+// Apply processes an HLC lease entry. The engine strips the raft.Log
+// envelope and passes only the raw command bytes, matching the
+// raftengine.StateMachine.Apply([]byte) signature.
+func (f *TSOStateMachine) Apply(data []byte) any {
+    if len(data) == 0 || data[0] != raftEncodeHLCLease {
         return nil
     }
-    return f.applyHLCLease(log.Data[1:])
+    return f.applyHLCLease(data[1:])
 }
 
 // Snapshot serialises the ceiling as 8 big-endian bytes.
-func (f *TSOStateMachine) Snapshot() (raft.FSMSnapshot, error) {
+// Returns raftengine.Snapshot (WriteTo/Close) rather than raft.FSMSnapshot.
+func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
     var ceiling int64
     if f.hlc != nil {
         ceiling = f.hlc.PhysicalCeiling()
@@ -166,9 +176,7 @@ func (f *TSOStateMachine) Snapshot() (raft.FSMSnapshot, error) {
 }
 
 // Restore deserialises the ceiling and updates the shared HLC.
-// The signature uses io.Reader (not io.ReadCloser) to align with the
-// project's internal raftengine.StateMachine interface; the caller owns
-// the reader and is responsible for closing it.
+// The caller owns the reader and is responsible for closing it.
 func (f *TSOStateMachine) Restore(r io.Reader) error {
     var buf [8]byte
     if _, err := io.ReadFull(r, buf[:]); err != nil {
@@ -181,24 +189,22 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
     return nil
 }
 
-// tsoSnapshot is the raft.FSMSnapshot produced by TSOStateMachine.Snapshot().
-// It serialises the HLC physical ceiling as 8 big-endian bytes — the entire
-// persisted state of the TSO Raft group.
+// tsoSnapshot implements raftengine.Snapshot. It serialises the HLC physical
+// ceiling as 8 big-endian bytes — the entire persisted state of the TSO group.
+// WriteTo/Close matches the raftengine.Snapshot interface (not Persist/Release
+// from raft.FSMSnapshot).
 type tsoSnapshot struct {
     ceiling int64
 }
 
-func (s *tsoSnapshot) Persist(sink raft.SnapshotSink) error {
+func (s *tsoSnapshot) WriteTo(w io.Writer) (int64, error) {
     var buf [8]byte
     binary.BigEndian.PutUint64(buf[:], uint64(s.ceiling))
-    if _, err := sink.Write(buf[:]); err != nil {
-        _ = sink.Cancel()
-        return err
-    }
-    return sink.Close()
+    n, err := w.Write(buf[:])
+    return int64(n), err
 }
 
-func (s *tsoSnapshot) Release() {}
+func (s *tsoSnapshot) Close() error { return nil }
 ```
 
 ### 3.5 Batch Allocator
@@ -321,18 +327,32 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
         b.mu.Unlock()
 
         // Network I/O: no lock held.
-        newBase, err := b.tso.NextBatch(ctx, b.batchSize)
-
-        b.mu.Lock()
-        if err == nil {
-            // Publish a fresh immutable window. Any goroutine that loaded the
-            // previous pointer before this Store continues to use it safely.
-            w := &windowSnapshot{base: newBase, size: b.batchSize}
-            b.win.Store(w)
-        }
-        b.refillDone = nil // clear before close so waiters re-enter the fast path
-        b.mu.Unlock()
-        close(ch) // unblock all waiters
+        //
+        // The deferred closure guarantees that refillDone is cleared and ch is
+        // closed regardless of how this goroutine exits — including a panic in
+        // NextBatch. Without the defer, a panic would leave refillDone non-nil
+        // and ch unclosed, permanently deadlocking every goroutine waiting on it.
+        //
+        // The window is published inside the defer, under the mutex, before ch
+        // is closed, so waiters that wake on <-ch are guaranteed to see the new
+        // window on their next fast-path attempt.
+        var newBase uint64
+        err := func() (retErr error) {
+            defer func() {
+                b.mu.Lock()
+                if retErr == nil {
+                    // Publish a fresh immutable window. Any goroutine that loaded
+                    // the previous pointer before this Store continues to use it
+                    // safely — the old struct is never mutated after publish.
+                    b.win.Store(&windowSnapshot{base: newBase, size: b.batchSize})
+                }
+                b.refillDone = nil // clear under lock so waiters retry cleanly
+                b.mu.Unlock()
+                close(ch) // unblock all waiters after window is visible
+            }()
+            newBase, retErr = b.tso.NextBatch(ctx, b.batchSize)
+            return
+        }()
 
         if err != nil {
             return 0, err
