@@ -190,33 +190,53 @@ func (f *TSOStateMachine) Restore(r io.ReadCloser) error {
 └──────────────────────────────────────────────────────┘
 ```
 
+The hot path (serving from an existing window) must never block on network I/O.
+The implementation uses an atomic counter for the common case and a mutex only
+to serialise the infrequent window-replenishment call, ensuring the lock is
+**not held** during the `NextBatch` network round-trip.
+
 ```go
 // BatchAllocator pre-fetches a window of timestamps from the TSO leader and
 // serves them locally without a Raft round-trip until the window is exhausted.
 // This reduces per-transaction TSO latency from ~1 ms (one Raft RTT) to ~1 µs.
+//
+// Design: `next` is an atomic counter shared across all concurrent callers.
+// The mutex is held only when replenishing the window (i.e. during NextBatch),
+// so it is never held during network I/O on the hot path.
 type BatchAllocator struct {
     tso       TSOAllocator
     batchSize int
 
-    mu    sync.Mutex
-    base  uint64
-    limit uint64 // exclusive upper bound of the current window
+    next  atomic.Uint64 // monotonically increasing; serves the hot path
+    limit atomic.Uint64 // exclusive upper bound of the current window
+
+    refillMu sync.Mutex // serialises window replenishment only
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
-    b.mu.Lock()
-    defer b.mu.Unlock()
-    if b.base >= b.limit {
-        newBase, err := b.tso.NextBatch(ctx, b.batchSize)
+    for {
+        ts := b.next.Add(1) - 1        // reserve a slot atomically
+        if ts < b.limit.Load() {
+            return ts, nil              // fast path: slot is within the window
+        }
+        // Slow path: window is exhausted; replenish under the mutex.
+        b.refillMu.Lock()
+        // Re-check after acquiring the lock; another goroutine may have
+        // already replenished the window while we were waiting.
+        if ts < b.limit.Load() {
+            b.refillMu.Unlock()
+            continue
+        }
+        newBase, err := b.tso.NextBatch(ctx, b.batchSize) // network I/O outside of hot path
         if err != nil {
+            b.refillMu.Unlock()
             return 0, err
         }
-        b.base = newBase
-        b.limit = newBase + uint64(b.batchSize)
+        b.next.Store(newBase + 1)
+        b.limit.Store(newBase + uint64(b.batchSize))
+        b.refillMu.Unlock()
+        return newBase, nil
     }
-    ts := b.base
-    b.base++
-    return ts, nil
 }
 ```
 
@@ -291,11 +311,21 @@ Before the full TSO is introduced, fix `RunHLCLeaseRenewal` to iterate over
 node share the same `*HLC` instance, a ceiling committed to any group advances
 the node-wide clock floor and protects timestamps issued by that node.
 
+Proposals to different Raft groups are independent and must be issued
+**in parallel**. A sequential loop would serialize blocking `Propose` calls:
+if one group's Raft quorum is slow (e.g. during a leader election), later
+groups would not receive their ceiling update until the slow call returns,
+potentially allowing `hlcRenewalInterval` to expire before all groups are
+updated.
+
 ```go
 // RunHLCLeaseRenewal proposes a ceiling renewal to every shard group this
-// node currently leads. Because all FSMs on the node share a single HLC
-// instance, any committed ceiling advances the node-wide clock floor,
-// preventing timestamp collisions after a leader election.
+// node currently leads, in parallel. Because all FSMs on the node share a
+// single HLC instance, any committed ceiling advances the node-wide clock
+// floor, preventing timestamp collisions after a leader election.
+//
+// Proposals are dispatched concurrently so that a slow Raft group (e.g.
+// during an election) does not delay renewals for healthy groups.
 func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
     timer := time.NewTimer(hlcRenewalInterval)
     defer timer.Stop()
@@ -303,21 +333,25 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
         select {
         case <-timer.C:
             ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+            payload := marshalHLCLeaseRenew(ceilingMs)
+            var wg sync.WaitGroup
             for gid, group := range c.groups {
-                if group.Engine == nil {
+                if group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
                     continue
                 }
-                if group.Engine.State() != raftengine.StateLeader {
-                    continue
-                }
-                if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
-                    c.logger().WarnContext(ctx, "hlc lease renewal failed",
-                        slog.Uint64("group_id", gid),
-                        slog.Int64("ceiling_ms", ceilingMs),
-                        slog.Any("err", err),
-                    )
-                }
+                wg.Add(1)
+                go func(gid uint64, eng raftengine.Engine) {
+                    defer wg.Done()
+                    if _, err := eng.Propose(ctx, payload); err != nil {
+                        c.logger().WarnContext(ctx, "hlc lease renewal failed",
+                            slog.Uint64("group_id", gid),
+                            slog.Int64("ceiling_ms", ceilingMs),
+                            slog.Any("err", err),
+                        )
+                    }
+                }(gid, group.Engine)
             }
+            wg.Wait()
             timer.Reset(hlcRenewalInterval)
         case <-ctx.Done():
             return
@@ -334,19 +368,83 @@ node are strictly monotonic**.
 
 ---
 
-## 7. Milestones
+## 7. Zero-Downtime Migration Strategy
 
-| Phase | Scope | Priority |
-|-------|-------|----------|
-| M1 — immediate | Extend `RunHLCLeaseRenewal` to all shard groups (Section 6) | High |
-| M2 | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
-| M3 | `BatchAllocator` for low-latency timestamp serving | Medium |
-| M4 | Dedicated TSO Raft group (`groupID = 0`) with `TSOStateMachine` | Low |
-| M5 | Cross-shard SSI read-timestamp validation via TSO | Low |
+Migrating from the current per-shard ceiling model to a centralized TSO must
+not interrupt writes or violate timestamp monotonicity. The following phased
+approach enables a live cutover.
+
+### 7.1 Phase A — Dual-Write Bridge (no cutover risk)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  ShardedCoordinator                                        │
+│                                                            │
+│  startTS = legacyHLC.Next()  (existing path, unchanged)   │
+│                                                            │
+│  RunHLCLeaseRenewal():                                     │
+│    ├─ propose to all shard groups (M1 fix, Section 6)      │
+│    └─ also propose to TSO group (new, write-only)          │
+│       ↳ TSO FSM advances its ceiling in parallel           │
+└──────────────────────────────────────────────────────────┘
+```
+
+- The TSO group receives ceiling proposals but **no reads are served from it**.
+- This allows TSO FSM state to warm up and be validated in production before
+  the cutover.
+- Rollback: stop proposing to the TSO group; no state change on data path.
+
+### 7.2 Phase B — Shadow Read Validation
+
+- Both `legacyHLC.Next()` and `tso.Next()` are called per transaction.
+- Results are compared in a shadow log; divergences are alerted but the legacy
+  value is used.
+- This phase validates that the TSO ceiling is always ≥ the legacy ceiling.
+
+### 7.3 Phase C — TSO Cutover (feature flag)
+
+- A runtime feature flag (`tso.enabled`) switches `startTS` to `tso.Next()`.
+- The flag can be toggled per-node via config reload (no process restart).
+- Because the TSO ceiling was kept ≥ the legacy ceiling throughout Phase A/B,
+  there is no timestamp regression at the moment of cutover.
+- Rollback: flip the flag back; the legacy HLC has been monotonically advancing
+  in parallel so it remains safe to resume.
+
+### 7.4 Phase D — Legacy Cleanup
+
+- Remove per-shard ceiling proposals.
+- Remove `legacyHLC` from `ShardedCoordinator`.
+- Remove the shadow comparison code.
+
+### 7.5 Monotonicity Invariant Across Phases
+
+At every phase boundary, the following invariant must hold:
+
+```
+tso_ceiling ≥ max(ceiling committed by any shard group leader)
+```
+
+This is enforced by Phase A's dual-write: every ceiling update that reaches
+a shard group also reaches the TSO group, so the TSO ceiling is always at
+least as large as the maximum shard ceiling.
 
 ---
 
-## 8. Open Questions
+## 8. Milestones
+
+| Phase | Scope | Priority |
+|-------|-------|----------|
+| M1 — immediate | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
+| M2 | Phase A dual-write bridge: also propose ceiling to TSO group (Section 7.1) | Medium |
+| M3 | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
+| M4 | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
+| M5 | Phase B shadow read validation + Phase C feature-flag cutover (Section 7.2–7.3) | Medium |
+| M6 | Dedicated TSO Raft group (`groupID = 0`) with `TSOStateMachine` | Low |
+| M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
+
+---
+
+## 9. Open Questions
 
 1. **TSO RTT when TSO leader ≠ write leader:** What batch size minimises tail
    latency? Needs benchmarking against realistic write fan-out.
