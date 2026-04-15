@@ -111,9 +111,10 @@
                           {:TableName      table-name
                            :Key            {pk-attr {:S (str k)}}
                            :ConsistentRead true})]
-    ;; cognitect/aws-api: Item is map[String,AttributeValue]; member keys
-    ;; of AttributeValue union (S, N, L …) are Clojure keywords.
-    (when-let [lv (get-in resp [:Item val-attr :L])]
+    ;; cognitect/aws-api uses (json/read-str … :key-fn keyword), so ALL JSON
+    ;; object keys — including DynamoDB attribute names inside Item — are
+    ;; keywordised.  Use (keyword val-attr) to look up :val, not the string "val".
+    (when-let [lv (get-in resp [:Item (keyword val-attr) :L])]
       (mapv #(Long/parseLong (:N %)) lv))))
 
 (defn- list-attr
