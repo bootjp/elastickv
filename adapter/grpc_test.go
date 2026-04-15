@@ -10,6 +10,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
@@ -98,6 +99,27 @@ func Test_grpc_scan(t *testing.T) {
 		assert.Equal(t, key, resp.Kv[i].Key, "Scan RPC failed")
 		assert.Equal(t, want, resp.Kv[i].Value, "Scan RPC failed")
 	}
+}
+
+func TestGRPCServer_RawLatestCommitTS_EmptyKeyReturnsGlobalWatermark(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v"), 77, 0))
+
+	s := NewGRPCServer(st, nil)
+
+	// Empty key should return global LastCommitTS, not an error.
+	resp, err := s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{})
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(77), resp.GetTs())
+	assert.True(t, resp.GetExists())
+
+	// Non-empty key should still work as before.
+	resp, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k")})
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(77), resp.GetTs())
 }
 
 func TestGRPCServer_RawScanAt_RejectsOversizedLimit(t *testing.T) {
