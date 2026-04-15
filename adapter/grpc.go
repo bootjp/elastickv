@@ -108,7 +108,14 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	key := req.GetKey()
 	if len(key) == 0 {
-		return nil, errors.WithStack(kv.ErrInvalidRequest)
+		// No key: return the store's global last-committed watermark.
+		// Used by followers to obtain the leader's authoritative LastCommitTS
+		// without per-key overhead, enabling consistent-read snapshot alignment.
+		ts := r.store.LastCommitTS()
+		return &pb.RawLatestCommitTSResponse{
+			Ts:     ts,
+			Exists: ts > 0,
+		}, nil
 	}
 
 	ts, exists, err := r.store.LatestCommitTS(ctx, key)

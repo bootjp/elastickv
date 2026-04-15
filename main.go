@@ -105,6 +105,7 @@ var (
 	shardRanges          = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
 	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
+	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 )
 
 func main() {
@@ -204,6 +205,7 @@ func run() error {
 		pubsubRelay:     adapter.NewRedisPubSubRelay(),
 		readTracker:     readTracker,
 		dynamoAddress:   *dynamoAddr,
+		leaderDynamo:    cfg.leaderDynamo,
 		s3Address:       *s3Addr,
 		leaderS3:        cfg.leaderS3,
 		s3Region:        *s3Region,
@@ -235,7 +237,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raft.Server, bool,
 		return runtimeConfig{}, "", nil, false, err
 	}
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map)
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap)
 	if err != nil {
 		return runtimeConfig{}, "", nil, false, err
 	}
@@ -254,10 +256,11 @@ type runtimeConfig struct {
 	engine       *distribution.Engine
 	leaderRedis  map[raft.ServerAddress]string
 	leaderS3     map[raft.ServerAddress]string
+	leaderDynamo map[raft.ServerAddress]string
 	multi        bool
 }
 
-func parseRuntimeConfig(myAddr, redisAddr, s3Addr, raftGroups, shardRanges, raftRedisMap, raftS3Map string) (runtimeConfig, error) {
+func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap string) (runtimeConfig, error) {
 	groups, err := parseRaftGroups(raftGroups, myAddr)
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft groups")
@@ -280,6 +283,10 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, raftGroups, shardRanges, raft
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft s3 map")
 	}
+	leaderDynamo, err := buildLeaderDynamo(groups, dynamoAddr, raftDynamoMap)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft dynamo map")
+	}
 
 	return runtimeConfig{
 		groups:       groups,
@@ -287,6 +294,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, raftGroups, shardRanges, raft
 		engine:       engine,
 		leaderRedis:  leaderRedis,
 		leaderS3:     leaderS3,
+		leaderDynamo: leaderDynamo,
 		multi:        len(groups) > 1,
 	}, nil
 }
@@ -305,6 +313,10 @@ func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string)
 
 func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[raft.ServerAddress]string, error) {
 	return buildLeaderAddrMap(groups, s3Addr, raftS3Map, parseRaftS3Map)
+}
+
+func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[raft.ServerAddress]string, error) {
+	return buildLeaderAddrMap(groups, dynamoAddr, raftDynamoMap, parseRaftDynamoMap)
 }
 
 func buildLeaderAddrMap(
@@ -525,7 +537,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[raft.ServerAddress]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
@@ -536,6 +548,7 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		coordinate,
 		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
+		adapter.WithDynamoDBLeaderMap(leaderDynamo),
 	)
 	eg.Go(func() error {
 		defer dynamoServer.Stop()
@@ -677,6 +690,7 @@ type runtimeServerRunner struct {
 	pubsubRelay     *adapter.RedisPubSubRelay
 	readTracker     *kv.ActiveTimestampTracker
 	dynamoAddress   string
+	leaderDynamo    map[raft.ServerAddress]string
 	s3Address       string
 	leaderS3        map[raft.ServerAddress]string
 	s3Region        string
@@ -708,7 +722,7 @@ func (r runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.metricsRegistry, r.readTracker); err != nil {
+	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {

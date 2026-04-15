@@ -49,6 +49,7 @@ var (
 	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
 	raftRedisMap   = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map      = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
+	raftDynamoMap  = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 )
 
 const (
@@ -85,6 +86,7 @@ type config struct {
 	raftBootstrap  bool
 	raftRedisMap   string
 	raftS3Map      string
+	raftDynamoMap  string
 }
 
 func main() {
@@ -111,6 +113,7 @@ func main() {
 			raftBootstrap:  *raftBootstrap,
 			raftRedisMap:   *raftRedisMap,
 			raftS3Map:      *raftS3Map,
+			raftDynamoMap:  *raftDynamoMap,
 		}
 		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
@@ -169,19 +172,23 @@ func main() {
 			},
 		}
 
-		// Build raftRedisMap/raftS3Map strings.
+		// Build raftRedisMap/raftS3Map/raftDynamoMap strings.
 		var redisMapParts []string
 		var s3MapParts []string
+		var dynamoMapParts []string
 		for _, n := range nodes {
 			redisMapParts = append(redisMapParts, n.address+"="+n.redisAddress)
 			s3MapParts = append(s3MapParts, n.address+"="+n.s3Address)
+			dynamoMapParts = append(dynamoMapParts, n.address+"="+n.dynamoAddress)
 		}
 		raftRedisMapStr := strings.Join(redisMapParts, ",")
 		raftS3MapStr := strings.Join(s3MapParts, ",")
+		raftDynamoMapStr := strings.Join(dynamoMapParts, ",")
 
 		for _, n := range nodes {
 			n.raftRedisMap = raftRedisMapStr
 			n.raftS3Map = raftS3MapStr
+			n.raftDynamoMap = raftDynamoMapStr
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
@@ -575,12 +582,23 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	leaderDynamo := make(map[raft.ServerAddress]string)
+	if cfg.raftDynamoMap != "" {
+		for part := range strings.SplitSeq(cfg.raftDynamoMap, ",") {
+			pair := strings.SplitN(part, "=", kvParts)
+			if len(pair) == kvParts {
+				leaderDynamo[raft.ServerAddress(pair[0])] = pair[1]
+			}
+		}
+	}
+	leaderDynamo[raft.ServerAddress(cfg.address)] = cfg.dynamoAddress
 	dynamoRoutedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	ds := adapter.NewDynamoDBServer(
 		dynamoL,
 		dynamoRoutedStore,
 		coordinator,
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
+		adapter.WithDynamoDBLeaderMap(leaderDynamo),
 	)
 	cleanup.Add(ds.Stop)
 	metricsL, ms, pprofL, ps, err := setupObservabilityServers(ctx, lc, &cleanup, cfg, metricsRegistry.Handler())

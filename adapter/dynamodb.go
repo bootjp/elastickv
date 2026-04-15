@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -24,6 +26,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"github.com/hashicorp/raft"
 )
 
 const (
@@ -94,11 +97,12 @@ var dynamoOperationTargets = map[string]string{
 }
 
 const (
-	dynamoErrValidation        = "ValidationException"
-	dynamoErrInternal          = "InternalServerError"
-	dynamoErrConditionalFailed = "ConditionalCheckFailedException"
-	dynamoErrResourceNotFound  = "ResourceNotFoundException"
-	dynamoErrResourceInUse     = "ResourceInUseException"
+	dynamoErrValidation          = "ValidationException"
+	dynamoErrInternal            = "InternalServerError"
+	dynamoErrConditionalFailed   = "ConditionalCheckFailedException"
+	dynamoErrTransactionCanceled = "TransactionCanceledException"
+	dynamoErrResourceNotFound    = "ResourceNotFoundException"
+	dynamoErrResourceInUse       = "ResourceInUseException"
 )
 
 const (
@@ -122,6 +126,7 @@ type DynamoDBServer struct {
 	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
+	leaderDynamo    map[raft.ServerAddress]string
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -134,6 +139,18 @@ func WithDynamoDBRequestObserver(observer monitoring.DynamoDBRequestObserver) Dy
 func WithDynamoDBActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
 		server.readTracker = tracker
+	}
+}
+
+// WithDynamoDBLeaderMap configures the Raft-address-to-DynamoDB-address mapping
+// used to forward requests from followers to the current leader.
+// The format mirrors the raftRedisMap / raftS3Map convention.
+func WithDynamoDBLeaderMap(m map[raft.ServerAddress]string) DynamoDBServerOption {
+	return func(server *DynamoDBServer) {
+		server.leaderDynamo = make(map[raft.ServerAddress]string, len(m))
+		for k, v := range m {
+			server.leaderDynamo[k] = v
+		}
 	}
 }
 
@@ -263,8 +280,45 @@ func (d *DynamoDBServer) Stop() {
 	}
 }
 
+// proxyToLeader forwards the HTTP request to the current DynamoDB leader when
+// this node is not the Raft leader.  Returns true if the request was handled
+// (either proxied or an error response was written), false if the request
+// should be handled locally (i.e. this node is the leader or no leader map is
+// configured).
+func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if len(d.leaderDynamo) == 0 || d.coordinator == nil {
+		return false
+	}
+	if d.coordinator.IsLeader() {
+		return false
+	}
+	// This node is a follower.  All requests must be forwarded to the leader to
+	// preserve linearizability — serving reads or writes locally on a follower
+	// causes stale-read anomalies (G2-item-realtime).
+	leader := d.coordinator.RaftLeader()
+	if leader == "" {
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "no raft leader currently available")
+		return true
+	}
+	targetAddr, ok := d.leaderDynamo[leader]
+	if !ok || strings.TrimSpace(targetAddr) == "" {
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "leader dynamo address not found")
+		return true
+	}
+	target := &url.URL{Scheme: "http", Host: targetAddr}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
+		writeDynamoError(rw, http.StatusServiceUnavailable, dynamoErrInternal, "leader proxy error: "+err.Error())
+	}
+	proxy.ServeHTTP(w, r)
+	return true
+}
+
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	if d.serveHealthz(w, r) {
+		return
+	}
+	if d.proxyToLeader(w, r) {
 		return
 	}
 
@@ -2063,9 +2117,27 @@ func (d *DynamoDBServer) mergeReadItemsFromSourceSchema(
 	return mergeMigratingReadItems(schema.PrimaryKey, orderKey, items, sourceItems)
 }
 
+// consistentReadLatestTS is a read timestamp used for ConsistentRead=true reads.
+// The value is far above any realistic HLC timestamp (~Unix-nanosecond range,
+// ≪ 10^19), so reading at this TS from the leader's Pebble store returns the
+// most recently committed version of any key.  It avoids the noStartTS
+// sentinel (^uint64(0)) used by the coordinator.
+//
+// This sentinel is used on BOTH the leader and followers:
+//   - On a follower, the read is proxied to the leader via proxyRawGet with
+//     ts=consistentReadLatestTS, so the leader reads the absolute latest version.
+//   - On the leader, the LeaderRoutedStore performs a linearizable read fence
+//     (ensuring all committed Raft entries are applied) and then reads locally
+//     at consistentReadLatestTS, returning the latest committed version.
+//
+// Using store.LastCommitTS() instead would introduce a TOCTOU race: the
+// timestamp is captured before the linearizable fence, so a write committed
+// after LastCommitTS() but applied during the fence would be missed.
+const consistentReadLatestTS = ^uint64(0) - 1
+
 func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
 	if consistentRead != nil && *consistentRead {
-		return d.nextTxnReadTS()
+		return consistentReadLatestTS
 	}
 	return snapshotTS(d.coordinator.Clock(), d.store)
 }
@@ -3996,33 +4068,118 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
 	cleanup := make([][]byte, 0, len(in.TransactItems))
+	// seenItemKeys tracks (tableName, primaryKey) pairs to detect duplicates.
+	// Real DynamoDB rejects requests with multiple operations on the same item.
+	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		tableName, err := transactWriteItemTableName(item)
-		if err != nil {
+		if err := d.processTransactWriteItem(ctx, item, readTS, reqs, schemaCache, seenItemKeys, tableGenerations, &cleanup); err != nil {
 			return nil, nil, nil, err
 		}
-		schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		reqs.Elems = append(reqs.Elems, plan.elems...)
-		if !plan.writes {
-			continue
-		}
-		tableGenerations[tableName] = schema.Generation
-		cleanup = append(cleanup, plan.cleanup...)
 	}
 	return reqs, tableGenerations, cleanup, nil
+}
+
+// processTransactWriteItem validates and plans a single item within a
+// TransactWriteItems request, appending the resulting ops to reqs and cleanup.
+func (d *DynamoDBServer) processTransactWriteItem(
+	ctx context.Context,
+	item transactWriteItem,
+	readTS uint64,
+	reqs *kv.OperationGroup[kv.OP],
+	schemaCache map[string]*dynamoTableSchema,
+	seenItemKeys map[string]struct{},
+	tableGenerations map[string]uint64,
+	cleanup *[][]byte,
+) error {
+	tableName, err := transactWriteItemTableName(item)
+	if err != nil {
+		return err
+	}
+	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
+	if err != nil {
+		return err
+	}
+	// Reject duplicate item keys to match real DynamoDB behavior.
+	itemKeyStr, err := transactWriteItemPrimaryKeyStr(schema, item)
+	if err != nil {
+		return err
+	}
+	compositeKey := tableName + "\x00" + itemKeyStr
+	if _, dup := seenItemKeys[compositeKey]; dup {
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+			"Transaction request cannot include multiple operations on one item")
+	}
+	seenItemKeys[compositeKey] = struct{}{}
+	plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
+	if err != nil {
+		// Real DynamoDB wraps per-item condition failures in
+		// TransactionCanceledException rather than surfacing the raw
+		// ConditionalCheckFailedException to the caller.
+		var apiErr *dynamoAPIError
+		if errors.As(err, &apiErr) && apiErr.errorType == dynamoErrConditionalFailed {
+			return newDynamoAPIError(http.StatusBadRequest, dynamoErrTransactionCanceled, apiErr.message)
+		}
+		return err
+	}
+	reqs.Elems = append(reqs.Elems, plan.elems...)
+	reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
+	if !plan.writes {
+		return nil
+	}
+	tableGenerations[tableName] = schema.Generation
+	*cleanup = append(*cleanup, plan.cleanup...)
+	return nil
+}
+
+// transactWriteItemPrimaryKeyStr returns a canonical JSON string of the item's
+// primary key attributes, used to detect duplicate-item violations in
+// TransactWriteItems (real DynamoDB returns ValidationException for these).
+func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
+	var keyAttrs map[string]attributeValue
+	switch {
+	case item.Update != nil:
+		keyAttrs = item.Update.Key
+	case item.Delete != nil:
+		keyAttrs = item.Delete.Key
+	case item.ConditionCheck != nil:
+		keyAttrs = item.ConditionCheck.Key
+	case item.Put != nil:
+		var err error
+		keyAttrs, err = primaryKeyAttributes(schema.PrimaryKey, item.Put.Item)
+		if err != nil {
+			return "", err
+		}
+	default:
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+	}
+	// Normalize numeric attribute values so that equivalent numbers (e.g. "10"
+	// and "10.0") produce the same canonical key string and are reliably detected
+	// as duplicates during JSON marshalling.
+	normalized := make(map[string]attributeValue, len(keyAttrs))
+	for k, v := range keyAttrs {
+		if v.N != nil {
+			n := canonicalNumberString(*v.N)
+			v.N = &n
+		}
+		normalized[k] = v
+	}
+	b, err := json.Marshal(normalized)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to serialize transact item key")
+	}
+	return string(b), nil
 }
 
 type transactWriteItemPlan struct {
 	elems   []*kv.Elem[kv.OP]
 	cleanup [][]byte
 	writes  bool
+	// readKeys contains the raw storage keys that were read during plan
+	// construction.  They are propagated into OperationGroup.ReadKeys so the
+	// FSM can validate read-write conflicts atomically at commit time,
+	// preventing lost-update and G0 anomalies on concurrent transactions that
+	// read the same item at a stale timestamp.
+	readKeys [][]byte
 }
 
 func (d *DynamoDBServer) buildTransactWriteItemPlan(
@@ -4080,9 +4237,10 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   req.Elems,
-		cleanup: cleanup,
-		writes:  true,
+		elems:    req.Elems,
+		cleanup:  cleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4123,9 +4281,10 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   req.Elems,
-		cleanup: cleanup,
-		writes:  true,
+		elems:    req.Elems,
+		cleanup:  cleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4135,6 +4294,10 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 	in transactDeleteInput,
 	readTS uint64,
 ) (*transactWriteItemPlan, error) {
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
@@ -4152,15 +4315,20 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
 	if !found {
-		return &transactWriteItemPlan{}, nil
+		// Item does not exist at readTS. Track the key so a concurrent create
+		// after our snapshot can be detected if the overall transaction
+		// includes write elems and therefore reaches FSM validation. In a
+		// pure no-op transaction, these read keys may not be validated.
+		return &transactWriteItemPlan{readKeys: [][]byte{itemKey}}, nil
 	}
 	req, err := buildItemDeleteRequestWithSource(currentLocation)
 	if err != nil {
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:  req.Elems,
-		writes: true,
+		elems:    req.Elems,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4202,9 +4370,10 @@ func (d *DynamoDBServer) buildTransactConditionCheckPlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:   lockReq.Elems,
-		cleanup: lockCleanup,
-		writes:  true,
+		elems:    lockReq.Elems,
+		cleanup:  lockCleanup,
+		writes:   true,
+		readKeys: [][]byte{itemKey},
 	}, nil
 }
 
@@ -4246,16 +4415,26 @@ func buildConditionCheckLockRequest(
 	current map[string]attributeValue,
 	found bool,
 ) (*kv.OperationGroup[kv.OP], [][]byte, error) {
-	elems := make([]*kv.Elem[kv.OP], 0, 1)
-	if found {
-		payload, err := encodeStoredDynamoItem(current)
-		if err != nil {
-			return nil, nil, errors.WithStack(err)
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: itemKey, Value: payload})
-	} else {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: itemKey})
+	if !found {
+		// Item does not exist: no write is needed.
+		// Include itemKey in ReadKeys only so OCC conflict detection fires
+		// if a concurrent writer commits to this key between our startTS and commitTS.
+		// Writing a Del tombstone here would shadow any concurrently committed Put
+		// at a higher timestamp, causing G-single-item-realtime anomalies.
+		// Return nil cleanup since nothing was written by this condition check.
+		return &kv.OperationGroup[kv.OP]{
+				IsTxn:   true,
+				StartTS: 0,
+				Elems:   nil,
+			},
+			nil,
+			nil
 	}
+	payload, err := encodeStoredDynamoItem(current)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: itemKey, Value: payload}}
 	return &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: 0,
@@ -4316,7 +4495,11 @@ func nextTransactRetryBackoff(current time.Duration) time.Duration {
 var errTableGenerationChanged = errors.New("table generation changed")
 
 func (d *DynamoDBServer) verifyTableGeneration(ctx context.Context, tableName string, expectedGeneration uint64) error {
-	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	// Use consistentReadLatestTS to always read the latest committed schema.
+	// Using a stale snapshotTS can cause false "table not found" results when
+	// this node's LastCommitTS is behind the table creation timestamp, which
+	// would erroneously trigger cleanupCommittedKeys and delete live item data.
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, consistentReadLatestTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -7374,23 +7557,47 @@ func cloneAttributeValue(in attributeValue) attributeValue {
 	return out
 }
 
+// globalLastCommitTSProvider is the interface satisfied by stores (e.g.
+// LeaderRoutedStore) that can proxy the leader's LastCommitTS.  Defined as a
+// local interface so DynamoDBServer avoids a hard dependency on the concrete
+// kv type.
+type globalLastCommitTSProvider interface {
+	GlobalLastCommitTS(ctx context.Context) uint64
+}
+
 func (d *DynamoDBServer) nextTxnReadTS() uint64 {
+	// On a follower the local store.LastCommitTS() may lag behind the leader.
+	// Use GlobalLastCommitTS so ConsistentRead snapshots and transaction
+	// start timestamps are aligned with the leader's committed watermark,
+	// preventing stale pre-reads that cause false Jepsen anomalies and
+	// unnecessary WriteConflict retries on every follower request.
 	maxTS := uint64(0)
-	if d.store != nil {
+	if p, ok := d.store.(globalLastCommitTSProvider); ok {
+		maxTS = p.GlobalLastCommitTS(context.Background())
+	} else if d.store != nil {
 		maxTS = d.store.LastCommitTS()
 	}
 
+	// Advance the HLC so subsequent commitTS calls produce values > maxTS,
+	// but return maxTS directly as the snapshot — NOT clock.Next().
+	//
+	// clock.Next() can be ahead of store.LastCommitTS() because concurrent
+	// dispatchTxn calls advance the HLC before their Raft entry is applied.
+	// If readTS = clock.Next() = T and a concurrent write obtained
+	// commitTS = T-1 (still in the Raft pipeline), the version at T-1 is
+	// not yet in Pebble.  Reads would see stale data and the FSM conflict
+	// check (latestTS > startTS: T-1 > T → false) would silently pass,
+	// allowing corrupted writes.  Returning maxTS closes this gap: every
+	// version at ≤ maxTS is guaranteed visible, and any concurrent write at
+	// > maxTS triggers a WriteConflict and a retry.
 	clock := d.coordinator.Clock()
-	if clock == nil {
-		if maxTS == ^uint64(0) {
-			return maxTS
-		}
-		return maxTS + 1
-	}
-	if maxTS > 0 {
+	if clock != nil && maxTS > 0 {
 		clock.Observe(maxTS)
 	}
-	return clock.Next()
+	if maxTS == 0 {
+		return 1
+	}
+	return maxTS
 }
 
 func (d *DynamoDBServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
