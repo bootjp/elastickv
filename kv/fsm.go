@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"os"
@@ -17,18 +18,25 @@ import (
 type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
+	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
+	// May be nil for nodes that do not participate in physical ceiling tracking.
+	hlc *HLC
 }
 
 type FSM interface {
 	raft.FSM
 }
 
-func NewKvFSM(store store.MVCCStore) FSM {
+// NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
+// a HLC lease entry is applied. The caller must pass the same *HLC instance to
+// the coordinator so both sides share the agreed physical ceiling.
+func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC) FSM {
 	return &kvFSM{
 		store: store,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
+		hlc: hlc,
 	}
 }
 
@@ -42,6 +50,12 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(l *raft.Log) any {
+	// HLC lease entries advance only the physical ceiling; they do not touch
+	// the MVCC store. The logical counter continues to be managed in memory.
+	if len(l.Data) > 0 && l.Data[0] == raftEncodeHLCLease {
+		return f.applyHLCLease(l.Data[1:])
+	}
+
 	ctx := context.TODO()
 
 	reqs, err := decodeRaftRequests(l.Data)
@@ -68,9 +82,30 @@ func (f *kvFSM) Apply(l *raft.Log) any {
 	return nil
 }
 
+// hlcLeasePayloadLen is the payload length (tag byte excluded) of an HLC lease entry.
+const hlcLeasePayloadLen = 8 //nolint:mnd
+
+// applyHLCLease decodes a physical ceiling from data and advances the shared HLC.
+// data must be exactly 8 bytes: a big-endian int64 Unix millisecond value.
+func (f *kvFSM) applyHLCLease(data []byte) any {
+	if len(data) != hlcLeasePayloadLen {
+		return errors.Newf("hlc lease: expected %d bytes, got %d", hlcLeasePayloadLen, len(data)) //nolint:wrapcheck // creating new error, nothing to wrap
+	}
+	ceilingMs := int64(binary.BigEndian.Uint64(data)) //nolint:gosec // value is a Unix ms timestamp encoded as uint64; fits in int64 for any sane date
+	if f.hlc != nil && ceilingMs > 0 {
+		f.hlc.SetPhysicalCeiling(ceilingMs)
+	}
+	return nil
+}
+
 const (
 	raftEncodeSingle byte = 0x00
 	raftEncodeBatch  byte = 0x01
+	// raftEncodeHLCLease marks an entry that carries only a physical ceiling for
+	// the HLC. The payload is 8 bytes: a big-endian int64 Unix millisecond value.
+	// These entries do not touch the MVCC store; they only advance the shared HLC
+	// physicalCeiling so the logical counter can continue to increment in memory.
+	raftEncodeHLCLease byte = 0x02
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
