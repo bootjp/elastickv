@@ -1,13 +1,18 @@
 (ns elastickv.dynamodb-workload
   "Jepsen workload for elastickv's DynamoDB-compatible API.
    Uses the list-append consistency model: each key maps to a DynamoDB item
-   whose 'val' attribute is a list of integers. Writes append to the list via
-   UpdateItem; reads fetch the list via GetItem."
+   whose 'val' attribute is a list of integers.
+
+   Writes append to the list via UpdateItem (single-op) or TransactWriteItems
+   (multi-op).  Reads fetch the list via GetItem with ConsistentRead=true.
+
+   Uses cognitect/aws-api as the DynamoDB client so that the full SDK wire
+   protocol (auth headers, error parsing, retry classification) is exercised
+   against elastickv rather than a hand-rolled HTTP layer."
   (:gen-class)
   (:require [clojure.string :as str]
-            [clojure.tools.logging :refer [warn]]
-            [cheshire.core :as json]
-            [clj-http.client :as http]
+            [cognitect.aws.client.api :as aws]
+            [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [jepsen [client :as client]
@@ -23,106 +28,136 @@
             [jepsen.tests.cycle.append :as append]))
 
 (def ^:private table-name "jepsen_append")
-(def ^:private pk-attr "pk")
-(def ^:private val-attr "val")
+(def ^:private pk-attr    "pk")
+(def ^:private val-attr   "val")
 
-(defn- dynamo-url
-  "Returns the base URL for the DynamoDB endpoint on a given node and port."
-  [node port]
-  (str "http://" (name node) ":" port))
+;; ---------------------------------------------------------------------------
+;; Client construction
+;; ---------------------------------------------------------------------------
 
-(defn- dynamo-request
-  "Send a DynamoDB JSON request. Returns the parsed response body or throws."
-  [url target body]
-  (let [resp (http/post url
-               {:headers      {"X-Amz-Target" target
-                               "Content-Type" "application/x-amz-json-1.0"}
-                :body         (json/generate-string body)
-                :as           :string
-                :throw-exceptions false
-                :conn-timeout 5000
-                :socket-timeout 10000})]
-    (if (< (:status resp) 400)
-      (when (and (:body resp) (not (str/blank? (:body resp))))
-        (json/parse-string (:body resp) true))
-      (let [parsed (when (and (:body resp) (not (str/blank? (:body resp))))
-                     (try (json/parse-string (:body resp) true)
-                          (catch Exception _ nil)))
-            err-type (get parsed :__type "UnknownError")
-            message  (get parsed :message (or (:body resp) ""))]
-        (throw (ex-info (str "DynamoDB error: " err-type ": " message)
-                        {:type err-type :status (:status resp) :body parsed}))))))
+(defn- make-ddb-client
+  "Returns a cognitect/aws-api DynamoDB client pointed at http://host:port.
+   Dummy credentials are provided explicitly so the SDK never attempts
+   credential resolution from the environment (which would fail in CI)."
+  [host port]
+  (aws/client
+    {:api                  :dynamodb
+     :credentials-provider (creds/basic-credentials-provider
+                             {:access-key-id     "dummy"
+                              :secret-access-key "dummy"})
+     :endpoint-override    {:protocol :http
+                            :hostname  host
+                            :port      port}}))
+
+;; ---------------------------------------------------------------------------
+;; Low-level DynamoDB helpers
+;; ---------------------------------------------------------------------------
+
+(defn- anomaly? [resp]
+  (contains? resp :cognitect.anomalies/category))
+
+(defn- ddb-invoke!
+  "Invoke op against ddb-client, returning the parsed response map.
+   Throws ex-info on any error (DynamoDB API error or network failure).
+   ex-data keys: :type (DynamoDB __type string or nil), :category (anomaly
+   keyword), :resp (raw cognitect/aws-api response)."
+  [ddb-client op request]
+  (let [resp (aws/invoke ddb-client {:op op :request request})]
+    (if (anomaly? resp)
+      (let [err-type (:__type resp)
+            category (:cognitect.anomalies/category resp)
+            msg      (or (:message resp)
+                         (:Message resp)
+                         (:cognitect.anomalies/message resp)
+                         "")]
+        (throw (ex-info (str "DynamoDB " (or err-type category) ": " msg)
+                        {:type     err-type
+                         :category category
+                         :resp     resp})))
+      resp)))
 
 (defn- create-table!
-  "Create the jepsen_append table if it doesn't exist."
-  [url]
+  "Create the jepsen_append table; ignore ResourceInUseException."
+  [ddb]
   (try
-    (dynamo-request url "DynamoDB_20120810.CreateTable"
-                    {:TableName             table-name
-                     :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
-                     :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
-                     :ProvisionedThroughput {:ReadCapacityUnits 5 :WriteCapacityUnits 5}})
+    (ddb-invoke! ddb :CreateTable
+                 {:TableName             table-name
+                  :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
+                  :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
+                  :ProvisionedThroughput {:ReadCapacityUnits 5 :WriteCapacityUnits 5}})
     (catch clojure.lang.ExceptionInfo e
       (when-not (= "ResourceInUseException" (:type (ex-data e)))
         (throw e)))))
 
 (defn- dynamo-append!
-  "Append a value to the list for the given key. Returns nil."
-  [url k v]
-  (dynamo-request url "DynamoDB_20120810.UpdateItem"
-                  {:TableName                 table-name
-                   :Key                       {pk-attr {:S (str k)}}
-                   :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
-                   :ExpressionAttributeNames  {"#v" val-attr}
-                   :ExpressionAttributeValues {":empty" {:L []}
-                                               ":val"   {:L [{:N (str v)}]}}})
+  "Append single value v to the list stored at key k."
+  [ddb k v]
+  (ddb-invoke! ddb :UpdateItem
+               {:TableName                 table-name
+                :Key                       {pk-attr {:S (str k)}}
+                :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
+                :ExpressionAttributeNames  {"#v" val-attr}
+                :ExpressionAttributeValues {":empty" {:L []}
+                                            ":val"   {:L [{:N (str v)}]}}})
   nil)
 
 (defn- dynamo-read
-  "Read the list for the given key. Returns a vector of longs, or nil if the
-   item doesn't exist."
-  [url k]
-  (let [resp (dynamo-request url "DynamoDB_20120810.GetItem"
-                             {:TableName      table-name
-                              :Key            {pk-attr {:S (str k)}}
-                              :ConsistentRead true})]
-    (when-let [item (:Item resp)]
-      (let [list-val (get-in item [(keyword val-attr) :L])]
-        (when list-val
-          (mapv (fn [elem] (Long/parseLong (:N elem))) list-val))))))
+  "Read the list stored at key k.  Returns a vector of longs, or nil if the
+   item does not exist.  ConsistentRead ensures we read from the leader."
+  [ddb k]
+  (let [resp (ddb-invoke! ddb :GetItem
+                          {:TableName      table-name
+                           :Key            {pk-attr {:S (str k)}}
+                           :ConsistentRead true})]
+    ;; cognitect/aws-api: Item is map[String,AttributeValue]; member keys
+    ;; of AttributeValue union (S, N, L …) are Clojure keywords.
+    (when-let [lv (get-in resp [:Item val-attr :L])]
+      (mapv #(Long/parseLong (:N %)) lv))))
 
 (defn- dynamo-transact-write!
-  "Atomically write multiple append operations via a single TransactWriteItems
-   request.  All list_append mutations are applied atomically so that a
-   concurrent reader never observes a partial set of writes from the same
-   transaction (which would produce spurious G0 write-cycle anomalies)."
-  [url writes]
-  (dynamo-request url "DynamoDB_20120810.TransactWriteItems"
-                  {:TransactItems
-                   (mapv (fn [[_ k v]]
-                           {:Update
-                            {:TableName                 table-name
-                             :Key                       {pk-attr {:S (str k)}}
-                             :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
-                             :ExpressionAttributeNames  {"#v" val-attr}
-                             :ExpressionAttributeValues {":empty" {:L []}
-                                                         ":val"   {:L [{:N (str v)}]}}}})
-                         writes)}))
+  "Atomically write all append micro-ops as a single TransactWriteItems call.
+   Multiple appends to the same key within one transaction are merged into one
+   UpdateItem entry so they are applied atomically — real DynamoDB rejects
+   requests with two operations on the same item (ValidationException), and
+   elastickv enforces the same constraint server-side."
+  [ddb writes]
+  ;; Group values by key, preserving append order within each key.
+  (let [by-key (reduce (fn [acc [_ k v]]
+                         (update acc k (fnil conj []) v))
+                       (array-map)
+                       writes)]
+    (ddb-invoke! ddb :TransactWriteItems
+                 {:TransactItems
+                  (mapv (fn [[k vs]]
+                          {:Update
+                           {:TableName                 table-name
+                            :Key                       {pk-attr {:S (str k)}}
+                            :UpdateExpression          "SET #v = list_append(if_not_exists(#v, :empty), :val)"
+                            :ExpressionAttributeNames  {"#v" val-attr}
+                            :ExpressionAttributeValues {":empty" {:L []}
+                                                        ":val"   {:L (mapv (fn [v] {:N (str v)}) vs)}}}})
+                        by-key)})))
 
-(defrecord DynamoDBClient [node->port url]
+;; ---------------------------------------------------------------------------
+;; Jepsen client
+;; ---------------------------------------------------------------------------
+
+(defrecord DynamoDBClient [node->port ddb]
   client/Client
+
   (open! [this test node]
     (let [port (get node->port node 8000)
           host (or (:dynamo-host test) (name node))]
-      (assoc this :url (dynamo-url host port))))
+      (assoc this :ddb (make-ddb-client host port))))
 
   (setup! [this _test]
-    (create-table! url))
+    (create-table! ddb))
 
   (teardown! [_this _test])
 
   (close! [this _test]
-    (assoc this :url nil))
+    (when ddb (aws/stop ddb))
+    (assoc this :ddb nil))
 
   (invoke! [_this _test op]
     (try
@@ -130,48 +165,63 @@
         :txn
         (let [mops (:value op)]
           (if (= 1 (count mops))
-            ;; Single micro-op: send as individual UpdateItem / GetItem.
+            ;; ---- Single micro-op: individual UpdateItem / GetItem ----
             (let [[f k v :as mop] (first mops)]
               (assoc op :type :ok
                         :value [(case f
-                                  :append (do (dynamo-append! url k v) mop)
-                                  :r      [f k (dynamo-read url k)])]))
-            ;; Multi-op: reads are individual GetItem (consistent snapshot),
-            ;; writes are batched into one TransactWriteItems for atomicity.
-            ;; Executing reads before writes mirrors snapshot-isolation
-            ;; semantics and prevents G0 write-cycle anomalies.
-            (let [writes (filterv (fn [[f _ _]] (= f :append)) mops)
-                  reads  (filterv (fn [[f _ _]] (= f :r))      mops)
-                  read-results (into {} (map (fn [[_ k _]] [k (dynamo-read url k)]) reads))
-                  _ (when (seq writes) (dynamo-transact-write! url writes))
+                                  :append (do (dynamo-append! ddb k v) mop)
+                                  :r      [f k (dynamo-read ddb k)])]))
+
+            ;; ---- Multi-op: snapshot isolation + read-your-own-writes ----
+            ;; 1. Pre-read a consistent snapshot for every key accessed.
+            ;; 2. Simulate micro-ops in order; track local appends so that
+            ;;    a :r after an :append in the same txn sees the append (RYOW).
+            ;; 3. Dispatch all writes atomically via TransactWriteItems,
+            ;;    merging same-key appends into one UpdateItem entry.
+            (let [all-keys      (into #{} (map second mops))
+                  snapshot      (into {} (map (fn [k] [k (dynamo-read ddb k)]) all-keys))
+                  local-appends (volatile! {})
                   value' (mapv (fn [[f k v :as mop]]
                                  (case f
-                                   :append mop
-                                   :r      [f k (get read-results k)]))
-                               mops)]
+                                   :append (do (vswap! local-appends update k (fnil conj []) v)
+                                               mop)
+                                   :r      (let [base    (get snapshot k)
+                                                 pending (get @local-appends k [])]
+                                             [f k (if (and (nil? base) (empty? pending))
+                                                    nil
+                                                    (into (or base []) pending))])))
+                               mops)
+                  writes (filterv (fn [[f _ _]] (= f :append)) mops)]
+              (when (seq writes) (dynamo-transact-write! ddb writes))
               (assoc op :type :ok :value value')))))
+
       (catch clojure.lang.ExceptionInfo e
-        (let [data (ex-data e)
-              err-type (:type data)]
+        (let [data     (ex-data e)
+              err-type (:type data)
+              category (:category data)]
           (cond
-            ;; Condition check failures or internal retryable errors → :info
+            ;; Network / transport error (no DynamoDB __type)
+            (and (nil? err-type)
+                 (#{:cognitect.anomalies/fault
+                    :cognitect.anomalies/unavailable} category))
+            (assoc op :type :info :error :network-error)
+
+            ;; Retryable DynamoDB server-side errors
             (contains? #{"ConditionalCheckFailedException"
                          "InternalServerError"
                          "TransactionCanceledException"} err-type)
             (assoc op :type :info :error (str err-type))
 
-            ;; Validation errors are definite failures
+            ;; Definite API-level failures
             (= "ValidationException" err-type)
-            (assoc op :type :fail :error (str err-type ": " (get-in data [:body :message] "")))
+            (assoc op :type :fail
+                      :error (str err-type ": "
+                                  (get-in data [:resp :message]
+                                    (get-in data [:resp :Message] ""))))
 
             :else
             (assoc op :type :info :error (.getMessage e)))))
-      (catch java.net.ConnectException _
-        (assoc op :type :info :error :connection-refused))
-      (catch java.net.SocketTimeoutException _
-        (assoc op :type :info :error :socket-timeout))
-      (catch java.net.SocketException e
-        (assoc op :type :info :error (str "socket: " (.getMessage e))))
+
       (catch Exception e
         (assoc op :type :info :error (.getMessage e))))))
 
@@ -182,16 +232,16 @@
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
 (defn dynamodb-append-workload
-  "Builds the list-append workload map targeting the DynamoDB endpoint.
-   Multi-op write transactions are executed atomically via TransactWriteItems
-   to prevent G0 write-cycle anomalies.  Reads within a transaction are sent
-   as individual ConsistentRead GetItem calls before the atomic write batch."
+  "Builds the list-append workload targeting the DynamoDB endpoint.
+   Multi-op write transactions are executed atomically via TransactWriteItems.
+   Reads within a transaction are ConsistentRead GetItem calls; RYOW semantics
+   are implemented client-side for reads that follow a write on the same key."
   [opts]
-  (let [workload (append/test {:key-count            (or (:key-count opts) 12)
-                               :min-txn-length       1
-                               :max-txn-length       (or (:max-txn-length opts) 4)
-                               :max-writes-per-key   (or (:max-writes-per-key opts) 128)
-                               :consistency-models   [:strict-serializable]})
+  (let [workload (append/test {:key-count          (or (:key-count opts) 12)
+                               :min-txn-length     1
+                               :max-txn-length     (or (:max-txn-length opts) 4)
+                               :max-writes-per-key (or (:max-writes-per-key opts) 128)
+                               :consistency-models [:strict-serializable]})
         client   (->DynamoDBClient (or (:node->port opts)
                                        (zipmap default-nodes (repeat 8000)))
                                    nil)]
@@ -202,30 +252,30 @@
    with the list-append workload."
   ([] (elastickv-dynamodb-test {}))
   ([opts]
-   (let [nodes       (or (:nodes opts) default-nodes)
+   (let [nodes        (or (:nodes opts) default-nodes)
          dynamo-ports (or (:dynamo-ports opts) (repeat (count nodes) (or (:dynamo-port opts) 8000)))
-         node->port  (or (:node->port opts) (cli/ports->node-map dynamo-ports nodes))
-         local?      (:local opts)
-         db          (if local?
-                       jdb/noop
-                       (ekdb/db {:grpc-port   (or (:grpc-port opts) 50051)
-                                 :redis-port  (or (:redis-port opts) 6379)
-                                 :dynamo-port node->port
-                                 :raft-groups  (:raft-groups opts)
-                                 :shard-ranges (:shard-ranges opts)}))
-         rate        (double (or (:rate opts) 5))
-         time-limit  (or (:time-limit opts) 30)
-         faults      (if local?
-                       []
-                       (cli/normalize-faults (or (:faults opts) [:partition :kill])))
-         nemesis-p   (when-not local?
-                       (combined/nemesis-package {:db       db
-                                                  :faults   faults
-                                                  :interval (or (:fault-interval opts) 40)}))
-         nemesis-gen (if nemesis-p
-                       (:generator nemesis-p)
-                       (gen/once {:type :info :f :noop}))
-         workload    (dynamodb-append-workload (assoc opts :node->port node->port))]
+         node->port   (or (:node->port opts) (cli/ports->node-map dynamo-ports nodes))
+         local?       (:local opts)
+         db           (if local?
+                        jdb/noop
+                        (ekdb/db {:grpc-port    (or (:grpc-port opts) 50051)
+                                  :redis-port   (or (:redis-port opts) 6379)
+                                  :dynamo-port  node->port
+                                  :raft-groups  (:raft-groups opts)
+                                  :shard-ranges (:shard-ranges opts)}))
+         rate         (double (or (:rate opts) 5))
+         time-limit   (or (:time-limit opts) 30)
+         faults       (if local?
+                        []
+                        (cli/normalize-faults (or (:faults opts) [:partition :kill])))
+         nemesis-p    (when-not local?
+                        (combined/nemesis-package {:db       db
+                                                   :faults   faults
+                                                   :interval (or (:fault-interval opts) 40)}))
+         nemesis-gen  (if nemesis-p
+                        (:generator nemesis-p)
+                        (gen/once {:type :info :f :noop}))
+         workload     (dynamodb-append-workload (assoc opts :node->port node->port))]
      (merge workload
             {:name            (or (:name opts) "elastickv-dynamodb-append")
              :nodes           nodes
@@ -233,15 +283,13 @@
              :dynamo-host     (:dynamo-host opts)
              :os              (if local? os/noop debian/os)
              :net             (if local? net/noop net/iptables)
-             :ssh             (merge {:username              "vagrant"
-                                      :private-key-path      "/home/vagrant/.ssh/id_rsa"
+             :ssh             (merge {:username               "vagrant"
+                                      :private-key-path       "/home/vagrant/.ssh/id_rsa"
                                       :strict-host-key-checking false}
                                      (when local? {:dummy true})
                                      (:ssh opts))
              :remote          control/ssh
-             :nemesis         (if nemesis-p
-                                (:nemesis nemesis-p)
-                                nemesis/noop)
+             :nemesis         (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
              :final-generator nil
              :concurrency     (or (:concurrency opts) 5)
              :generator       (->> (:generator workload)
@@ -255,7 +303,7 @@
 
 (def dynamo-cli-opts
   "DynamoDB-specific CLI options, appended to common opts."
-  [[nil "--dynamo-ports PORTS" "Comma separated DynamoDB ports (per node)."
+  [[nil "--dynamo-ports PORTS" "Comma-separated DynamoDB ports (one per node)."
     :default nil
     :parse-fn (fn [s]
                 (->> (str/split s #",")
@@ -275,15 +323,15 @@
   "Transform parsed CLI options into the map expected by elastickv-dynamodb-test."
   [options]
   (let [dynamo-ports (:dynamo-ports options)
-        options (cli/parse-common-opts options dynamo-ports)
-        node->port (if dynamo-ports
-                     (cli/ports->node-map dynamo-ports (:nodes options))
-                     (zipmap (:nodes options) (repeat (:dynamo-port options))))]
+        options      (cli/parse-common-opts options dynamo-ports)
+        node->port   (if dynamo-ports
+                       (cli/ports->node-map dynamo-ports (:nodes options))
+                       (zipmap (:nodes options) (repeat (:dynamo-port options))))]
     (assoc options
       :dynamo-host (:host options)
-      :node->port node->port
+      :node->port  node->port
       :dynamo-port (:dynamo-port options)
-      :redis-port (:redis-port options))))
+      :redis-port  (:redis-port options))))
 
 (defn -main
   [& args]

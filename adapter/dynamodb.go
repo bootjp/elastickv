@@ -3996,6 +3996,9 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
 	cleanup := make([][]byte, 0, len(in.TransactItems))
+	// seenItemKeys tracks (tableName, primaryKey) pairs to detect duplicates.
+	// Real DynamoDB rejects requests with multiple operations on the same item.
+	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
 	for _, item := range in.TransactItems {
 		tableName, err := transactWriteItemTableName(item)
 		if err != nil {
@@ -4005,6 +4008,17 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		// Reject duplicate item keys to match real DynamoDB behavior.
+		itemKeyStr, err := transactWriteItemPrimaryKeyStr(schema, item)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		compositeKey := tableName + "\x00" + itemKeyStr
+		if _, dup := seenItemKeys[compositeKey]; dup {
+			return nil, nil, nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+				"Transaction request cannot include multiple operations on one item")
+		}
+		seenItemKeys[compositeKey] = struct{}{}
 		plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
 		if err != nil {
 			return nil, nil, nil, err
@@ -4017,6 +4031,34 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 		cleanup = append(cleanup, plan.cleanup...)
 	}
 	return reqs, tableGenerations, cleanup, nil
+}
+
+// transactWriteItemPrimaryKeyStr returns a canonical JSON string of the item's
+// primary key attributes, used to detect duplicate-item violations in
+// TransactWriteItems (real DynamoDB returns ValidationException for these).
+func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
+	var keyAttrs map[string]attributeValue
+	switch {
+	case item.Update != nil:
+		keyAttrs = item.Update.Key
+	case item.Delete != nil:
+		keyAttrs = item.Delete.Key
+	case item.ConditionCheck != nil:
+		keyAttrs = item.ConditionCheck.Key
+	case item.Put != nil:
+		var err error
+		keyAttrs, err = primaryKeyAttributes(schema.PrimaryKey, item.Put.Item)
+		if err != nil {
+			return "", err
+		}
+	default:
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+	}
+	b, err := json.Marshal(keyAttrs)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to serialize transact item key")
+	}
+	return string(b), nil
 }
 
 type transactWriteItemPlan struct {
