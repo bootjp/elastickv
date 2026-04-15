@@ -70,9 +70,13 @@ type snapshotToken struct {
 	CRC32C uint32
 }
 
-// isSnapshotToken returns true if data begins with the EKVT magic prefix.
+// isSnapshotToken returns true if data is exactly snapshotTokenSize bytes and
+// begins with the EKVT magic prefix. The length check prevents false positives
+// from legacy FSM payloads that happen to start with the same magic bytes:
+// a false positive in dispatchSnapshot would cause decodeSnapshotToken to fail
+// and block the send instead of falling back to the legacy path.
 func isSnapshotToken(data []byte) bool {
-	if len(data) < snapshotTokenMagicLen {
+	if len(data) != snapshotTokenSize {
 		return false
 	}
 	return [snapshotTokenMagicLen]byte(data[:snapshotTokenMagicLen]) == snapshotTokenMagic
@@ -581,7 +585,9 @@ func purgeSnapPair(snapDir, fsmSnapDir, snapName string) error {
 	}
 
 	// Remove the corresponding .fsm file second.
-	if idx > 0 {
+	// Guard fsmSnapDir: when disk offloading is not configured (e.g. unit tests),
+	// fsmSnapDir may be empty and fsmSnapPath would return a relative path.
+	if idx > 0 && fsmSnapDir != "" {
 		fsmPath := fsmSnapPath(fsmSnapDir, idx)
 		if removeErr := os.Remove(fsmPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			return errors.WithStack(removeErr)
