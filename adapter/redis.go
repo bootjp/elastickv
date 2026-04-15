@@ -1348,15 +1348,80 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	results, err := r.runTransaction(state.queue)
+	queue := state.queue
 	state.inTxn = false
 	state.queue = nil
+
+	// Always execute MULTI/EXEC on the leader so that reads and writes within
+	// the transaction see consistent, up-to-date data. Serving transactions
+	// on followers risks reading stale MVCC state and producing write cycles.
+	if !r.coordinator.IsLeader() {
+		r.proxyTransactionToLeader(conn, queue)
+		return
+	}
+
+	results, err := r.runTransaction(queue)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 
 	r.writeResults(conn, results)
+}
+
+// proxyTransactionToLeader forwards a MULTI/EXEC transaction to the leader
+// node and writes the EXEC response array back to conn.
+func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.Command) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		conn.WriteError(ErrLeaderNotFound.Error())
+		return
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+		return
+	}
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	cmds := make([]*redis.Cmd, 0, len(queue))
+	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, cmd := range queue {
+			args := make([]interface{}, len(cmd.Args))
+			for i, a := range cmd.Args {
+				args[i] = a
+			}
+			cmds = append(cmds, pipe.Do(ctx, args...))
+		}
+		return nil
+	})
+	// Transaction aborted (WATCH conflict or server-side nil EXEC reply):
+	// Redis protocol requires a Null array reply (*-1), not an error array.
+	if errors.Is(err, redis.TxFailedErr) || errors.Is(err, redis.Nil) {
+		conn.WriteNull()
+		return
+	}
+	// Fatal transport error (context timeout, network failure): return a
+	// single error reply. Per-command results are unreliable in this case.
+	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		conn.WriteError(err.Error())
+		return
+	}
+	// For any other non-nil err (individual command errors within the
+	// transaction), individual results are still available on each cmd,
+	// which is the correct Redis EXEC semantics — an array of per-command
+	// responses where some entries may be error replies.
+	if len(cmds) == 0 {
+		conn.WriteArray(0)
+		return
+	}
+	conn.WriteArray(len(cmds))
+	for _, cmd := range cmds {
+		writeGoRedisResult(conn, cmd)
+	}
 }
 
 type txnValue struct {
@@ -2132,6 +2197,24 @@ func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
 	maxTS, err := r.maxLatestCommitTS(ctx, queue)
 	if err != nil {
 		return 0, err
+	}
+	// txnStartTS is only called on the leader (followers proxy MULTI/EXEC via
+	// proxyTransactionToLeader before reaching runTransaction). The leader's
+	// HLC clock is authoritative — Observe the highest known committed
+	// timestamp before issuing the next tick so the clock never goes backwards.
+	//
+	// store.LastCommitTS() covers the leader-election case: when a new leader
+	// is elected its in-memory HLC starts from wall-clock time (zero logical),
+	// which may be lower than the previous leader's last commit timestamp
+	// (stored in the MVCC layer and applied via FSM). Without this Observe
+	// call the new leader could issue a startTS below already-committed
+	// versions, causing spurious write-conflict retries. The FSM conflict check
+	// would still catch any real violations, but observing LastCommitTS here
+	// avoids the unnecessary retry loop.
+	if r.store != nil {
+		if storeTS := r.store.LastCommitTS(); storeTS > maxTS {
+			maxTS = storeTS
+		}
 	}
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
