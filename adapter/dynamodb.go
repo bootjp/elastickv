@@ -7380,17 +7380,23 @@ func (d *DynamoDBServer) nextTxnReadTS() uint64 {
 		maxTS = d.store.LastCommitTS()
 	}
 
+	// Advance the HLC so subsequent commitTS calls produce values > maxTS,
+	// but return maxTS directly as the snapshot — NOT clock.Next().
+	//
+	// clock.Next() can be ahead of store.LastCommitTS() because concurrent
+	// dispatchTxn calls advance the HLC before their Raft entry is applied.
+	// If readTS = clock.Next() = T and a concurrent write obtained
+	// commitTS = T-1 (still in the Raft pipeline), the version at T-1 is
+	// not yet in Pebble.  Reads would see stale data and the FSM conflict
+	// check (latestTS > startTS: T-1 > T → false) would silently pass,
+	// allowing corrupted writes.  Returning maxTS closes this gap: every
+	// version at ≤ maxTS is guaranteed visible, and any concurrent write at
+	// > maxTS triggers a WriteConflict and a retry.
 	clock := d.coordinator.Clock()
-	if clock == nil {
-		if maxTS == ^uint64(0) {
-			return maxTS
-		}
-		return maxTS + 1
-	}
-	if maxTS > 0 {
+	if clock != nil && maxTS > 0 {
 		clock.Observe(maxTS)
 	}
-	return clock.Next()
+	return maxTS
 }
 
 func (d *DynamoDBServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
