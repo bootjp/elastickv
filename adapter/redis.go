@@ -1166,10 +1166,11 @@ func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
 	return [][]byte{}, nil
 }
 
-// mergeInternalNamespaces scans all internal key namespaces (list, hash, set, and
-// other internal prefixes) for keys that match pattern and merges them into the
-// caller's keyset via mergeScannedKeys. Called only when the pattern is bounded
-// (start != nil) because unbounded scans already cover the full keyspace.
+// mergeInternalNamespaces scans all internal key namespaces (list, hash, set,
+// zset, and other internal prefixes) for keys that match pattern and merges
+// them into the caller's keyset via mergeScannedKeys. Called only when the
+// pattern is bounded (start != nil) because unbounded scans already cover the
+// full keyspace.
 func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, mergeScannedKeys func([]byte, []byte) error) error {
 	metaStart, metaEnd := listPatternScanBounds(store.ListMetaPrefix, pattern)
 	if err := mergeScannedKeys(metaStart, metaEnd); err != nil {
@@ -1185,7 +1186,7 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 			return err
 		}
 	}
-	// Wide-column hash/set keys embed the user-key as
+	// Wide-column hash/set/zset keys embed the user-key as
 	// <prefix><4-byte-len><userKey><field|member>, so the binary length
 	// prefix makes straightforward bounds-based scanning non-trivial.
 	// Use the user-key prefix as the lower bound and scan to the end of each
@@ -1197,7 +1198,12 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 	}
 	setMemberStart := store.SetMemberScanPrefix(start)
 	setMemberEnd := prefixScanEnd([]byte(store.SetMemberPrefix))
-	return mergeScannedKeys(setMemberStart, setMemberEnd)
+	if err := mergeScannedKeys(setMemberStart, setMemberEnd); err != nil {
+		return err
+	}
+	zsetMemberStart := store.ZSetMemberScanPrefix(start)
+	zsetMemberEnd := prefixScanEnd([]byte(store.ZSetMemberPrefix))
+	return mergeScannedKeys(zsetMemberStart, zsetMemberEnd)
 }
 
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
