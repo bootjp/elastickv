@@ -742,6 +742,9 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS ui
 		return d.LenDelta, errors.WithStack(unmarshalErr)
 	})
 	if err != nil {
+		if errors.Is(err, ErrDeltaScanTruncated) {
+			r.triggerUrgentCompaction("list", key)
+		}
 		return store.ListMeta{}, false, err
 	}
 	baseMeta.Len += lenSum
@@ -797,7 +800,7 @@ func (r *RedisServer) resolveCollectionLen(
 
 // resolveHashMeta aggregates the base hash metadata with all uncompacted Delta keys.
 func (r *RedisServer) resolveHashMeta(ctx context.Context, key []byte, readTS uint64) (int64, bool, error) {
-	return r.resolveCollectionLen(
+	n, exists, err := r.resolveCollectionLen(
 		ctx, key, readTS,
 		store.HashMetaKey(key),
 		store.HashMetaDeltaScanPrefix(key),
@@ -811,11 +814,15 @@ func (r *RedisServer) resolveHashMeta(ctx context.Context, key []byte, readTS ui
 		},
 		"resolveHashMeta: clamping negative Len to 0",
 	)
+	if errors.Is(err, ErrDeltaScanTruncated) {
+		r.triggerUrgentCompaction("hash", key)
+	}
+	return n, exists, err
 }
 
 // resolveSetMeta aggregates the base set metadata with all uncompacted Delta keys.
 func (r *RedisServer) resolveSetMeta(ctx context.Context, key []byte, readTS uint64) (int64, bool, error) {
-	return r.resolveCollectionLen(
+	n, exists, err := r.resolveCollectionLen(
 		ctx, key, readTS,
 		store.SetMetaKey(key),
 		store.SetMetaDeltaScanPrefix(key),
@@ -829,11 +836,15 @@ func (r *RedisServer) resolveSetMeta(ctx context.Context, key []byte, readTS uin
 		},
 		"resolveSetMeta: clamping negative Len to 0",
 	)
+	if errors.Is(err, ErrDeltaScanTruncated) {
+		r.triggerUrgentCompaction("set", key)
+	}
+	return n, exists, err
 }
 
 // resolveZSetMeta aggregates the base sorted set metadata with all uncompacted Delta keys.
 func (r *RedisServer) resolveZSetMeta(ctx context.Context, key []byte, readTS uint64) (int64, bool, error) {
-	return r.resolveCollectionLen(
+	n, exists, err := r.resolveCollectionLen(
 		ctx, key, readTS,
 		store.ZSetMetaKey(key),
 		store.ZSetMetaDeltaScanPrefix(key),
@@ -847,4 +858,8 @@ func (r *RedisServer) resolveZSetMeta(ctx context.Context, key []byte, readTS ui
 		},
 		"resolveZSetMeta: clamping negative Len to 0",
 	)
+	if errors.Is(err, ErrDeltaScanTruncated) {
+		r.triggerUrgentCompaction("zset", key)
+	}
+	return n, exists, err
 }

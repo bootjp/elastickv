@@ -520,7 +520,13 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker), adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()))
+	deltaCompactor := adapter.NewDeltaCompactor(shardStore, coordinate)
+	eg.Go(func() error { return deltaCompactor.Run(ctx) })
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
+		adapter.WithRedisActiveTimestampTracker(readTracker),
+		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
+		adapter.WithRedisCompactor(deltaCompactor),
+	)
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})

@@ -411,7 +411,7 @@ func setupGRPC(ctx context.Context, r *raft.Raft, st store.MVCCStore, tm *transp
 	return s, gs
 }
 
-func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker) (*adapter.RedisServer, error) {
+func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker, deltaCompactor *adapter.DeltaCompactor) (*adapter.RedisServer, error) {
 	leaderRedis := make(map[raft.ServerAddress]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
@@ -430,7 +430,10 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 		return nil, errors.WithStack(err)
 	}
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
-	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay, adapter.WithRedisActiveTimestampTracker(readTracker)), nil
+	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay,
+		adapter.WithRedisActiveTimestampTracker(readTracker),
+		adapter.WithRedisCompactor(deltaCompactor),
+	), nil
 }
 
 func setupS3(
@@ -590,7 +593,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		_ = grpcSock.Close()
 	})
 
-	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay, readTracker)
+	deltaCompactor := adapter.NewDeltaCompactor(st, coordinator)
+
+	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay, readTracker, deltaCompactor)
 	if err != nil {
 		return err
 	}
@@ -609,8 +614,6 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	if err != nil {
 		return err
 	}
-
-	deltaCompactor := adapter.NewDeltaCompactor(st, coordinator)
 
 	eg.Go(func() error { coordinator.RunHLCLeaseRenewal(ctx); return nil })
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))

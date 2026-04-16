@@ -40,6 +40,9 @@ func (s *stubAdapterCoordinator) RaftLeader() raft.ServerAddress {
 }
 
 func (s *stubAdapterCoordinator) IsLeaderForKey([]byte) bool {
+	if s.leaderSet {
+		return s.leader
+	}
 	return true
 }
 
