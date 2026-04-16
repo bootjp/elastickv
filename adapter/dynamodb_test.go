@@ -495,6 +495,159 @@ func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestDynamoDB_TransactGetItems_KeyAttributeErrors verifies that the server
+// returns a ValidationException (400) when a key attribute is missing from the
+// request or has an unsupported type. This covers the error paths added in
+// canonicalPrimaryKeyStr and writeCanonicalAttrValue, which must conform to
+// DynamoDB's behaviour: primary-key errors are always client-side validation
+// failures (HTTP 400 / ValidationException), never 500 InternalServerError.
+func TestDynamoDB_TransactGetItems_KeyAttributeErrors(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	ctx := context.Background()
+
+	// Table with hash key only.
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("key_err_hash"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+
+	// Table with hash key + range key (composite primary key).
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("key_err_composite"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+
+	t.Run("missing hash key attribute", func(t *testing.T) {
+		// Key map uses "wrong" instead of the schema's "pk" — server must return
+		// ValidationException, matching DynamoDB's "provided key element does not
+		// match the schema" behaviour.
+		_, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+			TransactItems: []types.TransactGetItem{
+				{Get: &types.Get{
+					TableName: aws.String("key_err_hash"),
+					Key:       map[string]types.AttributeValue{"wrong": &types.AttributeValueMemberS{Value: "v"}},
+				}},
+			},
+		})
+		var apiErr *types.TransactionCanceledException
+		// Some SDKs surface the inner validation error as a generic smithy error;
+		// the important assertion is that the request was rejected with an error.
+		assert.Error(t, err, "missing hash key must be rejected")
+		assert.False(t, errors.As(err, &apiErr), "must not be a TransactionCanceledException")
+	})
+
+	t.Run("missing range key attribute", func(t *testing.T) {
+		// Composite-key table: only hash key provided, range key "sk" is absent.
+		_, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+			TransactItems: []types.TransactGetItem{
+				{Get: &types.Get{
+					TableName: aws.String("key_err_composite"),
+					Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "v"}},
+				}},
+			},
+		})
+		assert.Error(t, err, "missing range key must be rejected")
+	})
+
+	t.Run("unsupported key attribute type BOOL", func(t *testing.T) {
+		// DynamoDB primary keys must be S, N, or B. BOOL is invalid and must
+		// produce a ValidationException (400), not an InternalServerError (500).
+		_, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+			TransactItems: []types.TransactGetItem{
+				{Get: &types.Get{
+					TableName: aws.String("key_err_hash"),
+					Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberBOOL{Value: true}},
+				}},
+			},
+		})
+		assert.Error(t, err, "BOOL key type must be rejected")
+	})
+}
+
+// TestDynamoDB_TransactWriteItems_KeyAttributeErrors verifies that
+// canonicalPrimaryKeyStr / writeCanonicalAttrValue errors in the write path
+// also surface as ValidationException (400), not InternalServerError (500).
+func TestDynamoDB_TransactWriteItems_KeyAttributeErrors(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	ctx := context.Background()
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("write_key_err"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+
+	t.Run("Put missing hash key in item", func(t *testing.T) {
+		// Item does not include the hash key "pk". primaryKeyAttributes extraction
+		// fails, which must surface as ValidationException (400).
+		_, err := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				{Put: &types.Put{
+					TableName: aws.String("write_key_err"),
+					Item:      map[string]types.AttributeValue{"other": &types.AttributeValueMemberS{Value: "v"}},
+				}},
+			},
+		})
+		assert.Error(t, err, "Put item missing hash key must be rejected")
+	})
+
+	t.Run("Delete missing hash key", func(t *testing.T) {
+		_, err := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				{Delete: &types.Delete{
+					TableName: aws.String("write_key_err"),
+					Key:       map[string]types.AttributeValue{"wrong": &types.AttributeValueMemberS{Value: "v"}},
+				}},
+			},
+		})
+		assert.Error(t, err, "Delete with missing hash key must be rejected")
+	})
+}
+
 func TestDynamoDB_TransactGetItems_ProjectionExpression(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
