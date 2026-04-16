@@ -4402,7 +4402,9 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	}
 	keyAttrs, err := primaryKeyAttributes(schema.PrimaryKey, rawAttrs)
 	if err != nil {
-		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		// primaryKeyAttributes already returns a dynamoAPIError; return it directly
+		// to preserve its status code and error type.
+		return "", err
 	}
 	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
 	if err != nil {

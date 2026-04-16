@@ -658,7 +658,7 @@ func checkTransactGetSnapshotConsistency(ctx context.Context, client *dynamodb.C
 		return &inconsistentSnapshotError{v1: v1Attr.Value, v2: "<missing>"}
 	}
 	v1, v2 := v1Attr.Value, v2Attr.Value
-	if (v1 == "init1") == (v2 == "init2") {
+	if (v1 == "init1" && v2 == "init2") || (v1 == "updated1" && v2 == "updated2") {
 		return nil
 	}
 	return &inconsistentSnapshotError{v1: v1, v2: v2}
