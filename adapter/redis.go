@@ -2703,7 +2703,8 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 		claimEnd = meta.Tail
 	}
 	// Capacity: n claim keys + n Del(item) for found items + 1 for the delta key appended by caller.
-	elems := make([]*kv.Elem[kv.OP], 0, n+int64(len(kvps))+listPopDeltaOverhead)
+	// n is bounded by maxWideColumnItems (100_000) so the int conversion is safe.
+	elems := make([]*kv.Elem[kv.OP], 0, int(n)+len(kvps)+listPopDeltaOverhead)
 	for seq := claimStart; seq < claimEnd; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
 	}
