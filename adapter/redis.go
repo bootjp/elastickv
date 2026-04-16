@@ -273,7 +273,8 @@ type RedisServer struct {
 
 	// ttlBuffer holds pending TTL writes that are flushed to Raft in batches.
 	// It eliminates TTL write conflicts from concurrent Lua script executions.
-	ttlBuffer *TTLBuffer
+	ttlBuffer        *TTLBuffer
+	ttlFlushInterval time.Duration
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
@@ -290,6 +291,17 @@ func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisSe
 func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.requestObserver = observer
+	}
+}
+
+// WithTTLFlushInterval overrides the default TTL buffer flush interval (100 ms).
+// Smaller values reduce the window for TTL loss on crash; larger values lower
+// Raft write amplification. Values ≤ 0 are ignored.
+func WithTTLFlushInterval(d time.Duration) RedisServerOption {
+	return func(r *RedisServer) {
+		if d > 0 {
+			r.ttlFlushInterval = d
+		}
 	}
 }
 
@@ -343,18 +355,19 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		relay = NewRedisPubSubRelay()
 	}
 	r := &RedisServer{
-		listen:          listen,
-		store:           store,
-		coordinator:     coordinate,
-		redisTranscoder: newRedisTranscoder(),
-		redisAddr:       redisAddr,
-		relay:           relay,
-		leaderRedis:     leaderRedis,
-		leaderClients:   make(map[string]*redis.Client),
-		pubsub:          newRedisPubSub(),
-		scriptCache:     map[string]string{},
-		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
-		ttlBuffer:       newTTLBuffer(),
+		listen:           listen,
+		store:            store,
+		coordinator:      coordinate,
+		redisTranscoder:  newRedisTranscoder(),
+		redisAddr:        redisAddr,
+		relay:            relay,
+		leaderRedis:      leaderRedis,
+		leaderClients:    make(map[string]*redis.Client),
+		pubsub:           newRedisPubSub(),
+		scriptCache:      map[string]string{},
+		traceCommands:    os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		ttlBuffer:        newTTLBuffer(),
+		ttlFlushInterval: defaultTTLFlushInterval,
 	}
 	r.relay.Bind(r.publishLocal)
 

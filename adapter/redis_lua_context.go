@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"log/slog"
 	"maps"
 	"math"
 	"sort"
@@ -2523,12 +2524,16 @@ func (c *luaScriptContext) flushTTLForKeyToBuffer(key string, finalType redisVal
 	}
 	ttl, err := c.finalTTL([]byte(key))
 	if err != nil {
+		// Data was already committed to Raft; log and leave the stale TTL as-is
+		// rather than silently losing the TTL state.
+		slog.Warn("lua TTL flush: failed to read finalTTL, TTL update skipped", "key_len", len(key), "err", err)
 		return
 	}
 	if ttl == nil {
-		if preserveExisting {
-			c.server.ttlBuffer.Set([]byte(key), nil)
-		}
+		// Write nil unconditionally: for read-modify-write paths (preserveExisting=true)
+		// this is an explicit TTL removal (PERSIST); for rewrite paths
+		// (preserveExisting=false) it clears any stale buffered TTL for this key.
+		c.server.ttlBuffer.Set([]byte(key), nil)
 		return
 	}
 	c.server.ttlBuffer.Set([]byte(key), ttl)

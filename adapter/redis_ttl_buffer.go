@@ -61,7 +61,7 @@ func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
 		return
 	}
 	if _, exists := b.entries[k]; !exists && len(b.entries) >= ttlBufferMaxSize {
-		slog.Warn("ttl buffer full, dropping entry", "size", len(b.entries), "key", k)
+		slog.Warn("ttl buffer full, dropping entry", "size", len(b.entries), "key_len", len(k))
 		return
 	}
 	b.entries[k] = ttlBufferEntry{expireAt: expireAt, seq: s}
@@ -100,7 +100,8 @@ func (b *TTLBuffer) Drain() map[string]ttlBufferEntry {
 
 // MergeBack re-inserts entries from a failed flush attempt.
 // For each key, the entry is only restored if the buffer does not already hold
-// a newer write (higher seq) for that key.
+// a newer write (higher seq) for that key. Keys that are new to the current
+// buffer are skipped once the buffer is full (same policy as Set).
 func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	if len(entries) == 0 {
 		return
@@ -108,8 +109,12 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for key, entry := range entries {
-		if e, ok := b.entries[key]; ok && e.seq > entry.seq {
-			continue // a newer write supersedes the failed entry
+		if e, ok := b.entries[key]; ok {
+			if e.seq > entry.seq {
+				continue // a newer write supersedes the failed entry
+			}
+		} else if len(b.entries) >= ttlBufferMaxSize {
+			continue // buffer full; drop the restored entry rather than growing unbounded
 		}
 		b.entries[key] = entry
 	}
@@ -150,7 +155,7 @@ func buildTTLFlushElems(entries map[string]ttlBufferEntry) []*kv.Elem[kv.OP] {
 // runTTLFlusher periodically flushes the TTL buffer to Raft until ctx is cancelled.
 // On cancellation it performs one final flush to minimise TTL loss during shutdown.
 func (r *RedisServer) runTTLFlusher(ctx context.Context) {
-	ticker := time.NewTicker(defaultTTLFlushInterval)
+	ticker := time.NewTicker(r.ttlFlushInterval)
 	defer ticker.Stop()
 	for {
 		select {
