@@ -1221,24 +1221,23 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 	return elems, nil
 }
 
-// buildHashFieldElems iterates over field-value pairs in args, records whether each field is
-// new vs. existing, appends Put operations to elems, and returns the updated elems and new-field count.
-func (r *RedisServer) buildHashFieldElems(ctx context.Context, key []byte, args [][]byte, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, error) {
+// buildHashFieldElems iterates over field-value pairs in args, checks each
+// field against existsMap to determine if it is new, appends Put operations
+// to elems, and returns the updated elems and new-field count.
+// existsMap is built by scanHashFieldExistsMap before this call so that
+// existence checks are a single bulk scan rather than N ExistsAt round-trips.
+func (r *RedisServer) buildHashFieldElems(key []byte, args [][]byte, existsMap map[string]struct{}, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int) {
 	newFields := 0
 	for i := 0; i < len(args); i += redisPairWidth {
 		field := args[i]
 		value := args[i+1]
 		fieldKey := store.HashFieldKey(key, field)
-		exists, existsErr := r.store.ExistsAt(ctx, fieldKey, readTS)
-		if existsErr != nil {
-			return nil, 0, cockerrors.WithStack(existsErr)
-		}
-		if !exists {
+		if _, exists := existsMap[string(field)]; !exists {
 			newFields++
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: value})
 	}
-	return elems, newFields, nil
+	return elems, newFields
 }
 
 func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error) {
@@ -1269,11 +1268,15 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		}
 		elems = append(elems, migrationElems...)
 
-		var newFields int
-		elems, newFields, err = r.buildHashFieldElems(ctx, key, args, readTS, elems)
+		// Bulk-scan existing fields once so buildHashFieldElems can check
+		// existence via a map lookup instead of per-field ExistsAt.
+		existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
+
+		var newFields int
+		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
 		added = newFields
 
 		// Emit a single delta key for all newly-added fields.
