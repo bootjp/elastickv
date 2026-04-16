@@ -851,6 +851,10 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 
 		changed = 0
 		lenDelta := int64(0)
+		// NOTE: sequential ExistsAt per member is O(N) round-trips to the store.
+		// This is acceptable for small member counts. For large SADD/SREM batches
+		// a scan-based existence check would reduce read amplification, but adds
+		// complexity. The OCC retry loop already bounds the total cost per commit.
 		for _, member := range members {
 			memberKey := store.SetMemberKey(key, member)
 			exists, existsErr := r.store.ExistsAt(ctx, memberKey, readTS)

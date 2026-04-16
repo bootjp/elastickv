@@ -57,35 +57,57 @@ func normalizeStartTS(ts uint64) uint64 {
 
 // detectWideColumnType checks for the presence of wide-column hash, set, or zset keys
 // and returns the corresponding redis type, or redisTypeNone if none is found.
+// It checks field/member keys first, then falls back to metadata and delta keys to
+// correctly detect collections whose fields were all deleted (metadata key exists but
+// no member keys) or newly created collections that only have delta keys.
 func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	hashFieldPrefix := store.HashFieldScanPrefix(key)
-	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
-	hashFieldKVs, err := r.store.ScanAt(ctx, hashFieldPrefix, hashFieldEnd, 1, readTS)
-	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
-	}
-	if len(hashFieldKVs) > 0 {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix); err != nil {
+		return redisTypeNone, err
+	} else if found {
 		return redisTypeHash, nil
 	}
-	setMemberPrefix := store.SetMemberScanPrefix(key)
-	setMemberEnd := store.PrefixScanEnd(setMemberPrefix)
-	setMemberKVs, err := r.store.ScanAt(ctx, setMemberPrefix, setMemberEnd, 1, readTS)
-	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
-	}
-	if len(setMemberKVs) > 0 {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix); err != nil {
+		return redisTypeNone, err
+	} else if found {
 		return redisTypeSet, nil
 	}
-	zsetMemberPrefix := store.ZSetMemberScanPrefix(key)
-	zsetMemberEnd := store.PrefixScanEnd(zsetMemberPrefix)
-	zsetMemberKVs, err := r.store.ScanAt(ctx, zsetMemberPrefix, zsetMemberEnd, 1, readTS)
-	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
-	}
-	if len(zsetMemberKVs) > 0 {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix); err != nil {
+		return redisTypeNone, err
+	} else if found {
 		return redisTypeZSet, nil
 	}
 	return redisTypeNone, nil
+}
+
+// wideColumnTypeExists checks whether a wide-column collection of the given type exists,
+// trying: member/field prefix → metadata key → delta key prefix (in order).
+func (r *RedisServer) wideColumnTypeExists(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	memberPrefix func([]byte) []byte,
+	metaKeyFn func([]byte) []byte,
+	deltaPrefix func([]byte) []byte,
+) (bool, error) {
+	if found, err := r.prefixExistsAt(ctx, memberPrefix(key), readTS); err != nil || found {
+		return found, err
+	}
+	if exists, err := r.store.ExistsAt(ctx, metaKeyFn(key), readTS); err != nil {
+		return false, errors.WithStack(err)
+	} else if exists {
+		return true, nil
+	}
+	return r.prefixExistsAt(ctx, deltaPrefix(key), readTS)
+}
+
+// prefixExistsAt reports whether any key under prefix exists at readTS.
+func (r *RedisServer) prefixExistsAt(ctx context.Context, prefix []byte, readTS uint64) (bool, error) {
+	end := store.PrefixScanEnd(prefix)
+	kvs, err := r.store.ScanAt(ctx, prefix, end, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return len(kvs) > 0, nil
 }
 
 func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
@@ -271,6 +293,9 @@ func (r *RedisServer) loadZSetMembersAt(ctx context.Context, key []byte, readTS 
 	if err != nil {
 		return redisZSetValue{}, errors.WithStack(err)
 	}
+	if len(kvs) > maxWideColumnItems {
+		return redisZSetValue{}, errors.Wrapf(ErrCollectionTooLarge, "zset %q exceeds %d members", key, maxWideColumnItems)
+	}
 	entries := make([]redisZSetEntry, 0, len(kvs))
 	for _, kv := range kvs {
 		member := store.ExtractZSetMemberName(kv.Key, key)
@@ -377,6 +402,9 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if !listExists {
 		return nil, nil
 	}
+	if meta.Len > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, int(meta.Len)+setWideColOverhead)
 	for seq := meta.Head; seq < meta.Tail; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
@@ -408,7 +436,8 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 
 // scanAllDeltaElems scans all delta keys under deltaPrefix and returns Del
 // elems for each. It paginates internally so callers are not limited to
-// MaxDeltaScanLimit entries.
+// MaxDeltaScanLimit entries. Total results are capped at maxWideColumnItems
+// to prevent unbounded memory growth if the compactor falls behind.
 func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	const cursorAdv = byte(0x00) // appended to advance past the last scanned key
 	var elems []*kv.Elem[kv.OP]
@@ -421,6 +450,9 @@ func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte,
 		}
 		for _, pair := range deltaKVs {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+		if len(elems) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
 		}
 		if len(deltaKVs) < store.MaxDeltaScanLimit {
 			break

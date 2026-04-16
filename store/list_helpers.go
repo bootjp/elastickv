@@ -18,9 +18,12 @@ const (
 	// Layout: !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)>
 	ListClaimPrefix = "!lst|claim|"
 
-	// MaxDeltaScanLimit is the hard limit on delta scan results.
-	// resolveListMeta returns ErrDeltaScanTruncated if this is reached.
-	MaxDeltaScanLimit = 256
+	// MaxDeltaScanLimit is the hard limit on delta scan results per read.
+	// If a key accumulates more than this many uncompacted deltas, reads
+	// return ErrDeltaScanTruncated until background compaction catches up.
+	// Set high enough to tolerate burst traffic between compaction ticks
+	// (default 30 s) without sacrificing read availability on hot keys.
+	MaxDeltaScanLimit = 1024
 
 	// wideColKeyLenSize is the number of bytes used to encode the user-key
 	// length as a big-endian uint32 in wide-column storage keys.

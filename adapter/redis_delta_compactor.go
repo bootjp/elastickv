@@ -297,6 +297,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	if newMeta.Len < 0 {
 		newMeta.Len = 0
 	}
+	newMeta.Tail = newMeta.Head + newMeta.Len
 
 	metaElem, err := listMetaElemForLen(store.ListMetaKey(userKey), newMeta)
 	if err != nil {
