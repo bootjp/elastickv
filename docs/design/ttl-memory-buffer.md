@@ -177,6 +177,28 @@ external TTL writes trigger write-conflict detection.  Since TTL is now written 
 `IsTxn=false` flushes (which do not participate in conflict detection), this tracking
 is no longer useful.  All `trackReadKey(redisTTLKey(...))` call sites are removed.
 
+### MULTI/EXEC — TTL snapshot isolation is not guaranteed
+
+With TTL removed from OCC read sets, a concurrent `EXPIRE` executed between a
+client's `MULTI` and `EXEC` will **not** surface as `ErrWriteConflict` for data
+operations.  Concretely:
+
+```
+Client A:  MULTI
+Client A:  SET   key value  ← queued
+Client B:  EXPIRE key 5     ← writes TTL buffer, IsTxn=false
+Client A:  EXEC             ← commits data, then flushes TTL from A's own state
+```
+
+After `EXEC`, Client A's buffered TTL (if any) will overwrite Client B's `EXPIRE`
+via last-writer-wins, because both take the `IsTxn=false` path.
+
+**Impact**: workloads that rely on TTL changes being detected as OCC conflicts
+inside `MULTI/EXEC` will no longer see that behaviour.  For rate-limiting keys
+(the primary use-case of this change) this is harmless — the TTL difference is
+at most one flush interval (100 ms) and the final committed value is always the
+most recent write as determined by `seq`.
+
 ---
 
 ## 6. Write-path changes

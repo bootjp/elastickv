@@ -2426,8 +2426,8 @@ type luaCommitPlan struct {
 
 // luaKeyPlan carries the data elements and TTL metadata for a single key commit.
 type luaKeyPlan struct {
-	elems           []*kv.Elem[kv.OP]
-	finalType       redisValueType
+	elems            []*kv.Elem[kv.OP]
+	finalType        redisValueType
 	preserveExisting bool
 }
 
