@@ -43,6 +43,7 @@ const (
 	updateItemTarget         = targetPrefix + "UpdateItem"
 	batchWriteItemTarget     = targetPrefix + "BatchWriteItem"
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
+	transactGetItemsTarget   = targetPrefix + "TransactGetItems"
 )
 
 const (
@@ -93,6 +94,7 @@ var dynamoOperationTargets = map[string]string{
 	queryTarget:              "Query",
 	scanTarget:               "Scan",
 	transactWriteItemsTarget: "TransactWriteItems",
+	transactGetItemsTarget:   "TransactGetItems",
 	updateItemTarget:         "UpdateItem",
 }
 
@@ -255,6 +257,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		updateItemTarget:         d.updateItem,
 		batchWriteItemTarget:     d.batchWriteItem,
 		transactWriteItemsTarget: d.transactWriteItems,
+		transactGetItemsTarget:   d.transactGetItems,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
@@ -661,6 +664,21 @@ type batchDeleteRequest struct {
 
 type transactWriteItemsInput struct {
 	TransactItems []transactWriteItem `json:"TransactItems"`
+}
+
+type transactGetItemsInput struct {
+	TransactItems []transactGetItem `json:"TransactItems"`
+}
+
+type transactGetItem struct {
+	Get *transactGetItemGet `json:"Get"`
+}
+
+type transactGetItemGet struct {
+	TableName                string                    `json:"TableName"`
+	Key                      map[string]attributeValue `json:"Key"`
+	ProjectionExpression     string                    `json:"ProjectionExpression,omitempty"`
+	ExpressionAttributeNames map[string]string         `json:"ExpressionAttributeNames,omitempty"`
 }
 
 type transactWriteItem struct {
@@ -3909,6 +3927,68 @@ func decodeTransactWriteItemsInput(bodyReader io.Reader) (transactWriteItemsInpu
 		return transactWriteItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing transact items")
 	}
 	return in, nil
+}
+
+// transactGetItems implements TransactGetItems: reads multiple items atomically
+// at a single snapshot timestamp, guaranteeing a consistent view across all keys.
+func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(maxDynamoBodyReader(w, r))
+	if err != nil {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return
+	}
+	var in transactGetItemsInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return
+	}
+	if len(in.TransactItems) == 0 {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing transact items")
+		return
+	}
+
+	// Acquire a single read timestamp for all items to guarantee a consistent snapshot.
+	readTS := d.nextTxnReadTS()
+	pin := d.pinReadTS(readTS)
+	defer pin.Release()
+
+	responses := make([]map[string]any, 0, len(in.TransactItems))
+	for _, item := range in.TransactItems {
+		if item.Get == nil {
+			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
+			return
+		}
+		g := item.Get
+		if strings.TrimSpace(g.TableName) == "" {
+			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
+			return
+		}
+		schema, exists, err := d.loadTableSchemaAt(r.Context(), g.TableName, readTS)
+		if err != nil {
+			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+			return
+		}
+		if !exists {
+			writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found: "+g.TableName)
+			return
+		}
+		loc, found, err := d.readLogicalItemAt(r.Context(), schema, g.Key, readTS)
+		if err != nil {
+			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+			return
+		}
+		entry := map[string]any{}
+		if found {
+			projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
+			if err != nil {
+				writeDynamoErrorFromErr(w, err)
+				return
+			}
+			entry["Item"] = projected
+		}
+		responses = append(responses, entry)
+	}
+	writeDynamoJSON(w, map[string]any{"Responses": responses})
 }
 
 func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error) {

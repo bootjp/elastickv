@@ -374,6 +374,72 @@ func TestDynamoDB_TransactWriteItems(t *testing.T) {
 	assert.Equal(t, "v2", value2Attr.Value)
 }
 
+func TestDynamoDB_TransactGetItems(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	assert.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	// Write two items.
+	_, err = client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Put: &types.Put{
+					TableName: aws.String("t"),
+					Item: map[string]types.AttributeValue{
+						"key":   &types.AttributeValueMemberS{Value: "k1"},
+						"value": &types.AttributeValueMemberS{Value: "v1"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String("t"),
+					Item: map[string]types.AttributeValue{
+						"key":   &types.AttributeValueMemberS{Value: "k2"},
+						"value": &types.AttributeValueMemberS{Value: "v2"},
+					},
+				},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	// TransactGetItems should read both items atomically at the same snapshot.
+	out, err := client.TransactGetItems(context.Background(), &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k2"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "missing"}}}},
+		},
+	})
+	assert.NoError(t, err)
+	assert.Len(t, out.Responses, 3)
+
+	// First response: k1 → "v1"
+	v1, ok := out.Responses[0].Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	assert.Equal(t, "v1", v1.Value)
+
+	// Second response: k2 → "v2"
+	v2, ok := out.Responses[1].Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	assert.Equal(t, "v2", v2.Value)
+
+	// Third response: missing key → empty Item map.
+	assert.Empty(t, out.Responses[2].Item)
+}
+
 func TestDynamoDB_UpdateItem_Condition(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)

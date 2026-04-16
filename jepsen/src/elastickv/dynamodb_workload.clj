@@ -117,6 +117,25 @@
     (when-let [lv (get-in resp [:Item (keyword val-attr) :L])]
       (mapv #(Long/parseLong (:N %)) lv))))
 
+(defn- dynamo-transact-get!
+  "Atomically read all keys in `ks` at a single snapshot via TransactGetItems.
+   Returns a map from key → list-of-longs (or nil when the item is absent).
+   All reads share the same server-side snapshot timestamp, preventing the
+   non-atomic pre-read that causes G-single-item anomalies."
+  [ddb ks]
+  (let [ks-vec (vec ks)
+        items  (mapv (fn [k]
+                       {:Get {:TableName table-name
+                              :Key       {pk-attr {:S (str k)}}}})
+                     ks-vec)
+        resp   (ddb-invoke! ddb :TransactGetItems {:TransactItems items})]
+    (into {}
+          (map (fn [k entry]
+                 [k (when-let [lv (get-in entry [:Item (keyword val-attr) :L])]
+                      (mapv #(Long/parseLong (:N %)) lv))])
+               ks-vec
+               (:Responses resp)))))
+
 (defn- list-attr
   "Convert a Clojure vector of longs to a DynamoDB {:L [...]} attribute."
   [vs]
@@ -216,15 +235,16 @@
                                   :r      [f k (dynamo-read ddb k)])]))
 
             ;; ---- Multi-op: pre-read + read-your-own-writes ----
-            ;; 1. Pre-read every key before applying any writes.  Each read is
-            ;;    an independent ConsistentRead GetItem; they do NOT form an
-            ;;    atomic multi-key snapshot (timestamps may differ per key).
+            ;; 1. Pre-read every key atomically via TransactGetItems so all
+            ;;    keys are read at the same server-side snapshot timestamp.
+            ;;    This prevents G-single-item anomalies caused by non-atomic
+            ;;    pre-reads where concurrent writes could slip between reads.
             ;; 2. Simulate micro-ops in order; track local appends so that
             ;;    a :r after an :append in the same txn sees the append (RYOW).
             ;; 3. Dispatch all writes atomically via TransactWriteItems,
             ;;    merging same-key appends into one UpdateItem entry.
             (let [all-keys      (into #{} (map second mops))
-                  snapshot      (into {} (map (fn [k] [k (dynamo-read ddb k)]) all-keys))
+                  snapshot      (dynamo-transact-get! ddb all-keys)
                   local-appends (volatile! {})
                   value' (mapv (fn [[f k v :as mop]]
                                  (case f
