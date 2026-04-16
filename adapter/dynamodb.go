@@ -4086,14 +4086,18 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	return entry, found, nil
 }
 
-// canonicalPrimaryKeyStr returns a canonical string representation of primary
+// canonicalPrimaryKeyStr returns a collision-free canonical string of primary
 // key attributes for duplicate-item detection in TransactGetItems and
 // TransactWriteItems. Shared between both operations to avoid duplicated logic.
 //
 // Takes the table's keySchema so it can write hash key then range key in a
 // fixed schema-defined order, avoiding a slice allocation and sort — DynamoDB
 // primary keys have at most two attributes, so direct lookup beats sorting.
-// Format: "<name>=<type>:<value>" pairs separated by \x1f (ASCII unit separator).
+//
+// Format per attribute: "<name>=<type>:<len>:<value>", separated by \x1f.
+// The length prefix makes the format collision-free: a string value that
+// contains \x1f cannot be confused with the inter-attribute separator because
+// the decoder knows exactly how many bytes belong to each value.
 // Numeric values are normalised; binary values are base64-encoded.
 func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeValue) (string, error) {
 	var buf strings.Builder
@@ -4121,19 +4125,29 @@ func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeV
 	return buf.String(), nil
 }
 
-// writeCanonicalAttrValue appends a typed canonical value for a single primary
-// key attribute to buf. Supports S, N (normalised), and B (base64-encoded).
+// writeCanonicalAttrValue appends a length-prefixed typed value for a single
+// primary key attribute to buf. Format: "<type>:<len>:<value>".
+// Supports S (string), N (normalised number), and B (base64-encoded binary).
+// The length prefix prevents collisions when string values contain \x1f.
 func writeCanonicalAttrValue(buf *strings.Builder, v attributeValue) error {
 	switch {
 	case v.S != nil:
 		buf.WriteString("S:")
+		buf.WriteString(strconv.Itoa(len(*v.S)))
+		buf.WriteByte(':')
 		buf.WriteString(*v.S)
 	case v.N != nil:
+		n := canonicalNumberString(*v.N)
 		buf.WriteString("N:")
-		buf.WriteString(canonicalNumberString(*v.N))
+		buf.WriteString(strconv.Itoa(len(n)))
+		buf.WriteByte(':')
+		buf.WriteString(n)
 	case v.B != nil:
+		encoded := base64.StdEncoding.EncodeToString(v.B)
 		buf.WriteString("B:")
-		buf.WriteString(base64.StdEncoding.EncodeToString(v.B))
+		buf.WriteString(strconv.Itoa(len(encoded)))
+		buf.WriteByte(':')
+		buf.WriteString(encoded)
 	default:
 		return errors.New("unsupported key attribute type for duplicate detection")
 	}
