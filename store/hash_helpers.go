@@ -124,7 +124,7 @@ func HashMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 
 // HashMetaDeltaScanPrefix returns the prefix to scan all delta keys for a hash.
 func HashMetaDeltaScanPrefix(userKey []byte) []byte {
-	buf := make([]byte, 0, len(HashMetaDeltaPrefix)+4+len(userKey))
+	buf := make([]byte, 0, len(HashMetaDeltaPrefix)+wideColKeyLenSize+len(userKey))
 	buf = append(buf, HashMetaDeltaPrefix...)
 	var kl [4]byte
 	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey))) //nolint:gosec // len is bounded by max slice size
