@@ -68,6 +68,7 @@ const (
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
 	batchWriteItemMaxItems      = 25
+	transactGetItemsMaxItems    = 25
 	dynamoMaxRequestBodyBytes   = 1 << 20
 
 	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
@@ -3946,12 +3947,19 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing transact items")
 		return
 	}
+	if len(in.TransactItems) > transactGetItemsMaxItems {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation,
+			"Too many items in TransactGetItems: "+strconv.Itoa(len(in.TransactItems))+" (max "+strconv.Itoa(transactGetItemsMaxItems)+")")
+		return
+	}
 
 	// Acquire a single read timestamp for all items to guarantee a consistent snapshot.
 	readTS := d.nextTxnReadTS()
 	pin := d.pinReadTS(readTS)
 	defer pin.Release()
 
+	// schemaCache avoids redundant storage reads when multiple items share the same table.
+	schemaCache := make(map[string]*dynamoTableSchema)
 	responses := make([]map[string]any, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
 		if item.Get == nil {
@@ -3963,13 +3971,9 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
 			return
 		}
-		schema, exists, err := d.loadTableSchemaAt(r.Context(), g.TableName, readTS)
+		schema, err := d.resolveTransactTableSchema(r.Context(), schemaCache, g.TableName, readTS)
 		if err != nil {
-			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
-			return
-		}
-		if !exists {
-			writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found: "+g.TableName)
+			writeDynamoErrorFromErr(w, err)
 			return
 		}
 		loc, found, err := d.readLogicalItemAt(r.Context(), schema, g.Key, readTS)
