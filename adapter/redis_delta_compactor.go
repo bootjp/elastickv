@@ -40,9 +40,15 @@ type urgentCompactionRequest struct {
 // DeltaCompactor folds accumulated delta keys into their corresponding base
 // metadata keys for all wide-column collection types (List, Hash, Set, ZSet).
 //
-// It runs as a background goroutine on the Raft leader. Non-leaders skip each
-// tick silently. Compaction is performed as an OCC transaction so concurrent
-// writers never conflict with the compactor.
+// Leadership gating operates at two levels:
+//
+//   - Regular tick (SyncOnce): gated on IsLeader() to avoid full-prefix delta
+//     scans on followers; followers skip the tick entirely.
+//   - Urgent path (compactUrgentKey): gated on IsLeaderForKey so that in
+//     sharded deployments each node compacts only the keys whose shard it leads.
+//
+// Compaction is performed as an OCC transaction so concurrent writers never
+// conflict with the compactor.
 type DeltaCompactor struct {
 	st       store.MVCCStore
 	coord    kv.Coordinator
