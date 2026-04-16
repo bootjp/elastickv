@@ -562,7 +562,7 @@ func TestDynamoDB_TransactGetItems_SnapshotIsolation(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Write initial values: k1=init1, k2=init2.
+	// Write initial values.
 	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
 			{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
@@ -575,63 +575,72 @@ func TestDynamoDB_TransactGetItems_SnapshotIsolation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Run TransactGetItems many times concurrently with concurrent writers.
-	// Each TransactGetItems response must be internally consistent:
-	// either both keys show the initial values, or both show the updated values —
-	// never a mix (which would indicate a non-atomic pre-read).
-	const iterations = 50
-	errCh := make(chan error, iterations)
-
 	// Concurrent writer that keeps updating both keys atomically.
 	stopCh := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{ //nolint:errcheck
-					TransactItems: []types.TransactWriteItem{
-						{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
-							"key": &types.AttributeValueMemberS{Value: "snap_k1"}, "value": &types.AttributeValueMemberS{Value: "updated1"},
-						}}},
-						{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
-							"key": &types.AttributeValueMemberS{Value: "snap_k2"}, "value": &types.AttributeValueMemberS{Value: "updated2"},
-						}}},
-					},
-				})
-			}
-		}
-	}()
+	go runSnapshotWriter(ctx, client, stopCh)
 	defer close(stopCh)
 
+	// Run TransactGetItems many times concurrently.
+	// Each response must be internally consistent: both keys from the same snapshot.
+	const iterations = 50
+	errCh := make(chan error, iterations)
 	for i := 0; i < iterations; i++ {
 		go func() {
-			out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
-				TransactItems: []types.TransactGetItem{
-					{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k1"}}}},
-					{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k2"}}}},
-				},
-			})
-			if err != nil {
-				errCh <- err
-				return
-			}
-			v1 := out.Responses[0].Item["value"].(*types.AttributeValueMemberS).Value
-			v2 := out.Responses[1].Item["value"].(*types.AttributeValueMemberS).Value
-			// Both keys must agree: either both "init" or both "updated" — never mixed.
-			initPair := v1 == "init1" && v2 == "init2"
-			updatedPair := v1 == "updated1" && v2 == "updated2"
-			if !initPair && !updatedPair {
-				errCh <- &inconsistentSnapshotError{v1: v1, v2: v2}
-				return
-			}
-			errCh <- nil
+			errCh <- checkTransactGetSnapshotConsistency(ctx, client)
 		}()
 	}
 	for i := 0; i < iterations; i++ {
 		assert.NoError(t, <-errCh)
 	}
+}
+
+// runSnapshotWriter continuously writes both snap_k1 and snap_k2 atomically until stopCh is closed.
+func runSnapshotWriter(ctx context.Context, client *dynamodb.Client, stopCh <-chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{ //nolint:errcheck
+				TransactItems: []types.TransactWriteItem{
+					{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+						"key": &types.AttributeValueMemberS{Value: "snap_k1"}, "value": &types.AttributeValueMemberS{Value: "updated1"},
+					}}},
+					{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+						"key": &types.AttributeValueMemberS{Value: "snap_k2"}, "value": &types.AttributeValueMemberS{Value: "updated2"},
+					}}},
+				},
+			})
+		}
+	}
+}
+
+// checkTransactGetSnapshotConsistency verifies that snap_k1 and snap_k2 are read
+// from the same snapshot: their values must both be the initial pair or both the
+// updated pair — never a mix, which would indicate a non-atomic pre-read.
+func checkTransactGetSnapshotConsistency(ctx context.Context, client *dynamodb.Client) error {
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k2"}}}},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	v1Attr, ok := out.Responses[0].Item["value"].(*types.AttributeValueMemberS)
+	if !ok {
+		return &inconsistentSnapshotError{v1: "<missing>", v2: "<unknown>"}
+	}
+	v2Attr, ok := out.Responses[1].Item["value"].(*types.AttributeValueMemberS)
+	if !ok {
+		return &inconsistentSnapshotError{v1: v1Attr.Value, v2: "<missing>"}
+	}
+	v1, v2 := v1Attr.Value, v2Attr.Value
+	if (v1 == "init1") == (v2 == "init2") {
+		return nil
+	}
+	return &inconsistentSnapshotError{v1: v1, v2: v2}
 }
 
 type inconsistentSnapshotError struct{ v1, v2 string }
