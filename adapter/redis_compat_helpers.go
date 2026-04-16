@@ -435,13 +435,13 @@ func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, read
 		if scanErr != nil {
 			return nil, errors.WithStack(scanErr)
 		}
-		if len(elems)+len(itemKVs) > maxWideColumnItems {
-			return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
-		}
 		for _, pair := range itemKVs {
 			// Guard against prefix collision with lexicographically adjacent userKeys.
 			if _, ok := store.ExtractListItemSeq(pair.Key, key); !ok {
 				continue
+			}
+			if len(elems)+1 > maxWideColumnItems {
+				return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
 			}
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 		}

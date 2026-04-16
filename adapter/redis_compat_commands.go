@@ -946,6 +946,47 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 	return existsMap, nil
 }
 
+// initSetExistsMap builds the initial existence map for a set mutation batch.
+// For large batches or when legacy members are present it does a bulk prefix
+// scan; otherwise it returns an empty (non-nil) map for per-member ExistsAt
+// fallback. Legacy members from migration elems are merged in so that members
+// already in-flight in the same transaction are treated as existing.
+func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}) (map[string]struct{}, error) {
+	existsMap := make(map[string]struct{})
+	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
+		var err error
+		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+	}
+	for m := range legacyBase {
+		existsMap[m] = struct{}{}
+	}
+	return existsMap, nil
+}
+
+// lookupSetMemberExists reports whether memberStr is present, updating
+// existsMap as a cache. For small clean batches (no bulk scan, no legacy
+// migration) it falls back to an ExistsAt store read; otherwise it relies
+// solely on the pre-built map.
+func (r *RedisServer) lookupSetMemberExists(ctx context.Context, memberStr string, memberKey []byte, readTS uint64, existsMap map[string]struct{}, isSmallClean bool) (bool, error) {
+	if _, ok := existsMap[memberStr]; ok {
+		return true, nil
+	}
+	if !isSmallClean {
+		return false, nil
+	}
+	exists, err := r.store.ExistsAt(ctx, memberKey, readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	if exists {
+		existsMap[memberStr] = struct{}{}
+	}
+	return exists, nil
+}
+
 // applySetMemberMutations resolves existence for each member using either a
 // pre-built bulk scan (for large batches) or individual ExistsAt calls (for
 // small batches), then applies the mutation to elems.
@@ -953,61 +994,34 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 // legacyBase contains members from a legacy blob being migrated in the same
 // transaction; they are not visible at readTS and must be treated as existing.
 func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}) ([]*kv.Elem[kv.OP], int, int64, error) {
-	var existsMap map[string]struct{}
-	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
-		var err error
-		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
-		if err != nil {
-			return nil, 0, 0, cockerrors.WithStack(err)
-		}
+	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase)
+	if err != nil {
+		return nil, 0, 0, err
 	}
-	// Merge legacy members into existsMap so that members already present in the
-	// legacy blob (migrated in this same transaction) are not counted as new.
-	for m := range legacyBase {
-		if existsMap == nil {
-			existsMap = make(map[string]struct{})
-		}
-		existsMap[m] = struct{}{}
-	}
+	isSmallClean := len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
 	changed := 0
 	lenDelta := int64(0)
 	for _, member := range members {
+		memberStr := string(member)
 		memberKey := store.SetMemberKey(key, member)
-		var exists bool
-		if existsMap != nil {
-			_, exists = existsMap[string(member)]
-		} else {
-			var err error
-			exists, err = r.store.ExistsAt(ctx, memberKey, readTS)
-			if err != nil {
-				return nil, 0, 0, cockerrors.WithStack(err)
-			}
+		exists, lookupErr := r.lookupSetMemberExists(ctx, memberStr, memberKey, readTS, existsMap, isSmallClean)
+		if lookupErr != nil {
+			return nil, 0, 0, lookupErr
 		}
 		var cnt int
 		var d int64
 		elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
 		changed += cnt
 		lenDelta += d
-		// Update existsMap to reflect this mutation so that duplicate members
-		// within the same command are handled correctly (last-write wins).
-		existsMap = trackSetMemberMutation(existsMap, string(member), add)
+		// Update existsMap to reflect this mutation so that subsequent
+		// duplicate members in this call observe the correct in-txn state.
+		if add {
+			existsMap[memberStr] = struct{}{}
+		} else {
+			delete(existsMap, memberStr)
+		}
 	}
 	return elems, changed, lenDelta, nil
-}
-
-// trackSetMemberMutation updates (lazily creating if nil) existsMap to reflect
-// an add or del mutation applied to member within the current batch.
-// This prevents duplicate members in a single SADD/SREM from being double-counted.
-func trackSetMemberMutation(existsMap map[string]struct{}, member string, add bool) map[string]struct{} {
-	if existsMap == nil {
-		existsMap = make(map[string]struct{})
-	}
-	if add {
-		existsMap[member] = struct{}{}
-	} else {
-		delete(existsMap, member)
-	}
-	return existsMap
 }
 
 func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
@@ -1325,20 +1339,16 @@ func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[
 // existence checks are a single bulk scan rather than N ExistsAt round-trips.
 func (r *RedisServer) buildHashFieldElems(key []byte, args [][]byte, existsMap map[string]struct{}, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int) {
 	newFields := 0
-	// seenInBatch tracks fields written earlier in this same command so that
-	// duplicate field names (e.g. HSET key f v1 f v2) count as new at most once
-	// and so the last value wins without double-counting the length delta.
-	seenInBatch := make(map[string]struct{}, len(args)/redisPairWidth)
 	for i := 0; i < len(args); i += redisPairWidth {
 		field := args[i]
 		value := args[i+1]
-		fieldKey := store.HashFieldKey(key, field)
 		fieldStr := string(field)
-		if _, alreadySeen := seenInBatch[fieldStr]; !alreadySeen {
-			if _, existsInStore := existsMap[fieldStr]; !existsInStore {
-				newFields++
-			}
-			seenInBatch[fieldStr] = struct{}{}
+		fieldKey := store.HashFieldKey(key, field)
+		if _, exists := existsMap[fieldStr]; !exists {
+			newFields++
+			// Mark as seen so duplicate field names in one HSET call are not
+			// counted as additional new fields (Redis deduplication semantics).
+			existsMap[fieldStr] = struct{}{}
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: value})
 	}
@@ -2030,18 +2040,11 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(added)
 }
 
-// applyZAddPair processes one ZADD pair against the wide-column store: reads the
-// existing member score (if any), checks the ZADD flags, emits del-old-score /
-// put-member / put-score-index ops, and returns the updated elems, the add count
-// (0 or 1), and the length delta (0 or +1).
-// buildZSetInTxnScores constructs a member→score map from the Put elems that
-// will be written in the current transaction but are not yet visible at readTS.
-// Returns nil when migrationElems is empty.
-func buildZSetInTxnScores(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]float64 {
-	if len(migrationElems) == 0 {
-		return nil
-	}
-	scores := make(map[string]float64, len(migrationElems)/2) //nolint:mnd // 2 elems per member (member key + score index)
+// buildZSetMigrationView extracts member→score from ZSet migration Put elems
+// so that applyZAddPair can see migrated members without a store round-trip.
+// Returns a map from member name to score; absent members were not migrated.
+func buildZSetMigrationView(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]float64 {
+	view := make(map[string]float64)
 	for _, elem := range migrationElems {
 		if elem.Op != kv.Put {
 			continue
@@ -2050,55 +2053,47 @@ func buildZSetInTxnScores(migrationElems []*kv.Elem[kv.OP], key []byte) map[stri
 		if m == nil {
 			continue
 		}
-		if s, err := store.UnmarshalZSetScore(elem.Value); err == nil {
-			scores[string(m)] = s
+		score, err := store.UnmarshalZSetScore(elem.Value)
+		if err == nil {
+			view[string(m)] = score
 		}
 	}
-	return scores
+	return view
 }
 
-// zsetInTxnMemberScore looks up the score for member among the migration elems
-// produced by buildZSetLegacyMigrationElems. Returns (score, true) if found.
-func zsetInTxnMemberScore(migrationElems []*kv.Elem[kv.OP], key []byte, member string) (float64, bool) {
-	for _, elem := range migrationElems {
-		if elem.Op == kv.Put {
-			if m := store.ExtractZSetMemberName(elem.Key, key); m != nil && string(m) == member {
-				if s, err := store.UnmarshalZSetScore(elem.Value); err == nil {
-					return s, true
-				}
-			}
-		}
+// resolveZSetMemberScore returns the current score and existence for a ZSet
+// member. It checks inTxnView first (covers migration elems and earlier pairs
+// in the same ZADD call), then falls back to a store GetAt.
+func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []byte, member string, readTS uint64, inTxnView map[string]float64) (score float64, exists bool, err error) {
+	if s, ok := inTxnView[member]; ok {
+		return s, true, nil
 	}
-	return 0, false
+	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	if getErr == nil {
+		s, unmarshalErr := store.UnmarshalZSetScore(raw)
+		if unmarshalErr != nil {
+			return 0, false, cockerrors.WithStack(unmarshalErr)
+		}
+		return s, true, nil
+	}
+	if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+		return 0, false, cockerrors.WithStack(getErr)
+	}
+	return 0, false, nil
 }
 
-// applyZAddPair applies a single ZADD pair to elems.
-// inTxnScores is an overlay of member→score for members being migrated in the
-// same transaction (not yet visible at readTS in the store). It is nil when
-// there are no migration elems.
-func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, inTxnScores map[string]float64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
+// applyZAddPair processes one ZADD pair against the wide-column store: reads the
+// existing member score (if any), checks the ZADD flags, emits del-old-score /
+// put-member / put-score-index ops, and returns the updated elems, the add count
+// (0 or 1), and the length delta (0 or +1).
+// inTxnView provides an in-transaction view of member→score for members written
+// in the same transaction (migration or earlier pairs); checked before GetAt so
+// migrated and duplicate members are handled correctly.
+func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP], inTxnView map[string]float64) ([]*kv.Elem[kv.OP], int, int64, error) {
 	memberKey := store.ZSetMemberKey(key, []byte(p.member))
-	var oldScore float64
-	memberExists := false
-	// Check the in-txn overlay first: migrated members are not yet visible at readTS.
-	if inTxnScores != nil {
-		if s, ok := inTxnScores[p.member]; ok {
-			oldScore = s
-			memberExists = true
-		}
-	}
-	if !memberExists {
-		raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
-		if getErr == nil {
-			memberExists = true
-			var unmarshalErr error
-			oldScore, unmarshalErr = store.UnmarshalZSetScore(raw)
-			if unmarshalErr != nil {
-				return nil, 0, 0, cockerrors.WithStack(unmarshalErr)
-			}
-		} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
-			return nil, 0, 0, cockerrors.WithStack(getErr)
-		}
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, p.member, readTS, inTxnView)
+	if err != nil {
+		return nil, 0, 0, err
 	}
 	if !flags.allows(memberExists, oldScore, p.score) {
 		return elems, 0, 0, nil
@@ -2110,6 +2105,8 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(p.score)},
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, p.score, []byte(p.member)), Value: []byte{}},
 	)
+	// Update inTxnView so subsequent pairs (duplicates) see this write.
+	inTxnView[p.member] = p.score
 	if memberExists {
 		return elems, 0, 0, nil
 	}
@@ -2137,16 +2134,16 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
 	elems = append(elems, migrationElems...)
 
-	// Build an in-txn overlay for migrated members so that applyZAddPair can
-	// detect existing members that are not yet visible at readTS in the store.
-	inTxnScores := buildZSetInTxnScores(migrationElems, key)
+	// Seed the in-transaction view from migration elems so that migrated
+	// members are not incorrectly counted as new by applyZAddPair.
+	inTxnView := buildZSetMigrationView(migrationElems, key)
 
 	added := 0
 	lenDelta := int64(0)
 	for _, p := range pairs {
 		var c int
 		var d int64
-		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, inTxnScores, elems)
+		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems, inTxnView)
 		if err != nil {
 			return 0, err
 		}
@@ -2176,20 +2173,6 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	return added, cockerrors.WithStack(dispatchErr)
 }
 
-// readZSetMemberScore returns the current score for member, reporting whether
-// the member exists. Returns an error if the stored value cannot be decoded.
-func (r *RedisServer) readZSetMemberScore(ctx context.Context, memberKey []byte, readTS uint64) (score float64, exists bool, err error) {
-	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
-	if getErr == nil {
-		score, err = store.UnmarshalZSetScore(raw)
-		return score, err == nil, cockerrors.WithStack(err)
-	}
-	if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
-		return 0, false, cockerrors.WithStack(getErr)
-	}
-	return 0, false, nil
-}
-
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
@@ -2210,15 +2193,12 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 		return 0, migErr
 	}
 
-	// Check whether the member is being migrated in this same transaction
-	// before falling back to the store (migrated keys are not yet visible at readTS).
-	oldScore, memberExists := zsetInTxnMemberScore(migrationElems, key, member)
-	if !memberExists {
-		var scoreErr error
-		oldScore, memberExists, scoreErr = r.readZSetMemberScore(ctx, memberKey, readTS)
-		if scoreErr != nil {
-			return 0, scoreErr
-		}
+	// Check in-txn migration view before falling back to the store
+	// (migrated keys are not yet visible at readTS).
+	inTxnView := buildZSetMigrationView(migrationElems, key)
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, member, readTS, inTxnView)
+	if err != nil {
+		return 0, err
 	}
 
 	newScore := oldScore + increment
