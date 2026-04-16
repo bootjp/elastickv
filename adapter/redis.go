@@ -1030,12 +1030,6 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
 func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
-	if expireAt, found := r.ttlBuffer.Get(key); found {
-		if expireAt == nil {
-			return false
-		}
-		return !expireAt.After(time.Now())
-	}
 	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
 	if err != nil {
 		return false
@@ -1052,11 +1046,7 @@ func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
 // key has an expired TTL.
 func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 	// Check TTL first: if expired, the key is logically gone.
-	if expireAt, found := r.ttlBuffer.Get(key); found {
-		if expireAt != nil && !expireAt.After(time.Now()) {
-			return false
-		}
-	} else if raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0); err == nil {
+	if raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0); err == nil {
 		if ttl, decErr := decodeRedisTTL(raw); decErr == nil && !ttl.After(time.Now()) {
 			return false
 		}
