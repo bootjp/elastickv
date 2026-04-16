@@ -382,16 +382,12 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-	// Delete all delta keys.
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
-	if scanErr != nil {
-		return nil, errors.WithStack(scanErr)
+	// Delete all delta keys (paginated).
+	deltaElems, err := r.scanAllDeltaElems(ctx, store.ListMetaDeltaScanPrefix(key), readTS)
+	if err != nil {
+		return nil, err
 	}
-	for _, pair := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-	}
+	elems = append(elems, deltaElems...)
 	// Delete all claim keys. Use maxWideScanLimit to guard against OOM; a list
 	// that has accumulated more claim keys than maxWideColumnItems is too large
 	// to delete atomically and should be rejected.
@@ -410,6 +406,30 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	return elems, nil
 }
 
+// scanAllDeltaElems scans all delta keys under deltaPrefix and returns Del
+// elems for each. It paginates internally so callers are not limited to
+// MaxDeltaScanLimit entries.
+func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	const cursorAdv = byte(0x00) // appended to advance past the last scanned key
+	var elems []*kv.Elem[kv.OP]
+	deltaEnd := store.PrefixScanEnd(deltaPrefix)
+	deltaCursor := deltaPrefix
+	for {
+		deltaKVs, scanErr := r.store.ScanAt(ctx, deltaCursor, deltaEnd, store.MaxDeltaScanLimit, readTS)
+		if scanErr != nil {
+			return nil, errors.WithStack(scanErr)
+		}
+		for _, pair := range deltaKVs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+		if len(deltaKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		deltaCursor = append(bytes.Clone(deltaKVs[len(deltaKVs)-1].Key), cursorAdv)
+	}
+	return elems, nil
+}
+
 // deleteWideColumnElems returns delete operations for all wide-column field/member keys,
 // the base meta key, and all delta keys for a collection identified by the given scan prefix,
 // meta key, and delta prefix.
@@ -419,23 +439,20 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs))
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs)+1)
 	for _, pair := range fieldKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
 	}
-	if len(fieldKVs) == 0 {
-		return elems, nil
-	}
+	// Always delete the metadata key and all delta keys regardless of whether
+	// field keys were found. A collection may have a metadata key (or uncompacted
+	// delta keys) with no field keys if all fields were individually deleted but
+	// compaction has not yet run. Omitting this would leak the metadata key.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, scanErr := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
-	if scanErr != nil {
-		return nil, errors.WithStack(scanErr)
+	deltaElems, err := r.scanAllDeltaElems(ctx, deltaPrefix, readTS)
+	if err != nil {
+		return nil, err
 	}
-	for _, pair := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-	}
-	return elems, nil
+	return append(elems, deltaElems...), nil
 }
 
 func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {

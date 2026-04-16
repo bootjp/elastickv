@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -45,7 +46,10 @@ type DeltaCompactor struct {
 	// later in the lexicographic range are eventually reached even when the
 	// prefix contains more than deltaCompactorTickScanLimit delta keys.
 	// A nil or missing cursor means "start from the beginning of the prefix".
-	cursors map[string][]byte
+	// cursorMu protects cursors against concurrent access (e.g. SyncOnce
+	// called from a test while Run is active).
+	cursorMu sync.Mutex
+	cursors  map[string][]byte
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -170,10 +174,12 @@ func (c *DeltaCompactor) allHandlers() []collectionDeltaHandler {
 func (c *DeltaCompactor) scanDeltaPrefix(ctx context.Context, h collectionDeltaHandler, readTS uint64) ([]*store.KVPair, error) {
 	// Build the effective start key: one byte past the cursor so we do not
 	// re-scan the key we stopped at last tick.
+	c.cursorMu.Lock()
 	start := h.prefix
 	if cur := c.cursors[h.typeName]; len(cur) > 0 {
 		start = append(bytes.Clone(cur), cursorNextByte)
 	}
+	c.cursorMu.Unlock()
 
 	end := store.PrefixScanEnd(h.prefix)
 	kvs, err := c.st.ScanAt(ctx, start, end, deltaCompactorTickScanLimit, readTS)
@@ -182,11 +188,13 @@ func (c *DeltaCompactor) scanDeltaPrefix(ctx context.Context, h collectionDeltaH
 	}
 
 	// Advance or reset the cursor for the next tick.
+	c.cursorMu.Lock()
 	if len(kvs) == deltaCompactorTickScanLimit {
 		c.cursors[h.typeName] = bytes.Clone(kvs[len(kvs)-1].Key)
 	} else {
 		delete(c.cursors, h.typeName)
 	}
+	c.cursorMu.Unlock()
 	return kvs, nil
 }
 
@@ -289,21 +297,30 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	if newMeta.Len < 0 {
 		newMeta.Len = 0
 	}
-	metaBytes, err := store.MarshalListMeta(newMeta)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
 
+	metaElem, err := listMetaElemForLen(store.ListMetaKey(userKey), newMeta)
+	if err != nil {
+		return nil, err
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.ListMetaKey(userKey),
-		Value: metaBytes,
-	})
+	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
 	}
 	return elems, nil
+}
+
+// listMetaElemForLen returns a Put or Del elem for the list metadata key.
+// When Len==0 a Del is returned to match Redis semantics (empty list = non-existent).
+func listMetaElemForLen(metaKey []byte, meta store.ListMeta) (*kv.Elem[kv.OP], error) {
+	if meta.Len == 0 {
+		return &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey}, nil
+	}
+	metaBytes, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: metaBytes}, nil
 }
 
 // simpleLenHandlerParams holds all type-specific configuration for a
@@ -427,14 +444,20 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 		newLen = 0
 	}
 
+	metaElem := simpleMetaElemForLen(metaKey, newLen, marshalBase)
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   metaKey,
-		Value: marshalBase(newLen),
-	})
+	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
 	}
 	return elems, nil
+}
+
+// simpleMetaElemForLen returns a Put or Del elem for a Hash/Set/ZSet metadata key.
+// When newLen==0 a Del is returned to match Redis semantics (empty collection = non-existent).
+func simpleMetaElemForLen(metaKey []byte, newLen int64, marshalBase func(int64) []byte) *kv.Elem[kv.OP] {
+	if newLen == 0 {
+		return &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey}
+	}
+	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen)}
 }

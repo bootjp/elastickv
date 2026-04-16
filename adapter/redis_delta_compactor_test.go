@@ -230,11 +230,14 @@ func TestDeltaCompactor_ListNoBaseMeta(t *testing.T) {
 
 	readTS := st.LastCommitTS()
 
-	// Base meta should be created with Head=2, Len=-2 (clamped to 0).
-	raw, err := st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
-	require.NoError(t, err)
-	got, err := store.UnmarshalListMeta(raw)
-	require.NoError(t, err)
-	require.Equal(t, int64(2), got.Head)
-	require.Equal(t, int64(0), got.Len) // clamped
+	// When the accumulated deltas produce Len=0 (clamped from -2), the metadata key
+	// must be deleted rather than written with Len=0. Redis semantics: an empty list
+	// is non-existent, so EXISTS/TYPE must not return a stale entry.
+	_, err := st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	// Delta keys must also be deleted by the compaction.
+	_, err = st.GetAt(ctx, d1Key, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, d2Key, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }

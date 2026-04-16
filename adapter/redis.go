@@ -2638,20 +2638,32 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 		return nil, nil, errors.WithStack(scanErr)
 	}
 
-	// Each item: Del(item) + Put(claim); capacity leaves room for the delta key appended by the caller.
-	elems := make([]*kv.Elem[kv.OP], 0, len(kvps)*2+1) //nolint:mnd // 2 ops per item (del item + put claim)
-	values := make([]string, 0, len(kvps))
+	// Emit claim keys for every sequence position in the claimed range, including
+	// holes. This ensures that two concurrent pops over the same hole produce a
+	// write conflict rather than both silently advancing HeadDelta over the same
+	// empty position, which would otherwise orphan later items.
+	var claimStart, claimEnd int64
+	if left {
+		claimStart = meta.Head
+		claimEnd = meta.Head + n
+	} else {
+		claimStart = meta.Tail - n
+		claimEnd = meta.Tail
+	}
+	// Capacity: n claim keys + n Del(item) for found items + 1 for the delta key appended by caller.
+	elems := make([]*kv.Elem[kv.OP], 0, n+int64(len(kvps))+1) //nolint:mnd
+	for seq := claimStart; seq < claimEnd; seq++ {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
+	}
 
+	values := make([]string, 0, len(kvps))
 	for _, pair := range kvps {
-		seq, ok := store.ExtractListItemSeq(pair.Key, key)
+		_, ok := store.ExtractListItemSeq(pair.Key, key)
 		if !ok {
 			continue
 		}
 		values = append(values, string(pair.Value))
-		elems = append(elems,
-			&kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)},
-			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}},
-		)
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)})
 	}
 	return values, elems, nil
 }
