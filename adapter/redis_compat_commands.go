@@ -988,8 +988,26 @@ func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, m
 		elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
 		changed += cnt
 		lenDelta += d
+		// Update existsMap to reflect this mutation so that duplicate members
+		// within the same command are handled correctly (last-write wins).
+		existsMap = trackSetMemberMutation(existsMap, string(member), add)
 	}
 	return elems, changed, lenDelta, nil
+}
+
+// trackSetMemberMutation updates (lazily creating if nil) existsMap to reflect
+// an add or del mutation applied to member within the current batch.
+// This prevents duplicate members in a single SADD/SREM from being double-counted.
+func trackSetMemberMutation(existsMap map[string]struct{}, member string, add bool) map[string]struct{} {
+	if existsMap == nil {
+		existsMap = make(map[string]struct{})
+	}
+	if add {
+		existsMap[member] = struct{}{}
+	} else {
+		delete(existsMap, member)
+	}
+	return existsMap
 }
 
 func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
@@ -1307,12 +1325,20 @@ func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[
 // existence checks are a single bulk scan rather than N ExistsAt round-trips.
 func (r *RedisServer) buildHashFieldElems(key []byte, args [][]byte, existsMap map[string]struct{}, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int) {
 	newFields := 0
+	// seenInBatch tracks fields written earlier in this same command so that
+	// duplicate field names (e.g. HSET key f v1 f v2) count as new at most once
+	// and so the last value wins without double-counting the length delta.
+	seenInBatch := make(map[string]struct{}, len(args)/redisPairWidth)
 	for i := 0; i < len(args); i += redisPairWidth {
 		field := args[i]
 		value := args[i+1]
 		fieldKey := store.HashFieldKey(key, field)
-		if _, exists := existsMap[string(field)]; !exists {
-			newFields++
+		fieldStr := string(field)
+		if _, alreadySeen := seenInBatch[fieldStr]; !alreadySeen {
+			if _, existsInStore := existsMap[fieldStr]; !existsInStore {
+				newFields++
+			}
+			seenInBatch[fieldStr] = struct{}{}
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: value})
 	}
@@ -2008,20 +2034,71 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 // existing member score (if any), checks the ZADD flags, emits del-old-score /
 // put-member / put-score-index ops, and returns the updated elems, the add count
 // (0 or 1), and the length delta (0 or +1).
-func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
+// buildZSetInTxnScores constructs a member→score map from the Put elems that
+// will be written in the current transaction but are not yet visible at readTS.
+// Returns nil when migrationElems is empty.
+func buildZSetInTxnScores(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]float64 {
+	if len(migrationElems) == 0 {
+		return nil
+	}
+	scores := make(map[string]float64, len(migrationElems)/2) //nolint:mnd // 2 elems per member (member key + score index)
+	for _, elem := range migrationElems {
+		if elem.Op != kv.Put {
+			continue
+		}
+		m := store.ExtractZSetMemberName(elem.Key, key)
+		if m == nil {
+			continue
+		}
+		if s, err := store.UnmarshalZSetScore(elem.Value); err == nil {
+			scores[string(m)] = s
+		}
+	}
+	return scores
+}
+
+// zsetInTxnMemberScore looks up the score for member among the migration elems
+// produced by buildZSetLegacyMigrationElems. Returns (score, true) if found.
+func zsetInTxnMemberScore(migrationElems []*kv.Elem[kv.OP], key []byte, member string) (float64, bool) {
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if m := store.ExtractZSetMemberName(elem.Key, key); m != nil && string(m) == member {
+				if s, err := store.UnmarshalZSetScore(elem.Value); err == nil {
+					return s, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// applyZAddPair applies a single ZADD pair to elems.
+// inTxnScores is an overlay of member→score for members being migrated in the
+// same transaction (not yet visible at readTS in the store). It is nil when
+// there are no migration elems.
+func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, inTxnScores map[string]float64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
 	memberKey := store.ZSetMemberKey(key, []byte(p.member))
-	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
 	var oldScore float64
 	memberExists := false
-	if getErr == nil {
-		memberExists = true
-		var unmarshalErr error
-		oldScore, unmarshalErr = store.UnmarshalZSetScore(raw)
-		if unmarshalErr != nil {
-			return nil, 0, 0, cockerrors.WithStack(unmarshalErr)
+	// Check the in-txn overlay first: migrated members are not yet visible at readTS.
+	if inTxnScores != nil {
+		if s, ok := inTxnScores[p.member]; ok {
+			oldScore = s
+			memberExists = true
 		}
-	} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
-		return nil, 0, 0, cockerrors.WithStack(getErr)
+	}
+	if !memberExists {
+		raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+		if getErr == nil {
+			memberExists = true
+			var unmarshalErr error
+			oldScore, unmarshalErr = store.UnmarshalZSetScore(raw)
+			if unmarshalErr != nil {
+				return nil, 0, 0, cockerrors.WithStack(unmarshalErr)
+			}
+		} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+			return nil, 0, 0, cockerrors.WithStack(getErr)
+		}
 	}
 	if !flags.allows(memberExists, oldScore, p.score) {
 		return elems, 0, 0, nil
@@ -2060,12 +2137,16 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
 	elems = append(elems, migrationElems...)
 
+	// Build an in-txn overlay for migrated members so that applyZAddPair can
+	// detect existing members that are not yet visible at readTS in the store.
+	inTxnScores := buildZSetInTxnScores(migrationElems, key)
+
 	added := 0
 	lenDelta := int64(0)
 	for _, p := range pairs {
 		var c int
 		var d int64
-		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems)
+		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, inTxnScores, elems)
 		if err != nil {
 			return 0, err
 		}
@@ -2129,9 +2210,15 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 		return 0, migErr
 	}
 
-	oldScore, memberExists, scoreErr := r.readZSetMemberScore(ctx, memberKey, readTS)
-	if scoreErr != nil {
-		return 0, scoreErr
+	// Check whether the member is being migrated in this same transaction
+	// before falling back to the store (migrated keys are not yet visible at readTS).
+	oldScore, memberExists := zsetInTxnMemberScore(migrationElems, key, member)
+	if !memberExists {
+		var scoreErr error
+		oldScore, memberExists, scoreErr = r.readZSetMemberScore(ctx, memberKey, readTS)
+		if scoreErr != nil {
+			return 0, scoreErr
+		}
 	}
 
 	newScore := oldScore + increment

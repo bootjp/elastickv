@@ -319,7 +319,6 @@ func (c *DeltaCompactor) splitGuardCursor(byKey map[string][]*store.KVPair, ukOr
 // compaction is deterministic and has good I/O locality regardless of Go's
 // random map iteration. Keys removed from byKey by splitGuardCursor are
 // skipped via the presence check.
-// compaction threshold, logging and skipping keys whose build fails.
 func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaHandler, byKey map[string][]*store.KVPair, ukOrder []string, readTS uint64) []*kv.Elem[kv.OP] {
 	var allElems []*kv.Elem[kv.OP]
 	for _, ukStr := range ukOrder {
