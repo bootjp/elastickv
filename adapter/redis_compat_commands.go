@@ -851,12 +851,12 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		}
 
 		commitTS := r.coordinator.Clock().Next()
-		elems := make([]*kv.Elem[kv.OP], 0, len(members)+setWideColOverhead)
 
 		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
 		if migErr != nil {
 			return migErr
 		}
+		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(members)+setWideColOverhead)
 		elems = append(elems, migrationElems...)
 
 		// Extract legacy member names from migration ops so that applySetMemberMutations
@@ -2050,14 +2050,14 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	}
 
 	commitTS := r.coordinator.Clock().Next()
-	// Capacity: each pair may produce 3 ops (del old score + put member + put score index),
-	// plus migration elems and a delta key.
-	elems := make([]*kv.Elem[kv.OP], 0, len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
 
 	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
+	// Capacity: each pair may produce 3 ops (del old score + put member + put score index),
+	// plus migration elems and a delta key.
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
 	elems = append(elems, migrationElems...)
 
 	added := 0
