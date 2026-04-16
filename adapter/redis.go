@@ -1070,6 +1070,17 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 
 // tryLeaderLogicalExists checks whether the key exists as any type on the leader.
 func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+	// Prefer asking the leader's Redis command path directly: it evaluates
+	// existence with ttlAt() semantics (including the in-memory TTL buffer).
+	if cli, err := r.leaderClientForKey(key); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+		defer cancel()
+		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
+			return count > 0
+		}
+	}
+
+	// Fallback to raw KV probing if Redis command proxying is unavailable.
 	if r.isLeaderKeyExpired(key) {
 		return false
 	}
