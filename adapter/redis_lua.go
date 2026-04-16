@@ -891,14 +891,58 @@ func (r *RedisServer) lpop(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.execLuaCompat(conn, cmdLPop, cmd.Args[1:])
+	r.execListPop(conn, cmd, true)
 }
 
 func (r *RedisServer) rpop(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.execLuaCompat(conn, cmdRPop, cmd.Args[1:])
+	r.execListPop(conn, cmd, false)
+}
+
+// execListPop executes LPOP (left=true) or RPOP (left=false) using the Claim
+// mechanism for O(1) conflict-free pops. An optional count argument is supported:
+// LPOP key [count] / RPOP key [count].
+func (r *RedisServer) execListPop(conn redcon.Conn, cmd redcon.Command, left bool) {
+	count := 1
+	withCount := len(cmd.Args) > 2 //nolint:mnd // args: [CMD, key, count]
+	if withCount {
+		n, err := strconv.Atoi(string(cmd.Args[2]))
+		if err != nil || n < 0 {
+			conn.WriteError("ERR value is not an integer or out of range")
+			return
+		}
+		count = n
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	values, err := r.listPopClaim(ctx, cmd.Args[1], count, left)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	if withCount {
+		// Count variant: always returns an array (or nil array if key not found).
+		if values == nil {
+			conn.WriteNull()
+			return
+		}
+		conn.WriteArray(len(values))
+		for _, v := range values {
+			conn.WriteBulkString(v)
+		}
+		return
+	}
+	// Non-count variant: return a single bulk string (or nil).
+	if len(values) == 0 {
+		conn.WriteNull()
+		return
+	}
+	conn.WriteBulkString(values[0])
 }
 
 func (r *RedisServer) rpoplpush(conn redcon.Conn, cmd redcon.Command) {
@@ -922,18 +966,52 @@ func (r *RedisServer) lset(conn redcon.Conn, cmd redcon.Command) {
 	r.execLuaCompat(conn, cmdLSet, cmd.Args[1:])
 }
 
-func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+// collectionCardinal handles SCARD/ZCARD: checks type, uses the delta-aggregated
+// metadata for wide-column collections (O(1)), and falls back to the Lua
+// compatibility path for legacy blob-encoded collections.
+func (r *RedisServer) collectionCardinal(
+	conn redcon.Conn,
+	cmd redcon.Command,
+	expectedType redisValueType,
+	resolveMeta func(context.Context, []byte, uint64) (int64, bool, error),
+	legacyCmd string,
+) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.execLuaCompat(conn, cmdSCard, cmd.Args[1:])
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if typ == redisTypeNone {
+		conn.WriteInt(0)
+		return
+	}
+	if typ != expectedType {
+		conn.WriteError(wrongTypeMessage)
+		return
+	}
+	count, exists, err := resolveMeta(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if exists {
+		conn.WriteInt64(count)
+		return
+	}
+	// Legacy blob fallback.
+	r.execLuaCompat(conn, legacyCmd, cmd.Args[1:])
+}
+
+func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+	r.collectionCardinal(conn, cmd, redisTypeSet, r.resolveSetMeta, cmdSCard)
 }
 
 func (r *RedisServer) zcard(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
-		return
-	}
-	r.execLuaCompat(conn, cmdZCard, cmd.Args[1:])
+	r.collectionCardinal(conn, cmd, redisTypeZSet, r.resolveZSetMeta, cmdZCard)
 }
 
 func (r *RedisServer) zcount(conn redcon.Conn, cmd redcon.Command) {

@@ -610,9 +610,12 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 
+	deltaCompactor := adapter.NewDeltaCompactor(st, coordinator)
+
 	eg.Go(func() error { coordinator.RunHLCLeaseRenewal(ctx); return nil })
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(func() error { return compactor.Run(ctx) })
+	eg.Go(func() error { return deltaCompactor.Run(ctx) })
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
 	eg.Go(grpcServeTask(s, grpcSock, cfg.address))
 	eg.Go(redisShutdownTask(ctx, rd, cfg.redisAddress))

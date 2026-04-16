@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
+	cockerrors "github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
 )
 
@@ -22,6 +25,17 @@ const (
 	pubsubFirstChannel   = 2
 	redisBusyPollBackoff = 10 * time.Millisecond
 	redisKeywordCount    = "COUNT"
+
+	// setWideColOverhead is the number of extra elements reserved in a set
+	// wide-column mutation slice beyond the per-member elements: one for the
+	// metadata key and one for the legacy-blob deletion tombstone.
+	setWideColOverhead = 2
+
+	// wideColumnBulkScanThreshold is the minimum batch size at which a full
+	// prefix scan is used to check field/member existence instead of one
+	// ExistsAt per field. Below this threshold the per-key lookups are cheaper
+	// because they avoid scanning an arbitrarily large collection.
+	wideColumnBulkScanThreshold = 16
 )
 
 type xreadRequest struct {
@@ -546,23 +560,39 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 
-		// Delete only Redis-related keys. Three DEL_PREFIX operations cover
-		// all Redis namespaces: "!redis|" (str, hash, set, zset, hll,
-		// stream, ttl), "!lst|" (list meta + items), and "!zs|" (zset
-		// wide-column meta/member/score).
+		// Delete only Redis-related keys. Each DEL_PREFIX operation must be
+		// dispatched separately because the FSM processes only one DEL_PREFIX
+		// per request (the first mutation).
+		//
+		// Namespaces covered:
+		//   "!redis|" — str, legacy hash/set/zset/hll/stream, ttl
+		//   "!lst|"   — list meta + items
+		//   "!zs|"    — zset wide-column
+		//   "!hs|"    — hash wide-column meta/field/delta
+		//   "!st|"    — set wide-column meta/member/delta
+		//
 		// Legacy bare keys are NOT deleted here to avoid a full keyspace
 		// scan. Run FLUSHLEGACY first to clean up legacy data.
-		_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.DelPrefix, Key: []byte("!redis|")},
-				{Op: kv.DelPrefix, Key: []byte("!lst|")},
-				{Op: kv.DelPrefix, Key: []byte("!zs|")},
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("dispatch del_prefix: %w", err)
+		//
+		// All prefixes are attempted even if one dispatch fails so that we
+		// delete as many namespaces as possible before reporting errors.
+		var combined error
+		for _, prefix := range [][]byte{
+			[]byte("!redis|"),
+			[]byte("!lst|"),
+			[]byte("!zs|"),
+			[]byte("!hs|"),
+			[]byte("!st|"),
+		} {
+			if _, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+				Elems: []*kv.Elem[kv.OP]{
+					{Op: kv.DelPrefix, Key: prefix},
+				},
+			}); err != nil {
+				combined = cockerrors.CombineErrors(combined, fmt.Errorf("dispatch del_prefix %q: %w", prefix, err))
+			}
 		}
-		return nil
+		return cockerrors.WithStack(combined)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -625,14 +655,14 @@ func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.mutateExactSet(conn, "set", cmd.Args[1], cmd.Args[2:], true)
+	r.mutateExactSet(conn, setKind, cmd.Args[1], cmd.Args[2:], true)
 }
 
 func (r *RedisServer) srem(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	r.mutateExactSet(conn, "set", cmd.Args[1], cmd.Args[2:], false)
+	r.mutateExactSet(conn, setKind, cmd.Args[1], cmd.Args[2:], false)
 }
 
 func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint64) error {
@@ -642,9 +672,9 @@ func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint6
 	}
 
 	switch kind {
-	case "set":
+	case setKind:
 		return r.validateExactSetType(typ, key, readTS)
-	case "hll":
+	case hllKind:
 		return r.validateExactHLLType(typ, key, readTS)
 	default:
 		return errors.New("ERR unsupported exact set kind")
@@ -731,6 +761,24 @@ func sortedExactSetMembers(existing map[string]struct{}) []string {
 }
 
 func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string, key []byte, readTS uint64, members map[string]struct{}) error {
+	if kind != setKind {
+		// HLL and other non-set kinds keep using the legacy blob format.
+		if len(members) == 0 {
+			elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+			if err != nil {
+				return err
+			}
+			return r.dispatchElems(ctx, true, readTS, elems)
+		}
+		payload, err := marshalSetValue(redisSetValue{Members: sortedExactSetMembers(members)})
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: redisExactSetStorageKey(kind, key), Value: payload},
+		})
+	}
+	// Wide-column set: full rewrite (used when the whole state is available).
 	if len(members) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
@@ -738,18 +786,38 @@ func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	payload, err := marshalSetValue(redisSetValue{Members: sortedExactSetMembers(members)})
-	if err != nil {
-		return err
+	elems := make([]*kv.Elem[kv.OP], 0, len(members)+setWideColOverhead)
+	for member := range members {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.SetMemberKey(key, []byte(member)),
+			Value: []byte{},
+		})
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisExactSetStorageKey(kind, key), Value: payload},
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.SetMetaKey(key),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(members))}),
 	})
+	// Remove legacy blob if present.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
-func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
+// applySetMemberMutation emits a Put or Del for one set member and returns the
+// change count (1) and the signed length delta (+1 or -1), or (0, 0) if no change.
+func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, add bool) ([]*kv.Elem[kv.OP], int, int64) {
+	if add && !exists {
+		return append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: []byte{}}), 1, 1
+	}
+	if !add && exists {
+		return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: memberKey}), 1, -1
+	}
+	return elems, 0, 0
+}
+
+// mutateExactSetLegacy handles SADD/SREM for non-set kinds (e.g. HLL) via the legacy blob path.
+func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context, kind string, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
@@ -773,6 +841,258 @@ func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, 
 	conn.WriteInt(changed)
 }
 
+// mutateExactSetWide handles SADD/SREM for the wide-column set path.
+func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, key []byte, members [][]byte, add bool) {
+	var changed int
+	if err := r.retryRedisWrite(ctx, func() error {
+		readTS := r.readTS()
+		if err := r.validateExactSetKind(setKind, key, readTS); err != nil {
+			return err
+		}
+
+		commitTS := r.coordinator.Clock().Next()
+
+		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
+		if migErr != nil {
+			return migErr
+		}
+		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(members)+setWideColOverhead)
+		elems = append(elems, migrationElems...)
+
+		// Extract legacy member names from migration ops so that applySetMemberMutations
+		// can treat them as already-existing (they are not yet visible at readTS).
+		legacyMemberBase := buildLegacySetMemberBase(migrationElems, key)
+
+		var lenDelta int64
+		var mutErr error
+		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase)
+		if mutErr != nil {
+			return mutErr
+		}
+
+		if changed == 0 && len(migrationElems) == 0 {
+			return nil
+		}
+
+		if lenDelta != 0 {
+			deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.SetMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			})
+		}
+
+		if len(elems) == 0 {
+			return nil
+		}
+
+		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    elems,
+		})
+		return cockerrors.WithStack(dispatchErr)
+	}); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	conn.WriteInt(changed)
+}
+
+// scanSetMemberExistsMap does a paginated prefix scan of all member keys for
+// the given set and returns a map from member name to struct{}{}.
+// Using a single prefix scan eliminates the per-member ExistsAt round-trip.
+func (r *RedisServer) scanSetMemberExistsMap(ctx context.Context, key []byte, readTS uint64) (map[string]struct{}, error) {
+	return r.scanKeyExistsMap(ctx, store.SetMemberScanPrefix(key), readTS,
+		func(k []byte) []byte { return store.ExtractSetMemberName(k, key) })
+}
+
+// scanHashFieldExistsMap does a paginated prefix scan of all field keys for
+// the given hash and returns a map from field name to struct{}{}.
+// Using a single prefix scan eliminates per-field ExistsAt round-trips.
+func (r *RedisServer) scanHashFieldExistsMap(ctx context.Context, key []byte, readTS uint64) (map[string]struct{}, error) {
+	return r.scanKeyExistsMap(ctx, store.HashFieldScanPrefix(key), readTS,
+		func(k []byte) []byte { return store.ExtractHashFieldName(k, key) })
+}
+
+// mergeZSetBulkScores performs a single prefix scan of ZSet member keys and
+// merges the store scores into inTxnView when pairCount >= wideColumnBulkScanThreshold.
+// This avoids O(pairCount) individual GetAt round-trips inside applyZAddPair.
+// Members already in inTxnView (migration elems or earlier pairs) take precedence.
+// Returns inTxnView unchanged when the batch is below the threshold.
+func (r *RedisServer) mergeZSetBulkScores(ctx context.Context, key []byte, readTS uint64, pairCount int, inTxnView map[string]float64) (map[string]float64, error) {
+	if pairCount < wideColumnBulkScanThreshold {
+		return inTxnView, nil
+	}
+	bulkScores, err := r.scanZSetMemberScoreMap(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if inTxnView == nil {
+		return bulkScores, nil
+	}
+	for m, s := range bulkScores {
+		if _, alreadySeen := inTxnView[m]; !alreadySeen {
+			inTxnView[m] = s
+		}
+	}
+	return inTxnView, nil
+}
+
+// scanZSetMemberScoreMap does a paginated prefix scan of all member keys for
+// the given ZSet and returns a map from member name to its current score.
+// Using a single prefix scan eliminates O(N) GetAt round-trips in ZADD for
+// large batches (>= wideColumnBulkScanThreshold pairs).
+func (r *RedisServer) scanZSetMemberScoreMap(ctx context.Context, key []byte, readTS uint64) (map[string]float64, error) {
+	scanPrefix := store.ZSetMemberScanPrefix(key)
+	scanEnd := store.PrefixScanEnd(scanPrefix)
+	scores := make(map[string]float64)
+	cursor := scanPrefix
+	for {
+		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+		for _, pair := range scanKVs {
+			m := store.ExtractZSetMemberName(pair.Key, key)
+			if m == nil {
+				continue
+			}
+			if s, decodeErr := store.UnmarshalZSetScore(pair.Value); decodeErr == nil {
+				scores[string(m)] = s
+			}
+		}
+		if len(scanKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		lastKey := scanKVs[len(scanKVs)-1].Key
+		next := make([]byte, len(lastKey)+1)
+		copy(next, lastKey)
+		cursor = next
+	}
+	return scores, nil
+}
+
+// scanKeyExistsMap paginates through all keys under scanPrefix, extracts a
+// name from each key using extractName, and builds a set of existing names.
+// It is used by scanSetMemberExistsMap and scanHashFieldExistsMap to eliminate
+// per-key ExistsAt round-trips during SADD/SREM/HDEL operations.
+func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, readTS uint64, extractName func([]byte) []byte) (map[string]struct{}, error) {
+	scanEnd := store.PrefixScanEnd(scanPrefix)
+	existsMap := make(map[string]struct{})
+	cursor := scanPrefix
+	for {
+		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+		for _, pair := range scanKVs {
+			if name := extractName(pair.Key); name != nil {
+				existsMap[string(name)] = struct{}{}
+			}
+		}
+		if len(scanKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		lastKey := scanKVs[len(scanKVs)-1].Key
+		next := make([]byte, len(lastKey)+1)
+		copy(next, lastKey)
+		cursor = next
+	}
+	return existsMap, nil
+}
+
+// initSetExistsMap builds the initial existence map for a set mutation batch.
+// For large batches or when legacy members are present it does a bulk prefix
+// scan; otherwise it returns an empty (non-nil) map for per-member ExistsAt
+// fallback. Legacy members from migration elems are merged in so that members
+// already in-flight in the same transaction are treated as existing.
+func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}) (map[string]struct{}, error) {
+	existsMap := make(map[string]struct{})
+	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
+		var err error
+		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+	}
+	for m := range legacyBase {
+		existsMap[m] = struct{}{}
+	}
+	return existsMap, nil
+}
+
+// lookupSetMemberExists reports whether memberStr is present, updating
+// existsMap as a cache. For small clean batches (no bulk scan, no legacy
+// migration) it falls back to an ExistsAt store read; otherwise it relies
+// solely on the pre-built map.
+func (r *RedisServer) lookupSetMemberExists(ctx context.Context, memberStr string, memberKey []byte, readTS uint64, existsMap map[string]struct{}, isSmallClean bool) (bool, error) {
+	if _, ok := existsMap[memberStr]; ok {
+		return true, nil
+	}
+	if !isSmallClean {
+		return false, nil
+	}
+	exists, err := r.store.ExistsAt(ctx, memberKey, readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	if exists {
+		existsMap[memberStr] = struct{}{}
+	}
+	return exists, nil
+}
+
+// applySetMemberMutations resolves existence for each member using either a
+// pre-built bulk scan (for large batches) or individual ExistsAt calls (for
+// small batches), then applies the mutation to elems.
+// The bulk scan threshold is wideColumnBulkScanThreshold.
+// legacyBase contains members from a legacy blob being migrated in the same
+// transaction; they are not visible at readTS and must be treated as existing.
+func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}) ([]*kv.Elem[kv.OP], int, int64, error) {
+	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	isSmallClean := len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
+	changed := 0
+	lenDelta := int64(0)
+	for _, member := range members {
+		memberStr := string(member)
+		memberKey := store.SetMemberKey(key, member)
+		exists, lookupErr := r.lookupSetMemberExists(ctx, memberStr, memberKey, readTS, existsMap, isSmallClean)
+		if lookupErr != nil {
+			return nil, 0, 0, lookupErr
+		}
+		var cnt int
+		var d int64
+		elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
+		changed += cnt
+		lenDelta += d
+		// Update existsMap to reflect this mutation so that subsequent
+		// duplicate members in this call observe the correct in-txn state.
+		if add {
+			existsMap[memberStr] = struct{}{}
+		} else {
+			delete(existsMap, memberStr)
+		}
+	}
+	return elems, changed, lenDelta, nil
+}
+
+func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	if kind != setKind {
+		r.mutateExactSetLegacy(conn, ctx, kind, key, members, add)
+		return
+	}
+	r.mutateExactSetWide(conn, ctx, key, members, add)
+}
+
 func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
@@ -792,7 +1112,7 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, err := r.loadSetAt(context.Background(), "set", cmd.Args[1], readTS)
+	value, err := r.loadSetAt(context.Background(), setKind, cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -823,7 +1143,7 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, err := r.loadSetAt(context.Background(), "set", cmd.Args[1], readTS)
+	value, err := r.loadSetAt(context.Background(), setKind, cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -843,11 +1163,11 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		if err := r.validateExactSetKind("hll", cmd.Args[1], readTS); err != nil {
+		if err := r.validateExactSetKind(hllKind, cmd.Args[1], readTS); err != nil {
 			return err
 		}
 
-		value, err := r.loadSetAt(context.Background(), "hll", cmd.Args[1], readTS)
+		value, err := r.loadSetAt(context.Background(), hllKind, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
@@ -857,7 +1177,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 			return nil
 		}
 
-		return r.persistExactSetMembersTxn(ctx, "hll", cmd.Args[1], readTS, existing)
+		return r.persistExactSetMembersTxn(ctx, hllKind, cmd.Args[1], readTS, existing)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -892,7 +1212,7 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 		}
-		value, err := r.loadSetAt(context.Background(), "hll", key, readTS)
+		value, err := r.loadSetAt(context.Background(), hllKind, key, readTS)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
@@ -927,16 +1247,170 @@ func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteString("OK")
 }
 
-func applyHashPairs(value redisHashValue, args [][]byte) int {
-	added := 0
-	for i := 0; i < len(args); i += redisPairWidth {
-		field := string(args[i])
-		if _, ok := value[field]; !ok {
-			added++
-		}
-		value[field] = string(args[i+1])
+// buildHashLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|hash| blob to wide-column !hs|fld| keys.  Returns nil if no legacy
+// blob exists.  The base meta key is also written with the migrated count so
+// that resolveHashMeta works correctly after migration.
+func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
 	}
-	return added
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalHashValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value)+setWideColOverhead)
+	for field, val := range value {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(key, []byte(field)),
+			Value: []byte(val),
+		})
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	// Write a base meta so that resolveHashMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.HashMetaKey(key),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
+	})
+	return elems, nil
+}
+
+// buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|set| blob to wide-column !st|mem| keys.  Returns nil if no legacy
+// blob exists.
+func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisSetKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Members)+setWideColOverhead)
+	for _, member := range value.Members {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.SetMemberKey(key, []byte(member)),
+			Value: []byte{},
+		})
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	// Write a base meta so that resolveSetMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.SetMetaKey(key),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
+	})
+	return elems, nil
+}
+
+// buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no legacy
+// blob exists.  The base meta key is also written with the migrated count so
+// that resolveZSetMeta works correctly after migration.
+func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Each entry → member key + score index key; plus legacy blob deletion + base meta.
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)*2+setWideColOverhead) //nolint:mnd // 2 ops per entry (member + score index)
+	for _, entry := range value.Entries {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey(key, []byte(entry.Member)),
+				Value: store.MarshalZSetScore(entry.Score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey(key, entry.Score, []byte(entry.Member)),
+				Value: []byte{},
+			},
+		)
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	// Write a base meta so that resolveZSetMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaKey(key),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries))}),
+	})
+	return elems, nil
+}
+
+// addLegacyHashFieldsToMap adds field names from migration Put elems (fields
+// being migrated in the current transaction, not yet visible at readTS) into
+// existsMap so that buildHashFieldElems does not count them as new fields.
+func addLegacyHashFieldsToMap(migrationElems []*kv.Elem[kv.OP], key []byte, existsMap map[string]struct{}) {
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if f := store.ExtractHashFieldName(elem.Key, key); f != nil {
+				existsMap[string(f)] = struct{}{}
+			}
+		}
+	}
+}
+
+// buildLegacySetMemberBase extracts member names from migration Put elems
+// (members being migrated in the current transaction, invisible at readTS)
+// and returns them as a set. Returns nil when no migration is happening.
+func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]struct{} {
+	var base map[string]struct{}
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if m := store.ExtractSetMemberName(elem.Key, key); m != nil {
+				if base == nil {
+					base = make(map[string]struct{})
+				}
+				base[string(m)] = struct{}{}
+			}
+		}
+	}
+	return base
+}
+
+// buildHashFieldElems iterates over field-value pairs in args, checks each
+// field against existsMap to determine if it is new, appends Put operations
+// to elems, and returns the updated elems and new-field count.
+// existsMap is built by scanHashFieldExistsMap before this call so that
+// existence checks are a single bulk scan rather than N ExistsAt round-trips.
+func (r *RedisServer) buildHashFieldElems(key []byte, args [][]byte, existsMap map[string]struct{}, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int) {
+	newFields := 0
+	for i := 0; i < len(args); i += redisPairWidth {
+		field := args[i]
+		value := args[i+1]
+		fieldStr := string(field)
+		fieldKey := store.HashFieldKey(key, field)
+		if _, exists := existsMap[fieldStr]; !exists {
+			newFields++
+			// Mark as seen so duplicate field names in one HSET call are not
+			// counted as additional new fields (Redis deduplication semantics).
+			existsMap[fieldStr] = struct{}{}
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: value})
+	}
+	return elems, newFields
 }
 
 func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error) {
@@ -956,18 +1430,56 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		if typ != redisTypeNone && typ != redisTypeHash {
 			return wrongTypeError()
 		}
-		value, err := r.loadHashAt(context.Background(), key, readTS)
+
+		commitTS := r.coordinator.Clock().Next()
+
+		// Atomically migrate any legacy blob on first wide-column write.
+		// Fetch migration elems before allocating the main elems slice so that
+		// the initial capacity accounts for both migration and field Put ops,
+		// avoiding a reallocation when a legacy blob is present.
+		migrationElems, err := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		added = applyHashPairs(value, args)
-		payload, err := marshalHashValue(value)
+		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(args)/redisPairWidth+setWideColOverhead)
+		elems = append(elems, migrationElems...)
+
+		// Bulk-scan existing fields once so buildHashFieldElems can check
+		// existence via a map lookup instead of per-field ExistsAt.
+		existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisHashKey(key), Value: payload},
+		// Fields from the legacy blob are being migrated in this same transaction,
+		// so they are not yet visible at readTS. Add them to existsMap so that
+		// buildHashFieldElems does not count already-existing fields as new.
+		addLegacyHashFieldsToMap(migrationElems, key, existsMap)
+
+		var newFields int
+		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
+		added = newFields
+
+		// Emit a single delta key for all newly-added fields.
+		if newFields != 0 {
+			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			})
+		}
+
+		if len(elems) == 0 {
+			return nil
+		}
+
+		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    elems,
 		})
+		return cockerrors.WithStack(dispatchErr)
 	})
 	return added, err
 }
@@ -1061,6 +1573,66 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
+// hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
+func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTS uint64) (int, error) {
+	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	commitTS := r.coordinator.Clock().Next()
+	elems := delElems
+	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+		Value: deltaVal,
+	})
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	return removed, cockerrors.WithStack(dispatchErr)
+}
+
+// resolveHashFieldDelElems checks which fields exist using either a bulk scan
+// (for large batches) or individual ExistsAt calls (for small batches), then
+// returns Del elems for every field that exists and the count of deletions.
+func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, fields [][]byte, readTS uint64) ([]*kv.Elem[kv.OP], int, error) {
+	var existsMap map[string]struct{}
+	if len(fields) >= wideColumnBulkScanThreshold {
+		var err error
+		existsMap, err = r.scanHashFieldExistsMap(ctx, key, readTS)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(fields)+1)
+	removed := 0
+	for _, field := range fields {
+		fieldKey := store.HashFieldKey(key, field)
+		var exists bool
+		if existsMap != nil {
+			_, exists = existsMap[string(field)]
+		} else {
+			var err error
+			exists, err = r.store.ExistsAt(ctx, fieldKey, readTS)
+			if err != nil {
+				return nil, 0, cockerrors.WithStack(err)
+			}
+		}
+		if exists {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: fieldKey})
+			removed++
+		}
+	}
+	return elems, removed, nil
+}
+
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
@@ -1073,6 +1645,19 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	if typ != redisTypeHash {
 		return 0, wrongTypeError()
 	}
+
+	// Wide-column path: check if any !hs|fld| keys exist for this key.
+	hashFieldPrefix := store.HashFieldScanPrefix(key)
+	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
+	wideKVs, err := r.store.ScanAt(context.Background(), hashFieldPrefix, hashFieldEnd, 1, readTS)
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
+	if len(wideKVs) > 0 {
+		return r.hdelWideColumn(ctx, key, fields, readTS)
+	}
+
+	// Legacy blob path.
 	value, err := r.loadHashAt(context.Background(), key, readTS)
 	if err != nil {
 		return 0, err
@@ -1103,13 +1688,24 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	payload, err := marshalHashValue(value)
-	if err != nil {
-		return err
+	// Wide-column rewrite: write per-field keys and a new base meta.
+	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.
+	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
+	for field, val := range value {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(key, []byte(field)),
+			Value: []byte(val),
+		})
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisHashKey(key), Value: payload},
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.HashMetaKey(key),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
 	})
+	// Also remove the legacy blob if it was present.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
@@ -1162,6 +1758,17 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	// Wide-column path: use delta-aggregated metadata for O(1) count.
+	count, exists, err := r.resolveHashMeta(context.Background(), cmd.Args[1], readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if exists {
+		conn.WriteInt64(count)
+		return
+	}
+	// Legacy blob fallback: load all fields and count.
 	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1194,6 +1801,66 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt64(current)
 }
 
+// readHashFieldInt reads the current integer value of a hash field from wide-column or legacy storage.
+// Returns (current, isNewField, legacyHashValue, error). legacyHashValue is non-nil only when
+// the value came from a legacy JSON blob that needs to be migrated on the next write.
+func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, readTS uint64) (int64, bool, redisHashValue, error) {
+	fieldKey := store.HashFieldKey(key, field)
+	raw, readErr := r.store.GetAt(ctx, fieldKey, readTS)
+	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
+		return 0, true, nil, cockerrors.WithStack(readErr)
+	}
+	if readErr == nil {
+		current, parseErr := strconv.ParseInt(string(raw), 10, 64)
+		if parseErr != nil {
+			return 0, false, nil, errors.New("ERR hash value is not an integer")
+		}
+		return current, false, nil, nil
+	}
+	// Not in wide-column – check legacy blob.
+	legacyValue, legacyErr := r.loadHashAt(ctx, key, readTS)
+	if legacyErr != nil {
+		return 0, true, nil, legacyErr
+	}
+	if rawLegacy, ok := legacyValue[string(field)]; ok {
+		current, parseErr := strconv.ParseInt(rawLegacy, 10, 64)
+		if parseErr != nil {
+			return 0, false, nil, errors.New("ERR hash value is not an integer")
+		}
+		return current, false, legacyValue, nil
+	}
+	return 0, true, legacyValue, nil
+}
+
+// hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
+// atomically with the increment operation.
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
+	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
+	if migErr != nil {
+		return 0, migErr
+	}
+	current += increment
+	newVal := strconv.FormatInt(current, 10)
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+setWideColOverhead)
+	elems = append(elems, migrationElems...)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	if isNewField {
+		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
+	}
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	return current, cockerrors.WithStack(dispatchErr)
+}
+
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
@@ -1203,26 +1870,39 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	if typ != redisTypeNone && typ != redisTypeHash {
 		return 0, wrongTypeError()
 	}
-	value, err := r.loadHashAt(context.Background(), key, readTS)
+
+	commitTS := r.coordinator.Clock().Next()
+	fieldKey := store.HashFieldKey(key, field)
+
+	current, isNewField, legacyValue, err := r.readHashFieldInt(ctx, key, field, readTS)
 	if err != nil {
 		return 0, err
 	}
-	var current int64
-	if raw, ok := value[string(field)]; ok {
-		current, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return 0, errors.New("ERR hash value is not an integer")
-		}
+
+	// If a legacy blob exists, migrate it atomically with the increment.
+	if len(legacyValue) > 0 {
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, increment)
 	}
+
 	current += increment
-	value[string(field)] = strconv.FormatInt(current, 10)
-	payload, err := marshalHashValue(value)
-	if err != nil {
-		return 0, err
+	newVal := strconv.FormatInt(current, 10)
+	elems := make([]*kv.Elem[kv.OP], 0, setWideColOverhead)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	if isNewField {
+		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
 	}
-	return current, r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisHashKey(key), Value: payload},
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
 	})
+	return current, cockerrors.WithStack(dispatchErr)
 }
 
 func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
@@ -1418,6 +2098,79 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(added)
 }
 
+// buildZSetMigrationView extracts member→score from ZSet migration Put elems
+// so that applyZAddPair can see migrated members without a store round-trip.
+// Returns a map from member name to score; absent members were not migrated.
+func buildZSetMigrationView(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]float64 {
+	view := make(map[string]float64)
+	for _, elem := range migrationElems {
+		if elem.Op != kv.Put {
+			continue
+		}
+		m := store.ExtractZSetMemberName(elem.Key, key)
+		if m == nil {
+			continue
+		}
+		score, err := store.UnmarshalZSetScore(elem.Value)
+		if err == nil {
+			view[string(m)] = score
+		}
+	}
+	return view
+}
+
+// resolveZSetMemberScore returns the current score and existence for a ZSet
+// member. It checks inTxnView first (covers migration elems and earlier pairs
+// in the same ZADD call), then falls back to a store GetAt.
+func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []byte, member string, readTS uint64, inTxnView map[string]float64) (score float64, exists bool, err error) {
+	if s, ok := inTxnView[member]; ok {
+		return s, true, nil
+	}
+	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	if getErr == nil {
+		s, unmarshalErr := store.UnmarshalZSetScore(raw)
+		if unmarshalErr != nil {
+			return 0, false, cockerrors.WithStack(unmarshalErr)
+		}
+		return s, true, nil
+	}
+	if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+		return 0, false, cockerrors.WithStack(getErr)
+	}
+	return 0, false, nil
+}
+
+// applyZAddPair processes one ZADD pair against the wide-column store: reads the
+// existing member score (if any), checks the ZADD flags, emits del-old-score /
+// put-member / put-score-index ops, and returns the updated elems, the add count
+// (0 or 1), and the length delta (0 or +1).
+// inTxnView provides an in-transaction view of member→score for members written
+// in the same transaction (migration or earlier pairs); checked before GetAt so
+// migrated and duplicate members are handled correctly.
+func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP], inTxnView map[string]float64) ([]*kv.Elem[kv.OP], int, int64, error) {
+	memberKey := store.ZSetMemberKey(key, []byte(p.member))
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, p.member, readTS, inTxnView)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if !flags.allows(memberExists, oldScore, p.score) {
+		return elems, 0, 0, nil
+	}
+	if memberExists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(p.member))})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(p.score)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, p.score, []byte(p.member)), Value: []byte{}},
+	)
+	// Update inTxnView so subsequent pairs (duplicates) see this write.
+	inTxnView[p.member] = p.score
+	if memberExists {
+		return elems, 0, 0, nil
+	}
+	return elems, 1, 1, nil
+}
+
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
@@ -1427,30 +2180,121 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	if typ != redisTypeNone && typ != redisTypeZSet {
 		return 0, wrongTypeError()
 	}
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+
+	commitTS := r.coordinator.Clock().Next()
+
+	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
-	members := zsetEntriesToMap(value.Entries)
+	// Capacity: each pair may produce 3 ops (del old score + put member + put score index),
+	// plus migration elems and a delta key.
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
+	elems = append(elems, migrationElems...)
+
+	// Seed the in-transaction view from migration elems so that migrated
+	// members are not incorrectly counted as new by applyZAddPair.
+	inTxnView := buildZSetMigrationView(migrationElems, key)
+
+	// For large batches, mergeZSetBulkScores performs one prefix scan that
+	// eliminates O(N) GetAt calls inside applyZAddPair; it is a no-op for
+	// batches below wideColumnBulkScanThreshold.
+	inTxnView, err = r.mergeZSetBulkScores(ctx, key, readTS, len(pairs), inTxnView)
+	if err != nil {
+		return 0, err
+	}
+
 	added := 0
+	lenDelta := int64(0)
 	for _, p := range pairs {
-		old, exists := members[p.member]
-		if !flags.allows(exists, old, p.score) {
-			continue
+		var c int
+		var d int64
+		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems, inTxnView)
+		if err != nil {
+			return 0, err
 		}
-		if !exists {
-			added++
-		}
-		members[p.member] = p.score
+		added += c
+		lenDelta += d
 	}
-	value.Entries = zsetMapToEntries(members)
-	payload, err := marshalZSetValue(value)
+
+	if len(elems) == 0 {
+		return 0, nil
+	}
+
+	if lenDelta != 0 {
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
+	}
+
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	return added, cockerrors.WithStack(dispatchErr)
+}
+
+// zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
+// Returns the new score after applying increment.
+func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
 		return 0, err
 	}
-	return added, r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+	if typ != redisTypeNone && typ != redisTypeZSet {
+		return 0, wrongTypeError()
+	}
+
+	memberKey := store.ZSetMemberKey(key, []byte(member))
+	commitTS := r.coordinator.Clock().Next()
+
+	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
+	if migErr != nil {
+		return 0, migErr
+	}
+
+	// Check in-txn migration view before falling back to the store
+	// (migrated keys are not yet visible at readTS).
+	inTxnView := buildZSetMigrationView(migrationElems, key)
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, member, readTS, inTxnView)
+	if err != nil {
+		return 0, err
+	}
+
+	newScore := oldScore + increment
+	if math.IsNaN(newScore) {
+		return 0, errors.New("ERR resulting score is not a number (NaN)")
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+3) //nolint:mnd // del old score + put member + put score index
+	elems = append(elems, migrationElems...)
+	if memberExists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(newScore)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, []byte(member)), Value: []byte{}},
+	)
+	if !memberExists {
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1})
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		})
+	}
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
 	})
+	return newScore, cockerrors.WithStack(dispatchErr)
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
@@ -1467,30 +2311,9 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var newScore float64
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		if typ != redisTypeNone && typ != redisTypeZSet {
-			return wrongTypeError()
-		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
-		if err != nil {
-			return err
-		}
-		members := zsetEntriesToMap(value.Entries)
-		member := string(cmd.Args[3])
-		members[member] += increment
-		newScore = members[member]
-		value.Entries = zsetMapToEntries(members)
-		payload, err := marshalZSetValue(value)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisZSetKey(cmd.Args[1]), Value: payload},
-		})
+		var txnErr error
+		newScore, txnErr = r.zincrbyTxn(ctx, cmd.Args[1], string(cmd.Args[3]), increment)
+		return txnErr
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1736,7 +2559,17 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 		}
 		popped := value.Entries[0]
 		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-		if err := r.persistBZPopMinResult(ctx, key, readTS, remaining); err != nil {
+
+		// Detect wide-column storage.
+		memberPrefix := store.ZSetMemberScanPrefix(key)
+		memberEnd := store.PrefixScanEnd(memberPrefix)
+		probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+		if probeErr != nil {
+			return cockerrors.WithStack(probeErr)
+		}
+		isWide := len(probeKVs) > 0
+
+		if err := r.persistBZPopMinResult(ctx, key, readTS, popped, remaining, isWide); err != nil {
 			return err
 		}
 		result = &bzpopminResult{key: key, entry: popped}
@@ -1745,7 +2578,7 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 	return result, err
 }
 
-func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, remaining []redisZSetEntry) error {
+func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, popped redisZSetEntry, remaining []redisZSetEntry, isWide bool) error {
 	if len(remaining) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
@@ -1753,6 +2586,24 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
+	if isWide {
+		// Wide-column: delete the popped member key + score index, emit delta -1.
+		commitTS := r.coordinator.Clock().Next()
+		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
+		elems := []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
+			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
+			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
+		}
+		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  normalizeStartTS(readTS),
+			CommitTS: commitTS,
+			Elems:    elems,
+		})
+		return cockerrors.WithStack(dispatchErr)
+	}
+	// Legacy blob: write back all remaining entries.
 	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
 	if err != nil {
 		return err

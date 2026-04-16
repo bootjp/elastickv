@@ -108,7 +108,12 @@ func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 			key := []byte("bootstrap-members-e2e-key")
 			value := []byte("bootstrap-members-e2e-value")
 
-			require.NoError(t, rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout))
+			// Retry the first Put: the gRPC connection to a freshly started node
+			// may not be ready immediately, causing "context canceled while waiting
+			// for connections to become ready".
+			require.Eventually(t, func() bool {
+				return rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout) == nil
+			}, waitTimeout, waitInterval)
 
 			for i := range clients {
 				client := clients[i]
@@ -146,7 +151,11 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 
 	keyA := []byte("bootstrap-etcd-restart-key-a")
 	valueA := []byte("bootstrap-etcd-restart-value-a")
-	require.NoError(t, rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA, rpcTimeout))
+	// Retry the first Put: the gRPC connection to a freshly started node may not
+	// be ready immediately, causing "context canceled while waiting for connections".
+	require.Eventually(t, func() bool {
+		return rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA, rpcTimeout) == nil
+	}, waitTimeout, waitInterval)
 	waitForValueOnAllClients(t, clients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
 
 	require.NoError(t, nodes[leaderIdx].close())
@@ -164,7 +173,9 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 
 	keyB := []byte("bootstrap-etcd-restart-key-b")
 	valueB := []byte("bootstrap-etcd-restart-value-b")
-	require.NoError(t, rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB, rpcTimeout))
+	require.Eventually(t, func() bool {
+		return rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB, rpcTimeout) == nil
+	}, waitTimeout, waitInterval)
 	waitForValueOnAllClients(t, restartedClients, keyB, valueB, waitTimeout, waitInterval, rpcTimeout)
 }
 

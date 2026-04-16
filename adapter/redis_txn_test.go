@@ -10,7 +10,11 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-func TestRedisTxnValidateReadSetDetectsStaleListMeta(t *testing.T) {
+// TestRedisTxnValidateReadSet_ListMetaUpdateNoConflict verifies that updating
+// the base list metadata key (e.g. by a DeltaCompactor) does NOT trigger an
+// OCC conflict for append operations.  With the Delta pattern, appenders never
+// read-modify-write the base meta key, so compaction is invisible to them.
+func TestRedisTxnValidateReadSet_ListMetaUpdateNoConflict(t *testing.T) {
 	t.Parallel()
 
 	server, st := newRedisStorageMigrationTestServer(t)
@@ -33,9 +37,45 @@ func TestRedisTxnValidateReadSetDetectsStaleListMeta(t *testing.T) {
 	_, err = txn.loadListState(key)
 	require.NoError(t, err)
 
+	// Simulate a DeltaCompactor updating the base meta after our read.
 	metaV2, err := store.MarshalListMeta(store.ListMeta{Len: 2})
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaV2, 11, 0))
+
+	// With the Delta pattern the base meta key is NOT in the OCC read set,
+	// so the compaction write must NOT surface as a write conflict.
+	err = txn.validateReadSet(context.Background())
+	require.NoError(t, err)
+}
+
+// TestRedisTxnValidateReadSet_TTLUpdateConflict verifies that updating the TTL
+// key for a list DOES trigger an OCC conflict, because TTL reads are still
+// tracked in the read set.
+func TestRedisTxnValidateReadSet_TTLUpdateConflict(t *testing.T) {
+	t.Parallel()
+
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("list:ttl-conflict")
+
+	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, 10, 0))
+
+	txn := &txnContext{
+		server:     server,
+		working:    map[string]*txnValue{},
+		listStates: map[string]*listTxnState{},
+		zsetStates: map[string]*zsetTxnState{},
+		ttlStates:  map[string]*ttlTxnState{},
+		readKeys:   map[string][]byte{},
+		startTS:    10,
+	}
+
+	_, err = txn.loadListState(key)
+	require.NoError(t, err)
+
+	// A concurrent EXPIRE updates the TTL key after our read.
+	require.NoError(t, st.PutAt(context.Background(), redisTTLKey(key), []byte("dummy"), 11, 0))
 
 	err = txn.validateReadSet(context.Background())
 	require.Error(t, err)
