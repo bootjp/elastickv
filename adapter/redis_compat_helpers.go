@@ -395,19 +395,16 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 // deleteListElems returns delete operations for all list keys: item keys, the base
 // meta key, all delta keys, and all claim keys.
 func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	meta, listExists, err := r.resolveListMeta(ctx, key, readTS)
+	_, listExists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
 	if !listExists {
 		return nil, nil
 	}
-	if meta.Len > maxWideColumnItems {
-		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
-	}
-	elems := make([]*kv.Elem[kv.OP], 0, int(meta.Len)+setWideColOverhead)
-	for seq := meta.Head; seq < meta.Tail; seq++ {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
+	elems, err := r.scanListItemDelElems(ctx, key, readTS)
+	if err != nil {
+		return nil, err
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
 	// Delete all delta keys (paginated).
@@ -416,9 +413,7 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 		return nil, err
 	}
 	elems = append(elems, deltaElems...)
-	// Delete all claim keys. Use maxWideScanLimit to guard against OOM; a list
-	// that has accumulated more claim keys than maxWideColumnItems is too large
-	// to delete atomically and should be rejected.
+	// Delete all claim keys (paginated).
 	claimPrefix := store.ListClaimScanPrefix(key)
 	claimEnd := store.PrefixScanEnd(claimPrefix)
 	claimKVs, claimScanErr := r.store.ScanAt(ctx, claimPrefix, claimEnd, maxWideScanLimit, readTS)
@@ -430,6 +425,39 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	}
 	for _, pair := range claimKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+	}
+	return elems, nil
+}
+
+// scanListItemDelElems returns Del elems for every item key that belongs to
+// the given list userKey. It uses a paginated prefix scan instead of
+// enumerating positions in [Head, Tail) so that sparse lists with large
+// sequence gaps do not cause O(range) iterations.
+func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	const cursorAdv = byte(0x00)
+	itemPrefix := append(append([]byte(nil), []byte(store.ListItemPrefix)...), key...)
+	itemEnd := store.PrefixScanEnd(itemPrefix)
+	var elems []*kv.Elem[kv.OP]
+	cursor := itemPrefix
+	for {
+		itemKVs, scanErr := r.store.ScanAt(ctx, cursor, itemEnd, store.MaxDeltaScanLimit, readTS)
+		if scanErr != nil {
+			return nil, errors.WithStack(scanErr)
+		}
+		for _, pair := range itemKVs {
+			// Guard against prefix collision with lexicographically adjacent userKeys.
+			if _, ok := store.ExtractListItemSeq(pair.Key, key); !ok {
+				continue
+			}
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+		if len(elems) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
+		}
+		if len(itemKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		cursor = append(bytes.Clone(itemKVs[len(itemKVs)-1].Key), cursorAdv)
 	}
 	return elems, nil
 }
@@ -466,14 +494,25 @@ func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte,
 // the base meta key, and all delta keys for a collection identified by the given scan prefix,
 // meta key, and delta prefix.
 func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, fieldPrefix, metaKey, deltaPrefix []byte) ([]*kv.Elem[kv.OP], error) {
+	const cursorAdv = byte(0x00)
 	fieldEnd := store.PrefixScanEnd(fieldPrefix)
-	fieldKVs, err := r.store.ScanAt(ctx, fieldPrefix, fieldEnd, maxWideScanLimit, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldKVs)+1)
-	for _, pair := range fieldKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+	var elems []*kv.Elem[kv.OP]
+	cursor := fieldPrefix
+	for {
+		fieldKVs, err := r.store.ScanAt(ctx, cursor, fieldEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		for _, pair := range fieldKVs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+		if len(elems) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "field key count exceeds %d", maxWideColumnItems)
+		}
+		if len(fieldKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		cursor = append(bytes.Clone(fieldKVs[len(fieldKVs)-1].Key), cursorAdv)
 	}
 	// Always delete the metadata key and all delta keys regardless of whether
 	// field keys were found. A collection may have a metadata key (or uncompacted

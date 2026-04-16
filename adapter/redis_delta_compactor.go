@@ -133,6 +133,9 @@ func (c *DeltaCompactor) Run(ctx context.Context) error {
 }
 
 // SyncOnce runs one compaction pass. Non-leaders return immediately.
+// Each collection-type handler runs in its own goroutine so that a slow
+// handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
+// compaction. All goroutines share the same per-tick timeout context.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	if c.coord == nil || !c.coord.IsLeader() {
 		return nil
@@ -141,9 +144,21 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	handlers := c.allHandlers()
+	errs := make([]error, len(handlers))
+	var wg sync.WaitGroup
+	for i, h := range handlers {
+		wg.Add(1)
+		go func(idx int, handler collectionDeltaHandler) {
+			defer wg.Done()
+			errs[idx] = c.compactHandler(tickCtx, handler, readTS)
+		}(i, h)
+	}
+	wg.Wait()
+
 	var combined error
-	for _, h := range c.allHandlers() {
-		if err := c.compactHandler(tickCtx, h, readTS); err != nil && !errors.Is(err, context.Canceled) {
+	for _, err := range errs {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
@@ -168,10 +183,12 @@ func (c *DeltaCompactor) allHandlers() []collectionDeltaHandler {
 	}
 }
 
-// scanDeltaPrefix scans the delta prefix for h starting from the stored
-// cursor position, updates the cursor for the next tick, and returns the
-// scanned KVPairs.
-func (c *DeltaCompactor) scanDeltaPrefix(ctx context.Context, h collectionDeltaHandler, readTS uint64) ([]*store.KVPair, error) {
+// scanDeltaRaw scans the delta prefix for h starting from the stored cursor
+// position and returns the scanned KVPairs plus a truncated flag.
+// truncated is true when the scan returned exactly deltaCompactorTickScanLimit
+// results, indicating there may be more keys beyond the current window.
+// The caller is responsible for advancing the cursor via advanceCursor.
+func (c *DeltaCompactor) scanDeltaRaw(ctx context.Context, h collectionDeltaHandler, readTS uint64) ([]*store.KVPair, bool, error) {
 	// Build the effective start key: one byte past the cursor so we do not
 	// re-scan the key we stopped at last tick.
 	c.cursorMu.Lock()
@@ -184,39 +201,62 @@ func (c *DeltaCompactor) scanDeltaPrefix(ctx context.Context, h collectionDeltaH
 	end := store.PrefixScanEnd(h.prefix)
 	kvs, err := c.st.ScanAt(ctx, start, end, deltaCompactorTickScanLimit, readTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, false, errors.WithStack(err)
 	}
+	return kvs, len(kvs) == deltaCompactorTickScanLimit, nil
+}
 
-	// Advance or reset the cursor for the next tick.
+// advanceCursor updates the persistent cursor for h after a compaction tick.
+// lastCompactedKey is the lexicographically greatest delta key that was
+// included in a successful compaction this tick (nil if nothing was compacted).
+// truncated indicates whether the scan returned a full page (there may be more
+// keys beyond the current window).
+//
+// Cursor policy:
+//   - Compaction happened: advance to lastCompactedKey so the next tick
+//     re-evaluates any non-compacted keys that followed it.
+//   - No compaction, scan was truncated: do not advance; re-scan the same
+//     window next tick so near-threshold keys are caught quickly.
+//   - No compaction, scan was not truncated: reset; next tick starts fresh.
+func (c *DeltaCompactor) advanceCursor(typeName string, lastCompactedKey []byte, truncated bool) {
 	c.cursorMu.Lock()
-	if len(kvs) == deltaCompactorTickScanLimit {
-		c.cursors[h.typeName] = bytes.Clone(kvs[len(kvs)-1].Key)
-	} else {
-		delete(c.cursors, h.typeName)
+	defer c.cursorMu.Unlock()
+	switch {
+	case lastCompactedKey != nil:
+		c.cursors[typeName] = bytes.Clone(lastCompactedKey)
+	case truncated:
+		// Nothing compacted but there are more keys — keep current cursor
+		// position so near-threshold keys are re-scanned next tick.
+	default:
+		delete(c.cursors, typeName)
 	}
-	c.cursorMu.Unlock()
-	return kvs, nil
 }
 
 // compactHandler scans the delta prefix for h, groups entries by userKey,
 // and compacts any key that has accumulated enough deltas.
+// All compactable keys are batched into a single OCC transaction to reduce
+// Raft round-trips.
 func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHandler, readTS uint64) error {
-	kvs, err := c.scanDeltaPrefix(ctx, h, readTS)
+	kvs, truncated, err := c.scanDeltaRaw(ctx, h, readTS)
 	if err != nil {
 		return err
 	}
 
 	// Group deltas per userKey.
 	byKey := make(map[string][]*store.KVPair)
-	for _, kv := range kvs {
-		uk := h.extractUserKey(kv.Key)
+	for _, pair := range kvs {
+		uk := h.extractUserKey(pair.Key)
 		if uk == nil {
 			continue
 		}
 		k := string(uk)
-		byKey[k] = append(byKey[k], kv)
+		byKey[k] = append(byKey[k], pair)
 	}
 
+	// Collect elems for all compactable keys into one batch, tracking the
+	// lexicographically greatest compacted delta key for cursor placement.
+	var allElems []*kv.Elem[kv.OP]
+	var lastCompactedKey []byte
 	for ukStr, deltaKVs := range byKey {
 		if len(deltaKVs) < c.maxCount {
 			continue
@@ -228,14 +268,24 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 				"type", h.typeName, "key", ukStr, "error", buildErr)
 			continue
 		}
-		if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
-			c.logger.WarnContext(ctx, "delta compactor: dispatch failed",
-				"type", h.typeName, "key", ukStr, "error", err)
-		} else {
-			c.logger.InfoContext(ctx, "delta compactor: compacted",
-				"type", h.typeName, "key", ukStr, "delta_count", len(deltaKVs))
+		allElems = append(allElems, elems...)
+		// Track the last delta key of this user key for cursor placement.
+		if last := deltaKVs[len(deltaKVs)-1].Key; bytes.Compare(last, lastCompactedKey) > 0 {
+			lastCompactedKey = last
 		}
+		c.logger.InfoContext(ctx, "delta compactor: queued for compaction",
+			"type", h.typeName, "key", ukStr, "delta_count", len(deltaKVs))
 	}
+
+	if err := c.dispatchCompaction(ctx, readTS, allElems); err != nil {
+		c.logger.WarnContext(ctx, "delta compactor: batch dispatch failed",
+			"type", h.typeName, "error", err)
+		// On failure, do not advance cursor; the same keys will be retried
+		// on the next tick.
+		return nil
+	}
+
+	c.advanceCursor(h.typeName, lastCompactedKey, truncated)
 	return nil
 }
 

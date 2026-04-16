@@ -849,22 +849,22 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		}
 		elems = append(elems, migrationElems...)
 
+		// Bulk-scan existing members once to build an existence map, reducing
+		// store round-trips from O(N members) to O(N members / page-size).
+		existsMap, scanErr := r.scanSetMemberExistsMap(ctx, key, readTS)
+		if scanErr != nil {
+			return cockerrors.WithStack(scanErr)
+		}
+
 		changed = 0
 		lenDelta := int64(0)
-		// NOTE: sequential ExistsAt per member is O(N) round-trips to the store.
-		// This is acceptable for small member counts. For large SADD/SREM batches
-		// a scan-based existence check would reduce read amplification, but adds
-		// complexity. The OCC retry loop already bounds the total cost per commit.
 		for _, member := range members {
 			memberKey := store.SetMemberKey(key, member)
-			exists, existsErr := r.store.ExistsAt(ctx, memberKey, readTS)
-			if existsErr != nil {
-				return cockerrors.WithStack(existsErr)
-			}
-			var c int
+			_, exists := existsMap[string(member)]
+			var cnt int
 			var d int64
-			elems, c, d = applySetMemberMutation(elems, memberKey, exists, add)
-			changed += c
+			elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
+			changed += cnt
 			lenDelta += d
 		}
 
@@ -897,6 +897,35 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+// scanSetMemberExistsMap does a paginated prefix scan of all member keys for
+// the given set and returns a map from member name to struct{}{}.
+// Using a single prefix scan eliminates the per-member ExistsAt round-trip.
+func (r *RedisServer) scanSetMemberExistsMap(ctx context.Context, key []byte, readTS uint64) (map[string]struct{}, error) {
+	memberScanPrefix := store.SetMemberScanPrefix(key)
+	memberScanEnd := store.PrefixScanEnd(memberScanPrefix)
+	existsMap := make(map[string]struct{})
+	scanCursor := memberScanPrefix
+	for {
+		scanKVs, err := r.store.ScanAt(ctx, scanCursor, memberScanEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+		for _, pair := range scanKVs {
+			if name := store.ExtractSetMemberName(pair.Key, key); name != nil {
+				existsMap[string(name)] = struct{}{}
+			}
+		}
+		if len(scanKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		lastKey := scanKVs[len(scanKVs)-1].Key
+		next := make([]byte, len(lastKey)+1)
+		copy(next, lastKey)
+		scanCursor = next
+	}
+	return existsMap, nil
 }
 
 func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
