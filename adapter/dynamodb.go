@@ -3944,13 +3944,13 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 	pin := d.pinReadTS(readTS)
 	defer pin.Release()
 
-	responses, tableReadCounts, err := d.buildTransactGetItemsResponses(r.Context(), in, readTS)
+	responses, tableMetrics, err := d.buildTransactGetItemsResponses(r.Context(), in, readTS)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	for table, count := range tableReadCounts {
-		d.observeReadMetrics(r.Context(), table, count, count)
+	for table, m := range tableMetrics {
+		d.observeReadMetrics(r.Context(), table, m.found, m.requested)
 	}
 	writeDynamoJSON(w, map[string]any{"Responses": responses})
 }
@@ -3974,69 +3974,108 @@ func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, e
 	return in, nil
 }
 
+// collectTransactGetTableNames returns a deduplicated list of table names referenced
+// in the TransactGetItems input. Used to run ensureLegacyTableMigration once per table.
+func collectTransactGetTableNames(in transactGetItemsInput) []string {
+	seen := make(map[string]struct{}, len(in.TransactItems))
+	names := make([]string, 0, len(in.TransactItems))
+	for _, item := range in.TransactItems {
+		if item.Get == nil {
+			continue
+		}
+		t := item.Get.TableName
+		if _, exists := seen[t]; exists {
+			continue
+		}
+		seen[t] = struct{}{}
+		names = append(names, t)
+	}
+	return names
+}
+
+// transactGetItemsMetrics holds per-table counts for metrics reporting.
+type transactGetItemsMetrics struct {
+	requested int
+	found     int
+}
+
 // buildTransactGetItemsResponses reads each requested item at the given readTS
-// and returns the ordered response list and a per-table read count for metrics.
+// and returns the ordered response list and a per-table metrics map.
 // schemaCache avoids redundant storage reads when multiple items share the same table.
 // seenItemKeys enforces the DynamoDB rule that a transaction may not reference the
 // same item more than once.
-func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in transactGetItemsInput, readTS uint64) ([]map[string]any, map[string]int, error) {
+// ensureLegacyTableMigration is called once per unique table before any item is read.
+func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in transactGetItemsInput, readTS uint64) ([]map[string]any, map[string]*transactGetItemsMetrics, error) {
+	tableNames := collectTransactGetTableNames(in)
+	for _, tableName := range tableNames {
+		if err := d.ensureLegacyTableMigration(ctx, tableName); err != nil {
+			return nil, nil, err
+		}
+	}
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
-	tableReadCounts := make(map[string]int)
+	tableMetrics := make(map[string]*transactGetItemsMetrics)
 	responses := make([]map[string]any, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		entry, err := d.readTransactGetItem(ctx, item, schemaCache, seenItemKeys, readTS)
+		entry, itemFound, err := d.readTransactGetItem(ctx, item, schemaCache, seenItemKeys, readTS)
 		if err != nil {
 			return nil, nil, err
 		}
 		responses = append(responses, entry)
 		if item.Get != nil {
-			tableReadCounts[item.Get.TableName]++
+			m := tableMetrics[item.Get.TableName]
+			if m == nil {
+				m = &transactGetItemsMetrics{}
+				tableMetrics[item.Get.TableName] = m
+			}
+			m.requested++
+			if itemFound {
+				m.found++
+			}
 		}
 	}
-	return responses, tableReadCounts, nil
+	return responses, tableMetrics, nil
 }
 
 // readTransactGetItem validates and reads a single item in a TransactGetItems request.
-func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[string]struct{}, readTS uint64) (map[string]any, error) {
+// ensureLegacyTableMigration must be called for g.TableName before invoking this function.
+// Returns the response entry, whether the item was found, and any error.
+func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[string]struct{}, readTS uint64) (map[string]any, bool, error) {
 	if item.Get == nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
 	}
 	g := item.Get
 	if strings.TrimSpace(g.TableName) == "" {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
-	}
-	if err := d.ensureLegacyTableMigration(ctx, g.TableName); err != nil {
-		return nil, err
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
 	}
 	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, g.TableName, readTS)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Reject duplicate item keys to match real DynamoDB behavior.
 	keyStr, err := transactGetItemPrimaryKeyStr(g.Key)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	compositeKey := g.TableName + "\x00" + keyStr
 	if _, dup := seenItemKeys[compositeKey]; dup {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
 			"Transaction request cannot include multiple operations on one item")
 	}
 	seenItemKeys[compositeKey] = struct{}{}
 	loc, found, err := d.readLogicalItemAt(ctx, schema, g.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	entry := map[string]any{}
 	if found {
 		projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		entry["Item"] = projected
 	}
-	return entry, nil
+	return entry, found, nil
 }
 
 // transactGetItemPrimaryKeyStr returns a canonical JSON string of the item's key
