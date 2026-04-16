@@ -636,6 +636,7 @@ func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
 
 	// Fill the script semaphore with blocking goroutines.
+	// Keep this tied to maxScriptWriteGoroutines so the test tracks the runtime cap.
 	blocker := make(chan struct{})
 	for range maxScriptWriteGoroutines {
 		d.goScript(func() {

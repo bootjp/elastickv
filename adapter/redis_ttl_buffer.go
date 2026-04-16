@@ -40,6 +40,8 @@ func newTTLBuffer() *TTLBuffer {
 	return newTTLBufferWithMaxSize(ttlBufferMaxSize)
 }
 
+// newTTLBufferWithMaxSize exists for tests that need a smaller buffer limit.
+// Non-positive maxSize falls back to ttlBufferMaxSize.
 func newTTLBufferWithMaxSize(maxSize int) *TTLBuffer {
 	if maxSize <= 0 {
 		maxSize = ttlBufferMaxSize
