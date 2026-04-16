@@ -1237,6 +1237,12 @@ func TestAddVoterAllowsJoiningNodeToReplicate(t *testing.T) {
 	waitForConfigSize(t, leader.engine, 2)
 	waitForConfigSize(t, nodes[1].engine, 2)
 
+	// Re-confirm leadership: the config-change commit can briefly lag the
+	// engine's cached State(), causing an immediate Propose to return errNotLeader.
+	require.Eventually(t, func() bool {
+		return leader.engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
+
 	result, err := leader.engine.Propose(context.Background(), []byte("alpha"))
 	require.NoError(t, err)
 	require.NotZero(t, result.CommitIndex)
@@ -1294,6 +1300,14 @@ func TestTransferLeadershipToServerMovesLeader(t *testing.T) {
 	require.NoError(t, err)
 	waitForConfigSize(t, leader.engine, 2)
 	waitForConfigSize(t, nodes[1].engine, 2)
+
+	// Re-confirm leadership before proposing. waitForConfigSize only verifies
+	// that the config entry is committed; the engine's cached State() (updated
+	// by refreshStatus on each drainReady cycle) may briefly lag behind the
+	// commit, causing an immediate Propose to return errNotLeader.
+	require.Eventually(t, func() bool {
+		return leader.engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
 
 	_, err = leader.engine.Propose(context.Background(), []byte("seed"))
 	require.NoError(t, err)
