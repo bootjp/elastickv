@@ -33,11 +33,20 @@ type TTLBuffer struct {
 	mu      sync.RWMutex
 	entries map[string]ttlBufferEntry
 	counter atomic.Uint64
+	maxSize int
 }
 
 func newTTLBuffer() *TTLBuffer {
+	return newTTLBufferWithMaxSize(ttlBufferMaxSize)
+}
+
+func newTTLBufferWithMaxSize(maxSize int) *TTLBuffer {
+	if maxSize <= 0 {
+		maxSize = ttlBufferMaxSize
+	}
 	return &TTLBuffer{
 		entries: make(map[string]ttlBufferEntry),
+		maxSize: maxSize,
 	}
 }
 
@@ -59,7 +68,7 @@ func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
 	if e, ok := b.entries[k]; ok && e.seq > s {
 		return
 	}
-	if _, exists := b.entries[k]; !exists && len(b.entries) >= ttlBufferMaxSize {
+	if _, exists := b.entries[k]; !exists && len(b.entries) >= b.maxSize {
 		slog.Warn("ttl buffer full, dropping entry", "size", len(b.entries), "key_len", len(k))
 		return
 	}
@@ -112,7 +121,7 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 			if e.seq > entry.seq {
 				continue // a newer write supersedes the failed entry
 			}
-		} else if len(b.entries) >= ttlBufferMaxSize {
+		} else if len(b.entries) >= b.maxSize {
 			continue // buffer full; drop the restored entry rather than growing unbounded
 		}
 		b.entries[key] = entry

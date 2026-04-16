@@ -625,6 +625,49 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	d.Close()      // wait for all goroutines to finish
 }
 
+func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	// Fill the script semaphore with blocking goroutines.
+	blocker := make(chan struct{})
+	for range maxScriptWriteGoroutines {
+		d.goScript(func() {
+			<-blocker
+		})
+	}
+
+	// Script should return promptly even when scriptSem is full.
+	done := make(chan struct{})
+	go func() {
+		_, err := d.Script(context.Background(), "EVALSHA", [][]byte{
+			[]byte("EVALSHA"), []byte("deadbeef"), []byte("0"),
+		})
+		assert.NoError(t, err)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good — Script returned without blocking on a full scriptSem
+	case <-time.After(time.Second):
+		t.Fatal("Script blocked when script semaphore was full")
+	}
+
+	// The async replay to secondary must be dropped.
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+
+	close(blocker)
+	d.Close()
+}
+
 // TestDualWriter_Close_NoWaitGroupRace verifies that concurrent calls to
 // goAsync and Close do not trigger a "WaitGroup misuse: Add called
 // concurrently with Wait" panic under the race detector.

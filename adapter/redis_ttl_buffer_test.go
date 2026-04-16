@@ -151,19 +151,20 @@ func TestTTLBuffer_NilReceiver_SetIsNoop(t *testing.T) {
 // Existing keys must still be updatable.
 func TestTTLBuffer_Full_DropsNewKey(t *testing.T) {
 	t.Parallel()
-	b := newTTLBuffer()
+	const testMaxSize = 8
+	b := newTTLBufferWithMaxSize(testMaxSize)
 
 	// Fill the map to exactly ttlBufferMaxSize via direct struct access so the
 	// test runs in O(N) map writes without going through the seq machinery.
 	b.mu.Lock()
 	var seq uint64
-	for i := range ttlBufferMaxSize {
+	for i := range testMaxSize {
 		seq++
 		b.entries[fmt.Sprintf("slot:%d", i)] = ttlBufferEntry{seq: seq}
 	}
 	b.mu.Unlock()
 
-	require.Equal(t, ttlBufferMaxSize, b.Len())
+	require.Equal(t, testMaxSize, b.Len())
 
 	// A brand-new key must be dropped.
 	expireAt := time.Now().Add(time.Minute)
