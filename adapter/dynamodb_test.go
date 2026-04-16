@@ -471,8 +471,8 @@ func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
 	})
 	assert.Error(t, err)
 
-	// Over 25 items should be rejected.
-	items := make([]types.TransactGetItem, 26)
+	// Over 100 items should be rejected (DynamoDB limit).
+	items := make([]types.TransactGetItem, 101)
 	for i := range items {
 		items[i] = types.TransactGetItem{
 			Get: &types.Get{
@@ -482,6 +482,15 @@ func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
 		}
 	}
 	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: items})
+	assert.Error(t, err)
+
+	// Duplicate item key in the same transaction should be rejected.
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+		},
+	})
 	assert.Error(t, err)
 }
 
