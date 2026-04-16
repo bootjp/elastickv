@@ -4059,7 +4059,7 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	if err != nil {
 		return nil, false, err
 	}
-	keyStr, err := canonicalPrimaryKeyStr(pkAttrs)
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, pkAttrs)
 	if err != nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -4086,46 +4086,58 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	return entry, found, nil
 }
 
-// canonicalPrimaryKeyStr returns a canonical string representation of a primary
-// key attribute map for duplicate-item detection in TransactGetItems and
+// canonicalPrimaryKeyStr returns a canonical string representation of primary
+// key attributes for duplicate-item detection in TransactGetItems and
 // TransactWriteItems. Shared between both operations to avoid duplicated logic.
-// Uses a strings.Builder (instead of json.Marshal) to avoid reflection overhead —
-// primary keys contain at most 2 attributes of type S, N, or B.
-// Format: "<name>=<type>:<value>" pairs separated by \x1f (ASCII unit separator),
-// sorted by name. Numeric values are normalised; binary values are base64-encoded.
-func canonicalPrimaryKeyStr(key map[string]attributeValue) (string, error) {
-	type kf struct {
-		name string
-		v    attributeValue
-	}
-	fields := make([]kf, 0, len(key))
-	for name, v := range key {
-		fields = append(fields, kf{name, v})
-	}
-	slices.SortFunc(fields, func(a, b kf) int { return strings.Compare(a.name, b.name) })
-
+//
+// Takes the table's keySchema so it can write hash key then range key in a
+// fixed schema-defined order, avoiding a slice allocation and sort — DynamoDB
+// primary keys have at most two attributes, so direct lookup beats sorting.
+// Format: "<name>=<type>:<value>" pairs separated by \x1f (ASCII unit separator).
+// Numeric values are normalised; binary values are base64-encoded.
+func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeValue) (string, error) {
 	var buf strings.Builder
-	for i, f := range fields {
-		if i > 0 {
-			buf.WriteByte('\x1f')
+	hashVal, ok := key[keySchema.HashKey]
+	if !ok {
+		return "", errors.New("missing hash key attribute")
+	}
+	buf.WriteString(keySchema.HashKey)
+	buf.WriteByte('=')
+	if err := writeCanonicalAttrValue(&buf, hashVal); err != nil {
+		return "", err
+	}
+	if keySchema.RangeKey != "" {
+		rangeVal, ok := key[keySchema.RangeKey]
+		if !ok {
+			return "", errors.New("missing range key attribute")
 		}
-		buf.WriteString(f.name)
+		buf.WriteByte('\x1f')
+		buf.WriteString(keySchema.RangeKey)
 		buf.WriteByte('=')
-		switch {
-		case f.v.S != nil:
-			buf.WriteString("S:")
-			buf.WriteString(*f.v.S)
-		case f.v.N != nil:
-			buf.WriteString("N:")
-			buf.WriteString(canonicalNumberString(*f.v.N))
-		case f.v.B != nil:
-			buf.WriteString("B:")
-			buf.WriteString(base64.StdEncoding.EncodeToString(f.v.B))
-		default:
-			return "", errors.New("unsupported key attribute type for duplicate detection")
+		if err := writeCanonicalAttrValue(&buf, rangeVal); err != nil {
+			return "", err
 		}
 	}
 	return buf.String(), nil
+}
+
+// writeCanonicalAttrValue appends a typed canonical value for a single primary
+// key attribute to buf. Supports S, N (normalised), and B (base64-encoded).
+func writeCanonicalAttrValue(buf *strings.Builder, v attributeValue) error {
+	switch {
+	case v.S != nil:
+		buf.WriteString("S:")
+		buf.WriteString(*v.S)
+	case v.N != nil:
+		buf.WriteString("N:")
+		buf.WriteString(canonicalNumberString(*v.N))
+	case v.B != nil:
+		buf.WriteString("B:")
+		buf.WriteString(base64.StdEncoding.EncodeToString(v.B))
+	default:
+		return errors.New("unsupported key attribute type for duplicate detection")
+	}
+	return nil
 }
 
 func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error) {
@@ -4370,7 +4382,7 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
-	return canonicalPrimaryKeyStr(keyAttrs)
+	return canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
 }
 
 type transactWriteItemPlan struct {
