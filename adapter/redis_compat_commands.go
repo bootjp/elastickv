@@ -917,6 +917,64 @@ func (r *RedisServer) scanHashFieldExistsMap(ctx context.Context, key []byte, re
 		func(k []byte) []byte { return store.ExtractHashFieldName(k, key) })
 }
 
+// mergeZSetBulkScores performs a single prefix scan of ZSet member keys and
+// merges the store scores into inTxnView when pairCount >= wideColumnBulkScanThreshold.
+// This avoids O(pairCount) individual GetAt round-trips inside applyZAddPair.
+// Members already in inTxnView (migration elems or earlier pairs) take precedence.
+// Returns inTxnView unchanged when the batch is below the threshold.
+func (r *RedisServer) mergeZSetBulkScores(ctx context.Context, key []byte, readTS uint64, pairCount int, inTxnView map[string]float64) (map[string]float64, error) {
+	if pairCount < wideColumnBulkScanThreshold {
+		return inTxnView, nil
+	}
+	bulkScores, err := r.scanZSetMemberScoreMap(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if inTxnView == nil {
+		return bulkScores, nil
+	}
+	for m, s := range bulkScores {
+		if _, alreadySeen := inTxnView[m]; !alreadySeen {
+			inTxnView[m] = s
+		}
+	}
+	return inTxnView, nil
+}
+
+// scanZSetMemberScoreMap does a paginated prefix scan of all member keys for
+// the given ZSet and returns a map from member name to its current score.
+// Using a single prefix scan eliminates O(N) GetAt round-trips in ZADD for
+// large batches (>= wideColumnBulkScanThreshold pairs).
+func (r *RedisServer) scanZSetMemberScoreMap(ctx context.Context, key []byte, readTS uint64) (map[string]float64, error) {
+	scanPrefix := store.ZSetMemberScanPrefix(key)
+	scanEnd := store.PrefixScanEnd(scanPrefix)
+	scores := make(map[string]float64)
+	cursor := scanPrefix
+	for {
+		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, cockerrors.WithStack(err)
+		}
+		for _, pair := range scanKVs {
+			m := store.ExtractZSetMemberName(pair.Key, key)
+			if m == nil {
+				continue
+			}
+			if s, decodeErr := store.UnmarshalZSetScore(pair.Value); decodeErr == nil {
+				scores[string(m)] = s
+			}
+		}
+		if len(scanKVs) < store.MaxDeltaScanLimit {
+			break
+		}
+		lastKey := scanKVs[len(scanKVs)-1].Key
+		next := make([]byte, len(lastKey)+1)
+		copy(next, lastKey)
+		cursor = next
+	}
+	return scores, nil
+}
+
 // scanKeyExistsMap paginates through all keys under scanPrefix, extracts a
 // name from each key using extractName, and builds a set of existing names.
 // It is used by scanSetMemberExistsMap and scanHashFieldExistsMap to eliminate
@@ -2137,6 +2195,14 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	// Seed the in-transaction view from migration elems so that migrated
 	// members are not incorrectly counted as new by applyZAddPair.
 	inTxnView := buildZSetMigrationView(migrationElems, key)
+
+	// For large batches, mergeZSetBulkScores performs one prefix scan that
+	// eliminates O(N) GetAt calls inside applyZAddPair; it is a no-op for
+	// batches below wideColumnBulkScanThreshold.
+	inTxnView, err = r.mergeZSetBulkScores(ctx, key, readTS, len(pairs), inTxnView)
+	if err != nil {
+		return 0, err
+	}
 
 	added := 0
 	lenDelta := int64(0)

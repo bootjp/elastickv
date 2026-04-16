@@ -467,11 +467,13 @@ func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte,
 		if scanErr != nil {
 			return nil, errors.WithStack(scanErr)
 		}
+		// Check before appending so len(elems) never exceeds maxWideColumnItems
+		// by more than one scan page.
+		if len(elems)+len(deltaKVs) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
+		}
 		for _, pair := range deltaKVs {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		}
-		if len(elems) > maxWideColumnItems {
-			return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
 		}
 		if len(deltaKVs) < store.MaxDeltaScanLimit {
 			break
@@ -494,11 +496,13 @@ func (r *RedisServer) deleteWideColumnElems(ctx context.Context, readTS uint64, 
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
+		// Check before appending so len(elems) never exceeds maxWideColumnItems
+		// by more than one scan page.
+		if len(elems)+len(fieldKVs) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "field key count exceeds %d", maxWideColumnItems)
+		}
 		for _, pair := range fieldKVs {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		}
-		if len(elems) > maxWideColumnItems {
-			return nil, errors.Wrapf(ErrCollectionTooLarge, "field key count exceeds %d", maxWideColumnItems)
 		}
 		if len(fieldKVs) < store.MaxDeltaScanLimit {
 			break
