@@ -779,11 +779,18 @@ func runSnapshotWriter(t *testing.T, ctx context.Context, client *dynamodb.Clien
 				},
 			})
 			// TransactionCanceledException is expected under write contention; any
-			// other error is unexpected and must fail the test.
+			// other error is unexpected and must fail the test. However, if stopCh
+			// is already closed the test is tearing down, so ignore errors that
+			// arise from nodes being shut down — otherwise t.Errorf would panic.
 			var txErr *types.TransactionCanceledException
 			if err != nil && !errors.As(err, &txErr) {
-				t.Errorf("runSnapshotWriter: unexpected TransactWriteItems error: %v", err)
-				return
+				select {
+				case <-stopCh:
+					return // teardown in progress; swallow shutdown errors
+				default:
+					t.Errorf("runSnapshotWriter: unexpected TransactWriteItems error: %v", err)
+					return
+				}
 			}
 		}
 	}
