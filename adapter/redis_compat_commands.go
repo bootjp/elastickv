@@ -30,6 +30,12 @@ const (
 	// wide-column mutation slice beyond the per-member elements: one for the
 	// metadata key and one for the legacy-blob deletion tombstone.
 	setWideColOverhead = 2
+
+	// wideColumnBulkScanThreshold is the minimum batch size at which a full
+	// prefix scan is used to check field/member existence instead of one
+	// ExistsAt per field. Below this threshold the per-key lookups are cheaper
+	// because they avoid scanning an arbitrarily large collection.
+	wideColumnBulkScanThreshold = 16
 )
 
 type xreadRequest struct {
@@ -849,23 +855,11 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		}
 		elems = append(elems, migrationElems...)
 
-		// Bulk-scan existing members once to build an existence map, reducing
-		// store round-trips from O(N members) to O(N members / page-size).
-		existsMap, scanErr := r.scanSetMemberExistsMap(ctx, key, readTS)
-		if scanErr != nil {
-			return cockerrors.WithStack(scanErr)
-		}
-
-		changed = 0
-		lenDelta := int64(0)
-		for _, member := range members {
-			memberKey := store.SetMemberKey(key, member)
-			_, exists := existsMap[string(member)]
-			var cnt int
-			var d int64
-			elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
-			changed += cnt
-			lenDelta += d
+		var lenDelta int64
+		var mutErr error
+		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems)
+		if mutErr != nil {
+			return mutErr
 		}
 
 		if changed == 0 && len(migrationElems) == 0 {
@@ -942,6 +936,42 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 		cursor = next
 	}
 	return existsMap, nil
+}
+
+// applySetMemberMutations resolves existence for each member using either a
+// pre-built bulk scan (for large batches) or individual ExistsAt calls (for
+// small batches), then applies the mutation to elems.
+// The bulk scan threshold is wideColumnBulkScanThreshold.
+func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
+	var existsMap map[string]struct{}
+	if len(members) >= wideColumnBulkScanThreshold {
+		var err error
+		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
+		if err != nil {
+			return nil, 0, 0, cockerrors.WithStack(err)
+		}
+	}
+	changed := 0
+	lenDelta := int64(0)
+	for _, member := range members {
+		memberKey := store.SetMemberKey(key, member)
+		var exists bool
+		if existsMap != nil {
+			_, exists = existsMap[string(member)]
+		} else {
+			var err error
+			exists, err = r.store.ExistsAt(ctx, memberKey, readTS)
+			if err != nil {
+				return nil, 0, 0, cockerrors.WithStack(err)
+			}
+		}
+		var cnt int
+		var d int64
+		elems, cnt, d = applySetMemberMutation(elems, memberKey, exists, add)
+		changed += cnt
+		lenDelta += d
+	}
+	return elems, changed, lenDelta, nil
 }
 
 func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
@@ -1395,24 +1425,15 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 
 // hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTS uint64) (int, error) {
-	// Bulk-scan existing fields once to build an existence map, reducing store
-	// round-trips from O(N fields) to O(N fields / page-size).
-	existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
+	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
 	if err != nil {
 		return 0, err
-	}
-	commitTS := r.coordinator.Clock().Next()
-	elems := make([]*kv.Elem[kv.OP], 0, len(fields)+1)
-	removed := 0
-	for _, field := range fields {
-		if _, exists := existsMap[string(field)]; exists {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.HashFieldKey(key, field)})
-			removed++
-		}
 	}
 	if removed == 0 {
 		return 0, nil
 	}
+	commitTS := r.coordinator.Clock().Next()
+	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
@@ -1426,6 +1447,40 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 		Elems:    elems,
 	})
 	return removed, cockerrors.WithStack(dispatchErr)
+}
+
+// resolveHashFieldDelElems checks which fields exist using either a bulk scan
+// (for large batches) or individual ExistsAt calls (for small batches), then
+// returns Del elems for every field that exists and the count of deletions.
+func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, fields [][]byte, readTS uint64) ([]*kv.Elem[kv.OP], int, error) {
+	var existsMap map[string]struct{}
+	if len(fields) >= wideColumnBulkScanThreshold {
+		var err error
+		existsMap, err = r.scanHashFieldExistsMap(ctx, key, readTS)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(fields)+1)
+	removed := 0
+	for _, field := range fields {
+		fieldKey := store.HashFieldKey(key, field)
+		var exists bool
+		if existsMap != nil {
+			_, exists = existsMap[string(field)]
+		} else {
+			var err error
+			exists, err = r.store.ExistsAt(ctx, fieldKey, readTS)
+			if err != nil {
+				return nil, 0, cockerrors.WithStack(err)
+			}
+		}
+		if exists {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: fieldKey})
+			removed++
+		}
+	}
+	return elems, removed, nil
 }
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
