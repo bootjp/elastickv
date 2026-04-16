@@ -855,9 +855,13 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		}
 		elems = append(elems, migrationElems...)
 
+		// Extract legacy member names from migration ops so that applySetMemberMutations
+		// can treat them as already-existing (they are not yet visible at readTS).
+		legacyMemberBase := buildLegacySetMemberBase(migrationElems, key)
+
 		var lenDelta int64
 		var mutErr error
-		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems)
+		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase)
 		if mutErr != nil {
 			return mutErr
 		}
@@ -942,14 +946,24 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 // pre-built bulk scan (for large batches) or individual ExistsAt calls (for
 // small batches), then applies the mutation to elems.
 // The bulk scan threshold is wideColumnBulkScanThreshold.
-func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], int, int64, error) {
+// legacyBase contains members from a legacy blob being migrated in the same
+// transaction; they are not visible at readTS and must be treated as existing.
+func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}) ([]*kv.Elem[kv.OP], int, int64, error) {
 	var existsMap map[string]struct{}
-	if len(members) >= wideColumnBulkScanThreshold {
+	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
 		var err error
 		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
 		if err != nil {
 			return nil, 0, 0, cockerrors.WithStack(err)
 		}
+	}
+	// Merge legacy members into existsMap so that members already present in the
+	// legacy blob (migrated in this same transaction) are not counted as new.
+	for m := range legacyBase {
+		if existsMap == nil {
+			existsMap = make(map[string]struct{})
+		}
+		existsMap[m] = struct{}{}
 	}
 	changed := 0
 	lenDelta := int64(0)
@@ -1251,6 +1265,37 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 	return elems, nil
 }
 
+// addLegacyHashFieldsToMap adds field names from migration Put elems (fields
+// being migrated in the current transaction, not yet visible at readTS) into
+// existsMap so that buildHashFieldElems does not count them as new fields.
+func addLegacyHashFieldsToMap(migrationElems []*kv.Elem[kv.OP], key []byte, existsMap map[string]struct{}) {
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if f := store.ExtractHashFieldName(elem.Key, key); f != nil {
+				existsMap[string(f)] = struct{}{}
+			}
+		}
+	}
+}
+
+// buildLegacySetMemberBase extracts member names from migration Put elems
+// (members being migrated in the current transaction, invisible at readTS)
+// and returns them as a set. Returns nil when no migration is happening.
+func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]struct{} {
+	var base map[string]struct{}
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if m := store.ExtractSetMemberName(elem.Key, key); m != nil {
+				if base == nil {
+					base = make(map[string]struct{})
+				}
+				base[string(m)] = struct{}{}
+			}
+		}
+	}
+	return base
+}
+
 // buildHashFieldElems iterates over field-value pairs in args, checks each
 // field against existsMap to determine if it is new, appends Put operations
 // to elems, and returns the updated elems and new-field count.
@@ -1304,6 +1349,10 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		if err != nil {
 			return err
 		}
+		// Fields from the legacy blob are being migrated in this same transaction,
+		// so they are not yet visible at readTS. Add them to existsMap so that
+		// buildHashFieldElems does not count already-existing fields as new.
+		addLegacyHashFieldsToMap(migrationElems, key, existsMap)
 
 		var newFields int
 		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)

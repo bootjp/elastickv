@@ -394,18 +394,17 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 
 // deleteListElems returns delete operations for all list keys: item keys, the base
 // meta key, all delta keys, and all claim keys.
+// It does not call resolveListMeta so that DEL succeeds even when a list has
+// more than MaxDeltaScanLimit uncompacted deltas (resolveListMeta would return
+// ErrDeltaScanTruncated in that case). The constituent key scans return empty
+// slices when no list exists, so the tombstone written for the meta key is the
+// only overhead when called on a non-existent key.
 func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	_, listExists, err := r.resolveListMeta(ctx, key, readTS)
-	if err != nil {
-		return nil, err
-	}
-	if !listExists {
-		return nil, nil
-	}
 	elems, err := r.scanListItemDelElems(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
+	// Always delete the base meta key (no-op tombstone if it doesn't exist).
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
 	// Delete all delta keys (paginated).
 	deltaElems, err := r.scanAllDeltaElems(ctx, store.ListMetaDeltaScanPrefix(key), readTS)
