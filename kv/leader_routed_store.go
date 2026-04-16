@@ -38,20 +38,30 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 	}
 }
 
-// leaderOKForKey prefers a linearizable read fence when the coordinator
-// exposes one. Older coordinators fall back to the legacy quorum verify check.
-func (s *LeaderRoutedStore) leaderOKForKey(ctx context.Context, key []byte) bool {
+// leaderFenceTS prefers a linearizable read fence when the coordinator
+// exposes one. Returns (localOK, fenceTS): when localOK is true the caller
+// should read from the local store at max(callerTS, fenceTS) so the snapshot
+// is at least as fresh as the fence point. Older coordinators fall back to the
+// legacy quorum verify path (fenceTS is 0 in that case).
+func (s *LeaderRoutedStore) leaderFenceTS(ctx context.Context, key []byte) (bool, uint64) {
 	if s.coordinator == nil {
-		return true
+		return true, 0
 	}
 	if reader, ok := s.coordinator.(linearizableKeyCoordinator); ok {
-		_, err := reader.LinearizableReadForKey(ctx, key)
-		return err == nil
+		fenceTS, err := reader.LinearizableReadForKey(ctx, key)
+		return err == nil, fenceTS
 	}
 	if !s.coordinator.IsLeaderForKey(key) {
-		return false
+		return false, 0
 	}
-	return s.coordinator.VerifyLeaderForKey(key) == nil
+	return s.coordinator.VerifyLeaderForKey(key) == nil, 0
+}
+
+// leaderOKForKey returns whether the local store is authoritative for key.
+// Use leaderFenceTS when the read timestamp must be updated after the fence.
+func (s *LeaderRoutedStore) leaderOKForKey(ctx context.Context, key []byte) bool {
+	ok, _ := s.leaderFenceTS(ctx, key)
+	return ok
 }
 
 func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) raft.ServerAddress {
@@ -148,8 +158,9 @@ func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([
 	if s == nil || s.local == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	if s.leaderOKForKey(ctx, key) {
-		val, err := s.local.GetAt(ctx, key, ts)
+	ok, fenceTS := s.leaderFenceTS(ctx, key)
+	if ok {
+		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
 		return val, errors.WithStack(err)
 	}
 	return s.proxyRawGet(ctx, key, ts)
@@ -159,9 +170,14 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	if s == nil || s.local == nil {
 		return false, nil
 	}
-	if s.leaderOKForKey(ctx, key) {
-		ok, err := s.local.ExistsAt(ctx, key, ts)
-		return ok, errors.WithStack(err)
+	ok, fenceTS := s.leaderFenceTS(ctx, key)
+	if ok {
+		// Use max(ts, fenceTS) so the snapshot is at least as fresh as the
+		// linearizable fence point. Without this, a timestamp acquired before the
+		// fence completes could cause the read to miss writes the fence was meant
+		// to make visible.
+		exists, err := s.local.ExistsAt(ctx, key, max(ts, fenceTS))
+		return exists, errors.WithStack(err)
 	}
 	// Via proxy path: RawGet returns a nil Value for a key that exists with an
 	// empty value because proto3 strips zero-valued bytes fields on the wire.
@@ -180,8 +196,9 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	if s.leaderOKForKey(ctx, start) {
-		kvs, err := s.local.ScanAt(ctx, start, end, limit, ts)
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		kvs, err := s.local.ScanAt(ctx, start, end, limit, max(ts, fenceTS))
 		return kvs, errors.WithStack(err)
 	}
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, false)
@@ -194,8 +211,9 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	if s.leaderOKForKey(ctx, start) {
-		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, ts)
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, max(ts, fenceTS))
 		return kvs, errors.WithStack(err)
 	}
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, true)
