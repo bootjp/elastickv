@@ -4022,16 +4022,16 @@ func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in 
 			return nil, nil, err
 		}
 		responses = append(responses, entry)
-		if item.Get != nil {
-			m := tableMetrics[item.Get.TableName]
-			if m == nil {
-				m = &transactGetItemsMetrics{}
-				tableMetrics[item.Get.TableName] = m
-			}
-			m.requested++
-			if itemFound {
-				m.found++
-			}
+		// item.Get is guaranteed non-nil here: readTransactGetItem returns an error
+		// for nil Get, so reaching this line means the nil check already passed.
+		m := tableMetrics[item.Get.TableName]
+		if m == nil {
+			m = &transactGetItemsMetrics{}
+			tableMetrics[item.Get.TableName] = m
+		}
+		m.requested++
+		if itemFound {
+			m.found++
 		}
 	}
 	return responses, tableMetrics, nil
@@ -4059,7 +4059,7 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	if err != nil {
 		return nil, false, err
 	}
-	keyStr, err := transactGetItemPrimaryKeyStr(pkAttrs)
+	keyStr, err := canonicalPrimaryKeyStr(pkAttrs)
 	if err != nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -4086,14 +4086,14 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	return entry, found, nil
 }
 
-// transactGetItemPrimaryKeyStr returns a canonical string representation of the
-// primary key attributes for duplicate detection in TransactGetItems.
+// canonicalPrimaryKeyStr returns a canonical string representation of a primary
+// key attribute map for duplicate-item detection in TransactGetItems and
+// TransactWriteItems. Shared between both operations to avoid duplicated logic.
 // Uses a strings.Builder (instead of json.Marshal) to avoid reflection overhead —
 // primary keys contain at most 2 attributes of type S, N, or B.
-// Format: "<name>=<type>:<value>" pairs separated by \x1f, sorted by name.
-// Numeric values are normalised so equivalent numbers produce the same string.
-// Binary values are base64-encoded for safe embedding in the result string.
-func transactGetItemPrimaryKeyStr(key map[string]attributeValue) (string, error) {
+// Format: "<name>=<type>:<value>" pairs separated by \x1f (ASCII unit separator),
+// sorted by name. Numeric values are normalised; binary values are base64-encoded.
+func canonicalPrimaryKeyStr(key map[string]attributeValue) (string, error) {
 	type kf struct {
 		name string
 		v    attributeValue
@@ -4348,9 +4348,10 @@ func (d *DynamoDBServer) processTransactWriteItem(
 	return nil
 }
 
-// transactWriteItemPrimaryKeyStr returns a canonical JSON string of the item's
+// transactWriteItemPrimaryKeyStr returns a canonical string of the item's
 // primary key attributes, used to detect duplicate-item violations in
 // TransactWriteItems (real DynamoDB returns ValidationException for these).
+// Delegates to canonicalPrimaryKeyStr for the actual serialization.
 func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
 	var keyAttrs map[string]attributeValue
 	switch {
@@ -4369,22 +4370,7 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
-	// Normalize numeric attribute values so that equivalent numbers (e.g. "10"
-	// and "10.0") produce the same canonical key string and are reliably detected
-	// as duplicates during JSON marshalling.
-	normalized := make(map[string]attributeValue, len(keyAttrs))
-	for k, v := range keyAttrs {
-		if v.N != nil {
-			n := canonicalNumberString(*v.N)
-			v.N = &n
-		}
-		normalized[k] = v
-	}
-	b, err := json.Marshal(normalized)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to serialize transact item key")
-	}
-	return string(b), nil
+	return canonicalPrimaryKeyStr(keyAttrs)
 }
 
 type transactWriteItemPlan struct {
