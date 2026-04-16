@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -190,8 +191,8 @@ func TestRedis_ExpiredKey_BecomesInvisible(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "v", got, "key must be visible before expiry")
 
-	time.Sleep(400 * time.Millisecond)
-
-	_, err = rdb.Get(ctx, "expiry:short").Result()
-	require.ErrorIs(t, err, redis.Nil, "key must be gone after expiry")
+	require.Eventually(t, func() bool {
+		_, e := rdb.Get(ctx, "expiry:short").Result()
+		return errors.Is(e, redis.Nil)
+	}, time.Second, 25*time.Millisecond, "key must be gone after expiry")
 }

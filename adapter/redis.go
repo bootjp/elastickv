@@ -1901,11 +1901,10 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	tv.deleted = false
 	tv.dirty = true
 
-	// EX/PX: store the TTL so it is flushed to the TTLBuffer after commit.
-	if opts.ttl != nil {
-		if err := t.applySetTTL(cmd.Args[1], opts.ttl); err != nil {
-			return redisResult{}, err
-		}
+	// Always update TTL state: EX/PX sets a new expiry; a plain SET clears it
+	// (opts.ttl == nil → nil stored → PERSIST semantics, matching Redis behaviour).
+	if err := t.applySetTTL(cmd.Args[1], opts.ttl); err != nil {
+		return redisResult{}, err
 	}
 
 	return applySetResult(opts, oldValue), nil

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
-	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -184,7 +183,11 @@ func (r *RedisServer) flushTTLBuffer(ctx context.Context) {
 		IsTxn: false, // no conflict detection; last writer wins
 		Elems: elems,
 	})
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil {
+		// MergeBack on any error, including context.Canceled.
+		// If a ticker tick races with shutdown (ctx already canceled), MergeBack
+		// ensures those entries are not lost: the final shutdown flush uses
+		// context.Background() and will retry them successfully.
 		r.ttlBuffer.MergeBack(entries)
 		slog.Warn("ttl buffer flush failed, will retry", "err", err, "entries", len(entries))
 	}

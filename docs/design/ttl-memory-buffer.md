@@ -342,7 +342,7 @@ key exists; a zombie TTL for a non-existent data key is never observed.
 | Flush fails (Raft unavailable) | `MergeBack` restores drained entries; retried on next tick |
 | Process crash | Buffer lost; keys exist without TTL until next write |
 | Concurrent Set + Drain | Protected by `sync.RWMutex` |
-| Buffer overflow (> 1 M entries) | Oldest entries dropped with a warning log |
+| Buffer overflow (> 1 M entries) | New keys are dropped with a warning log; updates to already-buffered keys are still accepted |
 
 ---
 
