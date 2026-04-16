@@ -573,6 +573,10 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		//
 		// Legacy bare keys are NOT deleted here to avoid a full keyspace
 		// scan. Run FLUSHLEGACY first to clean up legacy data.
+		//
+		// All prefixes are attempted even if one dispatch fails so that we
+		// delete as many namespaces as possible before reporting errors.
+		var combined error
 		for _, prefix := range [][]byte{
 			[]byte("!redis|"),
 			[]byte("!lst|"),
@@ -585,10 +589,10 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 					{Op: kv.DelPrefix, Key: prefix},
 				},
 			}); err != nil {
-				return fmt.Errorf("dispatch del_prefix %q: %w", prefix, err)
+				combined = cockerrors.CombineErrors(combined, fmt.Errorf("dispatch del_prefix %q: %w", prefix, err))
 			}
 		}
-		return nil
+		return cockerrors.WithStack(combined)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return

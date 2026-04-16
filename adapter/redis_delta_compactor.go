@@ -151,6 +151,14 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 		wg.Add(1)
 		go func(idx int, handler collectionDeltaHandler) {
 			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					c.logger.Error("DeltaCompactor: panic in handler",
+						slog.String("type", handler.typeName),
+						slog.Any("panic", rec))
+					errs[idx] = errors.Errorf("panic in %s compactor: %v", handler.typeName, rec)
+				}
+			}()
 			errs[idx] = c.compactHandler(tickCtx, handler, readTS)
 		}(i, h)
 	}
