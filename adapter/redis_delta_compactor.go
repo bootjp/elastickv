@@ -257,14 +257,19 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
 }
 
-// SyncOnce runs one compaction pass. Keys for shards this node does not lead
-// are skipped individually inside buildBatchElems via IsLeaderForKey, so the
-// scan proceeds on all nodes but only the shard leader dispatches each batch.
+// SyncOnce runs one compaction pass. The IsLeader() guard avoids the
+// full-prefix delta scan on followers, which would proxy cross-node on
+// ShardStore backends. For sharded deployments where this node is the
+// leader for a non-default shard group, the regular tick is skipped; those
+// keys are still handled by the urgent compaction path (compactUrgentKey)
+// which uses IsLeaderForKey for per-key routing. buildBatchElems adds an
+// additional per-key IsLeaderForKey filter so a default-group leader never
+// dispatches mutations for shards it does not own.
 // Each collection-type handler runs in its own goroutine so that a slow
 // handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
 // compaction. All goroutines share the same per-tick timeout context.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
-	if c.coord == nil {
+	if c.coord == nil || !c.coord.IsLeader() {
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
