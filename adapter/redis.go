@@ -1860,14 +1860,83 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
 	}
 
+	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
+	if err != nil {
+		return redisResult{}, err
+	}
+
+	// NX/XX: skip the write if the key-existence condition is not met.
+	blocked, res, err := t.applySetCondition(cmd.Args[1], opts)
+	if err != nil {
+		return redisResult{}, err
+	}
+	if blocked {
+		return res, nil
+	}
+
 	tv, err := t.load(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
+
+	var oldValue []byte
+	if opts.returnOld {
+		oldValue = tv.raw
+	}
+
 	tv.raw = cmd.Args[2]
 	tv.deleted = false
 	tv.dirty = true
-	return redisResult{typ: resultString, str: "OK"}, nil
+
+	// EX/PX: store the TTL so it is flushed to the TTLBuffer after commit.
+	if opts.ttl != nil {
+		if err := t.applySetTTL(cmd.Args[1], opts.ttl); err != nil {
+			return redisResult{}, err
+		}
+	}
+
+	return applySetResult(opts, oldValue), nil
+}
+
+// applySetCondition checks NX/XX conditions.  Returns (blocked, result, err).
+// blocked=true means the condition prevented the write; callers should return result.
+// Returns (false, _, nil) immediately when no condition is set.
+func (t *txnContext) applySetCondition(key []byte, opts redisSetOptions) (bool, redisResult, error) {
+	if !opts.existsCond && !opts.missingCond {
+		return false, redisResult{}, nil
+	}
+	typ, err := t.stagedKeyType(key)
+	if err != nil {
+		return false, redisResult{}, err
+	}
+	exists := typ != redisTypeNone
+	if (opts.missingCond && exists) || (opts.existsCond && !exists) {
+		return true, redisResult{typ: resultNil}, nil
+	}
+	return false, redisResult{}, nil
+}
+
+// applySetTTL stores the expiry in ttlStates so flushTTLToBuffer sends it to
+// the TTLBuffer after a successful commit.
+func (t *txnContext) applySetTTL(key []byte, expireAt *time.Time) error {
+	ttlSt, err := t.loadTTLState(key)
+	if err != nil {
+		return err
+	}
+	ttlSt.value = expireAt
+	ttlSt.dirty = true
+	return nil
+}
+
+// applySetResult returns the appropriate redisResult for a completed SET.
+func applySetResult(opts redisSetOptions, oldValue []byte) redisResult {
+	if !opts.returnOld {
+		return redisResult{typ: resultString, str: "OK"}
+	}
+	if oldValue == nil {
+		return redisResult{typ: resultNil}
+	}
+	return redisResult{typ: resultBulk, bulk: oldValue}
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {

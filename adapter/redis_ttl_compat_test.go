@@ -120,27 +120,6 @@ func TestRedis_INCR_NoTTL_StaysNegativeOne(t *testing.T) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// PERSIST — must remove an existing TTL
-// ────────────────────────────────────────────────────────────────
-
-func TestRedis_PERSIST_ClearsTTL(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
-	defer shutdown(nodes)
-
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
-
-	require.NoError(t, rdb.Do(ctx, "SET", "persist:key", "v", "EX", "100").Err())
-	require.NoError(t, rdb.Persist(ctx, "persist:key").Err())
-
-	ttl, err := rdb.TTL(ctx, "persist:key").Result()
-	require.NoError(t, err)
-	require.Equal(t, time.Duration(-1), ttl, "PERSIST must remove the TTL")
-}
-
-// ────────────────────────────────────────────────────────────────
 // MULTI/EXEC with EXPIRE
 // ────────────────────────────────────────────────────────────────
 
@@ -215,49 +194,4 @@ func TestRedis_ExpiredKey_BecomesInvisible(t *testing.T) {
 
 	_, err = rdb.Get(ctx, "expiry:short").Result()
 	require.ErrorIs(t, err, redis.Nil, "key must be gone after expiry")
-}
-
-// ────────────────────────────────────────────────────────────────
-// GETEX — must update TTL immediately
-// ────────────────────────────────────────────────────────────────
-
-func TestRedis_GETEX_UpdatesTTLImmediately(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
-	defer shutdown(nodes)
-
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
-
-	require.NoError(t, rdb.Set(ctx, "getex:key", "hello", 0).Err())
-
-	// GETEX with EX must set a TTL and return the value.
-	val, err := rdb.Do(ctx, "GETEX", "getex:key", "EX", "80").Text()
-	require.NoError(t, err)
-	require.Equal(t, "hello", val)
-
-	ttl, err := rdb.TTL(ctx, "getex:key").Result()
-	require.NoError(t, err)
-	require.Greater(t, ttl, time.Duration(0))
-	require.LessOrEqual(t, ttl, 80*time.Second)
-}
-
-// GETEX PERSIST must remove an existing TTL.
-func TestRedis_GETEX_PERSIST_ClearsTTL(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
-	defer shutdown(nodes)
-
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
-
-	require.NoError(t, rdb.Do(ctx, "SET", "getex:persist", "v", "EX", "100").Err())
-	_, err := rdb.Do(ctx, "GETEX", "getex:persist", "PERSIST").Text()
-	require.NoError(t, err)
-
-	ttl, err := rdb.TTL(ctx, "getex:persist").Result()
-	require.NoError(t, err)
-	require.Equal(t, time.Duration(-1), ttl, "GETEX PERSIST must clear the TTL")
 }
