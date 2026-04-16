@@ -699,11 +699,15 @@ func minRedisInt(a, b int) int {
 // ErrDeltaScanTruncated is returned when the scan hits MaxDeltaScanLimit.
 func (r *RedisServer) aggregateLenDeltas(ctx context.Context, prefix []byte, readTS uint64, unmarshalDelta func([]byte) (int64, error)) (int64, bool, error) {
 	end := store.PrefixScanEnd(prefix)
-	deltas, err := r.store.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit, readTS)
+	// Scan one extra key beyond the limit so we can distinguish "exactly
+	// MaxDeltaScanLimit results" (no truncation) from "more than MaxDeltaScanLimit
+	// results" (truncated). Without the +1, a collection with exactly
+	// MaxDeltaScanLimit deltas would incorrectly trigger ErrDeltaScanTruncated.
+	deltas, err := r.store.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	if len(deltas) == store.MaxDeltaScanLimit {
+	if len(deltas) > store.MaxDeltaScanLimit {
 		return 0, false, ErrDeltaScanTruncated
 	}
 	var sum int64

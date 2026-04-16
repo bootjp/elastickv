@@ -167,7 +167,11 @@ func rawScanLimit(limit64 int64) (int, error) {
 	return grpcScanLimit(int(limit64))
 }
 
-const maxGRPCScanLimit = 1024
+// maxGRPCScanLimit caps the number of results per RawScanAt call.
+// It is set to MaxDeltaScanLimit+1 so that aggregateLenDeltas can request one
+// extra item beyond the documented delta limit to distinguish "exactly
+// MaxDeltaScanLimit results" from "more than MaxDeltaScanLimit results".
+const maxGRPCScanLimit = store.MaxDeltaScanLimit + 1
 
 func grpcScanLimit(limit int) (int, error) {
 	if limit < 0 {

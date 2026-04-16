@@ -236,18 +236,79 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		return err
 	}
 
-	// Group deltas per userKey.
+	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
+	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
+
+	allElems := c.buildBatchElems(ctx, h, byKey, readTS)
+
+	if err := c.dispatchCompaction(ctx, readTS, allElems); err != nil {
+		c.logger.WarnContext(ctx, "delta compactor: batch dispatch failed",
+			"type", h.typeName, "error", err)
+		return err
+	}
+
+	c.advanceCursor(h.typeName, lastScannedKey, truncated)
+	return nil
+}
+
+// groupByUserKey groups KVPairs by their user key, returning both the map and
+// the unique user keys in lexicographic (scan) order.
+func (c *DeltaCompactor) groupByUserKey(kvs []*store.KVPair, extractUserKey func([]byte) []byte) (map[string][]*store.KVPair, []string) {
 	byKey := make(map[string][]*store.KVPair)
+	var ukOrder []string
 	for _, pair := range kvs {
-		uk := h.extractUserKey(pair.Key)
+		uk := extractUserKey(pair.Key)
 		if uk == nil {
 			continue
 		}
 		k := string(uk)
+		if _, seen := byKey[k]; !seen {
+			ukOrder = append(ukOrder, k)
+		}
 		byKey[k] = append(byKey[k], pair)
 	}
+	return byKey, ukOrder
+}
 
-	// Collect elems for all compactable keys into one batch.
+// splitGuardCursor implements the scan window split guard and returns the
+// effective last-scanned key for cursor advancement.
+//
+// When the scan is truncated the last user key in the window may have deltas
+// that straddle the window boundary. If its visible count is below the
+// compaction threshold those deltas would be skipped this tick, and advancing
+// the cursor past them prevents them from merging with the deltas in the next
+// window — leaving them stranded until the next full cycle.
+//
+// When that condition is detected, the last user key is removed from byKey and
+// the cursor is backtracked to the last delta key of the penultimate user key
+// (or nil to reset to the prefix start) so the next tick re-scans the full
+// combined delta set.
+func (c *DeltaCompactor) splitGuardCursor(byKey map[string][]*store.KVPair, ukOrder []string, kvs []*store.KVPair, truncated bool) []byte {
+	var lastScannedKey []byte
+	if len(kvs) > 0 {
+		lastScannedKey = kvs[len(kvs)-1].Key
+	}
+	if !truncated || len(ukOrder) == 0 {
+		return lastScannedKey
+	}
+	lastUK := ukOrder[len(ukOrder)-1]
+	if len(byKey[lastUK]) >= c.maxCount {
+		return lastScannedKey
+	}
+	// Backtrack: exclude last user key and reset cursor to penultimate key.
+	delete(byKey, lastUK)
+	ukOrder = ukOrder[:len(ukOrder)-1]
+	if len(ukOrder) == 0 {
+		return nil // reset to prefix start
+	}
+	prev := ukOrder[len(ukOrder)-1]
+	prevPairs := byKey[prev]
+	return prevPairs[len(prevPairs)-1].Key
+}
+
+// buildBatchElems builds OCC elems for all user keys in byKey that meet the
+// compaction threshold, logging and skipping keys whose build fails.
+func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaHandler, byKey map[string][]*store.KVPair, readTS uint64) []*kv.Elem[kv.OP] {
 	var allElems []*kv.Elem[kv.OP]
 	for ukStr, deltaKVs := range byKey {
 		if len(deltaKVs) < c.maxCount {
@@ -264,19 +325,7 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		c.logger.InfoContext(ctx, "delta compactor: queued for compaction",
 			"type", h.typeName, "key", ukStr, "delta_count", len(deltaKVs))
 	}
-
-	if err := c.dispatchCompaction(ctx, readTS, allElems); err != nil {
-		c.logger.WarnContext(ctx, "delta compactor: batch dispatch failed",
-			"type", h.typeName, "error", err)
-		return err
-	}
-
-	var lastScannedKey []byte
-	if len(kvs) > 0 {
-		lastScannedKey = kvs[len(kvs)-1].Key
-	}
-	c.advanceCursor(h.typeName, lastScannedKey, truncated)
-	return nil
+	return allElems
 }
 
 // dispatchCompaction commits elems as an OCC transaction.
