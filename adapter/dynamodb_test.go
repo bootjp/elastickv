@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -610,7 +611,7 @@ func runSnapshotWriter(ctx context.Context, client *dynamodb.Client, stopCh <-ch
 		case <-stopCh:
 			return
 		default:
-			client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{ //nolint:errcheck
+			_, err := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 				TransactItems: []types.TransactWriteItem{
 					{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
 						"key": &types.AttributeValueMemberS{Value: "snap_k1"}, "value": &types.AttributeValueMemberS{Value: "updated1"},
@@ -620,6 +621,12 @@ func runSnapshotWriter(ctx context.Context, client *dynamodb.Client, stopCh <-ch
 					}}},
 				},
 			})
+			// Transaction conflicts are expected under contention; only unexpected
+			// errors (non-TransactionCanceledException) indicate a real problem.
+			var txErr *types.TransactionCanceledException
+			if err != nil && !errors.As(err, &txErr) {
+				return
+			}
 		}
 	}
 }

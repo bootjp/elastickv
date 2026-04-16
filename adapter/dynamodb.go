@@ -4071,7 +4071,9 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	seenItemKeys[compositeKey] = struct{}{}
 	loc, found, err := d.readLogicalItemAt(ctx, schema, g.Key, readTS)
 	if err != nil {
-		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		// Return the error as-is: storage errors from readItemAtKeyAt surface as
+		// InternalServerError (500) via writeDynamoErrorFromErr in the HTTP handler.
+		return nil, false, err
 	}
 	entry := map[string]any{}
 	if found {
@@ -4084,23 +4086,46 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	return entry, found, nil
 }
 
-// transactGetItemPrimaryKeyStr returns a canonical JSON string of the item's key
-// attributes for duplicate detection in TransactGetItems. Numeric values are
-// normalised so that equivalent numbers produce the same string.
+// transactGetItemPrimaryKeyStr returns a canonical string representation of the
+// primary key attributes for duplicate detection in TransactGetItems.
+// Uses a strings.Builder (instead of json.Marshal) to avoid reflection overhead —
+// primary keys contain at most 2 attributes of type S, N, or B.
+// Format: "<name>=<type>:<value>" pairs separated by \x1f, sorted by name.
+// Numeric values are normalised so equivalent numbers produce the same string.
+// Binary values are base64-encoded for safe embedding in the result string.
 func transactGetItemPrimaryKeyStr(key map[string]attributeValue) (string, error) {
-	normalized := make(map[string]attributeValue, len(key))
-	for k, v := range key {
-		if v.N != nil {
-			n := canonicalNumberString(*v.N)
-			v.N = &n
+	type kf struct {
+		name string
+		v    attributeValue
+	}
+	fields := make([]kf, 0, len(key))
+	for name, v := range key {
+		fields = append(fields, kf{name, v})
+	}
+	slices.SortFunc(fields, func(a, b kf) int { return strings.Compare(a.name, b.name) })
+
+	var buf strings.Builder
+	for i, f := range fields {
+		if i > 0 {
+			buf.WriteByte('\x1f')
 		}
-		normalized[k] = v
+		buf.WriteString(f.name)
+		buf.WriteByte('=')
+		switch {
+		case f.v.S != nil:
+			buf.WriteString("S:")
+			buf.WriteString(*f.v.S)
+		case f.v.N != nil:
+			buf.WriteString("N:")
+			buf.WriteString(canonicalNumberString(*f.v.N))
+		case f.v.B != nil:
+			buf.WriteString("B:")
+			buf.WriteString(base64.StdEncoding.EncodeToString(f.v.B))
+		default:
+			return "", errors.New("unsupported key attribute type for duplicate detection")
+		}
 	}
-	b, err := json.Marshal(normalized)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to serialize transact get item key")
-	}
-	return string(b), nil
+	return buf.String(), nil
 }
 
 func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error) {
