@@ -4017,17 +4017,15 @@ func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in 
 	tableMetrics := make(map[string]*transactGetItemsMetrics)
 	responses := make([]map[string]any, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		entry, itemFound, err := d.readTransactGetItem(ctx, item, schemaCache, seenItemKeys, readTS)
+		entry, itemFound, tableName, err := d.readTransactGetItem(ctx, item, schemaCache, seenItemKeys, readTS)
 		if err != nil {
 			return nil, nil, err
 		}
 		responses = append(responses, entry)
-		// item.Get is guaranteed non-nil here: readTransactGetItem returns an error
-		// for nil Get, so reaching this line means the nil check already passed.
-		m := tableMetrics[item.Get.TableName]
+		m := tableMetrics[tableName]
 		if m == nil {
 			m = &transactGetItemsMetrics{}
-			tableMetrics[item.Get.TableName] = m
+			tableMetrics[tableName] = m
 		}
 		m.requested++
 		if itemFound {
@@ -4047,18 +4045,19 @@ type transactGetSeenKey struct {
 
 // readTransactGetItem validates and reads a single item in a TransactGetItems request.
 // ensureLegacyTableMigration must be called for g.TableName before invoking this function.
-// Returns the response entry, whether the item was found, and any error.
-func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[transactGetSeenKey]struct{}, readTS uint64) (map[string]any, bool, error) {
+// Returns the response entry, whether the item was found, the table name, and any error.
+// Returning the table name avoids the caller having to re-access item.Get after the call.
+func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[transactGetSeenKey]struct{}, readTS uint64) (map[string]any, bool, string, error) {
 	if item.Get == nil {
-		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
 	}
 	g := item.Get
 	if strings.TrimSpace(g.TableName) == "" {
-		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
 	}
 	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, g.TableName, readTS)
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	// Reject duplicate item keys to match real DynamoDB behavior.
 	// canonicalPrimaryKeyStr reads only hash/range key attributes from g.Key
@@ -4066,11 +4065,11 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	// no separate primaryKeyAttributes extraction is needed.
 	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, g.Key)
 	if err != nil {
-		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	seenKey := transactGetSeenKey{tableName: g.TableName, keyStr: keyStr}
 	if _, dup := seenItemKeys[seenKey]; dup {
-		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
 			"Transaction request cannot include multiple operations on one item")
 	}
 	seenItemKeys[seenKey] = struct{}{}
@@ -4078,17 +4077,17 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	if err != nil {
 		// Return the error as-is: storage errors from readItemAtKeyAt surface as
 		// InternalServerError (500) via writeDynamoErrorFromErr in the HTTP handler.
-		return nil, false, err
+		return nil, false, "", err
 	}
 	entry := map[string]any{}
 	if found {
 		projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
 		if err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 		entry["Item"] = projected
 	}
-	return entry, found, nil
+	return entry, found, g.TableName, nil
 }
 
 // canonicalPrimaryKeyStr returns a collision-free canonical string of primary
