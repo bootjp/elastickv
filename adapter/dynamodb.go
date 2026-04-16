@@ -4053,7 +4053,13 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 		return nil, false, err
 	}
 	// Reject duplicate item keys to match real DynamoDB behavior.
-	keyStr, err := transactGetItemPrimaryKeyStr(g.Key)
+	// Use only primary key attributes (hash + range) for dedup — extra attributes
+	// in the Key map must not prevent detection of same-item duplicates.
+	pkAttrs, err := primaryKeyAttributes(schema.PrimaryKey, g.Key)
+	if err != nil {
+		return nil, false, err
+	}
+	keyStr, err := transactGetItemPrimaryKeyStr(pkAttrs)
 	if err != nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
