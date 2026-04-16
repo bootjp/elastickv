@@ -192,8 +192,13 @@ func TestDeltaCompactor_ZSetDeltaFoldedIntoBaseMeta(t *testing.T) {
 func TestDeltaCompactor_NonLeaderSkips(t *testing.T) {
 	t.Parallel()
 
+	// Use a real (writing) coordinator so that if compaction were incorrectly
+	// dispatched the delta keys would actually be deleted, making the assertion
+	// meaningful. The stub's IsLeaderForKey returns false to simulate a follower.
 	st := store.NewMVCCStore()
-	coord := &stubAdapterCoordinator{leaderSet: true, leader: false}
+	coord := newLocalAdapterCoordinator(st)
+	coord.leaderSet = true
+	coord.leader = false
 	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(1))
 	ctx := context.Background()
 
@@ -207,7 +212,7 @@ func TestDeltaCompactor_NonLeaderSkips(t *testing.T) {
 	require.NoError(t, c.SyncOnce(ctx))
 
 	readTS := st.LastCommitTS()
-	// Delta keys must NOT be touched since this node is not the leader.
+	// Delta keys must NOT be touched since this node is not the per-key leader.
 	_, getErr := st.GetAt(ctx, d1Key, readTS)
 	require.NoError(t, getErr, "non-leader should not compact delta keys")
 }

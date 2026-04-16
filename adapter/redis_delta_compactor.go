@@ -192,7 +192,9 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 				slog.Any("panic", rec))
 		}
 	}()
-	if !c.coord.IsLeader() {
+	// Use per-key leadership so that in sharded deployments this node compacts
+	// keys for the shards it leads, not just those of the default Raft group.
+	if !c.coord.IsLeaderForKey(req.userKey) {
 		return
 	}
 	h := c.handlerByTypeName(req.typeName)
@@ -255,12 +257,14 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
 }
 
-// SyncOnce runs one compaction pass. Non-leaders return immediately.
+// SyncOnce runs one compaction pass. Keys for shards this node does not lead
+// are skipped individually inside buildBatchElems via IsLeaderForKey, so the
+// scan proceeds on all nodes but only the shard leader dispatches each batch.
 // Each collection-type handler runs in its own goroutine so that a slow
 // handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
 // compaction. All goroutines share the same per-tick timeout context.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
-	if c.coord == nil || !c.coord.IsLeader() {
+	if c.coord == nil {
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
@@ -456,6 +460,12 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 			continue
 		}
 		userKey := []byte(ukStr)
+		// In sharded deployments IsLeaderForKey returns false for keys whose
+		// shard this node does not lead. Skip those to avoid dispatching a
+		// transaction that the responsible leader will reject.
+		if !c.coord.IsLeaderForKey(userKey) {
+			continue
+		}
 		elems, buildErr := h.buildElems(ctx, userKey, deltaKVs, readTS)
 		if buildErr != nil {
 			c.logger.WarnContext(ctx, "delta compactor: failed to build elems",
