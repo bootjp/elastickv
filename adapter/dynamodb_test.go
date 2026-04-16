@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -372,6 +373,301 @@ func TestDynamoDB_TransactWriteItems(t *testing.T) {
 	value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
 	assert.True(t, ok)
 	assert.Equal(t, "v2", value2Attr.Value)
+}
+
+func TestDynamoDB_TransactGetItems(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	assert.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	// Write two items.
+	_, err = client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Put: &types.Put{
+					TableName: aws.String("t"),
+					Item: map[string]types.AttributeValue{
+						"key":   &types.AttributeValueMemberS{Value: "k1"},
+						"value": &types.AttributeValueMemberS{Value: "v1"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String("t"),
+					Item: map[string]types.AttributeValue{
+						"key":   &types.AttributeValueMemberS{Value: "k2"},
+						"value": &types.AttributeValueMemberS{Value: "v2"},
+					},
+				},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	// TransactGetItems should read both items atomically at the same snapshot.
+	out, err := client.TransactGetItems(context.Background(), &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k2"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "missing"}}}},
+		},
+	})
+	assert.NoError(t, err)
+	assert.Len(t, out.Responses, 3)
+
+	// First response: k1 → "v1"
+	v1, ok := out.Responses[0].Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	assert.Equal(t, "v1", v1.Value)
+
+	// Second response: k2 → "v2"
+	v2, ok := out.Responses[1].Item["value"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	assert.Equal(t, "v2", v2.Value)
+
+	// Third response: missing key → empty Item map.
+	assert.Empty(t, out.Responses[2].Item)
+}
+
+func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	ctx := context.Background()
+
+	// Empty TransactItems should be rejected.
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{},
+	})
+	assert.Error(t, err)
+
+	// Table not found.
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("no_such_table"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+		},
+	})
+	assert.Error(t, err)
+
+	// Over 100 items should be rejected (DynamoDB limit).
+	items := make([]types.TransactGetItem, 101)
+	for i := range items {
+		items[i] = types.TransactGetItem{
+			Get: &types.Get{
+				TableName: aws.String("t"),
+				Key:       map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: strconv.Itoa(i)}},
+			},
+		}
+	}
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: items})
+	assert.Error(t, err)
+
+	// Duplicate item key in the same transaction should be rejected.
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+		},
+	})
+	assert.Error(t, err)
+}
+
+func TestDynamoDB_TransactGetItems_ProjectionExpression(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+
+	// Create a table with multiple attributes.
+	_, err = client.CreateTable(context.Background(), &dynamodb.CreateTableInput{
+		TableName: aws.String("proj_test"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("key"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("key"), KeyType: types.KeyTypeHash},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String("proj_test"),
+		Item: map[string]types.AttributeValue{
+			"key":    &types.AttributeValueMemberS{Value: "k1"},
+			"field1": &types.AttributeValueMemberS{Value: "v1"},
+			"field2": &types.AttributeValueMemberS{Value: "v2"},
+		},
+	})
+	require.NoError(t, err)
+
+	// TransactGetItems with ProjectionExpression requesting only field1.
+	out, err := client.TransactGetItems(context.Background(), &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{
+				TableName:                aws.String("proj_test"),
+				Key:                      map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}},
+				ProjectionExpression:     aws.String("#f1"),
+				ExpressionAttributeNames: map[string]string{"#f1": "field1"},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Responses, 1)
+
+	item := out.Responses[0].Item
+	// field1 should be present.
+	f1, ok := item["field1"].(*types.AttributeValueMemberS)
+	assert.True(t, ok)
+	assert.Equal(t, "v1", f1.Value)
+	// field2 should be excluded by projection.
+	assert.Nil(t, item["field2"])
+}
+
+func TestDynamoDB_TransactGetItems_SnapshotIsolation(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
+	})
+	createSimpleKeyTable(t, context.Background(), client)
+
+	ctx := context.Background()
+
+	// Write initial values.
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+				"key": &types.AttributeValueMemberS{Value: "snap_k1"}, "value": &types.AttributeValueMemberS{Value: "init1"},
+			}}},
+			{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+				"key": &types.AttributeValueMemberS{Value: "snap_k2"}, "value": &types.AttributeValueMemberS{Value: "init2"},
+			}}},
+		},
+	})
+	require.NoError(t, err)
+
+	// Concurrent writer that keeps updating both keys atomically.
+	stopCh := make(chan struct{})
+	go runSnapshotWriter(t, ctx, client, stopCh)
+	defer close(stopCh)
+
+	// Run TransactGetItems many times concurrently.
+	// Each response must be internally consistent: both keys from the same snapshot.
+	const iterations = 50
+	errCh := make(chan error, iterations)
+	for i := 0; i < iterations; i++ {
+		go func() {
+			errCh <- checkTransactGetSnapshotConsistency(ctx, client)
+		}()
+	}
+	for i := 0; i < iterations; i++ {
+		assert.NoError(t, <-errCh)
+	}
+}
+
+// runSnapshotWriter continuously writes both snap_k1 and snap_k2 atomically until
+// stopCh is closed. Unexpected errors (not TransactionCanceledException) are reported
+// via t.Errorf so the test fails rather than the writer exiting silently — a silent
+// exit would leave the database static and cause readers to pass vacuously.
+func runSnapshotWriter(t *testing.T, ctx context.Context, client *dynamodb.Client, stopCh <-chan struct{}) {
+	t.Helper()
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			_, err := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+				TransactItems: []types.TransactWriteItem{
+					{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+						"key": &types.AttributeValueMemberS{Value: "snap_k1"}, "value": &types.AttributeValueMemberS{Value: "updated1"},
+					}}},
+					{Put: &types.Put{TableName: aws.String("t"), Item: map[string]types.AttributeValue{
+						"key": &types.AttributeValueMemberS{Value: "snap_k2"}, "value": &types.AttributeValueMemberS{Value: "updated2"},
+					}}},
+				},
+			})
+			// TransactionCanceledException is expected under write contention; any
+			// other error is unexpected and must fail the test.
+			var txErr *types.TransactionCanceledException
+			if err != nil && !errors.As(err, &txErr) {
+				t.Errorf("runSnapshotWriter: unexpected TransactWriteItems error: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// checkTransactGetSnapshotConsistency verifies that snap_k1 and snap_k2 are read
+// from the same snapshot: their values must both be the initial pair or both the
+// updated pair — never a mix, which would indicate a non-atomic pre-read.
+func checkTransactGetSnapshotConsistency(ctx context.Context, client *dynamodb.Client) error {
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k1"}}}},
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "snap_k2"}}}},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	v1Attr, ok := out.Responses[0].Item["value"].(*types.AttributeValueMemberS)
+	if !ok {
+		return &inconsistentSnapshotError{v1: "<missing>", v2: "<unknown>"}
+	}
+	v2Attr, ok := out.Responses[1].Item["value"].(*types.AttributeValueMemberS)
+	if !ok {
+		return &inconsistentSnapshotError{v1: v1Attr.Value, v2: "<missing>"}
+	}
+	v1, v2 := v1Attr.Value, v2Attr.Value
+	if (v1 == "init1" && v2 == "init2") || (v1 == "updated1" && v2 == "updated2") {
+		return nil
+	}
+	return &inconsistentSnapshotError{v1: v1, v2: v2}
+}
+
+type inconsistentSnapshotError struct{ v1, v2 string }
+
+func (e *inconsistentSnapshotError) Error() string {
+	return "inconsistent snapshot: snap_k1=" + e.v1 + " snap_k2=" + e.v2 + " (mixed state violates snapshot isolation)"
 }
 
 func TestDynamoDB_UpdateItem_Condition(t *testing.T) {

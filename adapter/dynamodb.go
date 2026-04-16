@@ -43,6 +43,7 @@ const (
 	updateItemTarget         = targetPrefix + "UpdateItem"
 	batchWriteItemTarget     = targetPrefix + "BatchWriteItem"
 	transactWriteItemsTarget = targetPrefix + "TransactWriteItems"
+	transactGetItemsTarget   = targetPrefix + "TransactGetItems"
 )
 
 const (
@@ -67,6 +68,7 @@ const (
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
 	batchWriteItemMaxItems      = 25
+	transactGetItemsMaxItems    = 100
 	dynamoMaxRequestBodyBytes   = 1 << 20
 
 	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
@@ -93,6 +95,7 @@ var dynamoOperationTargets = map[string]string{
 	queryTarget:              "Query",
 	scanTarget:               "Scan",
 	transactWriteItemsTarget: "TransactWriteItems",
+	transactGetItemsTarget:   "TransactGetItems",
 	updateItemTarget:         "UpdateItem",
 }
 
@@ -255,6 +258,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		updateItemTarget:         d.updateItem,
 		batchWriteItemTarget:     d.batchWriteItem,
 		transactWriteItemsTarget: d.transactWriteItems,
+		transactGetItemsTarget:   d.transactGetItems,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
@@ -661,6 +665,21 @@ type batchDeleteRequest struct {
 
 type transactWriteItemsInput struct {
 	TransactItems []transactWriteItem `json:"TransactItems"`
+}
+
+type transactGetItemsInput struct {
+	TransactItems []transactGetItem `json:"TransactItems"`
+}
+
+type transactGetItem struct {
+	Get *transactGetItemGet `json:"Get"`
+}
+
+type transactGetItemGet struct {
+	TableName                string                    `json:"TableName"`
+	Key                      map[string]attributeValue `json:"Key"`
+	ProjectionExpression     string                    `json:"ProjectionExpression,omitempty"`
+	ExpressionAttributeNames map[string]string         `json:"ExpressionAttributeNames,omitempty"`
 }
 
 type transactWriteItem struct {
@@ -3911,6 +3930,234 @@ func decodeTransactWriteItemsInput(bodyReader io.Reader) (transactWriteItemsInpu
 	return in, nil
 }
 
+// transactGetItems implements TransactGetItems: reads multiple items atomically
+// at a single snapshot timestamp, guaranteeing a consistent view across all keys.
+func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request) {
+	in, err := decodeTransactGetItemsInput(maxDynamoBodyReader(w, r))
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+
+	// Acquire a single read timestamp for all items to guarantee a consistent snapshot.
+	readTS := d.nextTxnReadTS()
+	pin := d.pinReadTS(readTS)
+	defer pin.Release()
+
+	responses, tableMetrics, err := d.buildTransactGetItemsResponses(r.Context(), in, readTS)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	for table, m := range tableMetrics {
+		d.observeReadMetrics(r.Context(), table, m.found, m.requested)
+	}
+	writeDynamoJSON(w, map[string]any{"Responses": responses})
+}
+
+func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in transactGetItemsInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if len(in.TransactItems) == 0 {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing transact items")
+	}
+	if len(in.TransactItems) > transactGetItemsMaxItems {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+			"Too many items in TransactGetItems: "+strconv.Itoa(len(in.TransactItems))+" (max "+strconv.Itoa(transactGetItemsMaxItems)+")")
+	}
+	return in, nil
+}
+
+// collectTransactGetTableNames returns a deduplicated list of table names referenced
+// in the TransactGetItems input. Used to run ensureLegacyTableMigration once per table.
+func collectTransactGetTableNames(in transactGetItemsInput) []string {
+	seen := make(map[string]struct{}, len(in.TransactItems))
+	names := make([]string, 0, len(in.TransactItems))
+	for _, item := range in.TransactItems {
+		if item.Get == nil {
+			continue
+		}
+		t := item.Get.TableName
+		if _, exists := seen[t]; exists {
+			continue
+		}
+		seen[t] = struct{}{}
+		names = append(names, t)
+	}
+	return names
+}
+
+// transactGetItemsMetrics holds per-table counts for metrics reporting.
+type transactGetItemsMetrics struct {
+	requested int
+	found     int
+}
+
+// buildTransactGetItemsResponses reads each requested item at the given readTS
+// and returns the ordered response list and a per-table metrics map.
+// schemaCache avoids redundant storage reads when multiple items share the same table.
+// seenItemKeys enforces the DynamoDB rule that a transaction may not reference the
+// same item more than once.
+// ensureLegacyTableMigration is called once per unique table before any item is read.
+func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in transactGetItemsInput, readTS uint64) ([]map[string]any, map[string]*transactGetItemsMetrics, error) {
+	tableNames := collectTransactGetTableNames(in)
+	for _, tableName := range tableNames {
+		if err := d.ensureLegacyTableMigration(ctx, tableName); err != nil {
+			return nil, nil, err
+		}
+	}
+	schemaCache := make(map[string]*dynamoTableSchema)
+	seenItemKeys := make(map[transactGetSeenKey]struct{}, len(in.TransactItems))
+	tableMetrics := make(map[string]*transactGetItemsMetrics)
+	responses := make([]map[string]any, 0, len(in.TransactItems))
+	for _, item := range in.TransactItems {
+		entry, itemFound, tableName, err := d.readTransactGetItem(ctx, item, schemaCache, seenItemKeys, readTS)
+		if err != nil {
+			return nil, nil, err
+		}
+		responses = append(responses, entry)
+		m := tableMetrics[tableName]
+		if m == nil {
+			m = &transactGetItemsMetrics{}
+			tableMetrics[tableName] = m
+		}
+		m.requested++
+		if itemFound {
+			m.found++
+		}
+	}
+	return responses, tableMetrics, nil
+}
+
+// transactGetSeenKey is the map key used for duplicate-item detection in
+// TransactGetItems. Using a struct avoids separator-collision risks from
+// string concatenation and is more idiomatic Go.
+type transactGetSeenKey struct {
+	tableName string
+	keyStr    string
+}
+
+// readTransactGetItem validates and reads a single item in a TransactGetItems request.
+// ensureLegacyTableMigration must be called for g.TableName before invoking this function.
+// Returns the response entry, whether the item was found, the table name, and any error.
+// Returning the table name avoids the caller having to re-access item.Get after the call.
+func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[transactGetSeenKey]struct{}, readTS uint64) (map[string]any, bool, string, error) {
+	if item.Get == nil {
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
+	}
+	g := item.Get
+	if strings.TrimSpace(g.TableName) == "" {
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
+	}
+	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, g.TableName, readTS)
+	if err != nil {
+		return nil, false, "", err
+	}
+	// Reject duplicate item keys to match real DynamoDB behavior.
+	// canonicalPrimaryKeyStr reads only hash/range key attributes from g.Key
+	// by schema name, so extra attributes in the map are safely ignored —
+	// no separate primaryKeyAttributes extraction is needed.
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, g.Key)
+	if err != nil {
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	seenKey := transactGetSeenKey{tableName: g.TableName, keyStr: keyStr}
+	if _, dup := seenItemKeys[seenKey]; dup {
+		return nil, false, "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+			"Transaction request cannot include multiple operations on one item")
+	}
+	seenItemKeys[seenKey] = struct{}{}
+	loc, found, err := d.readLogicalItemAt(ctx, schema, g.Key, readTS)
+	if err != nil {
+		// Return the error as-is: storage errors from readItemAtKeyAt surface as
+		// InternalServerError (500) via writeDynamoErrorFromErr in the HTTP handler.
+		return nil, false, "", err
+	}
+	entry := map[string]any{}
+	if found {
+		projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
+		if err != nil {
+			return nil, false, "", err
+		}
+		entry["Item"] = projected
+	}
+	return entry, found, g.TableName, nil
+}
+
+// canonicalPrimaryKeyStr returns a collision-free canonical string of primary
+// key attributes for duplicate-item detection in TransactGetItems and
+// TransactWriteItems. Shared between both operations to avoid duplicated logic.
+//
+// Takes the table's keySchema so it can write hash key then range key in a
+// fixed schema-defined order, avoiding a slice allocation and sort — DynamoDB
+// primary keys have at most two attributes, so direct lookup beats sorting.
+//
+// Format per attribute: "<name>=<type>:<len>:<value>", separated by \x1f.
+// The length prefix makes the format collision-free: a string value that
+// contains \x1f cannot be confused with the inter-attribute separator because
+// the decoder knows exactly how many bytes belong to each value.
+// Numeric values are normalised; binary values are base64-encoded.
+func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeValue) (string, error) {
+	var buf strings.Builder
+	hashVal, ok := key[keySchema.HashKey]
+	if !ok {
+		return "", errors.New("missing hash key attribute")
+	}
+	buf.WriteString(keySchema.HashKey)
+	buf.WriteByte('=')
+	if err := writeCanonicalAttrValue(&buf, hashVal); err != nil {
+		return "", err
+	}
+	if keySchema.RangeKey != "" {
+		rangeVal, ok := key[keySchema.RangeKey]
+		if !ok {
+			return "", errors.New("missing range key attribute")
+		}
+		buf.WriteByte('\x1f')
+		buf.WriteString(keySchema.RangeKey)
+		buf.WriteByte('=')
+		if err := writeCanonicalAttrValue(&buf, rangeVal); err != nil {
+			return "", err
+		}
+	}
+	return buf.String(), nil
+}
+
+// writeCanonicalAttrValue appends a length-prefixed typed value for a single
+// primary key attribute to buf. Format: "<type>:<len>:<value>".
+// Supports S (string), N (normalised number), and B (base64-encoded binary).
+// The length prefix prevents collisions when string values contain \x1f.
+func writeCanonicalAttrValue(buf *strings.Builder, v attributeValue) error {
+	switch {
+	case v.S != nil:
+		buf.WriteString("S:")
+		buf.WriteString(strconv.Itoa(len(*v.S)))
+		buf.WriteByte(':')
+		buf.WriteString(*v.S)
+	case v.N != nil:
+		n := canonicalNumberString(*v.N)
+		buf.WriteString("N:")
+		buf.WriteString(strconv.Itoa(len(n)))
+		buf.WriteByte(':')
+		buf.WriteString(n)
+	case v.B != nil:
+		encoded := base64.StdEncoding.EncodeToString(v.B)
+		buf.WriteString("B:")
+		buf.WriteString(strconv.Itoa(len(encoded)))
+		buf.WriteByte(':')
+		buf.WriteString(encoded)
+	default:
+		return errors.New("unsupported key attribute type for duplicate detection")
+	}
+	return nil
+}
+
 func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error) {
 	seen := map[string]struct{}{}
 	names := make([]string, 0, len(in.TransactItems))
@@ -4131,43 +4378,38 @@ func (d *DynamoDBServer) processTransactWriteItem(
 	return nil
 }
 
-// transactWriteItemPrimaryKeyStr returns a canonical JSON string of the item's
+// transactWriteItemPrimaryKeyStr returns a canonical string of the item's
 // primary key attributes, used to detect duplicate-item violations in
 // TransactWriteItems (real DynamoDB returns ValidationException for these).
+// Delegates to canonicalPrimaryKeyStr for the actual serialization.
+// primaryKeyAttributes is applied uniformly across all operation types so that
+// only hash/range key fields are used for duplicate detection, regardless of
+// whether the operation carries a full Item (Put) or a Key-only map (Update/Delete/ConditionCheck).
 func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
-	var keyAttrs map[string]attributeValue
+	var rawAttrs map[string]attributeValue
 	switch {
 	case item.Update != nil:
-		keyAttrs = item.Update.Key
+		rawAttrs = item.Update.Key
 	case item.Delete != nil:
-		keyAttrs = item.Delete.Key
+		rawAttrs = item.Delete.Key
 	case item.ConditionCheck != nil:
-		keyAttrs = item.ConditionCheck.Key
+		rawAttrs = item.ConditionCheck.Key
 	case item.Put != nil:
-		var err error
-		keyAttrs, err = primaryKeyAttributes(schema.PrimaryKey, item.Put.Item)
-		if err != nil {
-			return "", err
-		}
+		rawAttrs = item.Put.Item
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
-	// Normalize numeric attribute values so that equivalent numbers (e.g. "10"
-	// and "10.0") produce the same canonical key string and are reliably detected
-	// as duplicates during JSON marshalling.
-	normalized := make(map[string]attributeValue, len(keyAttrs))
-	for k, v := range keyAttrs {
-		if v.N != nil {
-			n := canonicalNumberString(*v.N)
-			v.N = &n
-		}
-		normalized[k] = v
-	}
-	b, err := json.Marshal(normalized)
+	keyAttrs, err := primaryKeyAttributes(schema.PrimaryKey, rawAttrs)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to serialize transact item key")
+		// primaryKeyAttributes already returns a dynamoAPIError; return it directly
+		// to preserve its status code and error type.
+		return "", err
 	}
-	return string(b), nil
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
+	if err != nil {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return keyStr, nil
 }
 
 type transactWriteItemPlan struct {
