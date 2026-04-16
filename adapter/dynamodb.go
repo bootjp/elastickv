@@ -4013,7 +4013,7 @@ func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in 
 		}
 	}
 	schemaCache := make(map[string]*dynamoTableSchema)
-	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
+	seenItemKeys := make(map[transactGetSeenKey]struct{}, len(in.TransactItems))
 	tableMetrics := make(map[string]*transactGetItemsMetrics)
 	responses := make([]map[string]any, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
@@ -4037,10 +4037,18 @@ func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in 
 	return responses, tableMetrics, nil
 }
 
+// transactGetSeenKey is the map key used for duplicate-item detection in
+// TransactGetItems. Using a struct avoids separator-collision risks from
+// string concatenation and is more idiomatic Go.
+type transactGetSeenKey struct {
+	tableName string
+	keyStr    string
+}
+
 // readTransactGetItem validates and reads a single item in a TransactGetItems request.
 // ensureLegacyTableMigration must be called for g.TableName before invoking this function.
 // Returns the response entry, whether the item was found, and any error.
-func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[string]struct{}, readTS uint64) (map[string]any, bool, error) {
+func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, seenItemKeys map[transactGetSeenKey]struct{}, readTS uint64) (map[string]any, bool, error) {
 	if item.Get == nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
 	}
@@ -4060,12 +4068,12 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 	if err != nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	compositeKey := g.TableName + "\x00" + keyStr
-	if _, dup := seenItemKeys[compositeKey]; dup {
+	seenKey := transactGetSeenKey{tableName: g.TableName, keyStr: keyStr}
+	if _, dup := seenItemKeys[seenKey]; dup {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
 			"Transaction request cannot include multiple operations on one item")
 	}
-	seenItemKeys[compositeKey] = struct{}{}
+	seenItemKeys[seenKey] = struct{}{}
 	loc, found, err := d.readLogicalItemAt(ctx, schema, g.Key, readTS)
 	if err != nil {
 		// Return the error as-is: storage errors from readItemAtKeyAt surface as
@@ -4375,23 +4383,26 @@ func (d *DynamoDBServer) processTransactWriteItem(
 // primary key attributes, used to detect duplicate-item violations in
 // TransactWriteItems (real DynamoDB returns ValidationException for these).
 // Delegates to canonicalPrimaryKeyStr for the actual serialization.
+// primaryKeyAttributes is applied uniformly across all operation types so that
+// only hash/range key fields are used for duplicate detection, regardless of
+// whether the operation carries a full Item (Put) or a Key-only map (Update/Delete/ConditionCheck).
 func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
-	var keyAttrs map[string]attributeValue
+	var rawAttrs map[string]attributeValue
 	switch {
 	case item.Update != nil:
-		keyAttrs = item.Update.Key
+		rawAttrs = item.Update.Key
 	case item.Delete != nil:
-		keyAttrs = item.Delete.Key
+		rawAttrs = item.Delete.Key
 	case item.ConditionCheck != nil:
-		keyAttrs = item.ConditionCheck.Key
+		rawAttrs = item.ConditionCheck.Key
 	case item.Put != nil:
-		var err error
-		keyAttrs, err = primaryKeyAttributes(schema.PrimaryKey, item.Put.Item)
-		if err != nil {
-			return "", err
-		}
+		rawAttrs = item.Put.Item
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+	}
+	keyAttrs, err := primaryKeyAttributes(schema.PrimaryKey, rawAttrs)
+	if err != nil {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
 	if err != nil {
