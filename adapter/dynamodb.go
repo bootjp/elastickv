@@ -4107,7 +4107,7 @@ func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeV
 	var buf strings.Builder
 	hashVal, ok := key[keySchema.HashKey]
 	if !ok {
-		return "", errors.New("missing hash key attribute")
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing hash key attribute")
 	}
 	buf.WriteString(keySchema.HashKey)
 	buf.WriteByte('=')
@@ -4117,7 +4117,7 @@ func canonicalPrimaryKeyStr(keySchema dynamoKeySchema, key map[string]attributeV
 	if keySchema.RangeKey != "" {
 		rangeVal, ok := key[keySchema.RangeKey]
 		if !ok {
-			return "", errors.New("missing range key attribute")
+			return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing range key attribute")
 		}
 		buf.WriteByte('\x1f')
 		buf.WriteString(keySchema.RangeKey)
@@ -4153,7 +4153,7 @@ func writeCanonicalAttrValue(buf *strings.Builder, v attributeValue) error {
 		buf.WriteByte(':')
 		buf.WriteString(encoded)
 	default:
-		return errors.New("unsupported key attribute type for duplicate detection")
+		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported key attribute type for duplicate detection")
 	}
 	return nil
 }
