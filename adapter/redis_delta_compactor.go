@@ -180,7 +180,16 @@ func (c *DeltaCompactor) handlerByTypeName(typeName string) *collectionDeltaHand
 // compactUrgentKey performs an immediate targeted compaction for a single user key
 // whose delta count exceeded MaxDeltaScanLimit. It scans all delta keys for the
 // key, builds compaction elems, and dispatches them as an OCC transaction.
+// A recover guard prevents a panic inside a handler from crashing the Run loop.
 func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompactionRequest) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.logger.Error("DeltaCompactor: panic in urgent compaction",
+				slog.String("type", req.typeName),
+				slog.String("key", string(req.userKey)),
+				slog.Any("panic", rec))
+		}
+	}()
 	if !c.coord.IsLeader() {
 		return
 	}
