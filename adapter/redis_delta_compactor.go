@@ -345,6 +345,8 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 		Len:  baseMeta.Len + lenDelta,
 	}
 	if newMeta.Len < 0 {
+		c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
+			"key", string(userKey), "computed_len", newMeta.Len)
 		newMeta.Len = 0
 	}
 	newMeta.Tail = newMeta.Head + newMeta.Len

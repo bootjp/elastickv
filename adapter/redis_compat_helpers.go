@@ -414,19 +414,11 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	}
 	elems = append(elems, deltaElems...)
 	// Delete all claim keys (paginated).
-	claimPrefix := store.ListClaimScanPrefix(key)
-	claimEnd := store.PrefixScanEnd(claimPrefix)
-	claimKVs, claimScanErr := r.store.ScanAt(ctx, claimPrefix, claimEnd, maxWideScanLimit, readTS)
-	if claimScanErr != nil {
-		return nil, errors.WithStack(claimScanErr)
+	claimElems, err := r.scanAllDeltaElems(ctx, store.ListClaimScanPrefix(key), readTS)
+	if err != nil {
+		return nil, err
 	}
-	if len(claimKVs) > maxWideColumnItems {
-		return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q has more than %d claim keys", key, maxWideColumnItems)
-	}
-	for _, pair := range claimKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-	}
-	return elems, nil
+	return append(elems, claimElems...), nil
 }
 
 // scanListItemDelElems returns Del elems for every item key that belongs to
@@ -444,15 +436,15 @@ func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, read
 		if scanErr != nil {
 			return nil, errors.WithStack(scanErr)
 		}
+		if len(elems)+len(itemKVs) > maxWideColumnItems {
+			return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
+		}
 		for _, pair := range itemKVs {
 			// Guard against prefix collision with lexicographically adjacent userKeys.
 			if _, ok := store.ExtractListItemSeq(pair.Key, key); !ok {
 				continue
 			}
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		}
-		if len(elems) > maxWideColumnItems {
-			return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
 		}
 		if len(itemKVs) < store.MaxDeltaScanLimit {
 			break
@@ -593,19 +585,12 @@ func (r *RedisServer) deleteZSetWideColumnElems(ctx context.Context, key []byte,
 	if err != nil {
 		return nil, err
 	}
-	// deleteWideColumnElems covers member + meta + delta. Also scan score index keys.
-	scorePrefix := store.ZSetScoreScanPrefix(key)
-	scoreEnd := store.PrefixScanEnd(scorePrefix)
-	scoreKVs, scanErr := r.store.ScanAt(ctx, scorePrefix, scoreEnd, maxWideScanLimit, readTS)
-	if scanErr != nil {
-		return nil, errors.WithStack(scanErr)
+	// deleteWideColumnElems covers member + meta + delta. Also scan score index keys (paginated).
+	scoreElems, err := r.scanAllDeltaElems(ctx, store.ZSetScoreScanPrefix(key), readTS)
+	if err != nil {
+		return nil, err
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(memberElems)+len(scoreKVs))
-	elems = append(elems, memberElems...)
-	for _, pair := range scoreKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-	}
-	return elems, nil
+	return append(memberElems, scoreElems...), nil
 }
 
 func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint64) ([]string, error) {

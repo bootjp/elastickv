@@ -121,6 +121,11 @@ const (
 	redisTraceArgEllipsis    = "..."
 	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
 	redisTraceRedactAfter    = 1 // redact arguments after key (command name already stripped by caller)
+
+	// listPopDeltaOverhead is the number of extra elements reserved in a list
+	// pop elem slice beyond the per-position claim keys and per-item del keys:
+	// one slot for the list meta delta key appended by the caller.
+	listPopDeltaOverhead = 1
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
@@ -2651,7 +2656,7 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 		claimEnd = meta.Tail
 	}
 	// Capacity: n claim keys + n Del(item) for found items + 1 for the delta key appended by caller.
-	elems := make([]*kv.Elem[kv.OP], 0, n+int64(len(kvps))+1) //nolint:mnd
+	elems := make([]*kv.Elem[kv.OP], 0, n+int64(len(kvps))+listPopDeltaOverhead)
 	for seq := claimStart; seq < claimEnd; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
 	}

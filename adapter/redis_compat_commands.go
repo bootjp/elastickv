@@ -903,17 +903,33 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 // the given set and returns a map from member name to struct{}{}.
 // Using a single prefix scan eliminates the per-member ExistsAt round-trip.
 func (r *RedisServer) scanSetMemberExistsMap(ctx context.Context, key []byte, readTS uint64) (map[string]struct{}, error) {
-	memberScanPrefix := store.SetMemberScanPrefix(key)
-	memberScanEnd := store.PrefixScanEnd(memberScanPrefix)
+	return r.scanKeyExistsMap(ctx, store.SetMemberScanPrefix(key), readTS,
+		func(k []byte) []byte { return store.ExtractSetMemberName(k, key) })
+}
+
+// scanHashFieldExistsMap does a paginated prefix scan of all field keys for
+// the given hash and returns a map from field name to struct{}{}.
+// Using a single prefix scan eliminates per-field ExistsAt round-trips.
+func (r *RedisServer) scanHashFieldExistsMap(ctx context.Context, key []byte, readTS uint64) (map[string]struct{}, error) {
+	return r.scanKeyExistsMap(ctx, store.HashFieldScanPrefix(key), readTS,
+		func(k []byte) []byte { return store.ExtractHashFieldName(k, key) })
+}
+
+// scanKeyExistsMap paginates through all keys under scanPrefix, extracts a
+// name from each key using extractName, and builds a set of existing names.
+// It is used by scanSetMemberExistsMap and scanHashFieldExistsMap to eliminate
+// per-key ExistsAt round-trips during SADD/SREM/HDEL operations.
+func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, readTS uint64, extractName func([]byte) []byte) (map[string]struct{}, error) {
+	scanEnd := store.PrefixScanEnd(scanPrefix)
 	existsMap := make(map[string]struct{})
-	scanCursor := memberScanPrefix
+	cursor := scanPrefix
 	for {
-		scanKVs, err := r.store.ScanAt(ctx, scanCursor, memberScanEnd, store.MaxDeltaScanLimit, readTS)
+		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
 		if err != nil {
 			return nil, cockerrors.WithStack(err)
 		}
 		for _, pair := range scanKVs {
-			if name := store.ExtractSetMemberName(pair.Key, key); name != nil {
+			if name := extractName(pair.Key); name != nil {
 				existsMap[string(name)] = struct{}{}
 			}
 		}
@@ -923,7 +939,7 @@ func (r *RedisServer) scanSetMemberExistsMap(ctx context.Context, key []byte, re
 		lastKey := scanKVs[len(scanKVs)-1].Key
 		next := make([]byte, len(lastKey)+1)
 		copy(next, lastKey)
-		scanCursor = next
+		cursor = next
 	}
 	return existsMap, nil
 }
@@ -1376,17 +1392,18 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 
 // hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTS uint64) (int, error) {
+	// Bulk-scan existing fields once to build an existence map, reducing store
+	// round-trips from O(N fields) to O(N fields / page-size).
+	existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
 	commitTS := r.coordinator.Clock().Next()
 	elems := make([]*kv.Elem[kv.OP], 0, len(fields)+1)
 	removed := 0
 	for _, field := range fields {
-		fieldKey := store.HashFieldKey(key, field)
-		exists, existsErr := r.store.ExistsAt(ctx, fieldKey, readTS)
-		if existsErr != nil {
-			return 0, cockerrors.WithStack(existsErr)
-		}
-		if exists {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: fieldKey})
+		if _, exists := existsMap[string(field)]; exists {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.HashFieldKey(key, field)})
 			removed++
 		}
 	}
