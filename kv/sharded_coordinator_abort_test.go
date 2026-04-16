@@ -41,7 +41,7 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 
 	// Group 1: real raft + real store.
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "abort-g1", NewKvFSM(s1))
+	r1, stop1 := newSingleRaft(t, "abort-g1", NewKvFSMWithHLC(s1, NewHLC()))
 	t.Cleanup(stop1)
 
 	// Group 2: real store (needed for routing) but a Transactional that always fails.

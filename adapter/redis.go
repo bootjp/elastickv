@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"math"
@@ -112,7 +113,6 @@ const (
 )
 
 const (
-	redisLatestCommitTimeout = 5 * time.Second
 	redisDispatchTimeout     = 10 * time.Second
 	redisFlushLegacyTimeout  = 10 * time.Minute
 	redisRelayPublishTimeout = 2 * time.Second
@@ -1411,15 +1411,115 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	results, err := r.runTransaction(state.queue)
+	queue := state.queue
 	state.inTxn = false
 	state.queue = nil
+
+	// Always execute MULTI/EXEC on the leader so that reads and writes within
+	// the transaction see consistent, up-to-date data. Serving transactions
+	// on followers risks reading stale MVCC state and producing write cycles.
+	if !r.coordinator.IsLeader() {
+		r.proxyTransactionToLeader(conn, queue)
+		return
+	}
+
+	results, err := r.runTransaction(queue)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 
 	r.writeResults(conn, results)
+}
+
+// proxyTransactionToLeader forwards a MULTI/EXEC transaction to the leader
+// node and writes the EXEC response array back to conn.
+//
+//nolint:cyclop // inherent complexity of MULTI/EXEC proxy; refactoring would obscure the protocol flow
+func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.Command) {
+	leaderAddr, ok := r.resolveLeaderRedisAddr(conn)
+	if !ok {
+		return
+	}
+	cli := r.getOrCreateLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+
+	cmds, err := r.execTxPipeline(ctx, cli, queue)
+	if handleProxyTxnError(conn, err) {
+		return
+	}
+	writeProxyCmdsResult(conn, cmds)
+}
+
+// resolveLeaderRedisAddr looks up the Redis address of the current Raft leader,
+// writes an error reply to conn on failure and returns ("", false).
+func (r *RedisServer) resolveLeaderRedisAddr(conn redcon.Conn) (string, bool) {
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		conn.WriteError(ErrLeaderNotFound.Error())
+		return "", false
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+		return "", false
+	}
+	return leaderAddr, true
+}
+
+// execTxPipeline sends queue as a single TxPipelined batch and returns the
+// per-command result handles together with any pipeline-level error.
+func (r *RedisServer) execTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
+	cmds := make([]*redis.Cmd, 0, len(queue))
+	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, cmd := range queue {
+			args := make([]interface{}, len(cmd.Args))
+			for i, a := range cmd.Args {
+				args[i] = a
+			}
+			cmds = append(cmds, pipe.Do(ctx, args...))
+		}
+		return nil
+	})
+	return cmds, errors.WithStack(err)
+}
+
+// handleProxyTxnError writes the appropriate reply for terminal pipeline errors
+// and returns true when the caller should return early without writing results.
+func handleProxyTxnError(conn redcon.Conn, err error) bool {
+	// Transaction aborted (WATCH conflict): Redis protocol requires a Null
+	// array reply (*-1\r\n), not a null bulk string or an error.
+	// redis.Nil is a per-command nil response and must NOT be treated as an
+	// EXEC abort — only redis.TxFailedErr signals that.
+	if errors.Is(err, redis.TxFailedErr) {
+		conn.WriteArray(-1)
+		return true
+	}
+	// Fatal transport / context error: per-command results are unreliable.
+	if err != nil {
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) ||
+			errors.Is(err, io.EOF) ||
+			errors.Is(err, io.ErrUnexpectedEOF) ||
+			errors.As(err, &netErr) {
+			conn.WriteError(err.Error())
+			return true
+		}
+	}
+	return false
+}
+
+// writeProxyCmdsResult writes an EXEC-style array reply for the given pipeline
+// command handles. For any other non-nil per-command errors, each cmd carries
+// its own result, which is the correct Redis EXEC semantics.
+func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
+	conn.WriteArray(len(cmds))
+	for _, cmd := range cmds {
+		writeGoRedisResult(conn, cmd)
+	}
 }
 
 type txnValue struct {
@@ -2248,10 +2348,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		startTS, err := r.txnStartTS(queue)
-		if err != nil {
-			return err
-		}
+		startTS := r.txnStartTS()
 		readPin := r.pinReadTS(startTS)
 		defer readPin.Release()
 
@@ -2290,54 +2387,42 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return results, nil
 }
 
-func (r *RedisServer) txnStartTS(queue []redcon.Command) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisLatestCommitTimeout)
-	defer cancel()
-
-	maxTS, err := r.maxLatestCommitTS(ctx, queue)
-	if err != nil {
-		return 0, err
+func (r *RedisServer) txnStartTS() uint64 {
+	// store.LastCommitTS() is the authoritative safe-snapshot watermark: it is
+	// updated atomically only AFTER the corresponding Pebble batch commit, so
+	// every version with commitTS ≤ store.LastCommitTS() is guaranteed visible
+	// in the store when we read.
+	//
+	// We must NOT return clock.Next() here.  clock.Next() can be AHEAD of
+	// store.LastCommitTS() because concurrent dispatchTxn calls advance the HLC
+	// before their Raft entry is applied.  If startTS = clock.Next() = T, a
+	// concurrent transaction that already called clock.Next() to obtain
+	// commitTS = T-1 and is still in the Raft pipeline will satisfy
+	//   latestTS(key) = T-1  ≤  T = startTS
+	// causing the FSM conflict check (latestTS > startTS) to silently pass even
+	// though we read stale data.  This allows two concurrent RPUSHes to pick the
+	// same sequence number, with the second overwriting the first — a lost write.
+	//
+	// Using store.LastCommitTS() directly closes this gap: any concurrent commit
+	// at > maxTS triggers a WriteConflict and a retry via retryRedisWrite.
+	//
+	// The Observe call still advances the HLC so that dispatchTxn's clock.Next()
+	// produces a commitTS strictly greater than maxTS (leader-election safety).
+	//
+	// When maxTS is 0 (empty store) we return 1 so the coordinator treats this
+	// as a valid startTS and does not override it with clock.Next() — which
+	// could be ahead of unapplied Raft entries and reintroduce the anomaly.
+	var maxTS uint64
+	if r.store != nil {
+		maxTS = r.store.LastCommitTS()
 	}
 	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
 		r.coordinator.Clock().Observe(maxTS)
 	}
-	if r.coordinator == nil || r.coordinator.Clock() == nil {
-		return maxTS + 1, nil
+	if maxTS == 0 {
+		return 1
 	}
-	return r.coordinator.Clock().Next(), nil
-}
-
-func (r *RedisServer) maxLatestCommitTS(ctx context.Context, queue []redcon.Command) (uint64, error) {
-	if r.store == nil {
-		return 0, nil
-	}
-
-	// NOTE: This currently calls LatestCommitTS for each (unique) key involved in
-	// the transaction. kv.MaxLatestCommitTS deduplicates keys and performs the
-	// lookups in parallel, but very large transactions can still make this a
-	// latency hot path. If needed, add batching/caching at the storage layer.
-	const txnLatestCommitKeysPerCmd = 4
-	keys := make([][]byte, 0, len(queue)*txnLatestCommitKeysPerCmd)
-	for _, cmd := range queue {
-		if len(cmd.Args) < minKeyedArgs {
-			continue
-		}
-		name := strings.ToUpper(string(cmd.Args[0]))
-		switch name {
-		case cmdSet, cmdGet, cmdDel, cmdExists, cmdRPush, cmdLRange, cmdExpire, cmdPExpire, cmdZIncrBy:
-			key := cmd.Args[1]
-			keys = append(keys, key)
-			// Also account for list metadata keys to avoid stale typing decisions.
-			keys = append(keys, listMetaKey(key))
-			keys = append(keys, redisZSetKey(key))
-			keys = append(keys, redisTTLKey(key))
-		}
-	}
-	ts, err := kv.MaxLatestCommitTS(ctx, r.store, keys)
-	if err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return ts, nil
+	return maxTS
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {

@@ -151,7 +151,8 @@ func startAddVoterJoinNode(
 	t.Helper()
 
 	st := store.NewMVCCStore()
-	fsm := kv.NewKvFSM(st)
+	hlc := kv.NewHLC()
+	fsm := kv.NewKvFSMWithHLC(st, hlc)
 
 	electionTimeout := leaderElectionTimeout
 	if idx != 0 {
@@ -163,11 +164,12 @@ func startAddVoterJoinNode(
 
 	s := grpc.NewServer()
 	trx := kv.NewTransaction(r)
-	coordinator := kv.NewCoordinator(trx, r)
+	coordinator := kv.NewCoordinator(trx, r, kv.WithHLC(hlc))
 	relay := NewRedisPubSubRelay()
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
 	opsCtx, opsCancel := context.WithCancel(ctx)
+	go coordinator.RunHLCLeaseRenewal(opsCtx)
 	tm.Register(s)
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)

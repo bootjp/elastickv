@@ -31,6 +31,7 @@ var (
 	ErrInvalidShardRangesEntry          = errors.New("invalid shardRanges entry")
 	ErrInvalidRaftRedisMapEntry         = errors.New("invalid raftRedisMap entry")
 	ErrInvalidRaftS3MapEntry            = errors.New("invalid raftS3Map entry")
+	ErrInvalidRaftDynamoMapEntry        = errors.New("invalid raftDynamoMap entry")
 	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
 )
 
@@ -121,6 +122,10 @@ func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
 
 func parseRaftS3Map(raw string) (map[raft.ServerAddress]string, error) {
 	return parseRaftAddressMap(raw, ErrInvalidRaftS3MapEntry)
+}
+
+func parseRaftDynamoMap(raw string) (map[raft.ServerAddress]string, error) {
+	return parseRaftAddressMap(raw, ErrInvalidRaftDynamoMapEntry)
 }
 
 func parseRaftAddressMap(raw string, invalidEntry error) (map[raft.ServerAddress]string, error) {

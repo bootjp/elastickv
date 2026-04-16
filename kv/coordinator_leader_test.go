@@ -11,7 +11,7 @@ func TestCoordinateVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "coord-leader", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "coord-leader", NewKvFSMWithHLC(st, NewHLC()))
 	t.Cleanup(stop)
 
 	c := NewCoordinator(&stubTransactional{}, r)

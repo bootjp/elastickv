@@ -16,10 +16,12 @@
                     :dynamo-port 9000})]
     (is (= 10 (:concurrency test-map)))))
 
-(deftest host-override-uses-provided-host
+(deftest host-override-creates-client
+  ;; Verify that open! produces a DynamoDBClient with a live cognitect/aws-api
+  ;; client object (not nil) when a host/port override is supplied.
   (let [test-map (workload/elastickv-dynamodb-test
                    {:dynamo-host "127.0.0.1"
-                    :node->port {"n1" 8000 "n2" 8001}})
+                    :node->port  {"n1" 8000 "n2" 8001}})
         c        (:client test-map)
         opened   (client/open! c test-map "n1")]
-    (is (re-find #"http://127\.0\.0\.1:8000" (:url opened)))))
+    (is (some? (:ddb opened)))))

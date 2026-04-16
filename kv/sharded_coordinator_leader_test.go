@@ -16,7 +16,7 @@ func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	engine.UpdateRoute([]byte("a"), nil, 1)
 
 	st := store.NewMVCCStore()
-	r, stop := newSingleRaft(t, "shard-leader", NewKvFSM(st))
+	r, stop := newSingleRaft(t, "shard-leader", NewKvFSMWithHLC(st, NewHLC()))
 	t.Cleanup(stop)
 
 	re := hashicorpraftengine.New(r)

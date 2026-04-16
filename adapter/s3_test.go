@@ -364,12 +364,13 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	engine.UpdateRoute([]byte(s3keys.RoutePrefix), []byte("!s3|"), 2)
 	engine.UpdateRoute([]byte("!s3|"), nil, 1)
 
+	hlc := kv.NewHLC()
 	store1 := store.NewMVCCStore()
-	raft1, stop1 := newSingleRaftForS3Test(t, "g1", kv.NewKvFSM(store1))
+	raft1, stop1 := newSingleRaftForS3Test(t, "g1", kv.NewKvFSMWithHLC(store1, hlc))
 	defer stop1()
 
 	store2 := store.NewMVCCStore()
-	raft2, stop2 := newSingleRaftForS3Test(t, "g2", kv.NewKvFSM(store2))
+	raft2, stop2 := newSingleRaftForS3Test(t, "g2", kv.NewKvFSMWithHLC(store2, hlc))
 	defer stop2()
 
 	engine1 := hashicorpraftengine.New(raft1)
@@ -379,7 +380,7 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 		2: {Engine: engine2, Store: store2, Txn: kv.NewLeaderProxyWithEngine(engine2)},
 	}
 	shardStore := kv.NewShardStore(engine, groups)
-	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), shardStore)
+	coord := kv.NewShardedCoordinator(engine, groups, 1, hlc, shardStore)
 	server := NewS3Server(nil, "", shardStore, coord, nil)
 
 	rec := httptest.NewRecorder()

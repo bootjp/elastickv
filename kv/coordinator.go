@@ -3,6 +3,8 @@ package kv
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"log/slog"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -14,16 +16,59 @@ import (
 
 const redirectForwardTimeout = 5 * time.Second
 
-func NewCoordinator(txm Transactional, r *raft.Raft) *Coordinate {
-	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r))
+// hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
+// physical ceiling extends ahead of the current wall clock. Modelled after
+// TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
+// renews before the window expires. A new leader inherits the committed ceiling
+// so it never issues timestamps that collide with the previous leader's window.
+const hlcPhysicalWindowMs int64 = 3_000
+
+// hlcRenewalInterval controls how often the leader proposes a new ceiling.
+// Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
+const hlcRenewalInterval = 1 * time.Second
+
+// CoordinatorOption is a functional option for Coordinate constructors.
+type CoordinatorOption func(*Coordinate)
+
+// WithHLC sets a pre-created HLC on the coordinator. Use this together with
+// NewKvFSMWithHLC so the FSM and coordinator share the same clock instance:
+// the FSM advances physicalCeiling on every applied HLC lease entry, and the
+// coordinator reads it inside Next() to floor new timestamps above the
+// previous leader's committed window.
+func WithHLC(hlc *HLC) CoordinatorOption {
+	return func(c *Coordinate) {
+		c.clock = hlc
+	}
 }
 
-func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine) *Coordinate {
-	return &Coordinate{
+func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {
+	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r), opts...)
+}
+
+func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts ...CoordinatorOption) *Coordinate {
+	c := &Coordinate{
 		transactionManager: txm,
 		engine:             engine,
 		clock:              NewHLC(),
+		log:                slog.Default(),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// hlcLeaseEntryLen is the byte length of a serialised HLC lease Raft entry:
+// 1 tag byte + 8 bytes big-endian int64 ceiling ms.
+const hlcLeaseEntryLen = 9 //nolint:mnd
+
+// marshalHLCLeaseRenew encodes a physical ceiling into a Raft log entry.
+// Format: [raftEncodeHLCLease][8 bytes big-endian int64 ceiling ms].
+func marshalHLCLeaseRenew(ceilingMs int64) []byte {
+	out := make([]byte, hlcLeaseEntryLen)
+	out[0] = raftEncodeHLCLease
+	binary.BigEndian.PutUint64(out[1:], uint64(ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp, always positive
+	return out
 }
 
 type CoordinateResponse struct {
@@ -35,6 +80,7 @@ type Coordinate struct {
 	engine             raftengine.Engine
 	clock              *HLC
 	connCache          GRPCConnCache
+	log                *slog.Logger
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -96,6 +142,49 @@ func (c *Coordinate) RaftLeader() raft.ServerAddress {
 
 func (c *Coordinate) Clock() *HLC {
 	return c.clock
+}
+
+// ProposeHLCLease proposes a new physical ceiling to the Raft cluster.
+// Only the current leader should call this; followers silently ignore
+// proposals from non-leaders via Raft's leader-only write guarantee.
+func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	_, err := c.engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs))
+	return errors.WithStack(err)
+}
+
+// RunHLCLeaseRenewal runs a background loop that periodically proposes a new
+// physical ceiling to the Raft cluster while this node is the leader.
+//
+// The ceiling is set to now + hlcPhysicalWindowMs (3 s) and is renewed every
+// hlcRenewalInterval (1 s), mirroring TiDB's TSO window strategy. Because the
+// window is always at least 2 s ahead of any real timestamp, a new leader will
+// never issue timestamps that overlap with the previous leader's window.
+//
+// RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
+func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
+	// Use a Timer rather than a Ticker so the next renewal is scheduled
+	// relative to the completion of the previous one. This prevents a burst
+	// of back-to-back proposals if ProposeHLCLease stalls (e.g. waiting for
+	// Raft quorum during a slow leader election).
+	timer := time.NewTimer(hlcRenewalInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			if c.IsLeader() {
+				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
+					c.log.WarnContext(ctx, "hlc lease renewal failed",
+						slog.Int64("ceiling_ms", ceilingMs),
+						slog.Any("err", err),
+					)
+				}
+			}
+			timer.Reset(hlcRenewalInterval)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *Coordinate) IsLeaderForKey(_ []byte) bool {

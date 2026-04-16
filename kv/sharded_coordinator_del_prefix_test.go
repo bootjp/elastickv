@@ -270,11 +270,11 @@ func TestShardedCoordinator_DelPrefixIntegration(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "dp-g1", NewKvFSM(s1))
+	r1, stop1 := newSingleRaft(t, "dp-g1", NewKvFSMWithHLC(s1, NewHLC()))
 	t.Cleanup(stop1)
 
 	s2 := store.NewMVCCStore()
-	r2, stop2 := newSingleRaft(t, "dp-g2", NewKvFSM(s2))
+	r2, stop2 := newSingleRaft(t, "dp-g2", NewKvFSMWithHLC(s2, NewHLC()))
 	t.Cleanup(stop2)
 
 	e1 := hashicorpraftengine.New(r1)
@@ -338,7 +338,7 @@ func TestShardedCoordinator_DelPrefixPreservesTxnKeys(t *testing.T) {
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	s1 := store.NewMVCCStore()
-	r1, stop1 := newSingleRaft(t, "dp-txn-g1", NewKvFSM(s1))
+	r1, stop1 := newSingleRaft(t, "dp-txn-g1", NewKvFSMWithHLC(s1, NewHLC()))
 	t.Cleanup(stop1)
 
 	e1 := hashicorpraftengine.New(r1)

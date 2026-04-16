@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
@@ -110,4 +111,43 @@ func TestRedisTxnMULTIEXECRetriesOnCoordinatorConflict(t *testing.T) {
 	val, err := st.GetAt(ctx, redisStrKey([]byte("txn:key")), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val)
+}
+
+// TestTxnStartTSUsesLastCommitTS verifies that txnStartTS returns
+// store.LastCommitTS() even when the HLC has advanced beyond the last applied
+// commit, preventing the lost-write anomaly described in the PR.
+// If txnStartTS returned clock.Next() instead, a concurrent write that obtained
+// commitTS = lastCommitTS could satisfy latestTS ≤ startTS, silently passing
+// the FSM conflict check and causing a lost write.
+func TestTxnStartTSUsesLastCommitTS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+
+	// Advance the store's LastCommitTS to a known value.
+	const appliedTS = uint64(5)
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v"), appliedTS, 0))
+	require.Equal(t, appliedTS, st.LastCommitTS())
+
+	// Advance the HLC well past the applied commit timestamp to simulate
+	// the window where clock.Next() is ahead of unapplied Raft entries.
+	clock := kv.NewHLC()
+	clock.Observe(100)
+	// Verify the clock is ahead of the store watermark.
+	require.Greater(t, clock.Next(), appliedTS)
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock = clock
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+
+	// txnStartTS must return store.LastCommitTS(), not the HLC value.
+	startTS := srv.txnStartTS()
+	require.Equal(t, appliedTS, startTS,
+		"txnStartTS must equal store.LastCommitTS() to prevent lost-write anomaly")
 }

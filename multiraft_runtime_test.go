@@ -33,7 +33,7 @@ func TestBuildRuntimeForGroupBootstrap(t *testing.T) {
 	require.NoError(t, err)
 
 	st := store.NewMVCCStore()
-	sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSM(st))
+	sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSMWithHLC(st, kv.NewHLC()))
 
 	runtime, err := buildRuntimeForGroup(
 		"n1",
@@ -87,7 +87,8 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 
 	factory, err := newRaftFactory(raftEngineEtcd)
 	require.NoError(t, err)
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil)
+	clock := kv.NewHLC()
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil, clock)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -102,7 +103,7 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 		}
 	})
 
-	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, kv.NewHLC(), shardStore)
+	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, clock, shardStore)
 	_, err = coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: []byte("b"), Value: []byte("left")},
@@ -137,17 +138,18 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
+	sharedClock := kv.NewHLC()
 	openShardStore := func() ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
 		factory, err := newRaftFactory(raftEngineEtcd)
 		require.NoError(t, err)
-		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil)
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil, sharedClock)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore
 	}
 
 	runtimes, shardGroups, shardStore := openShardStore()
-	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, kv.NewHLC(), shardStore)
+	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, sharedClock, shardStore)
 
 	_, err := coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
 		Elems: []*kv.Elem[kv.OP]{

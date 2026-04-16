@@ -49,6 +49,7 @@ var (
 	raftBootstrap  = flag.Bool("raftBootstrap", false, "Bootstrap cluster")
 	raftRedisMap   = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map      = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
+	raftDynamoMap  = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 )
 
 const (
@@ -85,6 +86,7 @@ type config struct {
 	raftBootstrap  bool
 	raftRedisMap   string
 	raftS3Map      string
+	raftDynamoMap  string
 }
 
 func main() {
@@ -111,6 +113,7 @@ func main() {
 			raftBootstrap:  *raftBootstrap,
 			raftRedisMap:   *raftRedisMap,
 			raftS3Map:      *raftS3Map,
+			raftDynamoMap:  *raftDynamoMap,
 		}
 		if err := run(runCtx, eg, cfg); err != nil {
 			slog.Error(err.Error())
@@ -169,19 +172,23 @@ func main() {
 			},
 		}
 
-		// Build raftRedisMap/raftS3Map strings.
+		// Build raftRedisMap/raftS3Map/raftDynamoMap strings.
 		var redisMapParts []string
 		var s3MapParts []string
+		var dynamoMapParts []string
 		for _, n := range nodes {
 			redisMapParts = append(redisMapParts, n.address+"="+n.redisAddress)
 			s3MapParts = append(s3MapParts, n.address+"="+n.s3Address)
+			dynamoMapParts = append(dynamoMapParts, n.address+"="+n.dynamoAddress)
 		}
 		raftRedisMapStr := strings.Join(redisMapParts, ",")
 		raftS3MapStr := strings.Join(s3MapParts, ",")
+		raftDynamoMapStr := strings.Join(dynamoMapParts, ",")
 
 		for _, n := range nodes {
 			n.raftRedisMap = raftRedisMapStr
 			n.raftS3Map = raftS3MapStr
+			n.raftDynamoMap = raftDynamoMapStr
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
@@ -485,6 +492,28 @@ func setupS3(
 	), nil
 }
 
+func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, dynamoAddr, raftDynamoMapStr string, observer monitoring.DynamoDBRequestObserver) (*adapter.DynamoDBServer, error) {
+	leaderDynamo := make(map[raft.ServerAddress]string)
+	if raftDynamoMapStr != "" {
+		for part := range strings.SplitSeq(raftDynamoMapStr, ",") {
+			pair := strings.SplitN(part, "=", kvParts)
+			if len(pair) == kvParts {
+				leaderDynamo[raft.ServerAddress(pair[0])] = pair[1]
+			}
+		}
+	}
+	leaderDynamo[raft.ServerAddress(addr)] = dynamoAddr
+	l, err := lc.Listen(ctx, "tcp", dynamoAddr)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
+	return adapter.NewDynamoDBServer(l, routedStore, coordinator,
+		adapter.WithDynamoDBRequestObserver(observer),
+		adapter.WithDynamoDBLeaderMap(leaderDynamo),
+	), nil
+}
+
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 	cleanup := internalutil.CleanupStack{}
@@ -495,7 +524,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 	cleanup.Add(func() { st.Close() })
-	fsm := kv.NewKvFSM(st)
+	hlc := kv.NewHLC()
+	fsm := kv.NewKvFSMWithHLC(st, hlc)
 	readTracker := kv.NewActiveTimestampTracker()
 
 	// Config
@@ -523,7 +553,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
 	engine := hashicorpraftengine.New(r)
 	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
-	coordinator := kv.NewCoordinatorWithEngine(trx, engine)
+	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
@@ -570,17 +600,10 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		return err
 	}
 	cleanup.Add(s3s.Stop)
-	dynamoL, err := lc.Listen(ctx, "tcp", cfg.dynamoAddress)
+	ds, err := setupDynamo(ctx, lc, st, coordinator, cfg.address, cfg.dynamoAddress, cfg.raftDynamoMap, metricsRegistry.DynamoDBObserver())
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
-	dynamoRoutedStore := kv.NewLeaderRoutedStore(st, coordinator)
-	ds := adapter.NewDynamoDBServer(
-		dynamoL,
-		dynamoRoutedStore,
-		coordinator,
-		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
-	)
 	cleanup.Add(ds.Stop)
 	metricsL, ms, pprofL, ps, err := setupObservabilityServers(ctx, lc, &cleanup, cfg, metricsRegistry.Handler())
 	if err != nil {
@@ -589,6 +612,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	deltaCompactor := adapter.NewDeltaCompactor(st, coordinator)
 
+	eg.Go(func() error { coordinator.RunHLCLeaseRenewal(ctx); return nil })
 	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
 	eg.Go(func() error { return compactor.Run(ctx) })
 	eg.Go(func() error { return deltaCompactor.Run(ctx) })

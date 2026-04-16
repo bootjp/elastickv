@@ -16,10 +16,15 @@ import (
 	"google.golang.org/grpc"
 )
 
-const defaultSnapshotChunkSize = 1 << 20
+const defaultSnapshotChunkSize = 16 << 20
 
 const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
+
+// defaultBridgeMaterializeLimit caps the number of bridge-mode snapshot
+// materializations that may hold memory concurrently. Each call allocates up
+// to fsmMaxInMemPayload; limiting concurrency bounds the aggregate allocation.
+const defaultBridgeMaterializeLimit = 1
 
 var (
 	errTransportPeerUnknown      = errors.New("etcd raft peer is not configured")
@@ -44,7 +49,18 @@ type GRPCTransport struct {
 	handler           MessageHandler
 	snapshotChunkSize int
 	spoolDir          string
-	dialGroup         singleflight.Group
+	fsmSnapDir        string
+	// readFSMPayload is the fallback bridge callback that materialises the full
+	// FSM payload into memory. Used only when openFSMPayload is not set.
+	readFSMPayload func(index uint64) ([]byte, error)
+	// openFSMPayload is the preferred bridge callback that opens the .fsm file
+	// for streaming without allocating a large buffer.
+	openFSMPayload func(index uint64) (io.ReadCloser, error)
+	dialGroup      singleflight.Group
+	// bridgeSem limits concurrent bridge-mode snapshot materializations so
+	// that aggregate in-memory allocation stays bounded even when multiple
+	// dispatch workers run simultaneously.
+	bridgeSem chan struct{}
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -66,6 +82,7 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		clients:           make(map[string]pb.EtcdRaftClient),
 		conns:             make(map[string]*grpc.ClientConn),
 		snapshotChunkSize: defaultSnapshotChunkSize,
+		bridgeSem:         make(chan struct{}, defaultBridgeMaterializeLimit),
 	}
 }
 
@@ -92,6 +109,36 @@ func (t *GRPCTransport) SetSpoolDir(dir string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.spoolDir = dir
+}
+
+func (t *GRPCTransport) SetFSMSnapDir(dir string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fsmSnapDir = dir
+}
+
+func (t *GRPCTransport) SetFSMPayloadReader(fn func(index uint64) ([]byte, error)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.readFSMPayload = fn
+}
+
+// SetFSMPayloadOpener registers the callback used by the bridge mode to stream
+// FSM snapshot payloads directly from disk without materialising the full
+// payload in memory.
+func (t *GRPCTransport) SetFSMPayloadOpener(fn func(index uint64) (io.ReadCloser, error)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.openFSMPayload = fn
 }
 
 func (t *GRPCTransport) UpsertPeer(peer Peer) {
@@ -158,11 +205,120 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 	if t == nil {
 		return nil
 	}
-	if msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0) {
-		ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
-		defer cancel()
-		return t.sendSnapshot(ctx, msg)
+	if isSnapshotMsg(msg) {
+		return t.dispatchSnapshot(ctx, msg)
 	}
+	return t.dispatchRegular(ctx, msg)
+}
+
+func isSnapshotMsg(msg raftpb.Message) bool {
+	return msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0)
+}
+
+func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message) error {
+	ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
+	defer cancel()
+
+	// Prefer streaming when the snapshot holds a token and an opener is wired.
+	// This avoids materialising the full FSM payload in memory on the sender.
+	if msg.Snapshot != nil && isSnapshotToken(msg.Snapshot.Data) {
+		t.mu.RLock()
+		openFn := t.openFSMPayload
+		t.mu.RUnlock()
+		if openFn != nil {
+			tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			return t.streamFSMSnapshot(ctx, msg, tok.Index, openFn)
+		}
+	}
+
+	// Fallback: materialise the payload (no opener wired, or non-token snapshot).
+	patched, err := t.applyBridgeMode(ctx, msg)
+	if err != nil {
+		return err
+	}
+	return t.sendSnapshot(ctx, patched)
+}
+
+// streamFSMSnapshot streams the .fsm payload file directly to the peer using
+// chunked gRPC without loading the full content into memory.
+func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Message, index uint64, openFn func(uint64) (io.ReadCloser, error)) error {
+	rc, err := openFn(index)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := rc.Close(); closeErr != nil {
+			slog.Warn("failed to close FSM snapshot reader", "index", index, "error", closeErr)
+		}
+	}()
+
+	header, err := snapshotMessageHeader(msg)
+	if err != nil {
+		return err
+	}
+	client, err := t.clientFor(msg.To)
+	if err != nil {
+		return err
+	}
+	stream, err := client.SendSnapshot(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := sendSnapshotReaderChunks(stream, header, rc, t.chunkSize()); err != nil {
+		return err
+	}
+	_, err = stream.CloseAndRecv()
+	return errors.WithStack(err)
+}
+
+// applyBridgeMode implements the Phase 1 bridge: when MemoryStorage holds a
+// token, the .fsm file is read back into []byte so all receivers (including
+// legacy nodes that predate Phase 2) get a standard full-payload MsgSnap.
+// This allocation is transient — freed after the send — and only occurs when
+// a slow follower needs a snapshot, not on every periodic creation.
+//
+// bridgeSem caps the number of concurrent materializations so that aggregate
+// in-memory allocation stays bounded across all dispatch workers.
+func (t *GRPCTransport) applyBridgeMode(ctx context.Context, msg raftpb.Message) (raftpb.Message, error) {
+	if msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+		return msg, nil
+	}
+	t.mu.RLock()
+	readFn := t.readFSMPayload
+	t.mu.RUnlock()
+	if readFn == nil {
+		return msg, nil
+	}
+
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	if err != nil {
+		return msg, errors.WithStack(err)
+	}
+
+	// Acquire the bridge semaphore before allocating the payload buffer.
+	// Block until a slot is available or the dispatch context is cancelled.
+	select {
+	case t.bridgeSem <- struct{}{}:
+		defer func() { <-t.bridgeSem }()
+	case <-ctx.Done():
+		return msg, errors.WithStack(ctx.Err())
+	}
+
+	payload, err := readFn(tok.Index)
+	if err != nil {
+		return msg, errors.WithStack(err)
+	}
+
+	snapCopy := *msg.Snapshot
+	snapCopy.Data = payload
+	msg.Snapshot = &snapCopy
+	return msg, nil
+}
+
+func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message) error {
 	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
 	defer cancel()
 
@@ -381,7 +537,15 @@ func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []by
 	current, err := readSnapshotChunk(buffered, chunkSize)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header, Final: true})
+			// The entire payload fit in one read (or reader was empty).
+			// current may be nil for an empty reader, or the full payload for
+			// a small snapshot. Include it so the receiver does not get an
+			// empty snapshot.Data.
+			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
+				Metadata: header,
+				Chunk:    current,
+				Final:    true,
+			})
 		}
 		return errors.WithStack(err)
 	}
@@ -479,6 +643,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	t.mu.RLock()
 	spoolDir := t.spoolDir
 	t.mu.RUnlock()
+
 	spool, err := newSnapshotSpool(spoolDir)
 	if err != nil {
 		return raftpb.Message{}, err

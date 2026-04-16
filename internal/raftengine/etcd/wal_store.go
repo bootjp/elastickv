@@ -30,59 +30,88 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	logger := zap.NewNop()
 	walDir := filepath.Join(cfg.DataDir, walDirName)
 	snapDir := filepath.Join(cfg.DataDir, snapDirName)
+	fsmSnapDir := filepath.Join(cfg.DataDir, fsmSnapDirName)
 
-	if err := os.MkdirAll(cfg.DataDir, defaultDirPerm); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if err := os.MkdirAll(snapDir, defaultDirPerm); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	if err := cleanupStaleSnapshotSpools(cfg.DataDir); err != nil {
-		return nil, errors.Wrap(err, "cleanup stale snapshot spools")
+	if err := prepareDataDirs(cfg.DataDir, snapDir, fsmSnapDir); err != nil {
+		return nil, err
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, cfg.StateMachine)
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
 	if legacyErr == nil {
-		return migrateLegacyState(logger, walDir, snapDir, cfg.StateMachine, legacy)
+		return migrateLegacyState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, legacy)
 	}
-	if legacyErr != nil && !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
+	if !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
 		return nil, legacyErr
 	}
 
+	return bootstrapNewCluster(logger, walDir, snapDir, fsmSnapDir, cfg, peers)
+}
+
+func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
+	if err := os.MkdirAll(dataDir, defaultDirPerm); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := os.MkdirAll(snapDir, defaultDirPerm); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := cleanupStaleSnapshotSpools(dataDir); err != nil {
+		return errors.Wrap(err, "cleanup stale snapshot spools")
+	}
+	// Startup CRC verification is disabled by default: for GiB-scale snapshots
+	// reading the entire file to compute a checksum can add seconds to recovery
+	// time. Orphan removal (index-based) still runs unconditionally. CRC
+	// integrity is enforced at restore time by openAndRestoreFSMSnapshot.
+	if err := cleanupStaleFSMSnaps(snapDir, fsmSnapDir, true); err != nil {
+		return errors.Wrap(err, "cleanup stale fsm snapshots")
+	}
+	return nil
+}
+
+func bootstrapNewCluster(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, cfg OpenConfig, peers []Peer) (*diskState, error) {
 	if len(peers) == 1 {
-		return bootstrapWalState(logger, walDir, snapDir, cfg.StateMachine, peers)
+		return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers)
 	}
 	if !cfg.Bootstrap {
-		return joinWalState(logger, walDir, snapDir)
+		return joinWalState(logger, walDir, snapDir, fsmSnapDir)
 	}
-	return bootstrapWalState(logger, walDir, snapDir, cfg.StateMachine, peers)
+	return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers)
 }
 
-func joinWalState(logger *zap.Logger, walDir string, snapDir string) (*diskState, error) {
-	return persistBootState(logger, walDir, snapDir, nil, persistedState{})
+func joinWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string) (*diskState, error) {
+	return persistBootState(logger, walDir, snapDir, fsmSnapDir, nil, persistedState{})
 }
 
-func bootstrapWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
-	snapshotData, err := stateMachineSnapshotBytes(fsm, snapDir)
+func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
+	// Bootstrap snapshot always has index 1.
+	const bootstrapIndex = uint64(1)
+	snapshot, err := fsm.Snapshot()
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	boot := bootstrapStateForPeers(peers, snapshotData)
-	return persistBootState(logger, walDir, snapDir, fsm, boot)
+	crc32c, writeErr := writeFSMSnapshotFile(snapshot, fsmSnapDir, bootstrapIndex)
+	closeErr := snapshot.Close()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, errors.WithStack(closeErr)
+	}
+	token := encodeSnapshotToken(bootstrapIndex, crc32c)
+	boot := bootstrapStateForPeers(peers, token)
+	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot)
 }
 
-func loadWalState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine) (*diskState, error) {
+func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine) (*diskState, error) {
 	snapshotter := snap.New(logger, snapDir)
 	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
 	if err != nil {
 		return nil, err
 	}
-	if err := restoreSnapshotState(fsm, snapshot); err != nil {
+	if err := restoreSnapshotState(fsm, snapshot, fsmSnapDir); err != nil {
 		return nil, err
 	}
 
@@ -130,13 +159,19 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot) error {
-	if !etcdraft.IsEmptySnap(snapshot) && len(snapshot.Data) > 0 && fsm != nil {
-		if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
-			return errors.WithStack(err)
-		}
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir string) error {
+	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
+		return nil
 	}
-	return nil
+	if isSnapshotToken(snapshot.Data) {
+		tok, err := decodeSnapshotToken(snapshot.Data)
+		if err != nil {
+			return err
+		}
+		return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
+	}
+	// Legacy format: full FSM payload embedded in snapshot.Data.
+	return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
 }
 
 func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
@@ -147,21 +182,51 @@ func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
 	}
 }
 
-func migrateLegacyState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
+func migrateLegacyState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
 	if !etcdraft.IsEmptySnap(state.Snapshot) && len(state.Snapshot.Data) > 0 {
-		if err := fsm.Restore(bytes.NewReader(state.Snapshot.Data)); err != nil {
-			return nil, errors.WithStack(err)
+		token, err := restoreAndOffloadLegacySnapshot(fsm, fsmSnapDir, state.Snapshot)
+		if err != nil {
+			return nil, err
 		}
+		state.Snapshot.Data = token
 	}
-	return persistBootState(logger, walDir, snapDir, fsm, state)
+	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, state)
 }
 
-func persistBootState(logger *zap.Logger, walDir string, snapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
+// restoreAndOffloadLegacySnapshot restores the FSM from a legacy full-payload
+// snapshot and, when fsmSnapDir is non-empty, eagerly converts the payload to
+// the disk-offloaded EKVT token format so the WAL no longer carries GiB-scale
+// blobs after the first startup following a HashiCorp → etcd migration.
+// Returns the token bytes (or the original Data slice when fsmSnapDir is empty).
+func restoreAndOffloadLegacySnapshot(fsm StateMachine, fsmSnapDir string, snap raftpb.Snapshot) ([]byte, error) {
+	if err := fsm.Restore(bytes.NewReader(snap.Data)); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if fsmSnapDir == "" {
+		return snap.Data, nil
+	}
+	index := snap.Metadata.Index
+	fsmSnap, err := fsm.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	crc32c, writeErr := writeFSMSnapshotFile(fsmSnap, fsmSnapDir, index)
+	closeErr := fsmSnap.Close()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, errors.WithStack(closeErr)
+	}
+	return encodeSnapshotToken(index, crc32c), nil
+}
+
+func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
 	if err := ensureWalDirs(walDir, snapDir); err != nil {
 		return nil, err
 	}
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsm)
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm)
 	}
 
 	w, err := wal.Create(logger, walDir, nil)
@@ -212,14 +277,9 @@ func saveBootstrapState(persist etcdstorage.Storage, state persistedState) error
 	return nil
 }
 
-func stateMachineSnapshotBytes(fsm StateMachine, spoolDir string) (data []byte, err error) {
-	snapshot, err := fsm.Snapshot()
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return snapshotBytesAndClose(snapshot, spoolDir)
-}
-
+// snapshotBytesAndClose materializes a Snapshot as []byte via disk spooling.
+// Retained for the legacy migration path (migrateLegacyState) where the old
+// format is still used. New code should call writeFSMSnapshotFile instead.
 func snapshotBytesAndClose(snapshot Snapshot, spoolDir string) (data []byte, err error) {
 	defer func() {
 		err = errors.CombineErrors(err, errors.WithStack(snapshot.Close()))
@@ -340,44 +400,10 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 	return snapshot, nil
 }
 
-// defaultMaxSnapFiles is the number of .snap files to retain in the snap
-// directory. etcd itself purges old snap files via fileutil.PurgeFile; the
-// elastickv etcd engine must do this explicitly.
+// defaultMaxSnapFiles is the number of .snap/.fsm file pairs to retain.
+// etcd itself purges old snap files via fileutil.PurgeFile; the elastickv
+// etcd engine must do this explicitly, coordinating with .fsm files.
 const defaultMaxSnapFiles = 3
-
-// purgeOldSnapFiles removes old .snap files from snapDir, keeping the most
-// recent defaultMaxSnapFiles files. Snap file names encode term and index in
-// hex and sort lexicographically from oldest to newest, matching etcd's
-// Snapshotter convention.
-func purgeOldSnapFiles(snapDir string) error {
-	entries, err := os.ReadDir(snapDir)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	var snaps []string
-	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".snap" {
-			snaps = append(snaps, e.Name())
-		}
-	}
-
-	if len(snaps) <= defaultMaxSnapFiles {
-		return nil
-	}
-
-	// snaps is already sorted ascending (oldest first) because os.ReadDir
-	// returns entries in directory order which, for zero-padded hex names,
-	// equals chronological order.
-
-	var combined error
-	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
-		if removeErr := os.Remove(filepath.Join(snapDir, name)); removeErr != nil && !os.IsNotExist(removeErr) {
-			combined = errors.CombineErrors(combined, errors.WithStack(removeErr))
-		}
-	}
-	return errors.WithStack(combined)
-}
 
 func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
 	_, confState, err := storage.InitialState()

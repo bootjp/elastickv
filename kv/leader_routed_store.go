@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -258,6 +259,39 @@ func (s *LeaderRoutedStore) LastCommitTS() uint64 {
 		return 0
 	}
 	return s.local.LastCommitTS()
+}
+
+const globalLastCommitTSTimeout = 200 * time.Millisecond
+
+// GlobalLastCommitTS returns the most recently committed HLC timestamp from
+// the authoritative leader.  On the leader this is the local LastCommitTS.
+// On a follower the method issues a lightweight RPC (RawLatestCommitTS with
+// an empty key) so callers obtain a non-stale snapshot — critical for
+// ConsistentRead semantics where followers must not serve reads at a stale
+// local watermark.  Falls back to the local LastCommitTS on any error.
+func (s *LeaderRoutedStore) GlobalLastCommitTS(ctx context.Context) uint64 {
+	if s == nil || s.local == nil {
+		return 0
+	}
+	if s.coordinator == nil || s.coordinator.IsLeader() {
+		return s.local.LastCommitTS()
+	}
+	addr := s.coordinator.RaftLeader()
+	if addr == "" {
+		return s.local.LastCommitTS()
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return s.local.LastCommitTS()
+	}
+	proxyCtx, cancel := context.WithTimeout(ctx, globalLastCommitTSTimeout)
+	defer cancel()
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawLatestCommitTS(proxyCtx, &pb.RawLatestCommitTSRequest{})
+	if err != nil || resp.GetTs() == 0 {
+		return s.local.LastCommitTS()
+	}
+	return resp.GetTs()
 }
 
 func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {

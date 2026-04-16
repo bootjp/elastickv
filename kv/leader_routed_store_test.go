@@ -261,3 +261,55 @@ func TestLeaderRoutedStore_ReturnsLeaderNotFoundWhenNoLeaderAddr(t *testing.T) {
 	_, _, err = s.LatestCommitTS(ctx, []byte("k"))
 	require.ErrorIs(t, err, ErrLeaderNotFound)
 }
+
+func TestLeaderRoutedStore_GlobalLastCommitTS_OnLeader(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 42, 0))
+
+	coord := &stubLeaderCoordinator{isLeader: true, clock: NewHLC()}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ts := s.GlobalLastCommitTS(ctx)
+	require.Equal(t, uint64(42), ts)
+}
+
+func TestLeaderRoutedStore_GlobalLastCommitTS_ProxiesToLeader(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		latestResp: &pb.RawLatestCommitTSResponse{Ts: 99, Exists: true},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
+	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ts := s.GlobalLastCommitTS(context.Background())
+	require.Equal(t, uint64(99), ts)
+
+	fake.mu.Lock()
+	require.Equal(t, 1, fake.latestCalls)
+	fake.mu.Unlock()
+}
+
+func TestLeaderRoutedStore_GlobalLastCommitTS_FallsBackWhenNoLeader(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 7, 0))
+
+	coord := &stubLeaderCoordinator{isLeader: false, leader: "", clock: NewHLC()}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// No leader address available → falls back to local LastCommitTS.
+	ts := s.GlobalLastCommitTS(ctx)
+	require.Equal(t, uint64(7), ts)
+}

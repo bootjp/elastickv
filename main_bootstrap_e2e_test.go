@@ -330,7 +330,7 @@ func startBootstrapE2ENode(
 	bootstrapMembers string,
 	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
-	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "")
+	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -345,15 +345,14 @@ func startBootstrapE2ENode(
 	if err != nil {
 		return nil, err
 	}
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil)
+	clock := kv.NewHLC()
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil, clock)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
-
-	clock := kv.NewHLC()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
 	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.engine)
