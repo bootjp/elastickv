@@ -271,6 +271,11 @@ type RedisServer struct {
 	leaderClientsMu sync.RWMutex
 	leaderClients   map[string]*redis.Client
 
+	// compactor is the background DeltaCompactor for this node. When set,
+	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
+	// reads on hot keys faster than the regular compaction interval.
+	compactor *DeltaCompactor
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -279,6 +284,14 @@ type RedisServerOption func(*RedisServer)
 func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisServerOption {
 	return func(r *RedisServer) {
 		r.readTracker = tracker
+	}
+}
+
+// WithRedisCompactor wires a DeltaCompactor to the RedisServer so that urgent
+// single-key compaction can be triggered when ErrDeltaScanTruncated is hit.
+func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
+	return func(r *RedisServer) {
+		r.compactor = c
 	}
 }
 
@@ -465,6 +478,14 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 		return nil
 	}
 	return r.readTracker.Pin(ts)
+}
+
+// triggerUrgentCompaction signals the DeltaCompactor to immediately compact
+// the given key, bypassing the regular interval. No-op when no compactor is wired.
+func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
+	if r.compactor != nil {
+		r.compactor.TriggerUrgentCompaction(typeName, key)
+	}
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
