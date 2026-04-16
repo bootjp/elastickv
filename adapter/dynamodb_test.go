@@ -587,7 +587,7 @@ func TestDynamoDB_TransactGetItems_SnapshotIsolation(t *testing.T) {
 
 	// Concurrent writer that keeps updating both keys atomically.
 	stopCh := make(chan struct{})
-	go runSnapshotWriter(ctx, client, stopCh)
+	go runSnapshotWriter(t, ctx, client, stopCh)
 	defer close(stopCh)
 
 	// Run TransactGetItems many times concurrently.
@@ -604,8 +604,12 @@ func TestDynamoDB_TransactGetItems_SnapshotIsolation(t *testing.T) {
 	}
 }
 
-// runSnapshotWriter continuously writes both snap_k1 and snap_k2 atomically until stopCh is closed.
-func runSnapshotWriter(ctx context.Context, client *dynamodb.Client, stopCh <-chan struct{}) {
+// runSnapshotWriter continuously writes both snap_k1 and snap_k2 atomically until
+// stopCh is closed. Unexpected errors (not TransactionCanceledException) are reported
+// via t.Errorf so the test fails rather than the writer exiting silently — a silent
+// exit would leave the database static and cause readers to pass vacuously.
+func runSnapshotWriter(t *testing.T, ctx context.Context, client *dynamodb.Client, stopCh <-chan struct{}) {
+	t.Helper()
 	for {
 		select {
 		case <-stopCh:
@@ -621,10 +625,11 @@ func runSnapshotWriter(ctx context.Context, client *dynamodb.Client, stopCh <-ch
 					}}},
 				},
 			})
-			// Transaction conflicts are expected under contention; only unexpected
-			// errors (non-TransactionCanceledException) indicate a real problem.
+			// TransactionCanceledException is expected under write contention; any
+			// other error is unexpected and must fail the test.
 			var txErr *types.TransactionCanceledException
 			if err != nil && !errors.As(err, &txErr) {
+				t.Errorf("runSnapshotWriter: unexpected TransactWriteItems error: %v", err)
 				return
 			}
 		}
