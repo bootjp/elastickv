@@ -247,7 +247,7 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
 
-	allElems := c.buildBatchElems(ctx, h, byKey, readTS)
+	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
 
 	if err := c.dispatchCompaction(ctx, readTS, allElems); err != nil {
 		c.logger.WarnContext(ctx, "delta compactor: batch dispatch failed",
@@ -315,10 +315,18 @@ func (c *DeltaCompactor) splitGuardCursor(byKey map[string][]*store.KVPair, ukOr
 }
 
 // buildBatchElems builds OCC elems for all user keys in byKey that meet the
+// delta threshold. ukOrder gives the lexicographic scan order so that
+// compaction is deterministic and has good I/O locality regardless of Go's
+// random map iteration. Keys removed from byKey by splitGuardCursor are
+// skipped via the presence check.
 // compaction threshold, logging and skipping keys whose build fails.
-func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaHandler, byKey map[string][]*store.KVPair, readTS uint64) []*kv.Elem[kv.OP] {
+func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaHandler, byKey map[string][]*store.KVPair, ukOrder []string, readTS uint64) []*kv.Elem[kv.OP] {
 	var allElems []*kv.Elem[kv.OP]
-	for ukStr, deltaKVs := range byKey {
+	for _, ukStr := range ukOrder {
+		deltaKVs, ok := byKey[ukStr]
+		if !ok {
+			continue // removed by splitGuardCursor
+		}
 		if len(deltaKVs) < c.maxCount {
 			continue
 		}
@@ -416,23 +424,26 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	if err != nil {
 		return nil, err
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
-	elems = append(elems, metaElem)
-	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+
+	// Pre-fetch stale claim keys before allocating elems so the initial
+	// capacity covers both delta deletes and claim GC entries, avoiding
+	// slice reallocations when the claim list is large.
+	claimElems, claimErr := c.collectStaleClaimElems(ctx, userKey, newMeta, readTS)
+	if claimErr != nil {
+		c.logger.WarnContext(ctx, "delta compactor: claim key GC scan failed; skipping",
+			"key", string(userKey), "error", claimErr)
+		claimElems = nil
 	}
 
 	// GC stale claim keys produced by LPOP/RPOP. Claim keys outside the
 	// current [Head, Tail) window will never again be needed for OCC
 	// conflict detection and can be deleted safely.
-	claimElems, err := c.collectStaleClaimElems(ctx, userKey, newMeta, readTS)
-	if err != nil {
-		c.logger.WarnContext(ctx, "delta compactor: claim key GC scan failed; skipping",
-			"key", string(userKey), "error", err)
-	} else {
-		elems = append(elems, claimElems...)
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs)+len(claimElems))
+	elems = append(elems, metaElem)
+	for _, d := range deltaKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
 	}
-	return elems, nil
+	return append(elems, claimElems...), nil
 }
 
 // collectStaleClaimElems returns Del elems for claim keys that lie outside the

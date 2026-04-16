@@ -1338,13 +1338,16 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		}
 
 		commitTS := r.coordinator.Clock().Next()
-		elems := make([]*kv.Elem[kv.OP], 0, len(args)/redisPairWidth+setWideColOverhead)
 
 		// Atomically migrate any legacy blob on first wide-column write.
+		// Fetch migration elems before allocating the main elems slice so that
+		// the initial capacity accounts for both migration and field Put ops,
+		// avoiding a reallocation when a legacy blob is present.
 		migrationElems, err := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
+		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(args)/redisPairWidth+setWideColOverhead)
 		elems = append(elems, migrationElems...)
 
 		// Bulk-scan existing fields once so buildHashFieldElems can check
