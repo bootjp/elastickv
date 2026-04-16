@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -191,8 +192,13 @@ func TestDeltaCompactor_ZSetDeltaFoldedIntoBaseMeta(t *testing.T) {
 func TestDeltaCompactor_NonLeaderSkips(t *testing.T) {
 	t.Parallel()
 
+	// Use a real (writing) coordinator so that if compaction were incorrectly
+	// dispatched the delta keys would actually be deleted, making the assertion
+	// meaningful. The stub's IsLeaderForKey returns false to simulate a follower.
 	st := store.NewMVCCStore()
-	coord := &stubAdapterCoordinator{leaderSet: true, leader: false}
+	coord := newLocalAdapterCoordinator(st)
+	coord.leaderSet = true
+	coord.leader = false
 	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(1))
 	ctx := context.Background()
 
@@ -206,7 +212,7 @@ func TestDeltaCompactor_NonLeaderSkips(t *testing.T) {
 	require.NoError(t, c.SyncOnce(ctx))
 
 	readTS := st.LastCommitTS()
-	// Delta keys must NOT be touched since this node is not the leader.
+	// Delta keys must NOT be touched since this node is not the per-key leader.
 	_, getErr := st.GetAt(ctx, d1Key, readTS)
 	require.NoError(t, getErr, "non-leader should not compact delta keys")
 }
@@ -240,4 +246,108 @@ func TestDeltaCompactor_ListNoBaseMeta(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	_, err = st.GetAt(ctx, d2Key, readTS)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+// TestDeltaCompactor_UrgentCompactionTriggeredByChannel verifies that a request
+// queued via TriggerUrgentCompaction is processed by the Run loop, compacting
+// the targeted key without waiting for the next regular tick.
+//
+// maxCount is set high so the regular SyncOnce pass skips the key, ensuring it
+// is the urgent path that performs the actual compaction.
+func TestDeltaCompactor_UrgentCompactionTriggeredByChannel(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	// High maxCount ensures SyncOnce does not compact our key; only the urgent path will.
+	const hugeMaxCount = 1<<31 - 1
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(hugeMaxCount))
+	ctx := context.Background()
+	userKey := []byte("urgent-hash-key")
+
+	// Write base meta: Len=5.
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(userKey), store.MarshalHashMeta(store.HashMeta{Len: 5}), 1, 0))
+
+	// Write 3 delta keys (LenDelta=+1 each). These are below hugeMaxCount so SyncOnce
+	// skips them; TriggerUrgentCompaction must be what kicks off compaction.
+	delta := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
+	for i := uint64(0); i < 3; i++ {
+		dKey := store.HashMetaDeltaKey(userKey, 10+i, 0)
+		require.NoError(t, st.PutAt(ctx, dKey, delta, 10+i, 0))
+	}
+
+	// Queue the urgent compaction request.
+	c.TriggerUrgentCompaction("hash", userKey)
+
+	// Start the Run loop; it runs SyncOnce (skips the key) then drains the urgent channel.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = c.Run(runCtx) }()
+
+	// Wait until the base meta reflects the compacted value (5 + 3 = 8).
+	require.Eventually(t, func() bool {
+		readTS := st.LastCommitTS()
+		raw, err := st.GetAt(ctx, store.HashMetaKey(userKey), readTS)
+		if err != nil {
+			return false
+		}
+		got, err := store.UnmarshalHashMeta(raw)
+		return err == nil && got.Len == 8
+	}, 2*time.Second, 10*time.Millisecond, "urgent compaction should have updated the hash meta to Len=8")
+}
+
+// TestDeltaCompactor_UrgentCompactionPagination verifies that when a key has
+// more than MaxDeltaScanLimit delta keys, compactUrgentKey loops until all
+// batches are compacted, leaving the key readable.
+//
+// maxCount is set to MaxInt so the regular SyncOnce pass skips the key
+// (threshold not met), ensuring only the urgent path exercises the pagination loop.
+func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	// Use a very high maxCount so SyncOnce never compacts our test key, forcing
+	// the urgent path to handle all batches via the pagination loop.
+	const hugeMaxCount = 1<<31 - 1
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(hugeMaxCount))
+	ctx := context.Background()
+	userKey := []byte("overflow-hash-key")
+
+	// Write more than MaxDeltaScanLimit delta keys so that a single-pass scan
+	// (capped at MaxDeltaScanLimit+1) leaves some unconsumed, requiring pagination.
+	// Use a typed constant to avoid int->uint64 overflow warnings.
+	const totalDeltasU64 = uint64(store.MaxDeltaScanLimit + 10) // 1034
+	delta := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
+	for i := uint64(0); i < totalDeltasU64; i++ {
+		dKey := store.HashMetaDeltaKey(userKey, i+1, 0)
+		require.NoError(t, st.PutAt(ctx, dKey, delta, i+1, 0))
+	}
+
+	// Queue and process the urgent compaction.
+	c.TriggerUrgentCompaction("hash", userKey)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = c.Run(runCtx) }()
+
+	// Wait until the base meta holds the accumulated total.
+	// The pagination loop should take two passes: first 1025, then 9.
+	require.Eventually(t, func() bool {
+		readTS := st.LastCommitTS()
+		raw, err := st.GetAt(ctx, store.HashMetaKey(userKey), readTS)
+		if err != nil {
+			return false
+		}
+		got, err := store.UnmarshalHashMeta(raw)
+		return err == nil && got.Len == int64(totalDeltasU64)
+	}, 5*time.Second, 20*time.Millisecond, "all %d delta keys should be compacted into base meta", totalDeltasU64)
+
+	// No delta keys should remain after pagination compaction.
+	readTS := st.LastCommitTS()
+	prefix := store.HashMetaDeltaScanPrefix(userKey)
+	end := store.PrefixScanEnd(prefix)
+	remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
+	require.NoError(t, err)
+	require.Empty(t, remaining, "all delta keys must be deleted after urgent compaction")
 }

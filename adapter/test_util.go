@@ -379,7 +379,11 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, srv.Serve(lis))
 		}(s, grpcSock)
 
-		rd := NewRedisServer(redisSock, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay)
+		dc := NewDeltaCompactor(st, coordinator)
+		go func() { _ = dc.Run(opsCtx) }()
+		rd := NewRedisServer(redisSock, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay,
+			WithRedisCompactor(dc),
+		)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())
 		}(rd)

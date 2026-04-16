@@ -25,7 +25,17 @@ const (
 	// cursorNextByte is appended to the last-scanned key to produce an
 	// exclusive lower bound that skips past it on the next tick.
 	cursorNextByte = byte(0x00)
+
+	// urgentCompactionChanSize is the buffer size for the urgent compaction
+	// channel. Excess signals are dropped (the regular tick will catch them).
+	urgentCompactionChanSize = 64
 )
+
+// urgentCompactionRequest is a request to immediately compact a single key.
+type urgentCompactionRequest struct {
+	typeName string
+	userKey  []byte
+}
 
 // DeltaCompactor folds accumulated delta keys into their corresponding base
 // metadata keys for all wide-column collection types (List, Hash, Set, ZSet).
@@ -50,6 +60,12 @@ type DeltaCompactor struct {
 	// called from a test while Run is active).
 	cursorMu sync.Mutex
 	cursors  map[string][]byte
+
+	// urgentCh receives requests to immediately compact a single key whose
+	// delta count has exceeded MaxDeltaScanLimit, making reads fail. The Run
+	// loop drains this channel between regular ticks so hot keys are unblocked
+	// quickly without waiting for the next scheduled pass.
+	urgentCh chan urgentCompactionRequest
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -103,6 +119,7 @@ func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCo
 		interval: defaultDeltaCompactorScanInterval,
 		timeout:  defaultDeltaCompactorTimeout,
 		cursors:  make(map[string][]byte),
+		urgentCh: make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -123,6 +140,8 @@ func (c *DeltaCompactor) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case req := <-c.urgentCh:
+			c.compactUrgentKey(ctx, req)
 		case <-timer.C:
 			if err := c.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				c.logger.WarnContext(ctx, "delta compactor pass failed", "error", err)
@@ -132,7 +151,120 @@ func (c *DeltaCompactor) Run(ctx context.Context) error {
 	}
 }
 
-// SyncOnce runs one compaction pass. Non-leaders return immediately.
+// TriggerUrgentCompaction queues an immediate single-key compaction for a key
+// whose delta count has exceeded MaxDeltaScanLimit. The request is dropped
+// silently when the channel is full (the regular tick will catch it).
+func (c *DeltaCompactor) TriggerUrgentCompaction(typeName string, userKey []byte) {
+	if c == nil {
+		return
+	}
+	req := urgentCompactionRequest{typeName: typeName, userKey: bytes.Clone(userKey)}
+	select {
+	case c.urgentCh <- req:
+	default: // channel full; the regular tick will catch it
+	}
+}
+
+// handlerByTypeName returns the collectionDeltaHandler for the given typeName,
+// or nil if not found.
+func (c *DeltaCompactor) handlerByTypeName(typeName string) *collectionDeltaHandler {
+	for _, h := range c.allHandlers() {
+		if h.typeName == typeName {
+			h := h
+			return &h
+		}
+	}
+	return nil
+}
+
+// compactUrgentKey performs an immediate targeted compaction for a single user key
+// whose delta count exceeded MaxDeltaScanLimit. It repeatedly scans and dispatches
+// compaction batches until the delta count drops to or below MaxDeltaScanLimit,
+// restoring readability for the key. Each iteration uses a fresh readTS so that
+// it observes the committed result of the previous batch.
+// A recover guard prevents a panic inside a handler from crashing the Run loop.
+func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompactionRequest) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.logger.Error("DeltaCompactor: panic in urgent compaction",
+				slog.String("type", req.typeName),
+				slog.String("key", string(req.userKey)),
+				slog.Any("panic", rec))
+		}
+	}()
+	// Use per-key leadership so that in sharded deployments this node compacts
+	// keys for the shards it leads, not just those of the default Raft group.
+	if !c.coord.IsLeaderForKey(req.userKey) {
+		return
+	}
+	h := c.handlerByTypeName(req.typeName)
+	if h == nil {
+		return
+	}
+	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	prefix := h.deltaKeyPrefixFn(req.userKey)
+	end := store.PrefixScanEnd(prefix)
+	totalCompacted, done := 0, false
+	for !done {
+		var n int
+		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix, end)
+		totalCompacted += n
+		if n == 0 {
+			break
+		}
+	}
+	if totalCompacted > 0 {
+		c.logger.InfoContext(tickCtx, "delta compactor urgent: compacted key",
+			"type", req.typeName, "key", string(req.userKey), "total_delta_count", totalCompacted)
+	}
+}
+
+// compactUrgentKeyBatch scans one window of delta keys for req.userKey, builds
+// compaction elems, and dispatches the OCC transaction.
+// Returns (n, done): n is the number of delta keys processed in this batch;
+// done is true when the remaining delta count is at or below MaxDeltaScanLimit
+// (the key is now readable).
+func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix, end []byte) (int, bool) {
+	// Use a fresh readTS each iteration so we observe the committed state from
+	// the previous compaction pass and do not re-scan already-deleted delta keys.
+	readTS := snapshotTS(c.coord.Clock(), c.st)
+
+	// Scan one extra beyond MaxDeltaScanLimit to detect whether more remain.
+	kvs, err := c.st.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
+	if err != nil {
+		c.logger.WarnContext(ctx, "delta compactor urgent: scan failed",
+			"type", req.typeName, "key", string(req.userKey), "error", err)
+		return 0, true
+	}
+	if len(kvs) == 0 {
+		return 0, true
+	}
+
+	elems, err := h.buildElems(ctx, req.userKey, kvs, readTS)
+	if err != nil {
+		c.logger.WarnContext(ctx, "delta compactor urgent: buildElems failed",
+			"type", req.typeName, "key", string(req.userKey), "error", err)
+		return 0, true
+	}
+	if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
+		c.logger.WarnContext(ctx, "delta compactor urgent: dispatch failed",
+			"type", req.typeName, "key", string(req.userKey), "error", err)
+		return 0, true
+	}
+	// Fewer than MaxDeltaScanLimit+1 results means no more deltas remain; key is readable.
+	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
+}
+
+// SyncOnce runs one compaction pass. The IsLeader() guard avoids the
+// full-prefix delta scan on followers, which would proxy cross-node on
+// ShardStore backends. For sharded deployments where this node is the
+// leader for a non-default shard group, the regular tick is skipped; those
+// keys are still handled by the urgent compaction path (compactUrgentKey)
+// which uses IsLeaderForKey for per-key routing. buildBatchElems adds an
+// additional per-key IsLeaderForKey filter so a default-group leader never
+// dispatches mutations for shards it does not own.
 // Each collection-type handler runs in its own goroutine so that a slow
 // handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
 // compaction. All goroutines share the same per-tick timeout context.
@@ -178,7 +310,10 @@ type collectionDeltaHandler struct {
 	typeName       string
 	prefix         []byte
 	extractUserKey func(key []byte) []byte
-	buildElems     func(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error)
+	// deltaKeyPrefixFn returns the prefix that covers all delta keys for a single
+	// user key. Used by compactUrgentKey to perform a targeted single-key scan.
+	deltaKeyPrefixFn func(userKey []byte) []byte
+	buildElems       func(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error)
 }
 
 // allHandlers returns the compaction handlers for all wide-column collection types.
@@ -330,6 +465,12 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 			continue
 		}
 		userKey := []byte(ukStr)
+		// In sharded deployments IsLeaderForKey returns false for keys whose
+		// shard this node does not lead. Skip those to avoid dispatching a
+		// transaction that the responsible leader will reject.
+		if !c.coord.IsLeaderForKey(userKey) {
+			continue
+		}
 		elems, buildErr := h.buildElems(ctx, userKey, deltaKVs, readTS)
 		if buildErr != nil {
 			c.logger.WarnContext(ctx, "delta compactor: failed to build elems",
@@ -389,10 +530,11 @@ func sumListMetaDeltas(deltaKVs []*store.KVPair) (headDelta, lenDelta int64, err
 
 func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 	return collectionDeltaHandler{
-		typeName:       "list",
-		prefix:         []byte(store.ListMetaDeltaPrefix),
-		extractUserKey: store.ExtractListUserKeyFromDelta,
-		buildElems:     c.buildListCompactElems,
+		typeName:         "list",
+		prefix:           []byte(store.ListMetaDeltaPrefix),
+		extractUserKey:   store.ExtractListUserKeyFromDelta,
+		deltaKeyPrefixFn: store.ListMetaDeltaScanPrefix,
+		buildElems:       c.buildListCompactElems,
 	}
 }
 
@@ -494,20 +636,22 @@ func listMetaElemForLen(metaKey []byte, meta store.ListMeta) (*kv.Elem[kv.OP], e
 // Hash/Set/ZSet compaction handler. All three types carry only a LenDelta,
 // so a single factory (makeSimpleLenHandler) produces all three handlers.
 type simpleLenHandlerParams struct {
-	typeName       string
-	deltaPrefix    string
-	extractUserKey func(key []byte) []byte
-	metaKeyFn      func(userKey []byte) []byte
-	unmarshalBase  func([]byte) (int64, error)
-	unmarshalDelta func([]byte) (int64, error)
-	marshalBase    func(int64) []byte
+	typeName         string
+	deltaPrefix      string
+	extractUserKey   func(key []byte) []byte
+	deltaKeyPrefixFn func(userKey []byte) []byte
+	metaKeyFn        func(userKey []byte) []byte
+	unmarshalBase    func([]byte) (int64, error)
+	unmarshalDelta   func([]byte) (int64, error)
+	marshalBase      func(int64) []byte
 }
 
 func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collectionDeltaHandler {
 	return collectionDeltaHandler{
-		typeName:       p.typeName,
-		prefix:         []byte(p.deltaPrefix),
-		extractUserKey: p.extractUserKey,
+		typeName:         p.typeName,
+		prefix:           []byte(p.deltaPrefix),
+		extractUserKey:   p.extractUserKey,
+		deltaKeyPrefixFn: p.deltaKeyPrefixFn,
 		buildElems: func(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 			return c.buildSimpleCompactElems(ctx, userKey, deltaKVs, readTS,
 				p.metaKeyFn(userKey),
@@ -521,10 +665,11 @@ func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collecti
 
 func (c *DeltaCompactor) hashHandler() collectionDeltaHandler {
 	return c.makeSimpleLenHandler(simpleLenHandlerParams{
-		typeName:       "hash",
-		deltaPrefix:    store.HashMetaDeltaPrefix,
-		extractUserKey: store.ExtractHashUserKeyFromDelta,
-		metaKeyFn:      store.HashMetaKey,
+		typeName:         "hash",
+		deltaPrefix:      store.HashMetaDeltaPrefix,
+		extractUserKey:   store.ExtractHashUserKeyFromDelta,
+		deltaKeyPrefixFn: store.HashMetaDeltaScanPrefix,
+		metaKeyFn:        store.HashMetaKey,
 		unmarshalBase: func(b []byte) (int64, error) {
 			m, err := store.UnmarshalHashMeta(b)
 			return m.Len, errors.WithStack(err)
@@ -539,10 +684,11 @@ func (c *DeltaCompactor) hashHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) setHandler() collectionDeltaHandler {
 	return c.makeSimpleLenHandler(simpleLenHandlerParams{
-		typeName:       "set",
-		deltaPrefix:    store.SetMetaDeltaPrefix,
-		extractUserKey: store.ExtractSetUserKeyFromDelta,
-		metaKeyFn:      store.SetMetaKey,
+		typeName:         "set",
+		deltaPrefix:      store.SetMetaDeltaPrefix,
+		extractUserKey:   store.ExtractSetUserKeyFromDelta,
+		deltaKeyPrefixFn: store.SetMetaDeltaScanPrefix,
+		metaKeyFn:        store.SetMetaKey,
 		unmarshalBase: func(b []byte) (int64, error) {
 			m, err := store.UnmarshalSetMeta(b)
 			return m.Len, errors.WithStack(err)
@@ -557,10 +703,11 @@ func (c *DeltaCompactor) setHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) zsetHandler() collectionDeltaHandler {
 	return c.makeSimpleLenHandler(simpleLenHandlerParams{
-		typeName:       "zset",
-		deltaPrefix:    store.ZSetMetaDeltaPrefix,
-		extractUserKey: store.ExtractZSetUserKeyFromDelta,
-		metaKeyFn:      store.ZSetMetaKey,
+		typeName:         "zset",
+		deltaPrefix:      store.ZSetMetaDeltaPrefix,
+		extractUserKey:   store.ExtractZSetUserKeyFromDelta,
+		deltaKeyPrefixFn: store.ZSetMetaDeltaScanPrefix,
+		metaKeyFn:        store.ZSetMetaKey,
 		unmarshalBase: func(b []byte) (int64, error) {
 			m, err := store.UnmarshalZSetMeta(b)
 			return m.Len, errors.WithStack(err)
