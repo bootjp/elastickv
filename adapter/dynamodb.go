@@ -3933,23 +3933,9 @@ func decodeTransactWriteItemsInput(bodyReader io.Reader) (transactWriteItemsInpu
 // transactGetItems implements TransactGetItems: reads multiple items atomically
 // at a single snapshot timestamp, guaranteeing a consistent view across all keys.
 func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(maxDynamoBodyReader(w, r))
+	in, err := decodeTransactGetItemsInput(maxDynamoBodyReader(w, r))
 	if err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
-	}
-	var in transactGetItemsInput
-	if err := json.Unmarshal(body, &in); err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
-	}
-	if len(in.TransactItems) == 0 {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing transact items")
-		return
-	}
-	if len(in.TransactItems) > transactGetItemsMaxItems {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation,
-			"Too many items in TransactGetItems: "+strconv.Itoa(len(in.TransactItems))+" (max "+strconv.Itoa(transactGetItemsMaxItems)+")")
+		writeDynamoErrorFromErr(w, err)
 		return
 	}
 
@@ -3958,41 +3944,75 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 	pin := d.pinReadTS(readTS)
 	defer pin.Release()
 
-	// schemaCache avoids redundant storage reads when multiple items share the same table.
+	responses, err := d.buildTransactGetItemsResponses(r.Context(), in, readTS)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	writeDynamoJSON(w, map[string]any{"Responses": responses})
+}
+
+func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, error) {
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	var in transactGetItemsInput
+	if err := json.Unmarshal(body, &in); err != nil {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	if len(in.TransactItems) == 0 {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing transact items")
+	}
+	if len(in.TransactItems) > transactGetItemsMaxItems {
+		return transactGetItemsInput{}, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation,
+			"Too many items in TransactGetItems: "+strconv.Itoa(len(in.TransactItems))+" (max "+strconv.Itoa(transactGetItemsMaxItems)+")")
+	}
+	return in, nil
+}
+
+// buildTransactGetItemsResponses reads each requested item at the given readTS
+// and returns the ordered response list. schemaCache avoids redundant storage
+// reads when multiple items share the same table.
+func (d *DynamoDBServer) buildTransactGetItemsResponses(ctx context.Context, in transactGetItemsInput, readTS uint64) ([]map[string]any, error) {
 	schemaCache := make(map[string]*dynamoTableSchema)
 	responses := make([]map[string]any, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		if item.Get == nil {
-			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
-			return
-		}
-		g := item.Get
-		if strings.TrimSpace(g.TableName) == "" {
-			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
-			return
-		}
-		schema, err := d.resolveTransactTableSchema(r.Context(), schemaCache, g.TableName, readTS)
+		entry, err := d.readTransactGetItem(ctx, item, schemaCache, readTS)
 		if err != nil {
-			writeDynamoErrorFromErr(w, err)
-			return
-		}
-		loc, found, err := d.readLogicalItemAt(r.Context(), schema, g.Key, readTS)
-		if err != nil {
-			writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-			return
-		}
-		entry := map[string]any{}
-		if found {
-			projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
-			if err != nil {
-				writeDynamoErrorFromErr(w, err)
-				return
-			}
-			entry["Item"] = projected
+			return nil, err
 		}
 		responses = append(responses, entry)
 	}
-	writeDynamoJSON(w, map[string]any{"Responses": responses})
+	return responses, nil
+}
+
+// readTransactGetItem validates and reads a single item in a TransactGetItems request.
+func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, readTS uint64) (map[string]any, error) {
+	if item.Get == nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "TransactGetItems only supports Get operations")
+	}
+	g := item.Get
+	if strings.TrimSpace(g.TableName) == "" {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing TableName in Get")
+	}
+	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, g.TableName, readTS)
+	if err != nil {
+		return nil, err
+	}
+	loc, found, err := d.readLogicalItemAt(ctx, schema, g.Key, readTS)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	entry := map[string]any{}
+	if found {
+		projected, err := projectItem(loc.item, g.ProjectionExpression, g.ExpressionAttributeNames)
+		if err != nil {
+			return nil, err
+		}
+		entry["Item"] = projected
+	}
+	return entry, nil
 }
 
 func collectTransactWriteTableNames(in transactWriteItemsInput) ([]string, error) {
