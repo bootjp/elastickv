@@ -1666,12 +1666,18 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	}
 
 	// Capture existing delta keys so they can be deleted if the list is later
-	// purged or deleted within this transaction.
+	// purged or deleted within this transaction. Scan one extra item to detect
+	// truncation: if >MaxDeltaScanLimit deltas exist the transaction cannot
+	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
+	// and let the caller retry after the background compactor has caught up.
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, t.startTS)
+	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if len(deltaKVs) > store.MaxDeltaScanLimit {
+		return nil, ErrDeltaScanTruncated
 	}
 	existingDeltas := make([][]byte, 0, len(deltaKVs))
 	for _, kv := range deltaKVs {
@@ -2610,6 +2616,20 @@ func (r *RedisServer) listLPush(ctx context.Context, key []byte, values [][]byte
 	return r.listPushCore(ctx, key, values, r.buildLPushOps)
 }
 
+// clampPopCount clamps count to [1, min(listLen, maxWideColumnItems)].
+// An error is returned when the effective count would exceed maxWideColumnItems,
+// which guards against OOM from enormous claim-key allocations.
+func clampPopCount(count int, listLen int64) (int64, error) {
+	n := int64(count)
+	if n > listLen {
+		n = listLen
+	}
+	if n > int64(maxWideColumnItems) {
+		return 0, errors.Wrapf(ErrCollectionTooLarge, "LPOP/RPOP count %d exceeds maximum %d", n, maxWideColumnItems)
+	}
+	return n, nil
+}
+
 // listPopClaim implements LPOP (left=true) or RPOP (left=false) using the
 // Claim pattern to avoid write-write conflicts on the list metadata key.
 // For each item popped it emits:
@@ -2707,9 +2727,9 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 		return nil, nil
 	}
 
-	n := int64(count)
-	if n > meta.Len {
-		n = meta.Len
+	n, err := clampPopCount(count, meta.Len)
+	if err != nil {
+		return nil, err
 	}
 
 	values, elems, buildErr := r.buildListPopElems(ctx, key, meta, n, left, readTS)

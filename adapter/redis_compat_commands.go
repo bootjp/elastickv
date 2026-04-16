@@ -1959,7 +1959,11 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 	memberExists := false
 	if getErr == nil {
 		memberExists = true
-		oldScore, _ = store.UnmarshalZSetScore(raw)
+		var unmarshalErr error
+		oldScore, unmarshalErr = store.UnmarshalZSetScore(raw)
+		if unmarshalErr != nil {
+			return nil, 0, 0, cockerrors.WithStack(unmarshalErr)
+		}
 	} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
 		return nil, 0, 0, cockerrors.WithStack(getErr)
 	}
@@ -2035,6 +2039,20 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	return added, cockerrors.WithStack(dispatchErr)
 }
 
+// readZSetMemberScore returns the current score for member, reporting whether
+// the member exists. Returns an error if the stored value cannot be decoded.
+func (r *RedisServer) readZSetMemberScore(ctx context.Context, memberKey []byte, readTS uint64) (score float64, exists bool, err error) {
+	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	if getErr == nil {
+		score, err = store.UnmarshalZSetScore(raw)
+		return score, err == nil, cockerrors.WithStack(err)
+	}
+	if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
+		return 0, false, cockerrors.WithStack(getErr)
+	}
+	return 0, false, nil
+}
+
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
@@ -2055,14 +2073,9 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 		return 0, migErr
 	}
 
-	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
-	var oldScore float64
-	memberExists := false
-	if getErr == nil {
-		memberExists = true
-		oldScore, _ = store.UnmarshalZSetScore(raw)
-	} else if !cockerrors.Is(getErr, store.ErrKeyNotFound) {
-		return 0, cockerrors.WithStack(getErr)
+	oldScore, memberExists, scoreErr := r.readZSetMemberScore(ctx, memberKey, readTS)
+	if scoreErr != nil {
+		return 0, scoreErr
 	}
 
 	newScore := oldScore + increment

@@ -343,6 +343,33 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 	return errors.WithStack(err)
 }
 
+// loadListBaseMeta reads the base list metadata key. Returns a zero ListMeta
+// if the key does not exist (all state may be in uncompacted delta keys).
+func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, error) {
+	raw, err := c.st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return store.ListMeta{}, nil
+		}
+		return store.ListMeta{}, errors.WithStack(err)
+	}
+	meta, err := store.UnmarshalListMeta(raw)
+	return meta, errors.WithStack(err)
+}
+
+// sumListMetaDeltas aggregates HeadDelta and LenDelta across all delta KVPairs.
+func sumListMetaDeltas(deltaKVs []*store.KVPair) (headDelta, lenDelta int64, err error) {
+	for _, d := range deltaKVs {
+		md, unmarshalErr := store.UnmarshalListMetaDelta(d.Value)
+		if unmarshalErr != nil {
+			return 0, 0, errors.WithStack(unmarshalErr)
+		}
+		headDelta += md.HeadDelta
+		lenDelta += md.LenDelta
+	}
+	return headDelta, lenDelta, nil
+}
+
 // --- List handler ---
 
 func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
@@ -356,27 +383,14 @@ func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	// Read base metadata (may not exist if all state is in deltas).
-	raw, err := c.st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
-	var baseMeta store.ListMeta
-	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return nil, errors.WithStack(err)
-	}
-	if err == nil {
-		baseMeta, err = store.UnmarshalListMeta(raw)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
+	baseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
+	if err != nil {
+		return nil, err
 	}
 
-	// Aggregate all provided deltas.
-	var headDelta, lenDelta int64
-	for _, d := range deltaKVs {
-		md, unmarshalErr := store.UnmarshalListMetaDelta(d.Value)
-		if unmarshalErr != nil {
-			return nil, errors.WithStack(unmarshalErr)
-		}
-		headDelta += md.HeadDelta
-		lenDelta += md.LenDelta
+	headDelta, lenDelta, err := sumListMetaDeltas(deltaKVs)
+	if err != nil {
+		return nil, err
 	}
 
 	newMeta := store.ListMeta{
@@ -399,6 +413,49 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	for _, d := range deltaKVs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
 	}
+
+	// GC stale claim keys produced by LPOP/RPOP. Claim keys outside the
+	// current [Head, Tail) window will never again be needed for OCC
+	// conflict detection and can be deleted safely.
+	claimElems, err := c.collectStaleClaimElems(ctx, userKey, newMeta, readTS)
+	if err != nil {
+		c.logger.WarnContext(ctx, "delta compactor: claim key GC scan failed; skipping",
+			"key", string(userKey), "error", err)
+	} else {
+		elems = append(elems, claimElems...)
+	}
+	return elems, nil
+}
+
+// collectStaleClaimElems returns Del elems for claim keys that lie outside the
+// current [newMeta.Head, newMeta.Tail) window. These are claim keys for
+// positions that have already been popped (< Head) or never existed (>= Tail).
+// At most deltaCompactorTickScanLimit keys are collected per call to bound I/O.
+func (c *DeltaCompactor) collectStaleClaimElems(ctx context.Context, userKey []byte, newMeta store.ListMeta, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	claimPrefix := store.ListClaimScanPrefix(userKey)
+	claimPrefixEnd := store.PrefixScanEnd(claimPrefix)
+	var elems []*kv.Elem[kv.OP]
+
+	// Stale LPOP claims: claim keys for seq < newMeta.Head.
+	lpopEnd := store.ListClaimKey(userKey, newMeta.Head)
+	lpopKVs, err := c.st.ScanAt(ctx, claimPrefix, lpopEnd, deltaCompactorTickScanLimit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, pair := range lpopKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)})
+	}
+
+	// Stale RPOP claims: claim keys for seq >= newMeta.Tail.
+	rpopStart := store.ListClaimKey(userKey, newMeta.Tail)
+	rpopKVs, err := c.st.ScanAt(ctx, rpopStart, claimPrefixEnd, deltaCompactorTickScanLimit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, pair := range rpopKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key)})
+	}
+
 	return elems, nil
 }
 
