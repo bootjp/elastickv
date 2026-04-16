@@ -178,8 +178,10 @@ func (c *DeltaCompactor) handlerByTypeName(typeName string) *collectionDeltaHand
 }
 
 // compactUrgentKey performs an immediate targeted compaction for a single user key
-// whose delta count exceeded MaxDeltaScanLimit. It scans all delta keys for the
-// key, builds compaction elems, and dispatches them as an OCC transaction.
+// whose delta count exceeded MaxDeltaScanLimit. It repeatedly scans and dispatches
+// compaction batches until the delta count drops to or below MaxDeltaScanLimit,
+// restoring readability for the key. Each iteration uses a fresh readTS so that
+// it observes the committed result of the previous batch.
 // A recover guard prevents a panic inside a handler from crashing the Run loop.
 func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompactionRequest) {
 	defer func() {
@@ -197,37 +199,60 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 	if h == nil {
 		return
 	}
-	readTS := snapshotTS(c.coord.Clock(), c.st)
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	// Scan all delta keys for this specific user key.
 	prefix := h.deltaKeyPrefixFn(req.userKey)
 	end := store.PrefixScanEnd(prefix)
-	// Scan one extra beyond MaxDeltaScanLimit to collect all accumulated deltas.
-	kvs, err := c.st.ScanAt(tickCtx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
+	totalCompacted, done := 0, false
+	for !done {
+		var n int
+		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix, end)
+		totalCompacted += n
+		if n == 0 {
+			break
+		}
+	}
+	if totalCompacted > 0 {
+		c.logger.InfoContext(tickCtx, "delta compactor urgent: compacted key",
+			"type", req.typeName, "key", string(req.userKey), "total_delta_count", totalCompacted)
+	}
+}
+
+// compactUrgentKeyBatch scans one window of delta keys for req.userKey, builds
+// compaction elems, and dispatches the OCC transaction.
+// Returns (n, done): n is the number of delta keys processed in this batch;
+// done is true when the remaining delta count is at or below MaxDeltaScanLimit
+// (the key is now readable).
+func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix, end []byte) (int, bool) {
+	// Use a fresh readTS each iteration so we observe the committed state from
+	// the previous compaction pass and do not re-scan already-deleted delta keys.
+	readTS := snapshotTS(c.coord.Clock(), c.st)
+
+	// Scan one extra beyond MaxDeltaScanLimit to detect whether more remain.
+	kvs, err := c.st.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
 	if err != nil {
-		c.logger.WarnContext(tickCtx, "delta compactor urgent: scan failed",
+		c.logger.WarnContext(ctx, "delta compactor urgent: scan failed",
 			"type", req.typeName, "key", string(req.userKey), "error", err)
-		return
+		return 0, true
 	}
 	if len(kvs) == 0 {
-		return
+		return 0, true
 	}
 
-	elems, err := h.buildElems(tickCtx, req.userKey, kvs, readTS)
+	elems, err := h.buildElems(ctx, req.userKey, kvs, readTS)
 	if err != nil {
-		c.logger.WarnContext(tickCtx, "delta compactor urgent: buildElems failed",
+		c.logger.WarnContext(ctx, "delta compactor urgent: buildElems failed",
 			"type", req.typeName, "key", string(req.userKey), "error", err)
-		return
+		return 0, true
 	}
-	if err := c.dispatchCompaction(tickCtx, readTS, elems); err != nil {
-		c.logger.WarnContext(tickCtx, "delta compactor urgent: dispatch failed",
+	if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
+		c.logger.WarnContext(ctx, "delta compactor urgent: dispatch failed",
 			"type", req.typeName, "key", string(req.userKey), "error", err)
-		return
+		return 0, true
 	}
-	c.logger.InfoContext(tickCtx, "delta compactor urgent: compacted key",
-		"type", req.typeName, "key", string(req.userKey), "delta_count", len(kvs))
+	// Fewer than MaxDeltaScanLimit+1 results means no more deltas remain; key is readable.
+	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
 }
 
 // SyncOnce runs one compaction pass. Non-leaders return immediately.
