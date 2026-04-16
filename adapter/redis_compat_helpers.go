@@ -384,12 +384,13 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)},
 	}
-	if ttl == nil {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
-	} else {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	if err := r.dispatchElems(ctx, false, 0, elems); err != nil {
+		return err
 	}
-	return r.dispatchElems(ctx, false, 0, elems)
+	// TTL is written to the buffer after a successful data commit; the
+	// background flusher batches it to Raft without conflict detection.
+	r.ttlBuffer.Set(key, ttl)
+	return nil
 }
 
 // deleteListElems returns delete operations for all list keys: item keys, the base

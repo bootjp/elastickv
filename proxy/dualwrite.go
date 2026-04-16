@@ -17,6 +17,13 @@ const (
 	// maxShadowGoroutines limits concurrent shadow read goroutines separately
 	// so that secondary write failures cannot starve shadow reads.
 	maxShadowGoroutines = 1024
+	// maxScriptWriteGoroutines limits concurrent secondary Lua-script write goroutines
+	// (EVAL / EVALSHA). Lua scripts under high load cause write conflicts in the Raft
+	// layer, and each conflict triggers a full script re-execution. Capping the
+	// concurrency reduces contention so individual scripts complete within
+	// SecondaryTimeout. Excess scripts are dropped (acceptable in dual-write mode
+	// where Redis remains the authoritative store).
+	maxScriptWriteGoroutines = 64
 )
 
 // DualWriter routes commands to primary and secondary backends based on mode.
@@ -31,6 +38,7 @@ type DualWriter struct {
 
 	writeSem  chan struct{} // bounds concurrent secondary write goroutines
 	shadowSem chan struct{} // bounds concurrent shadow read goroutines
+	scriptSem chan struct{} // bounds concurrent secondary Lua-script write goroutines
 
 	wg       sync.WaitGroup
 	mu       sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
@@ -52,6 +60,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		logger:    logger,
 		writeSem:  make(chan struct{}, maxWriteGoroutines),
 		shadowSem: make(chan struct{}, maxShadowGoroutines),
+		scriptSem: make(chan struct{}, maxScriptWriteGoroutines),
 		scripts:   make(map[string]string),
 	}
 
@@ -204,7 +213,7 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	d.rememberScript(cmd, args)
 
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
+		d.goScript(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -241,6 +250,13 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 // goWrite launches fn in a bounded write goroutine.
 func (d *DualWriter) goWrite(fn func()) {
 	d.goAsyncWithSem(d.writeSem, fn)
+}
+
+// goScript launches fn in a bounded Lua-script write goroutine.
+// It uses a smaller semaphore than goWrite to cap the number of concurrent
+// EVAL/EVALSHA secondary writes. When the cap is reached the write is dropped.
+func (d *DualWriter) goScript(fn func()) {
+	d.goAsyncWithSem(d.scriptSem, fn)
 }
 
 // goShadow launches fn in a bounded shadow-read goroutine.
