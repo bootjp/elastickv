@@ -4053,13 +4053,10 @@ func (d *DynamoDBServer) readTransactGetItem(ctx context.Context, item transactG
 		return nil, false, err
 	}
 	// Reject duplicate item keys to match real DynamoDB behavior.
-	// Use only primary key attributes (hash + range) for dedup — extra attributes
-	// in the Key map must not prevent detection of same-item duplicates.
-	pkAttrs, err := primaryKeyAttributes(schema.PrimaryKey, g.Key)
-	if err != nil {
-		return nil, false, err
-	}
-	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, pkAttrs)
+	// canonicalPrimaryKeyStr reads only hash/range key attributes from g.Key
+	// by schema name, so extra attributes in the map are safely ignored —
+	// no separate primaryKeyAttributes extraction is needed.
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, g.Key)
 	if err != nil {
 		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
@@ -4396,7 +4393,11 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	default:
 		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
-	return canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
+	if err != nil {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return keyStr, nil
 }
 
 type transactWriteItemPlan struct {
