@@ -293,8 +293,13 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 		return nil, errors.WithStack(err)
 	}
 
-	// Fall back to !redis|ttl| key (non-string types and legacy string data).
-	raw, err = r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
+	return r.legacyIndexTTLAt(ctx, userKey, readTS)
+}
+
+// legacyIndexTTLAt reads the TTL from the !redis|ttl| secondary index only.
+// Use this on non-string paths where the embedded-TTL probe would always miss.
+func (r *RedisServer) legacyIndexTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
+	raw, err := r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -309,7 +314,22 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 }
 
 func (r *RedisServer) hasExpiredTTLAt(ctx context.Context, userKey []byte, readTS uint64) (bool, error) {
-	ttl, err := r.ttlAt(ctx, userKey, readTS)
+	return r.hasExpired(ctx, userKey, readTS, false)
+}
+
+// hasExpired checks TTL expiry. When nonStringOnly is true, the embedded-TTL
+// probe is skipped and only the !redis|ttl| index is consulted, avoiding a
+// wasted GetAt on !redis|str|<key> for non-string types.
+func (r *RedisServer) hasExpired(ctx context.Context, userKey []byte, readTS uint64, nonStringOnly bool) (bool, error) {
+	var (
+		ttl *time.Time
+		err error
+	)
+	if nonStringOnly {
+		ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+	} else {
+		ttl, err = r.ttlAt(ctx, userKey, readTS)
+	}
 	if err != nil {
 		return false, err
 	}

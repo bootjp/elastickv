@@ -379,19 +379,38 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
 	raw, err := r.leaderAwareGetAt(redisStrKey(key), readTS)
 	if err == nil {
-		userValue, ttl, decErr := decodeRedisStr(raw)
-		if decErr != nil {
-			return nil, nil, decErr
-		}
-		if ttl != nil && !ttl.After(time.Now()) {
-			return nil, nil, errors.WithStack(store.ErrKeyNotFound)
-		}
-		return userValue, ttl, nil
+		return r.decodePrefixedString(key, raw, readTS)
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
 	}
-	// Legacy bare-key path: read !redis|ttl| once, then the bare value.
+	return r.readBareLegacyString(key, readTS)
+}
+
+// decodePrefixedString handles the !redis|str|<key> payload: new-format values
+// carry their TTL inline, while legacy-format payloads that still sit under
+// the prefixed key during rolling upgrade must consult the secondary index.
+func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]byte, *time.Time, error) {
+	userValue, ttl, err := decodeRedisStr(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !isNewRedisStrFormat(raw) {
+		legacyTTL, ttlErr := r.readLegacyTTL(key, readTS)
+		if ttlErr != nil {
+			return nil, nil, ttlErr
+		}
+		ttl = legacyTTL
+	}
+	if ttl != nil && !ttl.After(time.Now()) {
+		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
+	}
+	return userValue, ttl, nil
+}
+
+// readBareLegacyString handles pre-migration data still under the bare user
+// key: TTL in the secondary index, value at the bare key itself.
+func (r *RedisServer) readBareLegacyString(key []byte, readTS uint64) ([]byte, *time.Time, error) {
 	legacyTTL, err := r.readLegacyTTL(key, readTS)
 	if err != nil {
 		return nil, nil, err

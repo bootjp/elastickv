@@ -112,8 +112,9 @@ backward-compatible with no-TTL reads once a migration is applied; the old raw
 bytes that start with `0x00` are rare in practice (binary data) but must be
 handled during migration (see §7).
 
-Alternatively, a two-byte magic + version prefix (`0xFF 0x01`) avoids the
-collision problem at the cost of two extra bytes per value:
+Alternatively, a two-byte magic + version prefix (`0xFF 0x01`) distinguishes
+the new encoding from the overwhelming majority of user payloads, at the cost
+of two extra bytes per value:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -127,7 +128,31 @@ collision problem at the cost of two extra bytes per value:
 A raw value not starting with `0xFF 0x01` is treated as a legacy (no-TTL)
 encoding during the migration window.
 
-### 3.3 Collection metadata encoding
+**Ambiguity with legacy payloads.** Redis strings are arbitrary bytes and *can*
+legitimately start with `0xFF 0x01`; the magic prefix is a heuristic, not a
+cryptographic discriminator. The implementation accepts this residual risk as
+follows:
+
+- Before any write goes out in the new format, the value is always wrapped with
+  the magic+version header, so any post-upgrade payload that starts with
+  `0xFF 0x01` is guaranteed to be a new-format envelope produced by this code
+  path.
+- During the rolling-upgrade window, pre-existing bytes that happen to start
+  with `0xFF 0x01` will be decoded as new-format. If the `flags` byte or TTL
+  bytes happen to form an invalid header, `decodeRedisStr` returns an error
+  and the caller treats the key as malformed (e.g. `isLeaderKeyExpired` treats
+  the key as expired rather than silently alive).
+- For deployments that need a stronger guarantee, the migration compactor
+  should be run to rewrite every legacy value with the new envelope before
+  Phase 2 (legacy-read removal) begins.
+
+### 3.3 Collection metadata encoding (future work)
+
+> **Status in this PR:** only *string* values carry inline TTL today. Collection
+> anchors (`ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta`, stream, HLL) still
+> store TTL in the secondary `!redis|ttl|` index. The sections below describe
+> the intended Phase 4 design; they are not yet implemented and the adapter
+> deliberately keeps the legacy index in use for non-string types.
 
 `ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta` are fixed-width binary structs.
 Each gains an `ExpireAt uint64` field (0 = no TTL):

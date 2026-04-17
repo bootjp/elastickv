@@ -1001,18 +1001,31 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteBulk(v)
 }
 
+// leaderEmbeddedTTLExpired looks at !redis|str|<key> on the leader and, if the
+// payload is in new format, returns the embedded-TTL expiry verdict. The bool
+// indicates whether the caller should use this verdict (true) or fall through
+// to the legacy !redis|ttl| index (false).
+func (r *RedisServer) leaderEmbeddedTTLExpired(key []byte) (bool, bool) {
+	raw, err := r.tryLeaderGetAt(redisStrKey(key), 0)
+	if err != nil || !isNewRedisStrFormat(raw) {
+		return false, false
+	}
+	_, expireAt, decErr := decodeRedisStr(raw)
+	if decErr != nil {
+		// Malformed new-format payload: treat as expired rather than silently alive.
+		return true, true
+	}
+	if expireAt == nil {
+		return false, true
+	}
+	return !expireAt.After(time.Now()), true
+}
+
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
 func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
 	// For string keys with new encoding: check embedded TTL.
-	if raw, err := r.tryLeaderGetAt(redisStrKey(key), 0); err == nil {
-		if isNewRedisStrFormat(raw) {
-			_, expireAt, _ := decodeRedisStr(raw)
-			if expireAt == nil {
-				return false
-			}
-			return !expireAt.After(time.Now())
-		}
-		// Legacy format: fall through to !redis|ttl| key.
+	if expired, ok := r.leaderEmbeddedTTLExpired(key); ok {
+		return expired
 	}
 	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
 	if err != nil {
@@ -3248,10 +3261,15 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	ttlKey := key
+	nonStringInternal := false
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
+		// Non-string internal keys (!redis|hash|, !redis|set|, …) can never
+		// carry an embedded-TTL payload, so we can skip the !redis|str| probe
+		// that ttlAt would otherwise make.
+		nonStringInternal = !bytes.HasPrefix(key, []byte(redisStrPrefix))
 	}
-	expired, err := r.hasExpiredTTLAt(context.Background(), ttlKey, readTS)
+	expired, err := r.hasExpired(context.Background(), ttlKey, readTS, nonStringInternal)
 	if err != nil {
 		return nil, err
 	}
