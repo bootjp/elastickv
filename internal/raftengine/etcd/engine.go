@@ -2032,6 +2032,10 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 			if !ok {
 				return
 			}
+			if ctx.Err() != nil {
+				_ = req.Close()
+				continue
+			}
 			if err := e.dispatchTransport(ctx, req); err != nil {
 				count := e.dispatchErrorCount.Add(1)
 				if shouldLogDispatchEvent(count) {
