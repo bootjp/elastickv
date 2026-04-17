@@ -21,17 +21,17 @@ import (
 )
 
 const (
-	defaultTickInterval      = 10 * time.Millisecond
-	defaultHeartbeatTick     = 1
-	defaultElectionTick      = 10
-	defaultMaxInflightMsg    = 256
-	defaultMaxSizePerMsg     = 1 << 20
-	defaultDispatchWorkersPerPeer = 2
-	defaultSnapshotEvery     = 10_000
-	defaultSnapshotQueueSize = 1
-	defaultAdminPollInterval = 10 * time.Millisecond
-	defaultMaxPendingConfigs = 64
-	unknownLastContact       = time.Duration(-1)
+	defaultTickInterval           = 10 * time.Millisecond
+	defaultHeartbeatTick          = 1
+	defaultElectionTick           = 10
+	defaultMaxInflightMsg         = 256
+	defaultMaxSizePerMsg          = 1 << 20
+	defaultDispatchWorkersPerPeer = 1
+	defaultSnapshotEvery          = 10_000
+	defaultSnapshotQueueSize      = 1
+	defaultAdminPollInterval      = 10 * time.Millisecond
+	defaultMaxPendingConfigs      = 64
+	unknownLastContact            = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
