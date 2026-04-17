@@ -72,18 +72,23 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID         uint64
-	LocalID        string
-	LocalAddress   string
-	DataDir        string
-	Peers          []Peer
-	Bootstrap      bool
-	Transport      *GRPCTransport
-	TickInterval   time.Duration
-	ElectionTick   int
-	HeartbeatTick  int
-	StateMachine   StateMachine
-	MaxSizePerMsg  uint64
+	NodeID        uint64
+	LocalID       string
+	LocalAddress  string
+	DataDir       string
+	Peers         []Peer
+	Bootstrap     bool
+	Transport     *GRPCTransport
+	TickInterval  time.Duration
+	ElectionTick  int
+	HeartbeatTick int
+	StateMachine  StateMachine
+	MaxSizePerMsg uint64
+	// MaxInflightMsg controls how many MsgApp messages Raft may have in-flight
+	// per peer before waiting for an acknowledgement (Raft-level flow control).
+	// It also sets the per-peer dispatch channel capacity, so total buffered
+	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
+	// Default: 1024. Lower this value in memory-constrained clusters.
 	MaxInflightMsg int
 }
 
