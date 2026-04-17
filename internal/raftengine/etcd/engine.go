@@ -2224,7 +2224,6 @@ func decodeProposalEnvelope(data []byte) (uint64, []byte, bool) {
 	return binary.BigEndian.Uint64(data[1:envelopeHeaderSize]), data[envelopeHeaderSize:], true
 }
 
-
 func shouldLogDispatchEvent(count uint64) bool {
 	return count == 1 || count%128 == 0
 }
