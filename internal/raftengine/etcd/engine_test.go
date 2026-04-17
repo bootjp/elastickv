@@ -567,6 +567,74 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	}
 }
 
+func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	dispatched := make(chan raftpb.Message, 1)
+	engine := &Engine{
+		nodeID:           1,
+		peerDispatchers:  make(map[uint64]chan dispatchRequest),
+		perPeerQueueSize: 4,
+		dispatchStopCh:   make(chan struct{}),
+		dispatchCtx:      ctx,
+		dispatchCancel:   cancel,
+	}
+	engine.dispatchFn = func(_ context.Context, req dispatchRequest) error {
+		dispatched <- req.msg
+		return nil
+	}
+
+	engine.upsertPeer(Peer{NodeID: 2, ID: "peer2", Address: "localhost:2"})
+
+	ch, ok := engine.peerDispatchers[2]
+	require.True(t, ok, "dispatcher channel must be created on upsert")
+	require.Equal(t, 4, cap(ch))
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
+
+	select {
+	case msg := <-dispatched:
+		require.Equal(t, uint64(2), msg.To)
+	case <-time.After(time.Second):
+		t.Fatal("message was not dispatched to peer 2")
+	}
+
+	close(engine.dispatchStopCh)
+	engine.dispatchWG.Wait()
+}
+
+func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
+	stopCh := make(chan struct{})
+	ch := make(chan dispatchRequest, 4)
+	engine := &Engine{
+		nodeID:          1,
+		peers:           map[uint64]Peer{2: {NodeID: 2, ID: "peer2"}},
+		peerDispatchers: map[uint64]chan dispatchRequest{2: ch},
+		dispatchStopCh:  stopCh,
+	}
+	engine.dispatchWG.Add(1)
+	go engine.runDispatchWorker(ch)
+
+	engine.removePeer(2)
+
+	_, ok := engine.peerDispatchers[2]
+	require.False(t, ok, "dispatcher must be removed from map")
+
+	workerDone := make(chan struct{})
+	go func() {
+		engine.dispatchWG.Wait()
+		close(workerDone)
+	}()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch worker did not exit after channel close")
+	}
+
+	// Subsequent messages to the removed peer must be dropped without panic.
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
+}
+
 func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
