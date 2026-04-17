@@ -59,7 +59,7 @@ func newTTLBufferWithMaxSize(maxSize int) *TTLBuffer {
 // expireAt == nil marks the TTL for deletion (PERSIST).
 // Concurrent calls for the same key are resolved by keeping the latest seq.
 // Set is a no-op on a nil *TTLBuffer.
-// If the buffer already holds ttlBufferMaxSize distinct keys and key is new,
+// If the buffer already holds b.maxSize distinct keys and key is new,
 // the entry is dropped with a warning; the Raft store retains the last flushed
 // value so the impact is limited to a missed in-flight update.
 func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
@@ -73,10 +73,6 @@ func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
 	s := b.counter.Add(1)
 	b.mu.Lock()
 	k := string(key)
-	if e, ok := b.entries[k]; ok && e.seq > s {
-		b.mu.Unlock()
-		return
-	}
 	if _, exists := b.entries[k]; !exists && len(b.entries) >= b.maxSize {
 		size = len(b.entries)
 		keyLen = len(k)

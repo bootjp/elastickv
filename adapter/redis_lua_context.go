@@ -2511,10 +2511,14 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 }
 
 // flushTTLForKeyToBuffer writes the TTL for a single key to the server's
-// TTLBuffer. Only keys with a non-None final type and a dirty TTL state
-// (or an unconditionally-set TTL) are written.
+// TTLBuffer. Keys deleted by the script (finalType==None) write a nil TTL when
+// the Lua TTL state is dirty to clear pending/persisted expiry. For non-None
+// keys, only dirty TTL state (or unconditionally-set TTL) is written.
 func (c *luaScriptContext) flushTTLForKeyToBuffer(key string, finalType redisValueType, preserveExisting bool) {
 	if finalType == redisTypeNone {
+		if st := c.ttls[key]; st != nil && st.dirty {
+			c.server.ttlBuffer.Set([]byte(key), nil)
+		}
 		return
 	}
 	if preserveExisting {
