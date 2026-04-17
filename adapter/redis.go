@@ -1752,14 +1752,20 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	}
 	t.listStates[k] = st
 
+	// Track the list meta key so that concurrent structural changes (DEL,
+	// compaction that rewrites the base meta) create a read-write conflict.
+	t.trackReadKey(listMetaKey(key))
 	// Track the list-item key at the current tail (and the position before the
 	// head) so that concurrent RPUSH/LPUSH operations—which write to exactly
 	// these positions—trigger a read-write conflict and force a retry.
 	// Without this, a MULTI transaction that reads a list via LRANGE can commit
 	// with a stale snapshot while a concurrent RPUSH commits a new item,
 	// forming an anti-dependency (G2-item) cycle.
+	// We intentionally track only the list-specific keys (not trackTypeReadKeys)
+	// to avoid registering irrelevant type keys (hash/set/zset/str) that would
+	// add unnecessary FSM LatestCommitTS lookups for every LRANGE in a MULTI.
 	t.trackReadKey(listItemKey(key, meta.Head+meta.Len)) // next RPUSH target
-	t.trackReadKey(listItemKey(key, meta.Head-1))        // next LPUSH target
+	t.trackReadKey(listItemKey(key, meta.Head-1))         // next LPUSH target
 
 	return st, nil
 }
