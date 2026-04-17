@@ -211,6 +211,10 @@ func decodeRedisTTL(raw []byte) (time.Time, error) {
 }
 
 func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
+	// The buffer holds the most recent TTL write regardless of Raft flush state.
+	if expireAt, found := r.ttlBuffer.Get(userKey); found {
+		return expireAt, nil
+	}
 	raw, err := r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {

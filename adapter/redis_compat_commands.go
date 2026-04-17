@@ -355,9 +355,10 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 		}
 		expireAt := time.Now().Add(time.Duration(ttl) * unit)
 		result = 1
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(expireAt)},
-		})
+		// TTL is written to the in-memory buffer; the background flusher
+		// batches it to Raft without conflict detection (IsTxn=false).
+		r.ttlBuffer.Set(cmd.Args[1], &expireAt)
+		return nil
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1935,10 +1936,14 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		current++
 
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+		if err := r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: []byte(strconv.FormatInt(current, 10))},
-			{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])},
-		})
+		}); err != nil {
+			return err
+		}
+		// INCR clears any TTL; write nil to buffer (PERSIST semantics).
+		r.ttlBuffer.Set(cmd.Args[1], nil)
+		return nil
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return

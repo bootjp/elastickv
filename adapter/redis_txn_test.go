@@ -48,14 +48,15 @@ func TestRedisTxnValidateReadSet_ListMetaUpdateNoConflict(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestRedisTxnValidateReadSet_TTLUpdateConflict verifies that updating the TTL
-// key for a list DOES trigger an OCC conflict, because TTL reads are still
-// tracked in the read set.
-func TestRedisTxnValidateReadSet_TTLUpdateConflict(t *testing.T) {
+// TestRedisTxnValidateReadSet_TTLUpdateNoConflict verifies that a concurrent TTL
+// update does NOT trigger an OCC conflict for list append operations. TTL is now
+// written via IsTxn=false batch flushes and is excluded from the read set, so
+// concurrent EXPIRE/SETEX writes are invisible to data transactions.
+func TestRedisTxnValidateReadSet_TTLUpdateNoConflict(t *testing.T) {
 	t.Parallel()
 
 	server, st := newRedisStorageMigrationTestServer(t)
-	key := []byte("list:ttl-conflict")
+	key := []byte("list:ttl-no-conflict")
 
 	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: 1})
 	require.NoError(t, err)
@@ -75,11 +76,12 @@ func TestRedisTxnValidateReadSet_TTLUpdateConflict(t *testing.T) {
 	require.NoError(t, err)
 
 	// A concurrent EXPIRE updates the TTL key after our read.
+	// Because TTL is no longer tracked in the OCC read set, this must NOT
+	// surface as a write conflict.
 	require.NoError(t, st.PutAt(context.Background(), redisTTLKey(key), []byte("dummy"), 11, 0))
 
 	err = txn.validateReadSet(context.Background())
-	require.Error(t, err)
-	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.NoError(t, err)
 }
 
 // TestRedisTxnMULTIEXECRetriesOnCoordinatorConflict verifies that runTransaction
