@@ -1968,7 +1968,10 @@ func (e *Engine) runDispatchWorker(ch chan dispatchRequest) {
 		select {
 		case <-e.dispatchStopCh:
 			return
-		case req := <-ch:
+		case req, ok := <-ch:
+			if !ok {
+				return
+			}
 			if err := e.dispatchTransport(req); err != nil {
 				count := e.dispatchErrorCount.Add(1)
 				if shouldLogDispatchEvent(count) {
@@ -2198,7 +2201,10 @@ func (e *Engine) removePeer(nodeID uint64) {
 		e.transport.RemovePeer(nodeID)
 	}
 	if e.peerDispatchers != nil {
-		delete(e.peerDispatchers, nodeID)
+		if ch, ok := e.peerDispatchers[nodeID]; ok {
+			delete(e.peerDispatchers, nodeID)
+			close(ch)
+		}
 	}
 }
 
