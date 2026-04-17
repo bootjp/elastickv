@@ -2319,7 +2319,9 @@ func (t *txnContext) stringValueAndTTLElem(userKey []byte, tv *txnValue) ([]byte
 	if ttl != nil {
 		return value, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(userKey), Value: encodeRedisTTL(*ttl)}
 	}
-	if ttlSt != nil && ttlSt.dirty {
+	// ttl is nil: emit Del when there was a prior TTL (loaded or dirty-cleared)
+	// so the sweeper cannot later expire a now-persistent key or hit a stale index.
+	if tv.ttl != nil || (ttlSt != nil && ttlSt.dirty) {
 		return value, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)}
 	}
 	return value, nil

@@ -386,7 +386,13 @@ func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *tim
 	if err != nil {
 		return nil, nil, err
 	}
-	return legacy, nil, nil
+	// Legacy bare-key data still stores its TTL in the !redis|ttl| index;
+	// fetch it so callers that re-encode (INCR, MULTI/EXEC writes) preserve it.
+	legacyTTL, err := r.ttlAt(context.Background(), key, readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	return legacy, legacyTTL, nil
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
