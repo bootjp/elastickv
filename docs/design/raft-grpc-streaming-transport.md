@@ -37,7 +37,7 @@ being RTT-limited.
 Engine run loop
   └─ sendMessages()
        └─ enqueueDispatchMessage()
-            ├─ regular messages   → peerDispatchers[nodeID].normal    (chan, cap 512)
+            ├─ regular messages   → peerDispatchers[nodeID].normal    (chan, cap MaxInflightMsg)
             │                           ↓
             │                    runDispatchWorker (1 goroutine/peer)
             │                           ↓
@@ -47,7 +47,7 @@ Engine run loop
             │                           ↓
             │                    receive EtcdRaftAck
             │
-            └─ heartbeat messages → peerDispatchers[nodeID].heartbeat (chan, cap 512)
+            └─ heartbeat messages → peerDispatchers[nodeID].heartbeat (chan, cap MaxInflightMsg)
                                         ↓
                                  runDispatchWorker (1 goroutine/peer, dedicated)
                                         ↓

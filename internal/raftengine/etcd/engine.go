@@ -32,17 +32,11 @@ const (
 	// defaultDispatchWorkersPerPeer is the number of goroutines started per peer:
 	// one for normal messages (MsgApp, etc.) and one dedicated to heartbeats.
 	defaultDispatchWorkersPerPeer = 2
-	// defaultDispatchBufPerPeer is the per-peer dispatch channel capacity.
-	// It is intentionally decoupled from defaultMaxInflightMsg: MaxInflightMsg
-	// is a Raft-level flow-control knob, while this controls how many serialised
-	// messages the dispatch goroutine can buffer before dropping. 512 is chosen
-	// to keep memory overhead modest while still absorbing bursts.
-	defaultDispatchBufPerPeer = 512
-	defaultSnapshotEvery      = 10_000
-	defaultSnapshotQueueSize  = 1
-	defaultAdminPollInterval  = 10 * time.Millisecond
-	defaultMaxPendingConfigs  = 64
-	unknownLastContact        = time.Duration(-1)
+	defaultSnapshotEvery          = 10_000
+	defaultSnapshotQueueSize      = 1
+	defaultAdminPollInterval      = 10 * time.Millisecond
+	defaultMaxPendingConfigs      = 64
+	unknownLastContact            = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
@@ -357,7 +351,9 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// Gate inbound delivery on startedCh so messages are not enqueued until the
 	// local run loop has completed startup.
 	e.peerDispatchers = make(map[uint64]*peerQueues, len(e.peers))
-	e.perPeerQueueSize = defaultDispatchBufPerPeer
+	// Size the per-peer dispatch buffer to match the Raft inflight limit so that
+	// the channel never drops messages that Raft's flow-control would permit.
+	e.perPeerQueueSize = cfg.MaxInflightMsg
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
@@ -1978,7 +1974,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	size := e.perPeerQueueSize
 	if size <= 0 {
-		size = defaultDispatchBufPerPeer
+		size = defaultMaxInflightMsg
 	}
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, size),
