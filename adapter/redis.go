@@ -1072,6 +1072,8 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 	// Prefer asking the leader's Redis command path directly: it evaluates
 	// existence with ttlAt() semantics (including the in-memory TTL buffer).
+	// If this path is unavailable we fall back to raw-KV probing, which is
+	// best-effort and may lag unflushed buffer-only TTL updates.
 	if cli, err := r.leaderClientForKey(key); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 		defer cancel()

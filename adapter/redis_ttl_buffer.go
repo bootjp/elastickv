@@ -13,6 +13,8 @@ import (
 
 const (
 	defaultTTLFlushInterval = 100 * time.Millisecond
+	ttlShutdownFlushAttempts = 3
+	ttlShutdownFlushBackoff  = 100 * time.Millisecond
 	// ttlBufferMaxSize is the maximum number of entries retained in the buffer.
 	// Entries beyond this limit are dropped with a warning; the Raft store still
 	// holds the last flushed value so the impact is limited to a missed update.
@@ -182,16 +184,31 @@ func buildTTLFlushElems(entries map[string]ttlBufferEntry) []*kv.Elem[kv.OP] {
 }
 
 // runTTLFlusher periodically flushes the TTL buffer to Raft until ctx is cancelled.
-// On cancellation it performs one final flush to minimise TTL loss during shutdown.
+// On cancellation it performs bounded final-flush retries to minimise TTL loss
+// during shutdown and logs if entries remain unflushed.
 func (r *RedisServer) runTTLFlusher(ctx context.Context) {
 	ticker := time.NewTicker(r.ttlFlushInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			r.flushTTLBuffer(ctx)
+			r.flushTTLBuffer(ctx, false)
 		case <-ctx.Done():
-			r.flushTTLBuffer(context.Background())
+			for attempt := 1; attempt <= ttlShutdownFlushAttempts; attempt++ {
+				if r.flushTTLBuffer(context.Background(), true) {
+					return
+				}
+				if attempt < ttlShutdownFlushAttempts {
+					time.Sleep(ttlShutdownFlushBackoff)
+				}
+			}
+			if remaining := r.ttlBuffer.Len(); remaining > 0 {
+				slog.Warn(
+					"ttl buffer shutdown flush incomplete",
+					"remaining_entries", remaining,
+					"attempts", ttlShutdownFlushAttempts,
+				)
+			}
 			return
 		}
 	}
@@ -200,10 +217,10 @@ func (r *RedisServer) runTTLFlusher(ctx context.Context) {
 // flushTTLBuffer drains the buffer and dispatches the entries to Raft as a
 // non-transactional (last-writer-wins) operation group.
 // On failure the entries are merged back into the buffer for retry on the next tick.
-func (r *RedisServer) flushTTLBuffer(ctx context.Context) {
+func (r *RedisServer) flushTTLBuffer(ctx context.Context, shutdown bool) bool {
 	entries := r.ttlBuffer.Drain()
 	if len(entries) == 0 {
-		return
+		return true
 	}
 
 	elems := buildTTLFlushElems(entries)
@@ -219,6 +236,12 @@ func (r *RedisServer) flushTTLBuffer(ctx context.Context) {
 		// ensures those entries are not lost: the final shutdown flush uses
 		// context.Background() and will retry them successfully.
 		r.ttlBuffer.MergeBack(entries)
-		slog.Warn("ttl buffer flush failed, will retry", "err", err, "entries", len(entries))
+		if shutdown {
+			slog.Warn("ttl buffer shutdown flush attempt failed", "err", err, "entries", len(entries))
+		} else {
+			slog.Warn("ttl buffer flush failed, will retry on next tick", "err", err, "entries", len(entries))
+		}
+		return false
 	}
+	return true
 }

@@ -2,8 +2,10 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type shutdownFlushCoordinator struct {
+	stubAdapterCoordinator
+	failUntil int32
+	calls     atomic.Int32
+}
+
+func (c *shutdownFlushCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	call := c.calls.Add(1)
+	if call <= c.failUntil {
+		return nil, errors.New("dispatch failed")
+	}
+	return &kv.CoordinateResponse{}, nil
+}
 
 // ────────────────────────────────────────────────────────────────
 // TTLBuffer — unit tests
@@ -205,6 +221,44 @@ func TestTTLBuffer_ConcurrentAccess(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+func TestRunTTLFlusher_ShutdownRetriesUntilSuccess(t *testing.T) {
+	t.Parallel()
+	coord := &shutdownFlushCoordinator{failUntil: 2}
+	server := &RedisServer{
+		coordinator:      coord,
+		ttlBuffer:        newTTLBufferWithMaxSize(8),
+		ttlFlushInterval: time.Hour,
+	}
+	expireAt := time.Now().Add(time.Minute)
+	server.ttlBuffer.Set([]byte("k"), &expireAt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	server.runTTLFlusher(ctx)
+
+	require.Equal(t, int32(3), coord.calls.Load())
+	require.Equal(t, 0, server.ttlBuffer.Len())
+}
+
+func TestRunTTLFlusher_ShutdownStopsAfterBoundedRetries(t *testing.T) {
+	t.Parallel()
+	coord := &shutdownFlushCoordinator{failUntil: 100}
+	server := &RedisServer{
+		coordinator:      coord,
+		ttlBuffer:        newTTLBufferWithMaxSize(8),
+		ttlFlushInterval: time.Hour,
+	}
+	expireAt := time.Now().Add(time.Minute)
+	server.ttlBuffer.Set([]byte("k"), &expireAt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	server.runTTLFlusher(ctx)
+
+	require.Equal(t, int32(ttlShutdownFlushAttempts), coord.calls.Load())
+	require.Equal(t, 1, server.ttlBuffer.Len())
 }
 
 // ────────────────────────────────────────────────────────────────
