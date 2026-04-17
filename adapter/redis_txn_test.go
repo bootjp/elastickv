@@ -10,6 +10,80 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+// TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a
+// concurrent RPUSH to a list triggers an OCC read-write conflict for a MULTI
+// transaction that read the list via LRANGE.  Without the boundary key tracking
+// added to loadListState the validateReadSet call would report no conflict,
+// allowing a G2-item anti-dependency cycle to commit undetected.
+func TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict(t *testing.T) {
+	t.Parallel()
+
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("list:concurrent-rpush")
+
+	// Write a list with Head=0, Len=5 at ts=10.
+	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: 5})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, 10, 0))
+
+	// T1: begin a MULTI/EXEC that reads the list (LRANGE) at startTS=10.
+	txn := &txnContext{
+		server:     server,
+		working:    map[string]*txnValue{},
+		listStates: map[string]*listTxnState{},
+		zsetStates: map[string]*zsetTxnState{},
+		ttlStates:  map[string]*ttlTxnState{},
+		readKeys:   map[string][]byte{},
+		startTS:    10,
+	}
+	_, err = txn.loadListState(key)
+	require.NoError(t, err)
+
+	// T2: a concurrent RPUSH commits a new item at the tail position (seq=5) at ts=11.
+	require.NoError(t, st.PutAt(context.Background(), store.ListItemKey(key, 5), []byte("new"), 11, 0))
+
+	// T1's validateReadSet must detect the read-write conflict via the tracked tail key.
+	err = txn.validateReadSet(context.Background())
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"LRANGE in MULTI must conflict with a concurrent RPUSH on the same key (G2-item prevention)")
+}
+
+// TestRedisTxnValidateReadSet_ConcurrentLPushTriggersConflict verifies that a
+// concurrent LPUSH to a list triggers an OCC read-write conflict for a MULTI
+// transaction that read the list via LRANGE.
+func TestRedisTxnValidateReadSet_ConcurrentLPushTriggersConflict(t *testing.T) {
+	t.Parallel()
+
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("list:concurrent-lpush")
+
+	// Write a list with Head=0, Len=5 at ts=10.
+	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: 5})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, 10, 0))
+
+	// T1: begin a MULTI/EXEC that reads the list at startTS=10.
+	txn := &txnContext{
+		server:     server,
+		working:    map[string]*txnValue{},
+		listStates: map[string]*listTxnState{},
+		zsetStates: map[string]*zsetTxnState{},
+		ttlStates:  map[string]*ttlTxnState{},
+		readKeys:   map[string][]byte{},
+		startTS:    10,
+	}
+	_, err = txn.loadListState(key)
+	require.NoError(t, err)
+
+	// T2: a concurrent LPUSH commits a new item at head-1 (seq=-1) at ts=11.
+	require.NoError(t, st.PutAt(context.Background(), store.ListItemKey(key, -1), []byte("new"), 11, 0))
+
+	// T1's validateReadSet must detect the read-write conflict via the tracked head-adjacent key.
+	err = txn.validateReadSet(context.Background())
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"LRANGE in MULTI must conflict with a concurrent LPUSH on the same key (G2-item prevention)")
+}
+
 // TestRedisTxnValidateReadSet_ListMetaUpdateNoConflict verifies that updating
 // the base list metadata key (e.g. by a DeltaCompactor) does NOT trigger an
 // OCC conflict for append operations.  With the Delta pattern, appenders never

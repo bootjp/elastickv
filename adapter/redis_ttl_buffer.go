@@ -162,7 +162,7 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 		return
 	}
 	b.mu.Lock()
-	dropped := 0
+	var dropped uint64
 	var size int
 	for key, entry := range entries {
 		if e, ok := b.entries[key]; ok {
@@ -181,8 +181,8 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	if dropped == 0 {
 		return
 	}
-	dropCount := b.dropped.Add(uint64(dropped))
-	prevDropCount := dropCount - uint64(dropped)
+	dropCount := b.dropped.Add(dropped)
+	prevDropCount := dropCount - dropped
 	if prevDropCount == 0 || prevDropCount/ttlBufferDropLogEvery != dropCount/ttlBufferDropLogEvery {
 		slog.Warn(
 			"ttl buffer merge-back dropped entries",
