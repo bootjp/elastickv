@@ -22,7 +22,7 @@ messages per follower before receiving ACK. A single dispatch worker serialises
 those 256 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
 regardless of bandwidth.
 
-PR #522 introduced per-peer dispatch channels and `defaultDispatchWorkersPerPeer = 2`
+PR #522 introduced per-peer dispatch channels and two dispatch workers per peer
 (one goroutine for normal messages, one dedicated to heartbeats) to eliminate
 cross-peer head-of-line blocking. The remaining bottleneck is the
 per-message RTT of unary gRPC.
