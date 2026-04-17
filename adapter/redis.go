@@ -2151,7 +2151,15 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	state.value = &expireAt
 	state.dirty = true
 	if typ == redisTypeString {
-		return t.markStringDirty(key)
+		plain, err := t.server.isPlainRedisString(context.Background(), key, t.startTS)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if plain {
+			return t.markStringDirty(key)
+		}
+		// HLL is reported as redisTypeString but stores its payload under
+		// !redis|hll|<key>; keep TTL in the legacy scan index via buildTTLElems.
 	}
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
@@ -2356,6 +2364,13 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 		storageKey := []byte(k)
 		if tv.deleted {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
+			// Deleting a string anchor must also drop any stale !redis|ttl|
+			// scan-index entry; buildTTLElems skips strings because it assumes
+			// the inline-TTL path owns them.
+			if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+				userKey := storageKey[len(redisStrPrefix):]
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+			}
 			continue
 		}
 		value := tv.raw
