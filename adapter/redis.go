@@ -271,10 +271,6 @@ type RedisServer struct {
 	leaderClientsMu sync.RWMutex
 	leaderClients   map[string]*redis.Client
 
-	// ttlBuffer holds pending TTL writes that are flushed to Raft in batches.
-	// It eliminates TTL write conflicts from concurrent Lua script executions.
-	ttlBuffer        *TTLBuffer
-	ttlFlushInterval time.Duration
 	// compactor is the background DeltaCompactor for this node. When set,
 	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
 	// reads on hot keys faster than the regular compaction interval.
@@ -303,17 +299,6 @@ func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.requestObserver = observer
-	}
-}
-
-// WithTTLFlushInterval overrides the default TTL buffer flush interval (100 ms).
-// Smaller values reduce the window for TTL loss on crash; larger values lower
-// Raft write amplification. Values ≤ 0 are ignored.
-func WithTTLFlushInterval(d time.Duration) RedisServerOption {
-	return func(r *RedisServer) {
-		if d > 0 {
-			r.ttlFlushInterval = d
-		}
 	}
 }
 
@@ -367,19 +352,17 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		relay = NewRedisPubSubRelay()
 	}
 	r := &RedisServer{
-		listen:           listen,
-		store:            store,
-		coordinator:      coordinate,
-		redisTranscoder:  newRedisTranscoder(),
-		redisAddr:        redisAddr,
-		relay:            relay,
-		leaderRedis:      leaderRedis,
-		leaderClients:    make(map[string]*redis.Client),
-		pubsub:           newRedisPubSub(),
-		scriptCache:      map[string]string{},
-		traceCommands:    os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
-		ttlBuffer:        newTTLBuffer(),
-		ttlFlushInterval: defaultTTLFlushInterval,
+		listen:          listen,
+		store:           store,
+		coordinator:     coordinate,
+		redisTranscoder: newRedisTranscoder(),
+		redisAddr:       redisAddr,
+		relay:           relay,
+		leaderRedis:     leaderRedis,
+		leaderClients:   make(map[string]*redis.Client),
+		pubsub:          newRedisPubSub(),
+		scriptCache:     map[string]string{},
+		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 	}
 	r.relay.Bind(r.publishLocal)
 
@@ -537,16 +520,6 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 }
 
 func (r *RedisServer) Run() error {
-	// Start the TTL buffer flush goroutine. It runs until the listener closes,
-	// then performs one final flush before returning.
-	flushCtx, cancelFlush := context.WithCancel(context.Background())
-	var flushWG sync.WaitGroup
-	flushWG.Add(1)
-	go func() {
-		defer flushWG.Done()
-		r.runTTLFlusher(flushCtx)
-	}()
-
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			needsTiming := r.requestObserver != nil || r.traceCommands
@@ -593,8 +566,6 @@ func (r *RedisServer) Run() error {
 			// PubSub connections clean up their own subscriptions via bgrunner.
 		})
 
-	cancelFlush()
-	flushWG.Wait()
 	return errors.WithStack(err)
 }
 
@@ -751,7 +722,7 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 		return state, nil
 	}
 
-	oldValue, err := r.readRedisStringAt(key, readTS)
+	oldValue, _, err := r.readRedisStringAt(key, readTS)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return redisSetState{}, err
 	}
@@ -761,21 +732,23 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 
 func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
 	var elems []*kv.Elem[kv.OP]
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, delElems...)
 	}
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)})
-	// TTL is no longer part of the Raft transaction; it is written to the
-	// in-memory buffer after a successful data commit (see flushTTLToBuffer).
-	if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
-		return err
+	// Embed TTL in the string value; write !redis|ttl| as a secondary scan index.
+	encoded := encodeRedisStr(bytes.Clone(value), ttl)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encoded})
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	} else {
+		// Clear any prior scan index so a persistent string is not later expired.
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	r.ttlBuffer.Set(key, ttl)
-	return nil
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
@@ -946,7 +919,7 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 		conn.WriteError(err.Error())
 		return true
 	}
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		return false
 	}
 	if err := r.saveString(ctx, key, value, ttl); err != nil {
@@ -1015,7 +988,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	v, err := r.readRedisStringAt(key, readTS)
+	v, _, err := r.readRedisStringAt(key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -1028,8 +1001,32 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteBulk(v)
 }
 
+// leaderEmbeddedTTLExpired looks at !redis|str|<key> on the leader and, if the
+// payload is in new format, returns the embedded-TTL expiry verdict. The bool
+// indicates whether the caller should use this verdict (true) or fall through
+// to the legacy !redis|ttl| index (false).
+func (r *RedisServer) leaderEmbeddedTTLExpired(key []byte) (bool, bool) {
+	raw, err := r.tryLeaderGetAt(redisStrKey(key), 0)
+	if err != nil || !isNewRedisStrFormat(raw) {
+		return false, false
+	}
+	_, expireAt, decErr := decodeRedisStr(raw)
+	if decErr != nil {
+		// Malformed new-format payload: treat as expired rather than silently alive.
+		return true, true
+	}
+	if expireAt == nil {
+		return false, true
+	}
+	return !expireAt.After(time.Now()), true
+}
+
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
 func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
+	// For string keys with new encoding: check embedded TTL.
+	if expired, ok := r.leaderEmbeddedTTLExpired(key); ok {
+		return expired
+	}
 	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
 	if err != nil {
 		return false
@@ -1599,6 +1596,7 @@ func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
 
 type txnValue struct {
 	raw     []byte
+	ttl     *time.Time
 	deleted bool
 	dirty   bool
 	loaded  bool
@@ -1696,11 +1694,15 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 	var val []byte
 	if !isKnownInternalKey(key) {
 		// For bare user string keys, use the fallback-aware reader.
-		var err error
-		val, err = t.server.readRedisStringAt(key, t.startTS)
+		var (
+			err error
+			ttl *time.Time
+		)
+		val, ttl, err = t.server.readRedisStringAt(key, t.startTS)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
+		tv.ttl = ttl
 	} else {
 		var err error
 		val, err = t.server.readValueAt(storageKey, t.startTS)
@@ -2012,7 +2014,7 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 
@@ -2138,13 +2140,38 @@ func (t *txnContext) applyExpire(cmd redcon.Command, unit time.Duration) (redisR
 	if ttl <= 0 {
 		return t.stageKeyDeletion(cmd.Args[1])
 	}
+	return t.applyPositiveExpire(cmd.Args[1], ttl, unit, typ, state)
+}
+
+func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Duration, typ redisValueType, state *ttlTxnState) (redisResult, error) {
 	if ttl > math.MaxInt64/int64(unit) {
 		return redisResult{}, errors.New("ERR invalid expire time in command")
 	}
-
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
 	state.value = &expireAt
 	state.dirty = true
+	if typ == redisTypeString {
+		plain, err := t.server.isPlainRedisString(context.Background(), key, t.startTS)
+		if err != nil {
+			return redisResult{}, err
+		}
+		if plain {
+			return t.markStringDirty(key)
+		}
+		// HLL is reported as redisTypeString but stores its payload under
+		// !redis|hll|<key>; keep TTL in the legacy scan index via buildTTLElems.
+	}
+	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
+// markStringDirty loads the string value into the working set so that
+// buildKeyElems will re-encode it with the updated embedded TTL.
+func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
+	tv, err := t.load(key)
+	if err != nil {
+		return redisResult{}, err
+	}
+	tv.dirty = true
 	return redisResult{typ: resultInt, integer: 1}, nil
 }
 
@@ -2268,37 +2295,57 @@ func (t *txnContext) commit() error {
 	if err != nil {
 		return err
 	}
+	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
+	// non-string keys get a !redis|ttl| element written in the same transaction.
+	ttlElems := t.buildTTLElems()
 
-	// TTL is no longer included in the IsTxn=true transaction; it is written to
-	// the in-memory buffer after a successful data commit to eliminate write
-	// conflicts on redisTTLKey from concurrent EXPIRE/SETEX operations.
 	elems = append(elems, listElems...)
 	elems = append(elems, zsetElems...)
-	if len(elems) == 0 && !t.hasDirtyTTLStates() {
+	elems = append(elems, ttlElems...)
+	if len(elems) == 0 {
 		return nil
 	}
 
-	if len(elems) > 0 {
-		readKeys := make([][]byte, 0, len(t.readKeys))
-		for _, k := range t.readKeys {
-			readKeys = append(readKeys, k)
-		}
-		group := &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			Elems:    elems,
-			StartTS:  t.startTS,
-			CommitTS: commitTS,
-			ReadKeys: readKeys,
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-		defer cancel()
-		if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
-			return errors.WithStack(err)
-		}
+	readKeys := make([][]byte, 0, len(t.readKeys))
+	for _, k := range t.readKeys {
+		readKeys = append(readKeys, k)
 	}
-
-	t.flushTTLToBuffer()
+	group := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		Elems:    elems,
+		StartTS:  t.startTS,
+		CommitTS: commitTS,
+		ReadKeys: readKeys,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
+		return errors.WithStack(err)
+	}
 	return nil
+}
+
+// stringValueAndTTLElem returns the encoded string value and an optional
+// !redis|ttl| scan-index mutation for a string write. Dirty EXPIRE/PERSIST
+// state takes priority; otherwise the TTL loaded with the value is preserved
+// so commands like INCR or SETBIT inside MULTI/EXEC don't clear it. A dirty
+// PERSIST emits a Del so the sweeper cannot later expire a persistent key.
+func (t *txnContext) stringValueAndTTLElem(userKey []byte, tv *txnValue) ([]byte, *kv.Elem[kv.OP]) {
+	ttl := tv.ttl
+	ttlSt := t.ttlStates[string(userKey)]
+	if ttlSt != nil && ttlSt.dirty {
+		ttl = ttlSt.value
+	}
+	value := encodeRedisStr(tv.raw, ttl)
+	if ttl != nil {
+		return value, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(userKey), Value: encodeRedisTTL(*ttl)}
+	}
+	// ttl is nil: emit Del when there was a prior TTL (loaded or dirty-cleared)
+	// so the sweeper cannot later expire a now-persistent key or hit a stale index.
+	if tv.ttl != nil || (ttlSt != nil && ttlSt.dirty) {
+		return value, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)}
+	}
+	return value, nil
 }
 
 func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
@@ -2317,9 +2364,25 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 		storageKey := []byte(k)
 		if tv.deleted {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
+			// Deleting a string anchor must also drop any stale !redis|ttl|
+			// scan-index entry; buildTTLElems skips strings because it assumes
+			// the inline-TTL path owns them.
+			if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+				userKey := storageKey[len(redisStrPrefix):]
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+			}
 			continue
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: tv.raw})
+		value := tv.raw
+		if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+			userKey := storageKey[len(redisStrPrefix):]
+			var extra *kv.Elem[kv.OP]
+			value, extra = t.stringValueAndTTLElem(userKey, tv)
+			if extra != nil {
+				elems = append(elems, extra)
+			}
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: value})
 	}
 	return elems
 }
@@ -2478,26 +2541,25 @@ func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64)
 	return elems, lenDelta
 }
 
-// hasDirtyTTLStates returns true if any TTL state has been modified.
-func (t *txnContext) hasDirtyTTLStates() bool {
-	for _, st := range t.ttlStates {
-		if st.dirty {
-			return true
-		}
-	}
-	return false
-}
-
-// flushTTLToBuffer writes all dirty TTL states to the server's TTLBuffer.
-// It is called after a successful Raft data commit so TTL never reaches the
-// buffer if the data commit fails.
-func (t *txnContext) flushTTLToBuffer() {
+// buildTTLElems returns !redis|ttl| Raft elements for non-string keys with dirty TTL state.
+// String keys have TTL embedded in the value; they are handled by buildKeyElems.
+func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
+	var elems []*kv.Elem[kv.OP]
 	for k, st := range t.ttlStates {
 		if !st.dirty {
 			continue
 		}
-		t.server.ttlBuffer.Set([]byte(k), st.value)
+		// String keys encode TTL inside the value in buildKeyElems; skip them here.
+		if _, isString := t.working[string(redisStrKey([]byte(k)))]; isString {
+			continue
+		}
+		if st.value == nil {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey([]byte(k))})
+		} else {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(k)), Value: encodeRedisTTL(*st.value)})
+		}
 	}
+	return elems
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
@@ -3214,10 +3276,15 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 
 func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	ttlKey := key
+	nonStringInternal := false
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
+		// Non-string internal keys (!redis|hash|, !redis|set|, …) can never
+		// carry an embedded-TTL payload, so we can skip the !redis|str| probe
+		// that ttlAt would otherwise make.
+		nonStringInternal = !bytes.HasPrefix(key, []byte(redisStrPrefix))
 	}
-	expired, err := r.hasExpiredTTLAt(context.Background(), ttlKey, readTS)
+	expired, err := r.hasExpired(context.Background(), ttlKey, readTS, nonStringInternal)
 	if err != nil {
 		return nil, err
 	}

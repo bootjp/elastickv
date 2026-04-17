@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"context"
-	"log/slog"
 	"maps"
 	"math"
 	"sort"
@@ -429,7 +428,7 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.readRedisStringAt(key, c.startTS)
+	value, _, err := c.server.readRedisStringAt(key, c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		return st, nil
@@ -2442,7 +2441,6 @@ func (c *luaScriptContext) commit() error {
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
 	commitTS := c.server.coordinator.Clock().Next()
 
-	keyPlans := make([]luaKeyPlan, 0, len(keys))
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
 	ctx := context.Background()
 	for _, key := range keys {
@@ -2451,36 +2449,56 @@ func (c *luaScriptContext) commit() error {
 			return err
 		}
 		elems = append(elems, plan.elems...)
-		keyPlans = append(keyPlans, plan)
-	}
-
-	if len(elems) > 0 {
-		dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-		defer cancel()
-		startTS := c.startTS
-		if startTS == ^uint64(0) {
-			startTS = 0
-		}
-		if _, err := c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			StartTS:  startTS,
-			CommitTS: commitTS,
-			Elems:    elems,
-		}); err != nil {
-			return errors.WithStack(err)
+		// For non-string keys with dirty TTL: include !redis|ttl| in the same txn.
+		// String keys already have TTL embedded in the value via stringCommitElems.
+		if isNonStringCollectionType(plan.finalType) {
+			ttlElems, err := c.nonStringTTLElems(key, plan.preserveExisting)
+			if err != nil {
+				return err
+			}
+			elems = append(elems, ttlElems...)
 		}
 	}
 
-	// Flush TTL to the in-memory buffer after a successful data commit.
-	// TTL is excluded from the IsTxn=true transaction to eliminate write
-	// conflicts on redisTTLKey from concurrent EXPIRE/EVALSHA operations.
-	for i, key := range keys {
-		c.flushTTLForKeyToBuffer(key, keyPlans[i].finalType, keyPlans[i].preserveExisting)
+	if len(elems) == 0 {
+		return nil
+	}
+
+	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	startTS := c.startTS
+	if startTS == ^uint64(0) {
+		startTS = 0
+	}
+	if _, err := c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems:    elems,
+	}); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
 
-// commitPlanForKey builds the data Raft elements for a single key (TTL excluded).
+// nonStringTTLElems returns !redis|ttl| elements for a non-string key if the TTL
+// state is dirty (or the key was fully rewritten, requiring TTL to be included).
+func (c *luaScriptContext) nonStringTTLElems(key string, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
+	st := c.ttls[key]
+	if preserveExisting && (st == nil || !st.dirty) {
+		return nil, nil
+	}
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	if ttl == nil {
+		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey([]byte(key))}}, nil
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)}}, nil
+}
+
+// commitPlanForKey builds the data Raft elements for a single key.
 func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, commitTS uint64) (luaKeyPlan, error) {
 	finalType, err := c.finalType([]byte(key))
 	if err != nil {
@@ -2508,39 +2526,6 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		finalType:        finalType,
 		preserveExisting: valuePlan.preserveExisting,
 	}, nil
-}
-
-// flushTTLForKeyToBuffer writes the TTL for a single key to the server's
-// TTLBuffer. Keys deleted by the script (finalType==None) write a nil TTL when
-// the Lua TTL state is dirty to clear pending/persisted expiry. For non-None
-// keys, only dirty TTL state (or unconditionally-set TTL) is written.
-func (c *luaScriptContext) flushTTLForKeyToBuffer(key string, finalType redisValueType, preserveExisting bool) {
-	if finalType == redisTypeNone {
-		if st := c.ttls[key]; st != nil && st.dirty {
-			c.server.ttlBuffer.Set([]byte(key), nil)
-		}
-		return
-	}
-	if preserveExisting {
-		if st := c.ttls[key]; st == nil || !st.dirty {
-			return
-		}
-	}
-	ttl, err := c.finalTTL([]byte(key))
-	if err != nil {
-		// Data was already committed to Raft; log and leave the stale TTL as-is
-		// rather than silently losing the TTL state.
-		slog.Warn("lua TTL flush: failed to read finalTTL, TTL update skipped", "key_len", len(key), "err", err)
-		return
-	}
-	if ttl == nil {
-		// Write nil unconditionally: for read-modify-write paths (preserveExisting=true)
-		// this is an explicit TTL removal (PERSIST); for rewrite paths
-		// (preserveExisting=false) it clears any stale buffered TTL for this key.
-		c.server.ttlBuffer.Set([]byte(key), nil)
-		return
-	}
-	c.server.ttlBuffer.Set([]byte(key), ttl)
 }
 
 func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
@@ -2574,7 +2559,20 @@ func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	if err != nil {
 		return nil, err
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStrKey([]byte(key)), Value: append([]byte(nil), st.value...)}}, nil
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	encoded := encodeRedisStr(append([]byte(nil), st.value...), ttl)
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStrKey([]byte(key)), Value: encoded}}
+	// Write !redis|ttl| scan index alongside the encoded value; delete it when
+	// the script makes the string persistent, so the sweeper cannot later expire it.
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey([]byte(key))})
+	}
+	return elems, nil
 }
 
 func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommitPlan, error) {
