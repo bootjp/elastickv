@@ -2042,25 +2042,32 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 			if !ok {
 				return
 			}
-			if ctx.Err() != nil {
-				_ = req.Close()
-				continue
-			}
-			if err := e.dispatchTransport(ctx, req); err != nil {
-				count := e.dispatchErrorCount.Add(1)
-				if shouldLogDispatchEvent(count) {
-					slog.Warn("etcd raft outbound dispatch failed",
-						"node_id", e.nodeID,
-						"to", req.msg.To,
-						"type", req.msg.Type.String(),
-						"dispatch_error_count", count,
-						"err", err,
-					)
-				}
-				_ = req.Close()
-				continue
-			}
-			_ = req.Close()
+			e.handleDispatchRequest(ctx, req)
+		}
+	}
+}
+
+func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest) {
+	if ctx.Err() != nil {
+		if err := req.Close(); err != nil {
+			slog.Error("etcd raft dispatch: failed to close request", "err", err)
+		}
+		return
+	}
+	dispatchErr := e.dispatchTransport(ctx, req)
+	if err := req.Close(); err != nil {
+		slog.Error("etcd raft dispatch: failed to close request", "err", err)
+	}
+	if dispatchErr != nil {
+		count := e.dispatchErrorCount.Add(1)
+		if shouldLogDispatchEvent(count) {
+			slog.Warn("etcd raft outbound dispatch failed",
+				"node_id", e.nodeID,
+				"to", req.msg.To,
+				"type", req.msg.Type.String(),
+				"dispatch_error_count", count,
+				"err", dispatchErr,
+			)
 		}
 	}
 }
