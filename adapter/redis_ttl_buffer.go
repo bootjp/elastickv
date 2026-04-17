@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	defaultTTLFlushInterval = 100 * time.Millisecond
+	defaultTTLFlushInterval  = 100 * time.Millisecond
 	ttlShutdownFlushAttempts = 3
 	ttlShutdownFlushBackoff  = 100 * time.Millisecond
+	// Flush at most this many TTL updates per dispatch to avoid oversized raft ops.
+	ttlFlushBatchMax = 4096
 	// Rate-limit buffer-drop logs to the first drop and then each Nth drop.
 	ttlBufferDropLogEvery = 1024
 	// ttlBufferMaxSize is the maximum number of entries retained in the buffer.
@@ -124,6 +126,32 @@ func (b *TTLBuffer) Drain() map[string]ttlBufferEntry {
 	return snapshot
 }
 
+// DrainN atomically snapshots up to limit entries and removes them from
+// the buffer. If limit <= 0, all entries are drained.
+func (b *TTLBuffer) DrainN(limit int) map[string]ttlBufferEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.entries) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit >= len(b.entries) {
+		snapshot := b.entries
+		b.entries = make(map[string]ttlBufferEntry)
+		return snapshot
+	}
+	snapshot := make(map[string]ttlBufferEntry, limit)
+	count := 0
+	for key, entry := range b.entries {
+		snapshot[key] = entry
+		delete(b.entries, key)
+		count++
+		if count >= limit {
+			break
+		}
+	}
+	return snapshot
+}
+
 // MergeBack re-inserts entries from a failed flush attempt.
 // For each key, the entry is only restored if the buffer does not already hold
 // a newer write (higher seq) for that key. Keys that are new to the current
@@ -135,7 +163,7 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	}
 	b.mu.Lock()
 	dropped := 0
-	size := 0
+	var size int
 	for key, entry := range entries {
 		if e, ok := b.entries[key]; ok {
 			if e.seq > entry.seq {
@@ -232,11 +260,10 @@ func (r *RedisServer) runTTLFlusher(ctx context.Context) {
 // non-transactional (last-writer-wins) operation group.
 // On failure the entries are merged back into the buffer for retry on the next tick.
 func (r *RedisServer) flushTTLBuffer(ctx context.Context, shutdown bool) bool {
-	entries := r.ttlBuffer.Drain()
+	entries := r.ttlBuffer.DrainN(ttlFlushBatchMax)
 	if len(entries) == 0 {
 		return true
 	}
-
 	elems := buildTTLFlushElems(entries)
 	flushCtx, cancel := context.WithTimeout(ctx, redisDispatchTimeout)
 	defer cancel()
@@ -257,5 +284,5 @@ func (r *RedisServer) flushTTLBuffer(ctx context.Context, shutdown bool) bool {
 		}
 		return false
 	}
-	return true
+	return r.ttlBuffer.Len() == 0
 }

@@ -1916,7 +1916,7 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	}
 
 	var oldValue []byte
-	if opts.returnOld {
+	if opts.returnOld && !tv.deleted {
 		oldValue = tv.raw
 	}
 

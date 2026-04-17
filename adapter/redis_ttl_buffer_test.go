@@ -29,6 +29,33 @@ func (c *shutdownFlushCoordinator) Dispatch(context.Context, *kv.OperationGroup[
 	return &kv.CoordinateResponse{}, nil
 }
 
+type chunkingFlushCoordinator struct {
+	stubAdapterCoordinator
+	err   error
+	calls atomic.Int32
+	mu    sync.Mutex
+	sizes []int
+	keys  map[string]struct{}
+}
+
+func (c *chunkingFlushCoordinator) Dispatch(_ context.Context, opg *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.calls.Add(1)
+	c.mu.Lock()
+	if c.keys == nil {
+		c.keys = make(map[string]struct{})
+	}
+	c.sizes = append(c.sizes, len(opg.Elems))
+	prefix := len(redisTTLKey(nil))
+	for _, elem := range opg.Elems {
+		c.keys[string(elem.Key[prefix:])] = struct{}{}
+	}
+	c.mu.Unlock()
+	if c.err != nil {
+		return nil, c.err
+	}
+	return &kv.CoordinateResponse{}, nil
+}
+
 // ────────────────────────────────────────────────────────────────
 // TTLBuffer — unit tests
 // ────────────────────────────────────────────────────────────────
@@ -279,6 +306,59 @@ func TestRunTTLFlusher_ShutdownStopsAfterBoundedRetries(t *testing.T) {
 
 	require.Equal(t, int32(ttlShutdownFlushAttempts), coord.calls.Load())
 	require.Equal(t, 1, server.ttlBuffer.Len())
+}
+
+func TestFlushTTLBuffer_ChunksLargeBuffer(t *testing.T) {
+	t.Parallel()
+	coord := &chunkingFlushCoordinator{}
+	server := &RedisServer{
+		coordinator:      coord,
+		ttlBuffer:        newTTLBufferWithMaxSize(ttlFlushBatchMax + 64),
+		ttlFlushInterval: time.Hour,
+	}
+	expireAt := time.Now().Add(time.Minute)
+	total := ttlFlushBatchMax + 17
+	for i := range total {
+		server.ttlBuffer.Set([]byte(fmt.Sprintf("k:%d", i)), &expireAt)
+	}
+
+	drainedAll := server.flushTTLBuffer(context.Background(), false)
+	require.False(t, drainedAll, "first flush should leave remainder")
+	require.Equal(t, total-ttlFlushBatchMax, server.ttlBuffer.Len())
+
+	drainedAll = server.flushTTLBuffer(context.Background(), false)
+	require.True(t, drainedAll, "second flush should empty remaining entries")
+	require.Equal(t, 0, server.ttlBuffer.Len())
+	require.Equal(t, int32(2), coord.calls.Load())
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	require.Equal(t, []int{ttlFlushBatchMax, total - ttlFlushBatchMax}, coord.sizes)
+	require.Len(t, coord.keys, total, "all original keys must be flushed across chunks")
+}
+
+func TestFlushTTLBuffer_ChunkDispatchError_RequeuesAll(t *testing.T) {
+	t.Parallel()
+	coord := &chunkingFlushCoordinator{err: errors.New("dispatch failed")}
+	server := &RedisServer{
+		coordinator:      coord,
+		ttlBuffer:        newTTLBufferWithMaxSize(ttlFlushBatchMax + 64),
+		ttlFlushInterval: time.Hour,
+	}
+	expireAt := time.Now().Add(time.Minute)
+	total := ttlFlushBatchMax + 5
+	for i := range total {
+		server.ttlBuffer.Set([]byte(fmt.Sprintf("k:%d", i)), &expireAt)
+	}
+
+	drainedAll := server.flushTTLBuffer(context.Background(), false)
+	require.False(t, drainedAll)
+	require.Equal(t, total, server.ttlBuffer.Len(), "failed chunk must be merged back and remainder preserved")
+	require.Equal(t, int32(1), coord.calls.Load())
+
+	coord.mu.Lock()
+	require.Equal(t, []int{ttlFlushBatchMax}, coord.sizes)
+	coord.mu.Unlock()
 }
 
 // ────────────────────────────────────────────────────────────────
