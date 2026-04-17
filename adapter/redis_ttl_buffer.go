@@ -15,6 +15,8 @@ const (
 	defaultTTLFlushInterval = 100 * time.Millisecond
 	ttlShutdownFlushAttempts = 3
 	ttlShutdownFlushBackoff  = 100 * time.Millisecond
+	// Rate-limit buffer-drop logs to the first drop and then each Nth drop.
+	ttlBufferDropLogEvery = 1024
 	// ttlBufferMaxSize is the maximum number of entries retained in the buffer.
 	// Entries beyond this limit are dropped with a warning; the Raft store still
 	// holds the last flushed value so the impact is limited to a missed update.
@@ -86,10 +88,7 @@ func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
 logDrop:
 	// Log outside the mutex and rate-limit to avoid lock contention/log spam under overload.
 	dropCount := b.dropped.Add(1)
-	if dropCount == ^uint64(0) {
-		b.dropped.Store(0)
-	}
-	if dropCount == 1 || dropCount%1024 == 0 {
+	if dropCount == 1 || dropCount%ttlBufferDropLogEvery == 0 {
 		slog.Warn("ttl buffer full, dropping entry", "size", size, "key_len", keyLen, "dropped", dropCount)
 	}
 }
@@ -128,22 +127,41 @@ func (b *TTLBuffer) Drain() map[string]ttlBufferEntry {
 // MergeBack re-inserts entries from a failed flush attempt.
 // For each key, the entry is only restored if the buffer does not already hold
 // a newer write (higher seq) for that key. Keys that are new to the current
-// buffer are skipped once the buffer is full (same policy as Set).
+// buffer are skipped once the buffer is full (same policy as Set), and dropped
+// entries are counted/logged to make recovery-path loss observable.
 func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	if len(entries) == 0 {
 		return
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	dropped := 0
+	size := 0
 	for key, entry := range entries {
 		if e, ok := b.entries[key]; ok {
 			if e.seq > entry.seq {
 				continue // a newer write supersedes the failed entry
 			}
 		} else if len(b.entries) >= b.maxSize {
+			dropped++
 			continue // buffer full; drop the restored entry rather than growing unbounded
 		}
 		b.entries[key] = entry
+	}
+	size = len(b.entries)
+	b.mu.Unlock()
+
+	if dropped == 0 {
+		return
+	}
+	dropCount := b.dropped.Add(uint64(dropped))
+	prevDropCount := dropCount - uint64(dropped)
+	if prevDropCount == 0 || prevDropCount/ttlBufferDropLogEvery != dropCount/ttlBufferDropLogEvery {
+		slog.Warn(
+			"ttl buffer merge-back dropped entries",
+			"size", size,
+			"dropped", dropped,
+			"total_dropped", dropCount,
+		)
 	}
 }
 

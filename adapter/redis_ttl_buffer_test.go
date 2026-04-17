@@ -146,6 +146,26 @@ func TestTTLBuffer_MergeBack_RestoresWhenNoNewerWrite(t *testing.T) {
 	require.Equal(t, expireAt.UnixNano(), got.UnixNano())
 }
 
+func TestTTLBuffer_MergeBack_Full_DropsAndCounts(t *testing.T) {
+	t.Parallel()
+	b := newTTLBufferWithMaxSize(1)
+	expireAt := time.Now().Add(time.Minute)
+	b.Set([]byte("live"), &expireAt)
+
+	snapshot := map[string]ttlBufferEntry{
+		"a": {expireAt: &expireAt, seq: 1},
+		"b": {expireAt: nil, seq: 2},
+	}
+	b.MergeBack(snapshot)
+
+	require.Equal(t, uint64(2), b.dropped.Load())
+	require.Equal(t, 1, b.Len())
+	_, found := b.Get([]byte("a"))
+	require.False(t, found)
+	_, found = b.Get([]byte("b"))
+	require.False(t, found)
+}
+
 // A nil *TTLBuffer must not panic on Get.
 func TestTTLBuffer_NilReceiver_GetIsNoop(t *testing.T) {
 	t.Parallel()
