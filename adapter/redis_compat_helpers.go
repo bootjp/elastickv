@@ -446,8 +446,14 @@ func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, erro
 // uses, but without calling back into hasExpiredTTLAt. Callers are responsible
 // for handling expiration themselves using the TTL they just read.
 func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error) {
-	if r.coordinator.IsLeaderForKey(key) {
-		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+	// Leadership is partitioned by the logical user key, so strip the internal
+	// prefix before asking the coordinator.
+	routingKey := key
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		routingKey = userKey
+	}
+	if r.coordinator.IsLeaderForKey(routingKey) {
+		if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
 			return nil, errors.WithStack(err)
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)

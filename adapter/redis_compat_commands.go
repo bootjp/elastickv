@@ -328,10 +328,21 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
+	// Pin expireAt once before the retry loop so successive attempts all write
+	// the same wall-clock deadline (OCC retries must not push expiry forward).
+	var expireAt time.Time
+	if ttl > 0 {
+		if ttl > math.MaxInt64/int64(unit) {
+			conn.WriteError("ERR invalid expire time in command")
+			return
+		}
+		expireAt = time.Now().Add(time.Duration(ttl) * unit)
+	}
+
 	var result int
 	if err := r.retryRedisWrite(ctx, func() error {
 		var retErr error
-		result, retErr = r.doSetExpire(ctx, cmd.Args[1], ttl, unit, nxOnly)
+		result, retErr = r.doSetExpire(ctx, cmd.Args[1], ttl, expireAt, nxOnly)
 		return retErr
 	}); err != nil {
 		conn.WriteError(err.Error())
@@ -347,7 +358,7 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 // ErrWriteConflict if any touched key was modified after readTS. retryRedisWrite
 // then re-invokes doSetExpire with a fresh readTS, providing OCC safety without
 // an explicit mutex. Leadership is verified by coordinator.Dispatch itself.
-func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, unit time.Duration, nxOnly bool) (int, error) {
+func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, expireAt time.Time, nxOnly bool) (int, error) {
 	readTS, eligible, err := r.prepareExpire(key, nxOnly)
 	if err != nil {
 		return 0, err
@@ -358,7 +369,6 @@ func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, un
 	if ttl <= 0 {
 		return r.expireDeleteKey(ctx, key, readTS)
 	}
-	expireAt := time.Now().Add(time.Duration(ttl) * unit)
 	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
@@ -1991,6 +2001,10 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		if existingTTL != nil {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(*existingTTL)})
+		} else {
+			// Defensively clear any stale/legacy scan index entry so the sweeper
+			// cannot later expire a now-persistent key.
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
