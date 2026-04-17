@@ -330,40 +330,74 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 
 	var result int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, eligible, err := r.prepareExpire(cmd.Args[1], nxOnly)
-		if err != nil {
-			return err
-		}
-		if !eligible {
-			result = 0
-			return nil
-		}
-		if ttl <= 0 {
-			elems, existed, err := r.deleteLogicalKeyElems(ctx, cmd.Args[1], readTS)
-			if err != nil {
-				return err
-			}
-			if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
-				return err
-			}
-			if existed {
-				result = 1
-			} else {
-				result = 0
-			}
-			return nil
-		}
-		expireAt := time.Now().Add(time.Duration(ttl) * unit)
-		result = 1
-		// TTL is written to the in-memory buffer; the background flusher
-		// batches it to Raft without conflict detection (IsTxn=false).
-		r.ttlBuffer.Set(cmd.Args[1], &expireAt)
-		return nil
+		var retErr error
+		result, retErr = r.doSetExpire(ctx, cmd.Args[1], ttl, unit, nxOnly)
+		return retErr
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	conn.WriteInt(result)
+}
+
+func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, unit time.Duration, nxOnly bool) (int, error) {
+	readTS, eligible, err := r.prepareExpire(key, nxOnly)
+	if err != nil {
+		return 0, err
+	}
+	if !eligible {
+		return 0, nil
+	}
+	if ttl <= 0 {
+		return r.expireDeleteKey(ctx, key, readTS)
+	}
+	expireAt := time.Now().Add(time.Duration(ttl) * unit)
+	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if typ == redisTypeString {
+		return 1, r.dispatchStringExpire(ctx, key, readTS, expireAt)
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
+	return 1, r.dispatchElems(ctx, false, 0, elems)
+}
+
+func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS uint64) (int, error) {
+	elems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		return 0, err
+	}
+	if existed {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// dispatchStringExpire performs a read-modify-write on the string anchor key to
+// embed the new expiry time, then writes both the value and the !redis|ttl| scan
+// index in a single Raft entry.
+func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) error {
+	raw, readErr := r.store.GetAt(ctx, redisStrKey(key), readTS)
+	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
+		return cockerrors.WithStack(readErr)
+	}
+	var userValue []byte
+	if readErr == nil {
+		userValue, _, readErr = decodeRedisStr(raw)
+		if readErr != nil {
+			return readErr
+		}
+	}
+	encoded := encodeRedisStr(userValue, &expireAt)
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
+		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
+	}
+	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func parseScanArgs(args [][]byte) (int, []byte, int, error) {
@@ -1936,14 +1970,11 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		current++
 
-		if err := r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: []byte(strconv.FormatInt(current, 10))},
-		}); err != nil {
-			return err
-		}
-		// INCR clears any TTL; write nil to buffer (PERSIST semantics).
-		r.ttlBuffer.Set(cmd.Args[1], nil)
-		return nil
+		// INCR clears any TTL (PERSIST semantics); encode value with no TTL.
+		encoded := encodeRedisStr([]byte(strconv.FormatInt(current, 10)), nil)
+		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: encoded},
+		})
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return

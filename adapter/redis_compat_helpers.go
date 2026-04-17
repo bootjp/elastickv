@@ -368,11 +368,15 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 
 // readRedisStringAt reads a Redis string value, trying the prefixed key first
 // and falling back to the bare key for legacy data written before the
-// !redis|str| prefix migration.
+// !redis|str| prefix migration. Returns the decoded user value (without TTL header).
 func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, error) {
 	v, err := r.readValueAt(redisStrKey(key), readTS)
 	if err == nil {
-		return v, nil
+		userValue, _, decErr := decodeRedisStr(v)
+		if decErr != nil {
+			return nil, decErr
+		}
+		return userValue, nil
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, err
@@ -381,16 +385,15 @@ func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, erro
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
+	encoded := encodeRedisStr(value, ttl)
 	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)},
+		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
 	}
-	if err := r.dispatchElems(ctx, false, 0, elems); err != nil {
-		return err
+	// Write !redis|ttl| as a secondary scan index for background expiration (if TTL set).
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	}
-	// TTL is written to the buffer after a successful data commit; the
-	// background flusher batches it to Raft without conflict detection.
-	r.ttlBuffer.Set(key, ttl)
-	return nil
+	return r.dispatchElems(ctx, false, 0, elems)
 }
 
 // deleteListElems returns delete operations for all list keys: item keys, the base

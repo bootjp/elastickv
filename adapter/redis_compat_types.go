@@ -14,6 +14,67 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// redisStrEncoding constants for the new magic+version prefixed string format.
+// Format: [0xFF 0x01][flags(1)][expireAtMs(8, present iff has_ttl)][user value]
+const (
+	redisStrMagic      = byte(0xFF)
+	redisStrVersion    = byte(0x01)
+	redisStrHasTTL     = byte(0x01)
+	redisStrBaseHeader = 3 // magic(1) + version(1) + flags(1)
+)
+
+// encodeRedisStr encodes a Redis string value with optional TTL.
+// New format: [0xFF 0x01][flags][expireAtMs(8, optional)][user value]
+func encodeRedisStr(value []byte, expireAt *time.Time) []byte {
+	flags := byte(0)
+	headerLen := redisStrBaseHeader
+	if expireAt != nil {
+		flags = redisStrHasTTL
+		headerLen += redisUint64Bytes
+	}
+	buf := make([]byte, headerLen+len(value))
+	buf[0] = redisStrMagic
+	buf[1] = redisStrVersion
+	buf[2] = flags
+	if expireAt != nil {
+		ms := max(expireAt.UnixMilli(), 0)
+		binary.BigEndian.PutUint64(buf[redisStrBaseHeader:redisStrBaseHeader+redisUint64Bytes], uint64(ms)) // #nosec G115
+		copy(buf[redisStrBaseHeader+redisUint64Bytes:], value)
+	} else {
+		copy(buf[redisStrBaseHeader:], value)
+	}
+	return buf
+}
+
+// decodeRedisStr decodes a Redis string value.
+// For new format (magic prefix 0xFF 0x01): returns user value and optional expireAt.
+// For legacy format (no magic): returns raw bytes as user value with nil expireAt.
+func decodeRedisStr(raw []byte) (value []byte, expireAt *time.Time, err error) {
+	if isNewRedisStrFormat(raw) {
+		if len(raw) < redisStrBaseHeader {
+			return nil, nil, errors.New("invalid encoded string: too short")
+		}
+		flags := raw[2]
+		rest := raw[redisStrBaseHeader:]
+		if flags&redisStrHasTTL != 0 {
+			if len(rest) < redisUint64Bytes {
+				return nil, nil, errors.New("invalid encoded string: missing TTL bytes")
+			}
+			ms := min(binary.BigEndian.Uint64(rest[:redisUint64Bytes]), math.MaxInt64)
+			t := time.UnixMilli(int64(ms)) // #nosec G115
+			return rest[redisUint64Bytes:], &t, nil
+		}
+		return rest, nil, nil
+	}
+	// Legacy format: raw bytes with no TTL header.
+	return raw, nil, nil
+}
+
+// isNewRedisStrFormat reports whether raw uses the new magic+version prefix.
+func isNewRedisStrFormat(raw []byte) bool {
+	return len(raw) >= 2 && raw[0] == redisStrMagic && raw[1] == redisStrVersion
+}
+
 const (
 	redisStrPrefix    = "!redis|str|"
 	redisHashPrefix   = "!redis|hash|"
@@ -211,11 +272,21 @@ func decodeRedisTTL(raw []byte) (time.Time, error) {
 }
 
 func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
-	// The buffer holds the most recent TTL write regardless of Raft flush state.
-	if expireAt, found := r.ttlBuffer.Get(userKey); found {
-		return expireAt, nil
+	// For string keys with new encoding: TTL is embedded in the string value.
+	// Trust only the embedded TTL; do not fall back to !redis|ttl| for new-format strings.
+	raw, err := r.store.GetAt(ctx, redisStrKey(userKey), readTS)
+	if err == nil {
+		if isNewRedisStrFormat(raw) {
+			_, expireAt, decErr := decodeRedisStr(raw)
+			return expireAt, decErr
+		}
+		// Legacy string format: fall through to !redis|ttl| key.
+	} else if !errors.Is(err, store.ErrKeyNotFound) {
+		return nil, errors.WithStack(err)
 	}
-	raw, err := r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
+
+	// Fall back to !redis|ttl| key (non-string types and legacy string data).
+	raw, err = r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil

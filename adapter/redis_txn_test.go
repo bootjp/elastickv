@@ -110,7 +110,9 @@ func TestRedisTxnMULTIEXECRetriesOnCoordinatorConflict(t *testing.T) {
 	require.Len(t, results, 1)
 	require.Equal(t, 2, coord.dispatches) // first dispatch fails, second succeeds
 
-	val, err := st.GetAt(ctx, redisStrKey([]byte("txn:key")), snapshotTS(coord.clock, st))
+	rawVal, err := st.GetAt(ctx, redisStrKey([]byte("txn:key")), snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	val, _, err := decodeRedisStr(rawVal)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val)
 }
