@@ -24,7 +24,7 @@ const (
 	defaultTickInterval           = 10 * time.Millisecond
 	defaultHeartbeatTick          = 1
 	defaultElectionTick           = 10
-	defaultMaxInflightMsg         = 256
+	defaultMaxInflightMsg         = 1024
 	defaultMaxSizePerMsg          = 1 << 20
 	defaultDispatchWorkersPerPeer = 1
 	defaultSnapshotEvery          = 10_000
