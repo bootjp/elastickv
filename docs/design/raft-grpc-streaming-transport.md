@@ -17,9 +17,9 @@ dispatchRegular:
 ```
 
 Each call pays a full network round-trip before the next message can be sent.
-With `defaultMaxInflightMsg = 1024`, the leader can generate up to 1024 MsgApp
+With `defaultMaxInflightMsg = 256`, the leader can generate up to 256 MsgApp
 messages per follower before receiving ACK. A single dispatch worker serialises
-those 1024 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
+those 256 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
 regardless of bandwidth.
 
 PR #522 introduced per-peer dispatch channels and `defaultDispatchWorkersPerPeer = 2`
@@ -195,6 +195,38 @@ be used to skip the probe after the first successful stream is established.
 | **Memory** | gRPC stream send buffer (typically 32 KB) replaces per-peer channel as primary buffer; channel can be reduced |
 | **Complexity** | Stream state machine in `GRPCTransport`; backward-compat fallback path |
 | **Ordering** | Single stream per peer preserves FIFO — safe for Raft |
+| **Heartbeat starvation** | Under a burst of log entries, heartbeats could be delayed in the send buffer. Mitigated via biased-select (see below). |
+
+### 3.6 Heartbeat starvation mitigation — biased select
+
+When the multiplexing dispatch worker (Option A from §3.2) reads from both
+channels, a sustained `MsgApp` burst can delay heartbeats. The mitigation is
+a **biased select**: check the priority channel non-blocking first, fall back
+to either channel:
+
+```go
+for {
+    // Drain the priority channel before accepting normal messages.
+    select {
+    case req := <-pd.heartbeat:
+        stream.Send(req)
+        continue
+    default:
+    }
+    // No priority message pending; wait on either.
+    select {
+    case req := <-pd.heartbeat:
+        stream.Send(req)
+    case req := <-pd.normal:
+        stream.Send(req)
+    case <-ctx.Done():
+        return
+    }
+}
+```
+
+This guarantees heartbeats are flushed before the next log entry is written
+to the stream, bounding heartbeat delay to one normal-message send time.
 
 ---
 

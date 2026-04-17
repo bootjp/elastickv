@@ -91,7 +91,8 @@ type OpenConfig struct {
 	// per peer before waiting for an acknowledgement (Raft-level flow control).
 	// It also sets the per-peer dispatch channel capacity, so total buffered
 	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
-	// Default: 1024. Lower this value in memory-constrained clusters.
+	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
+	// lower in memory-constrained clusters.
 	MaxInflightMsg int
 }
 
