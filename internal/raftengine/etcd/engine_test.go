@@ -501,12 +501,13 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 }
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
+	ch := make(chan dispatchRequest, 1)
+	ch <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 	engine := &Engine{
-		nodeID:     1,
-		transport:  &GRPCTransport{},
-		dispatchCh: make(chan dispatchRequest, 1),
+		nodeID:          1,
+		transport:       &GRPCTransport{},
+		peerDispatchers: map[uint64]chan dispatchRequest{2: ch},
 	}
-	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 
 	done := make(chan struct{})
 	go func() {
@@ -528,10 +529,15 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	engine := &Engine{
-		dispatchCh:     make(chan dispatchRequest, 1),
-		dispatchStopCh: make(chan struct{}),
-		dispatchCtx:    ctx,
-		dispatchCancel: cancel,
+		nodeID: 1,
+		peers: map[uint64]Peer{
+			2: {NodeID: 2},
+		},
+		peerDispatchers:  make(map[uint64]chan dispatchRequest),
+		perPeerQueueSize: 1,
+		dispatchStopCh:   make(chan struct{}),
+		dispatchCtx:      ctx,
+		dispatchCancel:   cancel,
 	}
 	started := make(chan struct{})
 	engine.dispatchFn = func(ctx context.Context, _ dispatchRequest) error {
@@ -540,7 +546,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 		return ctx.Err()
 	}
 	engine.startDispatchWorkers()
-	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+	engine.peerDispatchers[2] <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 
 	select {
 	case <-started:

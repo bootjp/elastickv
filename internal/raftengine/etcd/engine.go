@@ -96,20 +96,21 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh      chan proposalRequest
-	readCh         chan readRequest
-	adminCh        chan adminRequest
-	stepCh         chan raftpb.Message
-	dispatchCh     chan dispatchRequest
-	dispatchStopCh chan struct{}
-	dispatchCtx    context.Context
-	dispatchCancel context.CancelFunc
-	snapshotReqCh  chan snapshotRequest
-	snapshotResCh  chan snapshotResult
-	snapshotStopCh chan struct{}
-	closeCh        chan struct{}
-	doneCh         chan struct{}
-	startedCh      chan struct{}
+	proposeCh        chan proposalRequest
+	readCh           chan readRequest
+	adminCh          chan adminRequest
+	stepCh           chan raftpb.Message
+	peerDispatchers  map[uint64]chan dispatchRequest
+	perPeerQueueSize int
+	dispatchStopCh   chan struct{}
+	dispatchCtx      context.Context
+	dispatchCancel   context.CancelFunc
+	snapshotReqCh    chan snapshotRequest
+	snapshotResCh    chan snapshotResult
+	snapshotStopCh   chan struct{}
+	closeCh          chan struct{}
+	doneCh           chan struct{}
+	startedCh        chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -337,7 +338,8 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// Transport listeners may already be accepting RPCs when Open is called.
 	// Gate inbound delivery on startedCh so messages are not enqueued until the
 	// local run loop has completed startup.
-	e.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
+	e.peerDispatchers = make(map[uint64]chan dispatchRequest, len(e.peers))
+	e.perPeerQueueSize = cfg.MaxInflightMsg
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
@@ -892,17 +894,22 @@ func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
 	if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
 		return true
 	}
-	return e.transport == nil || e.dispatchCh == nil
+	return e.transport == nil || e.peerDispatchers == nil
 }
 
 func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
-	if len(e.dispatchCh) >= cap(e.dispatchCh) {
+	ch, ok := e.peerDispatchers[msg.To]
+	if !ok {
+		e.recordDroppedDispatch(msg)
+		return nil
+	}
+	if len(ch) >= cap(ch) {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
 	dispatchReq := prepareDispatchRequest(msg)
 	select {
-	case e.dispatchCh <- dispatchReq:
+	case ch <- dispatchReq:
 		return nil
 	default:
 		_ = dispatchReq.Close()
@@ -1928,22 +1935,40 @@ func isLeaderContactMessage(msgType raftpb.MessageType) bool {
 }
 
 func (e *Engine) startDispatchWorkers() {
-	if e.dispatchCh == nil {
+	if e.peerDispatchers == nil {
 		return
 	}
-	for range defaultDispatchWorkers {
-		e.dispatchWG.Add(1)
-		go e.runDispatchWorker()
+	for nodeID := range e.peers {
+		if nodeID == e.nodeID {
+			continue
+		}
+		e.startPeerDispatcher(nodeID)
 	}
 }
 
-func (e *Engine) runDispatchWorker() {
+func (e *Engine) startPeerDispatcher(nodeID uint64) {
+	if _, exists := e.peerDispatchers[nodeID]; exists {
+		return
+	}
+	size := e.perPeerQueueSize
+	if size <= 0 {
+		size = defaultMaxInflightMsg
+	}
+	ch := make(chan dispatchRequest, size)
+	e.peerDispatchers[nodeID] = ch
+	for range defaultDispatchWorkers {
+		e.dispatchWG.Add(1)
+		go e.runDispatchWorker(ch)
+	}
+}
+
+func (e *Engine) runDispatchWorker(ch chan dispatchRequest) {
 	defer e.dispatchWG.Done()
 	for {
 		select {
 		case <-e.dispatchStopCh:
 			return
-		case req := <-e.dispatchCh:
+		case req := <-ch:
 			if err := e.dispatchTransport(req); err != nil {
 				count := e.dispatchErrorCount.Add(1)
 				if shouldLogDispatchEvent(count) {
@@ -2133,6 +2158,9 @@ func (e *Engine) upsertPeer(peer Peer) {
 	if e.transport != nil {
 		e.transport.UpsertPeer(peer)
 	}
+	if e.peerDispatchers != nil && peer.NodeID != e.nodeID {
+		e.startPeerDispatcher(peer.NodeID)
+	}
 }
 
 func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
@@ -2169,6 +2197,9 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
 	}
+	if e.peerDispatchers != nil {
+		delete(e.peerDispatchers, nodeID)
+	}
 }
 
 func (e *Engine) hasPeer(nodeID uint64) bool {
@@ -2193,13 +2224,6 @@ func decodeProposalEnvelope(data []byte) (uint64, []byte, bool) {
 	return binary.BigEndian.Uint64(data[1:envelopeHeaderSize]), data[envelopeHeaderSize:], true
 }
 
-func dispatchQueueSize(maxInflight int) int {
-	size := maxInflight
-	if size <= 0 {
-		size = defaultMaxInflightMsg
-	}
-	return size * defaultDispatchWorkers
-}
 
 func shouldLogDispatchEvent(count uint64) bool {
 	return count == 1 || count%128 == 0
