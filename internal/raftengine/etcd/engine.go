@@ -222,6 +222,8 @@ type dispatchRequest struct {
 type peerQueues struct {
 	normal    chan dispatchRequest
 	heartbeat chan dispatchRequest
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type preparedOpenState struct {
@@ -923,7 +925,7 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		return nil
 	}
 	ch := pd.normal
-	if isHeartbeatMsg(msg.Type) {
+	if isPriorityMsg(msg.Type) {
 		ch = pd.heartbeat
 	}
 	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
@@ -944,12 +946,17 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
-// isHeartbeatMsg returns true for small, latency-sensitive control messages
-// that must not be queued behind large MsgApp payloads. MsgReadIndex and
-// MsgReadIndexResp are included because delays hurt linearizable read latency.
-func isHeartbeatMsg(t raftpb.MessageType) bool {
+// isPriorityMsg returns true for small, latency-sensitive control messages
+// that must not be queued behind large MsgApp payloads in the normal channel.
+// Election messages (MsgVote/MsgPreVote) are included because delays can
+// trigger unnecessary election timeouts. MsgReadIndex/Resp affects linearizable
+// read latency. MsgAppResp lets the leader advance the commit index promptly.
+func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
-		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp
+		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
+		t == raftpb.MsgVote || t == raftpb.MsgVoteResp ||
+		t == raftpb.MsgPreVote || t == raftpb.MsgPreVoteResp ||
+		t == raftpb.MsgAppResp
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -1988,19 +1995,26 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	if size <= 0 {
 		size = defaultMaxInflightMsg
 	}
+	baseCtx := e.dispatchCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, size),
 		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	e.peerDispatchers[nodeID] = pd
 	workers := []chan dispatchRequest{pd.normal, pd.heartbeat}
 	e.dispatchWG.Add(len(workers))
 	for _, w := range workers {
-		go e.runDispatchWorker(w)
+		go e.runDispatchWorker(ctx, w)
 	}
 }
 
-func (e *Engine) runDispatchWorker(ch chan dispatchRequest) {
+func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest) {
 	defer e.dispatchWG.Done()
 	for {
 		select {
@@ -2010,7 +2024,7 @@ func (e *Engine) runDispatchWorker(ch chan dispatchRequest) {
 			if !ok {
 				return
 			}
-			if err := e.dispatchTransport(req); err != nil {
+			if err := e.dispatchTransport(ctx, req); err != nil {
 				count := e.dispatchErrorCount.Add(1)
 				if shouldLogDispatchEvent(count) {
 					slog.Warn("etcd raft outbound dispatch failed",
@@ -2241,6 +2255,7 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if e.peerDispatchers != nil {
 		if pd, ok := e.peerDispatchers[nodeID]; ok {
 			delete(e.peerDispatchers, nodeID)
+			pd.cancel() // cancel any in-flight RPC for this peer immediately
 			close(pd.normal)
 			close(pd.heartbeat)
 		}
@@ -2285,11 +2300,7 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 	}
 }
 
-func (e *Engine) dispatchTransport(req dispatchRequest) error {
-	ctx := e.dispatchCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func (e *Engine) dispatchTransport(ctx context.Context, req dispatchRequest) error {
 	if e.dispatchFn != nil {
 		return e.dispatchFn(ctx, req)
 	}

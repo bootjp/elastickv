@@ -608,9 +608,12 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 
 func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 	stopCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, 4),
 		heartbeat: make(chan dispatchRequest, 4),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	engine := &Engine{
 		nodeID:          1,
@@ -619,8 +622,8 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		dispatchStopCh:  stopCh,
 	}
 	engine.dispatchWG.Add(2)
-	go engine.runDispatchWorker(pd.normal)
-	go engine.runDispatchWorker(pd.heartbeat)
+	go engine.runDispatchWorker(ctx, pd.normal)
+	go engine.runDispatchWorker(ctx, pd.heartbeat)
 
 	engine.removePeer(2)
 
