@@ -340,6 +340,13 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 	conn.WriteInt(result)
 }
 
+// doSetExpire is the inner body of setExpire's retryRedisWrite loop.
+// All reads (existence, type, value) use the same readTS snapshot so they form
+// a consistent view. The subsequent dispatchElems calls use IsTxn=true with
+// StartTS=readTS, which causes coordinator.Dispatch to reject the write with
+// ErrWriteConflict if any touched key was modified after readTS. retryRedisWrite
+// then re-invokes doSetExpire with a fresh readTS, providing OCC safety without
+// an explicit mutex. Leadership is verified by coordinator.Dispatch itself.
 func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, unit time.Duration, nxOnly bool) (int, error) {
 	readTS, eligible, err := r.prepareExpire(key, nxOnly)
 	if err != nil {
@@ -377,9 +384,12 @@ func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS ui
 	return 0, nil
 }
 
-// dispatchStringExpire performs a read-modify-write on the string anchor key to
-// embed the new expiry time, then writes both the value and the !redis|ttl| scan
-// index in a single Raft entry.
+// dispatchStringExpire performs a read-modify-write on the string anchor key:
+// it reads the current value at readTS, re-encodes it with the new expiry, and
+// writes both the updated value and the !redis|ttl| scan index in a single Raft
+// entry (IsTxn=true, StartTS=readTS). The coordinator rejects the write with
+// ErrWriteConflict if any key was modified after readTS, so stale-data safety is
+// guaranteed by OCC — no explicit mutex is required.
 func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) error {
 	raw, readErr := r.store.GetAt(ctx, redisStrKey(key), readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
