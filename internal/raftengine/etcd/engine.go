@@ -26,7 +26,7 @@ const (
 	defaultElectionTick           = 10
 	defaultMaxInflightMsg         = 1024
 	defaultMaxSizePerMsg          = 1 << 20
-	defaultDispatchWorkersPerPeer = 1
+	defaultDispatchWorkersPerPeer = 2
 	defaultDispatchBufPerPeer     = 512
 	defaultSnapshotEvery          = 10_000
 	defaultSnapshotQueueSize      = 1
