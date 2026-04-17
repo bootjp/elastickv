@@ -908,6 +908,10 @@ func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
 	return e.transport == nil || e.peerDispatchers == nil
 }
 
+// enqueueDispatchMessage routes msg to the per-peer channel. It is called
+// exclusively from the engine event-loop goroutine, which is the same goroutine
+// that calls removePeer. The delete-then-close ordering in removePeer therefore
+// guarantees that no send can race with a channel close.
 func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	pd, ok := e.peerDispatchers[msg.To]
 	if !ok {
@@ -917,10 +921,6 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	ch := pd.normal
 	if isHeartbeatMsg(msg.Type) {
 		ch = pd.heartbeat
-	}
-	if len(ch) >= cap(ch) {
-		e.recordDroppedDispatch(msg)
-		return nil
 	}
 	dispatchReq := prepareDispatchRequest(msg)
 	select {
