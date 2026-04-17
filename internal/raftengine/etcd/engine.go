@@ -21,11 +21,11 @@ import (
 )
 
 const (
-	defaultTickInterval           = 10 * time.Millisecond
-	defaultHeartbeatTick          = 1
-	defaultElectionTick           = 10
-	defaultMaxInflightMsg         = 1024
-	defaultMaxSizePerMsg          = 1 << 20
+	defaultTickInterval   = 10 * time.Millisecond
+	defaultHeartbeatTick  = 1
+	defaultElectionTick   = 10
+	defaultMaxInflightMsg = 1024
+	defaultMaxSizePerMsg  = 1 << 20
 	// defaultDispatchWorkersPerPeer is the number of goroutines started per peer:
 	// one for normal messages (MsgApp, etc.) and one dedicated to heartbeats.
 	defaultDispatchWorkersPerPeer = 2
