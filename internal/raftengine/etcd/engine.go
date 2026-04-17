@@ -27,6 +27,7 @@ const (
 	defaultMaxInflightMsg         = 1024
 	defaultMaxSizePerMsg          = 1 << 20
 	defaultDispatchWorkersPerPeer = 1
+	defaultDispatchBufPerPeer     = 512
 	defaultSnapshotEvery          = 10_000
 	defaultSnapshotQueueSize      = 1
 	defaultAdminPollInterval      = 10 * time.Millisecond
@@ -339,7 +340,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// Gate inbound delivery on startedCh so messages are not enqueued until the
 	// local run loop has completed startup.
 	e.peerDispatchers = make(map[uint64]chan dispatchRequest, len(e.peers))
-	e.perPeerQueueSize = cfg.MaxInflightMsg
+	e.perPeerQueueSize = defaultDispatchBufPerPeer
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
@@ -1952,7 +1953,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	size := e.perPeerQueueSize
 	if size <= 0 {
-		size = defaultMaxInflightMsg
+		size = defaultDispatchBufPerPeer
 	}
 	ch := make(chan dispatchRequest, size)
 	e.peerDispatchers[nodeID] = ch
