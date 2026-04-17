@@ -1,5 +1,10 @@
 # Design: gRPC Streaming Transport for Raft Messages
 
+> **Status: proposed — not yet implemented.**
+> PR #522 delivers the per-peer dispatch channel foundation described in §2.
+> This document specifies the next step: replacing per-message unary RPCs with
+> a long-lived client-streaming gRPC connection per peer.
+
 ## 1. Background and motivation
 
 ### Problem
@@ -188,7 +193,22 @@ be used to skip the probe after the first successful stream is established.
 
 ---
 
-## 6. Out of scope
+## 6. Rollout and migration strategy
+
+Because `SendStream` is additive, the rollout is zero-downtime by design:
+
+| Phase | Action |
+|---|---|
+| **Deploy new server binary** | All nodes register both `Send` (unary) and `SendStream`. Existing peers that have not yet upgraded continue to use `Send` — no behaviour change. |
+| **Gradual upgrade** | As each peer is upgraded, the sender detects `SendStream` availability (no `codes.Unimplemented`) and opens a stream. Unary `Send` remains the fallback for un-upgraded peers. |
+| **Full cutover** | Once all peers run the new binary, every peer-to-peer path uses streaming. The unary `Send` handler is kept indefinitely for backward compatibility. |
+
+No dual-write or blue/green deployment is required: the `codes.Unimplemented` probe
+(§3.5) makes the switch per-peer and per-connection atomically.
+
+---
+
+## 7. Out of scope
 
 - Batch encoding (multiple `EtcdRaftMessage` payloads in one proto message) — independent optimisation.
 - Priority queuing for heartbeats vs log entries — orthogonal to transport protocol.

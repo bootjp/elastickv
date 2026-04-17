@@ -933,8 +933,12 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
+// isHeartbeatMsg returns true for small, latency-sensitive control messages
+// that must not be queued behind large MsgApp payloads. MsgReadIndex and
+// MsgReadIndexResp are included because delays hurt linearizable read latency.
 func isHeartbeatMsg(t raftpb.MessageType) bool {
-	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp
+	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
+		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
