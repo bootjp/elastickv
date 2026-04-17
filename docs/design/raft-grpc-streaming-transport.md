@@ -136,9 +136,11 @@ pick up the next message from the per-peer channel.
 > `stream.Send` with a `sync.Mutex` per peer. Simpler to implement but adds
 > a lock on the hot path.
 >
-> Option A is preferred: it eliminates the lock, and within-peer ordering is already
-> guaranteed by the two independent channels. `getOrOpenStream` is protected by
-> `mu` only for map access and must not be called from multiple workers simultaneously.
+> Option A is preferred: it eliminates the lock on the hot path, and within-peer
+> ordering is already guaranteed by the single multiplexing worker. `getOrOpenStream`
+> uses `mu` only to serialize map access; the per-peer stream itself is then written
+> by exactly one goroutine (the multiplexing worker), satisfying gRPC's
+> single-writer requirement.
 
 ### 3.3 Receiver side (`GRPCTransport`)
 

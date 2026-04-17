@@ -2042,18 +2042,18 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 			if !ok {
 				return
 			}
+			if ctx.Err() != nil {
+				if err := req.Close(); err != nil {
+					slog.Error("etcd raft dispatch: failed to close request", "err", err)
+				}
+				return
+			}
 			e.handleDispatchRequest(ctx, req)
 		}
 	}
 }
 
 func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest) {
-	if ctx.Err() != nil {
-		if err := req.Close(); err != nil {
-			slog.Error("etcd raft dispatch: failed to close request", "err", err)
-		}
-		return
-	}
 	dispatchErr := e.dispatchTransport(ctx, req)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
