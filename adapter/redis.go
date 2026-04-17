@@ -722,7 +722,7 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 		return state, nil
 	}
 
-	oldValue, err := r.readRedisStringAt(key, readTS)
+	oldValue, _, err := r.readRedisStringAt(key, readTS)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return redisSetState{}, err
 	}
@@ -985,7 +985,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	v, err := r.readRedisStringAt(key, readTS)
+	v, _, err := r.readRedisStringAt(key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			conn.WriteNull()
@@ -1580,6 +1580,7 @@ func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
 
 type txnValue struct {
 	raw     []byte
+	ttl     *time.Time
 	deleted bool
 	dirty   bool
 	loaded  bool
@@ -1677,11 +1678,15 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 	var val []byte
 	if !isKnownInternalKey(key) {
 		// For bare user string keys, use the fallback-aware reader.
-		var err error
-		val, err = t.server.readRedisStringAt(key, t.startTS)
+		var (
+			err error
+			ttl *time.Time
+		)
+		val, ttl, err = t.server.readRedisStringAt(key, t.startTS)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
+		tv.ttl = ttl
 	} else {
 		var err error
 		val, err = t.server.readValueAt(storageKey, t.startTS)
@@ -2318,7 +2323,10 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 		// For string keys: embed TTL in the encoded value.
 		if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
 			userKey := storageKey[len(redisStrPrefix):]
-			var ttl *time.Time
+			// Dirty EXPIRE/PERSIST state takes priority; otherwise preserve
+			// the TTL that was loaded with the value so commands like INCR
+			// or SETBIT inside MULTI/EXEC don't clear it.
+			ttl := tv.ttl
 			if ttlSt := t.ttlStates[string(userKey)]; ttlSt != nil && ttlSt.dirty {
 				ttl = ttlSt.value
 			}

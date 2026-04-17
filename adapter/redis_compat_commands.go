@@ -126,7 +126,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeString {
 			return wrongTypeError()
 		}
-		raw, err := r.readRedisStringAt(key, readTS)
+		raw, _, err := r.readRedisStringAt(key, readTS)
 		if err != nil {
 			// Key may have expired or been deleted between type check and read.
 			v = nil
@@ -391,7 +391,7 @@ func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS ui
 // ErrWriteConflict if any key was modified after readTS, so stale-data safety is
 // guaranteed by OCC — no explicit mutex is required.
 func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) error {
-	userValue, readErr := r.readRedisStringAt(key, readTS)
+	userValue, _, readErr := r.readRedisStringAt(key, readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
 		return cockerrors.WithStack(readErr)
 	}
@@ -1961,11 +1961,13 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 
 		current = 0
+		var existingTTL *time.Time
 		if typ == redisTypeString {
-			raw, err := r.readRedisStringAt(cmd.Args[1], readTS)
+			raw, ttl, err := r.readRedisStringAt(cmd.Args[1], readTS)
 			if err != nil {
 				return err
 			}
+			existingTTL = ttl
 			current, err = strconv.ParseInt(string(raw), 10, 64)
 			if err != nil {
 				return fmt.Errorf("ERR value is not an integer or out of range")
@@ -1973,11 +1975,15 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		current++
 
-		// INCR clears any TTL (PERSIST semantics); encode value with no TTL.
-		encoded := encodeRedisStr([]byte(strconv.FormatInt(current, 10)), nil)
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+		// INCR preserves any existing TTL (Redis semantics).
+		encoded := encodeRedisStr([]byte(strconv.FormatInt(current, 10)), existingTTL)
+		elems := []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: encoded},
-		})
+		}
+		if existingTTL != nil {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(*existingTTL)})
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return

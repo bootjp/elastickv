@@ -368,20 +368,25 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 
 // readRedisStringAt reads a Redis string value, trying the prefixed key first
 // and falling back to the bare key for legacy data written before the
-// !redis|str| prefix migration. Returns the decoded user value (without TTL header).
-func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, error) {
+// !redis|str| prefix migration. Returns the decoded user value and the
+// embedded TTL (nil when absent).
+func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
 	v, err := r.readValueAt(redisStrKey(key), readTS)
 	if err == nil {
-		userValue, _, decErr := decodeRedisStr(v)
+		userValue, ttl, decErr := decodeRedisStr(v)
 		if decErr != nil {
-			return nil, decErr
+			return nil, nil, decErr
 		}
-		return userValue, nil
+		return userValue, ttl, nil
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
-		return nil, err
+		return nil, nil, err
 	}
-	return r.readValueAt(key, readTS)
+	legacy, err := r.readValueAt(key, readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	return legacy, nil, nil
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {

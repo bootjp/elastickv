@@ -428,7 +428,7 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.readRedisStringAt(key, c.startTS)
+	value, _, err := c.server.readRedisStringAt(key, c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		return st, nil
