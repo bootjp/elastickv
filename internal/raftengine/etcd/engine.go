@@ -26,6 +26,8 @@ const (
 	defaultElectionTick           = 10
 	defaultMaxInflightMsg         = 1024
 	defaultMaxSizePerMsg          = 1 << 20
+	// defaultDispatchWorkersPerPeer is the number of goroutines started per peer:
+	// one for normal messages (MsgApp, etc.) and one dedicated to heartbeats.
 	defaultDispatchWorkersPerPeer = 2
 	defaultDispatchBufPerPeer     = 512
 	defaultSnapshotEvery          = 10_000
@@ -101,7 +103,7 @@ type Engine struct {
 	readCh           chan readRequest
 	adminCh          chan adminRequest
 	stepCh           chan raftpb.Message
-	peerDispatchers  map[uint64]chan dispatchRequest
+	peerDispatchers  map[uint64]*peerQueues
 	perPeerQueueSize int
 	dispatchStopCh   chan struct{}
 	dispatchCtx      context.Context
@@ -210,6 +212,13 @@ type snapshotResult struct {
 
 type dispatchRequest struct {
 	msg raftpb.Message
+}
+
+// peerQueues holds separate dispatch channels per peer so that heartbeats
+// are never blocked behind large log-entry RPCs.
+type peerQueues struct {
+	normal    chan dispatchRequest
+	heartbeat chan dispatchRequest
 }
 
 type preparedOpenState struct {
@@ -339,7 +348,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// Transport listeners may already be accepting RPCs when Open is called.
 	// Gate inbound delivery on startedCh so messages are not enqueued until the
 	// local run loop has completed startup.
-	e.peerDispatchers = make(map[uint64]chan dispatchRequest, len(e.peers))
+	e.peerDispatchers = make(map[uint64]*peerQueues, len(e.peers))
 	e.perPeerQueueSize = defaultDispatchBufPerPeer
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
@@ -899,10 +908,14 @@ func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
 }
 
 func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
-	ch, ok := e.peerDispatchers[msg.To]
+	pd, ok := e.peerDispatchers[msg.To]
 	if !ok {
 		e.recordDroppedDispatch(msg)
 		return nil
+	}
+	ch := pd.normal
+	if isHeartbeatMsg(msg.Type) {
+		ch = pd.heartbeat
 	}
 	if len(ch) >= cap(ch) {
 		e.recordDroppedDispatch(msg)
@@ -917,6 +930,10 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
+}
+
+func isHeartbeatMsg(t raftpb.MessageType) bool {
+	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -1955,12 +1972,14 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	if size <= 0 {
 		size = defaultDispatchBufPerPeer
 	}
-	ch := make(chan dispatchRequest, size)
-	e.peerDispatchers[nodeID] = ch
-	for range defaultDispatchWorkersPerPeer {
-		e.dispatchWG.Add(1)
-		go e.runDispatchWorker(ch)
+	pd := &peerQueues{
+		normal:    make(chan dispatchRequest, size),
+		heartbeat: make(chan dispatchRequest, size),
 	}
+	e.peerDispatchers[nodeID] = pd
+	e.dispatchWG.Add(defaultDispatchWorkersPerPeer)
+	go e.runDispatchWorker(pd.normal)
+	go e.runDispatchWorker(pd.heartbeat)
 }
 
 func (e *Engine) runDispatchWorker(ch chan dispatchRequest) {
@@ -2202,9 +2221,10 @@ func (e *Engine) removePeer(nodeID uint64) {
 		e.transport.RemovePeer(nodeID)
 	}
 	if e.peerDispatchers != nil {
-		if ch, ok := e.peerDispatchers[nodeID]; ok {
+		if pd, ok := e.peerDispatchers[nodeID]; ok {
 			delete(e.peerDispatchers, nodeID)
-			close(ch)
+			close(pd.normal)
+			close(pd.heartbeat)
 		}
 	}
 }
