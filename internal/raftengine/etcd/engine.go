@@ -21,17 +21,30 @@ import (
 )
 
 const (
-	defaultTickInterval      = 10 * time.Millisecond
-	defaultHeartbeatTick     = 1
-	defaultElectionTick      = 10
-	defaultMaxInflightMsg    = 256
-	defaultMaxSizePerMsg     = 1 << 20
-	defaultDispatchWorkers   = 4
-	defaultSnapshotEvery     = 10_000
-	defaultSnapshotQueueSize = 1
-	defaultAdminPollInterval = 10 * time.Millisecond
-	defaultMaxPendingConfigs = 64
-	unknownLastContact       = time.Duration(-1)
+	defaultTickInterval  = 10 * time.Millisecond
+	defaultHeartbeatTick = 1
+	defaultElectionTick  = 10
+	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
+	// allows per peer before waiting for an ACK (etcd/raft default: 256).
+	// It also sets the per-peer dispatch channel capacity; total buffered memory
+	// is bounded by O(numPeers × MaxInflightMsg × avgMsgSize).
+	// Increase via OpenConfig.MaxInflightMsg for deeper pipelining on
+	// high-bandwidth links; reduce it in memory-constrained clusters.
+	defaultMaxInflightMsg = 256
+	defaultMaxSizePerMsg  = 1 << 20
+	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
+	// It carries low-frequency control traffic: heartbeats, votes, read-index,
+	// leader-transfer, and their corresponding response messages
+	// (MsgHeartbeatResp, MsgReadIndexResp, MsgVoteResp, MsgPreVoteResp).
+	// MsgAppResp is intentionally kept in the normal channel: followers — the
+	// only senders of MsgAppResp — do not send MsgApp, so there is no
+	// head-of-line blocking risk there.
+	defaultHeartbeatBufPerPeer = 64
+	defaultSnapshotEvery       = 10_000
+	defaultSnapshotQueueSize   = 1
+	defaultAdminPollInterval   = 10 * time.Millisecond
+	defaultMaxPendingConfigs   = 64
+	unknownLastContact         = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
@@ -64,18 +77,24 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID         uint64
-	LocalID        string
-	LocalAddress   string
-	DataDir        string
-	Peers          []Peer
-	Bootstrap      bool
-	Transport      *GRPCTransport
-	TickInterval   time.Duration
-	ElectionTick   int
-	HeartbeatTick  int
-	StateMachine   StateMachine
-	MaxSizePerMsg  uint64
+	NodeID        uint64
+	LocalID       string
+	LocalAddress  string
+	DataDir       string
+	Peers         []Peer
+	Bootstrap     bool
+	Transport     *GRPCTransport
+	TickInterval  time.Duration
+	ElectionTick  int
+	HeartbeatTick int
+	StateMachine  StateMachine
+	MaxSizePerMsg uint64
+	// MaxInflightMsg controls how many MsgApp messages Raft may have in-flight
+	// per peer before waiting for an acknowledgement (Raft-level flow control).
+	// It also sets the per-peer dispatch channel capacity, so total buffered
+	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
+	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
+	// lower in memory-constrained clusters.
 	MaxInflightMsg int
 }
 
@@ -96,20 +115,21 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh      chan proposalRequest
-	readCh         chan readRequest
-	adminCh        chan adminRequest
-	stepCh         chan raftpb.Message
-	dispatchCh     chan dispatchRequest
-	dispatchStopCh chan struct{}
-	dispatchCtx    context.Context
-	dispatchCancel context.CancelFunc
-	snapshotReqCh  chan snapshotRequest
-	snapshotResCh  chan snapshotResult
-	snapshotStopCh chan struct{}
-	closeCh        chan struct{}
-	doneCh         chan struct{}
-	startedCh      chan struct{}
+	proposeCh        chan proposalRequest
+	readCh           chan readRequest
+	adminCh          chan adminRequest
+	stepCh           chan raftpb.Message
+	peerDispatchers  map[uint64]*peerQueues
+	perPeerQueueSize int
+	dispatchStopCh   chan struct{}
+	dispatchCtx      context.Context
+	dispatchCancel   context.CancelFunc
+	snapshotReqCh    chan snapshotRequest
+	snapshotResCh    chan snapshotResult
+	snapshotStopCh   chan struct{}
+	closeCh          chan struct{}
+	doneCh           chan struct{}
+	startedCh        chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -208,6 +228,15 @@ type snapshotResult struct {
 
 type dispatchRequest struct {
 	msg raftpb.Message
+}
+
+// peerQueues holds separate dispatch channels per peer so that heartbeats
+// are never blocked behind large log-entry RPCs.
+type peerQueues struct {
+	normal    chan dispatchRequest
+	heartbeat chan dispatchRequest
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type preparedOpenState struct {
@@ -337,7 +366,10 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	// Transport listeners may already be accepting RPCs when Open is called.
 	// Gate inbound delivery on startedCh so messages are not enqueued until the
 	// local run loop has completed startup.
-	e.dispatchCh = make(chan dispatchRequest, dispatchQueueSize(cfg.MaxInflightMsg))
+	e.peerDispatchers = make(map[uint64]*peerQueues, len(e.peers))
+	// Size the per-peer dispatch buffer to match the Raft inflight limit so that
+	// the channel never drops messages that Raft's flow-control would permit.
+	e.perPeerQueueSize = cfg.MaxInflightMsg
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
@@ -892,23 +924,53 @@ func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
 	if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
 		return true
 	}
-	return e.transport == nil || e.dispatchCh == nil
+	return e.transport == nil || e.peerDispatchers == nil
 }
 
+// enqueueDispatchMessage routes msg to the per-peer channel. It is called
+// exclusively from the engine event-loop goroutine, which is the same goroutine
+// that calls removePeer. The delete-then-close ordering in removePeer therefore
+// guarantees that no send can race with a channel close.
 func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
-	if len(e.dispatchCh) >= cap(e.dispatchCh) {
+	pd, ok := e.peerDispatchers[msg.To]
+	if !ok {
+		e.recordDroppedDispatch(msg)
+		return nil
+	}
+	ch := pd.normal
+	if isPriorityMsg(msg.Type) {
+		ch = pd.heartbeat
+	}
+	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
+	// is already full. The len/cap check is safe here because this function is
+	// only ever called from the single engine event-loop goroutine.
+	if len(ch) >= cap(ch) {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
 	dispatchReq := prepareDispatchRequest(msg)
 	select {
-	case e.dispatchCh <- dispatchReq:
+	case ch <- dispatchReq:
 		return nil
 	default:
 		_ = dispatchReq.Close()
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
+}
+
+// isPriorityMsg returns true for small, low-frequency control messages that
+// must not be queued behind large MsgApp payloads in the normal channel.
+// MsgAppResp is intentionally excluded: it is sent by followers, which never
+// send MsgApp, so it faces no head-of-line blocking in the normal channel.
+// Keeping it out of the priority queue preserves the low-frequency invariant
+// that justifies defaultHeartbeatBufPerPeer = 64.
+func isPriorityMsg(t raftpb.MessageType) bool {
+	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
+		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
+		t == raftpb.MsgVote || t == raftpb.MsgVoteResp ||
+		t == raftpb.MsgPreVote || t == raftpb.MsgPreVoteResp ||
+		t == raftpb.MsgTimeoutNow
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -1928,37 +1990,86 @@ func isLeaderContactMessage(msgType raftpb.MessageType) bool {
 }
 
 func (e *Engine) startDispatchWorkers() {
-	if e.dispatchCh == nil {
+	if e.peerDispatchers == nil {
 		return
 	}
-	for range defaultDispatchWorkers {
-		e.dispatchWG.Add(1)
-		go e.runDispatchWorker()
+	for nodeID := range e.peers {
+		if nodeID == e.nodeID {
+			continue
+		}
+		e.startPeerDispatcher(nodeID)
 	}
 }
 
-func (e *Engine) runDispatchWorker() {
+func (e *Engine) startPeerDispatcher(nodeID uint64) {
+	if _, exists := e.peerDispatchers[nodeID]; exists {
+		return
+	}
+	size := e.perPeerQueueSize
+	if size <= 0 {
+		size = defaultMaxInflightMsg
+	}
+	baseCtx := e.dispatchCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(baseCtx)
+	pd := &peerQueues{
+		normal:    make(chan dispatchRequest, size),
+		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+	e.peerDispatchers[nodeID] = pd
+	workers := []chan dispatchRequest{pd.normal, pd.heartbeat}
+	e.dispatchWG.Add(len(workers))
+	for _, w := range workers {
+		go e.runDispatchWorker(ctx, w)
+	}
+}
+
+// runDispatchWorker drains ch until the channel is closed, the engine stops,
+// or the per-peer context is cancelled (e.g. by removePeer). The ctx.Done()
+// arm ensures old workers exit promptly when a peer is removed and
+// immediately re-added, preventing stale goroutines from shadowing new ones.
+func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest) {
 	defer e.dispatchWG.Done()
 	for {
 		select {
 		case <-e.dispatchStopCh:
 			return
-		case req := <-e.dispatchCh:
-			if err := e.dispatchTransport(req); err != nil {
-				count := e.dispatchErrorCount.Add(1)
-				if shouldLogDispatchEvent(count) {
-					slog.Warn("etcd raft outbound dispatch failed",
-						"node_id", e.nodeID,
-						"to", req.msg.To,
-						"type", req.msg.Type.String(),
-						"dispatch_error_count", count,
-						"err", err,
-					)
-				}
-				_ = req.Close()
-				continue
+		case <-ctx.Done():
+			return
+		case req, ok := <-ch:
+			if !ok {
+				return
 			}
-			_ = req.Close()
+			if ctx.Err() != nil {
+				if err := req.Close(); err != nil {
+					slog.Error("etcd raft dispatch: failed to close request", "err", err)
+				}
+				return
+			}
+			e.handleDispatchRequest(ctx, req)
+		}
+	}
+}
+
+func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest) {
+	dispatchErr := e.dispatchTransport(ctx, req)
+	if err := req.Close(); err != nil {
+		slog.Error("etcd raft dispatch: failed to close request", "err", err)
+	}
+	if dispatchErr != nil && !errors.Is(dispatchErr, ctx.Err()) {
+		count := e.dispatchErrorCount.Add(1)
+		if shouldLogDispatchEvent(count) {
+			slog.Warn("etcd raft outbound dispatch failed",
+				"node_id", e.nodeID,
+				"to", req.msg.To,
+				"type", req.msg.Type.String(),
+				"dispatch_error_count", count,
+				"err", dispatchErr,
+			)
 		}
 	}
 }
@@ -2133,6 +2244,9 @@ func (e *Engine) upsertPeer(peer Peer) {
 	if e.transport != nil {
 		e.transport.UpsertPeer(peer)
 	}
+	if e.peerDispatchers != nil && peer.NodeID != e.nodeID {
+		e.startPeerDispatcher(peer.NodeID)
+	}
 }
 
 func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
@@ -2169,6 +2283,14 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
 	}
+	if e.peerDispatchers != nil {
+		if pd, ok := e.peerDispatchers[nodeID]; ok {
+			delete(e.peerDispatchers, nodeID)
+			pd.cancel() // cancel any in-flight RPC for this peer immediately
+			close(pd.normal)
+			close(pd.heartbeat)
+		}
+	}
 }
 
 func (e *Engine) hasPeer(nodeID uint64) bool {
@@ -2193,14 +2315,6 @@ func decodeProposalEnvelope(data []byte) (uint64, []byte, bool) {
 	return binary.BigEndian.Uint64(data[1:envelopeHeaderSize]), data[envelopeHeaderSize:], true
 }
 
-func dispatchQueueSize(maxInflight int) int {
-	size := maxInflight
-	if size <= 0 {
-		size = defaultMaxInflightMsg
-	}
-	return size * defaultDispatchWorkers
-}
-
 func shouldLogDispatchEvent(count uint64) bool {
 	return count == 1 || count%128 == 0
 }
@@ -2217,11 +2331,7 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 	}
 }
 
-func (e *Engine) dispatchTransport(req dispatchRequest) error {
-	ctx := e.dispatchCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func (e *Engine) dispatchTransport(ctx context.Context, req dispatchRequest) error {
 	if e.dispatchFn != nil {
 		return e.dispatchFn(ctx, req)
 	}

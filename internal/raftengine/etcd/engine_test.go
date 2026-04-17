@@ -501,12 +501,15 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 }
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
+	hbCh := make(chan dispatchRequest, 1)
+	hbCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 	engine := &Engine{
-		nodeID:     1,
-		transport:  &GRPCTransport{},
-		dispatchCh: make(chan dispatchRequest, 1),
+		nodeID:    1,
+		transport: &GRPCTransport{},
+		peerDispatchers: map[uint64]*peerQueues{
+			2: {normal: make(chan dispatchRequest, 1), heartbeat: hbCh},
+		},
 	}
-	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 
 	done := make(chan struct{})
 	go func() {
@@ -528,10 +531,15 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	engine := &Engine{
-		dispatchCh:     make(chan dispatchRequest, 1),
-		dispatchStopCh: make(chan struct{}),
-		dispatchCtx:    ctx,
-		dispatchCancel: cancel,
+		nodeID: 1,
+		peers: map[uint64]Peer{
+			2: {NodeID: 2},
+		},
+		peerDispatchers:  make(map[uint64]*peerQueues),
+		perPeerQueueSize: 1,
+		dispatchStopCh:   make(chan struct{}),
+		dispatchCtx:      ctx,
+		dispatchCancel:   cancel,
 	}
 	started := make(chan struct{})
 	engine.dispatchFn = func(ctx context.Context, _ dispatchRequest) error {
@@ -540,7 +548,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 		return ctx.Err()
 	}
 	engine.startDispatchWorkers()
-	engine.dispatchCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+	engine.peerDispatchers[2].heartbeat <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
 
 	select {
 	case <-started:
@@ -559,6 +567,82 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("dispatch workers did not stop after cancellation")
 	}
+}
+
+func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	dispatched := make(chan raftpb.Message, 1)
+	engine := &Engine{
+		nodeID:           1,
+		peerDispatchers:  make(map[uint64]*peerQueues),
+		perPeerQueueSize: 4,
+		dispatchStopCh:   make(chan struct{}),
+		dispatchCtx:      ctx,
+		dispatchCancel:   cancel,
+	}
+	engine.dispatchFn = func(_ context.Context, req dispatchRequest) error {
+		dispatched <- req.msg
+		return nil
+	}
+
+	engine.upsertPeer(Peer{NodeID: 2, ID: "peer2", Address: "localhost:2"})
+
+	pd, ok := engine.peerDispatchers[2]
+	require.True(t, ok, "dispatcher must be created on upsert")
+	require.Equal(t, defaultHeartbeatBufPerPeer, cap(pd.heartbeat))
+	require.Equal(t, 4, cap(pd.normal))
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
+
+	select {
+	case msg := <-dispatched:
+		require.Equal(t, uint64(2), msg.To)
+	case <-time.After(time.Second):
+		t.Fatal("message was not dispatched to peer 2")
+	}
+
+	close(engine.dispatchStopCh)
+	engine.dispatchWG.Wait()
+}
+
+func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
+	stopCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	pd := &peerQueues{
+		normal:    make(chan dispatchRequest, 4),
+		heartbeat: make(chan dispatchRequest, 4),
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+	engine := &Engine{
+		nodeID:          1,
+		peers:           map[uint64]Peer{2: {NodeID: 2, ID: "peer2"}},
+		peerDispatchers: map[uint64]*peerQueues{2: pd},
+		dispatchStopCh:  stopCh,
+	}
+	engine.dispatchWG.Add(2)
+	go engine.runDispatchWorker(ctx, pd.normal)
+	go engine.runDispatchWorker(ctx, pd.heartbeat)
+
+	engine.removePeer(2)
+
+	_, ok := engine.peerDispatchers[2]
+	require.False(t, ok, "dispatcher must be removed from map")
+
+	workerDone := make(chan struct{})
+	go func() {
+		engine.dispatchWG.Wait()
+		close(workerDone)
+	}()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch workers did not exit after channel close")
+	}
+
+	// Subsequent messages to the removed peer must be dropped without panic.
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
 }
 
 func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
