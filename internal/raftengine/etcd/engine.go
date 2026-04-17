@@ -27,13 +27,17 @@ const (
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before it must wait for an ACK. Increasing this from the
 	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
-	defaultMaxInflightMsg    = 1024
-	defaultMaxSizePerMsg     = 1 << 20
-	defaultSnapshotEvery     = 10_000
-	defaultSnapshotQueueSize = 1
-	defaultAdminPollInterval = 10 * time.Millisecond
-	defaultMaxPendingConfigs = 64
-	unknownLastContact       = time.Duration(-1)
+	defaultMaxInflightMsg = 1024
+	defaultMaxSizePerMsg  = 1 << 20
+	// defaultHeartbeatBufPerPeer is the capacity of the dedicated heartbeat
+	// dispatch channel. Heartbeats are low-frequency (one per heartbeatTick
+	// interval), so a small buffer is sufficient and avoids wasting memory.
+	defaultHeartbeatBufPerPeer = 64
+	defaultSnapshotEvery       = 10_000
+	defaultSnapshotQueueSize   = 1
+	defaultAdminPollInterval   = 10 * time.Millisecond
+	defaultMaxPendingConfigs   = 64
+	unknownLastContact         = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
@@ -921,6 +925,13 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	ch := pd.normal
 	if isHeartbeatMsg(msg.Type) {
 		ch = pd.heartbeat
+	}
+	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
+	// is already full. The len/cap check is safe here because this function is
+	// only ever called from the single engine event-loop goroutine.
+	if len(ch) >= cap(ch) {
+		e.recordDroppedDispatch(msg)
+		return nil
 	}
 	dispatchReq := prepareDispatchRequest(msg)
 	select {
@@ -1979,7 +1990,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, size),
-		heartbeat: make(chan dispatchRequest, size),
+		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
 	}
 	e.peerDispatchers[nodeID] = pd
 	workers := []chan dispatchRequest{pd.normal, pd.heartbeat}
