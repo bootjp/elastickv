@@ -33,6 +33,7 @@ type TTLBuffer struct {
 	mu      sync.RWMutex
 	entries map[string]ttlBufferEntry
 	counter atomic.Uint64
+	dropped atomic.Uint64
 	maxSize int
 }
 
@@ -63,18 +64,36 @@ func (b *TTLBuffer) Set(key []byte, expireAt *time.Time) {
 	if b == nil {
 		return
 	}
+	var (
+		size   int
+		keyLen int
+	)
 	s := b.counter.Add(1)
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	k := string(key)
 	if e, ok := b.entries[k]; ok && e.seq > s {
+		b.mu.Unlock()
 		return
 	}
 	if _, exists := b.entries[k]; !exists && len(b.entries) >= b.maxSize {
-		slog.Warn("ttl buffer full, dropping entry", "size", len(b.entries), "key_len", len(k))
-		return
+		size = len(b.entries)
+		keyLen = len(k)
+		b.mu.Unlock()
+		goto logDrop
 	}
 	b.entries[k] = ttlBufferEntry{expireAt: expireAt, seq: s}
+	b.mu.Unlock()
+	return
+
+logDrop:
+	// Log outside the mutex and rate-limit to avoid lock contention/log spam under overload.
+	dropCount := b.dropped.Add(1)
+	if dropCount == ^uint64(0) {
+		b.dropped.Store(0)
+	}
+	if dropCount == 1 || dropCount%1024 == 0 {
+		slog.Warn("ttl buffer full, dropping entry", "size", size, "key_len", keyLen, "dropped", dropCount)
+	}
 }
 
 // Get returns the buffered TTL for key.
@@ -104,7 +123,7 @@ func (b *TTLBuffer) Drain() map[string]ttlBufferEntry {
 		return nil
 	}
 	snapshot := b.entries
-	b.entries = make(map[string]ttlBufferEntry, len(snapshot))
+	b.entries = make(map[string]ttlBufferEntry)
 	return snapshot
 }
 
