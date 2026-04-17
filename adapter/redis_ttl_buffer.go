@@ -181,8 +181,8 @@ func (b *TTLBuffer) MergeBack(entries map[string]ttlBufferEntry) {
 	if dropped == 0 {
 		return
 	}
-	dropCount := b.dropped.Add(uint64(dropped))
-	prevDropCount := dropCount - uint64(dropped)
+	dropCount := b.dropped.Add(uint64(dropped))  //#nosec G115 -- dropped is always non-negative, bounded by map size
+	prevDropCount := dropCount - uint64(dropped) //#nosec G115 -- same bound
 	if prevDropCount == 0 || prevDropCount/ttlBufferDropLogEvery != dropCount/ttlBufferDropLogEvery {
 		slog.Warn(
 			"ttl buffer merge-back dropped entries",

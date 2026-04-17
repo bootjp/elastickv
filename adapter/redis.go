@@ -1751,6 +1751,16 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 		existingDeltas: existingDeltas,
 	}
 	t.listStates[k] = st
+
+	// Track the list-item key at the current tail (and the position before the
+	// head) so that concurrent RPUSH/LPUSH operations—which write to exactly
+	// these positions—trigger a read-write conflict and force a retry.
+	// Without this, a MULTI transaction that reads a list via LRANGE can commit
+	// with a stale snapshot while a concurrent RPUSH commits a new item,
+	// forming an anti-dependency (G2-item) cycle.
+	t.trackReadKey(listItemKey(key, meta.Head+meta.Len)) // next RPUSH target
+	t.trackReadKey(listItemKey(key, meta.Head-1))        // next LPUSH target
+
 	return st, nil
 }
 
