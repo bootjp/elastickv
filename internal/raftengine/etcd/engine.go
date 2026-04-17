@@ -25,13 +25,12 @@ const (
 	defaultHeartbeatTick = 1
 	defaultElectionTick  = 10
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
-	// allows per peer before waiting for an ACK. Increasing this from the
-	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
-	// Memory note: worst-case is defaultMaxInflightMsg × defaultMaxSizePerMsg per
-	// peer, but in practice Raft batches many small entries per MsgApp and typical
-	// message sizes are <<1 MB. Lower this via OpenConfig.MaxInflightMsg in
-	// memory-constrained clusters.
-	defaultMaxInflightMsg = 1024
+	// allows per peer before waiting for an ACK (etcd/raft default: 256).
+	// It also sets the per-peer dispatch channel capacity; total buffered memory
+	// is bounded by O(numPeers × MaxInflightMsg × avgMsgSize).
+	// Increase via OpenConfig.MaxInflightMsg for deeper pipelining on
+	// high-bandwidth links; reduce it in memory-constrained clusters.
+	defaultMaxInflightMsg = 256
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries only truly low-frequency control messages (heartbeats, votes,
@@ -2026,11 +2025,17 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 }
 
+// runDispatchWorker drains ch until the channel is closed, the engine stops,
+// or the per-peer context is cancelled (e.g. by removePeer). The ctx.Done()
+// arm ensures old workers exit promptly when a peer is removed and
+// immediately re-added, preventing stale goroutines from shadowing new ones.
 func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest) {
 	defer e.dispatchWG.Done()
 	for {
 		select {
 		case <-e.dispatchStopCh:
+			return
+		case <-ctx.Done():
 			return
 		case req, ok := <-ch:
 			if !ok {
