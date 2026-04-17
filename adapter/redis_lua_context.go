@@ -2451,7 +2451,7 @@ func (c *luaScriptContext) commit() error {
 		elems = append(elems, plan.elems...)
 		// For non-string keys with dirty TTL: include !redis|ttl| in the same txn.
 		// String keys already have TTL embedded in the value via stringCommitElems.
-		if plan.finalType != redisTypeNone && plan.finalType != redisTypeString {
+		if isNonStringCollectionType(plan.finalType) {
 			ttlElems, err := c.nonStringTTLElems(key, plan.preserveExisting)
 			if err != nil {
 				return err

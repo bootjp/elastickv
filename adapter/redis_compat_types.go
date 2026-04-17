@@ -110,6 +110,14 @@ const (
 	redisTypeStream redisValueType = "stream"
 )
 
+// isNonStringCollectionType reports whether typ is a collection type (list,
+// hash, set, zset, stream) — i.e. not none and not string. Used to decide
+// whether TTL must be stored in a separate !redis|ttl| key rather than
+// embedded in the value.
+func isNonStringCollectionType(typ redisValueType) bool {
+	return typ != redisTypeNone && typ != redisTypeString
+}
+
 type redisHashValue map[string]string
 
 type redisSetValue struct {

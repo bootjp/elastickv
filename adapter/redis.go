@@ -732,7 +732,7 @@ func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld boo
 
 func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
 	var elems []*kv.Elem[kv.OP]
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -916,7 +916,7 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 		conn.WriteError(err.Error())
 		return true
 	}
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		return false
 	}
 	if err := r.saveString(ctx, key, value, ttl); err != nil {
@@ -1978,7 +1978,7 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	if typ != redisTypeNone && typ != redisTypeString {
+	if isNonStringCollectionType(typ) {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 
