@@ -367,7 +367,7 @@ func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, un
 		return 1, r.dispatchStringExpire(ctx, key, readTS, expireAt)
 	}
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
-	return 1, r.dispatchElems(ctx, false, 0, elems)
+	return 1, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS uint64) (int, error) {
@@ -391,16 +391,9 @@ func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS ui
 // ErrWriteConflict if any key was modified after readTS, so stale-data safety is
 // guaranteed by OCC — no explicit mutex is required.
 func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) error {
-	raw, readErr := r.store.GetAt(ctx, redisStrKey(key), readTS)
+	userValue, readErr := r.readRedisStringAt(key, readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
 		return cockerrors.WithStack(readErr)
-	}
-	var userValue []byte
-	if readErr == nil {
-		userValue, _, readErr = decodeRedisStr(raw)
-		if readErr != nil {
-			return readErr
-		}
 	}
 	encoded := encodeRedisStr(userValue, &expireAt)
 	elems := []*kv.Elem[kv.OP]{
