@@ -25,8 +25,12 @@ const (
 	defaultHeartbeatTick = 1
 	defaultElectionTick  = 10
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
-	// allows per peer before it must wait for an ACK. Increasing this from the
+	// allows per peer before waiting for an ACK. Increasing this from the
 	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
+	// Memory note: worst-case is defaultMaxInflightMsg × defaultMaxSizePerMsg per
+	// peer, but in practice Raft batches many small entries per MsgApp and typical
+	// message sizes are <<1 MB. Lower this via OpenConfig.MaxInflightMsg in
+	// memory-constrained clusters.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.

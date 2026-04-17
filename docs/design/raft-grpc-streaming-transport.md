@@ -67,7 +67,7 @@ Snapshot messages already use client streaming (`SendSnapshot`); regular message
 
 ### 3.1 Protocol change
 
-Add a bidirectional streaming RPC to `etcd_raft.proto`:
+Add a client-streaming RPC to `etcd_raft.proto`:
 
 ```protobuf
 service EtcdRaft {
@@ -122,11 +122,23 @@ err = stream.Send(&pb.EtcdRaftMessage{Message: raw})
 pick up the next message from the per-peer channel.
 
 > **Concurrency constraint**: gRPC-go's `stream.Send` / `SendMsg` is **not**
-> goroutine-safe. Each per-peer stream must be accessed by exactly one goroutine
-> at a time. This is satisfied by the existing architecture: each peer has a
-> single dispatch worker goroutine that owns the stream and is the only caller
-> of `stream.Send`. `getOrOpenStream` is protected by `mu` only for map
-> access; stream sends must remain confined to the owning dispatch worker.
+> goroutine-safe. Each per-peer stream must be written by exactly one goroutine.
+>
+> PR #522 runs **two** dispatch workers per peer (one for normal messages, one for
+> heartbeats). When streaming is introduced, these two workers cannot share a
+> single `SendStream` stream without external synchronization. Two approaches:
+>
+> **Option A — single multiplexing worker**: merge both channels into one goroutine
+> that reads from either channel via `select` and writes to the stream. Preserves
+> stream ownership with no locking.
+>
+> **Option B — stream-level mutex**: keep the two-worker model and protect
+> `stream.Send` with a `sync.Mutex` per peer. Simpler to implement but adds
+> a lock on the hot path.
+>
+> Option A is preferred: it eliminates the lock, and within-peer ordering is already
+> guaranteed by the two independent channels. `getOrOpenStream` is protected by
+> `mu` only for map access and must not be called from multiple workers simultaneously.
 
 ### 3.3 Receiver side (`GRPCTransport`)
 
