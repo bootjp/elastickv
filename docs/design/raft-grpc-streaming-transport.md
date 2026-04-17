@@ -11,7 +11,7 @@
 
 The current Raft transport uses a unary gRPC RPC (`Send`) for every outbound message:
 
-```
+```text
 dispatchRegular:
   msg.Marshal() → client.Send(ctx, req) → wait ACK → return
 ```
@@ -38,7 +38,7 @@ being RTT-limited.
 
 ## 2. Current architecture
 
-```
+```text
 Engine run loop
   └─ sendMessages()
        └─ enqueueDispatchMessage()
@@ -120,6 +120,13 @@ err = stream.Send(&pb.EtcdRaftMessage{Message: raw})
 `stream.Send()` returns as soon as the message enters the gRPC send buffer
 (non-blocking under normal conditions). The dispatch worker can immediately
 pick up the next message from the per-peer channel.
+
+> **Concurrency constraint**: gRPC-go's `stream.Send` / `SendMsg` is **not**
+> goroutine-safe. Each per-peer stream must be accessed by exactly one goroutine
+> at a time. This is satisfied by the existing architecture: each peer has a
+> single dispatch worker goroutine that owns the stream and is the only caller
+> of `stream.Send`. `getOrOpenStream` is protected by `mu` only for map
+> access; stream sends must remain confined to the owning dispatch worker.
 
 ### 3.3 Receiver side (`GRPCTransport`)
 

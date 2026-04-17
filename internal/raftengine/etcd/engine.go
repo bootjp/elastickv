@@ -27,17 +27,13 @@ const (
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before it must wait for an ACK. Increasing this from the
 	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
-	defaultMaxInflightMsg = 1024
-	defaultMaxSizePerMsg  = 1 << 20
-	// defaultHeartbeatBufPerPeer is the capacity of the dedicated heartbeat
-	// dispatch channel. Heartbeats are low-frequency (one per heartbeatTick
-	// interval), so a small buffer is sufficient and avoids wasting memory.
-	defaultHeartbeatBufPerPeer = 64
-	defaultSnapshotEvery       = 10_000
-	defaultSnapshotQueueSize   = 1
-	defaultAdminPollInterval   = 10 * time.Millisecond
-	defaultMaxPendingConfigs   = 64
-	unknownLastContact         = time.Duration(-1)
+	defaultMaxInflightMsg    = 1024
+	defaultMaxSizePerMsg     = 1 << 20
+	defaultSnapshotEvery     = 10_000
+	defaultSnapshotQueueSize = 1
+	defaultAdminPollInterval = 10 * time.Millisecond
+	defaultMaxPendingConfigs = 64
+	unknownLastContact       = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
@@ -2004,7 +2000,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, size),
-		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		heartbeat: make(chan dispatchRequest, size),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
