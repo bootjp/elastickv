@@ -26,7 +26,7 @@ const (
 	defaultElectionTick      = 10
 	defaultMaxInflightMsg    = 256
 	defaultMaxSizePerMsg     = 1 << 20
-	defaultDispatchWorkers   = 4
+	defaultDispatchWorkersPerPeer = 2
 	defaultSnapshotEvery     = 10_000
 	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
@@ -1956,7 +1956,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	ch := make(chan dispatchRequest, size)
 	e.peerDispatchers[nodeID] = ch
-	for range defaultDispatchWorkers {
+	for range defaultDispatchWorkersPerPeer {
 		e.dispatchWG.Add(1)
 		go e.runDispatchWorker(ch)
 	}
