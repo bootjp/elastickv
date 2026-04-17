@@ -317,5 +317,5 @@ adapter/
 |---|---|---|
 | 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
 | 1 | Background migration of existing keys | Medium — requires careful compaction |
-| 2 | Remove legacy `!redis|ttl|` read path | Low — only after full migration |
+| 2 | Remove legacy `!redis\|ttl\|` read path | Low — only after full migration |
 | 3 | Remove TTL buffer | Low — no longer needed post-migration |

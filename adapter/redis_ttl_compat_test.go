@@ -99,6 +99,8 @@ func TestRedis_INCR_PreservesTTL(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, ttlAfter, time.Duration(0),
 		"INCR must preserve the existing TTL")
+	require.LessOrEqual(t, ttlAfter, ttlBefore,
+		"INCR must not extend/reset the existing TTL")
 }
 
 // INCR on a key without TTL must keep TTL as -1.

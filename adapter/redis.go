@@ -744,6 +744,9 @@ func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byt
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encoded})
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	} else {
+		// Clear any prior scan index so a persistent string is not later expired.
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
 	return r.dispatchElems(ctx, true, readTS, elems)
 }
@@ -2301,6 +2304,27 @@ func (t *txnContext) commit() error {
 	return nil
 }
 
+// stringValueAndTTLElem returns the encoded string value and an optional
+// !redis|ttl| scan-index mutation for a string write. Dirty EXPIRE/PERSIST
+// state takes priority; otherwise the TTL loaded with the value is preserved
+// so commands like INCR or SETBIT inside MULTI/EXEC don't clear it. A dirty
+// PERSIST emits a Del so the sweeper cannot later expire a persistent key.
+func (t *txnContext) stringValueAndTTLElem(userKey []byte, tv *txnValue) ([]byte, *kv.Elem[kv.OP]) {
+	ttl := tv.ttl
+	ttlSt := t.ttlStates[string(userKey)]
+	if ttlSt != nil && ttlSt.dirty {
+		ttl = ttlSt.value
+	}
+	value := encodeRedisStr(tv.raw, ttl)
+	if ttl != nil {
+		return value, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(userKey), Value: encodeRedisTTL(*ttl)}
+	}
+	if ttlSt != nil && ttlSt.dirty {
+		return value, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)}
+	}
+	return value, nil
+}
+
 func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 	keys := make([]string, 0, len(t.working))
 	for k := range t.working {
@@ -2320,20 +2344,12 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 			continue
 		}
 		value := tv.raw
-		// For string keys: embed TTL in the encoded value.
 		if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
 			userKey := storageKey[len(redisStrPrefix):]
-			// Dirty EXPIRE/PERSIST state takes priority; otherwise preserve
-			// the TTL that was loaded with the value so commands like INCR
-			// or SETBIT inside MULTI/EXEC don't clear it.
-			ttl := tv.ttl
-			if ttlSt := t.ttlStates[string(userKey)]; ttlSt != nil && ttlSt.dirty {
-				ttl = ttlSt.value
-			}
-			value = encodeRedisStr(tv.raw, ttl)
-			// Write !redis|ttl| scan index if TTL is set.
-			if ttl != nil {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(userKey), Value: encodeRedisTTL(*ttl)})
+			var extra *kv.Elem[kv.OP]
+			value, extra = t.stringValueAndTTLElem(userKey, tv)
+			if extra != nil {
+				elems = append(elems, extra)
 			}
 		}
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: value})

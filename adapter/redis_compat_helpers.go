@@ -395,8 +395,11 @@ func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, 
 		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
 	}
 	// Write !redis|ttl| as a secondary scan index for background expiration (if TTL set).
+	// Otherwise clear any pre-existing index so a persistent string is not later expired.
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
 	return r.dispatchElems(ctx, false, 0, elems)
 }

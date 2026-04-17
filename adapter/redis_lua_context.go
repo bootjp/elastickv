@@ -2565,9 +2565,12 @@ func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	}
 	encoded := encodeRedisStr(append([]byte(nil), st.value...), ttl)
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStrKey([]byte(key)), Value: encoded}}
-	// Write !redis|ttl| scan index alongside the encoded value.
+	// Write !redis|ttl| scan index alongside the encoded value; delete it when
+	// the script makes the string persistent, so the sweeper cannot later expire it.
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey([]byte(key))})
 	}
 	return elems, nil
 }

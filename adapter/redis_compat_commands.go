@@ -364,7 +364,11 @@ func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, un
 		return 0, err
 	}
 	if typ == redisTypeString {
-		return 1, r.dispatchStringExpire(ctx, key, readTS, expireAt)
+		applied, err := r.dispatchStringExpire(ctx, key, readTS, expireAt)
+		if err != nil || !applied {
+			return 0, err
+		}
+		return 1, nil
 	}
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
 	return 1, r.dispatchElems(ctx, true, readTS, elems)
@@ -390,17 +394,22 @@ func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS ui
 // entry (IsTxn=true, StartTS=readTS). The coordinator rejects the write with
 // ErrWriteConflict if any key was modified after readTS, so stale-data safety is
 // guaranteed by OCC — no explicit mutex is required.
-func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) error {
+func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) (bool, error) {
 	userValue, _, readErr := r.readRedisStringAt(key, readTS)
-	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
-		return cockerrors.WithStack(readErr)
+	if readErr != nil {
+		if cockerrors.Is(readErr, store.ErrKeyNotFound) {
+			// Raced with a delete/expiry between prepareExpire and this read;
+			// do not resurrect the key with an empty anchor.
+			return false, nil
+		}
+		return false, cockerrors.WithStack(readErr)
 	}
 	encoded := encodeRedisStr(userValue, &expireAt)
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
 		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
 	}
-	return r.dispatchElems(ctx, true, readTS, elems)
+	return true, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func parseScanArgs(args [][]byte) (int, []byte, int, error) {
