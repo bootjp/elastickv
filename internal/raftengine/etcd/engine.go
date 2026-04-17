@@ -27,13 +27,19 @@ const (
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before it must wait for an ACK. Increasing this from the
 	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
-	defaultMaxInflightMsg    = 1024
-	defaultMaxSizePerMsg     = 1 << 20
-	defaultSnapshotEvery     = 10_000
-	defaultSnapshotQueueSize = 1
-	defaultAdminPollInterval = 10 * time.Millisecond
-	defaultMaxPendingConfigs = 64
-	unknownLastContact       = time.Duration(-1)
+	defaultMaxInflightMsg = 1024
+	defaultMaxSizePerMsg  = 1 << 20
+	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
+	// It carries only truly low-frequency control messages (heartbeats, votes,
+	// read-index, leader-transfer). MsgAppResp is intentionally kept in the
+	// normal channel: followers — the only senders of MsgAppResp — do not send
+	// MsgApp, so there is no head-of-line blocking risk there.
+	defaultHeartbeatBufPerPeer = 64
+	defaultSnapshotEvery       = 10_000
+	defaultSnapshotQueueSize   = 1
+	defaultAdminPollInterval   = 10 * time.Millisecond
+	defaultMaxPendingConfigs   = 64
+	unknownLastContact         = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)
@@ -942,19 +948,18 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
-// isPriorityMsg returns true for small, latency-sensitive control messages
-// that must not be queued behind large MsgApp payloads in the normal channel.
-// Election messages (MsgVote/MsgPreVote) are included because delays can
-// trigger unnecessary election timeouts. MsgReadIndex/Resp affects linearizable
-// read latency. MsgAppResp lets the leader advance the commit index promptly.
-// MsgTimeoutNow triggers an immediate election on the target follower for
-// leadership transfer; delaying it stalls the transfer.
+// isPriorityMsg returns true for small, low-frequency control messages that
+// must not be queued behind large MsgApp payloads in the normal channel.
+// MsgAppResp is intentionally excluded: it is sent by followers, which never
+// send MsgApp, so it faces no head-of-line blocking in the normal channel.
+// Keeping it out of the priority queue preserves the low-frequency invariant
+// that justifies defaultHeartbeatBufPerPeer = 64.
 func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
 		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
 		t == raftpb.MsgVote || t == raftpb.MsgVoteResp ||
 		t == raftpb.MsgPreVote || t == raftpb.MsgPreVoteResp ||
-		t == raftpb.MsgAppResp || t == raftpb.MsgTimeoutNow
+		t == raftpb.MsgTimeoutNow
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
@@ -2000,7 +2005,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
 		normal:    make(chan dispatchRequest, size),
-		heartbeat: make(chan dispatchRequest, size),
+		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
 		ctx:       ctx,
 		cancel:    cancel,
 	}

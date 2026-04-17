@@ -590,7 +590,7 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 
 	pd, ok := engine.peerDispatchers[2]
 	require.True(t, ok, "dispatcher must be created on upsert")
-	require.Equal(t, 4, cap(pd.heartbeat))
+	require.Equal(t, defaultHeartbeatBufPerPeer, cap(pd.heartbeat))
 	require.Equal(t, 4, cap(pd.normal))
 
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
