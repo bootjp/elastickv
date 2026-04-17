@@ -951,12 +951,14 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 // Election messages (MsgVote/MsgPreVote) are included because delays can
 // trigger unnecessary election timeouts. MsgReadIndex/Resp affects linearizable
 // read latency. MsgAppResp lets the leader advance the commit index promptly.
+// MsgTimeoutNow triggers an immediate election on the target follower for
+// leadership transfer; delaying it stalls the transfer.
 func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
 		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
 		t == raftpb.MsgVote || t == raftpb.MsgVoteResp ||
 		t == raftpb.MsgPreVote || t == raftpb.MsgPreVoteResp ||
-		t == raftpb.MsgAppResp
+		t == raftpb.MsgAppResp || t == raftpb.MsgTimeoutNow
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
