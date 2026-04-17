@@ -209,7 +209,11 @@ to either channel:
 ```go
 for {
     // Drain the priority channel before accepting normal messages.
+    // ctx.Done() is checked here too so a sustained heartbeat burst
+    // cannot prevent a prompt shutdown.
     select {
+    case <-ctx.Done():
+        return nil
     case req := <-pd.heartbeat:
         if err := stream.Send(req); err != nil {
             return err // triggers teardown + reconnect (§3.4)

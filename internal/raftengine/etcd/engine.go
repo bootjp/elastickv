@@ -2058,7 +2058,7 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr != nil {
+	if dispatchErr != nil && !errors.Is(dispatchErr, ctx.Err()) {
 		count := e.dispatchErrorCount.Add(1)
 		if shouldLogDispatchEvent(count) {
 			slog.Warn("etcd raft outbound dispatch failed",
