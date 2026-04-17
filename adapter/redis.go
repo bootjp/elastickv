@@ -271,6 +271,11 @@ type RedisServer struct {
 	leaderClientsMu sync.RWMutex
 	leaderClients   map[string]*redis.Client
 
+	// compactor is the background DeltaCompactor for this node. When set,
+	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
+	// reads on hot keys faster than the regular compaction interval.
+	compactor *DeltaCompactor
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -279,6 +284,14 @@ type RedisServerOption func(*RedisServer)
 func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisServerOption {
 	return func(r *RedisServer) {
 		r.readTracker = tracker
+	}
+}
+
+// WithRedisCompactor wires a DeltaCompactor to the RedisServer so that urgent
+// single-key compaction can be triggered when ErrDeltaScanTruncated is hit.
+func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
+	return func(r *RedisServer) {
+		r.compactor = c
 	}
 }
 
@@ -465,6 +478,14 @@ func (r *RedisServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 		return nil
 	}
 	return r.readTracker.Pin(ts)
+}
+
+// triggerUrgentCompaction signals the DeltaCompactor to immediately compact
+// the given key, bypassing the regular interval. No-op when no compactor is wired.
+func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
+	if r.compactor != nil {
+		r.compactor.TriggerUrgentCompaction(typeName, key)
+	}
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
@@ -1030,6 +1051,19 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 
 // tryLeaderLogicalExists checks whether the key exists as any type on the leader.
 func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+	// Prefer asking the leader's Redis command path directly: it evaluates
+	// existence with ttlAt() semantics (including the in-memory TTL buffer).
+	// If this path is unavailable we fall back to raw-KV probing, which is
+	// best-effort and may lag unflushed buffer-only TTL updates.
+	if cli, err := r.leaderClientForKey(key); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+		defer cancel()
+		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
+			return count > 0
+		}
+	}
+
+	// Fallback to raw KV probing if Redis command proxying is unavailable.
 	if r.isLeaderKeyExpired(key) {
 		return false
 	}
@@ -1863,7 +1897,7 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	}
 
 	var oldValue []byte
-	if opts.returnOld {
+	if opts.returnOld && !tv.deleted {
 		oldValue = tv.raw
 	}
 
@@ -2782,7 +2816,8 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 		claimEnd = meta.Tail
 	}
 	// Capacity: n claim keys + n Del(item) for found items + 1 for the delta key appended by caller.
-	elems := make([]*kv.Elem[kv.OP], 0, n+int64(len(kvps))+listPopDeltaOverhead)
+	// n is bounded by maxWideColumnItems (100_000) so the int conversion is safe.
+	elems := make([]*kv.Elem[kv.OP], 0, int(n)+len(kvps)+listPopDeltaOverhead)
 	for seq := claimStart; seq < claimEnd; seq++ {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListClaimKey(key, seq), Value: []byte{}})
 	}

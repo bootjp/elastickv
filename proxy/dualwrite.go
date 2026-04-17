@@ -21,8 +21,9 @@ const (
 	// (EVAL / EVALSHA). Lua scripts under high load cause write conflicts in the Raft
 	// layer, and each conflict triggers a full script re-execution. Capping the
 	// concurrency reduces contention so individual scripts complete within
-	// SecondaryTimeout. Excess scripts are dropped (acceptable in dual-write mode
-	// where Redis remains the authoritative store).
+	// SecondaryTimeout. Excess secondary script writes may be dropped to keep
+	// contention bounded; this is only tolerable in modes where the script write
+	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
 )
 

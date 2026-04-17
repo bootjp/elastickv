@@ -220,3 +220,29 @@ func TestRedis_MultiExec_DelThenRPushRecreatesList(t *testing.T) {
 	}
 	require.Equal(t, []string{"new1", "new2"}, got)
 }
+
+func TestRedis_MultiExec_SetGetAfterDeleteReturnsNilOldValue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	ctx := context.Background()
+
+	require.NoError(t, rdb.Set(ctx, "sg:del", "v1", 0).Err())
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", "sg:del").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "sg:del", "v2", "GET").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 2)
+	require.Equal(t, int64(1), vals[0])
+	require.Nil(t, vals[1], "SET GET should see key as missing after staged DEL")
+
+	got, err := rdb.Get(ctx, "sg:del").Result()
+	require.NoError(t, err)
+	require.Equal(t, "v2", got)
+}
