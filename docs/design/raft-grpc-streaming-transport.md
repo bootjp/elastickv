@@ -29,7 +29,7 @@ per-message RTT of unary gRPC.
 
 ### Goal
 
-Replace per-message unary RPCs with a **long-lived bidirectional gRPC stream per peer**
+Replace per-message unary RPCs with a **long-lived client-streaming gRPC stream per peer**
 so that the sender does not block waiting for an individual ACK between messages.
 Expected outcome: throughput per peer scales with available bandwidth rather than
 being RTT-limited.
