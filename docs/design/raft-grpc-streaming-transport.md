@@ -211,21 +211,32 @@ for {
     // Drain the priority channel before accepting normal messages.
     select {
     case req := <-pd.heartbeat:
-        stream.Send(req)
+        if err := stream.Send(req); err != nil {
+            return err // triggers teardown + reconnect (§3.4)
+        }
         continue
     default:
     }
     // No priority message pending; wait on either.
     select {
     case req := <-pd.heartbeat:
-        stream.Send(req)
+        if err := stream.Send(req); err != nil {
+            return err
+        }
     case req := <-pd.normal:
-        stream.Send(req)
+        if err := stream.Send(req); err != nil {
+            return err
+        }
     case <-ctx.Done():
-        return
+        return nil
     }
 }
 ```
+
+`stream.Send` errors (broken stream, lost connection) are returned immediately,
+triggering the stream teardown and reconnect path described in §3.4. Raft's
+built-in retransmission handles any messages dropped during the reconnect window
+— identical to the behaviour of the existing unary `Send` drop path.
 
 This guarantees heartbeats are flushed before the next log entry is written
 to the stream, bounding heartbeat delay to one normal-message send time.
