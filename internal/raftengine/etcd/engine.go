@@ -21,20 +21,28 @@ import (
 )
 
 const (
-	defaultTickInterval   = 10 * time.Millisecond
-	defaultHeartbeatTick  = 1
-	defaultElectionTick   = 10
+	defaultTickInterval  = 10 * time.Millisecond
+	defaultHeartbeatTick = 1
+	defaultElectionTick  = 10
+	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
+	// allows per peer before it must wait for an ACK. Increasing this from the
+	// etcd/raft default of 256 enables deeper pipelining on high-bandwidth links.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultDispatchWorkersPerPeer is the number of goroutines started per peer:
 	// one for normal messages (MsgApp, etc.) and one dedicated to heartbeats.
 	defaultDispatchWorkersPerPeer = 2
-	defaultDispatchBufPerPeer     = 512
-	defaultSnapshotEvery          = 10_000
-	defaultSnapshotQueueSize      = 1
-	defaultAdminPollInterval      = 10 * time.Millisecond
-	defaultMaxPendingConfigs      = 64
-	unknownLastContact            = time.Duration(-1)
+	// defaultDispatchBufPerPeer is the per-peer dispatch channel capacity.
+	// It is intentionally decoupled from defaultMaxInflightMsg: MaxInflightMsg
+	// is a Raft-level flow-control knob, while this controls how many serialised
+	// messages the dispatch goroutine can buffer before dropping. 512 is chosen
+	// to keep memory overhead modest while still absorbing bursts.
+	defaultDispatchBufPerPeer = 512
+	defaultSnapshotEvery      = 10_000
+	defaultSnapshotQueueSize  = 1
+	defaultAdminPollInterval  = 10 * time.Millisecond
+	defaultMaxPendingConfigs  = 64
+	unknownLastContact        = time.Duration(-1)
 
 	proposalEnvelopeVersion  = byte(0x01)
 	readContextVersion       = byte(0x02)

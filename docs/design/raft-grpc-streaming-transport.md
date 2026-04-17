@@ -17,8 +17,9 @@ messages per follower before receiving ACK. A single dispatch worker serialises
 those 1024 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
 regardless of bandwidth.
 
-PR #522 introduced per-peer dispatch channels and `defaultDispatchWorkersPerPeer = 1`
-to eliminate cross-peer head-of-line blocking. The remaining bottleneck is the
+PR #522 introduced per-peer dispatch channels and `defaultDispatchWorkersPerPeer = 2`
+(one goroutine for normal messages, one dedicated to heartbeats) to eliminate
+cross-peer head-of-line blocking. The remaining bottleneck is the
 per-message RTT of unary gRPC.
 
 ### Goal
@@ -35,15 +36,22 @@ being RTT-limited.
 ```
 Engine run loop
   └─ sendMessages()
-       └─ enqueueDispatchMessage()  → peerDispatchers[nodeID] (chan, cap 512)
-                                          ↓
-                                   runDispatchWorker (1 goroutine/peer)
-                                          ↓
-                                   GRPCTransport.dispatchRegular()
-                                          ↓
-                                   client.Send(ctx, EtcdRaftMessage)   ← unary, blocks on RTT
-                                          ↓
-                                   receive EtcdRaftAck
+       └─ enqueueDispatchMessage()
+            ├─ regular messages   → peerDispatchers[nodeID].normal    (chan, cap 512)
+            │                           ↓
+            │                    runDispatchWorker (1 goroutine/peer)
+            │                           ↓
+            │                    GRPCTransport.dispatchRegular()
+            │                           ↓
+            │                    client.Send(ctx, EtcdRaftMessage)   ← unary, blocks on RTT
+            │                           ↓
+            │                    receive EtcdRaftAck
+            │
+            └─ heartbeat messages → peerDispatchers[nodeID].heartbeat (chan, cap 512)
+                                        ↓
+                                 runDispatchWorker (1 goroutine/peer, dedicated)
+                                        ↓
+                                 GRPCTransport.dispatchRegular()
 ```
 
 Snapshot messages already use client streaming (`SendSnapshot`); regular messages do not.
@@ -58,17 +66,17 @@ Add a bidirectional streaming RPC to `etcd_raft.proto`:
 
 ```protobuf
 service EtcdRaft {
-  rpc Send(EtcdRaftMessage)              returns (EtcdRaftAck) {}          // kept for compat
-  rpc SendStream(stream EtcdRaftMessage) returns (stream EtcdRaftAck) {}   // new
+  rpc Send(EtcdRaftMessage)              returns (EtcdRaftAck) {}        // kept for compat
+  rpc SendStream(stream EtcdRaftMessage) returns (EtcdRaftAck) {}        // new: client-streaming
   rpc SendSnapshot(stream EtcdRaftSnapshotChunk) returns (EtcdRaftAck) {}
 }
 ```
 
-`EtcdRaftAck` is reused as the per-stream ACK (sent once when the server closes
-the stream or on explicit flush). Per-message ACKs are intentionally omitted:
-Raft's own MsgAppResp / MsgHeartbeatResp handle application-level
-acknowledgement; the transport only needs delivery confirmation at stream
-granularity.
+`SendStream` is **client-streaming**: the client sends a sequence of messages and
+the server replies with a single `EtcdRaftAck` when the stream closes or on error.
+Per-message ACKs are intentionally omitted: Raft's own MsgAppResp / MsgHeartbeatResp
+handle application-level acknowledgement; the transport only needs delivery
+confirmation at stream granularity.
 
 ### 3.2 Sender side (`GRPCTransport`)
 
