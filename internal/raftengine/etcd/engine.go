@@ -22,8 +22,8 @@ import (
 
 const (
 	defaultTickInterval  = 10 * time.Millisecond
-	defaultHeartbeatTick = 10
-	defaultElectionTick  = 100
+	defaultHeartbeatTick = 10 // 100ms at 10ms interval
+	defaultElectionTick  = 100 // 1s at 10ms interval
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
