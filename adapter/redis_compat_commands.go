@@ -126,7 +126,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeString {
 			return wrongTypeError()
 		}
-		raw, err := r.readRedisStringAt(key, readTS)
+		raw, _, err := r.readRedisStringAt(key, readTS)
 		if err != nil {
 			// Key may have expired or been deleted between type check and read.
 			v = nil
@@ -328,42 +328,127 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
+	// Pin expireAt once before the retry loop so successive attempts all write
+	// the same wall-clock deadline (OCC retries must not push expiry forward).
+	var expireAt time.Time
+	if ttl > 0 {
+		if ttl > math.MaxInt64/int64(unit) {
+			conn.WriteError("ERR invalid expire time in command")
+			return
+		}
+		expireAt = time.Now().Add(time.Duration(ttl) * unit)
+	}
+
 	var result int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, eligible, err := r.prepareExpire(cmd.Args[1], nxOnly)
-		if err != nil {
-			return err
-		}
-		if !eligible {
-			result = 0
-			return nil
-		}
-		if ttl <= 0 {
-			elems, existed, err := r.deleteLogicalKeyElems(ctx, cmd.Args[1], readTS)
-			if err != nil {
-				return err
-			}
-			if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
-				return err
-			}
-			if existed {
-				result = 1
-			} else {
-				result = 0
-			}
-			return nil
-		}
-		expireAt := time.Now().Add(time.Duration(ttl) * unit)
-		result = 1
-		// TTL is written to the in-memory buffer; the background flusher
-		// batches it to Raft without conflict detection (IsTxn=false).
-		r.ttlBuffer.Set(cmd.Args[1], &expireAt)
-		return nil
+		var retErr error
+		result, retErr = r.doSetExpire(ctx, cmd.Args[1], ttl, expireAt, nxOnly)
+		return retErr
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
 	conn.WriteInt(result)
+}
+
+// doSetExpire is the inner body of setExpire's retryRedisWrite loop.
+// All reads (existence, type, value) use the same readTS snapshot so they form
+// a consistent view. The subsequent dispatchElems calls use IsTxn=true with
+// StartTS=readTS, which causes coordinator.Dispatch to reject the write with
+// ErrWriteConflict if any touched key was modified after readTS. retryRedisWrite
+// then re-invokes doSetExpire with a fresh readTS, providing OCC safety without
+// an explicit mutex. Leadership is verified by coordinator.Dispatch itself.
+func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, expireAt time.Time, nxOnly bool) (int, error) {
+	readTS, eligible, err := r.prepareExpire(key, nxOnly)
+	if err != nil {
+		return 0, err
+	}
+	if !eligible {
+		return 0, nil
+	}
+	if ttl <= 0 {
+		return r.expireDeleteKey(ctx, key, readTS)
+	}
+	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if typ == redisTypeString {
+		// rawKeyTypeAt also reports HLL as redisTypeString; HLL payloads live
+		// under !redis|hll|<key> and don't carry an inline TTL, so fall back
+		// to the legacy scan-index path for them.
+		plain, err := r.isPlainRedisString(ctx, key, readTS)
+		if err != nil {
+			return 0, err
+		}
+		if plain {
+			applied, err := r.dispatchStringExpire(ctx, key, readTS, expireAt)
+			if err != nil || !applied {
+				return 0, err
+			}
+			return 1, nil
+		}
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
+	return 1, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+// isPlainRedisString distinguishes a plain Redis string (stored under
+// !redis|str|<key> or, for legacy data, the bare key) from a HyperLogLog
+// (stored under !redis|hll|<key>), both of which rawKeyTypeAt reports as
+// redisTypeString.
+func (r *RedisServer) isPlainRedisString(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	if exists {
+		return true, nil
+	}
+	// Fall back to the bare legacy layout.
+	legacy, err := r.store.ExistsAt(ctx, key, readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	return legacy, nil
+}
+
+func (r *RedisServer) expireDeleteKey(ctx context.Context, key []byte, readTS uint64) (int, error) {
+	elems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		return 0, err
+	}
+	if existed {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// dispatchStringExpire performs a read-modify-write on the string anchor key:
+// it reads the current value at readTS, re-encodes it with the new expiry, and
+// writes both the updated value and the !redis|ttl| scan index in a single Raft
+// entry (IsTxn=true, StartTS=readTS). The coordinator rejects the write with
+// ErrWriteConflict if any key was modified after readTS, so stale-data safety is
+// guaranteed by OCC — no explicit mutex is required.
+func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) (bool, error) {
+	userValue, _, readErr := r.readRedisStringAt(key, readTS)
+	if readErr != nil {
+		if cockerrors.Is(readErr, store.ErrKeyNotFound) {
+			// Raced with a delete/expiry between prepareExpire and this read;
+			// do not resurrect the key with an empty anchor.
+			return false, nil
+		}
+		return false, cockerrors.WithStack(readErr)
+	}
+	encoded := encodeRedisStr(userValue, &expireAt)
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
+		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
+	}
+	return true, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func parseScanArgs(args [][]byte) (int, []byte, int, error) {
@@ -1924,11 +2009,13 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 
 		current = 0
+		var existingTTL *time.Time
 		if typ == redisTypeString {
-			raw, err := r.readRedisStringAt(cmd.Args[1], readTS)
+			raw, ttl, err := r.readRedisStringAt(cmd.Args[1], readTS)
 			if err != nil {
 				return err
 			}
+			existingTTL = ttl
 			current, err = strconv.ParseInt(string(raw), 10, 64)
 			if err != nil {
 				return fmt.Errorf("ERR value is not an integer or out of range")
@@ -1936,14 +2023,19 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		current++
 
-		if err := r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: []byte(strconv.FormatInt(current, 10))},
-		}); err != nil {
-			return err
+		// INCR preserves any existing TTL (Redis semantics).
+		encoded := encodeRedisStr([]byte(strconv.FormatInt(current, 10)), existingTTL)
+		elems := []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: redisStrKey(cmd.Args[1]), Value: encoded},
 		}
-		// INCR clears any TTL; write nil to buffer (PERSIST semantics).
-		r.ttlBuffer.Set(cmd.Args[1], nil)
-		return nil
+		if existingTTL != nil {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(cmd.Args[1]), Value: encodeRedisTTL(*existingTTL)})
+		} else {
+			// Defensively clear any stale/legacy scan index entry so the sweeper
+			// cannot later expire a now-persistent key.
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
 		conn.WriteError(err.Error())
 		return

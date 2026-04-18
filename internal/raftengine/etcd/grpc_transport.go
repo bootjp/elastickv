@@ -197,8 +197,11 @@ func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 	t.mu.Lock()
 	var closedNodeIDs []uint64
 	if peer, ok := t.peers[nodeID]; ok {
-		delete(t.peers, nodeID)
+		// Collect affected nodeIDs before deleting: closePeerConnLocked iterates
+		// t.peers to find all nodes using the address, so nodeID must still be
+		// present at this point or it won't be included in the cleanup list.
 		closedNodeIDs = t.closePeerConnLocked(peer.Address)
+		delete(t.peers, nodeID)
 	}
 	t.mu.Unlock()
 

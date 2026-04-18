@@ -72,10 +72,10 @@ func TestRedis_SET_EX_ImmediatelyVisibleViaTTL(t *testing.T) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// INCR — must clear any existing TTL (PERSIST semantics)
+// INCR — must preserve any existing TTL (Redis semantics)
 // ────────────────────────────────────────────────────────────────
 
-func TestRedis_INCR_ClearsTTL(t *testing.T) {
+func TestRedis_INCR_PreservesTTL(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
@@ -90,15 +90,17 @@ func TestRedis_INCR_ClearsTTL(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, ttlBefore, time.Duration(0), "key must have a TTL before INCR")
 
-	// INCR must clear the TTL.
 	val, err := rdb.Do(ctx, "INCR", "incr:key").Int64()
 	require.NoError(t, err)
 	require.Equal(t, int64(11), val)
 
+	// INCR must preserve the TTL — Redis documents INCR as not modifying the TTL.
 	ttlAfter, err := rdb.TTL(ctx, "incr:key").Result()
 	require.NoError(t, err)
-	require.Equal(t, time.Duration(-1), ttlAfter,
-		"INCR must clear the TTL (PERSIST); TTL must be -1 after INCR")
+	require.Greater(t, ttlAfter, time.Duration(0),
+		"INCR must preserve the existing TTL")
+	require.LessOrEqual(t, ttlAfter, ttlBefore,
+		"INCR must not extend/reset the existing TTL")
 }
 
 // INCR on a key without TTL must keep TTL as -1.

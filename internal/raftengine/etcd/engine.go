@@ -33,11 +33,12 @@ const (
 	defaultMaxInflightMsg = 256
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
-	// It carries low-latency control messages: MsgHeartbeat, MsgHeartbeatResp,
-	// MsgVote, MsgVoteResp, MsgPreVote, MsgPreVoteResp, MsgReadIndex,
-	// MsgReadIndexResp, and MsgTimeoutNow. MsgAppResp is intentionally kept in
-	// the normal channel: followers — the only senders of MsgAppResp — do not
-	// send MsgApp, so there is no head-of-line blocking risk there.
+	// It carries low-frequency control traffic: heartbeats, votes, read-index,
+	// leader-transfer, and their corresponding response messages
+	// (MsgHeartbeatResp, MsgReadIndexResp, MsgVoteResp, MsgPreVoteResp).
+	// MsgAppResp is intentionally kept in the normal channel: followers — the
+	// only senders of MsgAppResp — do not send MsgApp, so there is no
+	// head-of-line blocking risk there.
 	defaultHeartbeatBufPerPeer = 64
 	defaultSnapshotEvery       = 10_000
 	defaultSnapshotQueueSize   = 1

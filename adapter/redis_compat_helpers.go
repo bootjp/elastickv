@@ -368,29 +368,113 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 
 // readRedisStringAt reads a Redis string value, trying the prefixed key first
 // and falling back to the bare key for legacy data written before the
-// !redis|str| prefix migration.
-func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, error) {
-	v, err := r.readValueAt(redisStrKey(key), readTS)
+// !redis|str| prefix migration. Returns the decoded user value and the
+// embedded (or legacy-index) TTL.
+//
+// To minimise read amplification the function bypasses readValueAt/ttlAt so it
+// does not re-enter the hasExpiredTTLAt → ttlAt lookup chain: the new-format
+// path does a single GetAt on the prefixed key (value + TTL in one read);
+// the legacy path does at most two extra reads (TTL index, then bare key).
+// Expiration is checked locally from the TTL we just decoded.
+func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
+	raw, err := r.leaderAwareGetAt(redisStrKey(key), readTS)
 	if err == nil {
-		return v, nil
+		return r.decodePrefixedString(key, raw, readTS)
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil, err
+	}
+	return r.readBareLegacyString(key, readTS)
+}
+
+// decodePrefixedString handles the !redis|str|<key> payload: new-format values
+// carry their TTL inline, while legacy-format payloads that still sit under
+// the prefixed key during rolling upgrade must consult the secondary index.
+func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]byte, *time.Time, error) {
+	userValue, ttl, err := decodeRedisStr(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !isNewRedisStrFormat(raw) {
+		legacyTTL, ttlErr := r.readLegacyTTL(key, readTS)
+		if ttlErr != nil {
+			return nil, nil, ttlErr
+		}
+		ttl = legacyTTL
+	}
+	if ttl != nil && !ttl.After(time.Now()) {
+		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
+	}
+	return userValue, ttl, nil
+}
+
+// readBareLegacyString handles pre-migration data still under the bare user
+// key: TTL in the secondary index, value at the bare key itself.
+func (r *RedisServer) readBareLegacyString(key []byte, readTS uint64) ([]byte, *time.Time, error) {
+	legacyTTL, err := r.readLegacyTTL(key, readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if legacyTTL != nil && !legacyTTL.After(time.Now()) {
+		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
+	}
+	legacy, err := r.leaderAwareGetAt(key, readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	return legacy, legacyTTL, nil
+}
+
+// readLegacyTTL fetches the pre-migration !redis|ttl| entry, returning nil
+// when no index is present.
+func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, error) {
+	raw, err := r.leaderAwareGetAt(redisTTLKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	return r.readValueAt(key, readTS)
+	ttl, err := decodeRedisTTL(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &ttl, nil
+}
+
+// leaderAwareGetAt is a GetAt that honors the per-key leader routing readValueAt
+// uses, but without calling back into hasExpiredTTLAt. Callers are responsible
+// for handling expiration themselves using the TTL they just read.
+func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error) {
+	// Leadership is partitioned by the logical user key, so strip the internal
+	// prefix before asking the coordinator.
+	routingKey := key
+	if userKey := extractRedisInternalUserKey(key); userKey != nil {
+		routingKey = userKey
+	}
+	if r.coordinator.IsLeaderForKey(routingKey) {
+		if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		v, err := r.store.GetAt(context.Background(), key, readTS)
+		return v, errors.WithStack(err)
+	}
+	return r.tryLeaderGetAt(key, readTS)
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
+	encoded := encodeRedisStr(value, ttl)
 	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisStrKey(key), Value: bytes.Clone(value)},
+		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
 	}
-	if err := r.dispatchElems(ctx, false, 0, elems); err != nil {
-		return err
+	// Write !redis|ttl| as a secondary scan index for background expiration (if TTL set).
+	// Otherwise clear any pre-existing index so a persistent string is not later expired.
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	// TTL is written to the buffer after a successful data commit; the
-	// background flusher batches it to Raft without conflict detection.
-	r.ttlBuffer.Set(key, ttl)
-	return nil
+	return r.dispatchElems(ctx, false, 0, elems)
 }
 
 // deleteListElems returns delete operations for all list keys: item keys, the base
