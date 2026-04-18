@@ -44,6 +44,11 @@ var (
 // peerStream holds a long-lived client-streaming gRPC stream to one peer.
 // cancel tears down the stream context; the transport deletes the entry on
 // any Send error and re-opens on the next dispatch attempt.
+//
+// stream.Send is NOT goroutine-safe. This struct must be owned by exactly
+// one goroutine at a time — in practice the per-peer multiplexing dispatch
+// worker (runMultiplexDispatchWorker). Never call stream.Send from more than
+// one goroutine concurrently.
 type peerStream struct {
 	stream pb.EtcdRaft_SendStreamClient
 	cancel context.CancelFunc
@@ -427,9 +432,10 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	// immediately under normal conditions. It can block briefly under HTTP/2
 	// flow control, but Raft bounds in-flight messages via MaxInflightMsg, so
 	// the send buffer will not saturate during steady-state operation.
-	// Stalled TCP connections are detected by gRPC keepalive and fail the
-	// stream; the stream context (derived from ctx) is also cancelled on engine
-	// shutdown, unblocking any in-progress Send.
+	// The stream context is derived from ctx and is cancelled on engine
+	// shutdown, unblocking any in-progress Send. Note: gRPC keepalive is not
+	// configured here; stalled TCP connections rely on the OS-level TCP
+	// keepalive (typically ~2 h) unless the caller configures grpc.WithKeepalive.
 	if err := stream.Send(&pb.EtcdRaftMessage{Message: raw}); err != nil {
 		t.closeStream(msg.To)
 		return errors.WithStack(err)
@@ -490,8 +496,9 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 // SendStream is the server-side handler for the client-streaming SendStream RPC.
 // The client sends a sequence of Raft messages over one long-lived stream;
 // this handler processes each one and closes with a single EtcdRaftAck.
-// Transient backpressure (errStepQueueFull) is logged and skipped rather than
-// tearing down the stream — identical to how the unary Send handler behaves.
+// Transient backpressure (errStepQueueFull) is logged and the message is
+// dropped so the stream stays alive; the sender's Raft layer retransmits.
+// Other handler errors close the stream; Raft retransmits on reconnect.
 func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 	for {
 		req, err := stream.Recv()
