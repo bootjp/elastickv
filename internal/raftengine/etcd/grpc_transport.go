@@ -925,7 +925,9 @@ func (t *GRPCTransport) closeStream(nodeID uint64) {
 	if ok {
 		// CloseSend signals EOF to the server before cancelling the context so
 		// the server's Recv loop sees io.EOF rather than a context-cancelled error.
-		_ = ps.stream.CloseSend()
+		if err := ps.stream.CloseSend(); err != nil {
+			slog.Warn("etcd raft: CloseSend on peer stream failed", "nodeID", nodeID, "error", err)
+		}
 		ps.cancel()
 	}
 }
@@ -950,7 +952,9 @@ func (t *GRPCTransport) closeAllStreams() {
 	for _, ps := range old {
 		// CloseSend signals EOF to the server before cancelling the context so
 		// the server's Recv loop sees io.EOF rather than a context-cancelled error.
-		_ = ps.stream.CloseSend()
+		if err := ps.stream.CloseSend(); err != nil {
+			slog.Warn("etcd raft: CloseSend on peer stream failed during shutdown", "error", err)
+		}
 		ps.cancel()
 	}
 }
