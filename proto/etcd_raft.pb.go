@@ -172,11 +172,9 @@ const file_etcd_raft_proto_rawDesc = "" +
 	"\bmetadata\x18\x01 \x01(\fR\bmetadata\x12\x14\n" +
 	"\x05chunk\x18\x02 \x01(\fR\x05chunk\x12\x14\n" +
 	"\x05final\x18\x03 \x01(\bR\x05final\"\r\n" +
-	"\vEtcdRaftAck2\xa0\x01\n" +
+	"\vEtcdRaftAck2n\n" +
 	"\bEtcdRaft\x12(\n" +
-	"\x04Send\x12\x10.EtcdRaftMessage\x1a\f.EtcdRaftAck\"\x00\x120\n" +
-	"\n" +
-	"SendStream\x12\x10.EtcdRaftMessage\x1a\f.EtcdRaftAck\"\x00(\x01\x128\n" +
+	"\x04Send\x12\x10.EtcdRaftMessage\x1a\f.EtcdRaftAck\"\x00\x128\n" +
 	"\fSendSnapshot\x12\x16.EtcdRaftSnapshotChunk\x1a\f.EtcdRaftAck\"\x00(\x01B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
@@ -199,13 +197,11 @@ var file_etcd_raft_proto_goTypes = []any{
 }
 var file_etcd_raft_proto_depIdxs = []int32{
 	0, // 0: EtcdRaft.Send:input_type -> EtcdRaftMessage
-	0, // 1: EtcdRaft.SendStream:input_type -> EtcdRaftMessage
-	1, // 2: EtcdRaft.SendSnapshot:input_type -> EtcdRaftSnapshotChunk
-	2, // 3: EtcdRaft.Send:output_type -> EtcdRaftAck
-	2, // 4: EtcdRaft.SendStream:output_type -> EtcdRaftAck
-	2, // 5: EtcdRaft.SendSnapshot:output_type -> EtcdRaftAck
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	1, // 1: EtcdRaft.SendSnapshot:input_type -> EtcdRaftSnapshotChunk
+	2, // 2: EtcdRaft.Send:output_type -> EtcdRaftAck
+	2, // 3: EtcdRaft.SendSnapshot:output_type -> EtcdRaftAck
+	2, // [2:4] is the sub-list for method output_type
+	0, // [0:2] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name

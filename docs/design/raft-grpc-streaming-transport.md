@@ -1,8 +1,9 @@
 # Design: gRPC Streaming Transport for Raft Messages
 
-> **Status: implemented.**
+> **Status: proposed — not yet implemented.**
 > PR #522 delivers the per-peer dispatch channel foundation described in §2.
-> This document specifies the streaming transport replacement implemented on top of it.
+> This document specifies the next step: replacing per-message unary RPCs with
+> a long-lived client-streaming gRPC connection per peer.
 
 ## 1. Background and motivation
 
@@ -21,13 +22,10 @@ messages per follower before receiving ACK. A single dispatch worker serialises
 those 256 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
 regardless of bandwidth.
 
-PR #522 introduced per-peer dispatch channels with **two** dispatch goroutines
-per peer (one for normal messages, one for heartbeats) to eliminate cross-peer
-head-of-line blocking. This PR replaces those two workers with a **single
-multiplexing dispatch goroutine** per peer (biased-select: heartbeat priority
-over normal messages) — a prerequisite for the streaming transport, since gRPC
-requires a single writer per stream. The remaining bottleneck addressed here is
-the per-message RTT of unary gRPC.
+PR #522 introduced per-peer dispatch channels and two dispatch workers per peer
+(one goroutine for normal messages, one dedicated to heartbeats) to eliminate
+cross-peer head-of-line blocking. The remaining bottleneck is the
+per-message RTT of unary gRPC.
 
 ### Goal
 
@@ -54,7 +52,7 @@ Engine run loop
             │                           ↓
             │                    receive EtcdRaftAck
             │
-            └─ heartbeat messages → peerDispatchers[nodeID].heartbeat (chan, cap defaultHeartbeatBufPerPeer=64)
+            └─ heartbeat messages → peerDispatchers[nodeID].heartbeat (chan, cap MaxInflightMsg)
                                         ↓
                                  runDispatchWorker (1 goroutine/peer, dedicated)
                                         ↓
@@ -201,7 +199,7 @@ be used to skip the probe after the first successful stream is established.
 | **Ordering** | Single stream per peer preserves FIFO — safe for Raft |
 | **Heartbeat starvation** | Under a burst of log entries, heartbeats could be delayed in the send buffer. Mitigated via biased-select (see below). |
 
-### 4.1 Heartbeat starvation mitigation — biased select
+### 3.6 Heartbeat starvation mitigation — biased select
 
 When the multiplexing dispatch worker (Option A from §3.2) reads from both
 channels, a sustained `MsgApp` burst can delay heartbeats. The mitigation is
