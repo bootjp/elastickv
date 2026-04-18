@@ -176,13 +176,23 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 		return
 	}
 	t.mu.Lock()
-	var closedNodeIDs []uint64
+	var (
+		closedNodeIDs []uint64
+		oldConn       *grpc.ClientConn
+	)
 	if existing, ok := t.peers[peer.NodeID]; ok && existing.Address != "" && existing.Address != peer.Address {
-		closedNodeIDs = t.closePeerConnLocked(existing.Address)
+		closedNodeIDs, oldConn = t.closePeerConnLocked(existing.Address)
 	}
 	t.peers[peer.NodeID] = peer
 	t.mu.Unlock()
 
+	// Close the old connection outside mu: conn.Close is a network operation
+	// that can block; holding t.mu during it would stall concurrent callers.
+	if oldConn != nil {
+		if err := oldConn.Close(); err != nil {
+			slog.Warn("failed to close etcd raft peer connection", "address", peer.Address, "error", err)
+		}
+	}
 	// Clear stream state outside mu (never hold streamsMu and t.mu simultaneously).
 	for _, id := range closedNodeIDs {
 		t.closeStream(id)
@@ -200,16 +210,26 @@ func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 		return
 	}
 	t.mu.Lock()
-	var closedNodeIDs []uint64
+	var (
+		closedNodeIDs []uint64
+		oldConn       *grpc.ClientConn
+	)
 	if peer, ok := t.peers[nodeID]; ok {
 		// Collect affected nodeIDs before deleting: closePeerConnLocked iterates
 		// t.peers to find all nodes using the address, so nodeID must still be
 		// present at this point or it won't be included in the cleanup list.
-		closedNodeIDs = t.closePeerConnLocked(peer.Address)
+		closedNodeIDs, oldConn = t.closePeerConnLocked(peer.Address)
 		delete(t.peers, nodeID)
 	}
 	t.mu.Unlock()
 
+	// Close the old connection outside mu: conn.Close is a network operation
+	// that can block; holding t.mu during it would stall concurrent callers.
+	if oldConn != nil {
+		if err := oldConn.Close(); err != nil {
+			slog.Warn("failed to close etcd raft peer connection", "address", "", "error", err)
+		}
+	}
 	// Tear down stream state outside mu (never hold streamsMu and t.mu simultaneously).
 	for _, id := range closedNodeIDs {
 		t.closeStream(id)
@@ -237,32 +257,31 @@ func (t *GRPCTransport) Close() error {
 	return errors.WithStack(err)
 }
 
-// closePeerConnLocked closes the gRPC connection for address and returns the
-// node IDs that were using it. Callers should clear stream/noStream state for
-// those IDs after releasing t.mu, so the next dispatch re-probes streaming
-// support (e.g. after a peer upgrade at the same address).
+// closePeerConnLocked removes the gRPC connection for address from the
+// transport maps and returns (nodeIDs using that address, the connection to
+// close). The caller must call conn.Close() after releasing t.mu; doing so
+// inside the lock would block management operations on a network operation.
+// Callers should also clear stream/noStream state for the returned nodeIDs
+// after releasing t.mu so the next dispatch re-probes streaming support.
 // Caller must hold t.mu.
-func (t *GRPCTransport) closePeerConnLocked(address string) []uint64 {
+func (t *GRPCTransport) closePeerConnLocked(address string) (nodeIDs []uint64, conn *grpc.ClientConn) {
 	if address == "" {
-		return nil
+		return nil, nil
 	}
-	var nodeIDs []uint64
 	for id, peer := range t.peers {
 		if peer.Address == address {
 			nodeIDs = append(nodeIDs, id)
 		}
 	}
-	conn, ok := t.conns[address]
+	var ok bool
+	conn, ok = t.conns[address]
 	if !ok {
 		delete(t.clients, address)
-		return nodeIDs
+		return nodeIDs, nil
 	}
 	delete(t.conns, address)
 	delete(t.clients, address)
-	if err := conn.Close(); err != nil {
-		slog.Warn("failed to close etcd raft peer connection", "address", address, "error", err)
-	}
-	return nodeIDs
+	return nodeIDs, conn
 }
 
 func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error {

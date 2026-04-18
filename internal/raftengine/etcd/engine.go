@@ -2062,6 +2062,11 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 // runDispatchWorker while preserving heartbeat priority.
 func (e *Engine) runMultiplexDispatchWorker(ctx context.Context, pd *peerQueues) {
 	defer e.dispatchWG.Done()
+	// drainPendingRequests runs after the main loop exits regardless of the
+	// stop reason (peer removal, engine shutdown, channel close). It closes
+	// every dispatchRequest still sitting in either channel so that callers
+	// waiting on response futures are not left blocked, and so that
+	// dispatchRequest.Close() can release any associated resources.
 	defer e.drainPendingRequests(pd)
 	for {
 		drained, stop := e.drainPriorityChannel(ctx, pd)
