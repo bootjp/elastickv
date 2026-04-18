@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -254,12 +255,53 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
+// writeSecondary sends the command to the secondary, handling the NOSCRIPT
+// → EVAL fallback and transparently retrying when the secondary reports that
+// the read snapshot has been compacted. A re-sent command causes the backend
+// to re-select a fresh read timestamp, which is the only way to recover once
+// the original startTS has fallen behind MinRetainedTS on a peer node.
+//
+// The secondary's raw redis error is kept in sErr (not wrapped) so that
+// writeSecondary can classify it via errors.Is(sErr, redis.Nil), attach the
+// original message to Sentry and the structured log, and so the retry
+// predicate isReadTSCompactedError matches the exact substring coming back
+// from gRPC.
 func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 	defer cancel()
 
 	start := time.Now()
-	sErr := d.executeSecondary(sCtx, cmd, iArgs)
+
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	args := iArgs
+	for attempt := 0; ; attempt++ {
+		result := d.secondary.Do(sCtx, args...)
+		_, sErr = result.Result()
+		if isNoScriptError(sErr) {
+			// After a successful NOSCRIPT→EVAL resolution, retries reuse the
+			// resolved EVAL args so we don't waste a round-trip on the
+			// known-missing EVALSHA every iteration.
+			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
+				args = fallbackArgs
+				result = d.secondary.Do(sCtx, args...)
+				_, sErr = result.Result()
+			}
+		}
+		if !isReadTSCompactedError(sErr) {
+			break
+		}
+		if attempt >= maxCompactedRetries {
+			break
+		}
+		d.logger.Debug("retrying secondary write on compacted snapshot",
+			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if !waitCompactedRetryBackoff(sCtx, backoff) {
+			break
+		}
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(time.Since(start).Seconds())
 
 	if sErr != nil && !errors.Is(sErr, redis.Nil) {
@@ -275,52 +317,6 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
 }
 
-// executeSecondary sends the command to the secondary, handling the NOSCRIPT
-// → EVAL fallback and transparently retrying when the secondary reports that
-// the read snapshot has been compacted. A re-sent command causes the backend
-// to re-select a fresh read timestamp, which is the only way to recover once
-// the original startTS has fallen behind MinRetainedTS on a peer node.
-//
-// If the first attempt triggers a NOSCRIPT fallback, subsequent retry
-// attempts use the resolved EVAL args directly so we don't waste a
-// round-trip on the known-missing EVALSHA every iteration.
-func (d *DualWriter) executeSecondary(sCtx context.Context, cmd string, iArgs []any) error {
-	backoff := compactedRetryInitialBackoff
-	var sErr error
-	args := iArgs
-	for attempt := 0; ; attempt++ {
-		result := d.secondary.Do(sCtx, args...)
-		_, sErr = result.Result()
-		if isNoScriptError(sErr) {
-			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
-				args = fallbackArgs
-				result = d.secondary.Do(sCtx, args...)
-				_, sErr = result.Result()
-			}
-		}
-		if !isReadTSCompactedError(sErr) {
-			return wrapSecondaryError(sErr)
-		}
-		if attempt >= maxCompactedRetries {
-			return wrapSecondaryError(sErr)
-		}
-		if !waitCompactedRetryBackoff(sCtx, backoff) {
-			return wrapSecondaryError(sErr)
-		}
-		backoff = nextCompactedRetryBackoff(backoff)
-	}
-}
-
-// wrapSecondaryError forwards the secondary's error with a %w wrapper so
-// wrapcheck is satisfied while preserving errors.Is classification for
-// redis.Nil and redis.Error. Returns nil unchanged.
-func wrapSecondaryError(err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("secondary: %w", err)
-}
-
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early
 // when the context is cancelled. Returns false if the caller should abort
 // the retry loop (context done).
@@ -334,11 +330,7 @@ func waitCompactedRetryBackoff(ctx context.Context, backoff time.Duration) bool 
 	if backoff <= 0 {
 		return ctx.Err() == nil
 	}
-	jitter := time.Duration(0)
-	if jitterWindow := int64(backoff / compactedRetryJitterDivisor); jitterWindow > 0 {
-		jitter = time.Duration(rand.Int64N(jitterWindow)) //nolint:gosec // jitter for retry backoff, not security sensitive
-	}
-	timer := time.NewTimer(backoff + jitter)
+	timer := time.NewTimer(backoff + jitterFor(backoff))
 	defer timer.Stop()
 
 	select {
@@ -347,6 +339,22 @@ func waitCompactedRetryBackoff(ctx context.Context, backoff time.Duration) bool 
 	case <-timer.C:
 		return true
 	}
+}
+
+// jitterFor returns a random additive jitter in [0, backoff/compactedRetryJitterDivisor).
+// crypto/rand is used so the code does not trip the gosec G404 rule that
+// flags math/rand for randomness; the security grade does not matter for a
+// retry spread but this avoids a blanket lint suppression.
+func jitterFor(backoff time.Duration) time.Duration {
+	window := int64(backoff / compactedRetryJitterDivisor)
+	if window <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(window))
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n.Int64())
 }
 
 func nextCompactedRetryBackoff(current time.Duration) time.Duration {

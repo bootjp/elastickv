@@ -124,17 +124,31 @@ func (b *LeaderAwareRedisBackend) refreshLoop() {
 
 	b.refreshLeader(ctx)
 
-	t := time.NewTicker(b.refreshInterval)
-	defer t.Stop()
+	// Use a NewTimer that is reset after each probe completes rather than a
+	// Ticker so that when a probe takes longer than refreshInterval (e.g. a
+	// dead seed with a 1s probe timeout and a 50ms interval) we don't
+	// immediately re-fire a second probe the instant the first returns.
+	// This guarantees at least refreshInterval of quiet time between probes.
+	timer := time.NewTimer(b.refreshInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-b.stopCh:
 			return
-		case <-t.C:
+		case <-timer.C:
 			b.refreshLeader(ctx)
 		case <-b.refreshCh:
+			if !timer.Stop() {
+				// Drain the channel if the timer had already fired so the
+				// subsequent Reset doesn't race a pending tick.
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			b.refreshLeader(ctx)
 		}
+		timer.Reset(b.refreshInterval)
 	}
 }
 
@@ -154,7 +168,8 @@ func (b *LeaderAwareRedisBackend) TriggerRefresh() {
 // leader's Redis address is returned by the leader node itself when it's
 // healthy, so this converges in one probe during steady state.
 func (b *LeaderAwareRedisBackend) refreshLeader(ctx context.Context) {
-	for _, addr := range b.candidateAddrs() {
+	candidates := b.candidateAddrs()
+	for _, addr := range candidates {
 		if ctx.Err() != nil {
 			return
 		}
@@ -168,6 +183,12 @@ func (b *LeaderAwareRedisBackend) refreshLeader(ctx context.Context) {
 		}
 		b.setLeader(leader)
 		return
+	}
+	// Only warn when the context is still alive; an interrupted probe during
+	// shutdown is expected and not a cluster-health signal.
+	if ctx.Err() == nil {
+		b.logger.Warn("leader discovery could not find an advertised leader",
+			"backend", b.name, "candidates", candidates)
 	}
 }
 
