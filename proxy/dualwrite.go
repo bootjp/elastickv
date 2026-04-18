@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +28,39 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
+
+	// maxCompactedRetries caps retries when the secondary returns
+	// "read timestamp has been compacted". Each attempt re-sends the command so
+	// the secondary re-selects a fresh read snapshot; a small bound is enough
+	// because the compaction waterline advances slowly relative to SecondaryTimeout.
+	maxCompactedRetries = 3
+	// compactedRetryInitialBackoff is the first delay before retrying a secondary
+	// command that failed with a compacted-read error.
+	compactedRetryInitialBackoff = 10 * time.Millisecond
+	// compactedRetryMaxBackoff caps the jittered exponential backoff so it
+	// stays well within SecondaryTimeout even if the retry policy is ever
+	// widened.
+	compactedRetryMaxBackoff = 100 * time.Millisecond
+	// compactedRetryBackoffFactor is the multiplier applied to the backoff
+	// between retries; 2 gives a conventional exponential schedule.
+	compactedRetryBackoffFactor = 2
+	// compactedRetryJitterDivisor bounds the jitter to backoff/divisor so
+	// jitter stays small relative to the base delay.
+	compactedRetryJitterDivisor = 2
 )
+
+// readTSCompactedMarker is the substring produced by
+// store.ErrReadTSCompacted as it flows through gRPC (wrapped as
+// FailedPrecondition) and Lua PCall. Matching on substring is necessary
+// because both layers erase the typed error.
+const readTSCompactedMarker = "read timestamp has been compacted"
+
+func isReadTSCompactedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), readTSCompactedMarker)
+}
 
 // DualWriter routes commands to primary and secondary backends based on mode.
 type DualWriter struct {
@@ -220,19 +255,53 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
+// writeSecondary sends the command to the secondary, handling the NOSCRIPT
+// → EVAL fallback and transparently retrying when the secondary reports that
+// the read snapshot has been compacted. A re-sent command causes the backend
+// to re-select a fresh read timestamp, which is the only way to recover once
+// the original startTS has fallen behind MinRetainedTS on a peer node.
+//
+// The secondary's raw redis error is kept in sErr (not wrapped) so that
+// writeSecondary can classify it via errors.Is(sErr, redis.Nil), attach the
+// original message to Sentry and the structured log, and so the retry
+// predicate isReadTSCompactedError matches the exact substring coming back
+// from gRPC.
 func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 	defer cancel()
 
 	start := time.Now()
-	result := d.secondary.Do(sCtx, iArgs...)
-	_, sErr := result.Result()
-	if isNoScriptError(sErr) {
-		if fallbackArgs, ok := d.evalFallbackArgs(cmd, iArgs); ok {
-			result = d.secondary.Do(sCtx, fallbackArgs...)
-			_, sErr = result.Result()
+
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	args := iArgs
+	for attempt := 0; ; attempt++ {
+		result := d.secondary.Do(sCtx, args...)
+		_, sErr = result.Result()
+		if isNoScriptError(sErr) {
+			// After a successful NOSCRIPT→EVAL resolution, retries reuse the
+			// resolved EVAL args so we don't waste a round-trip on the
+			// known-missing EVALSHA every iteration.
+			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
+				args = fallbackArgs
+				result = d.secondary.Do(sCtx, args...)
+				_, sErr = result.Result()
+			}
 		}
+		if !isReadTSCompactedError(sErr) {
+			break
+		}
+		if attempt >= maxCompactedRetries {
+			break
+		}
+		d.logger.Debug("retrying secondary write on compacted snapshot",
+			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if !waitCompactedRetryBackoff(sCtx, backoff) {
+			break
+		}
+		backoff = nextCompactedRetryBackoff(backoff)
 	}
+
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(time.Since(start).Seconds())
 
 	if sErr != nil && !errors.Is(sErr, redis.Nil) {
@@ -246,6 +315,54 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 		return
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+}
+
+// waitCompactedRetryBackoff sleeps for a jittered interval or returns early
+// when the context is cancelled. Returns false if the caller should abort
+// the retry loop (context done).
+//
+// Jitter is in [backoff, backoff + backoff/2) so that concurrent retries
+// caused by a single compaction waterline advancement do not re-hit the
+// secondary in lockstep. A NewTimer is used instead of time.After so the
+// timer is released promptly on ctx cancellation (avoiding a leak until
+// expiry when the async goroutine is shutting down).
+func waitCompactedRetryBackoff(ctx context.Context, backoff time.Duration) bool {
+	if backoff <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(backoff + jitterFor(backoff))
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// jitterFor returns a random additive jitter in [0, backoff/compactedRetryJitterDivisor).
+// crypto/rand is used so the code does not trip the gosec G404 rule that
+// flags math/rand for randomness; the security grade does not matter for a
+// retry spread but this avoids a blanket lint suppression.
+func jitterFor(backoff time.Duration) time.Duration {
+	window := int64(backoff / compactedRetryJitterDivisor)
+	if window <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(window))
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n.Int64())
+}
+
+func nextCompactedRetryBackoff(current time.Duration) time.Duration {
+	next := current * compactedRetryBackoffFactor
+	if next > compactedRetryMaxBackoff {
+		return compactedRetryMaxBackoff
+	}
+	return next
 }
 
 // goWrite launches fn in a bounded write goroutine.

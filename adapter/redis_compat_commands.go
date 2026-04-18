@@ -73,13 +73,43 @@ type bzpopminResult struct {
 }
 
 func (r *RedisServer) info(conn redcon.Conn, _ redcon.Command) {
+	role := "slave"
+	if r.coordinator != nil && r.coordinator.IsLeader() {
+		role = "master"
+	}
+
+	leaderRedis := r.raftLeaderRedisAddr()
+
 	conn.WriteBulkString(strings.Join([]string{
 		"# Server",
 		"redis_version:7.2.0",
 		"loading:0",
-		"role:master",
+		"role:" + role,
+		"",
+		"# Replication",
+		"role:" + role,
+		"raft_leader_redis:" + leaderRedis,
 		"",
 	}, "\r\n"))
+}
+
+// raftLeaderRedisAddr returns the Redis-protocol address of the current Raft
+// leader as known by this node. When this node is itself the leader the
+// server's own listen address is returned. An empty string is returned when
+// the leader is not yet known or when the leader's Redis address is not
+// configured in the leaderRedis map.
+func (r *RedisServer) raftLeaderRedisAddr() string {
+	if r.coordinator == nil {
+		return ""
+	}
+	if r.coordinator.IsLeader() {
+		return r.redisAddr
+	}
+	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		return ""
+	}
+	return r.leaderRedis[leader]
 }
 
 // SETEX key seconds value — equivalent to SET key value EX seconds
