@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -212,6 +213,53 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.NoError(t, res.Err())
 	require.Equal(t, beforeA, nodeA.commands.Load(), "command must not reach former leader A")
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
+}
+
+func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {
+	// Regression guard: Close() must not race concurrent Do() callers —
+	// currentClient and ensureClientLocked hold the lock consistently with
+	// the closed flag, and Close snapshots the client map before iterating.
+	// Run under `go test -race` to exercise the fix.
+	leader := newFakeElasticKVNode(t, "")
+	leader.SetLeader(leader.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{leader.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		20*time.Millisecond, 200*time.Millisecond,
+		testLogger,
+	)
+
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == leader.addr
+	}, 2*time.Second, 10*time.Millisecond)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	const workers = 8
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// Error is expected once the backend closes (ErrNoLeaderBackend
+				// or a closed-pool error); we only care that no goroutine panics.
+				_ = backend.Do(context.Background(), "PING").Err()
+			}
+		}()
+	}
+
+	// Let the workers hammer the backend briefly, then close while they run.
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, backend.Close())
+	close(stop)
+	wg.Wait()
 }
 
 func TestLeaderAwareRedisBackend_FallsBackToSeedOnProbeFailure(t *testing.T) {

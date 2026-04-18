@@ -194,6 +194,11 @@ func (b *LeaderAwareRedisBackend) refreshLeader(ctx context.Context) {
 
 func (b *LeaderAwareRedisBackend) probeLeader(ctx context.Context, addr string) (string, error) {
 	cli := b.getOrCreateClient(addr)
+	if cli == nil {
+		// Backend is closing; treat as a normal probe failure so the loop
+		// moves on quickly rather than panicking on a nil dereference.
+		return "", ErrNoLeaderBackend
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, b.refreshTimeout)
 	defer cancel()
 	raw, err := cli.Info(probeCtx, infoReplicationArg).Result()
@@ -239,7 +244,7 @@ func (b *LeaderAwareRedisBackend) candidateAddrs() []string {
 func (b *LeaderAwareRedisBackend) setLeader(addr string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.leader == addr {
+	if b.closed || b.leader == addr {
 		return
 	}
 	prev := b.leader
@@ -264,6 +269,12 @@ func (b *LeaderAwareRedisBackend) ensureClientLocked(addr string) *redis.Client 
 	if cli, ok := b.clients[addr]; ok {
 		return cli
 	}
+	// Refuse to create a new pool once Close() has started; otherwise a
+	// command that raced shutdown could instantiate a client that no one
+	// will ever close.
+	if b.closed {
+		return nil
+	}
 	cli := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		DB:           b.opts.DB,
@@ -278,14 +289,17 @@ func (b *LeaderAwareRedisBackend) ensureClientLocked(addr string) *redis.Client 
 	return cli
 }
 
+// currentClient returns the client for the current leader. The whole
+// read happens under a single RLock so the closed flag, leader addr, and
+// clients map cannot diverge between reads (i.e. no TOCTOU window with
+// Close()). Returns nil once the backend is closing so callers fail fast.
 func (b *LeaderAwareRedisBackend) currentClient() *redis.Client {
 	b.mu.RLock()
-	cli, ok := b.clients[b.leader]
-	b.mu.RUnlock()
-	if ok && cli != nil {
-		return cli
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil
 	}
-	return b.getOrCreateClient(b.seeds[0])
+	return b.clients[b.leader]
 }
 
 // Do forwards a single command to the current leader.
@@ -345,6 +359,9 @@ func (b *LeaderAwareRedisBackend) NewPubSub(ctx context.Context) *redis.PubSub {
 func (b *LeaderAwareRedisBackend) Name() string { return b.name }
 
 // Close stops the refresh loop and releases every cached client pool.
+// It snapshots the client map under the lock before iterating so concurrent
+// Do/Pipeline calls that race shutdown cannot mutate the map out from under
+// us. After this call returns, currentClient() returns nil for every caller.
 func (b *LeaderAwareRedisBackend) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -359,12 +376,20 @@ func (b *LeaderAwareRedisBackend) Close() error {
 	// a concurrent probeLeader cannot race with Close on the clients map.
 	<-b.done
 
+	// Snapshot the clients map and swap in an empty replacement under the
+	// lock. After this point, currentClient()/getOrCreateClient see no
+	// clients (and ensureClientLocked refuses to add any because closed is
+	// true), so iterating the snapshot is safe without holding the lock.
 	b.mu.Lock()
-	clients := b.clients
+	snapshot := make(map[string]*redis.Client, len(b.clients))
+	for addr, cli := range b.clients {
+		snapshot[addr] = cli
+	}
+	b.clients = map[string]*redis.Client{}
 	b.mu.Unlock()
 
 	var firstErr error
-	for addr, cli := range clients {
+	for addr, cli := range snapshot {
 		if err := cli.Close(); err != nil {
 			b.logger.Warn("close leader-aware client failed", "backend", b.name, "addr", addr, "err", err)
 			if firstErr == nil {
