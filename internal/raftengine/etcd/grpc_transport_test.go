@@ -16,9 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
@@ -352,58 +350,16 @@ func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
 // testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
 // SendSnapshot calls to a pre-wired testSnapshotSendClient.
 type testEtcdRaftClient struct {
-	stream        *testSnapshotSendClient
-	sendStreamFn  func(ctx context.Context, opts ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error)
-	sendCallCount atomic.Int32
+	stream *testSnapshotSendClient
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
-	c.sendCallCount.Add(1)
 	return &pb.EtcdRaftAck{}, nil
-}
-
-func (c *testEtcdRaftClient) SendStream(ctx context.Context, opts ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
-	if c.sendStreamFn != nil {
-		return c.sendStreamFn(ctx, opts...)
-	}
-	return nil, status.Error(codes.Unimplemented, "SendStream not implemented in test mock")
 }
 
 func (c *testEtcdRaftClient) SendSnapshot(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendSnapshotClient, error) {
 	return c.stream, nil
 }
-
-// testSendStreamClient is a mock of pb.EtcdRaft_SendStreamClient that records
-// sent messages and optionally returns a configured error.
-type testSendStreamClient struct {
-	mu      sync.Mutex
-	sent    []*pb.EtcdRaftMessage
-	sendErr error
-}
-
-func (c *testSendStreamClient) Send(msg *pb.EtcdRaftMessage) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.sendErr != nil {
-		return c.sendErr
-	}
-	c.sent = append(c.sent, msg)
-	return nil
-}
-
-func (c *testSendStreamClient) SentCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.sent)
-}
-
-func (c *testSendStreamClient) CloseAndRecv() (*pb.EtcdRaftAck, error) { return &pb.EtcdRaftAck{}, nil }
-func (c *testSendStreamClient) Header() (metadata.MD, error)           { return nil, nil }
-func (c *testSendStreamClient) Trailer() metadata.MD                   { return nil }
-func (c *testSendStreamClient) CloseSend() error                       { return nil }
-func (c *testSendStreamClient) Context() context.Context               { return context.Background() }
-func (c *testSendStreamClient) SendMsg(any) error                      { return nil }
-func (c *testSendStreamClient) RecvMsg(any) error                      { return nil }
 
 // injectClient pre-populates the transport's client cache for the given peer
 // address so calls to clientFor return the mock without dialling.
@@ -625,64 +581,4 @@ func TestDispatchSnapshotTokenNoOpenerFallsBackToBridge(t *testing.T) {
 		got = append(got, c.Chunk...)
 	}
 	require.Equal(t, token, got)
-}
-
-// --- dispatchRegular streaming path tests ---
-
-func TestDispatchRegularUsesStreamWhenSupported(t *testing.T) {
-	streamClient := &testSendStreamClient{}
-	mock := &testEtcdRaftClient{
-		sendStreamFn: func(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
-			return streamClient, nil
-		},
-	}
-	transport := NewGRPCTransport([]Peer{{NodeID: 5, Address: "host:5"}})
-	t.Cleanup(func() { _ = transport.Close() })
-	injectClient(t, transport, "host:5", mock)
-
-	msg := raftpb.Message{Type: raftpb.MsgApp, To: 5, From: 1}
-	require.NoError(t, transport.dispatchRegular(context.Background(), msg))
-
-	require.Equal(t, 1, streamClient.SentCount(), "message should be sent via stream.Send")
-	require.Equal(t, int32(0), mock.sendCallCount.Load(), "unary Send should not be called")
-}
-
-func TestDispatchRegularFallsBackToUnaryOnUnimplemented(t *testing.T) {
-	mock := &testEtcdRaftClient{} // sendStreamFn nil → returns Unimplemented
-	transport := NewGRPCTransport([]Peer{{NodeID: 6, Address: "host:6"}})
-	t.Cleanup(func() { _ = transport.Close() })
-	injectClient(t, transport, "host:6", mock)
-
-	msg := raftpb.Message{Type: raftpb.MsgApp, To: 6, From: 1}
-	require.NoError(t, transport.dispatchRegular(context.Background(), msg))
-
-	require.Equal(t, int32(1), mock.sendCallCount.Load(), "unary Send should be called as fallback")
-
-	// noStream must be set so subsequent dispatches skip the probe.
-	transport.streamsMu.RLock()
-	_, skipped := transport.noStream[uint64(6)]
-	transport.streamsMu.RUnlock()
-	require.True(t, skipped, "noStream[6] should be set after Unimplemented")
-}
-
-func TestDispatchRegularClosesStreamOnSendError(t *testing.T) {
-	streamClient := &testSendStreamClient{sendErr: errors.New("send failed")}
-	mock := &testEtcdRaftClient{
-		sendStreamFn: func(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
-			return streamClient, nil
-		},
-	}
-	transport := NewGRPCTransport([]Peer{{NodeID: 7, Address: "host:7"}})
-	t.Cleanup(func() { _ = transport.Close() })
-	injectClient(t, transport, "host:7", mock)
-
-	msg := raftpb.Message{Type: raftpb.MsgApp, To: 7, From: 1}
-	err := transport.dispatchRegular(context.Background(), msg)
-	require.Error(t, err)
-
-	// Stream must be removed from the cache after a Send error.
-	transport.streamsMu.RLock()
-	_, stillCached := transport.streams[uint64(7)]
-	transport.streamsMu.RUnlock()
-	require.False(t, stillCached, "stream should be evicted from cache after Send error")
 }

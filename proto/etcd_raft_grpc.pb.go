@@ -20,7 +20,6 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	EtcdRaft_Send_FullMethodName         = "/EtcdRaft/Send"
-	EtcdRaft_SendStream_FullMethodName   = "/EtcdRaft/SendStream"
 	EtcdRaft_SendSnapshot_FullMethodName = "/EtcdRaft/SendSnapshot"
 )
 
@@ -29,7 +28,6 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type EtcdRaftClient interface {
 	Send(ctx context.Context, in *EtcdRaftMessage, opts ...grpc.CallOption) (*EtcdRaftAck, error)
-	SendStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EtcdRaftMessage, EtcdRaftAck], error)
 	SendSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EtcdRaftSnapshotChunk, EtcdRaftAck], error)
 }
 
@@ -51,22 +49,9 @@ func (c *etcdRaftClient) Send(ctx context.Context, in *EtcdRaftMessage, opts ...
 	return out, nil
 }
 
-func (c *etcdRaftClient) SendStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EtcdRaftMessage, EtcdRaftAck], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &EtcdRaft_ServiceDesc.Streams[0], EtcdRaft_SendStream_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[EtcdRaftMessage, EtcdRaftAck]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type EtcdRaft_SendStreamClient = grpc.ClientStreamingClient[EtcdRaftMessage, EtcdRaftAck]
-
 func (c *etcdRaftClient) SendSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EtcdRaftSnapshotChunk, EtcdRaftAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &EtcdRaft_ServiceDesc.Streams[1], EtcdRaft_SendSnapshot_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &EtcdRaft_ServiceDesc.Streams[0], EtcdRaft_SendSnapshot_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +67,6 @@ type EtcdRaft_SendSnapshotClient = grpc.ClientStreamingClient[EtcdRaftSnapshotCh
 // for forward compatibility.
 type EtcdRaftServer interface {
 	Send(context.Context, *EtcdRaftMessage) (*EtcdRaftAck, error)
-	SendStream(grpc.ClientStreamingServer[EtcdRaftMessage, EtcdRaftAck]) error
 	SendSnapshot(grpc.ClientStreamingServer[EtcdRaftSnapshotChunk, EtcdRaftAck]) error
 	mustEmbedUnimplementedEtcdRaftServer()
 }
@@ -96,9 +80,6 @@ type UnimplementedEtcdRaftServer struct{}
 
 func (UnimplementedEtcdRaftServer) Send(context.Context, *EtcdRaftMessage) (*EtcdRaftAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method Send not implemented")
-}
-func (UnimplementedEtcdRaftServer) SendStream(grpc.ClientStreamingServer[EtcdRaftMessage, EtcdRaftAck]) error {
-	return status.Error(codes.Unimplemented, "method SendStream not implemented")
 }
 func (UnimplementedEtcdRaftServer) SendSnapshot(grpc.ClientStreamingServer[EtcdRaftSnapshotChunk, EtcdRaftAck]) error {
 	return status.Error(codes.Unimplemented, "method SendSnapshot not implemented")
@@ -142,13 +123,6 @@ func _EtcdRaft_Send_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
-func _EtcdRaft_SendStream_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(EtcdRaftServer).SendStream(&grpc.GenericServerStream[EtcdRaftMessage, EtcdRaftAck]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type EtcdRaft_SendStreamServer = grpc.ClientStreamingServer[EtcdRaftMessage, EtcdRaftAck]
-
 func _EtcdRaft_SendSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(EtcdRaftServer).SendSnapshot(&grpc.GenericServerStream[EtcdRaftSnapshotChunk, EtcdRaftAck]{ServerStream: stream})
 }
@@ -169,11 +143,6 @@ var EtcdRaft_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "SendStream",
-			Handler:       _EtcdRaft_SendStream_Handler,
-			ClientStreams: true,
-		},
 		{
 			StreamName:    "SendSnapshot",
 			Handler:       _EtcdRaft_SendSnapshot_Handler,
