@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +26,29 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
+
+	// maxCompactedRetries caps retries when the secondary returns
+	// "read timestamp has been compacted". Each attempt re-sends the command so
+	// the secondary re-selects a fresh read snapshot; a small bound is enough
+	// because the compaction waterline advances slowly relative to SecondaryTimeout.
+	maxCompactedRetries = 3
+	// compactedRetryInitialBackoff is the first delay before retrying a secondary
+	// command that failed with a compacted-read error.
+	compactedRetryInitialBackoff = 10 * time.Millisecond
 )
+
+// readTSCompactedMarker is the substring produced by
+// store.ErrReadTSCompacted as it flows through gRPC (wrapped as
+// FailedPrecondition) and Lua PCall. Matching on substring is necessary
+// because both layers erase the typed error.
+const readTSCompactedMarker = "read timestamp has been compacted"
+
+func isReadTSCompactedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), readTSCompactedMarker)
+}
 
 // DualWriter routes commands to primary and secondary backends based on mode.
 type DualWriter struct {
@@ -225,14 +248,7 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	defer cancel()
 
 	start := time.Now()
-	result := d.secondary.Do(sCtx, iArgs...)
-	_, sErr := result.Result()
-	if isNoScriptError(sErr) {
-		if fallbackArgs, ok := d.evalFallbackArgs(cmd, iArgs); ok {
-			result = d.secondary.Do(sCtx, fallbackArgs...)
-			_, sErr = result.Result()
-		}
-	}
+	sErr := d.executeSecondary(sCtx, cmd, iArgs)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(time.Since(start).Seconds())
 
 	if sErr != nil && !errors.Is(sErr, redis.Nil) {
@@ -246,6 +262,38 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 		return
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+}
+
+// executeSecondary sends the command to the secondary, handling the NOSCRIPT
+// → EVAL fallback and transparently retrying when the secondary reports that
+// the read snapshot has been compacted. A re-sent command causes the backend
+// to re-select a fresh read timestamp, which is the only way to recover once
+// the original startTS has fallen behind MinRetainedTS on a peer node.
+func (d *DualWriter) executeSecondary(sCtx context.Context, cmd string, iArgs []any) error {
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	for attempt := 0; ; attempt++ {
+		result := d.secondary.Do(sCtx, iArgs...)
+		_, sErr = result.Result()
+		if isNoScriptError(sErr) {
+			if fallbackArgs, ok := d.evalFallbackArgs(cmd, iArgs); ok {
+				result = d.secondary.Do(sCtx, fallbackArgs...)
+				_, sErr = result.Result()
+			}
+		}
+		if !isReadTSCompactedError(sErr) {
+			return sErr
+		}
+		if attempt >= maxCompactedRetries {
+			return sErr
+		}
+		select {
+		case <-sCtx.Done():
+			return sErr
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
 }
 
 // goWrite launches fn in a bounded write goroutine.

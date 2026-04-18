@@ -920,6 +920,60 @@ func TestDualWriter_Script_EvalSHARO_FallsBackToEvalRO(t *testing.T) {
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 }
 
+func TestDualWriter_writeSecondary_RetriesReadTSCompacted(t *testing.T) {
+	// Simulate ElasticKV returning "read timestamp has been compacted"
+	// (wrapped as gRPC FailedPrecondition and surfaced through Lua PCall).
+	// The proxy must transparently retry so the async EVALSHA replay
+	// eventually succeeds with a fresher snapshot timestamp.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	compactedErr := testRedisErr("<string>:71: rpc error: code = FailedPrecondition desc = rpc error: code = FailedPrecondition desc = read timestamp has been compacted stack traceback: \t[G]: in function 'rcall'")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		if calls < 3 {
+			cmd.SetErr(compactedErr)
+			return cmd
+		}
+		cmd.SetVal("OK")
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 3, calls, "secondary must be retried until it succeeds")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a retried success must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T) {
+	// When the compacted error is persistent, the retry loop must stop after
+	// maxCompactedRetries+1 attempts so the secondary goroutine returns
+	// instead of burning a scriptSem slot indefinitely.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	compactedErr := testRedisErr("rpc error: code = FailedPrecondition desc = read timestamp has been compacted")
+	secondary.doFunc = makeCmd(nil, compactedErr)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, maxCompactedRetries+1, secondary.CallCount(),
+		"secondary must stop after maxCompactedRetries+1 attempts")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a persistent compacted error must still be reported as a secondary write error")
+}
+
 func TestDualWriter_Script_NoRememberOnPrimaryError(t *testing.T) {
 	// Verify that a failed SCRIPT FLUSH on the primary does NOT clear the proxy
 	// script cache, so that subsequent EVALSHA → EVAL fallbacks still work.
