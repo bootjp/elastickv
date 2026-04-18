@@ -33,10 +33,11 @@ const (
 	defaultMaxInflightMsg = 256
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
-	// It carries only truly low-frequency control messages (heartbeats, votes,
-	// read-index, leader-transfer). MsgAppResp is intentionally kept in the
-	// normal channel: followers — the only senders of MsgAppResp — do not send
-	// MsgApp, so there is no head-of-line blocking risk there.
+	// It carries low-latency control messages: MsgHeartbeat, MsgHeartbeatResp,
+	// MsgVote, MsgVoteResp, MsgPreVote, MsgPreVoteResp, MsgReadIndex,
+	// MsgReadIndexResp, and MsgTimeoutNow. MsgAppResp is intentionally kept in
+	// the normal channel: followers — the only senders of MsgAppResp — do not
+	// send MsgApp, so there is no head-of-line blocking risk there.
 	defaultHeartbeatBufPerPeer = 64
 	defaultSnapshotEvery       = 10_000
 	defaultSnapshotQueueSize   = 1
@@ -2060,6 +2061,7 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 // runDispatchWorker while preserving heartbeat priority.
 func (e *Engine) runMultiplexDispatchWorker(ctx context.Context, pd *peerQueues) {
 	defer e.dispatchWG.Done()
+	defer e.drainPendingRequests(pd)
 	for {
 		drained, stop := e.drainPriorityChannel(ctx, pd)
 		if stop {
@@ -2105,6 +2107,30 @@ func (e *Engine) waitForChannel(ctx context.Context, pd *peerQueues) (stop bool)
 	case req, ok := <-pd.normal:
 		return e.handleChannelReq(ctx, req, ok)
 	}
+}
+
+// drainPendingRequests closes all messages remaining in pd's channels.
+// Called as a deferred step when the multiplexing worker exits so that any
+// buffered dispatchRequests are properly released regardless of why the
+// worker stopped.
+func (e *Engine) drainPendingRequests(pd *peerQueues) {
+	drainCh := func(ch <-chan dispatchRequest) {
+		for {
+			select {
+			case req, ok := <-ch:
+				if !ok {
+					return
+				}
+				if err := req.Close(); err != nil {
+					slog.Error("etcd raft dispatch: failed to close pending request", "err", err)
+				}
+			default:
+				return
+			}
+		}
+	}
+	drainCh(pd.heartbeat)
+	drainCh(pd.normal)
 }
 
 // handleChannelReq processes one dequeued dispatch request.
