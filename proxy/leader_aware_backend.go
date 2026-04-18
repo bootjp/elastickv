@@ -24,6 +24,14 @@ const (
 
 	raftLeaderRedisField = "raft_leader_redis:"
 	infoReplicationArg   = "replication"
+
+	// maxLeaderAwareClients caps the number of cached redis.Client pools so
+	// that a long-running process cannot accumulate pools indefinitely as
+	// leaders churn (e.g. rolling restarts changing addresses). This is well
+	// above a realistic Raft cluster size; when the cap is reached we evict
+	// the oldest non-protected entry (FIFO, skipping seeds and the current
+	// leader) before inserting a new one.
+	maxLeaderAwareClients = 16
 )
 
 // ErrNoLeaderBackend is returned when LeaderAwareRedisBackend has no usable
@@ -45,10 +53,12 @@ type LeaderAwareRedisBackend struct {
 
 	logger *slog.Logger
 
-	mu      sync.RWMutex
-	clients map[string]*redis.Client
-	leader  string
-	closed  bool
+	mu           sync.RWMutex
+	clients      map[string]*redis.Client
+	clientOrder  []string // FIFO insertion order for bounded eviction
+	leader       string
+	closed       bool
+	seedProtect  map[string]struct{}
 
 	stopCh    chan struct{}
 	done      chan struct{}
@@ -72,6 +82,10 @@ func NewLeaderAwareRedisBackendWithInterval(seeds []string, name string, opts Ba
 	if logger == nil {
 		logger = slog.Default()
 	}
+	seedProtect := make(map[string]struct{}, len(normalized))
+	for _, s := range normalized {
+		seedProtect[s] = struct{}{}
+	}
 	b := &LeaderAwareRedisBackend{
 		name:            name,
 		opts:            opts,
@@ -80,6 +94,8 @@ func NewLeaderAwareRedisBackendWithInterval(seeds []string, name string, opts Ba
 		refreshTimeout:  refreshTimeout,
 		logger:          logger,
 		clients:         make(map[string]*redis.Client, len(normalized)),
+		clientOrder:     make([]string, 0, len(normalized)),
+		seedProtect:     seedProtect,
 		leader:          normalized[0],
 		stopCh:          make(chan struct{}),
 		done:            make(chan struct{}),
@@ -275,6 +291,15 @@ func (b *LeaderAwareRedisBackend) ensureClientLocked(addr string) *redis.Client 
 	if b.closed {
 		return nil
 	}
+	// Evict the oldest non-protected client (FIFO, skipping seeds and the
+	// current leader) so long-running leader churn cannot leak pools.
+	if len(b.clients) >= maxLeaderAwareClients {
+		if !b.evictOneLocked() {
+			b.logger.Warn("leader-aware client cache at cap with no evictable entries",
+				"backend", b.name, "cap", maxLeaderAwareClients, "rejected", addr)
+			return nil
+		}
+	}
 	cli := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		DB:           b.opts.DB,
@@ -286,7 +311,33 @@ func (b *LeaderAwareRedisBackend) ensureClientLocked(addr string) *redis.Client 
 		WriteTimeout: b.opts.WriteTimeout,
 	})
 	b.clients[addr] = cli
+	b.clientOrder = append(b.clientOrder, addr)
 	return cli
+}
+
+// evictOneLocked removes the oldest client that is neither a seed nor the
+// current leader and closes its pool. Returns true when an entry was evicted.
+// Must be called with b.mu held for writing.
+func (b *LeaderAwareRedisBackend) evictOneLocked() bool {
+	for i, addr := range b.clientOrder {
+		if _, protected := b.seedProtect[addr]; protected {
+			continue
+		}
+		if addr == b.leader {
+			continue
+		}
+		cli := b.clients[addr]
+		delete(b.clients, addr)
+		b.clientOrder = append(b.clientOrder[:i], b.clientOrder[i+1:]...)
+		if cli != nil {
+			if err := cli.Close(); err != nil {
+				b.logger.Warn("close evicted leader-aware client failed",
+					"backend", b.name, "addr", addr, "err", err)
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // currentClient returns the client for the current leader. The whole
@@ -386,6 +437,7 @@ func (b *LeaderAwareRedisBackend) Close() error {
 		snapshot[addr] = cli
 	}
 	b.clients = map[string]*redis.Client{}
+	b.clientOrder = b.clientOrder[:0]
 	b.mu.Unlock()
 
 	var firstErr error

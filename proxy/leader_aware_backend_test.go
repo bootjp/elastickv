@@ -66,13 +66,12 @@ type fakeElasticKVNode struct {
 	infoCalls  atomic.Int64
 }
 
-func newFakeElasticKVNode(t *testing.T, leader string) *fakeElasticKVNode {
+func newFakeElasticKVNode(t *testing.T) *fakeElasticKVNode {
 	t.Helper()
 	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	n := &fakeElasticKVNode{ln: ln, addr: ln.Addr().String()}
-	n.SetLeader(leader)
 	go n.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return n
@@ -171,8 +170,8 @@ func readRESPArray(rd *bufio.Reader) ([]string, error) {
 }
 
 func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
-	nodeA := newFakeElasticKVNode(t, "")
-	nodeB := newFakeElasticKVNode(t, "")
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
 
 	// Start: A is leader; both nodes advertise A as the leader.
 	nodeA.SetLeader(nodeA.addr)
@@ -220,7 +219,7 @@ func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {
 	// currentClient and ensureClientLocked hold the lock consistently with
 	// the closed flag, and Close snapshots the client map before iterating.
 	// Run under `go test -race` to exercise the fix.
-	leader := newFakeElasticKVNode(t, "")
+	leader := newFakeElasticKVNode(t)
 	leader.SetLeader(leader.addr)
 
 	backend := NewLeaderAwareRedisBackendWithInterval(
@@ -262,9 +261,52 @@ func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+// clientAddrs returns the set of addresses for which this backend currently
+// caches a *redis.Client. Exposed for tests; safe to call at any time.
+func (b *LeaderAwareRedisBackend) clientAddrs() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]string, 0, len(b.clients))
+	for addr := range b.clients {
+		out = append(out, addr)
+	}
+	return out
+}
+
+func TestLeaderAwareRedisBackend_EvictsOldestNonProtectedClient(t *testing.T) {
+	// Simulate leader churn by forcing many leader addresses through setLeader.
+	// The cached client map must stay bounded at maxLeaderAwareClients and the
+	// seed must never be evicted.
+	seed := newFakeElasticKVNode(t)
+	seed.SetLeader(seed.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{seed.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, time.Second, // disable auto-refresh; we drive setLeader manually
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Len(t, backend.clientAddrs(), 1, "seed client must be pre-created")
+
+	// Churn through many synthetic addresses. Since auto-refresh is effectively
+	// disabled, none of these addresses will ever be probed — we only care
+	// that the client cache stays bounded.
+	for i := 0; i < maxLeaderAwareClients*2; i++ {
+		backend.setLeader(fmt.Sprintf("10.0.0.%d:6379", i+2))
+	}
+
+	addrs := backend.clientAddrs()
+	assert.LessOrEqual(t, len(addrs), maxLeaderAwareClients,
+		"bounded client cache must not exceed maxLeaderAwareClients")
+	assert.Contains(t, addrs, seed.addr, "seed must never be evicted")
+}
+
 func TestLeaderAwareRedisBackend_FallsBackToSeedOnProbeFailure(t *testing.T) {
 	// Seed 1 is unreachable; seed 2 is alive and reports itself as leader.
-	aliveLeader := newFakeElasticKVNode(t, "")
+	aliveLeader := newFakeElasticKVNode(t)
 	aliveLeader.SetLeader(aliveLeader.addr)
 
 	backend := NewLeaderAwareRedisBackendWithInterval(
