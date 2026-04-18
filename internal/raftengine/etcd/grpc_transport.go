@@ -77,8 +77,12 @@ type GRPCTransport struct {
 	bridgeSem chan struct{}
 
 	// streamsMu protects streams and noStream.
-	// Lock ordering: always acquire streamsMu before t.mu (never the reverse).
-	streamsMu sync.Mutex
+	// Invariant: never hold streamsMu and t.mu simultaneously. All paths that
+	// need both release the first before acquiring the second:
+	//   getOrOpenStream: releases streamsMu before calling clientFor (t.mu), then re-acquires streamsMu.
+	//   UpsertPeer/RemovePeer: release t.mu before calling closeStream/clearNoStream (streamsMu).
+	// Using RWMutex so concurrent reads on the hot dispatch path do not contend.
+	streamsMu sync.RWMutex
 	// streams holds one long-lived SendStream RPC per peer node ID.
 	// Each entry is owned by the single per-peer multiplexing dispatch goroutine.
 	streams map[uint64]*peerStream
@@ -171,21 +175,18 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 	if t == nil || peer.NodeID == 0 {
 		return
 	}
-	addressChanged := false
 	t.mu.Lock()
+	var closedNodeIDs []uint64
 	if existing, ok := t.peers[peer.NodeID]; ok && existing.Address != "" && existing.Address != peer.Address {
-		t.closePeerConnLocked(existing.Address)
-		addressChanged = true
+		closedNodeIDs = t.closePeerConnLocked(existing.Address)
 	}
 	t.peers[peer.NodeID] = peer
 	t.mu.Unlock()
 
-	// Clear stream state outside mu to avoid lock-order inversion
-	// (getOrOpenStream acquires streamsMu then mu; callers of UpsertPeer must
-	// not hold streamsMu when calling here).
-	if addressChanged {
-		t.closeStream(peer.NodeID)
-		t.clearNoStream(peer.NodeID)
+	// Clear stream state outside mu (never hold streamsMu and t.mu simultaneously).
+	for _, id := range closedNodeIDs {
+		t.closeStream(id)
+		t.clearNoStream(id)
 	}
 }
 
@@ -193,20 +194,18 @@ func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 	if t == nil || nodeID == 0 {
 		return
 	}
-	removed := false
 	t.mu.Lock()
-	peer, ok := t.peers[nodeID]
-	if ok {
+	var closedNodeIDs []uint64
+	if peer, ok := t.peers[nodeID]; ok {
 		delete(t.peers, nodeID)
-		t.closePeerConnLocked(peer.Address)
-		removed = true
+		closedNodeIDs = t.closePeerConnLocked(peer.Address)
 	}
 	t.mu.Unlock()
 
-	// Tear down the stream outside mu to avoid lock-order inversion.
-	if removed {
-		t.closeStream(nodeID)
-		t.clearNoStream(nodeID)
+	// Tear down stream state outside mu (never hold streamsMu and t.mu simultaneously).
+	for _, id := range closedNodeIDs {
+		t.closeStream(id)
+		t.clearNoStream(id)
 	}
 }
 
@@ -230,20 +229,32 @@ func (t *GRPCTransport) Close() error {
 	return errors.WithStack(err)
 }
 
-func (t *GRPCTransport) closePeerConnLocked(address string) {
+// closePeerConnLocked closes the gRPC connection for address and returns the
+// node IDs that were using it. Callers should clear stream/noStream state for
+// those IDs after releasing t.mu, so the next dispatch re-probes streaming
+// support (e.g. after a peer upgrade at the same address).
+// Caller must hold t.mu.
+func (t *GRPCTransport) closePeerConnLocked(address string) []uint64 {
 	if address == "" {
-		return
+		return nil
+	}
+	var nodeIDs []uint64
+	for id, peer := range t.peers {
+		if peer.Address == address {
+			nodeIDs = append(nodeIDs, id)
+		}
 	}
 	conn, ok := t.conns[address]
 	if !ok {
 		delete(t.clients, address)
-		return
+		return nodeIDs
 	}
 	delete(t.conns, address)
 	delete(t.clients, address)
 	if err := conn.Close(); err != nil {
 		slog.Warn("failed to close etcd raft peer connection", "address", address, "error", err)
 	}
+	return nodeIDs
 }
 
 func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error {
@@ -364,6 +375,10 @@ func (t *GRPCTransport) applyBridgeMode(ctx context.Context, msg raftpb.Message)
 }
 
 func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	raw, err := msg.Marshal()
 	if err != nil {
 		return errors.WithStack(err)
@@ -437,6 +452,8 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 // SendStream is the server-side handler for the client-streaming SendStream RPC.
 // The client sends a sequence of Raft messages over one long-lived stream;
 // this handler processes each one and closes with a single EtcdRaftAck.
+// Transient backpressure (errStepQueueFull) is logged and skipped rather than
+// tearing down the stream — identical to how the unary Send handler behaves.
 func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 	for {
 		req, err := stream.Recv()
@@ -451,6 +468,14 @@ func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 			return errors.WithStack(err)
 		}
 		if err := t.handle(stream.Context(), msg); err != nil {
+			if errors.Is(err, errStepQueueFull) {
+				slog.Warn("etcd raft SendStream: step queue full, dropping message",
+					"type", msg.Type.String(),
+					"from", msg.From,
+					"to", msg.To,
+				)
+				continue
+			}
 			return err
 		}
 	}
@@ -782,10 +807,10 @@ func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.
 // calls clientFor (which may acquire t.mu) only after releasing streamsMu.
 func (t *GRPCTransport) getOrOpenStream(nodeID uint64) (pb.EtcdRaft_SendStreamClient, error) {
 	// Fast path: stream already open or peer known to be unary-only.
-	t.streamsMu.Lock()
+	t.streamsMu.RLock()
 	_, skip := t.noStream[nodeID]
 	ps, ok := t.streams[nodeID]
-	t.streamsMu.Unlock()
+	t.streamsMu.RUnlock()
 
 	if skip {
 		return nil, errStreamNotSupported
