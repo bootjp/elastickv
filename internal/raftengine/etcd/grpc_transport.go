@@ -838,27 +838,46 @@ func (t *GRPCTransport) getOrOpenStream(ctx context.Context, nodeID uint64) (pb.
 		return nil, err
 	}
 
-	// Re-acquire streamsMu to install the stream atomically.
+	// Double-check under write lock before making the network call.
+	// Another goroutine may have installed a stream while we dialled.
 	t.streamsMu.Lock()
-	defer t.streamsMu.Unlock()
-
-	// Re-check: another goroutine or closeStream may have raced.
 	if _, skip = t.noStream[nodeID]; skip {
+		t.streamsMu.Unlock()
 		return nil, errStreamNotSupported
 	}
 	if ps, ok = t.streams[nodeID]; ok {
+		t.streamsMu.Unlock()
 		return ps.stream, nil
 	}
+	t.streamsMu.Unlock()
 
+	// Open the stream outside any lock: SendStream is a network operation that
+	// can block during TLS handshake or connect, and holding streamsMu would
+	// stall all concurrent reads on the dispatch hot path.
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := client.SendStream(streamCtx)
 	if err != nil {
 		cancel()
 		if status.Code(err) == codes.Unimplemented {
+			t.streamsMu.Lock()
 			t.noStream[nodeID] = struct{}{}
+			t.streamsMu.Unlock()
 			return nil, errStreamNotSupported
 		}
 		return nil, errors.WithStack(err)
+	}
+
+	// Install under the lock. Another goroutine may have raced and already
+	// opened a stream while we were connecting; prefer the existing one.
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+	if _, skip = t.noStream[nodeID]; skip {
+		cancel()
+		return nil, errStreamNotSupported
+	}
+	if ps, ok = t.streams[nodeID]; ok {
+		cancel()
+		return ps.stream, nil
 	}
 	t.streams[nodeID] = &peerStream{stream: stream, cancel: cancel}
 	return stream, nil
