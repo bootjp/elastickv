@@ -433,9 +433,9 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	// flow control, but Raft bounds in-flight messages via MaxInflightMsg, so
 	// the send buffer will not saturate during steady-state operation.
 	// The stream context is derived from ctx and is cancelled on engine
-	// shutdown, unblocking any in-progress Send. Note: gRPC keepalive is not
-	// configured here; stalled TCP connections rely on the OS-level TCP
-	// keepalive (typically ~2 h) unless the caller configures grpc.WithKeepalive.
+	// shutdown, unblocking any in-progress Send. Stalled TCP connections are
+	// detected within ~13 s by the gRPC keepalive configured in GRPCDialOptions
+	// (10 s ping interval + 3 s timeout).
 	if err := stream.Send(&pb.EtcdRaftMessage{Message: raw}); err != nil {
 		t.closeStream(msg.To)
 		return errors.WithStack(err)
