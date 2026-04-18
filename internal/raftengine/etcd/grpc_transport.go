@@ -179,8 +179,10 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 	var (
 		closedNodeIDs []uint64
 		oldConn       *grpc.ClientConn
+		oldAddress    string
 	)
 	if existing, ok := t.peers[peer.NodeID]; ok && existing.Address != "" && existing.Address != peer.Address {
+		oldAddress = existing.Address
 		closedNodeIDs, oldConn = t.closePeerConnLocked(existing.Address)
 	}
 	t.peers[peer.NodeID] = peer
@@ -190,7 +192,7 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 	// that can block; holding t.mu during it would stall concurrent callers.
 	if oldConn != nil {
 		if err := oldConn.Close(); err != nil {
-			slog.Warn("failed to close etcd raft peer connection", "address", peer.Address, "error", err)
+			slog.Warn("failed to close etcd raft peer connection", "address", oldAddress, "error", err)
 		}
 	}
 	// Clear stream state outside mu (never hold streamsMu and t.mu simultaneously).
@@ -213,8 +215,10 @@ func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 	var (
 		closedNodeIDs []uint64
 		oldConn       *grpc.ClientConn
+		oldAddress    string
 	)
 	if peer, ok := t.peers[nodeID]; ok {
+		oldAddress = peer.Address
 		// Collect affected nodeIDs before deleting: closePeerConnLocked iterates
 		// t.peers to find all nodes using the address, so nodeID must still be
 		// present at this point or it won't be included in the cleanup list.
@@ -227,7 +231,7 @@ func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 	// that can block; holding t.mu during it would stall concurrent callers.
 	if oldConn != nil {
 		if err := oldConn.Close(); err != nil {
-			slog.Warn("failed to close etcd raft peer connection", "address", "", "error", err)
+			slog.Warn("failed to close etcd raft peer connection", "address", oldAddress, "error", err)
 		}
 	}
 	// Tear down stream state outside mu (never hold streamsMu and t.mu simultaneously).
@@ -912,6 +916,9 @@ func (t *GRPCTransport) closeStream(nodeID uint64) {
 	}
 	t.streamsMu.Unlock()
 	if ok {
+		// CloseSend signals EOF to the server before cancelling the context so
+		// the server's Recv loop sees io.EOF rather than a context-cancelled error.
+		_ = ps.stream.CloseSend()
 		ps.cancel()
 	}
 }

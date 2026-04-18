@@ -2119,6 +2119,12 @@ func (e *Engine) waitForChannel(ctx context.Context, pd *peerQueues) (stop bool)
 // Called as a deferred step when the multiplexing worker exits so that any
 // buffered dispatchRequests are properly released regardless of why the
 // worker stopped.
+//
+// The non-blocking select (default branch) is safe here: the multiplexing
+// worker is the only consumer of pd's channels, and its goroutine has already
+// exited (or is about to via defer) before this runs. The engine's event loop
+// — the only producer — stops enqueuing to these channels before it waits for
+// the worker to finish, so no new items will appear after the drain starts.
 func (e *Engine) drainPendingRequests(pd *peerQueues) {
 	drainCh := func(ch <-chan dispatchRequest) {
 		for {

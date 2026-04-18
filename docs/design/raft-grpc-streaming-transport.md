@@ -21,10 +21,13 @@ messages per follower before receiving ACK. A single dispatch worker serialises
 those 256 sends: at 1 ms RTT, throughput is capped at ~1 000 msg/s per peer
 regardless of bandwidth.
 
-PR #522 introduced per-peer dispatch channels with a single multiplexing dispatch
-goroutine per peer (biased-select: heartbeat priority over normal messages) to
-eliminate cross-peer head-of-line blocking. The remaining bottleneck is the
-per-message RTT of unary gRPC.
+PR #522 introduced per-peer dispatch channels with **two** dispatch goroutines
+per peer (one for normal messages, one for heartbeats) to eliminate cross-peer
+head-of-line blocking. This PR replaces those two workers with a **single
+multiplexing dispatch goroutine** per peer (biased-select: heartbeat priority
+over normal messages) — a prerequisite for the streaming transport, since gRPC
+requires a single writer per stream. The remaining bottleneck addressed here is
+the per-message RTT of unary gRPC.
 
 ### Goal
 
