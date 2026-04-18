@@ -376,6 +376,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
+	e.transport.SetBlockingHandler(e.handleTransportMessageBlocking)
 	e.startDispatchWorkers()
 }
 
@@ -1971,6 +1972,30 @@ func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message)
 		return e.currentErrorOrClosed()
 	case <-e.startedCh:
 		return e.enqueueStep(ctx, msg)
+	}
+}
+
+// handleTransportMessageBlocking is like handleTransportMessage but blocks
+// until stepCh has space rather than returning errStepQueueFull. Used by the
+// streaming transport's SendStream handler so that a full step queue applies
+// backpressure through gRPC HTTP/2 flow control to the sender, instead of
+// silently dropping messages (which stalls leader commit progress on MsgAppResp
+// drops and causes unnecessary Raft retransmissions).
+func (e *Engine) handleTransportMessageBlocking(ctx context.Context, msg raftpb.Message) error {
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return e.currentErrorOrClosed()
+	case <-e.startedCh:
+		select {
+		case <-ctx.Done():
+			return errors.WithStack(ctx.Err())
+		case <-e.doneCh:
+			return e.currentErrorOrClosed()
+		case e.stepCh <- msg:
+			return nil
+		}
 	}
 }
 

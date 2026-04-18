@@ -65,7 +65,11 @@ type GRPCTransport struct {
 	peers             map[uint64]Peer
 	clients           map[string]pb.EtcdRaftClient
 	conns             map[string]*grpc.ClientConn
-	handler           MessageHandler
+	handler         MessageHandler
+	// blockingHandler is like handler but blocks when the step queue is full
+	// instead of returning errStepQueueFull. Used by SendStream to propagate
+	// backpressure through gRPC flow control rather than dropping messages.
+	blockingHandler MessageHandler
 	snapshotChunkSize int
 	spoolDir          string
 	fsmSnapDir        string
@@ -135,6 +139,15 @@ func (t *GRPCTransport) SetHandler(handler MessageHandler) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.handler = handler
+}
+
+func (t *GRPCTransport) SetBlockingHandler(handler MessageHandler) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.blockingHandler = handler
 }
 
 func (t *GRPCTransport) SetSpoolDir(dir string) {
@@ -496,9 +509,11 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 // SendStream is the server-side handler for the client-streaming SendStream RPC.
 // The client sends a sequence of Raft messages over one long-lived stream;
 // this handler processes each one and closes with a single EtcdRaftAck.
-// Transient backpressure (errStepQueueFull) is logged and the message is
-// dropped so the stream stays alive; the sender's Raft layer retransmits.
-// Other handler errors close the stream; Raft retransmits on reconnect.
+// When the step queue is full, handleBlocking waits for space rather than
+// dropping the message. This propagates backpressure through gRPC HTTP/2 flow
+// control to the sender, preventing MsgAppResp drops that would stall leader
+// commit progress. Other handler errors close the stream; Raft retransmits on
+// reconnect.
 func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 	for {
 		req, err := stream.Recv()
@@ -516,15 +531,7 @@ func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 		if err := msg.Unmarshal(req.Message); err != nil {
 			return errors.WithStack(err)
 		}
-		if err := t.handle(stream.Context(), msg); err != nil {
-			if errors.Is(err, errStepQueueFull) {
-				slog.Warn("etcd raft SendStream: step queue full, dropping message",
-					"type", msg.Type.String(),
-					"from", msg.From,
-					"to", msg.To,
-				)
-				continue
-			}
+		if err := t.handleBlocking(stream.Context(), msg); err != nil {
 			return err
 		}
 	}
@@ -794,6 +801,19 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 		return errors.WithStack(errTransportHandlerNil)
 	}
 	return errors.WithStack(handler(ctx, msg))
+}
+
+// handleBlocking enqueues a message using the blocking handler (if set), falling
+// back to the regular handler. The blocking handler waits for stepCh space rather
+// than returning errStepQueueFull, propagating backpressure to the caller.
+func (t *GRPCTransport) handleBlocking(ctx context.Context, msg raftpb.Message) error {
+	t.mu.RLock()
+	h := t.blockingHandler
+	t.mu.RUnlock()
+	if h != nil {
+		return errors.WithStack(h(ctx, msg))
+	}
+	return t.handle(ctx, msg)
 }
 
 func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
