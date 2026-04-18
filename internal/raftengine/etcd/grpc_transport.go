@@ -14,6 +14,8 @@ import (
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const defaultSnapshotChunkSize = 16 << 20
@@ -33,7 +35,19 @@ var (
 	errSnapshotMetadataDuplicate = errors.New("etcd raft snapshot metadata was sent more than once")
 	errSnapshotMessageNil        = errors.New("etcd raft snapshot message is required")
 	errSnapshotStreamShort       = errors.New("etcd raft snapshot stream closed before final chunk")
+	// errStreamNotSupported is returned by getOrOpenStream when the remote peer
+	// responded with codes.Unimplemented on a previous SendStream attempt.
+	// dispatchRegular falls back to the unary Send path on this error.
+	errStreamNotSupported = errors.New("etcd raft peer does not support SendStream")
 )
+
+// peerStream holds a long-lived client-streaming gRPC stream to one peer.
+// cancel tears down the stream context; the transport deletes the entry on
+// any Send error and re-opens on the next dispatch attempt.
+type peerStream struct {
+	stream pb.EtcdRaft_SendStreamClient
+	cancel context.CancelFunc
+}
 
 var grpcNewClient = grpc.NewClient
 
@@ -61,6 +75,16 @@ type GRPCTransport struct {
 	// that aggregate in-memory allocation stays bounded even when multiple
 	// dispatch workers run simultaneously.
 	bridgeSem chan struct{}
+
+	// streamsMu protects streams and noStream.
+	// Lock ordering: always acquire streamsMu before t.mu (never the reverse).
+	streamsMu sync.Mutex
+	// streams holds one long-lived SendStream RPC per peer node ID.
+	// Each entry is owned by the single per-peer multiplexing dispatch goroutine.
+	streams map[uint64]*peerStream
+	// noStream records peers that returned codes.Unimplemented on SendStream;
+	// dispatchRegular falls back to unary Send for those peers.
+	noStream map[uint64]struct{}
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -83,6 +107,8 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		conns:             make(map[string]*grpc.ClientConn),
 		snapshotChunkSize: defaultSnapshotChunkSize,
 		bridgeSem:         make(chan struct{}, defaultBridgeMaterializeLimit),
+		streams:           make(map[uint64]*peerStream),
+		noStream:          make(map[uint64]struct{}),
 	}
 }
 
@@ -145,34 +171,53 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 	if t == nil || peer.NodeID == 0 {
 		return
 	}
+	addressChanged := false
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if existing, ok := t.peers[peer.NodeID]; ok && existing.Address != "" && existing.Address != peer.Address {
 		t.closePeerConnLocked(existing.Address)
+		addressChanged = true
 	}
 	t.peers[peer.NodeID] = peer
+	t.mu.Unlock()
+
+	// Clear stream state outside mu to avoid lock-order inversion
+	// (getOrOpenStream acquires streamsMu then mu; callers of UpsertPeer must
+	// not hold streamsMu when calling here).
+	if addressChanged {
+		t.closeStream(peer.NodeID)
+		t.clearNoStream(peer.NodeID)
+	}
 }
 
 func (t *GRPCTransport) RemovePeer(nodeID uint64) {
 	if t == nil || nodeID == 0 {
 		return
 	}
+	removed := false
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	peer, ok := t.peers[nodeID]
-	if !ok {
-		return
+	if ok {
+		delete(t.peers, nodeID)
+		t.closePeerConnLocked(peer.Address)
+		removed = true
 	}
-	delete(t.peers, nodeID)
-	t.closePeerConnLocked(peer.Address)
+	t.mu.Unlock()
+
+	// Tear down the stream outside mu to avoid lock-order inversion.
+	if removed {
+		t.closeStream(nodeID)
+		t.clearNoStream(nodeID)
+	}
 }
 
 func (t *GRPCTransport) Close() error {
 	if t == nil {
 		return nil
 	}
+	// Cancel all streams before closing connections so in-flight Send calls
+	// fail cleanly rather than blocking on a half-closed TCP connection.
+	t.closeAllStreams()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -319,14 +364,32 @@ func (t *GRPCTransport) applyBridgeMode(ctx context.Context, msg raftpb.Message)
 }
 
 func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message) error {
-	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
-	defer cancel()
-
 	raw, err := msg.Marshal()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	client, err := t.clientFor(msg.To)
+
+	stream, err := t.getOrOpenStream(msg.To)
+	if err != nil {
+		if errors.Is(err, errStreamNotSupported) {
+			return t.dispatchUnary(ctx, raw, msg.To)
+		}
+		return err
+	}
+
+	if err := stream.Send(&pb.EtcdRaftMessage{Message: raw}); err != nil {
+		t.closeStream(msg.To)
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// dispatchUnary sends a single Raft message via the legacy unary Send RPC.
+// Used as a fallback when the remote peer does not support SendStream.
+func (t *GRPCTransport) dispatchUnary(ctx context.Context, raw []byte, to uint64) error {
+	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
+	defer cancel()
+	client, err := t.clientFor(to)
 	if err != nil {
 		return err
 	}
@@ -369,6 +432,28 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 		return nil, err
 	}
 	return &pb.EtcdRaftAck{}, nil
+}
+
+// SendStream is the server-side handler for the client-streaming SendStream RPC.
+// The client sends a sequence of Raft messages over one long-lived stream;
+// this handler processes each one and closes with a single EtcdRaftAck.
+func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
+			}
+			return errors.WithStack(err)
+		}
+		var msg raftpb.Message
+		if err := msg.Unmarshal(req.Message); err != nil {
+			return errors.WithStack(err)
+		}
+		if err := t.handle(stream.Context(), msg); err != nil {
+			return err
+		}
+	}
 }
 
 func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) error {
@@ -687,6 +772,95 @@ func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.
 		}
 	}
 	return seenMetadata, nil
+}
+
+// getOrOpenStream returns the live SendStream to nodeID, opening one if
+// necessary. Returns errStreamNotSupported if the peer previously returned
+// codes.Unimplemented; callers should fall back to the unary Send path.
+//
+// Lock ordering: this method acquires streamsMu without holding t.mu; it
+// calls clientFor (which may acquire t.mu) only after releasing streamsMu.
+func (t *GRPCTransport) getOrOpenStream(nodeID uint64) (pb.EtcdRaft_SendStreamClient, error) {
+	// Fast path: stream already open or peer known to be unary-only.
+	t.streamsMu.Lock()
+	_, skip := t.noStream[nodeID]
+	ps, ok := t.streams[nodeID]
+	t.streamsMu.Unlock()
+
+	if skip {
+		return nil, errStreamNotSupported
+	}
+	if ok {
+		return ps.stream, nil
+	}
+
+	// Need a new stream. Dial without holding streamsMu to avoid lock-order
+	// inversion with t.mu (clientFor acquires t.mu internally).
+	client, err := t.clientFor(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Re-acquire streamsMu to install the stream atomically.
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+
+	// Re-check: another goroutine or closeStream may have raced.
+	if _, skip = t.noStream[nodeID]; skip {
+		return nil, errStreamNotSupported
+	}
+	if ps, ok = t.streams[nodeID]; ok {
+		return ps.stream, nil
+	}
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream, err := client.SendStream(streamCtx)
+	if err != nil {
+		cancel()
+		if status.Code(err) == codes.Unimplemented {
+			t.noStream[nodeID] = struct{}{}
+			return nil, errStreamNotSupported
+		}
+		return nil, errors.WithStack(err)
+	}
+	t.streams[nodeID] = &peerStream{stream: stream, cancel: cancel}
+	return stream, nil
+}
+
+// closeStream tears down the SendStream for nodeID. Safe to call with no
+// stream open. The caller must not hold streamsMu.
+func (t *GRPCTransport) closeStream(nodeID uint64) {
+	t.streamsMu.Lock()
+	ps, ok := t.streams[nodeID]
+	if ok {
+		delete(t.streams, nodeID)
+	}
+	t.streamsMu.Unlock()
+	if ok {
+		ps.cancel()
+	}
+}
+
+// clearNoStream removes nodeID from the noStream set so that the next
+// dispatch attempt will probe for SendStream support again (e.g. after an
+// upgrade that adds streaming to a previously unary-only peer).
+func (t *GRPCTransport) clearNoStream(nodeID uint64) {
+	t.streamsMu.Lock()
+	delete(t.noStream, nodeID)
+	t.streamsMu.Unlock()
+}
+
+// closeAllStreams cancels every open stream and resets the streams/noStream
+// maps. Called by Close before tearing down the underlying connections.
+func (t *GRPCTransport) closeAllStreams() {
+	t.streamsMu.Lock()
+	old := t.streams
+	t.streams = make(map[uint64]*peerStream)
+	t.noStream = make(map[uint64]struct{})
+	t.streamsMu.Unlock()
+	for _, ps := range old {
+		ps.cancel()
+	}
 }
 
 func buildSnapshotMessage(metadata raftpb.Message, spool *snapshotSpool, seenMetadata bool) (raftpb.Message, error) {

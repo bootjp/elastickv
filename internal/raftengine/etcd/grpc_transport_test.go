@@ -16,7 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
@@ -355,6 +357,10 @@ type testEtcdRaftClient struct {
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
 	return &pb.EtcdRaftAck{}, nil
+}
+
+func (c *testEtcdRaftClient) SendStream(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
+	return nil, status.Error(codes.Unimplemented, "SendStream not implemented in test mock")
 }
 
 func (c *testEtcdRaftClient) SendSnapshot(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendSnapshotClient, error) {

@@ -2019,11 +2019,8 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 		cancel:    cancel,
 	}
 	e.peerDispatchers[nodeID] = pd
-	workers := []chan dispatchRequest{pd.normal, pd.heartbeat}
-	e.dispatchWG.Add(len(workers))
-	for _, w := range workers {
-		go e.runDispatchWorker(ctx, w)
-	}
+	e.dispatchWG.Add(1)
+	go e.runMultiplexDispatchWorker(ctx, pd)
 }
 
 // runDispatchWorker drains ch until the channel is closed, the engine stops,
@@ -2051,6 +2048,79 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 			e.handleDispatchRequest(ctx, req)
 		}
 	}
+}
+
+// runMultiplexDispatchWorker is the single per-peer goroutine that reads from
+// both pd.heartbeat and pd.normal with a biased select: it drains the
+// heartbeat channel completely before waiting on the normal channel, bounding
+// heartbeat delay to one normal-message send time.
+//
+// A single writer goroutine per peer is required because gRPC stream.Send is
+// not goroutine-safe. The biased-select replaces the two-goroutine model from
+// runDispatchWorker while preserving heartbeat priority.
+func (e *Engine) runMultiplexDispatchWorker(ctx context.Context, pd *peerQueues) {
+	defer e.dispatchWG.Done()
+	for {
+		drained, stop := e.drainPriorityChannel(ctx, pd)
+		if stop {
+			return
+		}
+		if drained {
+			continue // re-check priority before waiting
+		}
+		if e.waitForChannel(ctx, pd) {
+			return
+		}
+	}
+}
+
+// drainPriorityChannel non-blockingly dequeues one heartbeat message.
+// Returns (true, false) when a message was processed (caller should loop),
+// (false, true) when the worker must stop, (false, false) when no message
+// was pending (caller should block on waitForChannel).
+func (e *Engine) drainPriorityChannel(ctx context.Context, pd *peerQueues) (drained bool, stop bool) {
+	select {
+	case <-e.dispatchStopCh:
+		return false, true
+	case <-ctx.Done():
+		return false, true
+	case req, ok := <-pd.heartbeat:
+		stop = e.handleChannelReq(ctx, req, ok)
+		return !stop, stop
+	default:
+		return false, false
+	}
+}
+
+// waitForChannel blocks until a message arrives on either channel or the
+// worker should stop. Returns true if the worker must exit.
+func (e *Engine) waitForChannel(ctx context.Context, pd *peerQueues) (stop bool) {
+	select {
+	case <-e.dispatchStopCh:
+		return true
+	case <-ctx.Done():
+		return true
+	case req, ok := <-pd.heartbeat:
+		return e.handleChannelReq(ctx, req, ok)
+	case req, ok := <-pd.normal:
+		return e.handleChannelReq(ctx, req, ok)
+	}
+}
+
+// handleChannelReq processes one dequeued dispatch request.
+// Returns true if the worker must stop (channel closed or context cancelled).
+func (e *Engine) handleChannelReq(ctx context.Context, req dispatchRequest, ok bool) (stop bool) {
+	if !ok {
+		return true
+	}
+	if ctx.Err() != nil {
+		if err := req.Close(); err != nil {
+			slog.Error("etcd raft dispatch: failed to close request", "err", err)
+		}
+		return true
+	}
+	e.handleDispatchRequest(ctx, req)
+	return false
 }
 
 func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest) {
