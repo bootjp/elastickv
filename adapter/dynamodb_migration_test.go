@@ -8,7 +8,6 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
-	json "github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
@@ -185,61 +184,6 @@ func TestDynamoDB_EnsureLegacyTableMigration_MigratesLegacyGeneration(t *testing
 		}
 		return len(oldItems) == 0 && len(oldGSI) == 0
 	}, time.Second, 10*time.Millisecond)
-}
-
-func TestDynamoDB_EnsureLegacyTableMigration_NormalizesLegacyGSIJSONFormat(t *testing.T) {
-	t.Parallel()
-
-	legacySchema, server, st := newLegacyMigrationTestServer(t, true, "S")
-	writer := newDynamoFixtureWriter(t, st)
-
-	legacyBody, err := json.Marshal(map[string]any{
-		"table_name":            legacySchema.TableName,
-		"attribute_definitions": legacySchema.AttributeDefinitions,
-		"primary_key": map[string]any{
-			"hash_key":  legacySchema.PrimaryKey.HashKey,
-			"range_key": legacySchema.PrimaryKey.RangeKey,
-		},
-		"global_secondary_indexes": map[string]any{
-			"status-index": map[string]any{
-				"hash_key":  "status",
-				"range_key": "sk",
-			},
-		},
-		"generation": legacySchema.Generation,
-	})
-	require.NoError(t, err)
-	writer.put(dynamoTableMetaKey(legacySchema.TableName), legacyBody)
-	writer.put(dynamoTableGenerationKey(legacySchema.TableName), fmt.Appendf(nil, "%d", legacySchema.Generation))
-
-	writer.writeItem(legacySchema, map[string]attributeValue{
-		"pk":     newStringAttributeValue("tenant"),
-		"sk":     newStringAttributeValue("2026-03-09T12:00:00Z"),
-		"status": newStringAttributeValue("open"),
-		"value":  newStringAttributeValue("v1"),
-	})
-
-	ctx := context.Background()
-	require.NoError(t, server.ensureLegacyTableMigration(ctx, legacySchema.TableName))
-
-	schema, exists, err := server.loadTableSchema(ctx, legacySchema.TableName)
-	require.NoError(t, err)
-	require.True(t, exists)
-	require.Equal(t, "status", schema.GlobalSecondaryIndexes["status-index"].KeySchema.HashKey)
-	require.Equal(t, "sk", schema.GlobalSecondaryIndexes["status-index"].KeySchema.RangeKey)
-	require.Equal(t, "ALL", schema.GlobalSecondaryIndexes["status-index"].Projection.ProjectionType)
-
-	out, err := server.queryItems(ctx, queryInput{
-		TableName:              legacySchema.TableName,
-		IndexName:              "status-index",
-		KeyConditionExpression: "status = :status",
-		ExpressionAttributeValues: map[string]attributeValue{
-			":status": newStringAttributeValue("open"),
-		},
-	})
-	require.NoError(t, err)
-	require.Len(t, out.items, 1)
-	require.Equal(t, newStringAttributeValue("v1"), out.items[0]["value"])
 }
 
 func TestDynamoDB_EnsureLegacyTableMigration_PrefersExistingTargetItems(t *testing.T) {

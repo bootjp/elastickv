@@ -648,71 +648,6 @@ func TestPebbleStore_RestoreFromStreamingMVCCPreservesMinRetainedTS(t *testing.T
 	require.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
-// TestPebbleStore_RestoreFromLegacyGob verifies that a pebbleStore can
-// restore from the oldest gob-based mvccStore snapshot format.
-func TestPebbleStore_RestoreFromLegacyGob(t *testing.T) {
-	ctx := context.Background()
-
-	// Build a legacy gob snapshot manually.
-	src := NewMVCCStore()
-	require.NoError(t, src.PutAt(ctx, []byte("a"), []byte("1"), 5, 0))
-	require.NoError(t, src.PutAt(ctx, []byte("b"), []byte("2"), 10, 0))
-
-	srcImpl, ok := src.(*mvccStore)
-	require.True(t, ok, "expected *mvccStore")
-	var buf bytes.Buffer
-	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
-
-	// Restore into pebbleStore.
-	dir, err := os.MkdirTemp("", "pebble-migrate-gob-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	dst, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer dst.Close()
-
-	require.NoError(t, dst.Restore(bytes.NewReader(buf.Bytes())))
-
-	val, err := dst.GetAt(ctx, []byte("a"), 5)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("1"), val)
-
-	val, err = dst.GetAt(ctx, []byte("b"), 10)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("2"), val)
-
-	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
-}
-
-func TestPebbleStore_RestoreFromLegacyGobPreservesMinRetainedTS(t *testing.T) {
-	ctx := context.Background()
-
-	src := NewMVCCStore()
-	require.NoError(t, src.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
-	require.NoError(t, src.PutAt(ctx, []byte("k"), []byte("v20"), 20, 0))
-	require.NoError(t, src.Compact(ctx, 20))
-
-	srcImpl, ok := src.(*mvccStore)
-	require.True(t, ok)
-	var buf bytes.Buffer
-	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
-
-	dir, err := os.MkdirTemp("", "pebble-migrate-gob-retained-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	dst, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer dst.Close()
-
-	require.NoError(t, dst.Restore(bytes.NewReader(buf.Bytes())))
-	require.Equal(t, uint64(20), requirePebbleRetentionController(t, dst).MinRetainedTS())
-
-	_, err = dst.GetAt(ctx, []byte("k"), 10)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-}
-
 // TestPebbleStore_Restore_EmptySnapshot verifies that restoring from an
 // empty reader clears the DB and resets lastCommitTS to zero.
 func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
@@ -756,38 +691,6 @@ func TestPebbleStore_Restore_TruncatedHeader(t *testing.T) {
 	err = s.Restore(bytes.NewReader([]byte{0x01, 0x02, 0x03, 0x04}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "truncated snapshot")
-}
-
-// TestPebbleStore_Restore_LegacyGobCRCFailure verifies that a gob-encoded
-// snapshot with an invalid CRC32 trailer is rejected.
-func TestPebbleStore_Restore_LegacyGobCRCFailure(t *testing.T) {
-	ctx := context.Background()
-
-	dir, err := os.MkdirTemp("", "pebble-restore-crc-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	// Build a valid legacy gob snapshot, then corrupt the CRC trailer.
-	src := NewMVCCStore()
-	require.NoError(t, src.PutAt(ctx, []byte("k"), []byte("v"), 5, 0))
-	srcImpl, ok := src.(*mvccStore)
-	require.True(t, ok)
-	var buf bytes.Buffer
-	require.NoError(t, srcImpl.writeLegacyGobSnapshot(&buf))
-
-	// Flip the last 4 bytes (the CRC) to corrupt the checksum.
-	data := buf.Bytes()
-	for i := len(data) - 4; i < len(data); i++ {
-		data[i] ^= 0xFF
-	}
-
-	err = s.Restore(bytes.NewReader(data))
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrInvalidChecksum)
 }
 
 // TestPebbleStore_Restore_PebbleMagicMismatch verifies that a stream

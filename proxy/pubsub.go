@@ -31,6 +31,8 @@ const (
 	cmdDiscard      = "DISCARD"
 	cmdPing         = "PING"
 	cmdQuit         = "QUIT"
+	cmdAuth         = "AUTH"
+	cmdSelect       = "SELECT"
 
 	// cleanupFwdTimeout bounds the wait for forwardMessages to exit during cleanup.
 	// If the client socket is stuck, we don't want to block indefinitely.
@@ -325,13 +327,13 @@ func (s *pubsubSession) handleTxnInSession(name string, args [][]byte) bool {
 // (not forwarded to a backend). Returns true if the command was handled.
 func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bool {
 	// AUTH is handled at the connection-pool level; accept silently.
-	if name == "AUTH" {
+	if name == cmdAuth {
 		s.writeString("OK")
 		return true
 	}
 	// Mirror ProxyServer's SELECT handling: accept only the configured DB to
 	// avoid per-connection DB state with pooled connections.
-	if name != "SELECT" {
+	if name != cmdSelect {
 		return false
 	}
 	// Enforce Redis arity: SELECT requires exactly one DB index argument.

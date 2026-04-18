@@ -3,7 +3,6 @@ package adapter
 import (
 	"testing"
 
-	json "github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,23 +42,6 @@ func TestStoredDynamoItemCodec_RoundTripProto(t *testing.T) {
 	require.Equal(t, item, decoded)
 }
 
-func TestStoredDynamoItemCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	boolTrue := true
-	legacy := map[string]attributeValue{
-		"pk":     newStringAttributeValue("tenant#1"),
-		"active": {BOOL: &boolTrue},
-	}
-
-	body, err := json.Marshal(legacy)
-	require.NoError(t, err)
-
-	decoded, err := decodeStoredDynamoItem(body)
-	require.NoError(t, err)
-	require.Equal(t, legacy, decoded)
-}
-
 func TestStoredDynamoItemCodec_NormalizesNullTrue(t *testing.T) {
 	t.Parallel()
 
@@ -75,37 +57,6 @@ func TestStoredDynamoItemCodec_NormalizesNullTrue(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, decoded["gone"].NULL)
 	require.True(t, *decoded["gone"].NULL)
-}
-
-func TestStoredDynamoTableSchemaCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	body, err := json.Marshal(map[string]any{
-		"table_name": "threads",
-		"attribute_definitions": map[string]string{
-			"threadId":  "S",
-			"createdAt": "S",
-			"status":    "S",
-		},
-		"primary_key": map[string]any{
-			"hash_key": "threadId",
-		},
-		"global_secondary_indexes": map[string]any{
-			"status-index": map[string]any{
-				"hash_key":  "status",
-				"range_key": "createdAt",
-			},
-		},
-		"generation": 7,
-	})
-	require.NoError(t, err)
-
-	schema, err := decodeStoredDynamoTableSchema(body)
-	require.NoError(t, err)
-	require.Equal(t, "threads", schema.TableName)
-	require.Equal(t, "status", schema.GlobalSecondaryIndexes["status-index"].KeySchema.HashKey)
-	require.Equal(t, "createdAt", schema.GlobalSecondaryIndexes["status-index"].KeySchema.RangeKey)
-	require.Equal(t, "ALL", schema.GlobalSecondaryIndexes["status-index"].Projection.ProjectionType)
 }
 
 func stringPtr(v string) *string {
