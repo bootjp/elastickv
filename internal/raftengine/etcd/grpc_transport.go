@@ -423,6 +423,13 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 		return err
 	}
 
+	// stream.Send enqueues the message into gRPC's send buffer and returns
+	// immediately under normal conditions. It can block briefly under HTTP/2
+	// flow control, but Raft bounds in-flight messages via MaxInflightMsg, so
+	// the send buffer will not saturate during steady-state operation.
+	// Stalled TCP connections are detected by gRPC keepalive and fail the
+	// stream; the stream context (derived from ctx) is also cancelled on engine
+	// shutdown, unblocking any in-progress Send.
 	if err := stream.Send(&pb.EtcdRaftMessage{Message: raw}); err != nil {
 		t.closeStream(msg.To)
 		return errors.WithStack(err)
@@ -941,6 +948,9 @@ func (t *GRPCTransport) closeAllStreams() {
 	t.noStream = make(map[uint64]struct{})
 	t.streamsMu.Unlock()
 	for _, ps := range old {
+		// CloseSend signals EOF to the server before cancelling the context so
+		// the server's Recv loop sees io.EOF rather than a context-cancelled error.
+		_ = ps.stream.CloseSend()
 		ps.cancel()
 	}
 }
