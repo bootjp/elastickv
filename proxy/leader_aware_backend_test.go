@@ -67,7 +67,8 @@ type fakeElasticKVNode struct {
 
 func newFakeElasticKVNode(t *testing.T, leader string) *fakeElasticKVNode {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	n := &fakeElasticKVNode{ln: ln, addr: ln.Addr().String()}
 	n.SetLeader(leader)

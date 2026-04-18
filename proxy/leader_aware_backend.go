@@ -112,7 +112,17 @@ func normalizeSeeds(seeds []string) []string {
 func (b *LeaderAwareRedisBackend) refreshLoop() {
 	defer close(b.done)
 
-	b.refreshLeader(context.Background())
+	// Derive a cancellable context from stopCh so that an in-flight INFO
+	// probe is interrupted as soon as Close() is called; otherwise the
+	// refreshTimeout must elapse before the loop can exit.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-b.stopCh
+		cancel()
+	}()
+
+	b.refreshLeader(ctx)
 
 	t := time.NewTicker(b.refreshInterval)
 	defer t.Stop()
@@ -121,9 +131,9 @@ func (b *LeaderAwareRedisBackend) refreshLoop() {
 		case <-b.stopCh:
 			return
 		case <-t.C:
-			b.refreshLeader(context.Background())
+			b.refreshLeader(ctx)
 		case <-b.refreshCh:
-			b.refreshLeader(context.Background())
+			b.refreshLeader(ctx)
 		}
 	}
 }
@@ -145,6 +155,9 @@ func (b *LeaderAwareRedisBackend) TriggerRefresh() {
 // healthy, so this converges in one probe during steady state.
 func (b *LeaderAwareRedisBackend) refreshLeader(ctx context.Context) {
 	for _, addr := range b.candidateAddrs() {
+		if ctx.Err() != nil {
+			return
+		}
 		leader, err := b.probeLeader(ctx, addr)
 		if err != nil {
 			b.logger.Debug("leader probe failed", "addr", addr, "err", err)
@@ -331,8 +344,11 @@ func (b *LeaderAwareRedisBackend) Close() error {
 
 	var firstErr error
 	for addr, cli := range clients {
-		if err := cli.Close(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("close %s client %s: %w", b.name, addr, err)
+		if err := cli.Close(); err != nil {
+			b.logger.Warn("close leader-aware client failed", "backend", b.name, "addr", addr, "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("close %s client %s: %w", b.name, addr, err)
+			}
 		}
 	}
 	return firstErr
