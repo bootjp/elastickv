@@ -989,7 +989,11 @@ func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T)
 	var evalshaCalls, evalCalls int
 	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
 		cmd := redis.NewCmd(ctx, args...)
-		switch string(args[0].([]byte)) {
+		raw, ok := args[0].([]byte)
+		if !ok {
+			t.Fatalf("expected []byte command, got %T", args[0])
+		}
+		switch string(raw) {
 		case "EVALSHA":
 			evalshaCalls++
 			cmd.SetErr(testRedisErr("NOSCRIPT No matching script. Please use EVAL."))

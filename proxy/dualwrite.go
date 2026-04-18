@@ -40,6 +40,12 @@ const (
 	// stays well within SecondaryTimeout even if the retry policy is ever
 	// widened.
 	compactedRetryMaxBackoff = 100 * time.Millisecond
+	// compactedRetryBackoffFactor is the multiplier applied to the backoff
+	// between retries; 2 gives a conventional exponential schedule.
+	compactedRetryBackoffFactor = 2
+	// compactedRetryJitterDivisor bounds the jitter to backoff/divisor so
+	// jitter stays small relative to the base delay.
+	compactedRetryJitterDivisor = 2
 )
 
 // readTSCompactedMarker is the substring produced by
@@ -278,10 +284,6 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 // If the first attempt triggers a NOSCRIPT fallback, subsequent retry
 // attempts use the resolved EVAL args directly so we don't waste a
 // round-trip on the known-missing EVALSHA every iteration.
-// The nolint:wrapcheck annotations on each return mirror the other
-// writeSecondary-family handlers above: the secondary error must flow back
-// unwrapped so writeSecondary can classify redis.Nil / redis.Error, fingerprint
-// it for Sentry, and attach the original message in the structured log.
 func (d *DualWriter) executeSecondary(sCtx context.Context, cmd string, iArgs []any) error {
 	backoff := compactedRetryInitialBackoff
 	var sErr error
@@ -297,16 +299,26 @@ func (d *DualWriter) executeSecondary(sCtx context.Context, cmd string, iArgs []
 			}
 		}
 		if !isReadTSCompactedError(sErr) {
-			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
+			return wrapSecondaryError(sErr)
 		}
 		if attempt >= maxCompactedRetries {
-			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
+			return wrapSecondaryError(sErr)
 		}
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
-			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
+			return wrapSecondaryError(sErr)
 		}
 		backoff = nextCompactedRetryBackoff(backoff)
 	}
+}
+
+// wrapSecondaryError forwards the secondary's error with a %w wrapper so
+// wrapcheck is satisfied while preserving errors.Is classification for
+// redis.Nil and redis.Error. Returns nil unchanged.
+func wrapSecondaryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("secondary: %w", err)
 }
 
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early
@@ -323,8 +335,8 @@ func waitCompactedRetryBackoff(ctx context.Context, backoff time.Duration) bool 
 		return ctx.Err() == nil
 	}
 	jitter := time.Duration(0)
-	if half := int64(backoff / 2); half > 0 {
-		jitter = time.Duration(rand.Int64N(half)) //nolint:gosec // jitter for retry backoff, not security sensitive
+	if jitterWindow := int64(backoff / compactedRetryJitterDivisor); jitterWindow > 0 {
+		jitter = time.Duration(rand.Int64N(jitterWindow)) //nolint:gosec // jitter for retry backoff, not security sensitive
 	}
 	timer := time.NewTimer(backoff + jitter)
 	defer timer.Stop()
@@ -338,7 +350,7 @@ func waitCompactedRetryBackoff(ctx context.Context, backoff time.Duration) bool 
 }
 
 func nextCompactedRetryBackoff(current time.Duration) time.Duration {
-	next := current * 2
+	next := current * compactedRetryBackoffFactor
 	if next > compactedRetryMaxBackoff {
 		return compactedRetryMaxBackoff
 	}
