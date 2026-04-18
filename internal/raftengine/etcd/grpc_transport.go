@@ -188,6 +188,11 @@ func (t *GRPCTransport) UpsertPeer(peer Peer) {
 		t.closeStream(id)
 		t.clearNoStream(id)
 	}
+	// Always clear noStream for the upserted peer so that a same-address
+	// upgrade (peer binary updated without changing address) re-probes
+	// streaming support on the next dispatch rather than staying stuck on
+	// the unary fallback indefinitely.
+	t.clearNoStream(peer.NodeID)
 }
 
 func (t *GRPCTransport) RemovePeer(nodeID uint64) {
@@ -387,7 +392,7 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 		return errors.WithStack(err)
 	}
 
-	stream, err := t.getOrOpenStream(msg.To)
+	stream, err := t.getOrOpenStream(ctx, msg.To)
 	if err != nil {
 		if errors.Is(err, errStreamNotSupported) {
 			return t.dispatchUnary(ctx, raw, msg.To)
@@ -806,9 +811,13 @@ func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.
 // necessary. Returns errStreamNotSupported if the peer previously returned
 // codes.Unimplemented; callers should fall back to the unary Send path.
 //
+// ctx is the per-peer dispatch context: the stream's lifetime is derived from
+// it so that a cancelled context (peer removed, engine shutdown) unblocks any
+// pending stream.Send without waiting for a TCP timeout.
+//
 // Lock ordering: this method acquires streamsMu without holding t.mu; it
 // calls clientFor (which may acquire t.mu) only after releasing streamsMu.
-func (t *GRPCTransport) getOrOpenStream(nodeID uint64) (pb.EtcdRaft_SendStreamClient, error) {
+func (t *GRPCTransport) getOrOpenStream(ctx context.Context, nodeID uint64) (pb.EtcdRaft_SendStreamClient, error) {
 	// Fast path: stream already open or peer known to be unary-only.
 	t.streamsMu.RLock()
 	_, skip := t.noStream[nodeID]
@@ -841,7 +850,7 @@ func (t *GRPCTransport) getOrOpenStream(nodeID uint64) (pb.EtcdRaft_SendStreamCl
 		return ps.stream, nil
 	}
 
-	streamCtx, cancel := context.WithCancel(context.Background())
+	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := client.SendStream(streamCtx)
 	if err != nil {
 		cancel()
