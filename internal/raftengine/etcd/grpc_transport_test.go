@@ -352,9 +352,9 @@ func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
 // testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
 // SendSnapshot calls to a pre-wired testSnapshotSendClient.
 type testEtcdRaftClient struct {
-	stream         *testSnapshotSendClient
-	sendStreamFn   func(ctx context.Context, opts ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error)
-	sendCallCount  atomic.Int32
+	stream        *testSnapshotSendClient
+	sendStreamFn  func(ctx context.Context, opts ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error)
+	sendCallCount atomic.Int32
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
