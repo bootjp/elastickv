@@ -499,6 +499,10 @@ func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 			if errors.Is(err, io.EOF) {
 				return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
 			}
+			slog.Warn("etcd raft SendStream: Recv error",
+				"code", status.Code(err).String(),
+				"error", err,
+			)
 			return errors.WithStack(err)
 		}
 		var msg raftpb.Message
