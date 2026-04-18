@@ -278,28 +278,32 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 // If the first attempt triggers a NOSCRIPT fallback, subsequent retry
 // attempts use the resolved EVAL args directly so we don't waste a
 // round-trip on the known-missing EVALSHA every iteration.
+// The nolint:wrapcheck annotations on each return mirror the other
+// writeSecondary-family handlers above: the secondary error must flow back
+// unwrapped so writeSecondary can classify redis.Nil / redis.Error, fingerprint
+// it for Sentry, and attach the original message in the structured log.
 func (d *DualWriter) executeSecondary(sCtx context.Context, cmd string, iArgs []any) error {
 	backoff := compactedRetryInitialBackoff
 	var sErr error
 	args := iArgs
 	for attempt := 0; ; attempt++ {
 		result := d.secondary.Do(sCtx, args...)
-		_, sErr = result.Result() //nolint:wrapcheck // classification/error propagation preserves redis.Error types
+		_, sErr = result.Result()
 		if isNoScriptError(sErr) {
 			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
 				args = fallbackArgs
 				result = d.secondary.Do(sCtx, args...)
-				_, sErr = result.Result() //nolint:wrapcheck // classification/error propagation preserves redis.Error types
+				_, sErr = result.Result()
 			}
 		}
 		if !isReadTSCompactedError(sErr) {
-			return sErr
+			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
 		}
 		if attempt >= maxCompactedRetries {
-			return sErr
+			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
 		}
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
-			return sErr
+			return sErr //nolint:wrapcheck // secondary error must pass through unwrapped for redis.Nil / redis.Error classification
 		}
 		backoff = nextCompactedRetryBackoff(backoff)
 	}
