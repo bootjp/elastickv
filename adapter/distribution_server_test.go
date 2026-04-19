@@ -743,3 +743,7 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) raft.ServerAddr
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
 	return nil
 }
+
+func (s *distributionCoordinatorStub) LinearizableRead(_ context.Context) (uint64, error) {
+	return 0, nil
+}

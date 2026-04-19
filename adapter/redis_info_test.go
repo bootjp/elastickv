@@ -34,6 +34,8 @@ func (c *infoTestCoordinator) Clock() *kv.HLC {
 	return c.clock
 }
 
+func (c *infoTestCoordinator) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
+
 func TestRedisServer_Info_LeaderRole(t *testing.T) {
 	r := &RedisServer{
 		redisAddr:   "10.0.0.1:6379",

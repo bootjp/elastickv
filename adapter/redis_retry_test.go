@@ -80,6 +80,10 @@ func (c *retryOnceCoordinator) Clock() *kv.HLC {
 	return c.clock
 }
 
+func (c *retryOnceCoordinator) LinearizableRead(_ context.Context) (uint64, error) {
+	return 0, nil
+}
+
 type recordingConn struct {
 	ctx  any
 	err  string
