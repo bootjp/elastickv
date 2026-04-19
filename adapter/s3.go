@@ -31,15 +31,17 @@ import (
 )
 
 const (
-	s3HealthPath             = "/healthz"
-	s3ChunkSize              = 1 << 20
-	s3ChunkBatchOps          = 16
-	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion          = "us-east-1"
-	s3MaxKeys                = 1000
-	s3ListPageSize           = 256
-	s3ManifestCleanupTimeout = 2 * time.Minute
-	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
+	s3HealthPath                = "/healthz"
+	s3LeaderHealthPath          = "/healthz/leader"
+	s3HealthMaxRequestBodyBytes = 1024
+	s3ChunkSize                 = 1 << 20
+	s3ChunkBatchOps             = 16
+	s3XMLNamespace              = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion             = "us-east-1"
+	s3MaxKeys                   = 1000
+	s3ListPageSize              = 256
+	s3ManifestCleanupTimeout    = 2 * time.Minute
+	s3MaxObjectSizeBytes        = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -331,6 +333,9 @@ func (s *S3Server) Stop() {
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if serveS3Healthz(w, r) {
+		return
+	}
+	if s.serveS3LeaderHealthz(w, r) {
 		return
 	}
 	if s.maybeProxyToLeader(w, r) {
@@ -2324,6 +2329,40 @@ func serveS3Healthz(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = io.WriteString(w, "ok")
 	}
 	return true
+}
+
+// serveS3LeaderHealthz returns 200 only when this node is the verified raft
+// leader. It mirrors the DynamoDB server's /healthz/leader so that an
+// upstream load balancer can route S3 traffic to the current leader without
+// hitting the (currently broken) follower-proxy SigV4 path.
+func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || r.URL == nil || r.URL.Path != s3LeaderHealthPath {
+		return false
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s3HealthMaxRequestBodyBytes)
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return true
+	}
+	status, body := http.StatusOK, "ok"
+	if !s.isVerifiedS3Leader() {
+		status, body = http.StatusServiceUnavailable, "not leader"
+	}
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, body)
+	}
+	return true
+}
+
+func (s *S3Server) isVerifiedS3Leader() bool {
+	if s.coordinator == nil || !s.coordinator.IsLeader() {
+		return false
+	}
+	return s.coordinator.VerifyLeader() == nil
 }
 
 func encodeS3BucketMeta(meta *s3BucketMeta) ([]byte, error) {
