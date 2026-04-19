@@ -811,7 +811,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
-	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA)
+	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
 		return
@@ -1310,7 +1310,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA)
+	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
 		return
@@ -2389,8 +2389,27 @@ func (s *S3Server) isVerifiedS3Leader() bool {
 // its helpers become no-ops. The caller uses the returned context to feed
 // decoded chunks through the optional trailer hasher and to verify the
 // trailer checksum once EOF is reached.
-func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded int64, payloadSHA string) (*s3StreamingBody, *s3PutBodyError) {
+//
+//nolint:cyclop // Linear protocol preamble: reject unsupported markers, parse declared length, bind trailer, then hand off.
+func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded int64, payloadSHA, tooLargeMessage string) (*s3StreamingBody, *s3PutBodyError) {
+	// Reject signed streaming payload markers up-front. Accepting them
+	// without verifying the per-chunk chunk-signature= would silently
+	// downgrade the client's integrity guarantee to just the request
+	// header signature; better to respond 501 so the client can fall back
+	// to the unsigned streaming variant or non-streaming SHA.
+	if isS3SignedStreamingPayloadMarker(payloadSHA) {
+		return nil, &s3PutBodyError{Status: http.StatusNotImplemented, Code: "NotImplemented", Message: "signed streaming uploads (STREAMING-AWS4-HMAC-SHA256-PAYLOAD*) are not supported"}
+	}
+
+	hasAwsChunkedEncoding := contentEncodingContains(r.Header.Get("Content-Encoding"), "aws-chunked")
 	if !isS3StreamingPayloadMarker(payloadSHA) {
+		// A client that labels the transport as aws-chunked MUST also set
+		// a streaming payload marker; otherwise the server would store the
+		// raw framed bytes as-is (and cleanStoredContentEncoding would
+		// later drop the only hint that the object is still encoded).
+		if hasAwsChunkedEncoding {
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "Content-Encoding: aws-chunked requires a streaming X-Amz-Content-Sha256 marker"}
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxDecoded)
 		return &s3StreamingBody{}, nil
 	}
@@ -2403,22 +2422,30 @@ func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded 
 			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "invalid X-Amz-Decoded-Content-Length"}
 		}
 		if parsed > maxDecoded {
-			return nil, &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: "object exceeds maximum allowed size"}
+			return nil, &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: tooLargeMessage}
 		}
 		declared = parsed
 	}
 
-	// Budget the raw transport generously to absorb chunk/trailer framing
-	// overhead. Decoded bytes are independently capped inside the chunked
-	// reader, so this outer limit only guards against a client that keeps
-	// the connection open with junk framing forever.
-	const framingOverhead = 1 << 20 // 1 MiB
-	rawMax := maxDecoded + framingOverhead
+	// Bound the raw transport. maxDecoded/256 covers the worst realistic
+	// per-chunk header overhead (AWS recommends >= 8 KiB chunks, and
+	// unsigned framing adds ~6 bytes per chunk; the allowance tolerates
+	// chunks as small as ~32 bytes). When the client declared a
+	// Content-Length tighter than that, honour the smaller bound; when
+	// they declared one larger, keep our cap so a runaway stream hits
+	// MaxBytesReader well before RAM pressure.
+	rawMax := maxDecoded + maxDecoded/s3StreamingFramingDivisor + s3StreamingTrailerBytes
+	if r.ContentLength > 0 && r.ContentLength < rawMax {
+		rawMax = r.ContentLength
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, rawMax)
 
 	reader := newAwsChunkedReader(r.Body, declared, maxDecoded)
 	body := &s3StreamingBody{reader: reader}
-	r.Body = io.NopCloser(reader)
+	// Preserve Close() on the outer body so net/http still drains and
+	// frees the underlying MaxBytesReader + transport when the handler
+	// returns (io.NopCloser would have dropped that on the floor).
+	r.Body = closeForwardingReader{Reader: reader, Closer: r.Body}
 
 	// X-Amz-Trailer is formally a comma-separated list per AWS docs; pick
 	// the first trailer whose checksum algorithm we support rather than
@@ -2435,6 +2462,39 @@ func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded 
 		}
 	}
 	return body, nil
+}
+
+const (
+	// s3StreamingFramingDivisor bounds the per-chunk header overhead we
+	// allow over the decoded payload. maxDecoded / 256 allows up to ~0.4%
+	// of framing bytes, which comfortably covers the AWS-recommended 8 KiB
+	// chunk size (~6 bytes of framing per chunk) with generous headroom
+	// for smaller chunks.
+	s3StreamingFramingDivisor = 256
+	// s3StreamingTrailerBytes reserves room for the terminating 0-chunk
+	// plus advertised trailer headers (x-amz-checksum-* values etc.).
+	s3StreamingTrailerBytes = 4 * 1024
+)
+
+// contentEncodingContains reports whether the Content-Encoding header lists
+// the given token (case-insensitive). Per RFC 9110 the value is a
+// comma-separated list of coding names.
+func contentEncodingContains(raw, token string) bool {
+	for _, part := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// closeForwardingReader pairs a new Reader (typically a decoder built on
+// top of r.Body) with the original body's Close method so that when the
+// HTTP server calls r.Body.Close() at the end of the request, the
+// underlying MaxBytesReader / transport still gets the cleanup call.
+type closeForwardingReader struct {
+	io.Reader
+	io.Closer
 }
 
 // canonicalTrailerName returns the MIME-canonical form (e.g.

@@ -378,7 +378,110 @@ func TestS3Server_PutObjectStreamingRejectsBadDecodedLength(t *testing.T) {
 	// Lie about decoded size: client claims 5 but the chunks total 20.
 	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
 	server.handle(rec, req)
-	require.NotEqual(t, http.StatusOK, rec.Code)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+}
+
+func TestS3Server_PutObjectStreamingRejectsSignedPayloadMarker(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-signed", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// STREAMING-AWS4-HMAC-SHA256-PAYLOAD requires chunk-signature=
+	// verification, which we don't implement. The server must not pretend
+	// the upload succeeded — clients would otherwise assume their signed
+	// integrity guarantee was honoured when it is not.
+	body := encodeSignedAwsChunked(t, []byte("irrelevant"), 4)
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-signed/obj.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingSignedPayload)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "10")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>NotImplemented</Code>")
+}
+
+func TestS3Server_PutObjectRejectsAwsChunkedWithoutStreamingMarker(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-mismatch", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// aws-chunked Content-Encoding without a streaming marker would make
+	// the server store the framed bytes as if they were the real payload,
+	// then cleanStoredContentEncoding would erase the only clue that the
+	// object is still encoded. Must be rejected.
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-mismatch/obj.bin",
+		bytes.NewReader([]byte("5\r\nhello\r\n0\r\n\r\n")))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	// Plain (non-sentinel) SHA256 that does NOT match the framed body.
+	req.Header.Set("X-Amz-Content-Sha256", sha256Hex("hello"))
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+}
+
+// Multipart UploadPart must also honour aws-chunked framing — coderabbit
+// nit: the existing streaming integration tests only covered putObject.
+func TestS3Server_UploadPartStreamingWithTrailerChecksum(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-part-stream", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Initiate multipart upload.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bkt-part-stream/blob.bin?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var init s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &init))
+	uploadID := init.UploadId
+
+	// Upload part via aws-chunked with a valid CRC32 trailer.
+	partPayload := bytes.Repeat([]byte("P"), 5*1024*1024) // 5 MiB -- minimum part size for non-last parts.
+	sum := crc32.NewIEEE()
+	_, _ = sum.Write(partPayload)
+	crc := base64.StdEncoding.EncodeToString(sum.Sum(nil))
+	body := encodeAwsChunked(t, partPayload, 64*1024, "x-amz-checksum-crc32", crc)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bkt-part-stream/blob.bin?uploadId=%s&partNumber=1", uploadID),
+		bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(partPayload)))
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	// Bad trailer must be rejected.
+	bodyBad := encodeAwsChunked(t, partPayload, 64*1024, "x-amz-checksum-crc32",
+		base64.StdEncoding.EncodeToString([]byte{0x00, 0x00, 0x00, 0x00}))
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bkt-part-stream/blob.bin?uploadId=%s&partNumber=2", uploadID),
+		bytes.NewReader(bodyBad))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(partPayload)))
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>BadDigest</Code>")
 }
 
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {

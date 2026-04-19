@@ -46,11 +46,25 @@ func isS3PayloadMarker(hash string) bool {
 }
 
 // isS3StreamingPayloadMarker reports whether the payload sentinel indicates
-// an aws-chunked framed body that the server must decode before storing.
+// an aws-chunked framed body whose integrity is NOT dependent on chained
+// chunk-signature verification. Only the unsigned streaming variant is
+// accepted today; see isS3SignedStreamingPayloadMarker for why the signed
+// variants require a separate implementation path.
 func isS3StreamingPayloadMarker(hash string) bool {
+	return strings.EqualFold(hash, s3StreamingUnsignedPayloadTrailer)
+}
+
+// isS3SignedStreamingPayloadMarker reports whether the payload sentinel is
+// one of the STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER] markers. These
+// require the server to recompute and compare the chunk-signature=<hex>
+// parameter on every chunk (AWS spec: chained HMAC-SHA256 across previous
+// signature + chunk data). Until we implement that chunk-by-chunk
+// verification, accepting the marker would silently downgrade the client's
+// integrity guarantee to just the request-header SigV4, so the PutObject
+// / UploadPart pipeline rejects these uploads with 501 NotImplemented.
+func isS3SignedStreamingPayloadMarker(hash string) bool {
 	switch {
-	case strings.EqualFold(hash, s3StreamingUnsignedPayloadTrailer),
-		strings.EqualFold(hash, s3StreamingSignedPayload),
+	case strings.EqualFold(hash, s3StreamingSignedPayload),
 		strings.EqualFold(hash, s3StreamingSignedPayloadTrailer):
 		return true
 	}

@@ -248,10 +248,23 @@ func TestIsS3PayloadMarker(t *testing.T) {
 }
 
 func TestIsS3StreamingPayloadMarker(t *testing.T) {
+	// Only the unsigned streaming variant is accepted today; signed
+	// variants require chained chunk-signature verification that the
+	// decoder does not implement yet.
 	require.False(t, isS3StreamingPayloadMarker("UNSIGNED-PAYLOAD"))
 	require.True(t, isS3StreamingPayloadMarker("STREAMING-UNSIGNED-PAYLOAD-TRAILER"))
-	require.True(t, isS3StreamingPayloadMarker("streaming-aws4-hmac-sha256-payload"))
+	require.True(t, isS3StreamingPayloadMarker("streaming-unsigned-payload-trailer"))
+	require.False(t, isS3StreamingPayloadMarker("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
+	require.False(t, isS3StreamingPayloadMarker("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"))
 	require.False(t, isS3StreamingPayloadMarker(""))
+}
+
+func TestIsS3SignedStreamingPayloadMarker(t *testing.T) {
+	require.True(t, isS3SignedStreamingPayloadMarker("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
+	require.True(t, isS3SignedStreamingPayloadMarker("streaming-aws4-hmac-sha256-payload-trailer"))
+	require.False(t, isS3SignedStreamingPayloadMarker("STREAMING-UNSIGNED-PAYLOAD-TRAILER"))
+	require.False(t, isS3SignedStreamingPayloadMarker("UNSIGNED-PAYLOAD"))
+	require.False(t, isS3SignedStreamingPayloadMarker(""))
 }
 
 func TestCleanStoredContentEncoding(t *testing.T) {
