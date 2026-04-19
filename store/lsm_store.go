@@ -200,7 +200,7 @@ func decodeKeyView(k []byte) ([]byte, uint64) {
 	return k[:keyLen], ^invTs
 }
 
-// Value encoding: We use gob to encode VersionedValue structure minus the key/ts which are in the key.
+// Value encoding: fixed binary header [Tombstone(1)][ExpireAt(8)] followed by raw value bytes; key and timestamp are encoded in the SST key.
 type storedValue struct {
 	Value     []byte
 	Tombstone bool

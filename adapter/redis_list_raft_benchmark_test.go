@@ -20,10 +20,10 @@ package adapter
 //     still race for the same item seq — but at lower probability than Legacy
 //     where ALL operation types conflict with ALL others.
 //
-// Store: NewPebbleStoreInMem — Pebble backed by vfs.NewMem().
+// Store: NewPebbleStore(b.TempDir()) — disk-backed Pebble in a temp directory.
 //   Background LSM compaction runs and removes tombstones, so the delta scan
 //   stays O(live deltas) ≤ compactor threshold throughout the benchmark.
-//   No disk sync overhead; Raft round-trip (~0.2 ms loopback) dominates.
+//   Disk I/O overhead is present but Raft round-trip (~0.2 ms loopback) dominates.
 //
 // Observed on Apple M1 Max (3-node loopback cluster, GOMAXPROCS=10, benchtime=30s):
 //
@@ -119,7 +119,6 @@ func createBenchCluster(b *testing.B, n int) ([]Node, func()) {
 	b.Helper()
 	ctx := context.Background()
 	ports := assignPorts(n)
-	cfg := buildRaftConfig(n, ports)
 
 	lc := net.ListenConfig{}
 	lis := make([]listeners, n)
@@ -139,6 +138,8 @@ func createBenchCluster(b *testing.B, n int) ([]Node, func()) {
 		}
 	}
 
+	// Build Raft config after port binding so retried ports are reflected.
+	cfg := buildRaftConfig(n, ports)
 	leaderRedisMap := make(map[raft.ServerAddress]string, n)
 	for _, p := range ports {
 		leaderRedisMap[raft.ServerAddress(p.raftAddress)] = p.redisAddress

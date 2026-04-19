@@ -56,6 +56,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"testing"
 	"time"
 
@@ -90,10 +91,7 @@ func (c *occAdapterCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 		return nil, err
 	}
 	if !req.IsTxn {
-		if err := c.applyElems(ctx, req.Elems, commitTS); err != nil {
-			return nil, err
-		}
-		return &kv.CoordinateResponse{}, nil
+		return c.localAdapterCoordinator.Dispatch(ctx, req)
 	}
 	mutations, err := c.collectMutations(ctx, req.Elems, commitTS)
 	if err != nil {
@@ -162,7 +160,11 @@ func (r *RedisServer) listRPushLegacy(ctx context.Context, key []byte, values []
 			})
 			seq++
 		}
-		meta.Len += int64(len(values)) //nolint:gosec
+		delta := int64(len(values))
+		if meta.Len > math.MaxInt64-delta {
+			return errors.New("list length overflow")
+		}
+		meta.Len += delta
 		metaBytes, marshalErr := store.MarshalListMeta(meta)
 		if marshalErr != nil {
 			return marshalErr
@@ -228,10 +230,17 @@ func benchCompactorOpts() []DeltaCompactorOption {
 }
 
 func startCompactor(r *RedisServer) (cancel context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancelFn := context.WithCancel(context.Background())
 	c := NewDeltaCompactor(r.store, r.coordinator, benchCompactorOpts()...)
-	go func() { _ = c.Run(ctx) }()
-	return cancel
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Run(ctx)
+	}()
+	return func() {
+		cancelFn()
+		<-done
+	}
 }
 
 // retryUntilSuccess calls fn in a loop, retrying when fn returns an error
