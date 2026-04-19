@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -777,7 +778,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop,gocognit,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
+//nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
 	startTS := s.txnStartTS(readTS)
@@ -809,8 +810,12 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	validatePayloadSHA := expectedPayloadSHA != "" && !strings.EqualFold(expectedPayloadSHA, s3UnsignedPayload)
-	r.Body = http.MaxBytesReader(w, r.Body, s3MaxObjectSizeBytes)
+	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
+	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA)
+	if bodyErr != nil {
+		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
 	part := s3ObjectPart{PartNo: 1}
 	sizeBytes := int64(0)
 	chunkNo := uint64(0)
@@ -857,6 +862,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 					return
 				}
 			}
+			streamBody.writeDecoded(chunk)
 			chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, part.PartNo, chunkNo)
 			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
 			chunkSize, err := uint64FromInt(n)
@@ -881,9 +887,8 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		if readErr != nil {
 			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(readErr, &maxBytesErr) {
-				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "object exceeds maximum allowed size", bucket, objectKey)
+			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 				return
 			}
 			writeS3InternalError(w, readErr)
@@ -903,6 +908,11 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			return
 		}
 	}
+	if err := streamBody.verifyTrailer(); err != nil {
+		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
+		return
+	}
 
 	etag := hex.EncodeToString(hasher.Sum(nil))
 	part.ETag = etag
@@ -920,7 +930,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		SizeBytes:          sizeBytes,
 		LastModifiedHLC:    commitTS,
 		ContentType:        headerOrDefault(r.Header.Get("Content-Type"), "application/octet-stream"),
-		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		ContentEncoding:    cleanStoredContentEncoding(r.Header.Get("Content-Encoding")),
 		CacheControl:       r.Header.Get("Cache-Control"),
 		ContentDisposition: r.Header.Get("Content-Disposition"),
 		UserMetadata:       collectS3UserMetadata(r.Header),
@@ -1299,7 +1309,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, s3MaxPartSizeBytes)
+	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
+	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA)
+	if bodyErr != nil {
+		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
 
 	// Pre-allocate the part's commit timestamp before writing any blob chunks so
 	// that the same version identifier is used for every chunk in this attempt.
@@ -1348,9 +1363,8 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 				break
 			}
 			if readErr != nil {
-				var maxBytesErr *http.MaxBytesError
-				if errors.As(readErr, &maxBytesErr) {
-					writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+				if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+					writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 					return
 				}
 				writeS3InternalError(w, readErr)
@@ -1363,6 +1377,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			writeS3InternalError(w, err)
 			return
 		}
+		partStreamBody.writeDecoded(chunk)
 		chunkKey := s3keys.VersionedBlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
 		cs, err := uint64FromInt(n)
@@ -1383,9 +1398,8 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			break
 		}
 		if readErr != nil {
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(readErr, &maxBytesErr) {
-				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 				return
 			}
 			writeS3InternalError(w, readErr)
@@ -1394,6 +1408,10 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 	if err := flushBatch(); err != nil {
 		writeS3InternalError(w, err)
+		return
+	}
+	if err := partStreamBody.verifyTrailer(); err != nil {
+		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
 		return
 	}
 
@@ -2363,6 +2381,102 @@ func (s *S3Server) isVerifiedS3Leader() bool {
 		return false
 	}
 	return s.coordinator.VerifyLeader() == nil
+}
+
+// prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When
+// the request is a plain (non-streaming) PUT the body is only wrapped with
+// MaxBytesReader; the streaming-body context returned is the zero value and
+// its helpers become no-ops. The caller uses the returned context to feed
+// decoded chunks through the optional trailer hasher and to verify the
+// trailer checksum once EOF is reached.
+func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded int64, payloadSHA string) (*s3StreamingBody, *s3PutBodyError) {
+	if !isS3StreamingPayloadMarker(payloadSHA) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxDecoded)
+		return &s3StreamingBody{}, nil
+	}
+
+	declaredRaw := strings.TrimSpace(r.Header.Get("X-Amz-Decoded-Content-Length"))
+	declared := int64(-1)
+	if declaredRaw != "" {
+		parsed, err := strconv.ParseInt(declaredRaw, 10, 64)
+		if err != nil || parsed < 0 {
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "invalid X-Amz-Decoded-Content-Length"}
+		}
+		if parsed > maxDecoded {
+			return nil, &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: "object exceeds maximum allowed size"}
+		}
+		declared = parsed
+	}
+
+	// Budget the raw transport generously to absorb chunk/trailer framing
+	// overhead. Decoded bytes are independently capped inside the chunked
+	// reader, so this outer limit only guards against a client that keeps
+	// the connection open with junk framing forever.
+	const framingOverhead = 1 << 20 // 1 MiB
+	rawMax := maxDecoded + framingOverhead
+	r.Body = http.MaxBytesReader(w, r.Body, rawMax)
+
+	reader := newAwsChunkedReader(r.Body, declared, maxDecoded)
+	body := &s3StreamingBody{reader: reader}
+	r.Body = io.NopCloser(reader)
+
+	if advertised := strings.TrimSpace(r.Header.Get("X-Amz-Trailer")); advertised != "" {
+		canonical := canonicalTrailerName(advertised)
+		if h := newS3TrailerChecksumHasher(advertised); h != nil {
+			body.trailerName = canonical
+			body.trailerHash = h
+		}
+	}
+	return body, nil
+}
+
+// canonicalTrailerName returns the MIME-canonical form (e.g.
+// "X-Amz-Checksum-Crc32") of a trailer header name.
+func canonicalTrailerName(name string) string {
+	return textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
+}
+
+type s3PutBodyError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+// classifyS3BodyReadErr folds the recognised body-read failures into an
+// s3PutBodyError the caller can pass to writeS3Error. Returns nil, false
+// when the error is not one of the known shapes, so the caller falls back
+// to writeS3InternalError.
+func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, bool) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: tooLargeMessage}, true
+	}
+	var chunkedErr *awsChunkedError
+	if errors.As(err, &chunkedErr) {
+		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
+	}
+	return nil, false
+}
+
+// cleanStoredContentEncoding strips "aws-chunked" from the Content-Encoding
+// value that will be persisted on the object. AWS S3 treats aws-chunked as a
+// transport-layer signal and does not store it; preserving it would cause
+// subsequent GET responses to advertise a transport encoding that no client
+// ever asked for.
+func cleanStoredContentEncoding(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	kept := parts[:0]
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" || strings.EqualFold(trimmed, "aws-chunked") {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	return strings.Join(kept, ", ")
 }
 
 func encodeS3BucketMeta(meta *s3BucketMeta) ([]byte, error) {

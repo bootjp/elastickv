@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -249,6 +252,103 @@ func TestS3Server_LeaderHealthz(t *testing.T) {
 	leaderSrv.handle(rec, newS3TestRequest(http.MethodPost, s3LeaderHealthPath, nil))
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
 	require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
+}
+
+func TestS3Server_PutObjectStreamingUnsignedPayloadTrailer(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-stream", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := bytes.Repeat([]byte("X"), 1000)
+	body := encodeAwsChunked(t, payload, 137, "", "")
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-stream/streamed.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "1000")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	// GET round-trip.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bkt-stream/streamed.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, payload, rec.Body.Bytes())
+
+	// The stored Content-Encoding must not carry the transport-layer
+	// aws-chunked marker.
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodHead, "/bkt-stream/streamed.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotContains(t, rec.Header().Get("Content-Encoding"), "aws-chunked")
+}
+
+func TestS3Server_PutObjectStreamingWithTrailerChecksum(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-trailer", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := []byte("trailer-me")
+	sum := crc32.NewIEEE()
+	_, _ = sum.Write(payload)
+	crc := base64.StdEncoding.EncodeToString(sum.Sum(nil))
+	body := encodeAwsChunked(t, payload, 4, "x-amz-checksum-crc32", crc)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-trailer/ok.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(payload)))
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	// Corrupted trailer: server must reject.
+	bodyBad := encodeAwsChunked(t, payload, 4, "x-amz-checksum-crc32",
+		base64.StdEncoding.EncodeToString([]byte{0xDE, 0xAD, 0xBE, 0xEF}))
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodPut, "/bkt-trailer/bad.bin", bytes.NewReader(bodyBad))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(payload)))
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>BadDigest</Code>")
+}
+
+func TestS3Server_PutObjectStreamingRejectsBadDecodedLength(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-badlen", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := []byte("actual-length-is-20-")
+	require.Len(t, payload, 20)
+	body := encodeAwsChunked(t, payload, 9, "", "")
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-badlen/obj.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	// Lie about decoded size: client claims 5 but the chunks total 20.
+	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
+	server.handle(rec, req)
+	require.NotEqual(t, http.StatusOK, rec.Code)
 }
 
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
