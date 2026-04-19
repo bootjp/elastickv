@@ -213,6 +213,38 @@ func TestS3Server_RejectsSigV4RequestWithExcessiveClockSkew(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "<Code>RequestTimeTooSkewed</Code>")
 }
 
+func TestS3Server_LeaderHealthz(t *testing.T) {
+	t.Parallel()
+
+	leaderSrv := NewS3Server(nil, "", store.NewMVCCStore(), newLocalAdapterCoordinator(store.NewMVCCStore()), nil)
+	followerSrv := NewS3Server(nil, "", store.NewMVCCStore(), &followerS3Coordinator{}, nil)
+
+	cases := []struct {
+		name   string
+		server *S3Server
+		status int
+		body   string
+	}{
+		{name: "leader", server: leaderSrv, status: http.StatusOK, body: "ok\n"},
+		{name: "follower", server: followerSrv, status: http.StatusServiceUnavailable, body: "not leader\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.server.handle(rec, newS3TestRequest(http.MethodGet, s3LeaderHealthPath, nil))
+			require.Equal(t, tc.status, rec.Code)
+			require.Equal(t, tc.body, rec.Body.String())
+
+			// HEAD must match status but carry no body.
+			rec = httptest.NewRecorder()
+			tc.server.handle(rec, newS3TestRequest(http.MethodHead, s3LeaderHealthPath, nil))
+			require.Equal(t, tc.status, rec.Code)
+			require.Empty(t, rec.Body.String())
+		})
+	}
+}
+
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
 	t.Parallel()
 
