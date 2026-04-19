@@ -563,6 +563,132 @@
       "title": "Errors by Node",
       "type": "timeseries",
       "description": "Error rate split by serving node."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "id": 11,
+      "title": "Secondary Write Diagnostics",
+      "type": "row"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Rate of commands that failed on the secondary backend, broken down by command name. A spike in EVALSHA here corresponds to the 'secondary write failed' warn log.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (command) (rate(proxy_command_total{job=\"elastickv\", status=\"error\"}[5m]))",
+          "legendFormat": "{{command}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Secondary Write Error Rate by Command",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Latency of EVALSHA / EVALSHA_RO commands as seen from the proxy when writing to the secondary. p99 approaching SecondaryTimeout (default 5 s) indicates write-conflict retries or Raft round-trip latency.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "EVALSHA Secondary Latency (p50 / p95 / p99)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
