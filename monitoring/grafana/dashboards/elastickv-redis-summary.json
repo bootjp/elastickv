@@ -1127,7 +1127,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\", outcome=\"success\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\"}[5m])",
+          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\", outcome=\"success\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\", outcome=\"success\"}[5m])",
           "legendFormat": "avg per redis.call()",
           "range": true,
           "refId": "A"

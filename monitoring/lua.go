@@ -41,7 +41,7 @@ type LuaScriptObserver interface {
 type LuaMetrics struct {
 	luaExecDuration   *prometheus.HistogramVec
 	redisCallDuration *prometheus.HistogramVec
-	redisCallCount    prometheus.Histogram
+	redisCallCount    *prometheus.HistogramVec
 	commitDuration    *prometheus.HistogramVec
 	conflictRetries   prometheus.Histogram
 }
@@ -68,12 +68,13 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 			},
 			[]string{"outcome"},
 		),
-		redisCallCount: prometheus.NewHistogram(
+		redisCallCount: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    "elastickv_lua_redis_call_count",
 				Help:    "Number of redis.call()/pcall() invocations per Lua script execution, summed across retries. High counts combined with high redis_call_duration indicate many individual Raft reads.",
 				Buckets: luaCallCountBuckets,
 			},
+			[]string{"outcome"},
 		),
 		commitDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -114,7 +115,7 @@ func (m *LuaMetrics) ObserveLuaScript(report LuaScriptReport) {
 	}
 	m.luaExecDuration.WithLabelValues(outcome).Observe(report.LuaExecDuration.Seconds())
 	m.redisCallDuration.WithLabelValues(outcome).Observe(report.RedisCallDuration.Seconds())
-	m.redisCallCount.Observe(float64(report.RedisCallCount))
+	m.redisCallCount.WithLabelValues(outcome).Observe(float64(report.RedisCallCount))
 	m.commitDuration.WithLabelValues(outcome).Observe(report.CommitDuration.Seconds())
 	m.conflictRetries.Observe(float64(report.ConflictRetries))
 }
