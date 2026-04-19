@@ -121,9 +121,9 @@ func (e *Engine) LeaseDuration() time.Duration
 
 Implementation: `electionTimeout - leaseSafetyMargin`, where
 `electionTimeout = defaultTickInterval * defaultElectionTick`. With current
-config: `10ms * 100 - 100ms = 900 ms`.
+config: `10ms * 100 - 300ms = 700 ms`.
 
-`leaseSafetyMargin` (proposed: 100 ms) absorbs:
+`leaseSafetyMargin` (proposed: 300 ms) absorbs:
 
 - Goroutine scheduling delay between heartbeat ack and lease refresh.
 - Wall-clock skew between leader and the partition's new leader candidate.
@@ -292,7 +292,7 @@ write to commit. However:
 - Clock skew exceeding `leaseSafetyMargin`: lease may extend beyond
   `electionTimeout`, allowing a stale read after a successor leader has
   accepted writes. Mitigation: keep `leaseSafetyMargin` larger than the
-  documented clock-skew SLO of the deployment. Default 100 ms is consistent
+  documented clock-skew SLO of the deployment. Default 300 ms is consistent
   with the HLC physical window of 3 s used elsewhere.
 
 ---
