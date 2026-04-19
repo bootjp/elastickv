@@ -90,6 +90,11 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.redis-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
+      - name: Run Redis ZSet safety Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.redis-zset-safety-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
       - name: Run DynamoDB Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3
