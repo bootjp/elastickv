@@ -5,9 +5,11 @@ import (
 	"crypto/sha1" // #nosec G505 -- Redis EVALSHA specifies SHA1 script digests.
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
@@ -115,8 +117,11 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
+	start := time.Now()
+	var attempts int
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
+		attempts++
 		scriptCtx := newLuaScriptContext(r)
 		defer scriptCtx.Close()
 		state := newRedisLuaState()
@@ -145,7 +150,10 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		reply = nextReply
 		return nil
 	})
+	elapsed := time.Since(start)
 	if err != nil {
+		slog.Default().Warn("lua script execution failed",
+			"elapsed", elapsed, "attempts", attempts, "err", err)
 		conn.WriteError(err.Error())
 		return
 	}

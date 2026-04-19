@@ -274,8 +274,10 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 
 	backoff := compactedRetryInitialBackoff
 	var sErr error
+	var attempt int
+	var usedNOSCRIPTFallback bool
 	args := iArgs
-	for attempt := 0; ; attempt++ {
+	for ; ; attempt++ {
 		result := d.secondary.Do(sCtx, args...)
 		_, sErr = result.Result()
 		if isNoScriptError(sErr) {
@@ -283,6 +285,7 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 			// resolved EVAL args so we don't waste a round-trip on the
 			// known-missing EVALSHA every iteration.
 			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
+				usedNOSCRIPTFallback = true
 				args = fallbackArgs
 				result = d.secondary.Do(sCtx, args...)
 				_, sErr = result.Result()
@@ -302,19 +305,35 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 		backoff = nextCompactedRetryBackoff(backoff)
 	}
 
-	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(time.Since(start).Seconds())
+	elapsed := time.Since(start)
+	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
 
 	if sErr != nil && !errors.Is(sErr, redis.Nil) {
-		d.metrics.SecondaryWriteErrors.Inc()
-		d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "error").Inc()
-		fingerprint := fmt.Sprintf("secondary_write_%s", cmd)
-		if d.sentry.ShouldReport(fingerprint) {
-			d.sentry.CaptureException(sErr, "secondary_write_failure", argsToBytes(iArgs))
-		}
-		d.logger.Warn("secondary write failed", "cmd", cmd, "err", sErr)
+		d.recordSecondaryWriteFailure(cmd, iArgs, elapsed, attempt+1, usedNOSCRIPTFallback, sErr)
 		return
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+}
+
+// recordSecondaryWriteFailure updates metrics, reports to Sentry, and emits a
+// structured warning with enough context to diagnose EVALSHA timeouts.
+func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapsed time.Duration, attempts int, usedNOSCRIPTFallback bool, sErr error) {
+	d.metrics.SecondaryWriteErrors.Inc()
+	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "error").Inc()
+	fingerprint := fmt.Sprintf("secondary_write_%s", cmd)
+	if d.sentry.ShouldReport(fingerprint) {
+		d.sentry.CaptureException(sErr, "secondary_write_failure", argsToBytes(iArgs))
+	}
+	warnArgs := []any{"cmd", cmd, "err", sErr, "elapsed", elapsed, "attempts", attempts}
+	if (cmd == "EVALSHA" || cmd == "EVALSHA_RO") && len(iArgs) > 1 {
+		if sha, ok := iArgs[1].([]byte); ok {
+			warnArgs = append(warnArgs, "sha", string(sha))
+		}
+	}
+	if usedNOSCRIPTFallback {
+		warnArgs = append(warnArgs, "noscript_fallback", true)
+	}
+	d.logger.Warn("secondary write failed", warnArgs...)
 }
 
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early

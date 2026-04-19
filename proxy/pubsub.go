@@ -325,13 +325,13 @@ func (s *pubsubSession) handleTxnInSession(name string, args [][]byte) bool {
 // (not forwarded to a backend). Returns true if the command was handled.
 func (s *pubsubSession) handleProxySpecialCommand(name string, args [][]byte) bool {
 	// AUTH is handled at the connection-pool level; accept silently.
-	if name == "AUTH" {
+	if name == cmdNameAUTH {
 		s.writeString("OK")
 		return true
 	}
 	// Mirror ProxyServer's SELECT handling: accept only the configured DB to
 	// avoid per-connection DB state with pooled connections.
-	if name != "SELECT" {
+	if name != cmdNameSELECT {
 		return false
 	}
 	// Enforce Redis arity: SELECT requires exactly one DB index argument.
