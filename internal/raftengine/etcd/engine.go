@@ -68,6 +68,8 @@ var (
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
 	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer was aborted by raft")
+	errLeadershipTransferRejected = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
@@ -883,7 +885,27 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 		req.done <- adminResult{err: err}
 		return
 	}
+	// Reject transfer requests when the local node is not leader — etcd/raft
+	// would silently drop the MsgTransferLeader in any non-leader state,
+	// leaving the caller to block until the deadline.
+	basicBefore := e.rawNode.BasicStatus()
+	if basicBefore.RaftState != etcdraft.StateLeader {
+		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferNotLeader)}
+		return
+	}
 	e.rawNode.TransferLeader(target.NodeID)
+	// TransferLeader is processed synchronously inside rawNode.TransferLeader.
+	// If raft accepted the request, r.leadTransferee now equals target.NodeID.
+	// If it was silently dropped (e.g. target has no progress entry, is a
+	// learner, or equals the local node), leadTransferee is still zero or
+	// unchanged — surface that as an immediate error rather than letting the
+	// caller poll until its deadline.
+	basicAfter := e.rawNode.BasicStatus()
+	if basicAfter.LeadTransferee != target.NodeID {
+		req.done <- adminResult{err: errors.Wrapf(errLeadershipTransferRejected,
+			"target id=%d addr=%s", target.NodeID, target.Address)}
+		return
+	}
 	req.done <- adminResult{peer: target}
 }
 
