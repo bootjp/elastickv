@@ -630,12 +630,15 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	if g.lease.valid(time.Now()) {
 		return lp.AppliedIndex(), nil
 	}
+	// Sample BEFORE LinearizableRead; the lease window must start at the
+	// quorum confirmation instant, not after the read returned.
+	readStart := time.Now()
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
 		g.lease.invalidate()
 		return 0, err
 	}
-	g.lease.extend(time.Now().Add(lp.LeaseDuration()))
+	g.lease.extend(readStart.Add(lp.LeaseDuration()))
 	return idx, nil
 }
 

@@ -28,14 +28,24 @@ func (s *leaseState) valid(now time.Time) bool {
 	return now.Before(*exp)
 }
 
-// extend sets the lease expiry to until. Concurrent calls race on the
-// pointer swap; the most recent writer wins, which matches the desired
-// semantics (any successful quorum confirmation refreshes the lease).
+// extend sets the lease expiry to until iff until is strictly after the
+// currently stored expiry (or no expiry is stored). The CAS loop prevents
+// an out-of-order writer that sampled time.Now() earlier from overwriting
+// a fresher extension and prematurely shortening the lease, while still
+// allowing invalidate() (which Stores nil) to win unconditionally.
 func (s *leaseState) extend(until time.Time) {
 	if s == nil {
 		return
 	}
-	s.expiry.Store(&until)
+	for {
+		current := s.expiry.Load()
+		if current != nil && !until.After(*current) {
+			return
+		}
+		if s.expiry.CompareAndSwap(current, &until) {
+			return
+		}
+	}
 }
 
 // invalidate clears the lease so the next read takes the slow path.

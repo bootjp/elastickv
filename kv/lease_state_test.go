@@ -45,7 +45,7 @@ func TestLeaseState_InvalidateClears(t *testing.T) {
 	require.False(t, s.valid(now))
 }
 
-func TestLeaseState_ExtendOverwritesEarlierAndLater(t *testing.T) {
+func TestLeaseState_ExtendIsMonotonic(t *testing.T) {
 	t.Parallel()
 	var s leaseState
 	now := time.Now()
@@ -53,12 +53,29 @@ func TestLeaseState_ExtendOverwritesEarlierAndLater(t *testing.T) {
 	s.extend(now.Add(time.Hour))
 	require.True(t, s.valid(now.Add(30*time.Minute)))
 
-	// Shorter extension overwrites — last writer wins, mirroring the
-	// single-atomic-pointer semantics. Practically this is rare because
-	// real callers always extend by LeaseDuration() relative to "now",
-	// which monotonically advances; documenting the behavior here.
+	// A shorter extension must NOT regress the lease: an out-of-order
+	// writer that sampled time.Now() earlier could otherwise prematurely
+	// expire a freshly extended lease and force callers into the slow
+	// path while the leader is still confirmed.
 	s.extend(now.Add(time.Minute))
-	require.False(t, s.valid(now.Add(30*time.Minute)))
+	require.True(t, s.valid(now.Add(30*time.Minute)))
+
+	// A strictly longer extension wins.
+	s.extend(now.Add(2 * time.Hour))
+	require.True(t, s.valid(now.Add(90*time.Minute)))
+}
+
+func TestLeaseState_InvalidateBeatsConcurrentExtend(t *testing.T) {
+	t.Parallel()
+	var s leaseState
+	now := time.Now()
+	s.extend(now.Add(time.Hour))
+
+	// invalidate stores nil unconditionally, even when the current expiry
+	// is in the future. Otherwise leadership-loss callbacks would be
+	// powerless once a lease is in place.
+	s.invalidate()
+	require.False(t, s.valid(now))
 }
 
 func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
