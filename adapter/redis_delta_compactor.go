@@ -720,6 +720,38 @@ func (c *DeltaCompactor) zsetHandler() collectionDeltaHandler {
 	})
 }
 
+// foldSimpleLenDeltas folds deltaKVs and additionalDelta into a new base meta
+// element plus DEL operations for each consumed delta key. It is the shared core
+// used by both the background DeltaCompactor and the inline Lua compaction path.
+func foldSimpleLenDeltas(
+	deltaKVs []*store.KVPair,
+	additionalDelta int64,
+	baseLen int64,
+	metaKey []byte,
+	unmarshalDelta func([]byte) (int64, error),
+	marshalBase func(int64) []byte,
+) ([]*kv.Elem[kv.OP], error) {
+	var deltaSum int64
+	for _, d := range deltaKVs {
+		v, err := unmarshalDelta(d.Value)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		deltaSum += v
+	}
+	newLen := baseLen + deltaSum + additionalDelta
+	if newLen < 0 {
+		newLen = 0
+	}
+	metaElem := simpleMetaElemForLen(metaKey, newLen, marshalBase)
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
+	elems = append(elems, metaElem)
+	for _, d := range deltaKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+	}
+	return elems, nil
+}
+
 // buildSimpleCompactElems folds deltaKVs into a single base-meta update.
 // It is used by Hash, Set, and ZSet compaction, which all carry only a LenDelta.
 func (c *DeltaCompactor) buildSimpleCompactElems(
@@ -743,28 +775,54 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 			return nil, errors.WithStack(err)
 		}
 	}
+	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, metaKey, unmarshalDelta, marshalBase)
+}
 
-	var deltaSum int64
-	for _, d := range deltaKVs {
-		v, unmarshalErr := unmarshalDelta(d.Value)
+// zsetInlineMetaCompactionThreshold is the number of existing ZSetMetaDeltaKey
+// entries at which an inline compaction is triggered during a Lua ZSet delta commit.
+// Aligned with defaultDeltaCompactorMaxDeltaCount so both paths compact at the same rate.
+const zsetInlineMetaCompactionThreshold = defaultDeltaCompactorMaxDeltaCount
+
+// zsetInlineMetaCompactionElems checks whether ZSetMetaDeltaKeys for key have
+// accumulated past the inline threshold. When they have, it returns elems that
+// fold them (together with additionalDelta) into a single base ZSetMetaKey and
+// deletes the old delta keys. Returns (nil, false, nil) when the threshold is not
+// met; the caller should write a new ZSetMetaDeltaKey instead.
+func (r *RedisServer) zsetInlineMetaCompactionElems(
+	ctx context.Context, key []byte, readTS uint64, additionalDelta int64,
+) ([]*kv.Elem[kv.OP], bool, error) {
+	prefix := store.ZSetMetaDeltaScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	// Scan threshold+1 to distinguish "exactly threshold" from "below threshold".
+	deltaKVs, err := r.store.ScanAt(ctx, prefix, end, zsetInlineMetaCompactionThreshold+1, readTS)
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if len(deltaKVs) < zsetInlineMetaCompactionThreshold {
+		return nil, false, nil
+	}
+	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	var baseLen int64
+	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+		return nil, false, errors.WithStack(err)
+	}
+	if err == nil {
+		m, unmarshalErr := store.UnmarshalZSetMeta(raw)
 		if unmarshalErr != nil {
-			return nil, errors.WithStack(unmarshalErr)
+			return nil, false, errors.WithStack(unmarshalErr)
 		}
-		deltaSum += v
+		baseLen = m.Len
 	}
-
-	newLen := baseLen + deltaSum
-	if newLen < 0 {
-		newLen = 0
-	}
-
-	metaElem := simpleMetaElemForLen(metaKey, newLen, marshalBase)
-	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
-	elems = append(elems, metaElem)
-	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
-	}
-	return elems, nil
+	elems, err := foldSimpleLenDeltas(
+		deltaKVs, additionalDelta, baseLen,
+		store.ZSetMetaKey(key),
+		func(b []byte) (int64, error) {
+			d, unmarshalErr := store.UnmarshalZSetMetaDelta(b)
+			return d.LenDelta, errors.WithStack(unmarshalErr)
+		},
+		func(n int64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n}) },
+	)
+	return elems, true, err
 }
 
 // simpleMetaElemForLen returns a Put or Del elem for a Hash/Set/ZSet metadata key.
