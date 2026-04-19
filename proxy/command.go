@@ -15,6 +15,11 @@ const (
 	CmdScript                          // EVAL, EVALSHA
 )
 
+const (
+	cmdNameAUTH   = "AUTH"
+	cmdNameSELECT = "SELECT"
+)
+
 var commandTable = map[string]CommandCategory{
 	// ---- Read commands ----
 	"GET":                  CmdRead,

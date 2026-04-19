@@ -333,7 +333,7 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 
 	// SELECT: accept only the configured DB; reject others since the proxy
 	// uses a shared connection pool and cannot maintain per-client DB state.
-	if name == "SELECT" {
+	if name == cmdNameSELECT {
 		// Redis arity: SELECT <db>. Require exactly one DB argument.
 		if len(args) != selectArgCount {
 			conn.WriteError("ERR wrong number of arguments for 'select' command")
@@ -353,7 +353,7 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 
 	// AUTH is handled at the connection-pool level via config.
 	// Silently accept so clients don't break.
-	if name == "AUTH" {
+	if name == cmdNameAUTH {
 		conn.WriteString("OK")
 		return
 	}
