@@ -16,12 +16,46 @@ import (
 )
 
 const (
-	s3SigV4Algorithm     = "AWS4-HMAC-SHA256"
-	s3UnsignedPayload    = "UNSIGNED-PAYLOAD"
-	s3EmptyPayloadHash   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	s3DateHeaderFormat   = "20060102T150405Z"
-	s3RequestTimeMaxSkew = 15 * time.Minute
+	s3SigV4Algorithm = "AWS4-HMAC-SHA256"
+	// s3UnsignedPayload / s3Streaming* are sentinel values that AWS SDKs may
+	// place in X-Amz-Content-Sha256. None of them are a literal SHA-256 hash
+	// of the body, so the PUT pipeline must skip hash validation when it sees
+	// one. The streaming variants additionally signal that the request body
+	// is framed in the aws-chunked encoding; see adapter/s3_chunked.go.
+	s3UnsignedPayload                 = "UNSIGNED-PAYLOAD"
+	s3StreamingUnsignedPayloadTrailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+	s3StreamingSignedPayload          = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	s3StreamingSignedPayloadTrailer   = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	s3EmptyPayloadHash                = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	s3DateHeaderFormat                = "20060102T150405Z"
+	s3RequestTimeMaxSkew              = 15 * time.Minute
 )
+
+// isS3PayloadMarker reports whether the given X-Amz-Content-Sha256 value is a
+// sentinel (UNSIGNED-PAYLOAD / STREAMING-*) rather than a literal SHA-256
+// hash. Callers MUST NOT try to hash the request body against a marker value.
+func isS3PayloadMarker(hash string) bool {
+	switch {
+	case strings.EqualFold(hash, s3UnsignedPayload),
+		strings.EqualFold(hash, s3StreamingUnsignedPayloadTrailer),
+		strings.EqualFold(hash, s3StreamingSignedPayload),
+		strings.EqualFold(hash, s3StreamingSignedPayloadTrailer):
+		return true
+	}
+	return false
+}
+
+// isS3StreamingPayloadMarker reports whether the payload sentinel indicates
+// an aws-chunked framed body that the server must decode before storing.
+func isS3StreamingPayloadMarker(hash string) bool {
+	switch {
+	case strings.EqualFold(hash, s3StreamingUnsignedPayloadTrailer),
+		strings.EqualFold(hash, s3StreamingSignedPayload),
+		strings.EqualFold(hash, s3StreamingSignedPayloadTrailer):
+		return true
+	}
+	return false
+}
 
 type S3ServerOption func(*S3Server)
 
