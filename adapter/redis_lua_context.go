@@ -19,6 +19,8 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
+	redisCallDuration time.Duration
+
 	touched     map[string]struct{}
 	deleted     map[string]bool
 	everDeleted map[string]bool
@@ -214,11 +216,16 @@ func (c *luaScriptContext) Close() {
 }
 
 func (c *luaScriptContext) exec(command string, args []string) (luaReply, error) {
+	execStart := time.Now()
+	var reply luaReply
+	var err error
 	if handler, ok := luaCommandHandlers[command]; ok {
-		return handler(c, args)
+		reply, err = handler(c, args)
+	} else {
+		err = errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
 	}
-
-	return luaReply{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
+	c.redisCallDuration += time.Since(execStart)
+	return reply, err
 }
 
 func (c *luaScriptContext) markTouched(key []byte) {
