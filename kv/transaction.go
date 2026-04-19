@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -113,7 +114,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		if len(b)+1 > maxMarshaledCommandSize {
+		if len(b) >= maxMarshaledCommandSize {
 			return nil, errors.New("marshaled request too large")
 		}
 		return prependByte(raftEncodeSingle, b), nil
@@ -122,7 +123,7 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if len(b)+1 > maxMarshaledCommandSize {
+	if len(b) >= maxMarshaledCommandSize {
 		return nil, errors.New("marshaled request batch too large")
 	}
 	return prependByte(raftEncodeBatch, b), nil
@@ -130,6 +131,9 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 
 // prependByte returns a new slice with prefix followed by data.
 func prependByte(prefix byte, data []byte) []byte {
+	if len(data) >= math.MaxInt {
+		panic("prependByte: data too large")
+	}
 	out := make([]byte, len(data)+1)
 	out[0] = prefix
 	copy(out[1:], data)
