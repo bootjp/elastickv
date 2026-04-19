@@ -416,6 +416,45 @@ func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
 	require.True(t, client.chunks[1].Final)
 }
 
+// TestSendSnapshotReaderChunksTrailingPartialChunk regressions a production
+// failure where payloads whose length was not a whole multiple of chunkSize
+// had the trailing partial chunk silently dropped. The old loop emitted the
+// last full chunk with Final=true and returned, leaving the partial in
+// `next` unsent. Receivers observed payload_bytes truncated to the previous
+// boundary and FSM.Restore hit readRestoreEntry with unexpected EOF.
+//
+// In the reproduction the exactly-on-boundary case already passed, so the
+// pre-existing TestSendSnapshotReaderChunksExactBoundary missed the bug.
+// This test fixes the coverage gap: chunkSize=4 with a 9-byte payload yields
+// two full chunks plus a 1-byte tail that must arrive.
+func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
+	chunkSize := 4
+	payload := []byte("12345678X")
+	header := []byte("hdr")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 3, "expected two full chunks plus a trailing partial")
+
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+
+	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
+	require.False(t, client.chunks[1].Final)
+
+	require.Equal(t, []byte("X"), client.chunks[2].Chunk)
+	require.True(t, client.chunks[2].Final)
+
+	var delivered []byte
+	for _, c := range client.chunks {
+		delivered = append(delivered, c.Chunk...)
+	}
+	require.Equal(t, payload, delivered)
+}
+
 // --- streamFSMSnapshot tests ---
 
 func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
