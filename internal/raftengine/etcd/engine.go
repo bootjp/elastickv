@@ -660,14 +660,8 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 		if err != nil {
 			return err
 		}
-		status := e.Status()
-		if status.State != raftengine.StateLeader {
-			if status.Leader.ID == target.ID {
-				return nil
-			}
-			if status.Leader.ID != "" {
-				return errors.WithStack(errLeadershipTransferAborted)
-			}
+		if done {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
