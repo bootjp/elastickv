@@ -190,10 +190,12 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 	redisTypeStream: (*luaScriptContext).renameStreamValue,
 }
 
-func newLuaScriptContext(server *RedisServer) (*luaScriptContext, error) {
-	// Verify leadership once here so that all subsequent reads within the script
-	// can use snapshotGetAt (no per-call VerifyLeader round-trip).
-	if err := server.coordinator.VerifyLeader(); err != nil {
+func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptContext, error) {
+	// LinearizableRead confirms leadership via quorum AND waits for the local
+	// FSM to apply all committed entries, so startTS reflects the latest
+	// committed state. All subsequent reads within the script use snapshotGetAt
+	// (no per-call VerifyLeader), making VerifyLeader O(1) per script.
+	if _, err := server.coordinator.LinearizableRead(ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	startTS := server.readTS()

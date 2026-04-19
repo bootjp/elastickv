@@ -1855,3 +1855,7 @@ func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) raft.ServerAddress
 func (w *testCoordinatorWrapper) Clock() *kv.HLC {
 	return w.inner.Clock()
 }
+
+func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, error) {
+	return w.inner.LinearizableRead(ctx)
+}

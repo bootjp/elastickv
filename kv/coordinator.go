@@ -89,6 +89,7 @@ type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
 	VerifyLeader() error
+	LinearizableRead(ctx context.Context) (uint64, error)
 	RaftLeader() raft.ServerAddress
 	IsLeaderForKey(key []byte) bool
 	VerifyLeaderForKey(key []byte) error

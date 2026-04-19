@@ -467,6 +467,10 @@ func (c *followerS3Coordinator) VerifyLeader() error {
 	return kv.ErrLeaderNotFound
 }
 
+func (c *followerS3Coordinator) LinearizableRead(_ context.Context) (uint64, error) {
+	return 0, kv.ErrLeaderNotFound
+}
+
 func (c *followerS3Coordinator) RaftLeader() raft.ServerAddress {
 	return raft.ServerAddress("leader")
 }

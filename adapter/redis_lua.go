@@ -124,7 +124,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
 		attempts++
-		scriptCtx, err := newLuaScriptContext(r)
+		scriptCtx, err := newLuaScriptContext(ctx, r)
 		if err != nil {
 			return err
 		}
@@ -883,7 +883,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 
 	var reply luaReply
 	err := r.retryRedisWrite(ctx, func() error {
-		scriptCtx, err := newLuaScriptContext(r)
+		scriptCtx, err := newLuaScriptContext(ctx, r)
 		if err != nil {
 			return err
 		}

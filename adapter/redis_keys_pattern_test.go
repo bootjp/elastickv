@@ -61,6 +61,10 @@ func (s *stubAdapterCoordinator) Clock() *kv.HLC {
 	return s.clock
 }
 
+func (s *stubAdapterCoordinator) LinearizableRead(_ context.Context) (uint64, error) {
+	return 0, s.verifyLeaderErr
+}
+
 func (s *stubAdapterCoordinator) VerifyLeaderCalls() int32 {
 	if s == nil {
 		return 0
