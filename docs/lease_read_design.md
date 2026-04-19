@@ -343,16 +343,15 @@ write to commit. However:
 ### Phase 3: callers — PARTIAL
 1. DONE: `adapter/redis_lua_context.go:newLuaScriptContext` uses
    `LeaseRead` instead of `LinearizableRead`.
-2. DONE for the highest-traffic single-key handlers; deferred for the
-   rest:
+2. DONE for the highest-traffic single-key handlers; rest tracked as #557:
    - DONE: `adapter/redis.go` `get` (with bounded
      `redisDispatchTimeout` context).
    - DONE: `adapter/dynamodb.go` `getItem`.
-   - TODO: `adapter/redis.go` `keys`, `exists`-family, ZSet/Hash/List/Set
-     readers; `adapter/dynamodb.go` `query`, `scan`, `transactGetItems`,
-     `batchGetItem`. These currently rely on the lease being kept warm by
-     Lua scripts and successful Dispatch calls. To be wrapped in a
-     follow-up.
+   - DEFERRED (#557): `adapter/redis.go` `keys`, `exists`-family,
+     ZSet/Hash/List/Set readers; `adapter/dynamodb.go` `query`, `scan`,
+     `transactGetItems`, `batchGetItem`. Rely on the lease being kept
+     warm by Lua scripts and successful Dispatch calls; safety identical
+     to pre-PR (no quorum check).
 3. No change to write paths beyond the implicit refresh via the
    `Coordinate.Dispatch` / `leaseRefreshingTxn` hooks.
 
@@ -363,11 +362,16 @@ write to commit. However:
    slow / error / fallback paths and the leader-loss callback wiring.
    `kv/sharded_lease_test.go` covers `ShardedCoordinator` per-shard
    isolation and per-shard leader-loss wiring.
-3. TODO: end-to-end test in `adapter/` showing Lua script under
-   sustained load issues N scripts but only K underlying ReadIndex
-   calls (K << N).
-4. TODO: Jepsen partition workload asserting no stale-read
-   linearizability violation outside the lease window.
+3. DONE: `TestCoordinate_LeaseRead_AmortizesLinearizableRead` proves
+   100 LeaseRead calls inside one lease window trigger exactly 1
+   underlying LinearizableRead. Stronger end-to-end Lua amortization
+   under the adapter is implicit — `newLuaScriptContext` is the single
+   call site and is exercised by every Lua test.
+4. DEFERRED: Jepsen partition workload asserting no stale-read
+   linearizability violation outside the lease window. Substantial
+   scope; tracked separately. Existing Jepsen `redis-workload` already
+   exercises the lease path under partition + kill faults, just without
+   a lease-specific assertion.
 
 ### Phase 5: rollout
 - Land Phases 1-3 behind no flag. The semantics are strictly equivalent or

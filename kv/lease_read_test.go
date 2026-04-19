@@ -181,3 +181,25 @@ func TestCoordinate_RegistersLeaderLossCallback(t *testing.T) {
 	require.False(t, c.lease.valid(time.Now()),
 		"leader-loss callback must invalidate the lease")
 }
+
+// --- Amortization end-to-end ---------------------------------------------
+
+// TestCoordinate_LeaseRead_AmortizesLinearizableRead is the Phase-4 design
+// item proving the lease actually amortizes the cost: N calls within a
+// single lease window must trigger only the first slow-path
+// LinearizableRead and N-1 fast-path returns.
+func TestCoordinate_LeaseRead_AmortizesLinearizableRead(t *testing.T) {
+	t.Parallel()
+	const N = 100
+	eng := &fakeLeaseEngine{applied: 9, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	for i := 0; i < N; i++ {
+		idx, err := c.LeaseRead(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, uint64(9), idx)
+	}
+
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"100 LeaseRead calls inside the lease window should trigger exactly 1 LinearizableRead")
+}
