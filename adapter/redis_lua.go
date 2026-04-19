@@ -120,7 +120,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 
 	start := time.Now()
 	var attempts int
-	var totalLuaExec, totalCommit time.Duration
+	var totalLuaExec, totalCommit, totalRedisCall time.Duration
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
 		attempts++
@@ -142,6 +142,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 			return errors.WithStack(err)
 		}
 		totalLuaExec += time.Since(luaStart)
+		totalRedisCall += scriptCtx.redisCallDuration
 
 		result := state.Get(-1)
 		defer state.Pop(1)
@@ -163,10 +164,11 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 	elapsed := time.Since(start)
 	if r.luaObserver != nil {
 		r.luaObserver.ObserveLuaScript(monitoring.LuaScriptReport{
-			LuaExecDuration: totalLuaExec,
-			CommitDuration:  totalCommit,
-			ConflictRetries: attempts - 1,
-			IsError:         err != nil,
+			LuaExecDuration:  totalLuaExec,
+			RedisCallDuration: totalRedisCall,
+			CommitDuration:   totalCommit,
+			ConflictRetries:  attempts - 1,
+			IsError:          err != nil,
 		})
 	}
 	if err != nil {

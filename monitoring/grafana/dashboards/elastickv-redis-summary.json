@@ -704,7 +704,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Time spent purely in the Lua VM (state.PCall) per script invocation, summed across write-conflict retries. High p99 here means the Lua script itself is the bottleneck, not Raft or storage.",
+      "description": "Total time inside state.PCall per script invocation (includes redis.call() handler time). Compare with 'redis.call() Time' panel to separate pure VM overhead from distributed read latency.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -896,6 +896,130 @@
         }
       ],
       "title": "Write-Conflict Retries per Script (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Time spent inside redis.call()/pcall() handlers per script invocation (Raft reads + in-memory state updates). Pure Lua VM time = 'Lua VM Execution Time' minus this value. High values here indicate distributed read latency is the bottleneck, not the Lua VM itself.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p50 redis.call()",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p95 redis.call()",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p99 redis.call()",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "redis.call() Time inside Lua Script (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Fraction of PCall time consumed by redis.call() handlers. Values near 100% confirm the bottleneck is distributed read latency, not the Lua VM.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m]))) / histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p50 redis.call() fraction",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m]))) / histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p99 redis.call() fraction",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "redis.call() Time as Fraction of Lua PCall Time",
       "type": "timeseries"
     }
   ],
