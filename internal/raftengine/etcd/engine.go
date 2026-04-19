@@ -22,8 +22,8 @@ import (
 
 const (
 	defaultTickInterval  = 10 * time.Millisecond
-	defaultHeartbeatTick = 10 // 100ms at 10ms interval
-	defaultElectionTick  = 50 // 500ms at 10ms interval
+	defaultHeartbeatTick = 10  // 100ms at 10ms interval
+	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
@@ -694,7 +694,9 @@ func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPe
 		// No known leader yet; keep polling until one is elected.
 		return false, nil
 	}
-	if status.LeadTransferee != 0 {
+	// Match the transferee against the specific target to avoid tracking a
+	// stale or unrelated transfer that was initiated by a different caller.
+	if status.LeadTransferee == target.NodeID {
 		*sawPending = true
 		return false, nil
 	}
