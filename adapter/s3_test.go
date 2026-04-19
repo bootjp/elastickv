@@ -704,6 +704,14 @@ func (c *followerS3Coordinator) LinearizableRead(_ context.Context) (uint64, err
 	return 0, kv.ErrLeaderNotFound
 }
 
+func (c *followerS3Coordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
+
+func (c *followerS3Coordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
+
 func (c *followerS3Coordinator) RaftLeader() raft.ServerAddress {
 	return raft.ServerAddress("leader")
 }

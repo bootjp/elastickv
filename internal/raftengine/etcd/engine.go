@@ -24,6 +24,12 @@ const (
 	defaultTickInterval  = 10 * time.Millisecond
 	defaultHeartbeatTick = 10  // 100ms at 10ms interval
 	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
+	// leaseSafetyMargin is subtracted from electionTimeout when computing the
+	// duration of a leader-local read lease. It absorbs goroutine scheduling
+	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
+	// and bounded wall-clock skew between the leader and a partition's new
+	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
@@ -108,6 +114,7 @@ type Engine struct {
 	dataDir      string
 	fsmSnapDir   string
 	tickInterval time.Duration
+	electionTick int
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -290,6 +297,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		dataDir:          prepared.cfg.DataDir,
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
+		electionTick:     prepared.cfg.ElectionTick,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
@@ -519,6 +527,43 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return e.submitRead(ctx, true)
+}
+
+// LeaseDuration returns the time during which a lease holder can serve
+// reads from local state without re-confirming leadership via ReadIndex.
+// It is bounded by electionTimeout - leaseSafetyMargin so that the lease
+// expires before a successor leader could realistically be elected and
+// accept new writes elsewhere.
+func (e *Engine) LeaseDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	tick := e.tickInterval
+	if tick <= 0 {
+		tick = defaultTickInterval
+	}
+	election := e.electionTick
+	if election <= 0 {
+		election = defaultElectionTick
+	}
+	d := time.Duration(election)*tick - leaseSafetyMargin
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// AppliedIndex returns the highest log index applied to the local FSM.
+// Suitable for callers that need a non-blocking read fence equivalent to
+// what LinearizableRead would have returned, paired with an external
+// quorum confirmation (e.g. a valid lease).
+func (e *Engine) AppliedIndex() uint64 {
+	if e == nil {
+		return 0
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.status.AppliedIndex
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {

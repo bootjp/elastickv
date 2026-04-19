@@ -81,6 +81,7 @@ type Coordinate struct {
 	clock              *HLC
 	connCache          GRPCConnCache
 	log                *slog.Logger
+	lease              leaseState
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -90,9 +91,11 @@ type Coordinator interface {
 	IsLeader() bool
 	VerifyLeader() error
 	LinearizableRead(ctx context.Context) (uint64, error)
+	LeaseRead(ctx context.Context) (uint64, error)
 	RaftLeader() raft.ServerAddress
 	IsLeaderForKey(key []byte) bool
 	VerifyLeaderForKey(key []byte) error
+	LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
 	RaftLeaderForKey(key []byte) raft.ServerAddress
 	Clock() *HLC
 }
@@ -213,6 +216,34 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 
 func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return c.LinearizableRead(ctx)
+}
+
+// LeaseRead returns a read fence backed by a leader-local lease when
+// available, falling back to a full LinearizableRead when the lease has
+// expired or the underlying engine does not implement LeaseProvider.
+//
+// The returned index is the engine's current applied index (fast path) or
+// the index returned by LinearizableRead (slow path). Callers that resolve
+// timestamps via store.LastCommitTS may discard the value.
+func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return c.LinearizableRead(ctx)
+	}
+	if c.lease.valid(time.Now()) {
+		return lp.AppliedIndex(), nil
+	}
+	idx, err := c.LinearizableRead(ctx)
+	if err != nil {
+		c.lease.invalidate()
+		return 0, err
+	}
+	c.lease.extend(time.Now().Add(lp.LeaseDuration()))
+	return idx, nil
+}
+
+func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LeaseRead(ctx)
 }
 
 func (c *Coordinate) nextStartTS() uint64 {

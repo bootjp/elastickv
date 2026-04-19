@@ -65,6 +65,14 @@ func (s *stubAdapterCoordinator) LinearizableRead(_ context.Context) (uint64, er
 	return 0, s.verifyLeaderErr
 }
 
+func (s *stubAdapterCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
+
+func (s *stubAdapterCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
+
 func (s *stubAdapterCoordinator) VerifyLeaderCalls() int32 {
 	if s == nil {
 		return 0

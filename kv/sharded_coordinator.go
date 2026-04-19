@@ -21,6 +21,7 @@ type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
+	lease  leaseState
 }
 
 const (
@@ -597,6 +598,45 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
+}
+
+// LeaseRead routes through the default group's lease. See Coordinate.LeaseRead
+// for semantics.
+func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	g, ok := c.groups[c.defaultGroup]
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return groupLeaseRead(ctx, g)
+}
+
+// LeaseReadForKey performs the lease check on the shard group that owns key.
+// Each group maintains its own lease since each group has independent
+// leadership and term.
+func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return groupLeaseRead(ctx, g)
+}
+
+func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
+	engine := engineForGroup(g)
+	lp, ok := engine.(raftengine.LeaseProvider)
+	if !ok {
+		return linearizableReadEngineCtx(ctx, engine)
+	}
+	if g.lease.valid(time.Now()) {
+		return lp.AppliedIndex(), nil
+	}
+	idx, err := linearizableReadEngineCtx(ctx, engine)
+	if err != nil {
+		g.lease.invalidate()
+		return 0, err
+	}
+	g.lease.extend(time.Now().Add(lp.LeaseDuration()))
+	return idx, nil
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

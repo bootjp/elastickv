@@ -67,6 +67,18 @@ type LeaderView interface {
 	LinearizableRead(ctx context.Context) (uint64, error)
 }
 
+// LeaseProvider is an optional capability implemented by engines that support
+// leader-local lease reads. Callers that want lease-based reads should
+// type-assert to this interface and fall back to LinearizableRead when the
+// underlying engine does not implement it.
+type LeaseProvider interface {
+	// LeaseDuration returns the time during which a lease holder can serve
+	// reads from local state without re-confirming leadership via ReadIndex.
+	LeaseDuration() time.Duration
+	// AppliedIndex returns the highest log index applied to the local FSM.
+	AppliedIndex() uint64
+}
+
 type StatusReader interface {
 	Status() Status
 }

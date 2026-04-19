@@ -747,3 +747,11 @@ func (s *distributionCoordinatorStub) Clock() *kv.HLC {
 func (s *distributionCoordinatorStub) LinearizableRead(_ context.Context) (uint64, error) {
 	return 0, nil
 }
+
+func (s *distributionCoordinatorStub) LeaseRead(ctx context.Context) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
+
+func (s *distributionCoordinatorStub) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
