@@ -287,3 +287,65 @@ func TestRetryPolicyForRedisTxnErr(t *testing.T) {
 	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(store.ErrWriteConflict))
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrTxnLocked))
 }
+
+// TestZCard_LegacyBlobZSet verifies that ZCARD inside a Lua script returns the
+// correct member count for a ZSet stored in the legacy single-blob format.
+// Before the fix, zsetCard fell through to resolveZSetMeta which found no
+// wide-column ZSetMetaKey and returned 0 for legacy-blob ZSets.
+func TestZCard_LegacyBlobZSet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+
+	payload, err := marshalZSetValue(redisZSetValue{
+		Entries: []redisZSetEntry{
+			{Member: "a", Score: 1.0},
+			{Member: "b", Score: 2.0},
+			{Member: "c", Score: 3.0},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisZSetKey([]byte("legacy:zset")), payload, 1, 0))
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: &stubAdapterCoordinator{clock: kv.NewHLC()},
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+	srv.runLuaScript(conn, `return redis.call("ZCARD", KEYS[1])`, [][]byte{
+		[]byte("1"),
+		[]byte("legacy:zset"),
+	})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(3), conn.int)
+}
+
+// TestZAdd_XX_MissingKey_NoPhantom verifies that ZADD with the XX flag on a
+// key that does not exist does not create a phantom key visible to subsequent
+// EXISTS/TYPE calls within the same script.
+func TestZAdd_XX_MissingKey_NoPhantom(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := &stubAdapterCoordinator{clock: kv.NewHLC()}
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+	// ZADD XX on a non-existent key must not create the key; EXISTS must return 0.
+	srv.runLuaScript(conn, `
+		redis.call("ZADD", KEYS[1], "XX", 1, "member")
+		return redis.call("EXISTS", KEYS[1])
+	`, [][]byte{
+		[]byte("1"),
+		[]byte("phantom:zset"),
+	})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(0), conn.int, "ZADD XX on missing key must not create a phantom key")
+}

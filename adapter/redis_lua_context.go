@@ -773,12 +773,20 @@ func (c *luaScriptContext) memberScoreFromPebble(st *luaZSetState, key []byte, m
 // len(st.members); otherwise it reads the base metadata from storage and adds
 // the in-script lenDelta, which is O(log N). The storage-level result is cached
 // in st so repeated ZCARD calls within the same script do not re-scan delta keys.
+// For legacy-blob ZSets there is no wide-column ZSetMetaKey, so resolveZSetMeta
+// would return 0; ensureZSetLoaded is used instead to get the real count.
 func (c *luaScriptContext) zsetCard(st *luaZSetState, key []byte) (int64, error) {
 	if st.membersLoaded {
 		return int64(len(st.members)), nil
 	}
 	if !st.exists {
 		return 0, nil
+	}
+	if st.legacyBlobBase {
+		if err := c.ensureZSetLoaded(st, key); err != nil {
+			return 0, err
+		}
+		return int64(len(st.members)), nil
 	}
 	if !st.resolvedBaseCardCached {
 		baseLen, _, err := c.server.resolveZSetMeta(context.Background(), key, c.startTS)
