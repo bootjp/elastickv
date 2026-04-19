@@ -67,7 +67,7 @@ var (
 	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer was aborted by raft")
+	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer aborted: a different leader was elected")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
