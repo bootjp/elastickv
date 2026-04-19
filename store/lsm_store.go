@@ -82,8 +82,14 @@ func WithPebbleLogger(l *slog.Logger) PebbleStoreOption {
 // defaultPebbleOptions returns the standard Pebble options used throughout
 // the store (including restores) to ensure consistent behaviour between a
 // freshly opened and a restored/swapped-in database.
+//
+// FormatMajorVersion is pinned to ratchet v1-era DBs above pebble v2's
+// FormatMinSupported (FormatFlushableIngest) before the v2 upgrade lands.
 func defaultPebbleOptions() *pebble.Options {
-	opts := &pebble.Options{FS: vfs.Default}
+	opts := &pebble.Options{
+		FS:                 vfs.Default,
+		FormatMajorVersion: pebble.FormatVirtualSSTables,
+	}
 	// Enable automatic compactions and apply all other Pebble defaults.
 	opts.EnsureDefaults()
 	return opts
