@@ -575,26 +575,46 @@ func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []by
 		}
 		return errors.WithStack(err)
 	}
+	return streamReaderChunks(stream, header, buffered, current, chunkSize)
+}
+
+// streamReaderChunks drains buffered starting from `current` (the first full
+// chunk already read by the caller) and emits gRPC chunks. When the payload
+// length is not a whole multiple of chunkSize the last readSnapshotChunk call
+// returns (partial, io.EOF) via io.ErrUnexpectedEOF: in that case `current`
+// is still a full chunk that must be flushed as non-final and `next` is the
+// trailing partial that must be emitted as the final chunk. Emitting only
+// `current` with Final=true would silently drop the trailing bytes and
+// truncate the stream to the previous chunkSize boundary on the receiver.
+func streamReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, buffered *bufio.Reader, current []byte, chunkSize int) error {
 	first := true
 	for {
 		next, nextErr := readSnapshotChunk(buffered, chunkSize)
 		final := errors.Is(nextErr, io.EOF)
 		if nextErr != nil && !final {
-			return errors.WithStack(nextErr)
+			return nextErr
 		}
-		chunk := &pb.EtcdRaftSnapshotChunk{
-			Chunk: append([]byte(nil), current...),
-			Final: final,
+		isLast := final && len(next) == 0
+		metadata := header
+		if !first {
+			metadata = nil
 		}
-		if first {
-			chunk.Metadata = header
-			first = false
-		}
-		if err := sendSnapshotChunk(stream, chunk); err != nil {
+		first = false
+		if err := sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
+			Metadata: metadata,
+			Chunk:    current,
+			Final:    isLast,
+		}); err != nil {
 			return err
 		}
-		if final {
+		if isLast {
 			return nil
+		}
+		if final {
+			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
+				Chunk: next,
+				Final: true,
+			})
 		}
 		current = next
 	}
