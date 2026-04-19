@@ -18,7 +18,6 @@ require (
 	github.com/getsentry/sentry-go v0.44.1
 	github.com/goccy/go-json v0.10.6
 	github.com/hashicorp/go-hclog v1.6.3
-	github.com/hashicorp/go-msgpack/v2 v2.1.5
 	github.com/hashicorp/raft v1.7.3
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.23.2
@@ -28,7 +27,6 @@ require (
 	github.com/tidwall/redcon v1.6.2
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/yuin/gopher-lua v1.1.2
-	go.etcd.io/bbolt v1.4.3
 	go.etcd.io/etcd/server/v3 v3.6.10
 	go.etcd.io/raft/v3 v3.6.0
 	go.uber.org/zap v1.27.1
@@ -77,6 +75,7 @@ require (
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-metrics v0.5.4 // indirect
+	github.com/hashicorp/go-msgpack/v2 v2.1.5 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
@@ -96,6 +95,7 @@ require (
 	github.com/tidwall/btree v1.1.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	go.etcd.io/bbolt v1.4.3 // indirect
 	go.etcd.io/etcd/api/v3 v3.6.10 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.6.10 // indirect
 	go.etcd.io/etcd/client/v3 v3.6.10 // indirect

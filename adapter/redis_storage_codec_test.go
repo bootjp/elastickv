@@ -3,7 +3,6 @@ package adapter
 import (
 	"testing"
 
-	json "github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,18 +23,6 @@ func TestStoredRedisHashCodec_RoundTripProto(t *testing.T) {
 	require.Equal(t, value, decoded)
 }
 
-func TestStoredRedisHashCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	legacy := redisHashValue{"field": "value"}
-	body, err := json.Marshal(legacy)
-	require.NoError(t, err)
-
-	decoded, err := unmarshalHashValue(body)
-	require.NoError(t, err)
-	require.Equal(t, legacy, decoded)
-}
-
 func TestStoredRedisSetCodec_RoundTripProto(t *testing.T) {
 	t.Parallel()
 
@@ -44,18 +31,6 @@ func TestStoredRedisSetCodec_RoundTripProto(t *testing.T) {
 	body, err := marshalSetValue(value)
 	require.NoError(t, err)
 	require.True(t, hasStoredRedisPrefix(body, storedRedisSetProtoPrefix))
-
-	decoded, err := unmarshalSetValue(body)
-	require.NoError(t, err)
-	require.Equal(t, redisSetValue{Members: []string{"a", "b"}}, decoded)
-}
-
-func TestStoredRedisSetCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	legacy := redisSetValue{Members: []string{"b", "a"}}
-	body, err := json.Marshal(legacy)
-	require.NoError(t, err)
 
 	decoded, err := unmarshalSetValue(body)
 	require.NoError(t, err)
@@ -86,28 +61,6 @@ func TestStoredRedisZSetCodec_RoundTripProto(t *testing.T) {
 	}, decoded)
 }
 
-func TestStoredRedisZSetCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	legacy := redisZSetValue{
-		Entries: []redisZSetEntry{
-			{Member: "b", Score: 2},
-			{Member: "a", Score: 1},
-		},
-	}
-	body, err := json.Marshal(legacy)
-	require.NoError(t, err)
-
-	decoded, err := unmarshalZSetValue(body)
-	require.NoError(t, err)
-	require.Equal(t, redisZSetValue{
-		Entries: []redisZSetEntry{
-			{Member: "a", Score: 1},
-			{Member: "b", Score: 2},
-		},
-	}, decoded)
-}
-
 func TestStoredRedisStreamCodec_RoundTripProto(t *testing.T) {
 	t.Parallel()
 
@@ -126,26 +79,4 @@ func TestStoredRedisStreamCodec_RoundTripProto(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, value, decoded)
 	require.True(t, decoded.Entries[0].parsedIDValid)
-}
-
-func TestStoredRedisStreamCodec_LegacyJSONFallback(t *testing.T) {
-	t.Parallel()
-
-	legacy := redisStreamValue{
-		Entries: []redisStreamEntry{
-			{ID: "1001-0", Fields: []string{"field", "value"}},
-			{ID: "1002-0", Fields: []string{"field", "value-2"}},
-		},
-	}
-	body, err := json.Marshal(legacy)
-	require.NoError(t, err)
-
-	decoded, err := unmarshalStreamValue(body)
-	require.NoError(t, err)
-	require.Equal(t, redisStreamValue{
-		Entries: []redisStreamEntry{
-			newRedisStreamEntry("1001-0", []string{"field", "value"}),
-			newRedisStreamEntry("1002-0", []string{"field", "value-2"}),
-		},
-	}, decoded)
 }

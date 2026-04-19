@@ -6,7 +6,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	json "github.com/goccy/go-json"
 	gproto "google.golang.org/protobuf/proto"
 )
 
@@ -17,7 +16,8 @@ var (
 	storedRedisStreamProtoPrefix = []byte{0x00, 'R', 'X', 0x01}
 	storedRedisMarshalOptions    = gproto.MarshalOptions{Deterministic: true}
 
-	errStoredRedisMessageTooLarge = errors.New("stored redis message too large")
+	errStoredRedisMessageTooLarge    = errors.New("stored redis message too large")
+	errUnrecognizedStoredRedisFormat = errors.New("unrecognized stored redis format")
 )
 
 func marshalHashValue(v redisHashValue) ([]byte, error) {
@@ -31,19 +31,14 @@ func unmarshalHashValue(raw []byte) (redisHashValue, error) {
 	if len(raw) == 0 {
 		return redisHashValue{}, nil
 	}
-	if hasStoredRedisPrefix(raw, storedRedisHashProtoPrefix) {
-		msg := &pb.RedisHashValue{}
-		if err := gproto.Unmarshal(raw[len(storedRedisHashProtoPrefix):], msg); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return redisHashValueFromProto(msg), nil
+	if !hasStoredRedisPrefix(raw, storedRedisHashProtoPrefix) {
+		return nil, errUnrecognizedStoredRedisFormat
 	}
-
-	out := redisHashValue{}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	msg := &pb.RedisHashValue{}
+	if err := gproto.Unmarshal(raw[len(storedRedisHashProtoPrefix):], msg); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return out, nil
+	return redisHashValueFromProto(msg), nil
 }
 
 func marshalSetValue(v redisSetValue) ([]byte, error) {
@@ -55,18 +50,14 @@ func unmarshalSetValue(raw []byte) (redisSetValue, error) {
 	if len(raw) == 0 {
 		return redisSetValue{}, nil
 	}
-	var out redisSetValue
-	if hasStoredRedisPrefix(raw, storedRedisSetProtoPrefix) {
-		msg := &pb.RedisSetValue{}
-		if err := gproto.Unmarshal(raw[len(storedRedisSetProtoPrefix):], msg); err != nil {
-			return redisSetValue{}, errors.WithStack(err)
-		}
-		out = redisSetValueFromProto(msg)
-	} else {
-		if err := json.Unmarshal(raw, &out); err != nil {
-			return redisSetValue{}, errors.WithStack(err)
-		}
+	if !hasStoredRedisPrefix(raw, storedRedisSetProtoPrefix) {
+		return redisSetValue{}, errUnrecognizedStoredRedisFormat
 	}
+	msg := &pb.RedisSetValue{}
+	if err := gproto.Unmarshal(raw[len(storedRedisSetProtoPrefix):], msg); err != nil {
+		return redisSetValue{}, errors.WithStack(err)
+	}
+	out := redisSetValueFromProto(msg)
 	sortStrings(out.Members)
 	return out, nil
 }
@@ -80,18 +71,14 @@ func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
 	if len(raw) == 0 {
 		return redisZSetValue{}, nil
 	}
-	var out redisZSetValue
-	if hasStoredRedisPrefix(raw, storedRedisZSetProtoPrefix) {
-		msg := &pb.RedisZSetValue{}
-		if err := gproto.Unmarshal(raw[len(storedRedisZSetProtoPrefix):], msg); err != nil {
-			return redisZSetValue{}, errors.WithStack(err)
-		}
-		out = redisZSetValueFromProto(msg)
-	} else {
-		if err := json.Unmarshal(raw, &out); err != nil {
-			return redisZSetValue{}, errors.WithStack(err)
-		}
+	if !hasStoredRedisPrefix(raw, storedRedisZSetProtoPrefix) {
+		return redisZSetValue{}, errUnrecognizedStoredRedisFormat
 	}
+	msg := &pb.RedisZSetValue{}
+	if err := gproto.Unmarshal(raw[len(storedRedisZSetProtoPrefix):], msg); err != nil {
+		return redisZSetValue{}, errors.WithStack(err)
+	}
+	out := redisZSetValueFromProto(msg)
 	sortZSetEntries(out.Entries)
 	return out, nil
 }
@@ -104,21 +91,14 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 	if len(raw) == 0 {
 		return redisStreamValue{}, nil
 	}
-	if hasStoredRedisPrefix(raw, storedRedisStreamProtoPrefix) {
-		msg := &pb.RedisStreamValue{}
-		if err := gproto.Unmarshal(raw[len(storedRedisStreamProtoPrefix):], msg); err != nil {
-			return redisStreamValue{}, errors.WithStack(err)
-		}
-		return redisStreamValueFromProto(msg), nil
+	if !hasStoredRedisPrefix(raw, storedRedisStreamProtoPrefix) {
+		return redisStreamValue{}, errUnrecognizedStoredRedisFormat
 	}
-
-	var out redisStreamValue
-	if err := json.Unmarshal(raw, &out); err != nil {
+	msg := &pb.RedisStreamValue{}
+	if err := gproto.Unmarshal(raw[len(storedRedisStreamProtoPrefix):], msg); err != nil {
 		return redisStreamValue{}, errors.WithStack(err)
 	}
-	// Legacy JSON payloads were stored in-order, so only cache parsed IDs.
-	out.cacheParsedIDs()
-	return out, nil
+	return redisStreamValueFromProto(msg), nil
 }
 
 func marshalStoredRedisMessage(prefix []byte, msg gproto.Message) ([]byte, error) {

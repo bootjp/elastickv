@@ -10,6 +10,13 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+func newRedisStorageMigrationTestServer(t *testing.T) (*RedisServer, store.MVCCStore) {
+	t.Helper()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	return server, st
+}
+
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a
 // concurrent RPUSH to a list triggers an OCC read-write conflict for a MULTI
 // transaction that read the list via LRANGE.  Without the boundary key tracking
