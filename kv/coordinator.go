@@ -55,6 +55,12 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	for _, opt := range opts {
 		opt(c)
 	}
+	// Register a leader-loss hook so the lease is invalidated the instant
+	// the engine notices a state transition out of the leader role,
+	// rather than waiting for wall-clock expiry of the current lease.
+	if lp, ok := engine.(raftengine.LeaseProvider); ok {
+		lp.RegisterLeaderLossCallback(c.lease.invalidate)
+	}
 	return c
 }
 

@@ -77,6 +77,13 @@ type LeaseProvider interface {
 	LeaseDuration() time.Duration
 	// AppliedIndex returns the highest log index applied to the local FSM.
 	AppliedIndex() uint64
+	// RegisterLeaderLossCallback registers fn to be invoked whenever the
+	// local node leaves the leader role (graceful transfer, partition
+	// step-down, or shutdown). Callers use this to invalidate any
+	// leader-local lease they hold so the next read takes the slow path.
+	// Multiple callbacks can be registered; each fires synchronously from
+	// the engine's status refresh and must not block.
+	RegisterLeaderLossCallback(fn func())
 }
 
 type StatusReader interface {

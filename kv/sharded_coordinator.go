@@ -49,6 +49,12 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	router := NewShardRouter(engine)
 	for gid, g := range groups {
 		router.Register(gid, g.Txn, g.Store)
+		// Per-shard leader-loss hook: when this group's engine notices
+		// a state transition out of leader, drop the lease so the next
+		// LeaseReadForKey on that shard takes the slow path.
+		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
+			lp.RegisterLeaderLossCallback(g.lease.invalidate)
+		}
 	}
 	return &ShardedCoordinator{
 		engine:       engine,

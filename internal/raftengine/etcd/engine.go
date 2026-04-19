@@ -172,6 +172,13 @@ type Engine struct {
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
 
+	// leaderLossCbsMu guards the slice of callbacks invoked when the node
+	// transitions out of the leader role (graceful transfer, partition
+	// step-down, shutdown). Callbacks fire synchronously from
+	// refreshStatus and must not block.
+	leaderLossCbsMu sync.Mutex
+	leaderLossCbs   []func()
+
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
 	pendingConfigs   map[uint64]adminRequest
@@ -564,6 +571,32 @@ func (e *Engine) AppliedIndex() uint64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.status.AppliedIndex
+}
+
+// RegisterLeaderLossCallback registers fn to fire on every transition
+// out of the leader role (including LeadTransferee != 0 hand-off,
+// CheckQuorum step-down, and shutdown). Used by lease-read callers to
+// invalidate cached lease state so the next read takes the slow path.
+func (e *Engine) RegisterLeaderLossCallback(fn func()) {
+	if e == nil || fn == nil {
+		return
+	}
+	e.leaderLossCbsMu.Lock()
+	e.leaderLossCbs = append(e.leaderLossCbs, fn)
+	e.leaderLossCbsMu.Unlock()
+}
+
+// fireLeaderLossCallbacks invokes all registered callbacks. Safe to call
+// from refreshStatus while holding no engine locks; callbacks run
+// synchronously and must not block.
+func (e *Engine) fireLeaderLossCallbacks() {
+	e.leaderLossCbsMu.Lock()
+	cbs := make([]func(), len(e.leaderLossCbs))
+	copy(cbs, e.leaderLossCbs)
+	e.leaderLossCbsMu.Unlock()
+	for _, fn := range cbs {
+		fn()
+	}
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {
@@ -1655,6 +1688,11 @@ func (e *Engine) refreshStatus() {
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
+		// Notify lease holders so they invalidate any cached lease;
+		// without this hook, a former leader keeps serving fast-path
+		// reads from local state for up to LeaseDuration after a
+		// successor leader is already accepting writes.
+		e.fireLeaderLossCallbacks()
 	}
 }
 
