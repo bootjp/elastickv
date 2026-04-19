@@ -933,9 +933,10 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 	}
 	// Reject transfer requests when the local node is not leader — etcd/raft
 	// would silently drop the MsgTransferLeader in any non-leader state,
-	// leaving the caller to block until the deadline.
-	basicBefore := e.rawNode.BasicStatus()
-	if basicBefore.RaftState != etcdraft.StateLeader {
+	// leaving the caller to block until the deadline. handleTransferLeadership
+	// runs on the single-threaded event loop, so rawNode state reads here are
+	// not racy with other rawNode mutations.
+	if e.rawNode.BasicStatus().RaftState != etcdraft.StateLeader {
 		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferNotLeader)}
 		return
 	}
@@ -946,8 +947,7 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 	// learner, or equals the local node), leadTransferee is still zero or
 	// unchanged — surface that as an immediate error rather than letting the
 	// caller poll until its deadline.
-	basicAfter := e.rawNode.BasicStatus()
-	if basicAfter.LeadTransferee != target.NodeID {
+	if e.rawNode.BasicStatus().LeadTransferee != target.NodeID {
 		req.done <- adminResult{err: errors.Wrapf(errLeadershipTransferRejected,
 			"target id=%d addr=%s", target.NodeID, target.Address)}
 		return
