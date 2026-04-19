@@ -161,33 +161,44 @@ The lease is invalidated (set to nil) on:
 ### 3.5 API
 
 ```go
-// kv/coordinator.go
-type Coordinate interface {
-    // ...existing...
-    LeaseRead(ctx context.Context) (uint64, error)
+// internal/raftengine/engine.go — optional capability
+type LeaseProvider interface {
+    LeaseDuration() time.Duration
+    AppliedIndex() uint64
+    RegisterLeaderLossCallback(fn func())
 }
 
-// kv/sharded_coordinator.go
-func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
+// kv/coordinator.go
+type Coordinator interface {
+    // ...existing...
+    LeaseRead(ctx context.Context) (uint64, error)
+    LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
+}
 ```
 
 Returned index is the engine's applied index at the moment of return. Callers
 that use `store.LastCommitTS()` can ignore the index; callers that need an
 explicit fence can use it.
 
-Pseudocode:
+Pseudocode (matches `Coordinate.LeaseRead`; the sharded variant is the same
+with per-shard `g.lease` and `g.Engine`):
 
 ```go
 func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
-    if c.lease.valid(time.Now()) {
-        return c.engine.AppliedIndex(), nil
+    lp, ok := c.engine.(raftengine.LeaseProvider)
+    if !ok {
+        return c.LinearizableRead(ctx) // hashicorp engine, test stubs
     }
-    idx, err := c.engine.LinearizableRead(ctx)
+    if c.lease.valid(time.Now()) {
+        return lp.AppliedIndex(), nil
+    }
+    readStart := time.Now()                           // sample BEFORE
+    idx, err := c.LinearizableRead(ctx)
     if err != nil {
         c.lease.invalidate()
         return 0, err
     }
-    c.lease.extend(time.Now().Add(c.engine.LeaseDuration()))
+    c.lease.extend(readStart.Add(lp.LeaseDuration())) // monotonic CAS
     return idx, nil
 }
 ```
@@ -299,35 +310,63 @@ write to commit. However:
 
 ## 5. Implementation Plan
 
-### Phase 1: engine surface
-1. Add `LeaseDuration() time.Duration` to `internal/raftengine/engine.go`
-   `LeaderView` interface and to the etcd implementation.
-2. Add `AppliedIndex() uint64` if not already exposed by a public method.
+### Phase 1: engine surface — DONE
+1. Added `LeaseProvider` as a separate optional interface in
+   `internal/raftengine/engine.go` (not on `LeaderView`) so non-etcd
+   engines and test stubs can omit lease methods. Etcd engine implements
+   `LeaseDuration() time.Duration` and `AppliedIndex() uint64`.
+2. `RegisterLeaderLossCallback(fn func())` was added to `LeaseProvider`
+   in the follow-up review pass; the etcd engine fires registered
+   callbacks from `refreshStatus` whenever the local node leaves the
+   leader role.
 
-### Phase 2: coordinator lease
-1. Add `leaseState` field to `Coordinate` and to each shard inside
-   `ShardedCoordinator`.
-2. Implement `LeaseRead(ctx)` and `LeaseReadForKey(ctx, key)`.
-3. Wrap `Propose` calls in coordinator to refresh lease on success.
-4. Wrap leadership-change detection (`refreshStatus` callback) to invalidate.
+### Phase 2: coordinator lease — DONE
+1. `leaseState` (lock-free `atomic.Pointer[time.Time]` with monotonic
+   CAS extend) added to `Coordinate`; `ShardGroup` gets a per-shard
+   `leaseState`.
+2. `Coordinate.LeaseRead` / `Coordinate.LeaseReadForKey` and
+   `ShardedCoordinator.LeaseRead` / `ShardedCoordinator.LeaseReadForKey`
+   implemented. Time is sampled BEFORE the underlying
+   `LinearizableRead` so the lease window starts at quorum
+   confirmation.
+3. `Coordinate.Dispatch` refreshes the lease on successful commit using
+   the pre-dispatch timestamp. `ShardedCoordinator` wraps each
+   `g.Txn` in `leaseRefreshingTxn` so all dispatch paths (raw via
+   `router.Commit`, `dispatchSingleShardTxn`, `dispatchTxn` 2PC, and
+   `dispatchDelPrefixBroadcast`) refresh the per-shard lease on
+   `Commit` / `Abort` success.
+4. `NewCoordinatorWithEngine` and `NewShardedCoordinator` register
+   `lease.invalidate` via the `LeaseProvider.RegisterLeaderLossCallback`
+   hook, so the engine's `refreshStatus` invalidates the lease the
+   instant it observes a non-leader transition.
 
-### Phase 3: callers
-1. Replace `LinearizableRead` with `LeaseRead` in
-   `adapter/redis_lua_context.go:newLuaScriptContext`.
-2. Add `LeaseRead` at the entry of:
-   - `adapter/redis.go` `get`, `keyTypeAt`, `keys`, `exists`-family.
-   - `adapter/dynamodb.go` `getItem`, `query`, `scan`,
-     `transactGetItems`, `batchGetItem`.
-3. No change to write paths beyond the implicit refresh via `Propose`.
+### Phase 3: callers — PARTIAL
+1. DONE: `adapter/redis_lua_context.go:newLuaScriptContext` uses
+   `LeaseRead` instead of `LinearizableRead`.
+2. DONE for the highest-traffic single-key handlers; deferred for the
+   rest:
+   - DONE: `adapter/redis.go` `get` (with bounded
+     `redisDispatchTimeout` context).
+   - DONE: `adapter/dynamodb.go` `getItem`.
+   - TODO: `adapter/redis.go` `keys`, `exists`-family, ZSet/Hash/List/Set
+     readers; `adapter/dynamodb.go` `query`, `scan`, `transactGetItems`,
+     `batchGetItem`. These currently rely on the lease being kept warm by
+     Lua scripts and successful Dispatch calls. To be wrapped in a
+     follow-up.
+3. No change to write paths beyond the implicit refresh via the
+   `Coordinate.Dispatch` / `leaseRefreshingTxn` hooks.
 
-### Phase 4: tests
-1. Unit test for `leaseState`: extend, expire, invalidate.
-2. Integration test in `kv/`: `LeaseRead` returns immediately when lease
-   valid, falls back to `LinearizableRead` when expired, returns error and
-   invalidates when underlying `LinearizableRead` errs.
-3. End-to-end test in `adapter/`: Lua script under sustained load issues
-   N scripts but only K underlying ReadIndex calls (K << N).
-4. Jepsen workload addition: a partition test that asserts no stale-read
+### Phase 4: tests — PARTIAL
+1. DONE: `kv/lease_state_test.go` covers `leaseState` extend, expire,
+   invalidate, monotonic CAS, invalidate-vs-extend race.
+2. DONE: `kv/lease_read_test.go` covers `Coordinate.LeaseRead` fast /
+   slow / error / fallback paths and the leader-loss callback wiring.
+   `kv/sharded_lease_test.go` covers `ShardedCoordinator` per-shard
+   isolation and per-shard leader-loss wiring.
+3. TODO: end-to-end test in `adapter/` showing Lua script under
+   sustained load issues N scripts but only K underlying ReadIndex
+   calls (K << N).
+4. TODO: Jepsen partition workload asserting no stale-read
    linearizability violation outside the lease window.
 
 ### Phase 5: rollout

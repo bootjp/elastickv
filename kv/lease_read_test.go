@@ -24,7 +24,7 @@ type fakeLeaseEngine struct {
 	registerLeaderLossCalled atomic.Int32
 }
 
-func (e *fakeLeaseEngine) State() raftengine.State    { return raftengine.StateLeader }
+func (e *fakeLeaseEngine) State() raftengine.State { return raftengine.StateLeader }
 func (e *fakeLeaseEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "n1", Address: "127.0.0.1:0"}
 }
@@ -45,9 +45,9 @@ func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configurati
 func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
-func (e *fakeLeaseEngine) Close() error                  { return nil }
-func (e *fakeLeaseEngine) LeaseDuration() time.Duration  { return e.leaseDur }
-func (e *fakeLeaseEngine) AppliedIndex() uint64          { return e.applied }
+func (e *fakeLeaseEngine) Close() error                 { return nil }
+func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
+func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
 func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) {
 	e.registerLeaderLossCalled.Add(1)
 	for !e.leaderLossCallbacksMu.CompareAndSwap(false, true) {
@@ -73,7 +73,7 @@ type nonLeaseEngine struct {
 	linearizableErr   error
 }
 
-func (e *nonLeaseEngine) State() raftengine.State    { return raftengine.StateLeader }
+func (e *nonLeaseEngine) State() raftengine.State { return raftengine.StateLeader }
 func (e *nonLeaseEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "n1", Address: "127.0.0.1:0"}
 }
@@ -181,4 +181,3 @@ func TestCoordinate_RegistersLeaderLossCallback(t *testing.T) {
 	require.False(t, c.lease.valid(time.Now()),
 		"leader-loss callback must invalidate the lease")
 }
-
