@@ -780,8 +780,8 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 
 // zsetInlineMetaCompactionThreshold is the number of existing ZSetMetaDeltaKey
 // entries at which an inline compaction is triggered during a Lua ZSet delta commit.
-// Aligned with defaultDeltaCompactorMaxDeltaCount so both paths compact at the same rate.
-const zsetInlineMetaCompactionThreshold = defaultDeltaCompactorMaxDeltaCount
+// Set to MaxDeltaScanLimit so compaction fires just before reads would fail.
+const zsetInlineMetaCompactionThreshold = store.MaxDeltaScanLimit
 
 // zsetInlineMetaCompactionElems checks whether ZSetMetaDeltaKeys for key have
 // accumulated past the inline threshold. When they have, it returns elems that
