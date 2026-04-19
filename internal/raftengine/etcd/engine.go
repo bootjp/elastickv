@@ -54,23 +54,23 @@ const (
 )
 
 var (
-	errNilEngine                  = errors.New("raft engine is not configured")
-	errClosed                     = errors.New("etcd raft engine is closed")
-	errNotLeader                  = errors.New("etcd raft engine is not leader")
-	errNodeIDRequired             = errors.New("etcd raft node id is required")
-	errDataDirRequired            = errors.New("etcd raft data dir is required")
-	errStateMachineUnset          = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired           = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull              = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch            = errors.New("etcd raft persisted cluster does not match configured peers")
-	errConfigIndexMismatch        = errors.New("etcd raft configuration index does not match")
-	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
-	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
-	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer was aborted by raft")
-	errLeadershipTransferRejected = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errNilEngine                   = errors.New("raft engine is not configured")
+	errClosed                      = errors.New("etcd raft engine is closed")
+	errNotLeader                   = errors.New("etcd raft engine is not leader")
+	errNodeIDRequired              = errors.New("etcd raft node id is required")
+	errDataDirRequired             = errors.New("etcd raft data dir is required")
+	errStateMachineUnset           = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired            = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull               = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch             = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch         = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge   = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget    = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady  = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer was aborted by raft")
+	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
 	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
-	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
+	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
 )
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
@@ -335,7 +335,7 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		return preparedOpenState{}, err
 	}
 
-	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK)
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK, cfg.Bootstrap)
 	if err != nil {
 		return preparedOpenState{}, err
 	}
