@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // pebbleSnapshotMagic is the 8-byte header that identifies a native Pebble

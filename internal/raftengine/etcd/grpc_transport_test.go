@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -416,7 +417,194 @@ func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
 	require.True(t, client.chunks[1].Final)
 }
 
+// TestSendSnapshotReaderChunksTrailingPartialChunk regressions a production
+// failure where payloads whose length was not a whole multiple of chunkSize
+// had the trailing partial chunk silently dropped. The old loop emitted the
+// last full chunk with Final=true and returned, leaving the partial in
+// `next` unsent. Receivers observed payload_bytes truncated to the previous
+// boundary and FSM.Restore hit readRestoreEntry with unexpected EOF.
+//
+// In the reproduction the exactly-on-boundary case already passed, so the
+// pre-existing TestSendSnapshotReaderChunksExactBoundary missed the bug.
+// This test fixes the coverage gap: chunkSize=4 with a 9-byte payload yields
+// two full chunks plus a 1-byte tail that must arrive.
+func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
+	chunkSize := 4
+	payload := []byte("12345678X")
+	header := []byte("hdr")
+
+	client := &testSnapshotSendClient{}
+	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
+	require.NoError(t, err)
+
+	require.Len(t, client.chunks, 3, "expected two full chunks plus a trailing partial")
+
+	require.Equal(t, header, client.chunks[0].Metadata)
+	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+
+	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
+	require.False(t, client.chunks[1].Final)
+
+	require.Equal(t, []byte("X"), client.chunks[2].Chunk)
+	require.True(t, client.chunks[2].Final)
+
+	var delivered []byte
+	for _, c := range client.chunks {
+		delivered = append(delivered, c.Chunk...)
+	}
+	require.Equal(t, payload, delivered)
+}
+
 // --- streamFSMSnapshot tests ---
+
+// TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM exercises the full
+// sender-to-receiver streaming path over a real gRPC server and then drives
+// the received bytes through StateMachine.Restore on a fresh follower FSM,
+// simulating the deployment scenario the bug manifested in (a follower whose
+// data directory was wiped and then received a snapshot from the leader).
+//
+// The reproducer uses a 3-entry testStateMachine serialization whose total
+// byte size (31 bytes) is not a whole multiple of the forced chunkSize (8).
+// Before the trailing-partial fix in sendSnapshotReaderChunks the receiver
+// observed the stream truncated to 24 bytes (3 full chunks) and the
+// subsequent Restore failed with io.ErrUnexpectedEOF while reading the last
+// length-prefixed item. The assertion chain is therefore:
+//
+//  1. sender streams the full .fsm file contents,
+//  2. receiver accumulates all chunks and reconstructs the message,
+//  3. a *fresh* receiver FSM restores from msg.Snapshot.Data and exposes
+//     exactly the entries that were serialized on the sender side.
+//
+// (3) is the real acceptance criterion — (1) and (2) are stepping stones.
+func TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM(t *testing.T) {
+	// Seed a sender-side state machine with known entries and serialize it
+	// through its own Snapshot() codec so the payload format matches what
+	// Restore expects.
+	senderFSM := &testStateMachine{}
+	for _, e := range [][]byte{[]byte("alpha"), []byte("bravo"), []byte("charlie")} {
+		senderFSM.Apply(e)
+	}
+	snap, err := senderFSM.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+	payload := buf.Bytes()
+
+	dir := t.TempDir()
+	crc, _ := writeFSMFileForTest(t, dir, 77, payload)
+
+	// Pick a chunk size that guarantees a trailing partial — without this
+	// shape the pre-fix code path would have exited normally and the test
+	// would be useless as a regression guard.
+	const chunkSize = 8
+	require.NotZero(t, len(payload)%chunkSize,
+		"payload length %d must not be a whole multiple of chunkSize %d or this test would no longer cover the trailing-partial bug",
+		len(payload), chunkSize)
+
+	// Real gRPC server with receiver transport.
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lis.Close() })
+
+	recvTransport := NewGRPCTransport(nil)
+	recvTransport.snapshotChunkSize = chunkSize
+	recvTransport.SetSpoolDir(t.TempDir())
+
+	receiverFSM := &testStateMachine{}
+	restoredCh := make(chan error, 1)
+	recvTransport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
+		if msg.Snapshot == nil {
+			restoredCh <- errors.New("nil snapshot on receiver")
+			return nil
+		}
+		restoredCh <- receiverFSM.Restore(bytes.NewReader(msg.Snapshot.Data))
+		return nil
+	})
+
+	server := grpc.NewServer()
+	recvTransport.Register(server)
+	t.Cleanup(server.Stop)
+	go func() { _ = server.Serve(lis) }()
+
+	sendTransport := NewGRPCTransport([]Peer{{NodeID: 2, Address: lis.Addr().String()}})
+	sendTransport.snapshotChunkSize = chunkSize
+	t.Cleanup(func() { require.NoError(t, sendTransport.Close()) })
+
+	openFn := func(index uint64) (io.ReadCloser, error) {
+		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
+	}
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap, From: 1, To: 2,
+		Snapshot: &raftpb.Snapshot{
+			Data:     encodeSnapshotToken(77, crc),
+			Metadata: raftpb.SnapshotMetadata{Index: 77, Term: 5},
+		},
+	}
+	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 77, openFn))
+
+	select {
+	case restoreErr := <-restoredCh:
+		require.NoError(t, restoreErr,
+			"fresh follower FSM must restore cleanly; a short-read EOF here means the trailing partial chunk was dropped in transit")
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiver never ran Restore")
+	}
+
+	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied(),
+		"receiver FSM state after Restore must equal sender FSM state")
+}
+
+// TestStreamFSMSnapshotOverGRPCAtChunkBoundary pins the exact-multiple case
+// so a future refactor cannot regress it while fixing the non-aligned case.
+func TestStreamFSMSnapshotOverGRPCAtChunkBoundary(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("AAAAAAAABBBBBBBB") // 16 bytes == 2 × chunkSize(8)
+	crc, _ := writeFSMFileForTest(t, dir, 91, payload)
+
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lis.Close() })
+
+	recvTransport := NewGRPCTransport(nil)
+	recvTransport.snapshotChunkSize = 8
+	recvTransport.SetSpoolDir(t.TempDir())
+	gotCh := make(chan raftpb.Message, 1)
+	recvTransport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
+		gotCh <- msg
+		return nil
+	})
+
+	server := grpc.NewServer()
+	recvTransport.Register(server)
+	t.Cleanup(server.Stop)
+	go func() { _ = server.Serve(lis) }()
+
+	sendTransport := NewGRPCTransport([]Peer{{NodeID: 2, Address: lis.Addr().String()}})
+	sendTransport.snapshotChunkSize = 8
+	t.Cleanup(func() { require.NoError(t, sendTransport.Close()) })
+
+	openFn := func(index uint64) (io.ReadCloser, error) {
+		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
+	}
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap, From: 1, To: 2,
+		Snapshot: &raftpb.Snapshot{
+			Data:     encodeSnapshotToken(91, crc),
+			Metadata: raftpb.SnapshotMetadata{Index: 91, Term: 5},
+		},
+	}
+	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 91, openFn))
+
+	select {
+	case got := <-gotCh:
+		require.Equal(t, payload, got.Snapshot.Data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiver never observed the snapshot message")
+	}
+}
 
 func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
 	dir := t.TempDir()

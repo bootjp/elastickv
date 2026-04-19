@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/hashicorp/raft"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -32,11 +32,21 @@ func NewPebbleStore(dir string) (*PebbleStore, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	db, err := pebble.Open(dir, &pebble.Options{})
+	db, err := pebble.Open(dir, pebbleOptions())
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return &PebbleStore{db: db}, nil
+}
+
+// Pinned so existing v1-era DBs are ratcheted above pebble v2's
+// FormatMinSupported (FormatFlushableIngest) before the v2 upgrade lands.
+func pebbleOptions() *pebble.Options {
+	opts := &pebble.Options{
+		FormatMajorVersion: pebble.FormatVirtualSSTables,
+	}
+	opts.EnsureDefaults()
+	return opts
 }
 
 func (s *PebbleStore) FirstIndex() (uint64, error) {

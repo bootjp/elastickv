@@ -42,6 +42,11 @@ type Status struct {
 	FSMPending        uint64
 	NumPeers          uint64
 	LastContact       time.Duration
+	// LeadTransferee is non-zero on the current leader while a leadership
+	// transfer is in progress, and zero otherwise (including on followers).
+	// Writers should hold new proposals while this is non-zero, since etcd/raft
+	// drops proposals during transfer.
+	LeadTransferee uint64
 }
 
 type ProposalResult struct {

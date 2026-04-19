@@ -263,6 +263,7 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      t.TempDir(),
+		Bootstrap:    true,
 		StateMachine: etcdFSMAdapter{fsm: NewKvFSMWithHLC(st, NewHLC())},
 	})
 	require.NoError(t, err)

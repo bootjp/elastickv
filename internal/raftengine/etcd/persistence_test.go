@@ -110,6 +110,7 @@ func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      dir,
+		Bootstrap:    true,
 		StateMachine: &testStateMachine{},
 	})
 	require.Error(t, err)

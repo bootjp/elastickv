@@ -131,6 +131,13 @@ func (c *Coordinate) IsLeader() bool {
 	return isLeaderEngine(c.engine)
 }
 
+// IsLeaderAcceptingWrites reports whether this node is leader and not currently
+// transferring leadership. Background proposers should gate on this to avoid
+// piling up dropped proposals while a transfer is in flight.
+func (c *Coordinate) IsLeaderAcceptingWrites() bool {
+	return isLeaderAcceptingWrites(c.engine)
+}
+
 func (c *Coordinate) VerifyLeader() error {
 	return verifyLeaderEngine(c.engine)
 }
@@ -171,7 +178,7 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
-			if c.IsLeader() {
+			if c.IsLeaderAcceptingWrites() {
 				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
 					c.log.WarnContext(ctx, "hlc lease renewal failed",

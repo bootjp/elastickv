@@ -23,7 +23,7 @@ import (
 const (
 	defaultTickInterval  = 10 * time.Millisecond
 	defaultHeartbeatTick = 10  // 100ms at 10ms interval
-	defaultElectionTick  = 100 // 1s at 10ms interval
+	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
@@ -54,21 +54,23 @@ const (
 )
 
 var (
-	errNilEngine                  = errors.New("raft engine is not configured")
-	errClosed                     = errors.New("etcd raft engine is closed")
-	errNotLeader                  = errors.New("etcd raft engine is not leader")
-	errNodeIDRequired             = errors.New("etcd raft node id is required")
-	errDataDirRequired            = errors.New("etcd raft data dir is required")
-	errStateMachineUnset          = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired           = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull              = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch            = errors.New("etcd raft persisted cluster does not match configured peers")
-	errConfigIndexMismatch        = errors.New("etcd raft configuration index does not match")
-	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
-	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
-	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer aborted: a different leader was elected")
-	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
+	errNilEngine                   = errors.New("raft engine is not configured")
+	errClosed                      = errors.New("etcd raft engine is closed")
+	errNotLeader                   = errors.New("etcd raft engine is not leader")
+	errNodeIDRequired              = errors.New("etcd raft node id is required")
+	errDataDirRequired             = errors.New("etcd raft data dir is required")
+	errStateMachineUnset           = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired            = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull               = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch             = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch         = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge   = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget    = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady  = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer aborted")
+	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
+	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
 )
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
@@ -120,6 +122,7 @@ type Engine struct {
 	readCh           chan readRequest
 	adminCh          chan adminRequest
 	stepCh           chan raftpb.Message
+	dispatchReportCh chan dispatchReport
 	peerDispatchers  map[uint64]*peerQueues
 	perPeerQueueSize int
 	dispatchStopCh   chan struct{}
@@ -297,6 +300,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
 		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
+		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -333,7 +337,7 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		return preparedOpenState{}, err
 	}
 
-	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK)
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK, cfg.Bootstrap)
 	if err != nil {
 		return preparedOpenState{}, err
 	}
@@ -649,20 +653,20 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 	ticker := time.NewTicker(defaultAdminPollInterval)
 	defer ticker.Stop()
 
+	// etcd/raft sets leadTransferee synchronously inside TransferLeader, so by
+	// the time we observe the first Status snapshot after submitting the admin
+	// request it should be non-zero. If we then observe it drop back to zero
+	// while we are still leader, raft aborted the transfer (electionTimeout
+	// elapsed) — surface that as an error instead of polling indefinitely.
+	sawTransferPending := false
 	for {
-		if err := contextErr(ctx); err != nil {
+		done, err := e.checkLeadershipTransfer(ctx, target, &sawTransferPending)
+		if err != nil {
 			return err
 		}
-		status := e.Status()
-		if status.State != raftengine.StateLeader {
-			if status.Leader.ID == target.ID {
-				return nil
-			}
-			if status.Leader.ID != "" {
-				return errors.WithStack(errLeadershipTransferAborted)
-			}
+		if done {
+			return nil
 		}
-
 		select {
 		case <-ctx.Done():
 			return errors.WithStack(ctx.Err())
@@ -671,6 +675,39 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 		case <-ticker.C:
 		}
 	}
+}
+
+// checkLeadershipTransfer returns (done, err). done==true means the transfer
+// succeeded; a non-nil error indicates either context cancellation or that
+// raft aborted the transfer.
+func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPending *bool) (bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
+	status := e.Status()
+	if status.State != raftengine.StateLeader {
+		if status.Leader.ID == target.ID {
+			return true, nil
+		}
+		// We stepped down but a different node is leader — transfer landed on
+		// the wrong peer (e.g., target lost election and another peer won).
+		// Treat as aborted so the caller doesn't spin until its deadline.
+		if status.Leader.ID != "" {
+			return false, errors.WithStack(errLeadershipTransferAborted)
+		}
+		// No known leader yet; keep polling until one is elected.
+		return false, nil
+	}
+	// Match the transferee against the specific target to avoid tracking a
+	// stale or unrelated transfer that was initiated by a different caller.
+	if status.LeadTransferee == target.NodeID {
+		*sawPending = true
+		return false, nil
+	}
+	if *sawPending {
+		return false, errors.WithStack(errLeadershipTransferAborted)
+	}
+	return false, nil
 }
 
 func (e *Engine) run() {
@@ -733,12 +770,56 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleAdmin(req)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
+	case report := <-e.dispatchReportCh:
+		e.handleDispatchReport(report)
 	case result := <-e.snapshotResCh:
 		if err := e.handleSnapshotResult(result); err != nil {
 			return false, err
 		}
 	}
 	return true, nil
+}
+
+// dispatchReport is posted by the dispatch workers when a transport send
+// to a peer fails; the engine goroutine drains these and informs etcd/raft
+// via rawNode so follower Progress leaves StateReplicate / StateSnapshot on
+// unreachable peers and does not silently stall.
+type dispatchReport struct {
+	to      uint64
+	msgType raftpb.MessageType
+}
+
+func (e *Engine) handleDispatchReport(report dispatchReport) {
+	if e.rawNode == nil {
+		return
+	}
+	// MsgSnap requires the distinct SnapshotFailure path: raft tracks
+	// PendingSnapshot in Progress, and only ReportSnapshot clears it.
+	// All other message types use ReportUnreachable, which transitions the
+	// peer from StateReplicate to StateProbe so the next heartbeat response
+	// drives a fresh sendAppend attempt.
+	if report.msgType == raftpb.MsgSnap {
+		e.rawNode.ReportSnapshot(report.to, etcdraft.SnapshotFailure)
+		return
+	}
+	e.rawNode.ReportUnreachable(report.to)
+}
+
+// postDispatchReport delivers a dispatch failure to the event loop without
+// blocking the worker. If the channel is full (unlikely — the buffer is
+// sized to MaxInflightMsg), the report is dropped and logged; this is
+// acceptable because raft will retry on the next tick and we only need
+// eventual consistency between transport state and Progress state.
+func (e *Engine) postDispatchReport(report dispatchReport) {
+	select {
+	case e.dispatchReportCh <- report:
+	case <-e.closeCh:
+	default:
+		slog.Warn("etcd raft dispatch report dropped (channel full)",
+			"to", report.to,
+			"type", report.msgType.String(),
+		)
+	}
 }
 
 func (e *Engine) handleProposal(req proposalRequest) {
@@ -850,7 +931,27 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 		req.done <- adminResult{err: err}
 		return
 	}
+	// Reject transfer requests when the local node is not leader — etcd/raft
+	// would silently drop the MsgTransferLeader in any non-leader state,
+	// leaving the caller to block until the deadline. handleTransferLeadership
+	// runs on the single-threaded event loop, so rawNode state reads here are
+	// not racy with other rawNode mutations.
+	if e.rawNode.BasicStatus().RaftState != etcdraft.StateLeader {
+		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferNotLeader)}
+		return
+	}
 	e.rawNode.TransferLeader(target.NodeID)
+	// TransferLeader is processed synchronously inside rawNode.TransferLeader.
+	// If raft accepted the request, r.leadTransferee now equals target.NodeID.
+	// If it was silently dropped (e.g. target has no progress entry, is a
+	// learner, or equals the local node), leadTransferee is still zero or
+	// unchanged — surface that as an immediate error rather than letting the
+	// caller poll until its deadline.
+	if e.rawNode.BasicStatus().LeadTransferee != target.NodeID {
+		req.done <- adminResult{err: errors.Wrapf(errLeadershipTransferRejected,
+			"target id=%d addr=%s", target.NodeID, target.Address)}
+		return
+	}
 	req.done <- adminResult{peer: target}
 }
 
@@ -998,20 +1099,21 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if isSnapshotToken(snapshot.Data) {
 		tok, err := decodeSnapshotToken(snapshot.Data)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
-			return errors.WithStack(err)
+			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
 	} else {
 		// Legacy format: full FSM payload in snapshot.Data.
 		if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
-			return errors.WithStack(err)
+			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.Metadata.Index)
 		}
 	}
 
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
-		return errors.WithStack(err)
+		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
+			snapshot.Metadata.Index, snapshot.Metadata.Term)
 	}
 	e.applied = snapshot.Metadata.Index
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
@@ -1493,6 +1595,7 @@ func (e *Engine) refreshStatus() {
 		FSMPending:        pendingEntries(basic.Commit, e.applied),
 		NumPeers:          numRemoteServers(config.Servers, e.localID),
 		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
+		LeadTransferee:    basic.LeadTransferee,
 	}
 
 	e.mu.Lock()
@@ -1540,6 +1643,34 @@ func (e *Engine) shutdown() {
 }
 
 func (e *Engine) fail(err error) {
+	// Idempotency guard: fail can be invoked from handleStep, which runs inside
+	// the main run loop and does not return on error. Without this guard a
+	// persistent step error would re-enter fail on every loop iteration,
+	// producing a log storm and redundant teardown calls.
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		// Make sure the run loop still observes the shutdown signal even if a
+		// previous fail path did not reach requestShutdown (e.g. concurrent
+		// invocation racing on the closed flag).
+		e.requestShutdown()
+		return
+	}
+	e.mu.Unlock()
+
+	// Log before mutating state so observability is preserved even if the
+	// downstream stopDispatch/closePersist calls themselves block or panic.
+	// Without this, the engine quietly transitions to StateShutdown and the
+	// only signal to the operator is a "shutdown" gauge — which is what
+	// happened in the production rolling-update incident where a snapshot
+	// restore failed silently and left the process running but unusable.
+	if err != nil {
+		slog.Error("etcd raft engine shutting down due to error",
+			slog.String("node_id", e.localID),
+			slog.Uint64("raft_node_id", e.nodeID),
+			slog.Any("err", err),
+		)
+	}
 	e.mu.Lock()
 	if err != nil {
 		e.runErr = err
@@ -1547,6 +1678,9 @@ func (e *Engine) fail(err error) {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	// Signal the run loop so that callers which invoke fail without returning
+	// from run themselves (notably handleStep) still exit on the next select.
+	e.requestShutdown()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
@@ -1809,7 +1943,16 @@ func normalizeIdentity(cfg OpenConfig) OpenConfig {
 }
 
 func normalizePeersConfig(cfg OpenConfig) OpenConfig {
-	if len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
+	// Only fill cfg.Peers with a single-peer self-list when an explicit
+	// Bootstrap flag was passed. Historically we defaulted to a local-only
+	// peer list whenever cfg.Peers was empty, but that silently bypassed the
+	// self-bootstrap guard in normalizePeers: a node with a wiped data dir
+	// and no persisted peers would arrive here with cfg.Peers empty, get a
+	// self-only list injected, and then sail past the len(peers) == 0 guard
+	// — the exact split-brain scenario the guard is supposed to prevent.
+	// When Bootstrap is false and no persisted peers were loaded,
+	// normalizePeers will reject the empty list via errNoPeersConfigured.
+	if cfg.Bootstrap && len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
 		cfg.Peers = []Peer{{
 			NodeID:  cfg.NodeID,
 			ID:      cfg.LocalID,
@@ -2066,18 +2209,24 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr != nil && !errors.Is(dispatchErr, ctx.Err()) {
-		count := e.dispatchErrorCount.Add(1)
-		if shouldLogDispatchEvent(count) {
-			slog.Warn("etcd raft outbound dispatch failed",
-				"node_id", e.nodeID,
-				"to", req.msg.To,
-				"type", req.msg.Type.String(),
-				"dispatch_error_count", count,
-				"err", dispatchErr,
-			)
-		}
+	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
+		return
 	}
+	count := e.dispatchErrorCount.Add(1)
+	if shouldLogDispatchEvent(count) {
+		slog.Warn("etcd raft outbound dispatch failed",
+			"node_id", e.nodeID,
+			"to", req.msg.To,
+			"type", req.msg.Type.String(),
+			"dispatch_error_count", count,
+			"err", dispatchErr,
+		)
+	}
+	// Inform etcd/raft that the peer is unreachable so Progress transitions
+	// out of StateReplicate / StateSnapshot. Without this the leader keeps
+	// Progress stuck and never retries sendAppend/sendSnap for the peer,
+	// leaving the follower indefinitely stale even after heartbeats resume.
+	e.postDispatchReport(dispatchReport{to: req.msg.To, msgType: req.msg.Type})
 }
 
 func (e *Engine) stopDispatchWorkers() {
