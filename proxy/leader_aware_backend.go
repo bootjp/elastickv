@@ -53,12 +53,12 @@ type LeaderAwareRedisBackend struct {
 
 	logger *slog.Logger
 
-	mu           sync.RWMutex
-	clients      map[string]*redis.Client
-	clientOrder  []string // FIFO insertion order for bounded eviction
-	leader       string
-	closed       bool
-	seedProtect  map[string]struct{}
+	mu          sync.RWMutex
+	clients     map[string]*redis.Client
+	clientOrder []string // FIFO insertion order for bounded eviction
+	leader      string
+	closed      bool
+	seedProtect map[string]struct{}
 
 	stopCh    chan struct{}
 	done      chan struct{}

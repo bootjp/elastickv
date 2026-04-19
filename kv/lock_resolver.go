@@ -72,8 +72,9 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		// Only resolve on the leader to avoid duplicate work.
-		if !isLeaderEngine(engineForGroup(g)) {
+		// Only resolve on the leader and skip during leadership transfer to
+		// avoid a flood of dropped proposals.
+		if !isLeaderAcceptingWrites(engineForGroup(g)) {
 			continue
 		}
 		if err := lr.resolveGroupLocks(ctx, gid, g); err != nil {

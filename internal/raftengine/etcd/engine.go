@@ -22,8 +22,8 @@ import (
 
 const (
 	defaultTickInterval  = 10 * time.Millisecond
-	defaultHeartbeatTick = 10 // 100ms at 10ms interval
-	defaultElectionTick  = 100 // 1s at 10ms interval
+	defaultHeartbeatTick = 10  // 100ms at 10ms interval
+	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
@@ -67,6 +67,7 @@ var (
 	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer was aborted by raft")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
@@ -648,15 +649,20 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 	ticker := time.NewTicker(defaultAdminPollInterval)
 	defer ticker.Stop()
 
+	// etcd/raft sets leadTransferee synchronously inside TransferLeader, so by
+	// the time we observe the first Status snapshot after submitting the admin
+	// request it should be non-zero. If we then observe it drop back to zero
+	// while we are still leader, raft aborted the transfer (electionTimeout
+	// elapsed) — surface that as an error instead of polling indefinitely.
+	sawTransferPending := false
 	for {
-		if err := contextErr(ctx); err != nil {
+		done, err := e.checkLeadershipTransfer(ctx, target, &sawTransferPending)
+		if err != nil {
 			return err
 		}
-		status := e.Status()
-		if status.State != raftengine.StateLeader && status.Leader.ID == target.ID {
+		if done {
 			return nil
 		}
-
 		select {
 		case <-ctx.Done():
 			return errors.WithStack(ctx.Err())
@@ -665,6 +671,39 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 		case <-ticker.C:
 		}
 	}
+}
+
+// checkLeadershipTransfer returns (done, err). done==true means the transfer
+// succeeded; a non-nil error indicates either context cancellation or that
+// raft aborted the transfer.
+func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPending *bool) (bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
+	status := e.Status()
+	if status.State != raftengine.StateLeader {
+		if status.Leader.ID == target.ID {
+			return true, nil
+		}
+		// We stepped down but a different node is leader — transfer landed on
+		// the wrong peer (e.g., target lost election and another peer won).
+		// Treat as aborted so the caller doesn't spin until its deadline.
+		if status.Leader.ID != "" {
+			return false, errors.WithStack(errLeadershipTransferAborted)
+		}
+		// No known leader yet; keep polling until one is elected.
+		return false, nil
+	}
+	// Match the transferee against the specific target to avoid tracking a
+	// stale or unrelated transfer that was initiated by a different caller.
+	if status.LeadTransferee == target.NodeID {
+		*sawPending = true
+		return false, nil
+	}
+	if *sawPending {
+		return false, errors.WithStack(errLeadershipTransferAborted)
+	}
+	return false, nil
 }
 
 func (e *Engine) run() {
@@ -1487,6 +1526,7 @@ func (e *Engine) refreshStatus() {
 		FSMPending:        pendingEntries(basic.Commit, e.applied),
 		NumPeers:          numRemoteServers(config.Servers, e.localID),
 		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
+		LeadTransferee:    basic.LeadTransferee,
 	}
 
 	e.mu.Lock()
