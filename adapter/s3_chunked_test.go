@@ -156,6 +156,31 @@ func TestAwsChunkedReader_TruncatedInput(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestAwsChunkedReader_TruncatedAtChunkBoundary covers the scenario the
+// gemini review flagged: the underlying reader hits EOF exactly at the end
+// of a data chunk (before the terminating 0-chunk). Without the
+// !r.finished guard the reader would happily return io.EOF and a caller
+// like io.ReadAll would treat the upload as complete.
+func TestAwsChunkedReader_TruncatedAtChunkBoundary(t *testing.T) {
+	// Valid first chunk followed by its CRLF, but the terminator chunk
+	// is missing.
+	body := "5\r\nhello\r\n"
+	r := newAwsChunkedReader(strings.NewReader(body), -1, 1<<20)
+	_, err := io.ReadAll(r)
+	require.Error(t, err, "must not silently accept truncation at a chunk boundary")
+}
+
+func TestAwsChunkedReader_OversizedLineRejectedWithoutUnboundedAlloc(t *testing.T) {
+	// Single line that never terminates with \n. ReadSlice must surface
+	// ErrBufferFull once the bufio buffer is saturated (8 KiB) instead of
+	// growing to accommodate the attacker-controlled input.
+	raw := strings.Repeat("A", s3ChunkedMaxLineLength*4)
+	r := newAwsChunkedReader(strings.NewReader(raw), -1, 1<<20)
+	_, err := io.ReadAll(r)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeds")
+}
+
 func TestS3StreamingBody_VerifyTrailer_CRC32(t *testing.T) {
 	payload := []byte("Mary had a little lamb")
 	sum := crc32.NewIEEE()

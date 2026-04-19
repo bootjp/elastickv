@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"hash"
 	"hash/crc32"
@@ -19,8 +20,10 @@ import (
 // The cap is generous relative to AWS SDK defaults (128 KiB - 1 MiB) so it
 // only triggers on clearly pathological inputs.
 const (
-	s3ChunkSizeMax     = 16 * 1024 * 1024 // 16 MiB
-	s3MaxTrailerLength = 4 * 1024         // 4 KiB total across trailer headers
+	s3ChunkSizeMax          = 16 * 1024 * 1024 // 16 MiB
+	s3MaxTrailerLength      = 4 * 1024         // 4 KiB total across trailer headers
+	s3ChunkedMaxLineLength  = 8 * 1024         // 8 KiB — also the bufio buffer size
+	s3ChunkedReaderBufBytes = s3ChunkedMaxLineLength
 )
 
 // awsChunkedError tags failures that originate from aws-chunked framing or
@@ -66,8 +69,11 @@ type awsChunkedReader struct {
 }
 
 func newAwsChunkedReader(r io.Reader, declaredDecoded, maxDecoded int64) *awsChunkedReader {
+	// Pre-size the bufio buffer to the maximum allowed line length so that
+	// readLine can rely on ReadSlice returning ErrBufferFull on over-long
+	// lines instead of growing the buffer unboundedly.
 	return &awsChunkedReader{
-		br:              bufio.NewReader(r),
+		br:              bufio.NewReaderSize(r, s3ChunkedReaderBufBytes),
 		cur:             0,
 		declaredDecoded: declaredDecoded,
 		maxDecoded:      maxDecoded,
@@ -114,10 +120,14 @@ func (r *awsChunkedReader) Read(p []byte) (int, error) {
 			return n, newAwsChunkedError(sizeErr)
 		}
 	}
-	// The underlying reader ran out of bytes before the chunk completed.
-	// Treat that as a malformed stream rather than a clean EOF so the caller
-	// does not silently store a truncated object.
-	if errors.Is(err, io.EOF) && r.cur > 0 {
+	// The underlying reader ran out of bytes before the stream terminated.
+	// This covers two scenarios that must both be treated as malformed:
+	//   - EOF mid-chunk (r.cur > 0)
+	//   - EOF exactly at a chunk boundary before the terminating 0-chunk
+	//     was processed (r.cur == 0 but !r.finished)
+	// Returning io.EOF to the caller in the second case would let
+	// io.ReadAll silently accept a truncated upload.
+	if errors.Is(err, io.EOF) && !r.finished {
 		return n, newAwsChunkedError(io.ErrUnexpectedEOF)
 	}
 	if r.cur == 0 && err == nil {
@@ -207,15 +217,16 @@ func (r *awsChunkedReader) readTrailer() error {
 // the line length so a malicious peer cannot force us to read an unbounded
 // buffer.
 func (r *awsChunkedReader) readLine() (string, error) {
-	const maxLine = 8 * 1024
-	line, err := r.br.ReadString('\n')
+	line, err := r.br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "", errors.Newf("aws-chunked: header line exceeds %d bytes", s3ChunkedMaxLineLength) //nolint:wrapcheck // creating new error, nothing to wrap
+	}
 	if err != nil {
 		return "", errors.Wrap(err, "aws-chunked: read line")
 	}
-	if len(line) > maxLine {
-		return "", errors.Newf("aws-chunked: header line exceeds %d bytes", maxLine) //nolint:wrapcheck // creating new error, nothing to wrap
-	}
-	return strings.TrimRight(line, "\r\n"), nil
+	// Convert to string (which copies) so the result survives the next
+	// ReadSlice call that reuses the internal buffer.
+	return strings.TrimRight(string(line), "\r\n"), nil
 }
 
 func (r *awsChunkedReader) consumeCRLF() error {
@@ -289,20 +300,8 @@ func (s *s3StreamingBody) verifyTrailer() error {
 		return errors.Wrapf(err, "aws-chunked: decode trailer %q", s.trailerName)
 	}
 	computed := s.trailerHash.Sum(nil)
-	if !hashesEqual(expected, computed) {
+	if !bytes.Equal(expected, computed) {
 		return errors.Newf("aws-chunked: trailer %q checksum mismatch", s.trailerName) //nolint:wrapcheck // creating new error, nothing to wrap
 	}
 	return nil
-}
-
-func hashesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
