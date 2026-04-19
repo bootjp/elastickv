@@ -328,6 +328,36 @@ func TestS3Server_PutObjectStreamingWithTrailerChecksum(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "<Code>BadDigest</Code>")
 }
 
+// X-Amz-Trailer is formally a comma-separated list. The handler must pick
+// the first supported algorithm rather than treating the whole value as a
+// single header name (regression for gemini review on #544).
+func TestS3Server_PutObjectStreamingWithMultipleAdvertisedTrailers(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-multi-trailer", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	payload := []byte("multi-trailer body")
+	sum := crc32.NewIEEE()
+	_, _ = sum.Write(payload)
+	crc := base64.StdEncoding.EncodeToString(sum.Sum(nil))
+	body := encodeAwsChunked(t, payload, 6, "x-amz-checksum-crc32", crc)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-multi-trailer/obj.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(payload)))
+	// Advertise two trailers — only the first is one we support. The handler
+	// must still drive validation off x-amz-checksum-crc32.
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32, x-amz-checksum-sha256")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
 func TestS3Server_PutObjectStreamingRejectsBadDecodedLength(t *testing.T) {
 	t.Parallel()
 

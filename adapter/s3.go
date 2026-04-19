@@ -2420,11 +2420,18 @@ func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded 
 	body := &s3StreamingBody{reader: reader}
 	r.Body = io.NopCloser(reader)
 
-	if advertised := strings.TrimSpace(r.Header.Get("X-Amz-Trailer")); advertised != "" {
-		canonical := canonicalTrailerName(advertised)
-		if h := newS3TrailerChecksumHasher(advertised); h != nil {
-			body.trailerName = canonical
+	// X-Amz-Trailer is formally a comma-separated list per AWS docs; pick
+	// the first trailer whose checksum algorithm we support rather than
+	// treating the whole value as one header name.
+	for _, raw := range strings.Split(r.Header.Get("X-Amz-Trailer"), ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if h := newS3TrailerChecksumHasher(name); h != nil {
+			body.trailerName = canonicalTrailerName(name)
 			body.trailerHash = h
+			break
 		}
 	}
 	return body, nil
