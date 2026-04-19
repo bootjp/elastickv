@@ -326,8 +326,11 @@ func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapse
 	}
 	warnArgs := []any{"cmd", cmd, "err", sErr, "elapsed", elapsed, "attempts", attempts}
 	if (cmd == "EVALSHA" || cmd == "EVALSHA_RO") && len(iArgs) > 1 {
-		if sha, ok := iArgs[1].([]byte); ok {
-			warnArgs = append(warnArgs, "sha", string(sha))
+		switch v := iArgs[1].(type) {
+		case []byte:
+			warnArgs = append(warnArgs, "sha", string(v))
+		case string:
+			warnArgs = append(warnArgs, "sha", v)
 		}
 	}
 	if usedNOSCRIPTFallback {

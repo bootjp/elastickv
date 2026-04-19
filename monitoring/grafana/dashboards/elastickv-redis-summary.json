@@ -616,7 +616,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (command) (rate(proxy_command_total{job=\"elastickv\", status=\"error\"}[5m]))",
+          "expr": "sum by (command) (rate(proxy_command_total{job=\"elastickv\", backend=\"elastickv\", status=\"error\"}[5m]))",
           "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
@@ -665,7 +665,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", backend=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -673,7 +673,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", backend=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -681,7 +681,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_command_duration_seconds_bucket{job=\"elastickv\", backend=\"elastickv\", command=~\"EVALSHA|EVALSHA_RO\"}[5m])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
