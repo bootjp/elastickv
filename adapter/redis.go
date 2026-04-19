@@ -263,6 +263,7 @@ type RedisServer struct {
 	relay           *RedisPubSubRelay
 	relayConnCache  kv.GRPCConnCache
 	requestObserver monitoring.RedisRequestObserver
+	luaObserver     monitoring.LuaScriptObserver
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -299,6 +300,13 @@ func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.requestObserver = observer
+	}
+}
+
+// WithLuaObserver enables per-phase Lua script metrics (VM exec, Raft commit, retries).
+func WithLuaObserver(observer monitoring.LuaScriptObserver) RedisServerOption {
+	return func(r *RedisServer) {
+		r.luaObserver = observer
 	}
 }
 

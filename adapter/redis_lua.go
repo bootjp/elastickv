@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
 	"github.com/tidwall/redcon"
@@ -119,6 +120,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 
 	start := time.Now()
 	var attempts int
+	var totalLuaExec, totalCommit time.Duration
 	var reply luaReply
 	err = r.retryRedisWrite(ctx, func() error {
 		attempts++
@@ -134,9 +136,13 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 			return errors.WithStack(err)
 		}
 		state.Push(chunk)
+
+		luaStart := time.Now()
 		if err := state.PCall(0, 1, nil); err != nil {
 			return errors.WithStack(err)
 		}
+		totalLuaExec += time.Since(luaStart)
+
 		result := state.Get(-1)
 		defer state.Pop(1)
 
@@ -144,13 +150,25 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		if err != nil {
 			return err
 		}
+
+		commitStart := time.Now()
 		if err := scriptCtx.commit(); err != nil {
 			return err
 		}
+		totalCommit += time.Since(commitStart)
+
 		reply = nextReply
 		return nil
 	})
 	elapsed := time.Since(start)
+	if r.luaObserver != nil {
+		r.luaObserver.ObserveLuaScript(monitoring.LuaScriptReport{
+			LuaExecDuration: totalLuaExec,
+			CommitDuration:  totalCommit,
+			ConflictRetries: attempts - 1,
+			IsError:         err != nil,
+		})
+	}
 	if err != nil {
 		slog.Default().Warn("lua script execution failed",
 			"elapsed", elapsed, "attempts", attempts, "err", err)

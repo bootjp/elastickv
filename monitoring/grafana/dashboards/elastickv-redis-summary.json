@@ -689,6 +689,214 @@
       ],
       "title": "EVALSHA Secondary Latency (p50 / p95 / p99)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "id": 14,
+      "title": "Lua Script Internals",
+      "type": "row"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Time spent purely in the Lua VM (state.PCall) per script invocation, summed across write-conflict retries. High p99 here means the Lua script itself is the bottleneck, not Raft or storage.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 38
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Lua VM Execution Time (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Time spent in coordinator.Dispatch (Raft consensus + storage write) per script invocation, summed across retries. High p99 here means Raft or the storage layer is the bottleneck.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 38
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Raft Commit Time (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Distribution of write-conflict retry counts per Lua script invocation. 0 = succeeded on first try. Frequent values > 0 indicate hot-key contention causing re-execution overhead.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "fillOpacity": 20
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 38
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p50 retries",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p95 retries",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p99 retries",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Write-Conflict Retries per Script (p50 / p95 / p99)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
