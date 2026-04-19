@@ -1,6 +1,7 @@
 (ns elastickv.jepsen-test
   (:gen-class)
   (:require [elastickv.redis-workload :as redis-workload]
+            [elastickv.redis-zset-safety-workload :as zset-safety-workload]
             [elastickv.dynamodb-workload :as dynamodb-workload]
             [elastickv.s3-workload :as s3-workload]
             [jepsen.cli :as cli]))
@@ -13,6 +14,9 @@
 
 (defn elastickv-s3-test []
   (s3-workload/elastickv-s3-test {}))
+
+(defn elastickv-zset-safety-test []
+  (zset-safety-workload/elastickv-zset-safety-test {}))
 
 (defn -main
   [& args]
