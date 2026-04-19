@@ -31,20 +31,20 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
-      - name: Pre-fetch Go modules
+      - name: Pre-fetch Go modules and build binary
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
           GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
+          go build -o /tmp/elastickv-bin .
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
       - name: Launch etcd-backed cluster
         run: |
           set -euo pipefail
-          mkdir -p "$GOCACHE" /tmp/go-tmp /tmp/elastickv-ci
-          export GOTMPDIR=/tmp/go-tmp
+          mkdir -p /tmp/elastickv-ci
           BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
@@ -52,7 +52,7 @@ jobs:
 
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
-            nohup go run . \
+            nohup /tmp/elastickv-bin \
               --address "127.0.0.1:5005${node}" \
               --redisAddress "127.0.0.1:6379${node}" \
               --dynamoAddress "127.0.0.1:6380${node}" \
