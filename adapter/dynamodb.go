@@ -1340,26 +1340,37 @@ func (d *DynamoDBServer) commitItemWrite(ctx context.Context, req *kv.OperationG
 	return nil
 }
 
-func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
+func (d *DynamoDBServer) parseGetItemInput(w http.ResponseWriter, r *http.Request) (getItemInput, bool) {
 	body, err := io.ReadAll(maxDynamoBodyReader(w, r))
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
+		return getItemInput{}, false
 	}
 	var in getItemInput
 	if err := json.Unmarshal(body, &in); err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
-		return
+		return getItemInput{}, false
 	}
 	if strings.TrimSpace(in.TableName) == "" {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, "missing table name")
-		return
+		return getItemInput{}, false
 	}
 	if err := d.ensureLegacyTableMigration(r.Context(), in.TableName); err != nil {
 		writeDynamoErrorFromErr(w, err)
+		return getItemInput{}, false
+	}
+	return in, true
+}
+
+func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
+	in, ok := d.parseGetItemInput(w, r)
+	if !ok {
 		return
 	}
-
+	if _, err := d.coordinator.LeaseRead(r.Context()); err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+		return
+	}
 	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 	schema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
 	if err != nil {

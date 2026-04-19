@@ -981,6 +981,10 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	if _, err := r.coordinator.LeaseReadForKey(context.Background(), key); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
