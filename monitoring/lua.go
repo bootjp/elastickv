@@ -16,6 +16,9 @@ type LuaScriptReport struct {
 	// redis.pcall() handlers (scriptCtx.exec) — Raft reads and in-memory
 	// state updates. Pure VM time = LuaExecDuration - RedisCallDuration.
 	RedisCallDuration time.Duration
+	// RedisCallCount is the total number of redis.call()/pcall() invocations
+	// across all retry attempts. High counts explain high RedisCallDuration.
+	RedisCallCount int
 	// CommitDuration is the cumulative time spent in scriptCtx.commit()
 	// (coordinator.Dispatch → Raft consensus + storage write).
 	CommitDuration time.Duration
@@ -38,12 +41,14 @@ type LuaScriptObserver interface {
 type LuaMetrics struct {
 	luaExecDuration   *prometheus.HistogramVec
 	redisCallDuration *prometheus.HistogramVec
+	redisCallCount    prometheus.Histogram
 	commitDuration    *prometheus.HistogramVec
 	conflictRetries   prometheus.Histogram
 }
 
 var luaDurationBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
 var luaRetryBuckets = []float64{0, 1, 2, 3, 5, 10, 20, 50}
+var luaCallCountBuckets = []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}
 
 func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 	m := &LuaMetrics{
@@ -62,6 +67,13 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 				Buckets: luaDurationBuckets,
 			},
 			[]string{"outcome"},
+		),
+		redisCallCount: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "elastickv_lua_redis_call_count",
+				Help:    "Number of redis.call()/pcall() invocations per Lua script execution, summed across retries. High counts combined with high redis_call_duration indicate many individual Raft reads.",
+				Buckets: luaCallCountBuckets,
+			},
 		),
 		commitDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -83,6 +95,7 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 	registerer.MustRegister(
 		m.luaExecDuration,
 		m.redisCallDuration,
+		m.redisCallCount,
 		m.commitDuration,
 		m.conflictRetries,
 	)
@@ -101,6 +114,7 @@ func (m *LuaMetrics) ObserveLuaScript(report LuaScriptReport) {
 	}
 	m.luaExecDuration.WithLabelValues(outcome).Observe(report.LuaExecDuration.Seconds())
 	m.redisCallDuration.WithLabelValues(outcome).Observe(report.RedisCallDuration.Seconds())
+	m.redisCallCount.Observe(float64(report.RedisCallCount))
 	m.commitDuration.WithLabelValues(outcome).Observe(report.CommitDuration.Seconds())
 	m.conflictRetries.Observe(float64(report.ConflictRetries))
 }

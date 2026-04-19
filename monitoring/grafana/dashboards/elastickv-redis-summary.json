@@ -1021,6 +1021,120 @@
       ],
       "title": "redis.call() Time as Fraction of Lua PCall Time",
       "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Number of redis.call()/pcall() invocations per Lua script execution. High count × per-call latency = total redis.call() time. If p99 count is large (e.g. >100), the script is iterating many keys and each Raft read compounds the latency.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p50 calls",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p95 calls",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "legendFormat": "p99 calls",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "redis.call() Count per Script Invocation (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Average time per redis.call() invocation = redis_call_duration / redis_call_count. Consistent high values (e.g. >10ms) indicate slow individual Raft reads regardless of call count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\", outcome=\"success\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\"}[5m])",
+          "legendFormat": "avg per redis.call()",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Average Time per redis.call() Invocation",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

@@ -20,6 +20,7 @@ type luaScriptContext struct {
 	readPin *kv.ActiveTimestampToken
 
 	redisCallDuration time.Duration
+	redisCallCount    int
 
 	touched     map[string]struct{}
 	deleted     map[string]bool
@@ -217,6 +218,7 @@ func (c *luaScriptContext) Close() {
 
 func (c *luaScriptContext) exec(command string, args []string) (luaReply, error) {
 	execStart := time.Now()
+	c.redisCallCount++
 	var reply luaReply
 	var err error
 	if handler, ok := luaCommandHandlers[command]; ok {
