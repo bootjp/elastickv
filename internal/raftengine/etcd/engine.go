@@ -67,7 +67,7 @@ var (
 	errConfChangeContextTooLarge   = errors.New("etcd raft conf change context is too large")
 	errLeadershipTransferTarget    = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady  = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer was aborted by raft")
+	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer aborted")
 	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
 	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
 	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
@@ -122,6 +122,7 @@ type Engine struct {
 	readCh           chan readRequest
 	adminCh          chan adminRequest
 	stepCh           chan raftpb.Message
+	dispatchReportCh chan dispatchReport
 	peerDispatchers  map[uint64]*peerQueues
 	perPeerQueueSize int
 	dispatchStopCh   chan struct{}
@@ -299,6 +300,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
 		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
+		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -768,12 +770,56 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleAdmin(req)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
+	case report := <-e.dispatchReportCh:
+		e.handleDispatchReport(report)
 	case result := <-e.snapshotResCh:
 		if err := e.handleSnapshotResult(result); err != nil {
 			return false, err
 		}
 	}
 	return true, nil
+}
+
+// dispatchReport is posted by the dispatch workers when a transport send
+// to a peer fails; the engine goroutine drains these and informs etcd/raft
+// via rawNode so follower Progress leaves StateReplicate / StateSnapshot on
+// unreachable peers and does not silently stall.
+type dispatchReport struct {
+	to      uint64
+	msgType raftpb.MessageType
+}
+
+func (e *Engine) handleDispatchReport(report dispatchReport) {
+	if e.rawNode == nil {
+		return
+	}
+	// MsgSnap requires the distinct SnapshotFailure path: raft tracks
+	// PendingSnapshot in Progress, and only ReportSnapshot clears it.
+	// All other message types use ReportUnreachable, which transitions the
+	// peer from StateReplicate to StateProbe so the next heartbeat response
+	// drives a fresh sendAppend attempt.
+	if report.msgType == raftpb.MsgSnap {
+		e.rawNode.ReportSnapshot(report.to, etcdraft.SnapshotFailure)
+		return
+	}
+	e.rawNode.ReportUnreachable(report.to)
+}
+
+// postDispatchReport delivers a dispatch failure to the event loop without
+// blocking the worker. If the channel is full (unlikely — the buffer is
+// sized to MaxInflightMsg), the report is dropped and logged; this is
+// acceptable because raft will retry on the next tick and we only need
+// eventual consistency between transport state and Progress state.
+func (e *Engine) postDispatchReport(report dispatchReport) {
+	select {
+	case e.dispatchReportCh <- report:
+	case <-e.closeCh:
+	default:
+		slog.Warn("etcd raft dispatch report dropped (channel full)",
+			"to", report.to,
+			"type", report.msgType.String(),
+		)
+	}
 }
 
 func (e *Engine) handleProposal(req proposalRequest) {
@@ -1053,20 +1099,21 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if isSnapshotToken(snapshot.Data) {
 		tok, err := decodeSnapshotToken(snapshot.Data)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
-			return errors.WithStack(err)
+			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
 	} else {
 		// Legacy format: full FSM payload in snapshot.Data.
 		if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
-			return errors.WithStack(err)
+			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.Metadata.Index)
 		}
 	}
 
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
-		return errors.WithStack(err)
+		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
+			snapshot.Metadata.Index, snapshot.Metadata.Term)
 	}
 	e.applied = snapshot.Metadata.Index
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
@@ -1596,6 +1643,34 @@ func (e *Engine) shutdown() {
 }
 
 func (e *Engine) fail(err error) {
+	// Idempotency guard: fail can be invoked from handleStep, which runs inside
+	// the main run loop and does not return on error. Without this guard a
+	// persistent step error would re-enter fail on every loop iteration,
+	// producing a log storm and redundant teardown calls.
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		// Make sure the run loop still observes the shutdown signal even if a
+		// previous fail path did not reach requestShutdown (e.g. concurrent
+		// invocation racing on the closed flag).
+		e.requestShutdown()
+		return
+	}
+	e.mu.Unlock()
+
+	// Log before mutating state so observability is preserved even if the
+	// downstream stopDispatch/closePersist calls themselves block or panic.
+	// Without this, the engine quietly transitions to StateShutdown and the
+	// only signal to the operator is a "shutdown" gauge — which is what
+	// happened in the production rolling-update incident where a snapshot
+	// restore failed silently and left the process running but unusable.
+	if err != nil {
+		slog.Error("etcd raft engine shutting down due to error",
+			slog.String("node_id", e.localID),
+			slog.Uint64("raft_node_id", e.nodeID),
+			slog.Any("err", err),
+		)
+	}
 	e.mu.Lock()
 	if err != nil {
 		e.runErr = err
@@ -1603,6 +1678,9 @@ func (e *Engine) fail(err error) {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	// Signal the run loop so that callers which invoke fail without returning
+	// from run themselves (notably handleStep) still exit on the next select.
+	e.requestShutdown()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
@@ -2122,18 +2200,24 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr != nil && !errors.Is(dispatchErr, ctx.Err()) {
-		count := e.dispatchErrorCount.Add(1)
-		if shouldLogDispatchEvent(count) {
-			slog.Warn("etcd raft outbound dispatch failed",
-				"node_id", e.nodeID,
-				"to", req.msg.To,
-				"type", req.msg.Type.String(),
-				"dispatch_error_count", count,
-				"err", dispatchErr,
-			)
-		}
+	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
+		return
 	}
+	count := e.dispatchErrorCount.Add(1)
+	if shouldLogDispatchEvent(count) {
+		slog.Warn("etcd raft outbound dispatch failed",
+			"node_id", e.nodeID,
+			"to", req.msg.To,
+			"type", req.msg.Type.String(),
+			"dispatch_error_count", count,
+			"err", dispatchErr,
+		)
+	}
+	// Inform etcd/raft that the peer is unreachable so Progress transitions
+	// out of StateReplicate / StateSnapshot. Without this the leader keeps
+	// Progress stuck and never retries sendAppend/sendSnap for the peer,
+	// leaving the follower indefinitely stale even after heartbeats resume.
+	e.postDispatchReport(dispatchReport{to: req.msg.To, msgType: req.msg.Type})
 }
 
 func (e *Engine) stopDispatchWorkers() {
