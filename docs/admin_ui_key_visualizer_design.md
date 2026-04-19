@@ -21,7 +21,7 @@ This document proposes a built-in admin Web UI, shipped as a separate binary `cm
 2. Provide a single UI that covers cluster overview, routes, Raft groups, adapter throughput, and the key visualizer.
 3. Produce a time × key-space heatmap with at least four switchable series: read count, write count, read bytes, write bytes.
 4. Follow hotspot shards across `SplitRange` / merge events so the heatmap stays continuous.
-5. Keep the sampler's hot-path overhead within the measurement noise floor; define success as "≥95% of operations captured with no detectable regression in coordinator benchmarks."
+5. Keep the sampler's hot-path overhead within the measurement noise floor of `BenchmarkCoordinatorDispatch`. Accuracy is expressed as a bound on the **estimator's relative error**, not a raw capture rate (see §5.2).
 6. Stay off the Prometheus client library in Phases 0–3. Traffic counters used by the UI are maintained by the in-process sampler and a small adapter-side aggregator that already exists on the hot path.
 7. Make the admin binary easy to deploy: a single Go binary with the SPA embedded via `go:embed`, producing one artifact per platform in CI.
 
@@ -89,8 +89,8 @@ Two layers:
 | `ListRoutes` | Existing `Distribution.ListRoutes` (reused, not duplicated) |
 | `GetRaftGroups` | Per-group state (leader, term, commit/applied, last contact) |
 | `GetAdapterSummary` | Per-adapter QPS and latency quantiles from the in-process aggregator |
-| `GetKeyVizMatrix` | Heatmap matrix (see §5.4) |
-| `GetRouteDetail` | Time series for one route (drill-down) |
+| `GetKeyVizMatrix` | Heatmap matrix for **this node's leader-owned routes only** (see §5.4). The admin binary fans out and merges. |
+| `GetRouteDetail` | Time series for one route (drill-down). Served only by the current leader of that route. |
 | `StreamEvents` | Server-stream of route-state transitions and fresh matrix columns |
 
 **Layer B — HTTP/JSON, browser → admin binary.** Thin pass-through wrappers over the gRPC calls, plus static asset serving.
@@ -129,37 +129,59 @@ A single call site is added at the dispatch entry of `kv.ShardedCoordinator` (se
 sampler.Observe(routeID, op, keyLen, valueLen)
 ```
 
-`sampler` is an interface; the default implementation is lock-free and nil-safe, so a nil sampler compiles to a predictable branch and no allocation. The hook runs *before* Raft proposal so it measures offered load, not applied load.
+`sampler` is an interface; the default implementation is nil-safe (a nil sampler compiles to one branch and no allocation). The hook runs *before* Raft proposal so it measures offered load, not applied load.
 
-Reads and writes are both sampled on the leader. Followers do not sample, because follower-local reads flow through the same coordinator path on the follower.
+Reads and writes are both sampled on the leader. Followers do not sample, because follower-local reads flow through the same coordinator path on the follower. Because only the current leader samples, a cluster-wide heatmap requires the admin binary to fan out and merge across nodes (§9.1) — pointing at a single node would produce a partial view.
 
-### 5.2 Adaptive sub-sampling and the 95% SLO
+The hot path is not literally lock-free; "low-overhead concurrent" is a more honest description. The data structures used are:
 
-Observing every call is cheap but not free. To guarantee "no detectable regression," the sampler uses **adaptive 1-in-N sampling per route**:
+- **Current-window counters**: `routes` is a **fixed-size 16-way shard-striped map**, each shard holding `map[RouteID]*routeCounters` behind its own `sync.RWMutex`. `Observe` takes the shard's **read lock** for the lookup and uses `atomic.AddUint64` on the counter fields. Adding a new `RouteID` takes the shard's write lock exactly once per route (amortised to zero after warm-up). No `Observe` call ever runs against a plain Go map undergoing concurrent writes.
+- **Flush**: instead of holding a long write lock, the flush goroutine **atomically swaps** the `*routeCounters` pointer for each key using `atomic.Pointer[routeCounters]`, then reads the old pointer's frozen counters to build the new matrix column. `Observe` that loaded the old pointer before the swap completes its increments against the (now-retired) old counters, which the next flush will harvest. No counts are lost; at most one step-boundary's worth of counts land in the next column instead of the current one.
+- **Split/merge** (§5.4): the route-watch callback creates the new child shards' counters *before* the `distribution.Engine` exposes the new `RouteID` to the coordinator, so by the time `Observe` sees the new `RouteID` the counter already exists and the callback does not race with the hot path.
 
-- Each route maintains an atomic `sampleRate` counter.
-- Under low load (below a threshold QPS per route), `sampleRate = 1` (every op counted).
-- As per-route QPS rises, `sampleRate` doubles stepwise, and the increment applied is multiplied by `sampleRate` so counters remain unbiased estimators.
-- The controller targets **≥95% capture rate** in steady state: `sampleRate` is only raised when the write contention on the atomic increment itself crosses a noise-floor CPU threshold, measured at flush time.
-- Worst-case error on per-bucket totals is bounded by `1/sqrt(observedSamples)`, so buckets with fewer samples are tagged in the response for the UI to hatch them.
+### 5.2 Adaptive sub-sampling and the accuracy SLO
 
-Benchmark gate in CI: run `BenchmarkCoordinatorDispatch` with the sampler disabled and with it enabled; the delta must be within the benchmark's own run-to-run variance (noise floor), not a fixed percentage. If a future change inflates variance, the gate fails until the noise floor is reduced or the sampler is made cheaper.
+Observing every call is cheap but not free. To stay under the benchmark noise floor at very high per-route QPS, the sampler may sub-sample via **adaptive 1-in-N per route**. Counters remain unbiased estimators because each accepted sample increments by `sampleRate`.
 
-### 5.3 In-memory representation
+The capture rate itself is not the SLO — at `sampleRate = 8` the raw capture rate is 12.5%, but the estimator is still unbiased. What the UI cares about is the **relative error of the bucket total** shown in the heatmap. The SLO is therefore:
+
+> For every bucket displayed in the response, the estimated total is within **±5% of the true value with 95% confidence**, over the bucket's full step window (default 60 s).
+
+For Poisson-ish traffic, the relative error of the Horvitz–Thompson estimator is approximately `sampleRate / sqrt(acceptedSamples)`. Setting this ≤0.05 at 95% CI gives a required `acceptedSamples ≥ (1.96 · sampleRate / 0.05)²`. The adaptive controller enforces this by never raising `sampleRate` past the point where the most recent window's `acceptedSamples` falls below that bound; if a burst violates the bound the affected buckets are flagged in the response and the UI renders them hatched so the operator knows the estimate is soft.
+
+`sampleRate` only rises at all when the previous flush window's CPU attributed to `Observe` crosses a measured threshold. In steady state with moderate per-route QPS, `sampleRate` stays at 1 and every op is counted.
+
+Benchmark gate in CI: `BenchmarkCoordinatorDispatch` with sampler off vs on; the delta must stay within run-to-run variance. Separately, a correctness test drives a known synthetic workload through a sub-sampling sampler and asserts the ±5% / 95%-CI bound holds across 1000 trials.
+
+### 5.3 In-memory representation and the route budget
 
 ```
 Sampler
- ├─ routes map[RouteID]*routeCounters   // current 1s window (reads,writes,readBytes,writeBytes, plus sampleRate)
+ ├─ routes [16]shard                    // shard-striped; each shard holds map[RouteID]*routeCounters + RWMutex
+ │     each routeCounters has          (reads, writes, readBytes, writeBytes, sampleRate)
  └─ history *ringBuffer[matrixColumn]   // one column per stepSeconds (default 60s)
 ```
 
-Every `stepSeconds` a flush goroutine swaps the map into a new column of the ring buffer.
+Every `stepSeconds` a flush goroutine swaps each route's counter pointer (§5.1) and drops a new column into the ring buffer.
 
-The ring buffer default is **24 hours of 60 s columns = 1440 columns**. Memory estimate: `1440 × routes × 4 × 8B`. For 10 k routes: ~460 MiB. The flush goroutine compacts columns beyond 1 hour into 5-minute aggregates, bringing the steady-state cost to under 80 MiB for the same route count.
+**Route budget and memory cap.** Naïve sizing (`columns × routes × series × 8B`) does not scale: 1 M routes × 1440 columns × 4 series × 8 B = ~46 GiB. Unbounded growth is unacceptable. The sampler enforces a hard budget on tracked routes:
+
+- A new flag `--keyvizMaxTrackedRoutes` (default **10 000** per node) caps the size of `routes`.
+- When `ListRoutes` exceeds the cap, the sampler **coarsens adjacent routes into virtual tracking buckets** sized to fit the budget. This is a purely internal aggregation; the admin binary still sees real `RouteID`s in `ListRoutes`, but their `Observe` calls land in the shared bucket, and the heatmap row simply labels the range `[start-of-first, end-of-last)`.
+- Coarsening is greedy on sorted `start` with merge priority given to **lowest recent activity**, so hot routes stay 1:1 until the budget is exhausted.
+- Compacted storage: columns older than 1 hour are re-bucketed into 5-minute aggregates, and columns older than 6 hours into 1-hour aggregates. The resulting steady-state footprint is:
+
+| Tracked routes | Ring-buffer retention | Footprint (4 series × 8 B) |
+|---|---|---|
+| 10 000 (default cap) | 24 h (1440 × 60 s) | ~1.8 GiB raw, **~120 MiB** after tiered compaction |
+| 10 000 | 1 h only | **~18 MiB** |
+| 1 000 | 24 h compacted | ~12 MiB |
+
+If an operator needs higher fidelity across more routes than the cap allows, they raise `--keyvizMaxTrackedRoutes` knowingly; the log emits an `INFO` at startup stating the selected cap and projected memory. If the cap is hit at runtime, an `INFO` fires once per hour naming which adjacent routes were coalesced.
 
 ### 5.4 Keeping up with splits and merges
 
-`distribution.Engine` already emits a watch stream on route-state transitions. The sampler subscribes and, on a split, copies the parent route's historical column values into both children so the heatmap stays visually continuous across the event. On a merge, child columns are summed into the surviving parent. The current `routeCounters` map is updated atomically under the watch callback; in-flight `Observe` calls that raced with the transition are attributed to whichever route is visible at observe time — acceptable because the loss is bounded by a single step window.
+`distribution.Engine` already emits a watch stream on route-state transitions. The sampler subscribes and, on a split, copies the parent route's historical column values into both children so the heatmap stays visually continuous across the event. On a merge, child columns are summed into the surviving parent. Current-window updates use the shard-striped, pointer-swap scheme from §5.1: child shards' `routeCounters` are installed **before** the `distribution.Engine` publishes the new `RouteID` to the coordinator, so `Observe` never dereferences a missing route. Counts that raced a transition are attributed to whichever `RouteID` the coordinator resolved — acceptable because the loss is bounded by a single step window.
 
 ### 5.5 Bucketing for the response
 
@@ -169,7 +191,15 @@ The API's `rows` parameter is a *target*, not a guarantee. The server walks the 
 
 Phases 0–2 keep history in memory only. Restart loses the heatmap — acceptable for an MVP and keeps the Raft critical path untouched.
 
-Phase 3 writes compacted columns to the default Raft group under reserved keys `!admin|keyviz|<unix-hour>|...`. Writes are batched once per flush and are not part of user transactions, so they cannot stall the data plane. A TTL of 7 days is applied via the existing HLC-based expiry (`store/lsm_store.go:24`).
+Phase 3 persists compacted columns **distributed across the user Raft groups themselves, not the default group**. Concentrating KeyViz writes on the default group would centralise I/O and Raft-log growth onto a single group, creating exactly the kind of hotspot this feature is built to surface. Instead:
+
+- Each compacted KeyViz column for a route is written to the **Raft group that owns that route**, under a reserved key `!admin|keyviz|<routeID>|<unix-hour>`.
+- Writes are batched hourly per group (not per flush) and dispatched as a single low-priority proposal per group, keeping the write amplification proportional to the group's own traffic.
+- A TTL of 7 days is applied via the existing HLC-based expiry (`store/lsm_store.go:24`).
+- The admin binary, on a history query, fans out to all groups' leaders (§9.1) and merges the returned slices.
+- For coarsened virtual buckets (§5.3), the column is written to the group owning the bucket's **first** constituent route, with a small index entry under `!admin|keyviz|index|<hour>` on the same group so the fan-out reader can discover it. The index entry is the only per-hour write that is shared — but its size is bounded by the route-budget cap, not by total traffic.
+
+This keeps the data-plane Raft-log overhead bounded by per-group load and fails independently when a single group is unavailable.
 
 ### 5.7 Key preview labels
 
@@ -183,8 +213,9 @@ Raw keys are binary. The UI needs a printable hint per bucket. Strategy:
 
 The existing `monitoring.Registry` observers record into Prometheus counters/histograms — useful for Grafana, but not readable back without pulling in the Prometheus client library. To keep the admin binary and node binary free of that dependency during Phases 0–3:
 
-- A small sibling struct `monitoring.LiveSummary` is added alongside each observer. It maintains, in parallel with the existing Prometheus writes, an in-process rolling window (10-second buckets, 5-minute history) of request count and latency reservoir samples per adapter and per operation.
-- `LiveSummary` is read-only from the outside and lock-free on the write path (atomic counters + a tiny t-digest per op).
+- A small sibling struct `monitoring.LiveSummary` is added alongside each observer. It maintains, in parallel with the existing Prometheus writes, an in-process rolling window (10-second buckets, 5-minute history) of request count and latency per adapter and per operation.
+- Latency is tracked with a **fixed-bucket log-linear histogram** (256 pre-sized buckets covering 1 µs – 10 s, similar to the Prometheus default schema but owned in-process). Each observation is a single `atomic.AddUint64` on the bucket's counter — no sort, no merge, no locks, predictable nanosecond cost. Quantiles (p50/p95/p99) are interpolated at read time by `GetAdapterSummary`. A t-digest was considered but rejected because its centroid merge cost is not bounded on the hot path and is hard to make concurrent without a lock.
+- Count, in-flight, and byte totals are plain `atomic.Uint64`.
 - `GetAdapterSummary` reads directly from `LiveSummary`. The Prometheus exposition remains unchanged and untouched.
 
 This adds roughly a dozen integer fields per tracked operation and avoids both the Prometheus dependency and the need to scrape `/metrics` from within the admin binary.
@@ -221,25 +252,39 @@ No changes to Raft, FSM, MVCC, or any protocol adapter beyond the single sampler
 ## 9. Deployment and Operation
 
 - The admin binary is not intended to be exposed on the public network in its initial form. It has no auth. Default bind is `127.0.0.1:8080`.
-- Typical operator workflow: `ssh -L 8080:localhost:8080 operator@host` then `elastickv-admin --node=localhost:50051`, or run the binary on a laptop and point it at a reachable node.
+- Typical operator workflow: `ssh -L 8080:localhost:8080 operator@host` then `elastickv-admin --nodes=host1:50051,host2:50051,host3:50051`, or run the binary on a laptop and point it at any reachable subset of nodes.
 - The admin binary is stateless; it can be killed and restarted without coordination.
 - CI produces release artifacts for `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`.
 
+### 9.1 Cluster-wide fan-out
+
+Because only the current leader of a Raft group records samples for that group's routes (§5.1), pointing the admin binary at a single node produces a **partial heatmap** covering only the routes that node happens to lead. To give operators a complete view by default, the admin binary runs in **fan-out mode**:
+
+- `--nodes` accepts a comma-separated list of seed addresses. The admin binary calls `GetClusterOverview` on any reachable seed to discover the current full membership (node → gRPC endpoint, plus per-group leader identity).
+- For each query (`GetKeyVizMatrix`, `GetRouteDetail`, `GetAdapterSummary`), the admin binary issues parallel gRPC calls to every known node and merges results server-side before sending one combined JSON payload to the browser.
+- Merging rule for the heatmap: each route appears in exactly one node's response (the leader's), so the merge is a concatenation with deduplication on `RouteID`. If two nodes report the same `RouteID` (a leadership change during the query window), the response with the **later** last-sampled timestamp wins, and the other is discarded.
+- Degraded mode: if any node is unreachable, the admin binary returns a partial result with a per-node `{node, ok, error}` status array so the UI can surface "3 of 4 nodes responded" instead of silently hiding ranges. The heatmap hatches rows whose owning node failed.
+- A single-node mode (`--nodes=one:50051 --no-fanout`) is retained for operators who explicitly want the partial view.
+
 ## 10. Performance Considerations
 
-- Sampler fast path: one atomic read of `sampleRate`, a modulo check, and four atomic increments on a hit. No allocation per call.
+- Sampler fast path on a hit: shard-select (a bitmask on `RouteID`), `RLock` on that shard, map lookup, `atomic.Pointer[routeCounters].Load`, then `atomic.AddUint64` on the four counters. No allocation per call, no global lock.
 - The coordinator already holds the `RouteID` at the hook site, so the sampler does not re-resolve.
-- The flush goroutine takes a write lock on the route-counters map exactly once per `stepSeconds`. A CAS-based double-buffer is the first optimisation if profiling shows contention.
+- The flush goroutine performs atomic pointer swaps per tracked route; there is no global write lock covering `Observe` calls. Splits and merges install child counters before publishing the new `RouteID` (§5.4), so the callback does not race with the hot path.
 - API endpoints cap `to − from` at 7 days and `rows` at 1024 to bound server work.
-- `LiveSummary` adds a second atomic increment alongside each existing Prometheus `Inc()`; its cost is on the order of a nanosecond and well below the noise floor in §5.2.
+- `LiveSummary` adds a second atomic increment alongside each existing Prometheus `Inc()`, plus one atomic increment on a fixed-bucket histogram counter. Cost is on the order of a nanosecond and well below the noise floor in §5.2.
+- Fan-out cost (§9.1) is N parallel gRPC calls; each node already serves `GetKeyVizMatrix` only for its own leader-owned routes, so the response size is distributed and the aggregate wall-clock is bounded by the slowest node, not the sum.
 
 ## 11. Testing
 
-1. Unit tests for `keyviz.Sampler` (concurrent Observe, adaptive sub-sampling correctness, flush, split/merge reshaping, 95% capture SLO under synthetic load).
-2. Integration test in `kv/` that drives synthetic traffic through the coordinator and asserts the matrix reflects the skew.
-3. gRPC handler tests with a fake engine and fake Raft status reader.
-4. Benchmark gate: `BenchmarkCoordinatorDispatch` with sampler off vs on. CI fails if the difference exceeds the benchmark's own run-to-run variance.
-5. Playwright smoke test against the embedded SPA to catch build-time regressions.
+1. Unit tests for `keyviz.Sampler`: concurrent `Observe` under the `-race` detector across all shards, flush correctness via the pointer-swap protocol, split/merge reshaping, and the **accuracy SLO** (1000 trials of synthetic workload must satisfy ±5% relative error at 95% CI per §5.2).
+2. Route-budget test: generate more than `--keyvizMaxTrackedRoutes` routes and assert that coarsening preserves total observed traffic and keeps hot routes un-merged.
+3. Integration test in `kv/` that drives synthetic traffic through the coordinator and asserts the matrix reflects the skew.
+4. gRPC handler tests with a fake engine and fake Raft status reader.
+5. Fan-out test: admin binary against a 3-node fake cluster, including one unreachable node; the merged response must include the partial-status array.
+6. Persistence test: write compacted columns to per-route groups, take a leadership transfer, and verify the reader sees the complete history across groups.
+7. Benchmark gate: `BenchmarkCoordinatorDispatch` with sampler off vs on. CI fails if the difference exceeds the benchmark's own run-to-run variance.
+8. Playwright smoke test against the embedded SPA to catch build-time regressions.
 
 ## 12. Phased Delivery
 
@@ -247,14 +292,15 @@ No changes to Raft, FSM, MVCC, or any protocol adapter beyond the single sampler
 |---|---|---|
 | 0 | `cmd/elastickv-admin` skeleton, `Admin` gRPC service stub, empty SPA shell, CI wiring. | Binary builds, `/api/cluster/overview` returns live data from a real node. |
 | 1 | Overview, Routes, Raft Groups, Adapters pages. `LiveSummary` added. No sampler. | All read-only pages match `grpcurl` ground truth. |
-| 2 | Key Visualizer MVP: in-memory sampler with adaptive sub-sampling, reads/writes series, static matrix API. | Benchmark gate green; heatmap shows synthetic hotspot within 2 s of load; capture rate ≥95% at target QPS. |
-| 3 | Bytes series, drill-down, split/merge continuity, persistence of compacted columns in the default Raft group. | Heatmap remains continuous across a live `SplitRange`; restart preserves last 7 days. |
+| 2 | Key Visualizer MVP: in-memory sampler with adaptive sub-sampling, reads/writes series, fan-out across nodes, static matrix API. | Benchmark gate green; heatmap shows synthetic hotspot within 2 s of load; ±5% / 95%-CI accuracy SLO holds under synthetic bursts; fan-out returns complete view with 1 node down. |
+| 3 | Bytes series, drill-down, split/merge continuity, persistence of compacted columns distributed **per owning Raft group**. | Heatmap remains continuous across a live `SplitRange`; restart preserves last 7 days; no single Raft group sees more than its share of KeyViz writes. |
 | 4 (deferred) | Mutating admin operations (`SplitRange` from UI), authentication. Out of scope for this design; a follow-up design will cover it. | — |
 
 Phases 0–2 are the minimum operationally useful product; Phase 3 is the "ship-quality" target.
 
 ## 13. Open Questions
 
-1. Is the 24 h × 60 s retention default right, or should it scale with route count? A node with 100 k routes would exceed the ~80 MiB compacted footprint — consider a configurable `--keyvizRetention` on the node binary in Phase 2.
+1. Default value of `--keyvizMaxTrackedRoutes`. 10 000 is conservative; operators with very large clusters may prefer a higher default paired with shorter retention. Settle during Phase 2 benchmarking.
 2. Do we want to expose follower-local read traffic separately from leader traffic in Phase 2, or defer that split to Phase 3?
-3. Should `GetKeyVizMatrix` support requesting data from multiple nodes at once (fan-out in the admin binary) to reduce operator confusion when the leader moves, or is "always point at the current leader" simpler?
+3. In fan-out (§9.1), should the admin binary **pin** to the seed list or dynamically refresh membership from `GetClusterOverview` on every request? Dynamic is more correct during scale events; pinned is simpler and avoids stampedes on the seed.
+4. For the Phase 3 persistence schema, should KeyViz writes share a transaction with other per-group low-priority maintenance (compaction metadata, etc.) to amortise Raft cost, or remain a dedicated batch for easier rollback?
