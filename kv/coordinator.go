@@ -124,11 +124,21 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		reqs.CommitTS = 0
 	}
 
+	var resp *CoordinateResponse
+	var err error
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+	} else {
+		resp, err = c.dispatchRaw(reqs.Elems)
 	}
-
-	return c.dispatchRaw(reqs.Elems)
+	if err == nil {
+		// A successful dispatch implies majority append + ack; treat it as a
+		// fresh quorum confirmation and extend the lease.
+		if lp, ok := c.engine.(raftengine.LeaseProvider); ok {
+			c.lease.extend(time.Now().Add(lp.LeaseDuration()))
+		}
+	}
+	return resp, err
 }
 
 func (c *Coordinate) IsLeader() bool {
