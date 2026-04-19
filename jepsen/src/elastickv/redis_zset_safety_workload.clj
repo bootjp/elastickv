@@ -223,10 +223,18 @@
 
 (defn- completed-mutation-window
   "For each completed mutation, produce
-  {:member m :score s :zrem? bool? :invoke-idx i :complete-idx j :type t}.
-  For :zadd and :zincrby, :score is the final (committed) score. For :zrem,
-  :score is nil and :zrem? is true. :info (indeterminate) ops are kept as
-  possibly-applied with :type :info."
+  {:member m :score s :zrem? bool? :unknown-score? bool? :invoke-idx i
+   :complete-idx j :type t}.
+  - :zadd: :score is the requested score (always known).
+  - :zincrby: when :ok, :score is the server-returned final score. When
+    :info or pending, the resulting score is unknown (depends on which
+    other ops were applied first); :unknown-score? is set so allowed-
+    scores-for-member can short-circuit the strict score check.
+  - :zrem: :removed? is the boolean returned by ZREM (true iff the
+    member existed). A no-op ZREM (returns 0) does NOT mutate state, so
+    the model must not treat it as a deletion.
+  :info / :pending mutations are still emitted so concurrent windows
+  account for their possible effect."
   [pairs]
   (keep
     (fn [{:keys [invoke complete]}]
@@ -243,14 +251,30 @@
 
             :zincrby
             (let [[m _delta] (:value invoke)
-                  s (when (and (= :ok t) (vector? (:value complete)))
+                  ;; ZINCRBY's resulting score is only knowable from the
+                  ;; server reply. For :info/:pending we don't have it.
+                  ok? (= :ok t)
+                  s (when (and ok? (vector? (:value complete)))
                       (second (:value complete)))]
               {:f :zincrby :member m :score (some-> s double)
+               :unknown-score? (not (and ok? (some? s)))
                :type t :invoke-idx inv-idx :complete-idx cmp-idx})
 
             :zrem
-            (let [m (:value invoke)]
-              {:f :zrem :member m :score nil :zrem? true
+            (let [m (:value invoke)
+                  ;; invoke! returns [member removed?]. For :info we don't
+                  ;; know whether the member was removed.
+                  removed? (cond
+                             (and (= :ok t)
+                                  (vector? (:value complete)))
+                             (boolean (second (:value complete)))
+                             ;; pending / info: assume removal could have
+                             ;; happened; the checker treats it as a
+                             ;; possibly-concurrent deletion via the
+                             ;; concurrent window.
+                             :else true)]
+              {:f :zrem :member m :score nil
+               :zrem? true :removed? removed?
                :type t :invoke-idx inv-idx :complete-idx cmp-idx})))))
     pairs))
 
@@ -266,12 +290,23 @@
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) read-inv-idx))))
 
+(defn- apply-mutation-to-state
+  "Fold one mutation into a per-member state {:present? bool :score s}.
+  A no-op ZREM (member did not exist; :removed? false) leaves state
+  unchanged so the checker doesn't falsely conclude the member is gone."
+  [st m]
+  (case (:f m)
+    :zadd    {:present? true :score (:score m)}
+    :zincrby {:present? true :score (:score m)}
+    :zrem    (if (:removed? m)
+               {:present? false :score nil}
+               st)))
+
 (defn- model-before
-  "Construct model state from the set of mutations whose completions
-  strictly precede `read-inv-idx`. Model maps member -> {:score s} or
-  marks member as :deleted. Returns {:members map :ok-members set}.
-  Only considers :ok mutations for the authoritative model; :info
-  mutations are treated as uncertain (neither strictly applied nor not)."
+  "Construct authoritative per-member state from mutations whose
+  completions strictly precede read-inv-idx. Returns
+  {member -> {:present? bool :score s}}. Only :ok mutations contribute;
+  :info / :pending are deferred to the concurrent-window check."
   [mutations-by-m read-inv-idx]
   (reduce-kv
     (fn [model member muts]
@@ -280,14 +315,7 @@
                                        (some? (:complete-idx %))
                                        (< (:complete-idx %) read-inv-idx)))
                          (sort-by :complete-idx))
-            state (reduce
-                    (fn [st m]
-                      (case (:f m)
-                        :zadd    {:present? true :score (:score m)}
-                        :zincrby {:present? true :score (:score m)}
-                        :zrem    {:present? false :score nil}))
-                    nil
-                    applied)]
+            state (reduce apply-mutation-to-state nil applied)]
         (if state
           (assoc model member state)
           model)))
@@ -302,7 +330,18 @@
 (defn- allowed-scores-for-member
   "Compute the set of scores considered valid for `member` by a read
   whose window is [read-inv-idx, read-cmp-idx], based on committed state
-  and any concurrent mutations."
+  and any concurrent mutations.
+
+  Returns:
+    :scores            - set of acceptable scores (committed + concurrent
+                         :zadd / :ok :zincrby).
+    :unknown-score?    - true iff any concurrent ZINCRBY's resulting score
+                         is unknown (in-flight or :info). When set, the
+                         caller MUST skip the strict score-membership
+                         check to stay sound.
+    :must-be-present?  - committed state says present and no concurrent
+                         mutation could have removed/changed it.
+    :any-known?        - some op claims to have touched this member."
   [mutations-by-m member read-inv-idx read-cmp-idx]
   (let [muts (get mutations-by-m member [])
         committed (->> muts
@@ -310,13 +349,7 @@
                                      (some? (:complete-idx %))
                                      (< (:complete-idx %) read-inv-idx)))
                        (sort-by :complete-idx))
-        committed-state (reduce
-                          (fn [st m]
-                            (case (:f m)
-                              (:zadd :zincrby) {:present? true :score (:score m)}
-                              :zrem            {:present? false :score nil}))
-                          nil
-                          committed)
+        committed-state (reduce apply-mutation-to-state nil committed)
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
         scores (cond-> #{}
                  (and committed-state (:present? committed-state))
@@ -328,8 +361,12 @@
                      :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
                      :zrem    acc))
                  scores
-                 concurrent)]
+                 concurrent)
+        unknown-score? (some #(and (= :zincrby (:f %))
+                                   (:unknown-score? %))
+                             concurrent)]
       {:scores scores
+       :unknown-score? (boolean unknown-score?)
        :must-be-present? (boolean (and committed-state (:present? committed-state)
                                        (empty? concurrent)))
        :any-known? (or (boolean committed-state) (seq concurrent))}))
@@ -347,7 +384,7 @@
                           :entries entries}))
     ;; 2. For each observed (member,score): validate score and non-phantom
     (doseq [[member score] entries]
-      (let [{:keys [scores any-known?]}
+      (let [{:keys [scores any-known? unknown-score?]}
             (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
         (cond
           (not any-known?)
@@ -355,6 +392,10 @@
                               :index cmp-idx
                               :member member
                               :score score})
+          ;; Skip the strict score check when any concurrent ZINCRBY's
+          ;; resulting score is unknown: the read could legitimately
+          ;; observe any value the in-flight increment produces.
+          unknown-score? nil
           (not (contains? scores score))
           (swap! errors conj {:kind :score-mismatch
                               :index cmp-idx
@@ -394,7 +435,7 @@
                             :bounds bounds
                             :member member
                             :score score}))
-      (let [{:keys [scores any-known?]}
+      (let [{:keys [scores any-known? unknown-score?]}
             (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
         (cond
           (not any-known?)
@@ -402,6 +443,7 @@
                               :index cmp-idx
                               :member member
                               :score score})
+          unknown-score? nil
           (not (contains? scores score))
           (swap! errors conj {:kind :score-mismatch-range
                               :index cmp-idx
