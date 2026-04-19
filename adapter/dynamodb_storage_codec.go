@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	json "github.com/goccy/go-json"
 	gproto "google.golang.org/protobuf/proto"
 )
 
@@ -18,6 +17,7 @@ var (
 	storedDynamoMarshalOptions    = gproto.MarshalOptions{Deterministic: true}
 
 	errStoredDynamoMessageTooLarge        = errors.New("stored dynamo message too large")
+	errUnrecognizedStoredDynamoFormat     = errors.New("unrecognized stored dynamo format")
 	errNilDynamoTableSchema               = errors.New("nil dynamo table schema")
 	errInvalidDynamoKeyEncodingVersion    = errors.New("invalid key encoding version")
 	errDynamoKeyEncodingVersionOverflow   = errors.New("dynamo key encoding version overflows int")
@@ -58,20 +58,15 @@ func encodeStoredDynamoTableSchema(schema *dynamoTableSchema) ([]byte, error) {
 }
 
 func decodeStoredDynamoTableSchema(b []byte) (*dynamoTableSchema, error) {
-	if hasStoredDynamoPrefix(b, storedDynamoSchemaProtoPrefix) {
-		msg := &pb.DynamoTableSchema{}
-		if err := gproto.Unmarshal(b[len(storedDynamoSchemaProtoPrefix):], msg); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		schema, err := dynamoTableSchemaFromProto(msg)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return schema, nil
+	if !hasStoredDynamoPrefix(b, storedDynamoSchemaProtoPrefix) {
+		return nil, errUnrecognizedStoredDynamoFormat
 	}
-
-	schema := &dynamoTableSchema{}
-	if err := json.Unmarshal(b, schema); err != nil {
+	msg := &pb.DynamoTableSchema{}
+	if err := gproto.Unmarshal(b[len(storedDynamoSchemaProtoPrefix):], msg); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	schema, err := dynamoTableSchemaFromProto(msg)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return schema, nil
@@ -86,20 +81,15 @@ func encodeStoredDynamoItem(item map[string]attributeValue) ([]byte, error) {
 }
 
 func decodeStoredDynamoItem(b []byte) (map[string]attributeValue, error) {
-	if hasStoredDynamoPrefix(b, storedDynamoItemProtoPrefix) {
-		msg := &pb.DynamoItem{}
-		if err := gproto.Unmarshal(b[len(storedDynamoItemProtoPrefix):], msg); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		item, err := dynamoItemFromProto(msg)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return item, nil
+	if !hasStoredDynamoPrefix(b, storedDynamoItemProtoPrefix) {
+		return nil, errUnrecognizedStoredDynamoFormat
 	}
-
-	item := map[string]attributeValue{}
-	if err := json.Unmarshal(b, &item); err != nil {
+	msg := &pb.DynamoItem{}
+	if err := gproto.Unmarshal(b[len(storedDynamoItemProtoPrefix):], msg); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	item, err := dynamoItemFromProto(msg)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return item, nil

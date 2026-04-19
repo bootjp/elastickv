@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"math/rand/v2"
 	"time"
 
@@ -96,6 +97,8 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if attempt >= policy.maxAttempts {
 			return errors.Wrap(err, "redis txn retry limit exceeded")
 		}
+		slog.Default().Debug("retryRedisWrite: retrying on write conflict",
+			"attempt", attempt+1, "backoff", backoff, "err", err)
 		if !waitRedisRetryBackoff(ctx, backoff) {
 			return err
 		}

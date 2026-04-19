@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/gob"
 	"hash"
 	"hash/crc32"
 	"io"
@@ -201,7 +200,7 @@ func decodeKeyView(k []byte) ([]byte, uint64) {
 	return k[:keyLen], ^invTs
 }
 
-// Value encoding: We use gob to encode VersionedValue structure minus the key/ts which are in the key.
+// Value encoding: fixed binary header [Tombstone(1)][ExpireAt(8)] followed by raw value bytes; key and timestamp are encoded in the SST key.
 type storedValue struct {
 	Value     []byte
 	Tombstone bool
@@ -1464,14 +1463,7 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 		// verification succeeds.
 		return s.restoreFromStreamingMVCC(br)
 	default:
-		// Legacy gob format: restoreFromLegacyGob performs an atomic
-		// temp-dir swap similarly.
-		// NOTE: Streams without a recognised magic header are assumed to be
-		// in the legacy gob format. Snapshots produced by older Pebble
-		// implementations that did not include a magic prefix are therefore
-		// not supported by this dispatcher and will typically surface as a
-		// gob decode error rather than being restored successfully.
-		return s.restoreFromLegacyGob(br)
+		return errors.WithStack(errors.Newf("unrecognized snapshot format: unknown magic header"))
 	}
 }
 
@@ -1781,155 +1773,6 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
 	return nil
-}
-
-// restoreLegacyGobToTempDB writes the decoded gob snapshot into a temporary
-// Pebble directory sibling to s.dir and atomically swaps it into place.
-func (s *pebbleStore) restoreLegacyGobToTempDB(entries []mvccSnapshotEntry, lastCommitTS uint64, minRetainedTS uint64) error {
-	tmpDir := filepath.Clean(s.dir) + ".legacy-tmp"
-	if err := os.RemoveAll(tmpDir); err != nil {
-		return errors.WithStack(err)
-	}
-	tmpDB, err := pebble.Open(tmpDir, defaultPebbleOptions())
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if err := writeGobEntriesToDB(entries, tmpDB); err != nil {
-		_ = tmpDB.Close()
-		_ = os.RemoveAll(tmpDir)
-		return err
-	}
-
-	if err := writeTempDBMetadata(tmpDB, lastCommitTS, minRetainedTS); err != nil {
-		_ = tmpDB.Close()
-		_ = os.RemoveAll(tmpDir)
-		return err
-	}
-
-	if err := tmpDB.Close(); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
-	}
-	return s.swapInTempDB(tmpDir)
-}
-
-// restoreFromLegacyGob restores from the legacy gob-encoded MVCCStore
-// snapshot format (gob payload + CRC32 trailer).
-//
-// The CRC32 is computed in a single pass while spooling the gob payload to a
-// temporary file co-located with s.dir. The CRC32 trailer is NOT written to
-// the spool file — only the pure gob payload is stored, so the decoder can
-// read the spool file directly without needing a LimitReader. Entries are
-// written into a temporary Pebble directory and only swapped into place after
-// decoding succeeds, preserving the existing store on failure.
-func (s *pebbleStore) restoreFromLegacyGob(r io.Reader) error {
-	snapshot, err := spoolAndDecodeGobSnapshot(r, s.dir)
-	if err != nil {
-		return err
-	}
-	if err := s.restoreLegacyGobToTempDB(snapshot.Entries, snapshot.LastCommitTS, snapshot.MinRetainedTS); err != nil {
-		return err
-	}
-	return nil
-}
-
-// spoolAndDecodeGobSnapshot streams r into a spool file co-located with dir,
-// verifies the CRC32 trailer, then gob-decodes the payload and returns the
-// snapshot. The spool file is always cleaned up before returning.
-func spoolAndDecodeGobSnapshot(r io.Reader, dir string) (mvccSnapshot, error) {
-	tmpFile, err := os.CreateTemp(dir, "ekv-legacy-gob-*.tmp")
-	if err != nil {
-		return mvccSnapshot{}, errors.WithStack(err)
-	}
-	tmpPath := tmpFile.Name()
-	closeTmp := func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-	}
-
-	if err := spoolGobPayload(r, tmpFile); err != nil {
-		closeTmp()
-		return mvccSnapshot{}, err
-	}
-
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		closeTmp()
-		return mvccSnapshot{}, errors.WithStack(err)
-	}
-	var snapshot mvccSnapshot
-	if err := gob.NewDecoder(tmpFile).Decode(&snapshot); err != nil {
-		closeTmp()
-		return mvccSnapshot{}, errors.WithStack(err)
-	}
-	// Close and remove the spool file before swapInTempDB removes dir.
-	closeTmp()
-	return snapshot, nil
-}
-
-// spoolGobPayload streams r into dst, stripping the final checksumSize-byte
-// CRC32 trailer. The payload bytes are written to dst and hashed; the trailer
-// is verified but not written. Returns ErrInvalidChecksum on mismatch or a
-// truncated stream.
-func spoolGobPayload(r io.Reader, dst io.Writer) error {
-	hasher := crc32.NewIEEE()
-	buf := make([]byte, spoolBufSize)
-	var tail []byte
-	for {
-		n, readErr := r.Read(buf)
-		if n > 0 {
-			tail = append(tail, buf[:n]...)
-			if len(tail) > checksumSize {
-				toProcessLen := len(tail) - checksumSize
-				toProcess := tail[:toProcessLen]
-				if _, err := dst.Write(toProcess); err != nil {
-					return errors.WithStack(err)
-				}
-				_, _ = hasher.Write(toProcess)
-				tail = append([]byte(nil), tail[toProcessLen:]...)
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return errors.WithStack(readErr)
-		}
-	}
-	if len(tail) != checksumSize {
-		return errors.WithStack(ErrInvalidChecksum)
-	}
-	if hasher.Sum32() != binary.LittleEndian.Uint32(tail) {
-		return errors.WithStack(ErrInvalidChecksum)
-	}
-	return nil
-}
-
-// writeGobEntriesToDB writes the decoded gob snapshot entries into db using
-// batched commits. NOTE: this function mutates entries in-place by clearing
-// each version's Value and then nilling the entry's Key and Versions slice
-// after encoding to reduce peak memory usage. Callers must not reuse entries
-// after this call.
-func writeGobEntriesToDB(entries []mvccSnapshotEntry, db *pebble.DB) error {
-	batch := db.NewBatch()
-	for i := range entries {
-		entry := &entries[i]
-		for j := range entry.Versions {
-			version := entry.Versions[j]
-			if err := setEncodedVersionInBatch(batch, entry.Key, version); err != nil {
-				_ = batch.Close()
-				return err
-			}
-			entry.Versions[j].Value = nil
-			if snapshotBatchShouldFlush(batch) {
-				if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
-					return err
-				}
-			}
-		}
-		entry.Key = nil
-		entry.Versions = nil
-	}
-	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
 func (s *pebbleStore) Close() error {

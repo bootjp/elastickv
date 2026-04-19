@@ -17,6 +17,7 @@ type Registry struct {
 	dynamo *DynamoDBMetrics
 	redis  *RedisMetrics
 	raft   *RaftMetrics
+	lua    *LuaMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -35,6 +36,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.dynamo = newDynamoDBMetrics(registerer)
 	r.redis = newRedisMetrics(registerer)
 	r.raft = newRaftMetrics(registerer)
+	r.lua = newLuaMetrics(registerer)
 	return r
 }
 
@@ -68,6 +70,14 @@ func (r *Registry) RedisObserver() RedisRequestObserver {
 		return nil
 	}
 	return r.redis
+}
+
+// LuaObserver returns the Lua script execution observer backed by this registry.
+func (r *Registry) LuaObserver() LuaScriptObserver {
+	if r == nil {
+		return nil
+	}
+	return r.lua
 }
 
 // RaftObserver returns the Raft topology observer backed by this registry.

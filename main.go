@@ -525,6 +525,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
+		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
 	)
 	eg.Go(func() error {
