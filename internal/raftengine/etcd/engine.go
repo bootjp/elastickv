@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultTickInterval  = 10 * time.Millisecond
-	defaultHeartbeatTick = 10 // 100ms at 10ms interval
+	defaultHeartbeatTick = 10  // 100ms at 10ms interval
 	defaultElectionTick  = 100 // 1s at 10ms interval
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
@@ -67,6 +67,7 @@ var (
 	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
 	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
 	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer aborted: a different leader was elected")
 	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
 )
 
@@ -653,8 +654,13 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 			return err
 		}
 		status := e.Status()
-		if status.State != raftengine.StateLeader && status.Leader.ID == target.ID {
-			return nil
+		if status.State != raftengine.StateLeader {
+			if status.Leader.ID == target.ID {
+				return nil
+			}
+			if status.Leader.ID != "" {
+				return errors.WithStack(errLeadershipTransferAborted)
+			}
 		}
 
 		select {
