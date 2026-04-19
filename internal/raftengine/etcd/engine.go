@@ -1943,7 +1943,16 @@ func normalizeIdentity(cfg OpenConfig) OpenConfig {
 }
 
 func normalizePeersConfig(cfg OpenConfig) OpenConfig {
-	if len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
+	// Only fill cfg.Peers with a single-peer self-list when an explicit
+	// Bootstrap flag was passed. Historically we defaulted to a local-only
+	// peer list whenever cfg.Peers was empty, but that silently bypassed the
+	// self-bootstrap guard in normalizePeers: a node with a wiped data dir
+	// and no persisted peers would arrive here with cfg.Peers empty, get a
+	// self-only list injected, and then sail past the len(peers) == 0 guard
+	// — the exact split-brain scenario the guard is supposed to prevent.
+	// When Bootstrap is false and no persisted peers were loaded,
+	// normalizePeers will reject the empty list via errNoPeersConfigured.
+	if cfg.Bootstrap && len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
 		cfg.Peers = []Peer{{
 			NodeID:  cfg.NodeID,
 			ID:      cfg.LocalID,
