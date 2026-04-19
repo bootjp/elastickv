@@ -48,7 +48,7 @@ type LuaMetrics struct {
 
 var luaDurationBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
 var luaRetryBuckets = []float64{0, 1, 2, 3, 5, 10, 20, 50}
-var luaCallCountBuckets = []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}
+var luaCallCountBuckets = []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}
 
 func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 	m := &LuaMetrics{
