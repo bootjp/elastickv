@@ -657,44 +657,37 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	c.zsets[k] = st
 
-	typ, err := c.keyType(key)
-	if errors.Is(err, store.ErrKeyNotFound) {
-		st.loaded = true
-		return st, nil
-	}
+	// zsetStorageHintAt performs the member-prefix scan once, so we never need
+	// a second ScanAt after type detection.
+	h, err := c.server.zsetStorageHintAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
-	if typ == redisTypeNone {
-		// Check whether physical ZSet data exists despite the key being logically
-		// absent (TTL-expired). If so, mark physicallyExistsAtStart so that
-		// zsetCommitPlan can force a full commit to clean up stale storage rows.
-		rawTyp, rawErr := c.server.rawKeyTypeAt(context.Background(), key, c.startTS)
-		if rawErr != nil {
-			return nil, rawErr
-		}
-		st.physicallyExistsAtStart = rawTyp == redisTypeZSet
+	switch {
+	case h.physType == redisTypeNone:
+		// Truly absent: brand-new key.
 		st.loaded = true
 		return st, nil
-	}
-	if typ != redisTypeZSet {
+	case h.logType == redisTypeNone:
+		// TTL-expired: physical ZSet data exists but the key is logically absent.
+		// physicallyExistsAtStart tells zsetCommitPlan to force a full commit so
+		// deleteLogicalKeyElems can remove the stale storage rows.
+		st.physicallyExistsAtStart = true
+		st.loaded = true
+		return st, nil
+	case h.logType != redisTypeZSet:
 		return nil, wrongTypeError()
 	}
 
-	// Probe for wide-column format with a single seek instead of a full scan.
-	prefix := store.ZSetMemberScanPrefix(key)
-	kvs, err := c.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), 1, c.startTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	// Key is a live ZSet.
 	st.loaded = true
 	st.exists = true
-	if len(kvs) > 0 {
+	if h.memberFound {
+		// Member keys present → wide-column format (not legacy blob).
 		return st, nil
 	}
-	// No !zs|mem| rows does not imply legacy-blob: a wide-column ZSet that had
-	// all members deleted leaves only meta/delta keys behind. Probe the legacy
-	// blob key directly to distinguish these cases.
+	// No !zs|mem| rows: either wide-column with all members deleted (meta/delta
+	// only) or legacy blob. Probe the legacy blob key to distinguish.
 	blobExists, err := c.server.store.ExistsAt(context.Background(), redisZSetKey(key), c.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)

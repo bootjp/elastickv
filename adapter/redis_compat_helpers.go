@@ -110,6 +110,71 @@ func (r *RedisServer) prefixExistsAt(ctx context.Context, prefix []byte, readTS 
 	return len(kvs) > 0, nil
 }
 
+// zsetStorageHint bundles the storage-probe results needed by zsetState so that
+// the member-prefix scan is performed at most once.
+type zsetStorageHint struct {
+	physType    redisValueType // type ignoring TTL expiry
+	logType     redisValueType // type after TTL check (redisTypeNone if expired)
+	memberFound bool           // true when the member-prefix scan returned ≥1 key
+}
+
+// zsetStorageHintAt probes storage for ZSet data at readTS.
+// It performs the ZSetMemberScanPrefix scan only once, so callers (zsetState)
+// do not need a second ScanAt to determine wide-column vs legacy-blob format.
+// For non-ZSet keys the full rawKeyTypeAt path is used for correctness.
+func (r *RedisServer) zsetStorageHintAt(ctx context.Context, key []byte, readTS uint64) (zsetStorageHint, error) {
+	physType, memberFound, err := r.rawZSetPhysTypeAt(ctx, key, readTS)
+	if err != nil {
+		return zsetStorageHint{}, err
+	}
+	h := zsetStorageHint{physType: physType, logType: physType, memberFound: memberFound}
+	if physType != redisTypeNone {
+		expired, err := r.hasExpiredTTLAt(ctx, key, readTS)
+		if err != nil {
+			return zsetStorageHint{}, err
+		}
+		if expired {
+			h.logType = redisTypeNone
+		}
+	}
+	return h, nil
+}
+
+// rawZSetPhysTypeAt detects whether a ZSet exists physically at readTS (ignoring
+// TTL) and whether the detection was via the member-prefix scan (memberFound).
+// For non-ZSet keys it falls back to rawKeyTypeAt.
+func (r *RedisServer) rawZSetPhysTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
+	// Single scan: probe member prefix (common path).
+	memberFound, err := r.prefixExistsAt(ctx, store.ZSetMemberScanPrefix(key), readTS)
+	if err != nil {
+		return redisTypeNone, false, err
+	}
+	if memberFound {
+		return redisTypeZSet, true, nil
+	}
+	// No member rows — check meta/delta for a memberless wide-column ZSet.
+	zsetOnly, err := r.zsetMetaOrDeltaExistsAt(ctx, key, readTS)
+	if err != nil {
+		return redisTypeNone, false, err
+	}
+	if zsetOnly {
+		return redisTypeZSet, false, nil
+	}
+	// Not a wide-column ZSet — full detection for other types.
+	physType, err := r.rawKeyTypeAt(ctx, key, readTS)
+	return physType, false, err
+}
+
+// zsetMetaOrDeltaExistsAt reports whether a ZSet meta key or delta prefix exists.
+func (r *RedisServer) zsetMetaOrDeltaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	if exists, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS); err != nil {
+		return false, errors.WithStack(err)
+	} else if exists {
+		return true, nil
+	}
+	return r.prefixExistsAt(ctx, store.ZSetMetaDeltaScanPrefix(key), readTS)
+}
+
 func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	// Check list base metadata key first.
 	listMetaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
