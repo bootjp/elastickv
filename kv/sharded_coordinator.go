@@ -24,6 +24,39 @@ type ShardGroup struct {
 	lease  leaseState
 }
 
+// leaseRefreshingTxn wraps a Transactional so every successful Commit /
+// Abort extends its shard's lease, treating committed Raft entries as
+// fresh quorum confirmations. Mirrors Coordinate.Dispatch's lease hook
+// for the per-shard case.
+type leaseRefreshingTxn struct {
+	inner Transactional
+	g     *ShardGroup
+}
+
+func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	start := time.Now()
+	resp, err := t.inner.Commit(reqs)
+	if err != nil {
+		return resp, errors.WithStack(err)
+	}
+	if lp, ok := t.g.Engine.(raftengine.LeaseProvider); ok {
+		t.g.lease.extend(start.Add(lp.LeaseDuration()))
+	}
+	return resp, nil
+}
+
+func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+	start := time.Now()
+	resp, err := t.inner.Abort(reqs)
+	if err != nil {
+		return resp, errors.WithStack(err)
+	}
+	if lp, ok := t.g.Engine.(raftengine.LeaseProvider); ok {
+		t.g.lease.extend(start.Add(lp.LeaseDuration()))
+	}
+	return resp, nil
+}
+
 const (
 	txnPhaseCount = 2
 
@@ -48,6 +81,12 @@ type ShardedCoordinator struct {
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
 	for gid, g := range groups {
+		// Wrap Txn so every successful Commit/Abort refreshes the
+		// per-shard lease. All dispatch paths (raw via router.Commit,
+		// dispatchSingleShardTxn, dispatchTxn 2PC, dispatchDelPrefix
+		// broadcast) flow through g.Txn so this single hook catches
+		// them all.
+		g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
 		router.Register(gid, g.Txn, g.Store)
 		// Per-shard leader-loss hook: when this group's engine notices
 		// a state transition out of leader, drop the lease so the next
