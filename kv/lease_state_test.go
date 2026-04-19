@@ -11,8 +11,8 @@ func TestLeaseState_NilReceiverIsAlwaysExpired(t *testing.T) {
 	t.Parallel()
 	var s *leaseState
 	require.False(t, s.valid(time.Now()))
-	s.extend(time.Now().Add(time.Hour))  // must not panic
-	s.invalidate()                       // must not panic
+	s.extend(time.Now().Add(time.Hour)) // must not panic
+	s.invalidate()                      // must not panic
 	require.False(t, s.valid(time.Now()))
 }
 
