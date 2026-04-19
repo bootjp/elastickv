@@ -42,9 +42,11 @@ func NewPebbleStore(dir string) (*PebbleStore, error) {
 // Pinned so existing v1-era DBs are ratcheted above pebble v2's
 // FormatMinSupported (FormatFlushableIngest) before the v2 upgrade lands.
 func pebbleOptions() *pebble.Options {
-	return &pebble.Options{
+	opts := &pebble.Options{
 		FormatMajorVersion: pebble.FormatVirtualSSTables,
 	}
+	opts.EnsureDefaults()
+	return opts
 }
 
 func (s *PebbleStore) FirstIndex() (uint64, error) {

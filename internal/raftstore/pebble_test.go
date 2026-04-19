@@ -15,7 +15,7 @@ func TestPebbleStore_FormatRatchetedForV2(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
 
 	require.GreaterOrEqual(t, s.db.FormatMajorVersion(), pebble.FormatFlushableIngest)
 }
@@ -38,7 +38,7 @@ func TestPebbleStore_RatchetsExistingDB(t *testing.T) {
 	// Reopen through the production path.
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
 
 	require.GreaterOrEqual(t, s.db.FormatMajorVersion(), pebble.FormatFlushableIngest)
 }
@@ -58,7 +58,7 @@ func TestPebbleStore_PreservesLogsAcrossRatchet(t *testing.T) {
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
 
 	var got raft.Log
 	require.NoError(t, s.GetLog(1, &got))
