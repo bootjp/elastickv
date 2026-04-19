@@ -592,7 +592,7 @@ func streamReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, bu
 		next, nextErr := readSnapshotChunk(buffered, chunkSize)
 		final := errors.Is(nextErr, io.EOF)
 		if nextErr != nil && !final {
-			return errors.WithStack(nextErr)
+			return nextErr
 		}
 		isLast := final && len(next) == 0
 		metadata := header
@@ -602,7 +602,7 @@ func streamReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, bu
 		first = false
 		if err := sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
 			Metadata: metadata,
-			Chunk:    append([]byte(nil), current...),
+			Chunk:    current,
 			Final:    isLast,
 		}); err != nil {
 			return err
@@ -612,7 +612,7 @@ func streamReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, bu
 		}
 		if final {
 			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
-				Chunk: append([]byte(nil), next...),
+				Chunk: next,
 				Final: true,
 			})
 		}
