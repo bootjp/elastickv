@@ -73,8 +73,8 @@ type luaZSetState struct {
 	loaded         bool
 	exists         bool
 	dirty          bool
-	membersLoaded  bool                // all members loaded into st.members
-	legacyBlobBase bool                // existing data is in legacy blob format
+	membersLoaded  bool // all members loaded into st.members
+	legacyBlobBase bool // existing data is in legacy blob format
 	// physicallyExistsAtStart is true when the key had physical ZSet data in
 	// storage at script-start time, even if logically absent due to TTL expiry.
 	// It is used by zsetCommitPlan to force a full commit (and thus cleanup of
