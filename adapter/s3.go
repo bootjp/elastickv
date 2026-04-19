@@ -31,16 +31,17 @@ import (
 )
 
 const (
-	s3HealthPath             = "/healthz"
-	s3LeaderHealthPath       = "/healthz/leader"
-	s3ChunkSize              = 1 << 20
-	s3ChunkBatchOps          = 16
-	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion          = "us-east-1"
-	s3MaxKeys                = 1000
-	s3ListPageSize           = 256
-	s3ManifestCleanupTimeout = 2 * time.Minute
-	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
+	s3HealthPath                = "/healthz"
+	s3LeaderHealthPath          = "/healthz/leader"
+	s3HealthMaxRequestBodyBytes = 1024
+	s3ChunkSize                 = 1 << 20
+	s3ChunkBatchOps             = 16
+	s3XMLNamespace              = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion             = "us-east-1"
+	s3MaxKeys                   = 1000
+	s3ListPageSize              = 256
+	s3ManifestCleanupTimeout    = 2 * time.Minute
+	s3MaxObjectSizeBytes        = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -2338,7 +2339,11 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 	if r == nil || r.URL == nil || r.URL.Path != s3LeaderHealthPath {
 		return false
 	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s3HealthMaxRequestBodyBytes)
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return true
 	}

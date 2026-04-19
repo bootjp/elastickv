@@ -243,6 +243,12 @@ func TestS3Server_LeaderHealthz(t *testing.T) {
 			require.Empty(t, rec.Body.String())
 		})
 	}
+
+	// Disallowed methods must get 405 with an Allow header per RFC 7231.
+	rec := httptest.NewRecorder()
+	leaderSrv.handle(rec, newS3TestRequest(http.MethodPost, s3LeaderHealthPath, nil))
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
 }
 
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
