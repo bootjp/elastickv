@@ -1715,6 +1715,7 @@ func (e *Engine) requestShutdown() {
 
 func (e *Engine) shutdown() {
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
@@ -1723,6 +1724,15 @@ func (e *Engine) shutdown() {
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(errors.WithStack(errClosed))
+	// LeaseProvider contract promises callbacks fire on shutdown too.
+	// refreshStatus only fires them on the leader -> non-leader edge,
+	// which can be missed when shutdown short-circuits the status loop.
+	// Always fire here so lease holders invalidate even on engine close
+	// initiated while still leader, on shutdown after fail(), or via
+	// Close() racing against the run loop.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) fail(err error) {

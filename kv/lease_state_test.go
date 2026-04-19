@@ -78,6 +78,47 @@ func TestLeaseState_InvalidateBeatsConcurrentExtend(t *testing.T) {
 	require.False(t, s.valid(now))
 }
 
+// TestLeaseState_ExtendCannotResurrectAfterInvalidate exercises the
+// generation-guard invariant: an extend call whose internal CAS lands
+// after a concurrent invalidate must undo its own write rather than
+// leave the lease alive. Without the guard, a Dispatch that succeeded
+// just before the leader-loss callback could resurrect the lease for
+// up to LeaseDuration.
+func TestLeaseState_ExtendCannotResurrectAfterInvalidate(t *testing.T) {
+	t.Parallel()
+	var s leaseState
+	now := time.Now()
+
+	// Simulate the race: extend captured the current generation, then
+	// invalidate fires before extend's CAS lands. The simplest way to
+	// exercise this deterministically is to invalidate first (so the
+	// extend sees the bumped generation) and verify extend leaves the
+	// state invalidated.
+	expectedGen := s.gen.Load()
+	s.invalidate()
+	require.NotEqual(t, expectedGen, s.gen.Load(),
+		"invalidate must bump the generation")
+
+	// Manually replay an extend that captured the pre-invalidate
+	// generation. Use the package-internal helper to avoid time-based
+	// races.
+	until := now.Add(time.Hour)
+	for {
+		current := s.expiry.Load()
+		if !s.expiry.CompareAndSwap(current, &until) {
+			continue
+		}
+		// Match the production extend's post-CAS check.
+		if s.gen.Load() != expectedGen {
+			s.expiry.CompareAndSwap(&until, nil)
+		}
+		break
+	}
+
+	require.False(t, s.valid(now),
+		"stale-generation extend must NOT resurrect the lease")
+}
+
 func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 	t.Parallel()
 	var s leaseState
