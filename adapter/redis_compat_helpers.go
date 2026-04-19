@@ -377,26 +377,37 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 // the legacy path does at most two extra reads (TTL index, then bare key).
 // Expiration is checked locally from the TTL we just decoded.
 func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	raw, err := r.leaderAwareGetAt(redisStrKey(key), readTS)
+	return r.readRedisStringWith(key, readTS, r.leaderAwareGetAt)
+}
+
+// readRedisStringAtSnapshot reads a string without re-verifying leadership on
+// every sub-call. The caller must have already called coordinator.VerifyLeader()
+// once before invoking this (e.g. at Lua script startTS acquisition time).
+func (r *RedisServer) readRedisStringAtSnapshot(key []byte, readTS uint64) ([]byte, *time.Time, error) {
+	return r.readRedisStringWith(key, readTS, r.snapshotGetAt)
+}
+
+func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+	raw, err := get(redisStrKey(key), readTS)
 	if err == nil {
-		return r.decodePrefixedString(key, raw, readTS)
+		return r.decodePrefixedStringWith(key, raw, readTS, get)
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
 	}
-	return r.readBareLegacyString(key, readTS)
+	return r.readBareLegacyStringWith(key, readTS, get)
 }
 
 // decodePrefixedString handles the !redis|str|<key> payload: new-format values
 // carry their TTL inline, while legacy-format payloads that still sit under
 // the prefixed key during rolling upgrade must consult the secondary index.
-func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]byte, *time.Time, error) {
+func (r *RedisServer) decodePrefixedStringWith(key, raw []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
 	userValue, ttl, err := decodeRedisStr(raw)
 	if err != nil {
 		return nil, nil, err
 	}
 	if !isNewRedisStrFormat(raw) {
-		legacyTTL, ttlErr := r.readLegacyTTL(key, readTS)
+		legacyTTL, ttlErr := r.readLegacyTTLWith(key, readTS, get)
 		if ttlErr != nil {
 			return nil, nil, ttlErr
 		}
@@ -408,27 +419,27 @@ func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]by
 	return userValue, ttl, nil
 }
 
-// readBareLegacyString handles pre-migration data still under the bare user
+// readBareLegacyStringWith handles pre-migration data still under the bare user
 // key: TTL in the secondary index, value at the bare key itself.
-func (r *RedisServer) readBareLegacyString(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	legacyTTL, err := r.readLegacyTTL(key, readTS)
+func (r *RedisServer) readBareLegacyStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+	legacyTTL, err := r.readLegacyTTLWith(key, readTS, get)
 	if err != nil {
 		return nil, nil, err
 	}
 	if legacyTTL != nil && !legacyTTL.After(time.Now()) {
 		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
-	legacy, err := r.leaderAwareGetAt(key, readTS)
+	legacy, err := get(key, readTS)
 	if err != nil {
 		return nil, nil, err
 	}
 	return legacy, legacyTTL, nil
 }
 
-// readLegacyTTL fetches the pre-migration !redis|ttl| entry, returning nil
+// readLegacyTTLWith fetches the pre-migration !redis|ttl| entry, returning nil
 // when no index is present.
-func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, error) {
-	raw, err := r.leaderAwareGetAt(redisTTLKey(key), readTS)
+func (r *RedisServer) readLegacyTTLWith(key []byte, readTS uint64, get rawGetFn) (*time.Time, error) {
+	raw, err := get(redisTTLKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -442,10 +453,25 @@ func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, erro
 	return &ttl, nil
 }
 
+// rawGetFn is the signature shared by leaderAwareGetAt and snapshotGetAt so
+// that the string-read helpers can be parameterised without duplication.
+type rawGetFn func(key []byte, readTS uint64) ([]byte, error)
+
 // leaderAwareGetAt is a GetAt that honors the per-key leader routing readValueAt
 // uses, but without calling back into hasExpiredTTLAt. Callers are responsible
 // for handling expiration themselves using the TTL they just read.
 func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error) {
+	return r.doGetAt(key, readTS, true)
+}
+
+// snapshotGetAt reads at readTS without re-verifying leadership on every call.
+// The caller must have already called coordinator.VerifyLeader() once (e.g. at
+// Lua script startTS acquisition time) before using this method.
+func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
+	return r.doGetAt(key, readTS, false)
+}
+
+func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
 	// Leadership is partitioned by the logical user key, so strip the internal
 	// prefix before asking the coordinator.
 	routingKey := key
@@ -453,8 +479,10 @@ func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error
 		routingKey = userKey
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
-		if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
-			return nil, errors.WithStack(err)
+		if verify {
+			if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
+				return nil, errors.WithStack(err)
+			}
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)
 		return v, errors.WithStack(err)
