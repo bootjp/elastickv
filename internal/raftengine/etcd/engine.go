@@ -54,21 +54,23 @@ const (
 )
 
 var (
-	errNilEngine                  = errors.New("raft engine is not configured")
-	errClosed                     = errors.New("etcd raft engine is closed")
-	errNotLeader                  = errors.New("etcd raft engine is not leader")
-	errNodeIDRequired             = errors.New("etcd raft node id is required")
-	errDataDirRequired            = errors.New("etcd raft data dir is required")
-	errStateMachineUnset          = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired           = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull              = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch            = errors.New("etcd raft persisted cluster does not match configured peers")
-	errConfigIndexMismatch        = errors.New("etcd raft configuration index does not match")
-	errConfChangeContextTooLarge  = errors.New("etcd raft conf change context is too large")
-	errLeadershipTransferTarget   = errors.New("etcd raft leadership transfer target is required")
-	errLeadershipTransferNotReady = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted  = errors.New("etcd raft leadership transfer aborted: a different leader was elected")
-	errTooManyPendingConfigs      = errors.New("etcd raft engine has too many pending config changes")
+	errNilEngine                   = errors.New("raft engine is not configured")
+	errClosed                      = errors.New("etcd raft engine is closed")
+	errNotLeader                   = errors.New("etcd raft engine is not leader")
+	errNodeIDRequired              = errors.New("etcd raft node id is required")
+	errDataDirRequired             = errors.New("etcd raft data dir is required")
+	errStateMachineUnset           = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired            = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull               = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch             = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch         = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge   = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget    = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady  = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer aborted")
+	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
+	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
 )
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
@@ -335,7 +337,7 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		return preparedOpenState{}, err
 	}
 
-	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK)
+	localPeer, peers, err := normalizePeers(cfg.NodeID, cfg.LocalID, cfg.LocalAddress, cfg.Peers, persistedPeersOK, cfg.Bootstrap)
 	if err != nil {
 		return preparedOpenState{}, err
 	}
@@ -929,7 +931,27 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 		req.done <- adminResult{err: err}
 		return
 	}
+	// Reject transfer requests when the local node is not leader — etcd/raft
+	// would silently drop the MsgTransferLeader in any non-leader state,
+	// leaving the caller to block until the deadline. handleTransferLeadership
+	// runs on the single-threaded event loop, so rawNode state reads here are
+	// not racy with other rawNode mutations.
+	if e.rawNode.BasicStatus().RaftState != etcdraft.StateLeader {
+		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferNotLeader)}
+		return
+	}
 	e.rawNode.TransferLeader(target.NodeID)
+	// TransferLeader is processed synchronously inside rawNode.TransferLeader.
+	// If raft accepted the request, r.leadTransferee now equals target.NodeID.
+	// If it was silently dropped (e.g. target has no progress entry, is a
+	// learner, or equals the local node), leadTransferee is still zero or
+	// unchanged — surface that as an immediate error rather than letting the
+	// caller poll until its deadline.
+	if e.rawNode.BasicStatus().LeadTransferee != target.NodeID {
+		req.done <- adminResult{err: errors.Wrapf(errLeadershipTransferRejected,
+			"target id=%d addr=%s", target.NodeID, target.Address)}
+		return
+	}
 	req.done <- adminResult{peer: target}
 }
 
@@ -1921,7 +1943,16 @@ func normalizeIdentity(cfg OpenConfig) OpenConfig {
 }
 
 func normalizePeersConfig(cfg OpenConfig) OpenConfig {
-	if len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
+	// Only fill cfg.Peers with a single-peer self-list when an explicit
+	// Bootstrap flag was passed. Historically we defaulted to a local-only
+	// peer list whenever cfg.Peers was empty, but that silently bypassed the
+	// self-bootstrap guard in normalizePeers: a node with a wiped data dir
+	// and no persisted peers would arrive here with cfg.Peers empty, get a
+	// self-only list injected, and then sail past the len(peers) == 0 guard
+	// — the exact split-brain scenario the guard is supposed to prevent.
+	// When Bootstrap is false and no persisted peers were loaded,
+	// normalizePeers will reject the empty list via errNoPeersConfigured.
+	if cfg.Bootstrap && len(cfg.Peers) == 0 && cfg.LocalAddress != "" && cfg.LocalID != "" {
 		cfg.Peers = []Peer{{
 			NodeID:  cfg.NodeID,
 			ID:      cfg.LocalID,
