@@ -5,9 +5,8 @@ import (
 	"testing"
 	"time"
 
-	raftpb "go.etcd.io/raft/v3/raftpb"
-
 	"github.com/stretchr/testify/require"
+	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 
 const testDispatchReportTimeout = 2 * time.Second
