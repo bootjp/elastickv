@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -348,4 +349,102 @@ func TestZAdd_XX_MissingKey_NoPhantom(t *testing.T) {
 
 	require.Empty(t, conn.err)
 	require.Equal(t, int64(0), conn.int, "ZADD XX on missing key must not create a phantom key")
+}
+
+// TestZSetTTLExpiredRecreation verifies that when a ZSet expires via TTL and is
+// recreated by Lua ZADD, stale wide-column data (members, score-index, meta, TTL)
+// from the expired ZSet is removed. Before the fix, zsetCommitPlan took the delta
+// path (preserveExisting=true) because st.exists==false and everDeleted was never
+// set, leaving old members and the expired TTL key in storage.
+func TestZSetTTLExpiredRecreation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+
+	// Write a wide-column ZSet with member "old-member" at ts=1.
+	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey([]byte("expired:zset"), []byte("old-member")), store.MarshalZSetScore(9.0), 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey([]byte("expired:zset"), 9.0, []byte("old-member")), []byte{}, 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey([]byte("expired:zset")), store.MarshalZSetMeta(store.ZSetMeta{Len: 1}), 1, 0))
+	// Set a TTL that is already in the past so the key appears expired.
+	require.NoError(t, st.PutAt(ctx, redisTTLKey([]byte("expired:zset")), encodeRedisTTL(time.Unix(0, 0)), 2, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(2)
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+	// Recreate the expired ZSet by adding "new-member".
+	srv.runLuaScript(conn, `return redis.call("ZADD", KEYS[1], 1, "new-member")`, [][]byte{
+		[]byte("1"),
+		[]byte("expired:zset"),
+	})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int, "ZADD should add new-member")
+
+	// Old member key must be gone.
+	oldMemberExists, err := st.ExistsAt(ctx, store.ZSetMemberKey([]byte("expired:zset"), []byte("old-member")), snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.False(t, oldMemberExists, "old-member from expired ZSet must not survive recreation")
+
+	// Old TTL key must be gone.
+	ttlExists, err := st.ExistsAt(ctx, redisTTLKey([]byte("expired:zset")), snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.False(t, ttlExists, "expired TTL key must not survive ZSet recreation")
+
+	// New member must exist.
+	newMemberExists, err := st.ExistsAt(ctx, store.ZSetMemberKey([]byte("expired:zset"), []byte("new-member")), snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.True(t, newMemberExists, "new-member must be present after recreation")
+}
+
+// TestZSetDeltaCommitOnExistingWideColumn verifies that the delta commit path
+// (write-only Lua script on a pre-existing wide-column ZSet) correctly adds new
+// members without dropping untouched existing ones, and that ZCARD reflects the
+// updated count inside the script.
+func TestZSetDeltaCommitOnExistingWideColumn(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+
+	// Pre-populate wide-column ZSet with member "a" at ts=1.
+	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey([]byte("delta:zset"), []byte("a")), store.MarshalZSetScore(1.0), 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey([]byte("delta:zset"), 1.0, []byte("a")), []byte{}, 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey([]byte("delta:zset")), store.MarshalZSetMeta(store.ZSetMeta{Len: 1}), 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+	// Add "b" and return ZCARD; ZCARD must account for both "a" (existing) and "b" (added).
+	srv.runLuaScript(conn, `redis.call("ZADD", KEYS[1], 2, "b"); return redis.call("ZCARD", KEYS[1])`, [][]byte{
+		[]byte("1"),
+		[]byte("delta:zset"),
+	})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(2), conn.int, "ZCARD must reflect both existing and newly added member")
+
+	readTS := snapshotTS(coord.clock, st)
+
+	// "a" must still exist after delta commit.
+	aExists, err := st.ExistsAt(ctx, store.ZSetMemberKey([]byte("delta:zset"), []byte("a")), readTS)
+	require.NoError(t, err)
+	require.True(t, aExists, "existing member 'a' must survive delta commit")
+
+	// "b" must have been written.
+	bExists, err := st.ExistsAt(ctx, store.ZSetMemberKey([]byte("delta:zset"), []byte("b")), readTS)
+	require.NoError(t, err)
+	require.True(t, bExists, "new member 'b' must be written by delta commit")
 }

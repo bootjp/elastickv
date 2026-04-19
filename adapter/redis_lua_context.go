@@ -75,11 +75,16 @@ type luaZSetState struct {
 	dirty          bool
 	membersLoaded  bool                // all members loaded into st.members
 	legacyBlobBase bool                // existing data is in legacy blob format
-	members        map[string]float64  // full member map (only when membersLoaded=true)
-	added          map[string]float64  // members added/updated in this script (delta)
-	storageScores  map[string]*float64 // original scores from Pebble (nil ptr = absent)
-	removed        map[string]struct{} // members explicitly removed in this script
-	lenDelta       int64               // net cardinality change (for delta commit)
+	// physicallyExistsAtStart is true when the key had physical ZSet data in
+	// storage at script-start time, even if logically absent due to TTL expiry.
+	// It is used by zsetCommitPlan to force a full commit (and thus cleanup of
+	// stale wide-column rows) when recreating a TTL-expired ZSet.
+	physicallyExistsAtStart bool
+	members                 map[string]float64  // full member map (only when membersLoaded=true)
+	added                   map[string]float64  // members added/updated in this script (delta)
+	storageScores           map[string]*float64 // original scores from Pebble (nil ptr = absent)
+	removed                 map[string]struct{} // members explicitly removed in this script
+	lenDelta                int64               // net cardinality change (for delta commit)
 
 	// resolvedBaseCard caches the result of resolveZSetMeta (storage-level cardinality)
 	// so ZCARD does not re-scan delta keys on every call within the same script.
@@ -661,6 +666,14 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 		return nil, err
 	}
 	if typ == redisTypeNone {
+		// Check whether physical ZSet data exists despite the key being logically
+		// absent (TTL-expired). If so, mark physicallyExistsAtStart so that
+		// zsetCommitPlan can force a full commit to clean up stale storage rows.
+		rawTyp, rawErr := c.server.rawKeyTypeAt(context.Background(), key, c.startTS)
+		if rawErr != nil {
+			return nil, rawErr
+		}
+		st.physicallyExistsAtStart = rawTyp == redisTypeZSet
 		st.loaded = true
 		return st, nil
 	}
@@ -3011,7 +3024,11 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	if c.everDeleted[key] || st.membersLoaded {
+	// physicallyExistsAtStart is true when the key had physical ZSet data in
+	// storage at script start but was TTL-expired (logically absent). Force a
+	// full commit so deleteLogicalKeyElems removes stale wide-column rows
+	// (members, score-index, meta, TTL) that were left by the expired ZSet.
+	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
 		return c.zsetFullCommitWithMerge(key, st), nil
 	}
 	if st.legacyBlobBase {
@@ -3162,7 +3179,16 @@ func (c *luaScriptContext) finalTTL(key []byte) (*time.Time, error) {
 	if st != nil && st.loaded {
 		return st.value, nil
 	}
-	return c.server.ttlAt(context.Background(), key, c.startTS)
+	ttl, err := c.server.ttlAt(context.Background(), key, c.startTS)
+	if err != nil {
+		return nil, err
+	}
+	// Treat an already-expired TTL as absent so a recreated key does not
+	// inherit the old expired timestamp (which would leave a stale TTL key).
+	if ttl != nil && !ttl.After(time.Now()) {
+		return nil, nil
+	}
+	return ttl, nil
 }
 
 func reverseStrings(values []string) {
