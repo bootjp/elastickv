@@ -800,8 +800,8 @@ func (c *luaScriptContext) zsetCard(st *luaZSetState, key []byte) (int64, error)
 }
 
 // zsetStateForRead returns a fully-loaded ZSet state for commands that need the
-// complete member set (ZRANGE, ZCOUNT, ZPOPMIN, etc.). Returns (nil, false, nil)
-// when the key does not exist.
+// complete member set (ZRANGE, ZCOUNT, ZPOPMIN, etc.). Returns (st, false, nil)
+// when the key does not exist; callers must check the bool before using st.
 func (c *luaScriptContext) zsetStateForRead(key []byte) (*luaZSetState, bool, error) {
 	st, err := c.zsetState(key)
 	if err != nil {

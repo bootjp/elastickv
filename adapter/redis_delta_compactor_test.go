@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -350,4 +351,71 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 	remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all delta keys must be deleted after urgent compaction")
+}
+
+// TestZSetInlineMetaCompaction verifies that zsetInlineMetaCompactionElems
+// returns nil when below the threshold, and folds delta keys into the base
+// ZSetMetaKey (deleting all scanned delta keys) when at or above the threshold.
+func TestZSetInlineMetaCompaction(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	r := &RedisServer{store: st, coordinator: coord}
+	userKey := []byte("inline:zset")
+
+	// Write a base meta key with Len=10.
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey(userKey),
+		store.MarshalZSetMeta(store.ZSetMeta{Len: 10}), 1, 0))
+
+	// Write (threshold - 1) delta keys: should NOT trigger compaction.
+	const threshold = zsetInlineMetaCompactionThreshold
+	delta := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1})
+	for i := range threshold - 1 {
+		ts := uint64(10 + i) //nolint:gosec // i is bounded by threshold (1024)
+		require.NoError(t, st.PutAt(ctx, store.ZSetMetaDeltaKey(userKey, ts, 0), delta, ts, 0))
+	}
+
+	readTS := st.LastCommitTS()
+	elems, compacted, err := r.zsetInlineMetaCompactionElems(ctx, userKey, readTS, 0)
+	require.NoError(t, err)
+	require.False(t, compacted, "below threshold: should not compact")
+	require.Nil(t, elems)
+
+	// Write one more delta key to reach the threshold.
+	const lastTS = uint64(10 + threshold - 1)
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaDeltaKey(userKey, lastTS, 0), delta, lastTS, 0))
+
+	readTS = st.LastCommitTS()
+	elems, compacted, err = r.zsetInlineMetaCompactionElems(ctx, userKey, readTS, 2)
+	require.NoError(t, err)
+	require.True(t, compacted, "at threshold: should compact")
+	// Expected new Len = base(10) + threshold deltas(each +1) + additionalDelta(2)
+	expectedLen := int64(10+threshold) + 2
+
+	// Dispatch the compaction elems.
+	commitTS := coord.Clock().Next()
+	_, dispatchErr := coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  0,
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	require.NoError(t, dispatchErr)
+
+	// Verify base meta holds the folded total.
+	afterTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.ZSetMetaKey(userKey), afterTS)
+	require.NoError(t, err)
+	got, err := store.UnmarshalZSetMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, expectedLen, got.Len)
+
+	// All delta keys must be deleted.
+	prefix := store.ZSetMetaDeltaScanPrefix(userKey)
+	scanEnd := store.PrefixScanEnd(prefix)
+	remaining, err := st.ScanAt(ctx, prefix, scanEnd, threshold+1, afterTS)
+	require.NoError(t, err)
+	require.Empty(t, remaining, "all delta keys must be removed after inline compaction")
 }
