@@ -2347,9 +2347,9 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return true
 	}
-	status, body := http.StatusOK, "ok\n"
+	status, body := http.StatusOK, "ok"
 	if !s.isVerifiedS3Leader() {
-		status, body = http.StatusServiceUnavailable, "not leader\n"
+		status, body = http.StatusServiceUnavailable, "not leader"
 	}
 	w.WriteHeader(status)
 	if r.Method != http.MethodHead {
@@ -2359,10 +2359,7 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *S3Server) isVerifiedS3Leader() bool {
-	if s == nil || s.coordinator == nil {
-		return false
-	}
-	if !s.coordinator.IsLeader() {
+	if s.coordinator == nil || !s.coordinator.IsLeader() {
 		return false
 	}
 	return s.coordinator.VerifyLeader() == nil

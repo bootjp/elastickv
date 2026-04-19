@@ -225,8 +225,8 @@ func TestS3Server_LeaderHealthz(t *testing.T) {
 		status int
 		body   string
 	}{
-		{name: "leader", server: leaderSrv, status: http.StatusOK, body: "ok\n"},
-		{name: "follower", server: followerSrv, status: http.StatusServiceUnavailable, body: "not leader\n"},
+		{name: "leader", server: leaderSrv, status: http.StatusOK, body: "ok"},
+		{name: "follower", server: followerSrv, status: http.StatusServiceUnavailable, body: "not leader"},
 	}
 
 	for _, tc := range cases {
