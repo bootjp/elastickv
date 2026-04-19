@@ -1031,7 +1031,7 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if isSnapshotToken(snapshot.Data) {
 		tok, err := decodeSnapshotToken(snapshot.Data)
 		if err != nil {
-			return errors.Wrapf(err, "decode snapshot token for index %d", snapshot.Metadata.Index)
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
@@ -1575,6 +1575,21 @@ func (e *Engine) shutdown() {
 }
 
 func (e *Engine) fail(err error) {
+	// Idempotency guard: fail can be invoked from handleStep, which runs inside
+	// the main run loop and does not return on error. Without this guard a
+	// persistent step error would re-enter fail on every loop iteration,
+	// producing a log storm and redundant teardown calls.
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		// Make sure the run loop still observes the shutdown signal even if a
+		// previous fail path did not reach requestShutdown (e.g. concurrent
+		// invocation racing on the closed flag).
+		e.requestShutdown()
+		return
+	}
+	e.mu.Unlock()
+
 	// Log before mutating state so observability is preserved even if the
 	// downstream stopDispatch/closePersist calls themselves block or panic.
 	// Without this, the engine quietly transitions to StateShutdown and the
@@ -1595,6 +1610,9 @@ func (e *Engine) fail(err error) {
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
+	// Signal the run loop so that callers which invoke fail without returning
+	// from run themselves (notably handleStep) still exit on the next select.
+	e.requestShutdown()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
