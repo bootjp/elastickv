@@ -3,70 +3,45 @@ package raftstore
 import (
 	"testing"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
-// Guards the pebble v1 → v2 migration: v2 refuses to open DBs below
-// FormatFlushableIngest.
-func TestPebbleStore_FormatRatchetedForV2(t *testing.T) {
+// Pins the on-open format so unintended downgrades below pebble v2
+// FormatMinSupported are caught early.
+func TestPebbleStore_OpensAtPinnedFormat(t *testing.T) {
 	dir := t.TempDir()
 
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 
-	require.GreaterOrEqual(t, s.db.FormatMajorVersion(), pebble.FormatFlushableIngest)
+	require.Equal(t, pebble.FormatVirtualSSTables, s.db.FormatMajorVersion())
 }
 
-// Existing on-disk DBs from pre-migration binaries must be ratcheted up on
-// reopen — this is the migration path for clusters that already have raft.db.
-func TestPebbleStore_RatchetsExistingDB(t *testing.T) {
+// End-to-end check that StoreLog/GetLog round-trip across a close/reopen
+// against pebble v2.
+func TestPebbleStore_PersistsLogsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 
-	// Simulate an existing on-disk DB created by a pre-migration binary,
-	// which left FormatMajorVersion unset (== FormatMostCompatible after
-	// EnsureDefaults in pebble v1).
-	old, err := pebble.Open(dir, &pebble.Options{
-		FormatMajorVersion: pebble.FormatMostCompatible,
-	})
+	s1, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	require.Equal(t, pebble.FormatMostCompatible, old.FormatMajorVersion())
-	require.NoError(t, old.Close())
+	require.NoError(t, s1.StoreLog(&raft.Log{Index: 1, Term: 1, Data: []byte("hello")}))
+	require.NoError(t, s1.StoreLog(&raft.Log{Index: 2, Term: 1, Data: []byte("world")}))
+	require.NoError(t, s1.Close())
 
-	// Reopen through the production path.
-	s, err := NewPebbleStore(dir)
+	s2, err := NewPebbleStore(dir)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
-
-	require.GreaterOrEqual(t, s.db.FormatMajorVersion(), pebble.FormatFlushableIngest)
-}
-
-// The format ratchet runs during DB open; committed Raft entries must survive it.
-func TestPebbleStore_PreservesLogsAcrossRatchet(t *testing.T) {
-	dir := t.TempDir()
-
-	old, err := pebble.Open(dir, &pebble.Options{
-		FormatMajorVersion: pebble.FormatMostCompatible,
-	})
-	require.NoError(t, err)
-	pre := &PebbleStore{db: old}
-	require.NoError(t, pre.StoreLog(&raft.Log{Index: 1, Term: 1, Data: []byte("hello")}))
-	require.NoError(t, pre.StoreLog(&raft.Log{Index: 2, Term: 1, Data: []byte("world")}))
-	require.NoError(t, old.Close())
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	t.Cleanup(func() { require.NoError(t, s2.Close()) })
 
 	var got raft.Log
-	require.NoError(t, s.GetLog(1, &got))
+	require.NoError(t, s2.GetLog(1, &got))
 	require.Equal(t, []byte("hello"), got.Data)
-	require.NoError(t, s.GetLog(2, &got))
+	require.NoError(t, s2.GetLog(2, &got))
 	require.Equal(t, []byte("world"), got.Data)
 
-	last, err := s.LastIndex()
+	last, err := s2.LastIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), last)
 }
