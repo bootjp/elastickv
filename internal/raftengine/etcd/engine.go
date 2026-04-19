@@ -681,10 +681,17 @@ func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPe
 		return false, err
 	}
 	status := e.Status()
-	if status.State != raftengine.StateLeader && status.Leader.ID == target.ID {
-		return true, nil
-	}
 	if status.State != raftengine.StateLeader {
+		if status.Leader.ID == target.ID {
+			return true, nil
+		}
+		// We stepped down but a different node is leader — transfer landed on
+		// the wrong peer (e.g., target lost election and another peer won).
+		// Treat as aborted so the caller doesn't spin until its deadline.
+		if status.Leader.ID != "" {
+			return false, errors.WithStack(errLeadershipTransferAborted)
+		}
+		// No known leader yet; keep polling until one is elected.
 		return false, nil
 	}
 	if status.LeadTransferee != 0 {
