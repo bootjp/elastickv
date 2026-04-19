@@ -188,6 +188,7 @@ func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      t.TempDir(),
+		Bootstrap:    true,
 		StateMachine: fsm,
 	})
 	require.NoError(t, err)
@@ -234,6 +235,7 @@ func TestOpenSingleNodeRestartsFromPersistedLog(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      dir,
+		Bootstrap:    true,
 		StateMachine: firstFSM,
 	})
 	require.NoError(t, err)
@@ -292,6 +294,7 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      dir,
+		Bootstrap:    true,
 		StateMachine: &testStateMachine{},
 	})
 	require.NoError(t, err)
@@ -1242,6 +1245,7 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      dir,
+		Bootstrap:    true,
 		StateMachine: fsm,
 	})
 	require.NoError(t, err)
@@ -1528,6 +1532,7 @@ func TestSingleNodeWALRotatesSegments(t *testing.T) {
 		LocalID:      "n1",
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      dir,
+		Bootstrap:    true,
 		StateMachine: &testStateMachine{},
 	})
 	require.NoError(t, err)

@@ -88,7 +88,7 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	factory, err := newRaftFactory(raftEngineEtcd)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil, clock)
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, nil, factory, nil, clock)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -139,16 +139,16 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	sharedClock := kv.NewHLC()
-	openShardStore := func() ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
+	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
 		factory, err := newRaftFactory(raftEngineEtcd)
 		require.NoError(t, err)
-		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, false, nil, factory, nil, sharedClock)
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap, nil, factory, nil, sharedClock)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore
 	}
 
-	runtimes, shardGroups, shardStore := openShardStore()
+	runtimes, shardGroups, shardStore := openShardStore(true)
 	coord := kv.NewShardedCoordinator(engine, shardGroups, 1, sharedClock, shardStore)
 
 	_, err := coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
@@ -163,7 +163,7 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 		rt.Close()
 	}
 
-	runtimes, shardGroups, shardStore = openShardStore()
+	runtimes, shardGroups, shardStore = openShardStore(false)
 	t.Cleanup(func() {
 		require.NoError(t, shardStore.Close())
 		for _, rt := range runtimes {

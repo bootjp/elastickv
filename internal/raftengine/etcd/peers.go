@@ -16,6 +16,7 @@ var (
 	errPeerNodeIDConflict  = errors.New("etcd raft peer node id collides")
 	errLocalPeerMissing    = errors.New("etcd raft local peer is missing from cluster config")
 	errPeerFormatInvalid   = errors.New("etcd raft peer format is invalid")
+	errNoPeersConfigured   = errors.New("etcd raft refuses to self-bootstrap: no persisted peers and no peer list was supplied; pass --raftBootstrapMembers or --raftBootstrap to start a fresh cluster")
 )
 
 const peerSpecParts = 2
@@ -66,9 +67,19 @@ func ParsePeers(raw string) ([]Peer, error) {
 	return peers, nil
 }
 
-func normalizePeers(localNodeID uint64, localID string, localAddress string, peers []Peer, allowIncomplete bool) (Peer, []Peer, error) {
+func normalizePeers(localNodeID uint64, localID string, localAddress string, peers []Peer, allowIncomplete bool, allowSelfBootstrap bool) (Peer, []Peer, error) {
 	local := Peer{NodeID: localNodeID, ID: localID, Address: localAddress}
 	if len(peers) == 0 {
+		// allowIncomplete is set when we loaded persisted peers from a previous
+		// run (i.e., the cluster membership is already committed on disk); in
+		// that case a single-peer fallback is legitimate — we are recovering,
+		// not bootstrapping. Without any on-disk state and without an explicit
+		// bootstrap request, refuse to self-bootstrap: this is the scenario
+		// that produced a split-brain when a node's data dir was wiped and the
+		// node was restarted against a cluster that already had a majority.
+		if !allowIncomplete && !allowSelfBootstrap {
+			return Peer{}, nil, errors.WithStack(errNoPeersConfigured)
+		}
 		normalizedLocal, err := normalizeLocalPeer(local)
 		if err != nil {
 			return Peer{}, nil, err
