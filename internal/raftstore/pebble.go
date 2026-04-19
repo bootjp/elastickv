@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/hashicorp/raft"
 	"github.com/vmihailenco/msgpack/v5"
 )
