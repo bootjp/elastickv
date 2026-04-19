@@ -676,7 +676,17 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	st.loaded = true
 	st.exists = true
-	st.legacyBlobBase = len(kvs) == 0
+	if len(kvs) > 0 {
+		return st, nil
+	}
+	// No !zs|mem| rows does not imply legacy-blob: a wide-column ZSet that had
+	// all members deleted leaves only meta/delta keys behind. Probe the legacy
+	// blob key directly to distinguish these cases.
+	blobExists, err := c.server.store.ExistsAt(context.Background(), redisZSetKey(key), c.startTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	st.legacyBlobBase = blobExists
 	return st, nil
 }
 
