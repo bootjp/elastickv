@@ -267,11 +267,37 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if err := sendSnapshotReaderChunks(stream, header, rc, t.chunkSize()); err != nil {
+	// Count payload bytes so a sender-side total can be correlated against the
+	// receiver-side total when a follower fails to restore. A mismatch points
+	// at transport truncation; a match points at a format/parsing issue.
+	counter := &countingReadCloser{inner: rc}
+	if err := sendSnapshotReaderChunks(stream, header, counter, t.chunkSize()); err != nil {
 		return err
 	}
-	_, err = stream.CloseAndRecv()
-	return errors.WithStack(err)
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return errors.WithStack(err)
+	}
+	slog.Info("etcd raft snapshot stream sent",
+		"index", index,
+		"to", msg.To,
+		"payload_bytes", counter.n,
+	)
+	return nil
+}
+
+type countingReadCloser struct {
+	inner io.ReadCloser
+	n     int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.inner.Read(p)
+	c.n += int64(n)
+	return n, err //nolint:wrapcheck // preserve io.EOF sentinel identity for callers
+}
+
+func (c *countingReadCloser) Close() error {
+	return c.inner.Close() //nolint:wrapcheck // caller expects the underlying close error verbatim
 }
 
 // applyBridgeMode implements the Phase 1 bridge: when MemoryStorage holds a
@@ -652,6 +678,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		_ = spool.Close()
 	}()
 
+	var payloadBytes int64
 	for {
 		chunk, err := stream.Recv()
 		if err != nil {
@@ -660,13 +687,27 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 			}
 			return raftpb.Message{}, errors.WithStack(err)
 		}
+		payloadBytes += int64(len(chunk.Chunk))
 		seen, err := appendSnapshotChunk(&metadata, spool, chunk, seenMetadata)
 		if err != nil {
 			return raftpb.Message{}, err
 		}
 		seenMetadata = seen
 		if chunk.Final {
-			return buildSnapshotMessage(metadata, spool, seenMetadata)
+			msg, err := buildSnapshotMessage(metadata, spool, seenMetadata)
+			if err != nil {
+				return raftpb.Message{}, err
+			}
+			index := uint64(0)
+			if msg.Snapshot != nil {
+				index = msg.Snapshot.Metadata.Index
+			}
+			slog.Info("etcd raft snapshot stream received",
+				"index", index,
+				"from", msg.From,
+				"payload_bytes", payloadBytes,
+			)
+			return msg, nil
 		}
 	}
 }

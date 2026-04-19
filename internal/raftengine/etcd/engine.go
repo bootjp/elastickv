@@ -120,6 +120,7 @@ type Engine struct {
 	readCh           chan readRequest
 	adminCh          chan adminRequest
 	stepCh           chan raftpb.Message
+	dispatchReportCh chan dispatchReport
 	peerDispatchers  map[uint64]*peerQueues
 	perPeerQueueSize int
 	dispatchStopCh   chan struct{}
@@ -297,6 +298,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
 		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
+		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -766,12 +768,56 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleAdmin(req)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
+	case report := <-e.dispatchReportCh:
+		e.handleDispatchReport(report)
 	case result := <-e.snapshotResCh:
 		if err := e.handleSnapshotResult(result); err != nil {
 			return false, err
 		}
 	}
 	return true, nil
+}
+
+// dispatchReport is posted by the dispatch workers when a transport send
+// to a peer fails; the engine goroutine drains these and informs etcd/raft
+// via rawNode so follower Progress leaves StateReplicate / StateSnapshot on
+// unreachable peers and does not silently stall.
+type dispatchReport struct {
+	to      uint64
+	msgType raftpb.MessageType
+}
+
+func (e *Engine) handleDispatchReport(report dispatchReport) {
+	if e.rawNode == nil {
+		return
+	}
+	// MsgSnap requires the distinct SnapshotFailure path: raft tracks
+	// PendingSnapshot in Progress, and only ReportSnapshot clears it.
+	// All other message types use ReportUnreachable, which transitions the
+	// peer from StateReplicate to StateProbe so the next heartbeat response
+	// drives a fresh sendAppend attempt.
+	if report.msgType == raftpb.MsgSnap {
+		e.rawNode.ReportSnapshot(report.to, etcdraft.SnapshotFailure)
+		return
+	}
+	e.rawNode.ReportUnreachable(report.to)
+}
+
+// postDispatchReport delivers a dispatch failure to the event loop without
+// blocking the worker. If the channel is full (unlikely — the buffer is
+// sized to MaxInflightMsg), the report is dropped and logged; this is
+// acceptable because raft will retry on the next tick and we only need
+// eventual consistency between transport state and Progress state.
+func (e *Engine) postDispatchReport(report dispatchReport) {
+	select {
+	case e.dispatchReportCh <- report:
+	case <-e.closeCh:
+	default:
+		slog.Warn("etcd raft dispatch report dropped (channel full)",
+			"to", report.to,
+			"type", report.msgType.String(),
+		)
+	}
 }
 
 func (e *Engine) handleProposal(req proposalRequest) {
@@ -2132,18 +2178,24 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr != nil && !errors.Is(dispatchErr, ctx.Err()) {
-		count := e.dispatchErrorCount.Add(1)
-		if shouldLogDispatchEvent(count) {
-			slog.Warn("etcd raft outbound dispatch failed",
-				"node_id", e.nodeID,
-				"to", req.msg.To,
-				"type", req.msg.Type.String(),
-				"dispatch_error_count", count,
-				"err", dispatchErr,
-			)
-		}
+	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
+		return
 	}
+	count := e.dispatchErrorCount.Add(1)
+	if shouldLogDispatchEvent(count) {
+		slog.Warn("etcd raft outbound dispatch failed",
+			"node_id", e.nodeID,
+			"to", req.msg.To,
+			"type", req.msg.Type.String(),
+			"dispatch_error_count", count,
+			"err", dispatchErr,
+		)
+	}
+	// Inform etcd/raft that the peer is unreachable so Progress transitions
+	// out of StateReplicate / StateSnapshot. Without this the leader keeps
+	// Progress stuck and never retries sendAppend/sendSnap for the peer,
+	// leaving the follower indefinitely stale even after heartbeats resume.
+	e.postDispatchReport(dispatchReport{to: req.msg.To, msgType: req.msg.Type})
 }
 
 func (e *Engine) stopDispatchWorkers() {
