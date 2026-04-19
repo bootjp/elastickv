@@ -1089,7 +1089,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Average time per redis.call() invocation = redis_call_duration / redis_call_count. Consistent high values (e.g. >10ms) indicate slow individual Raft reads regardless of call count.",
+      "description": "Average time per redis.call() invocation across all outcomes (success and error). Includes failed scripts to surface latency that causes timeouts. Consistent high values (e.g. >10ms) indicate slow individual Raft reads regardless of call count.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1127,7 +1127,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\", outcome=\"success\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\", outcome=\"success\"}[5m])",
+          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\"}[5m])",
           "legendFormat": "avg per redis.call()",
           "range": true,
           "refId": "A"
