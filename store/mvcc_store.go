@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/gob"
 	"hash/crc32"
 	"io"
 	"log/slog"
@@ -26,7 +25,6 @@ type VersionedValue struct {
 }
 
 const (
-	checksumSize            = 4
 	mvccSnapshotVersion     = uint32(1)
 	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
 	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
@@ -34,26 +32,11 @@ const (
 
 // maxSnapshotValueSize caps the allowed size of a single value during streaming
 // snapshot restore and write paths to prevent OOM from malformed or adversarial
-// snapshots. It does not apply to legacy gob-backed snapshot restore.
-// Declared as a var so tests can temporarily lower the limit without allocating
-// hundreds of MiB.
+// snapshots. Declared as a var so tests can temporarily lower the limit without
+// allocating hundreds of MiB.
 var maxSnapshotValueSize = 256 << 20 // 256 MiB
 
 var mvccSnapshotMagic = [8]byte{'E', 'K', 'V', 'M', 'V', 'C', 'C', '2'}
-
-// mvccSnapshot is retained for backward compatibility with older gob-backed
-// snapshots that were materialized fully in memory.
-type mvccSnapshot struct {
-	LastCommitTS  uint64
-	MinRetainedTS uint64
-	Entries       []mvccSnapshotEntry
-}
-
-// mvccSnapshotEntry is used solely for gob snapshot serialization.
-type mvccSnapshotEntry struct {
-	Key      []byte
-	Versions []VersionedValue
-}
 
 type compactEntry struct {
 	key []byte
@@ -615,12 +598,14 @@ func (s *mvccStore) Snapshot() (Snapshot, error) {
 
 func (s *mvccStore) Restore(r io.Reader) error {
 	br := bufio.NewReader(r)
-	if streaming, err := isStreamingMVCCSnapshot(br); err != nil {
+	streaming, err := isStreamingMVCCSnapshot(br)
+	if err != nil {
 		return errors.WithStack(err)
-	} else if streaming {
-		return s.restoreStreamingSnapshot(br)
 	}
-	return s.restoreLegacySnapshot(br)
+	if !streaming {
+		return errors.New("unrecognized snapshot format: unknown magic header")
+	}
+	return s.restoreStreamingSnapshot(br)
 }
 
 func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
@@ -632,39 +617,6 @@ func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
 		return false, errors.WithStack(err)
 	}
 	return bytes.Equal(header, mvccSnapshotMagic[:]), nil
-}
-
-func (s *mvccStore) restoreLegacySnapshot(r io.Reader) error {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if len(data) < checksumSize {
-		return errors.WithStack(ErrInvalidChecksum)
-	}
-	payload := data[:len(data)-checksumSize]
-	expected := binary.LittleEndian.Uint32(data[len(data)-checksumSize:])
-	if crc32.ChecksumIEEE(payload) != expected {
-		return errors.WithStack(ErrInvalidChecksum)
-	}
-
-	var snapshot mvccSnapshot
-	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&snapshot); err != nil {
-		return errors.WithStack(err)
-	}
-
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
-	s.tree.Clear()
-	s.lastCommitTS = snapshot.LastCommitTS
-	s.minRetainedTS = snapshot.MinRetainedTS
-	for _, entry := range snapshot.Entries {
-		versions := append([]VersionedValue(nil), entry.Versions...)
-		s.tree.Put(bytes.Clone(entry.Key), versions)
-	}
-
-	return nil
 }
 
 func (s *mvccStore) writeSnapshotFile(f *os.File) error {

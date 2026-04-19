@@ -3,9 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
-	"encoding/gob"
-	"hash/crc32"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -82,43 +79,6 @@ func TestMVCCStore_ApplyMutations_UnknownOp(t *testing.T) {
 		{Op: OpType(99), Key: []byte("k"), Value: []byte("v")},
 	}, nil, 10, 20)
 	require.ErrorIs(t, err, ErrUnknownOp)
-}
-
-func TestMVCCStore_RestoreLegacySnapshot(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	// Build a legacy gob+crc32 snapshot payload.
-	legacy := mvccSnapshot{
-		LastCommitTS:  42,
-		MinRetainedTS: 10,
-		Entries: []mvccSnapshotEntry{
-			{
-				Key: []byte("legacy-key"),
-				Versions: []VersionedValue{
-					{TS: 42, Value: []byte("legacy-value"), Tombstone: false, ExpireAt: 0},
-				},
-			},
-		},
-	}
-
-	var payload bytes.Buffer
-	require.NoError(t, gob.NewEncoder(&payload).Encode(legacy))
-
-	checksum := crc32.ChecksumIEEE(payload.Bytes())
-	var cs [4]byte
-	binary.LittleEndian.PutUint32(cs[:], checksum)
-	full := append(payload.Bytes(), cs[:]...)
-
-	dst := newTestMVCCStore(t)
-	require.NoError(t, dst.Restore(bytes.NewReader(full)))
-
-	require.Equal(t, uint64(42), dst.LastCommitTS())
-
-	v, err := dst.GetAt(ctx, []byte("legacy-key"), 100)
-	require.NoError(t, err)
-	require.Equal(t, []byte("legacy-value"), v)
 }
 
 func snapshotBytes(t *testing.T, snap Snapshot) []byte {
