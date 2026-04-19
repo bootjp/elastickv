@@ -106,7 +106,7 @@ func (c *occAdapterCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 	return &kv.CoordinateResponse{}, nil
 }
 
-func (c *occAdapterCoordinator) collectMutations(ctx context.Context, elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
+func (c *occAdapterCoordinator) collectMutations(_ context.Context, elems []*kv.Elem[kv.OP], _ uint64) ([]*store.KVPairMutation, error) {
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
 		if elem == nil {
@@ -118,9 +118,10 @@ func (c *occAdapterCoordinator) collectMutations(ctx context.Context, elems []*k
 		case kv.Del:
 			mutations = append(mutations, &store.KVPairMutation{Op: store.OpTypeDelete, Key: elem.Key})
 		case kv.DelPrefix:
-			if err := c.store.DeletePrefixAt(ctx, elem.Key, nil, commitTS); err != nil {
-				return nil, err
-			}
+			// ApplyMutations has no prefix-delete op; applying it here before the
+			// OCC conflict check would break atomicity. List benchmark ops never
+			// emit DelPrefix, so reject it to make any such misuse explicit.
+			return nil, errors.New("DelPrefix not supported in transactional OCC simulation")
 		}
 	}
 	return mutations, nil

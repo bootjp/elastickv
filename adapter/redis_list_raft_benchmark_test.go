@@ -105,7 +105,9 @@ func createBenchNode(b *testing.B, ctx context.Context, isLeader bool, port port
 	}(s, lis.grpc)
 
 	rd := NewRedisServer(lis.redis, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay)
-	_ = lis.dynamo.Close()
+	if err := lis.dynamo.Close(); err != nil {
+		b.Logf("failed to close unused dynamo listener: %v", err)
+	}
 
 	return newNode(port.grpcAddress, port.raftAddress, port.redisAddress, port.dynamoAddress, r, tm, s, gs, rd, nil, opsCancel)
 }

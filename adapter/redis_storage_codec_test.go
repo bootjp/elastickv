@@ -80,4 +80,3 @@ func TestStoredRedisStreamCodec_RoundTripProto(t *testing.T) {
 	require.Equal(t, value, decoded)
 	require.True(t, decoded.Entries[0].parsedIDValid)
 }
-
