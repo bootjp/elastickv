@@ -3,7 +3,32 @@ package kv
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 )
+
+// isLeadershipLossError reports whether err signals that this node has
+// lost leadership and a successor should be contacted. Propose/Commit
+// errors that are NOT leadership-related (write conflict, validation,
+// deadline on a non-ReadIndex path) must NOT trigger lease
+// invalidation -- doing so forces every subsequent read into the slow
+// LinearizableRead path and defeats the lease's purpose.
+//
+// Both engine backends mark their internal leadership errors with the
+// shared raftengine sentinels via cockroachdb/errors.Mark, so a single
+// errors.Is check (using cockroachdb's Is, which understands the
+// mark-based equivalence) covers both engines without relying on
+// error-message substrings. Note: stdlib errors.Is does NOT traverse
+// cockroachdb marks; this file must use cockroachdb/errors.Is.
+func isLeadershipLossError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
+}
 
 // leaseState tracks the wall-clock expiry of a leader-local read lease.
 // All operations are lock-free via atomic.Pointer plus a generation

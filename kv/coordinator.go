@@ -220,13 +220,26 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 // Abort), and refreshing would be unsound because no quorum
 // confirmation happened.
 //
-// On err != nil the lease is invalidated: a Propose error commonly
-// signals leadership loss (non-leader rejection, transfer in
-// progress, quorum lost, etc.) and the design doc lists
-// "any error from engine.Propose" as an invalidation trigger.
+// On err != nil the lease is invalidated ONLY when isLeadershipLossError
+// reports a real leadership-loss signal (non-leader rejection,
+// ErrLeadershipLost, transfer-in-progress). Business-logic failures
+// such as write conflicts or validation errors are NOT leadership
+// signals and must not invalidate the lease -- doing so would force
+// every subsequent read onto the slow LinearizableRead path and defeat
+// the lease's purpose. RegisterLeaderLossCallback plus the
+// State()==StateLeader fast-path guard cover real leader loss.
 func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
 	if err != nil {
-		c.lease.invalidate()
+		// Only invalidate on errors that actually signal leadership
+		// loss. Write conflicts and validation errors are business-
+		// logic failures that do NOT mean this node stopped being
+		// leader; invalidating for them would force every subsequent
+		// read into the slow LinearizableRead path and defeat the
+		// lease. Engine.RegisterLeaderLossCallback and the fast-path
+		// State() == StateLeader guard cover real leader loss.
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
 		return
 	}
 	if resp == nil || resp.CommitIndex == 0 {
@@ -365,7 +378,16 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	}
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
-		c.lease.invalidate()
+		// Only invalidate on real leadership-loss signals. A context
+		// deadline or transient transport error is NOT leadership loss;
+		// forcing invalidation for those would push every subsequent
+		// read onto the slow path for the remainder of the lease
+		// window, mirroring the production regression the write-path
+		// guard fixed. RegisterLeaderLossCallback plus the
+		// State()==StateLeader fast-path check cover real transitions.
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
 		return 0, err
 	}
 	c.lease.extend(now.Add(leaseDur), expectedGen)

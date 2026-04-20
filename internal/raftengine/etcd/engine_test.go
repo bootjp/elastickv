@@ -1611,3 +1611,16 @@ func mustRawNode(t *testing.T, storage *etcdraft.MemoryStorage, nodeID uint64) *
 	require.NoError(t, err)
 	return rawNode
 }
+
+// TestErrNotLeaderMatchesRaftEngineSentinel pins the invariant that the
+// etcd engine's internal leadership-loss errors are marked against the
+// shared raftengine sentinels. The lease-read fast path in package kv
+// relies on a single cross-backend errors.Is(err, raftengine.ErrNotLeader)
+// check; a future refactor that forgets to mark these errors would
+// silently force every read onto the slow LinearizableRead path.
+func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
+	t.Parallel()
+	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
+}

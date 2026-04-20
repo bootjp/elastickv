@@ -46,10 +46,18 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(reqs)
 	if err != nil {
-		// Propose failures commonly signal leadership loss; follow
-		// the design doc and invalidate so the next read takes the
-		// slow path and re-verifies.
-		t.g.lease.invalidate()
+		// Only invalidate on errors that actually signal a leadership
+		// change. Write-conflicts, validation errors, and deadline
+		// exceeded on non-ReadIndex paths do NOT imply the leader is
+		// gone; invalidating the lease for them forces every read
+		// into the slow LinearizableRead path and defeats the whole
+		// point of the lease. The engine's own leader-loss callback
+		// already handles true leadership loss, plus
+		// Coordinate.LeaseRead guards the fast path on
+		// engine.State() == StateLeader.
+		if isLeadershipLossError(err) {
+			t.g.lease.invalidate()
+		}
 		return resp, errors.WithStack(err)
 	}
 	t.maybeRefresh(resp, start, expectedGen)
@@ -61,7 +69,9 @@ func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, er
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Abort(reqs)
 	if err != nil {
-		t.g.lease.invalidate()
+		if isLeadershipLossError(err) {
+			t.g.lease.invalidate()
+		}
 		return resp, errors.WithStack(err)
 	}
 	t.maybeRefresh(resp, start, expectedGen)
@@ -757,7 +767,13 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	}
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		g.lease.invalidate()
+		// See Coordinate.LeaseRead: only real leadership-loss signals
+		// invalidate the lease. Deadlines, transport blips, and other
+		// transient errors must NOT force the remainder of the lease
+		// window onto the slow path.
+		if isLeadershipLossError(err) {
+			g.lease.invalidate()
+		}
 		return 0, err
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
