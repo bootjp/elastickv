@@ -209,16 +209,25 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
     if !ok {
         return c.LinearizableRead(ctx) // hashicorp engine, test stubs
     }
-    if c.lease.valid(time.Now()) {
+    // Capture time.Now() exactly once. Reused for both the fast-path
+    // validity check and (on the slow path) the lease-extension base:
+    // a second sample would let the fast path accept a read whose
+    // instant slightly exceeds the intended expiry boundary, while
+    // also shortening the slow-path window by the same delta.
+    now := time.Now()
+    if c.lease.valid(now) {
         return lp.AppliedIndex(), nil
     }
-    readStart := time.Now()                           // sample BEFORE
     idx, err := c.LinearizableRead(ctx)
     if err != nil {
         c.lease.invalidate()
         return 0, err
     }
-    c.lease.extend(readStart.Add(lp.LeaseDuration())) // monotonic CAS
+    // `now` was sampled strictly before LinearizableRead ran, so the
+    // resulting lease window is strictly conservative (any real
+    // quorum confirmation LinearizableRead witnessed happens at or
+    // after `now`). extend uses a monotonic CAS to reject regressions.
+    c.lease.extend(now.Add(lp.LeaseDuration()))
     return idx, nil
 }
 ```

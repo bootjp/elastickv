@@ -130,12 +130,15 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		reqs.CommitTS = 0
 	}
 
-	// Sample the clock BEFORE dispatching so the lease extension reflects
-	// the moment we know the leader was alive at quorum confirmation, not
-	// the moment dispatch returned. Otherwise apply-queue depth and
-	// scheduling jitter could push the effective lease window past
-	// electionTimeout, allowing a stale leader to serve reads beyond the
-	// safety bound.
+	// Sample the clock BEFORE dispatching and use this pre-dispatch
+	// instant as the lease-extension base on success. Any real quorum
+	// confirmation necessarily happens at or after this instant, so
+	// basing the lease here is strictly conservative -- the effective
+	// window can only be SHORTER than the actual safety window, never
+	// longer. Without this, apply-queue depth / scheduling jitter
+	// between Propose return and the lease extend call could push the
+	// window past electionTimeout and let a stale leader serve reads
+	// beyond the safety bound.
 	dispatchStart := time.Now()
 	var resp *CoordinateResponse
 	var err error
@@ -272,10 +275,12 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	if c.lease.valid(now) {
 		return lp.AppliedIndex(), nil
 	}
-	// The captured `now` also serves as readStart: it is strictly
-	// before LinearizableRead returns, so the lease window starts at
-	// the real quorum confirmation instant, not after the heartbeat
-	// round returned. See Coordinate.Dispatch for the same rationale.
+	// The captured `now` also serves as the lease-extension base: it
+	// is sampled strictly before LinearizableRead runs, so any real
+	// quorum confirmation LinearizableRead witnesses happens at or
+	// after `now`. The resulting lease window is therefore strictly
+	// conservative (can only shorten, never overextend). See
+	// Coordinate.Dispatch for the same rationale.
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
 		c.lease.invalidate()
