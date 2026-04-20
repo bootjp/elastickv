@@ -364,12 +364,24 @@
                  concurrent)
         unknown-score? (some #(and (= :zincrby (:f %))
                                    (:unknown-score? %))
-                             concurrent)]
+                             concurrent)
+        ;; any-known? must only be true when something provides evidence
+        ;; the member actually existed at some point. A no-op ZREM
+        ;; (:removed? false) does NOT prove existence -- it explicitly
+        ;; says the member wasn't there. Without this guard, reads of a
+        ;; never-added member that happened to race with a no-op ZREM
+        ;; would flip from :phantom to :score-mismatch with an empty
+        ;; :allowed set, producing a false positive.
+        existence-evidence? (or (boolean committed-state)
+                                (some #(case (:f %)
+                                         (:zadd :zincrby) true
+                                         :zrem            (:removed? %))
+                                      concurrent))]
       {:scores scores
        :unknown-score? (boolean unknown-score?)
        :must-be-present? (boolean (and committed-state (:present? committed-state)
                                        (empty? concurrent)))
-       :any-known? (or (boolean committed-state) (seq concurrent))}))
+       :any-known? (boolean existence-evidence?)}))
 
 (defn- check-zrange-all
   [mutations-by-m {:keys [invoke complete] :as _pair}]

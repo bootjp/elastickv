@@ -74,3 +74,16 @@
                  {:type :ok     :process 0 :f :zrange-all :value [["m1" 999.0]] :index 3}]
         result  (run-checker history)]
     (is (not (:valid? result)) (str "expected mismatch, got: " result))))
+
+(deftest no-op-zrem-alone-does-not-false-positive
+  ;; CI-observed false positive: a member whose only prior ops are no-op
+  ;; ZREMs was classified as :score-mismatch with :allowed #{} instead
+  ;; of treated as never-existed (:phantom candidate, empty read -> OK).
+  ;; After the existence-evidence? fix, a read that observes NO such
+  ;; member must be accepted as valid.
+  (let [history [{:type :invoke :process 0 :f :zrem :value "never-added" :index 0}
+                 {:type :invoke :process 1 :f :zrange-all :index 1}
+                 {:type :ok     :process 1 :f :zrange-all :value [] :index 2}
+                 {:type :ok     :process 0 :f :zrem :value ["never-added" false] :index 3}]
+        result  (run-checker history)]
+    (is (:valid? result) (str "expected valid, got: " result))))
