@@ -1235,6 +1235,12 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byte, readTS uint64) (hit, alive bool, err error) {
+	// String-priority guard; see hashFieldFastLookup for rationale.
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return false, false, hErr
+	} else if higher {
+		return false, false, nil
+	}
 	exists, err := r.store.ExistsAt(ctx, store.SetMemberKey(key, member), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
@@ -1658,7 +1664,10 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteNull()
 			return
 		}
-		conn.WriteBulkString(string(raw))
+		// WriteBulk sends the payload directly from the []byte backing
+		// store; WriteBulkString(string(raw)) would force a []byte →
+		// string copy on every fast-path hit.
+		conn.WriteBulk(raw)
 		return
 	}
 	r.hgetSlow(conn, ctx, key, field, readTS)
@@ -1666,11 +1675,27 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 
 // hashFieldFastLookup probes the wide-column field entry directly and
 // reports whether it is present and TTL-alive. Returns hit=false when
-// the wide-column key is absent (caller must take the slow path).
+// the wide-column key is absent OR when a higher-priority encoding
+// (string / list) exists on the same user key, so the caller falls
+// through to hgetSlow and ends up with the keyTypeAt-consistent
+// WRONGTYPE / nil response.
+//
+// The priority guard costs a single ExistsAt on redisStrKey, covering
+// the most common dual-encoding corruption (SET on a key that
+// previously held a hash, where cleanup did not run). Rarer legacy
+// corruption mixing hash with HLL / bare-key / list encodings will
+// still let this fast-path hit; those workloads should take the slow
+// path too, but in normal operation at most one encoding exists per
+// user key and the guard is a guaranteed miss.
 func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte, readTS uint64) (raw []byte, hit, alive bool, err error) {
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return nil, false, false, hErr
+	} else if higher {
+		return nil, false, false, nil
+	}
 	raw, err = r.store.GetAt(ctx, store.HashFieldKey(key, field), readTS)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, false, nil
 		}
 		return nil, false, false, cockerrors.WithStack(err)
@@ -1680,6 +1705,20 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 		return nil, false, false, cockerrors.WithStack(expErr)
 	}
 	return raw, true, !expired, nil
+}
+
+// hasHigherPriorityStringEncoding returns true iff a string-encoded
+// entry exists for key. Matches the "string wins" tiebreaker in
+// rawKeyTypeAt (see adapter/redis_compat_helpers.go), so a corrupt
+// dual-encoded key where both a string and a collection row are
+// present will take the slow path and return WRONGTYPE / nil from
+// keyTypeAt rather than the collection-specific fast-path answer.
+func (r *RedisServer) hasHigherPriorityStringEncoding(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	return exists, nil
 }
 
 // hgetSlow falls back to the type-probing path when hashFieldFastLookup
@@ -1931,6 +1970,12 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte, readTS uint64) (hit, alive bool, err error) {
+	// String-priority guard; see hashFieldFastLookup for rationale.
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return false, false, hErr
+	} else if higher {
+		return false, false, nil
+	}
 	exists, err := r.store.ExistsAt(ctx, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
