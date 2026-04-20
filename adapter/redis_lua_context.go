@@ -1344,21 +1344,55 @@ func (c *luaScriptContext) renameStreamValue(src, dst []byte) error {
 }
 
 func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// Honor in-script writes first: if a prior HSET / HINCRBY / HDEL on
+	// this key within this script run already loaded the hash into
+	// c.hashes, the fast path would miss those unflushed mutations.
+	// This also covers callers that pre-loaded the state (e.g. HGETALL
+	// before HGET).
+	if st, ok := c.hashes[string(key)]; ok {
+		return hgetFromHashState(st, field), nil
+	}
+	// Fast path: direct wide-column field lookup, bypassing the ~8-seek
+	// keyTypeAt probe inside hashState. This is the same pattern that
+	// the top-level HGET handler uses (see adapter/redis_compat_commands.go),
+	// reused verbatim here so BullMQ-style scripts that touch many
+	// hash keys stop paying the type-probe tax per redis.call.
+	raw, hit, alive, err := c.server.hashFieldFastLookup(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(string(raw)), nil
+	}
+	// Miss: fall back to the full hashState path so legacy-blob hashes,
+	// nil / WRONGTYPE disambiguation, and the script-local cache all
+	// behave exactly as before.
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
 		}
 		return luaReply{}, err
 	}
+	return hgetFromHashState(st, field), nil
+}
+
+// hgetFromHashState reads field out of a loaded luaHashState in the
+// same way the legacy cmdHGet did.
+func hgetFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	value, ok := st.value[args[1]]
+	value, ok := st.value[field]
 	if !ok {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	return luaStringReply(value), nil
+	return luaStringReply(value)
 }
 
 func (c *luaScriptContext) cmdHSet(args []string) (luaReply, error) {
@@ -1510,21 +1544,42 @@ func (c *luaScriptContext) cmdHDel(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// In-script cache first; same rationale as cmdHGet.
+	if st, ok := c.hashes[string(key)]; ok {
+		return hexistsFromHashState(st, field), nil
+	}
+	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return hexistsFromHashState(st, field), nil
+}
+
+// hexistsFromHashState reports whether field is present in a loaded
+// luaHashState, matching the legacy cmdHExists semantics.
+func hexistsFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	_, ok := st.value[args[1]]
-	if ok {
-		return luaIntReply(1), nil
+	if _, ok := st.value[field]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func (c *luaScriptContext) cmdHLen(args []string) (luaReply, error) {
@@ -2052,20 +2107,43 @@ func finalizeSetLikeRemoval(c *luaScriptContext, key string, removed int, empty 
 }
 
 func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
-	st, err := c.setState([]byte(args[0]))
+	key := []byte(args[0])
+	member := args[1]
+	// In-script cache first; same rationale as cmdHGet.
+	if st, ok := c.sets[string(key)]; ok {
+		return sismemberFromSetState(st, member), nil
+	}
+	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	st, err := c.setState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return sismemberFromSetState(st, member), nil
+}
+
+// sismemberFromSetState returns the Redis integer reply for SISMEMBER
+// against a loaded luaSetState, matching the legacy cmdSIsMember
+// semantics.
+func sismemberFromSetState(st *luaSetState, member string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	if _, ok := st.members[args[1]]; ok {
-		return luaIntReply(1), nil
+	if _, ok := st.members[member]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func parseLuaZAddArgs(args []string) (zaddFlags, []string, error) {
