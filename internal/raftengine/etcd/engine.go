@@ -175,9 +175,10 @@ type Engine struct {
 
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
-	// step-down, shutdown). Callbacks fire synchronously from
-	// refreshStatus and must not block. Each entry carries a sentinel
-	// pointer so that the deregister closure returned by
+	// step-down, shutdown). Callbacks are started asynchronously by the
+	// leader-loss handling path, so callers must not assume they run inline
+	// with refreshStatus or complete before it returns. Each entry carries a
+	// sentinel pointer so that the deregister closure returned by
 	// RegisterLeaderLossCallback can identify THIS specific
 	// registration even if the same fn is registered multiple times.
 	leaderLossCbsMu sync.Mutex
