@@ -1400,6 +1400,12 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// ConsistentRead=false reads by returning a snapshot from before
 	// the most recent confirmed commit.
 	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
+	// Pin readTS so concurrent MVCC GC cannot reclaim versions
+	// between the schema revalidation and the item read below;
+	// matches the pattern already used by queryItems / scanItems /
+	// transactGetItems.
+	readPin := d.pinReadTS(readTS)
+	defer readPin.Release()
 
 	// Re-resolve schema + itemKey at readTS and verify that the key
 	// we lease-checked is STILL the key that will be read. A table
