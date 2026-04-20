@@ -199,6 +199,28 @@ type Engine struct {
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
 
+	// ackTracker records per-peer last-response times on the leader and
+	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// read lock-free from LastQuorumAck() on the hot lease-read path
+	// and updated inside the single event-loop goroutine from
+	// handleStep when a follower response arrives.
+	ackTracker quorumAckTracker
+	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// single-node leader path: self IS the quorum, so there are no
+	// follower responses to observe. refreshStatus keeps this value
+	// current (set to time.Now().UnixNano() each tick while leader and
+	// cluster size is 1; cleared otherwise) so the lease-read hot path
+	// never has to acquire e.mu to check peer count or leader state.
+	singleNodeLeaderAckUnixNano atomic.Int64
+	// isLeader mirrors status.State == StateLeader for lock-free reads
+	// on the hot path. refreshStatus writes it on every tick;
+	// recordQuorumAck reads it before admitting a follower response
+	// into ackTracker (so late MsgAppResp / MsgHeartbeatResp arriving
+	// after a step-down cannot repopulate the tracker), and
+	// LastQuorumAck reads it to honor the LeaseProvider contract
+	// ("zero time when the local node is not the leader").
+	isLeader atomic.Bool
+
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
 	// step-down, shutdown). Callbacks fire synchronously from the
@@ -620,6 +642,33 @@ func (e *Engine) AppliedIndex() uint64 {
 		return 0
 	}
 	return e.appliedIndex.Load()
+}
+
+// LastQuorumAck returns the wall-clock instant by which a majority of
+// followers most recently responded to the leader, or the zero time
+// when no such observation exists (follower / candidate / startup).
+//
+// Lock-free: reads atomic.Int64 values published by recordQuorumAck
+// (multi-node cluster) or refreshStatus (single-node cluster keeps
+// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
+// the hot lease-read path performs zero lock work). See
+// raftengine.LeaseProvider for the lease-read correctness contract.
+func (e *Engine) LastQuorumAck() time.Time {
+	if e == nil {
+		return time.Time{}
+	}
+	// Honor the LeaseProvider contract that non-leaders always return
+	// the zero time. Without this guard a late MsgAppResp that sneaks
+	// past recordQuorumAck (or a tracker entry that survived a brief
+	// step-down/step-up window) could leak stale liveness into the
+	// caller's fast-path validation.
+	if !e.isLeader.Load() {
+		return time.Time{}
+	}
+	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
+		return time.Unix(0, ns)
+	}
+	return e.ackTracker.load()
 }
 
 // RegisterLeaderLossCallback registers fn to fire every time the local
@@ -1240,12 +1289,82 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		return
 	}
 	e.recordLeaderContact(msg)
+	e.recordQuorumAck(msg)
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			return
 		}
 		e.fail(errors.WithStack(err))
 	}
+}
+
+// recordQuorumAck updates the per-peer last-response time when msg is
+// a follower -> leader response, so LastQuorumAck() reflects ongoing
+// majority liveness without requiring a fresh ReadIndex.
+//
+// Called inside the event-loop goroutine (single writer to e.peers
+// and to the raft state), so the e.peers read is race-free.
+//
+// Gated on the atomic isLeader mirror: a transport-level MsgAppResp /
+// MsgHeartbeatResp can land shortly after a step-down (reset() has
+// already cleared ackTracker); admitting it here would repopulate
+// the tracker and leak a stale liveness instant into the next
+// re-election as a non-zero LastQuorumAck(). isLeader is written by
+// refreshStatus on every tick, which catches every role transition
+// before the next handleStep runs.
+func (e *Engine) recordQuorumAck(msg raftpb.Message) {
+	if !isFollowerResponse(msg.Type) {
+		return
+	}
+	if msg.From == 0 || msg.From == e.nodeID {
+		return
+	}
+	if !e.isLeader.Load() {
+		return
+	}
+	// Reject acks from peers not in the current membership. Without
+	// this filter, a late MsgAppResp from a just-removed peer (which
+	// rawNode.Step will immediately reject with ErrStepPeerNotFound)
+	// would still land an ack in the tracker -- resurrecting the
+	// "ghost" entry that removePeer just pruned. Since we run on the
+	// event-loop goroutine (the sole writer to e.peers), the map read
+	// here is race-free.
+	if _, ok := e.peers[msg.From]; !ok {
+		return
+	}
+	clusterSize := len(e.peers)
+	if clusterSize <= 1 {
+		return
+	}
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+}
+
+// followerQuorumForClusterSize returns the number of non-self peer
+// acks required to form a Raft majority for a cluster of the given
+// size. Centralising the formula keeps ackTracker callers (handleStep
+// and removePeer) consistent and avoids scattered //nolint:mnd
+// suppressions. clusterSize is the total voter count INCLUDING self;
+// the result is floor((clusterSize - 1) / 2) + 1 − 1 = clusterSize / 2
+// for odd sizes (3 → 1, 5 → 2, 7 → 3) and clusterSize / 2 for even
+// sizes (4 → 2, 6 → 3) where a strict majority still requires
+// (N/2)+1 voters total, i.e. (N/2) followers beyond self.
+func followerQuorumForClusterSize(clusterSize int) int {
+	if clusterSize <= 1 {
+		return 0
+	}
+	// The Raft majority for a cluster of size N is floor(N/2)+1 voters
+	// INCLUDING self, which means the leader needs N/2 OTHER acks.
+	return clusterSize / 2 //nolint:mnd
+}
+
+// isFollowerResponse reports whether a Raft message type represents a
+// follower acknowledging the leader. We use only the two response
+// types that ALL committed replication traffic passes through:
+// MsgAppResp (log append ack) and MsgHeartbeatResp (passive heartbeat
+// ack). Either one is proof that the peer's election timer has been
+// reset, which is what the lease relies on.
+func isFollowerResponse(t raftpb.MessageType) bool {
+	return t == raftpb.MsgAppResp || t == raftpb.MsgHeartbeatResp
 }
 
 func (e *Engine) sendMessages(messages []raftpb.Message) error {
@@ -1846,13 +1965,34 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
+	clusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Keep the lock-free single-node fast path in sync with the current
+	// role: populate while leader of a 1-node cluster, clear otherwise
+	// (including on leader loss, so LastQuorumAck transitions to the
+	// multi-node tracker or zero time atomically).
+	// Publish leader state atomically so recordQuorumAck / LastQuorumAck
+	// can gate on it without acquiring e.mu. MUST run before the
+	// single-node ack store below, otherwise a brand-new leader tick
+	// could publish a ack instant while isLeader is still false.
+	e.isLeader.Store(status.State == raftengine.StateLeader)
+
+	if status.State == raftengine.StateLeader && clusterSize <= 1 {
+		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+	} else {
+		e.singleNodeLeaderAckUnixNano.Store(0)
+	}
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
+		// Drop the per-peer ack map so a future re-election cannot
+		// surface a stale majority-ack instant before the new term's
+		// heartbeats have actually confirmed liveness.
+		e.ackTracker.reset()
 		// Notify lease holders so they invalidate any cached lease;
 		// without this hook, a former leader keeps serving fast-path
 		// reads from local state for up to LeaseDuration after a
@@ -2710,7 +2850,22 @@ func (e *Engine) removePeer(nodeID uint64) {
 		delete(e.peers, nodeID)
 	}
 	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
+	postRemovalClusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Drop the peer's recorded ack so a reconfiguration cannot leave a
+	// stale entry that falsely satisfies the new cluster's majority.
+	// followerQuorum is computed against the POST-removal cluster; a
+	// shrink to <=1 would otherwise pass 0 here, which
+	// quorumAckTracker.removePeer treats as "keep the current instant"
+	// and would surface stale liveness to LastQuorumAck if the cluster
+	// subsequently grew back. Clear the tracker explicitly in that
+	// case so any future multi-node membership starts fresh.
+	if postRemovalClusterSize <= 1 {
+		e.ackTracker.reset()
+	} else {
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
+	}
 
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
