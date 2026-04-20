@@ -344,44 +344,87 @@
     :any-known?        - some op claims to have touched this member."
   [mutations-by-m member read-inv-idx read-cmp-idx]
   (let [muts (get mutations-by-m member [])
+        ;; :ok mutations that completed strictly before the read. They
+        ;; may have overlapped with each other in wall-clock time, so
+        ;; the serialization order among them is ambiguous.
         committed (->> muts
                        (filter #(and (= :ok (:type %))
                                      (some? (:complete-idx %))
-                                     (< (:complete-idx %) read-inv-idx)))
-                       (sort-by :complete-idx))
-        committed-state (reduce apply-mutation-to-state nil committed)
+                                     (< (:complete-idx %) read-inv-idx))))
+        ;; :info mutations that completed before the read: they may or
+        ;; may not have taken effect server-side. We must account for
+        ;; their possible scores just like concurrent ones.
+        pre-read-info (->> muts
+                           (filter #(and (= :info (:type %))
+                                         (some? (:complete-idx %))
+                                         (< (:complete-idx %) read-inv-idx))))
+        ;; Concurrent mutations: windows overlap the read. Include both
+        ;; :ok and :info since either may have taken effect.
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
-        scores (cond-> #{}
-                 (and committed-state (:present? committed-state))
-                 (conj (:score committed-state)))
-        scores (reduce
-                 (fn [acc m]
-                   (case (:f m)
-                     :zadd    (conj acc (:score m))
-                     :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
-                     :zrem    acc))
-                 scores
-                 concurrent)
-        unknown-score? (some #(and (= :zincrby (:f %))
-                                   (:unknown-score? %))
-                             concurrent)
+        ;; A conservative last-wins linearization for the must-be-present?
+        ;; check only. Ambiguous when committed writes overlap each other.
+        committed-sorted (sort-by :complete-idx committed)
+        committed-state (reduce apply-mutation-to-state nil committed-sorted)
+        committed-overlap? (boolean
+                             (some (fn [[a b]]
+                                     (and (not (identical? a b))
+                                          (<= (:invoke-idx a) (:complete-idx b))
+                                          (<= (:invoke-idx b) (:complete-idx a))))
+                                   (for [a committed, b committed] [a b])))
+        ;; Union of every score that any committed / pre-read :info /
+        ;; concurrent op could have produced. This over-approximates the
+        ;; legitimate post-state set when writes overlap, keeping the
+        ;; checker sound at the cost of being slightly less strict on
+        ;; overlapping concurrent writers.
+        add-scores (fn [acc m]
+                     (case (:f m)
+                       :zadd    (conj acc (:score m))
+                       :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
+                       :zrem    acc))
+        scores (as-> #{} s
+                 (reduce add-scores s committed)
+                 (reduce add-scores s pre-read-info)
+                 (reduce add-scores s concurrent))
+        unknown-score? (or
+                         (some #(and (= :zincrby (:f %)) (:unknown-score? %))
+                               concurrent)
+                         (some #(and (= :zincrby (:f %)) (:unknown-score? %))
+                               pre-read-info))
         ;; any-known? must only be true when something provides evidence
         ;; the member actually existed at some point. A no-op ZREM
-        ;; (:removed? false) does NOT prove existence -- it explicitly
-        ;; says the member wasn't there. Without this guard, reads of a
-        ;; never-added member that happened to race with a no-op ZREM
-        ;; would flip from :phantom to :score-mismatch with an empty
-        ;; :allowed set, producing a false positive.
-        existence-evidence? (or (boolean committed-state)
+        ;; (:removed? false) does NOT prove existence.
+        existence-evidence? (or (some #(case (:f %)
+                                         (:zadd :zincrby) true
+                                         :zrem            (:removed? %))
+                                      committed)
+                                (some #(case (:f %)
+                                         (:zadd :zincrby) true
+                                         :zrem            (:removed? %))
+                                      pre-read-info)
                                 (some #(case (:f %)
                                          (:zadd :zincrby) true
                                          :zrem            (:removed? %))
                                       concurrent))]
       {:scores scores
        :unknown-score? (boolean unknown-score?)
-       :must-be-present? (boolean (and committed-state (:present? committed-state)
+       ;; must-be-present? is relaxed when committed writes overlap
+       ;; among themselves or when any :info / concurrent mutation could
+       ;; have removed the member before the read.
+       :must-be-present? (boolean (and committed-state
+                                       (:present? committed-state)
+                                       (not committed-overlap?)
+                                       (empty? pre-read-info)
                                        (empty? concurrent)))
        :any-known? (boolean existence-evidence?)}))
+
+(defn- duplicate-members
+  "Return the set of members that appear more than once in entries."
+  [entries]
+  (->> entries
+       (map first)
+       frequencies
+       (keep (fn [[m n]] (when (> n 1) m)))
+       set))
 
 (defn- check-zrange-all
   [mutations-by-m {:keys [invoke complete] :as _pair}]
@@ -394,6 +437,14 @@
       (swap! errors conj {:kind :unsorted
                           :index cmp-idx
                           :entries entries}))
+    ;; 1b. No duplicate members: a ZSet read must return each member at
+    ;; most once. A duplicate-member result could otherwise satisfy
+    ;; ordering and score-membership checks while hiding a real bug.
+    (let [dupes (duplicate-members entries)]
+      (when (seq dupes)
+        (swap! errors conj {:kind :duplicate-members
+                            :index cmp-idx
+                            :members dupes})))
     ;; 2. For each observed (member,score): validate score and non-phantom
     (doseq [[member score] entries]
       (let [{:keys [scores any-known? unknown-score?]}
@@ -439,6 +490,12 @@
                           :index cmp-idx
                           :bounds bounds
                           :members members}))
+    (let [dupes (duplicate-members members)]
+      (when (seq dupes)
+        (swap! errors conj {:kind :duplicate-members-range
+                            :index cmp-idx
+                            :bounds bounds
+                            :members dupes})))
     ;; Observed members must be within bounds AND have a known allowed score.
     (doseq [[member score] members]
       (when (or (< score lo) (> score hi))
