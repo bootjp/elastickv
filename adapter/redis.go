@@ -264,6 +264,13 @@ type RedisServer struct {
 	relayConnCache  kv.GRPCConnCache
 	requestObserver monitoring.RedisRequestObserver
 	luaObserver     monitoring.LuaScriptObserver
+	// baseCtx is the parent context for per-request handlers. It is
+	// derived from the server's lifecycle so Close() cancels all
+	// in-flight handlers instead of letting them run unbounded on
+	// context.Background(). Falls back to context.Background() if
+	// SetBaseContext was never called (existing test stubs).
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -359,6 +366,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	if relay == nil {
 		relay = NewRedisPubSubRelay()
 	}
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
@@ -371,6 +379,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		baseCtx:         baseCtx,
+		baseCancel:      baseCancel,
 	}
 	r.relay.Bind(r.publishLocal)
 
@@ -525,6 +535,31 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 	default:
 		handler(conn, cmd)
 	}
+}
+
+// handlerContext returns the base context for a request handler.
+// Falls back to context.Background() when the server was constructed
+// by a test stub that bypassed NewRedisServer. Handlers that need a
+// deadline should wrap this via context.WithTimeout.
+func (r *RedisServer) handlerContext() context.Context {
+	if r == nil || r.baseCtx == nil {
+		return context.Background()
+	}
+	return r.baseCtx
+}
+
+// Close cancels the base context, signalling all in-flight handlers to
+// abort. Idempotent. The underlying redcon listener is still owned by
+// the caller; Close does NOT touch it so shutdown orchestration can
+// remain with the server owner.
+func (r *RedisServer) Close() error {
+	if r == nil {
+		return nil
+	}
+	if r.baseCancel != nil {
+		r.baseCancel()
+	}
+	return nil
 }
 
 func (r *RedisServer) Run() error {
@@ -809,6 +844,9 @@ func (r *RedisServer) observeRedisSuccess(command string, dur time.Duration) {
 }
 
 func (r *RedisServer) Stop() {
+	// Cancel baseCtx first so in-flight handlers observe a cancelled
+	// context before their network connections are torn down.
+	_ = r.Close()
 	_ = r.relayConnCache.Close()
 	_ = r.listen.Close()
 }
@@ -981,12 +1019,14 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// Single bounded context for the slow paths in this handler.
-	// Only LeaseReadForKey and keyTypeAt accept a context;
-	// readRedisStringAt is a local-store read that does not take one.
-	// The shared deadline still bounds the only branches that can
-	// actually block on quorum / I/O.
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	// Single bounded context for the slow paths in this handler,
+	// derived from the server's base context so Close() cancels any
+	// in-flight handler instead of leaving it running on a detached
+	// context.Background(). Only LeaseReadForKey and keyTypeAt accept
+	// a context; readRedisStringAt is a local-store read that does
+	// not take one. The shared deadline bounds the only branches
+	// that can actually block on quorum / I/O.
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := r.coordinator.LeaseReadForKey(ctx, key); err != nil {
 		conn.WriteError(err.Error())

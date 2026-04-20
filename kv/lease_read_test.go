@@ -21,8 +21,16 @@ type fakeLeaseEngine struct {
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
 	leaderLossCallbacksMu    sync.Mutex
-	leaderLossCallbacks      []func()
+	leaderLossCallbacks      []fakeLeaseEngineCb
 	registerLeaderLossCalled atomic.Int32
+}
+
+// fakeLeaseEngineCb pairs a callback with a unique sentinel pointer so
+// deregister can target THIS specific registration even when callbacks
+// are removed out of order, matching the production etcd engine.
+type fakeLeaseEngineCb struct {
+	id *struct{}
+	fn func()
 }
 
 func (e *fakeLeaseEngine) State() raftengine.State { return raftengine.StateLeader }
@@ -51,22 +59,35 @@ func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
 func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 	e.registerLeaderLossCalled.Add(1)
+	// Unique sentinel per registration so deregister can target THIS
+	// entry even after earlier entries were removed. Mirrors the
+	// production etcd engine semantics; a naive index-based remover
+	// would drop the wrong callback under out-of-order deregister.
+	slot := &struct{}{}
 	e.leaderLossCallbacksMu.Lock()
-	idx := len(e.leaderLossCallbacks)
-	e.leaderLossCallbacks = append(e.leaderLossCallbacks, fn)
+	e.leaderLossCallbacks = append(e.leaderLossCallbacks, fakeLeaseEngineCb{id: slot, fn: fn})
 	e.leaderLossCallbacksMu.Unlock()
+	var once sync.Once
 	return func() {
-		e.leaderLossCallbacksMu.Lock()
-		defer e.leaderLossCallbacksMu.Unlock()
-		if idx < len(e.leaderLossCallbacks) {
-			e.leaderLossCallbacks = append(e.leaderLossCallbacks[:idx], e.leaderLossCallbacks[idx+1:]...)
-		}
+		once.Do(func() {
+			e.leaderLossCallbacksMu.Lock()
+			defer e.leaderLossCallbacksMu.Unlock()
+			for i, c := range e.leaderLossCallbacks {
+				if c.id == slot {
+					e.leaderLossCallbacks = append(e.leaderLossCallbacks[:i], e.leaderLossCallbacks[i+1:]...)
+					return
+				}
+			}
+		})
 	}
 }
 
 func (e *fakeLeaseEngine) fireLeaderLoss() {
 	e.leaderLossCallbacksMu.Lock()
-	cbs := append([]func(){}, e.leaderLossCallbacks...)
+	cbs := make([]func(), len(e.leaderLossCallbacks))
+	for i, c := range e.leaderLossCallbacks {
+		cbs[i] = c.fn
+	}
 	e.leaderLossCallbacksMu.Unlock()
 	for _, cb := range cbs {
 		cb()

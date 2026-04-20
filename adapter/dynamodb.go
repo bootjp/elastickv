@@ -1367,24 +1367,19 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Use LeaseReadForKey with the table-meta key so sharded
-	// deployments consult the shard that actually owns the table's
-	// metadata rather than falling back to the default group. The
-	// item-specific key is not known until after schema resolution;
-	// the table-meta key is a deterministic proxy for the shard that
-	// hosts this table.
-	if _, err := d.coordinator.LeaseReadForKey(r.Context(), dynamoTableMetaKey(in.TableName)); err != nil {
-		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
-		return
-	}
 	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
-	schema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
-	if err != nil {
-		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+	schema, itemKey, ok := d.resolveGetItemTarget(w, r, in, readTS)
+	if !ok {
 		return
 	}
-	if !exists {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	// Lease-check the shard that actually owns the ITEM key, not the
+	// table-meta key. In a sharded deployment items are routed per
+	// primary key, which may land on a different shard than the
+	// table's metadata; confirming only the table-meta shard's
+	// leadership would leave the item-shard read linearizability
+	// gap wide open.
+	if _, err := d.coordinator.LeaseReadForKey(r.Context(), itemKey); err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
 	}
 
@@ -1404,6 +1399,27 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeDynamoJSON(w, map[string]any{"Item": projected})
+}
+
+// resolveGetItemTarget loads the schema and computes the item key whose
+// shard must be lease-checked before the read. Returns false after
+// writing an error response; the caller should simply return.
+func (d *DynamoDBServer) resolveGetItemTarget(w http.ResponseWriter, r *http.Request, in getItemInput, readTS uint64) (*dynamoTableSchema, []byte, bool) {
+	schema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
+	if err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+		return nil, nil, false
+	}
+	if !exists {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+		return nil, nil, false
+	}
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, nil, false
+	}
+	return schema, itemKey, true
 }
 
 func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
