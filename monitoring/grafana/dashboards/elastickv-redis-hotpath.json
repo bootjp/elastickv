@@ -74,7 +74,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m])) / sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+          "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m])) / clamp_min(sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\"}[5m])), 1e-9)",
           "legendFormat": "hit ratio",
           "refId": "A",
           "instant": true

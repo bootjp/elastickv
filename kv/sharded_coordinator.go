@@ -137,7 +137,7 @@ type ShardedCoordinator struct {
 	leaseObserver LeaseReadObserver
 }
 
-// WithShardedLeaseReadObserver wires a LeaseReadObserver onto a
+// WithLeaseReadObserver wires a LeaseReadObserver onto a
 // ShardedCoordinator. Applied after construction because the
 // NewShardedCoordinator signature is already heavily overloaded;
 // see Coordinate.WithLeaseReadObserver for the equivalent option on

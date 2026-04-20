@@ -10,11 +10,11 @@ probe") landed cleanly in production.
 Three panels together answer the question. All other panels on the
 dashboard are supporting context.
 
-| Panel                                 | Expected direction post-deploy                                                                 |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **LinearizableRead Rate (lease miss)**| Falls sharply as each node rolls. A steady GET workload used to push every GET through this.   |
-| **GET p99 (success)**                 | Flat or down. The fast path removes ~15 pebble seeks per GET, shaving the head of the tail.    |
-| **Lease Fast-Path Hit Ratio**         | Climbs toward 1.0. Leases stay warm because GETs no longer force slow-path ReadIndex traffic.  |
+| Panel                                  | Expected direction post-deploy                                                                |
+| -------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **LinearizableRead Rate (lease miss)** | Falls sharply as each node rolls. A steady GET workload used to push every GET through this.  |
+| **GET p99 (success)**                  | Flat or down. The fast path removes ~15 pebble seeks per GET, shaving the head of the tail.   |
+| **Lease Fast-Path Hit Ratio**          | Climbs toward 1.0. Leases stay warm because GETs no longer force slow-path ReadIndex traffic. |
 
 If LinearizableRead rate drops but p99 worsens, something on the
 lease-read path is regressing (look at Raft Queue Saturation). If p99
