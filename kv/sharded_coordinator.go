@@ -131,10 +131,12 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	var deregisters []func()
 	for gid, g := range groups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
-		// per-shard lease. Skip if already wrapped so repeat calls
-		// don't stack wrappers.
-		if _, already := g.Txn.(*leaseRefreshingTxn); !already {
-			g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+		// per-shard lease. Leave nil transactions unchanged, and skip
+		// if already wrapped so repeat calls don't stack wrappers.
+		if g.Txn != nil {
+			if _, already := g.Txn.(*leaseRefreshingTxn); !already {
+				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+			}
 		}
 		router.Register(gid, g.Txn, g.Store)
 		// Per-shard leader-loss hook: when this group's engine notices
