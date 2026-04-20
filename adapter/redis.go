@@ -1258,11 +1258,14 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
-	// Derive ctx from the server's base context so shutdown cancels
-	// in-flight probes. Both the fast path (existsAtFast →
-	// store.GetAt / legacyIndexTTLAt) and the slow fallback
-	// (logicalExistsAt) are ctx-aware, so the deadline bounds every
-	// per-key branch we can reach.
+	// Derive ctx from the server's base context so proxy hops (which
+	// DO honor ctx) are bounded by this deadline and cancel on
+	// shutdown. Local Pebble reads (store.GetAt / ExistsAt / ScanAt)
+	// currently ignore the context parameter, so cancellation does
+	// not actually interrupt an in-flight local probe -- the deadline
+	// bounds the per-key loop iteration and any leader-proxy RPC
+	// taken by the negative-result fallback, not the local probes
+	// themselves.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	count := 0
