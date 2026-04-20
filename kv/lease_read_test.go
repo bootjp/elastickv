@@ -20,6 +20,7 @@ type fakeLeaseEngine struct {
 	leaseDur                 time.Duration
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
+	state                    atomic.Value // stores raftengine.State; default Leader
 	leaderLossCallbacksMu    sync.Mutex
 	leaderLossCallbacks      []fakeLeaseEngineCb
 	registerLeaderLossCalled atomic.Int32
@@ -33,7 +34,12 @@ type fakeLeaseEngineCb struct {
 	fn func()
 }
 
-func (e *fakeLeaseEngine) State() raftengine.State { return raftengine.StateLeader }
+func (e *fakeLeaseEngine) State() raftengine.State {
+	if v := e.state.Load(); v != nil {
+		return v.(raftengine.State) //nolint:forcetypeassert
+	}
+	return raftengine.StateLeader
+}
 func (e *fakeLeaseEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "n1", Address: "127.0.0.1:0"}
 }
@@ -175,6 +181,32 @@ func TestCoordinate_LeaseRead_ErrorInvalidatesLease(t *testing.T) {
 	_, err = c.LeaseRead(context.Background())
 	require.ErrorIs(t, err, sentinel)
 	require.Equal(t, int32(2), eng.linearizableCalls.Load())
+}
+
+func TestCoordinate_LeaseRead_FallbackWhenEngineNotLeader(t *testing.T) {
+	t.Parallel()
+	// Even with a currently-valid lease, if the engine already reports
+	// a non-leader state (e.g. a leader-loss transition that has not
+	// yet triggered the async invalidation callback), LeaseRead must
+	// NOT return the fast-path AppliedIndex -- it must fall through
+	// to LinearizableRead, which will fail fast on a non-leader.
+	sentinel := errors.New("not leader")
+	eng := &fakeLeaseEngine{applied: 7, leaseDur: time.Hour, linearizableErr: sentinel}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	// Warm the lease so valid() returns true.
+	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
+	require.True(t, c.lease.valid(time.Now()))
+
+	// Engine transitioned to follower (or unknown); async invalidate
+	// hasn't run yet.
+	eng.state.Store(raftengine.StateFollower)
+
+	_, err := c.LeaseRead(context.Background())
+	require.ErrorIs(t, err, sentinel,
+		"fast path must not hide an already-known non-leader state")
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"non-leader state must force the slow path")
 }
 
 func TestCoordinate_LeaseRead_FallbackWhenLeaseDurationZero(t *testing.T) {

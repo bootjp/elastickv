@@ -746,7 +746,11 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	// leader-loss invalidation that fires during LinearizableRead.
 	now := time.Now()
 	expectedGen := g.lease.generation()
-	if g.lease.valid(now) {
+	// Defense-in-depth: also check the shard engine's current state.
+	// Async callbacks may not have flipped the lease yet, but
+	// State() is refreshed every tick and catches transitions
+	// sooner. See Coordinate.LeaseRead for details.
+	if g.lease.valid(now) && engine.State() == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil
 	}
 	idx, err := linearizableReadEngineCtx(ctx, engine)

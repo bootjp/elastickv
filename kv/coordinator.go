@@ -318,7 +318,14 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	// See Coordinate.Dispatch for the same rationale.
 	now := time.Now()
 	expectedGen := c.lease.generation()
-	if c.lease.valid(now) {
+	// Defense-in-depth against the narrow race between an engine
+	// state transition out of leader and the async leader-loss
+	// callback flipping the lease: check the engine's current view
+	// too. State() is updated every Raft tick (~10 ms), which is
+	// tighter than the lease's time-bound. If the engine already
+	// knows it's not leader, force the slow path (which will fail
+	// fast via LinearizableRead and invalidate the lease).
+	if c.lease.valid(now) && c.engine.State() == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil
 	}
 	idx, err := c.LinearizableRead(ctx)
