@@ -1258,14 +1258,13 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
-	// Derive ctx from the server's base context so proxy hops (which
-	// DO honor ctx) are bounded by this deadline and cancel on
-	// shutdown. Local Pebble reads (store.GetAt / ExistsAt / ScanAt)
-	// currently ignore the context parameter, so cancellation does
-	// not actually interrupt an in-flight local probe -- the deadline
-	// bounds the per-key loop iteration and any leader-proxy RPC
-	// taken by the negative-result fallback, not the local probes
-	// themselves.
+	// Derive ctx from the server's base context so work in this handler
+	// that honors context deadlines is bounded and cancels on shutdown.
+	// Local Pebble reads (store.GetAt / ExistsAt / ScanAt) currently
+	// ignore the context parameter, so cancellation does not interrupt
+	// an in-flight local probe. The negative-result follower fallback
+	// currently calls tryLeaderLogicalExists(), which manages its own
+	// timeout/context rather than using this ctx.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	count := 0
