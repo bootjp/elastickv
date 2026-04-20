@@ -172,9 +172,10 @@ func TestLeaseRefreshingTxn_ForwardsClose(t *testing.T) {
 	}
 	wrapper := &leaseRefreshingTxn{inner: inner, g: &ShardGroup{}}
 
-	// ShardStore.closeGroup does `g.Txn.(io.Closer).Close()`. After
-	// wrapping, the same assertion must still discover a Close method
-	// that reaches the inner Transactional.
+	// ShardStore.closeGroup does a guarded type assertion
+	// `if closer, ok := g.Txn.(io.Closer); ok { closer.Close() }`.
+	// After wrapping, that `ok` must still be true and the resulting
+	// Close must reach the inner Transactional.
 	closer, ok := interface{}(wrapper).(io.Closer)
 	require.True(t, ok, "leaseRefreshingTxn must implement io.Closer")
 	require.NoError(t, closer.Close())

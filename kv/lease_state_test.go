@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -125,6 +126,10 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 	stop := make(chan struct{})
 	done := make(chan struct{}, 2)
 
+	// Cooperative scheduling: runtime.Gosched() between iterations keeps
+	// the workers from pegging a core while still interleaving enough
+	// extend/valid pairs under `-race` to exercise the atomic-pointer
+	// invariants.
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
@@ -133,6 +138,7 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 				return
 			default:
 				s.extend(time.Now().Add(time.Second))
+				runtime.Gosched()
 			}
 		}
 	}()
@@ -144,6 +150,7 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 				return
 			default:
 				_ = s.valid(time.Now())
+				runtime.Gosched()
 			}
 		}
 	}()
