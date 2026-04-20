@@ -77,6 +77,7 @@ var (
 	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer aborted")
 	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
 	errLeadershipTransferNotLeader = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
+	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
 	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
 )
 
@@ -1024,6 +1025,15 @@ func (e *Engine) handleProposal(req proposalRequest) {
 	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
+		return
+	}
+	// etcd/raft silently drops proposals while a leadership transfer is
+	// in flight (LeadTransferee != 0). Surface this as a distinct error
+	// so callers (lease-read invalidation, proxy retry, etc.) can
+	// recognise it via errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
+	// instead of hanging on an ack that will never come.
+	if e.rawNode.BasicStatus().LeadTransferee != 0 {
+		req.done <- proposalResult{err: errors.WithStack(errLeadershipTransferInProgress)}
 		return
 	}
 	e.storePendingProposal(req)

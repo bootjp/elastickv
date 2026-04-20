@@ -1622,4 +1622,5 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	t.Parallel()
 	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
 }

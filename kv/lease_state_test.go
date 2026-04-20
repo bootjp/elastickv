@@ -38,6 +38,11 @@ func TestIsLeadershipLossError(t *testing.T) {
 			true,
 		},
 		{
+			"hashicorp ErrLeadershipTransferInProgress marked with raftengine sentinel",
+			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrLeadershipTransferInProgress, raftengine.ErrLeadershipTransferInProgress)),
+			true,
+		},
+		{
 			"bare hashicorp ErrNotLeader (no raftengine mark) is NOT detected",
 			hashicorpraft.ErrNotLeader,
 			false,
