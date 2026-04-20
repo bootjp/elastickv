@@ -1,12 +1,11 @@
 package kv
 
 import (
-	"errors"
-	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 )
 
 // isLeadershipLossError reports whether err signals that this node has
@@ -16,26 +15,19 @@ import (
 // invalidation -- doing so forces every subsequent read into the slow
 // LinearizableRead path and defeats the lease's purpose.
 //
-// The underlying engines surface leadership loss via distinct
-// sentinel errors; we recognize the hashicorp variant directly and
-// match the etcd engine's "not leader" string via errors.Is /
-// substring match so a future rename in etcd/raft does not silently
-// reintroduce the over-invalidation bug.
+// Both engine backends mark their internal leadership errors with the
+// shared raftengine sentinels via cockroachdb/errors.Mark, so a single
+// errors.Is check (using cockroachdb's Is, which understands the
+// mark-based equivalence) covers both engines without relying on
+// error-message substrings. Note: stdlib errors.Is does NOT traverse
+// cockroachdb marks; this file must use cockroachdb/errors.Is.
 func isLeadershipLossError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) ||
-		errors.Is(err, raft.ErrLeadershipTransferInProgress) {
-		return true
-	}
-	msg := err.Error()
-	// etcd engine errors (cockroachdb/errors wraps them, so Is may
-	// not traverse reliably across package boundaries; fall back to
-	// substring match against the sentinel messages).
-	return strings.Contains(msg, "not leader") ||
-		strings.Contains(msg, "leadership transfer") ||
-		strings.Contains(msg, "leadership lost")
+	return errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
 // leaseState tracks the wall-clock expiry of a leader-local read lease.
