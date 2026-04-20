@@ -159,6 +159,13 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// appliedIndex mirrors the current applied-entry index for
+	// lock-free readers on the lease-read fast path. Writers inside
+	// the Raft run loop update both `applied` (protected by the run
+	// loop's single-writer invariant) and `appliedIndex.Store(...)`.
+	// AppliedIndex() reads via atomic.Load so it does not contend
+	// with refreshStatus's write lock.
+	appliedIndex atomic.Uint64
 	// configIndex tracks the highest configuration index durably published to
 	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
@@ -334,6 +341,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingConfigs:   map[uint64]adminRequest{},
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -578,16 +586,19 @@ func (e *Engine) LeaseDuration() time.Duration {
 }
 
 // AppliedIndex returns the highest log index applied to the local FSM.
-// Suitable for callers that need a non-blocking read fence equivalent to
-// what LinearizableRead would have returned, paired with an external
-// quorum confirmation (e.g. a valid lease).
+// Suitable for callers that need a non-blocking read fence equivalent
+// to what LinearizableRead would have returned, paired with an
+// external quorum confirmation (e.g. a valid lease).
+//
+// Lock-free: reads the mirrored atomic.Uint64 written by the run
+// loop's apply path (and by Restore's snapshot installation), so the
+// lease-read fast path does not contend with refreshStatus's write
+// lock under high read concurrency.
 func (e *Engine) AppliedIndex() uint64 {
 	if e == nil {
 		return 0
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.status.AppliedIndex
+	return e.appliedIndex.Load()
 }
 
 // RegisterLeaderLossCallback registers fn to fire every time the local
@@ -1301,6 +1312,7 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 			snapshot.Metadata.Index, snapshot.Metadata.Term)
 	}
 	e.applied = snapshot.Metadata.Index
+	e.appliedIndex.Store(snapshot.Metadata.Index)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
 	return nil
 }
@@ -1371,7 +1383,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 		switch entry.Type {
 		case raftpb.EntryNormal:
 			response := e.applyNormalEntry(entry)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 			e.resolveProposal(entry.Index, entry.Data, response)
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
@@ -1384,7 +1396,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
 			if err := cc.Unmarshal(entry.Data); err != nil {
@@ -1396,12 +1408,21 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChangeV2(cc, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		default:
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		}
 	}
 	return nil
+}
+
+// setApplied advances both the run-loop-owned `applied` field and the
+// lock-free atomic mirror in a single place. Called exclusively from
+// the Raft run loop, so no synchronization between the two writes is
+// required beyond the single-writer invariant.
+func (e *Engine) setApplied(index uint64) {
+	e.applied = index
+	e.appliedIndex.Store(index)
 }
 
 func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
