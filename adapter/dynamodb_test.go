@@ -1861,9 +1861,9 @@ func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, 
 }
 
 func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
-	return w.inner.LeaseRead(ctx)
+	return kv.LeaseReadThrough(w.inner, ctx)
 }
 
 func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	return w.inner.LeaseReadForKey(ctx, key)
+	return kv.LeaseReadForKeyThrough(w.inner, ctx, key)
 }

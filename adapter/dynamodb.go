@@ -1390,7 +1390,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// in-handler calls are local store reads.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
-	if _, err := d.coordinator.LeaseReadForKey(leaseCtx, itemKey); err != nil {
+	if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, itemKey); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
 	}

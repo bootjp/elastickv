@@ -123,13 +123,48 @@ type Coordinator interface {
 	IsLeader() bool
 	VerifyLeader() error
 	LinearizableRead(ctx context.Context) (uint64, error)
-	LeaseRead(ctx context.Context) (uint64, error)
 	RaftLeader() raft.ServerAddress
 	IsLeaderForKey(key []byte) bool
 	VerifyLeaderForKey(key []byte) error
-	LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
 	RaftLeaderForKey(key []byte) raft.ServerAddress
 	Clock() *HLC
+}
+
+// LeaseReadableCoordinator is the optional capability implemented by
+// coordinators that participate in the leader-local lease read path
+// (see docs/lease_read_design.md). Callers that want lease reads
+// should type-assert to this interface and fall back to
+// LinearizableRead when the assertion fails, following the same
+// pattern as raftengine.LeaseProvider. Keeping the lease methods OFF
+// the Coordinator interface avoids breaking existing external
+// implementations that predate the lease-read feature.
+type LeaseReadableCoordinator interface {
+	LeaseRead(ctx context.Context) (uint64, error)
+	LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
+}
+
+// LeaseReadThrough is a helper that calls LeaseRead when the
+// coordinator supports it, falling back to LinearizableRead otherwise.
+// Adapter call sites use this so they don't have to repeat the
+// type-assertion dance.
+func LeaseReadThrough(c Coordinator, ctx context.Context) (uint64, error) {
+	if lr, ok := c.(LeaseReadableCoordinator); ok {
+		idx, err := lr.LeaseRead(ctx)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
+}
+
+// LeaseReadForKeyThrough is the key-routed counterpart of
+// LeaseReadThrough.
+func LeaseReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) (uint64, error) {
+	if lr, ok := c.(LeaseReadableCoordinator); ok {
+		idx, err := lr.LeaseReadForKey(ctx, key)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
 }
 
 func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {

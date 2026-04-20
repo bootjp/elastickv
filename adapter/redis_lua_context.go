@@ -218,7 +218,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	// All subsequent reads within the script use snapshotGetAt at startTS,
 	// so leadership is verified at most once per script and amortised across
 	// scripts via the lease.
-	if _, err := server.coordinator.LeaseRead(ctx); err != nil {
+	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	startTS := server.readTS()

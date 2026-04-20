@@ -1043,7 +1043,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// that can actually block on quorum / I/O.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
-	if _, err := r.coordinator.LeaseReadForKey(ctx, key); err != nil {
+	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
