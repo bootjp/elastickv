@@ -1282,6 +1282,16 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if msg.From == 0 || msg.From == e.nodeID {
 		return
 	}
+	// Reject acks from peers not in the current membership. Without
+	// this filter, a late MsgAppResp from a just-removed peer (which
+	// rawNode.Step will immediately reject with ErrStepPeerNotFound)
+	// would still land an ack in the tracker -- resurrecting the
+	// "ghost" entry that removePeer just pruned. Since we run on the
+	// event-loop goroutine (the sole writer to e.peers), the map read
+	// here is race-free.
+	if _, ok := e.peers[msg.From]; !ok {
+		return
+	}
 	clusterSize := len(e.peers)
 	if clusterSize <= 1 {
 		return
