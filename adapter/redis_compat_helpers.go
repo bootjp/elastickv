@@ -110,32 +110,77 @@ func (r *RedisServer) prefixExistsAt(ctx context.Context, prefix []byte, readTS 
 	return len(kvs) > 0, nil
 }
 
+// rawKeyTypeAt classifies the Redis encoding under which key is
+// currently stored. Probes run string-first because real workloads are
+// dominated by string keys: a live new-format string resolves in 1
+// pebble seek here, versus the ~17 seeks the prior collection-first
+// ordering required before falling through to the string block.
+//
+// Tiebreaker invariant when the same user key carries BOTH a string
+// and a collection entry (legal only during data-corruption recovery):
+// string wins. replaceWithStringTxn still uses the returned type as a
+// cleanup hint, so on corrupt input any lingering collection keys are
+// evicted by TTL or an explicit DEL rather than piggy-backing on SET.
+// In non-corrupt data at most one encoding exists per user key, so
+// the ordering is indistinguishable.
 func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	// Check list base metadata key first.
-	listMetaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
+	if typ, found, err := r.probeStringTypes(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, found, err := r.probeListType(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, err := r.detectWideColumnType(ctx, key, readTS); err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.probeLegacyCollectionTypes(ctx, key, readTS)
+}
+
+// probeStringTypes runs the three cheap point lookups against the
+// string-family prefixes. Returns (String, true, nil) on first hit.
+func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
+	candidates := [...][]byte{
+		redisStrKey(key), // new-format prefixed string
+		redisHLLKey(key), // HyperLogLog (reported as string)
+		key,              // legacy bare key (pre-migration)
+	}
+	for _, k := range candidates {
+		exists, err := r.store.ExistsAt(ctx, k, readTS)
+		if err != nil {
+			return redisTypeNone, false, errors.WithStack(err)
+		}
+		if exists {
+			return redisTypeString, true, nil
+		}
+	}
+	return redisTypeNone, false, nil
+}
+
+// probeListType detects lists via the base meta key or any delta key.
+// Delta scan is bounded to 1 result.
+func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
+	metaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
+		return redisTypeNone, false, errors.WithStack(err)
 	}
-	if listMetaExists {
-		return redisTypeList, nil
+	if metaExists {
+		return redisTypeList, true, nil
 	}
-	// Fallback: detect a delta-only list (base meta not yet written or
-	// already compacted away but deltas still present).
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
 	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
 	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
+		return redisTypeNone, false, errors.WithStack(err)
 	}
 	if len(deltaKVs) > 0 {
-		return redisTypeList, nil
+		return redisTypeList, true, nil
 	}
+	return redisTypeNone, false, nil
+}
 
-	// Check wide-column hash and set types.
-	if typ, wideErr := r.detectWideColumnType(ctx, key, readTS); wideErr != nil || typ != redisTypeNone {
-		return typ, wideErr
-	}
-
+// probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
+// encodings left by pre-wide-column code paths.
+func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	checks := []struct {
 		typ redisValueType
 		key []byte
@@ -144,12 +189,6 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeSet, key: redisSetKey(key)},
 		{typ: redisTypeZSet, key: redisZSetKey(key)},
 		{typ: redisTypeStream, key: redisStreamKey(key)},
-		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
-		{typ: redisTypeString, key: redisHLLKey(key)},
-		{typ: redisTypeString, key: redisStrKey(key)},
-		// Fallback: check bare key for legacy data written before the
-		// !redis|str| prefix migration.
-		{typ: redisTypeString, key: key},
 	}
 	for _, check := range checks {
 		exists, err := r.store.ExistsAt(ctx, check.key, readTS)
