@@ -1213,8 +1213,44 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	key := cmd.Args[1]
+	member := cmd.Args[2]
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	ctx := context.Background()
+
+	hit, alive, err := r.setMemberFastExists(ctx, key, member, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if hit {
+		if alive {
+			conn.WriteInt(1)
+		} else {
+			conn.WriteInt(0)
+		}
+		return
+	}
+	r.sismemberSlow(conn, ctx, key, member, readTS)
+}
+
+func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byte, readTS uint64) (hit, alive bool, err error) {
+	exists, err := r.store.ExistsAt(ctx, store.SetMemberKey(key, member), readTS)
+	if err != nil {
+		return false, false, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return false, false, nil
+	}
+	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	if expErr != nil {
+		return false, false, cockerrors.WithStack(expErr)
+	}
+	return true, !expired, nil
+}
+
+func (r *RedisServer) sismemberSlow(conn redcon.Conn, ctx context.Context, key, member []byte, readTS uint64) {
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1227,13 +1263,12 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-
-	value, err := r.loadSetAt(context.Background(), setKind, cmd.Args[1], readTS)
+	value, err := r.loadSetAt(ctx, setKind, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	if slices.Contains(value.Members, string(cmd.Args[2])) {
+	if slices.Contains(value.Members, string(member)) {
 		conn.WriteInt(1)
 		return
 	}
@@ -1604,8 +1639,53 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	key := cmd.Args[1]
+	field := cmd.Args[2]
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	ctx := context.Background()
+
+	// Fast path: look the wide-column field up directly. Live
+	// wide-column hashes resolve here in 1 seek + TTL probe versus
+	// the ~17 seeks rawKeyTypeAt issues through keyTypeAt. Legacy-
+	// blob hashes miss the wide-column key and fall through.
+	raw, hit, alive, err := r.hashFieldFastLookup(ctx, key, field, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if hit {
+		if !alive {
+			conn.WriteNull()
+			return
+		}
+		conn.WriteBulkString(string(raw))
+		return
+	}
+	r.hgetSlow(conn, ctx, key, field, readTS)
+}
+
+// hashFieldFastLookup probes the wide-column field entry directly and
+// reports whether it is present and TTL-alive. Returns hit=false when
+// the wide-column key is absent (caller must take the slow path).
+func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte, readTS uint64) (raw []byte, hit, alive bool, err error) {
+	raw, err = r.store.GetAt(ctx, store.HashFieldKey(key, field), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, false, false, nil
+		}
+		return nil, false, false, cockerrors.WithStack(err)
+	}
+	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	if expErr != nil {
+		return nil, false, false, cockerrors.WithStack(expErr)
+	}
+	return raw, true, !expired, nil
+}
+
+// hgetSlow falls back to the type-probing path when hashFieldFastLookup
+// misses. Handles legacy-blob hashes and nil / WRONGTYPE disambiguation.
+func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1618,13 +1698,12 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+	value, err := r.loadHashAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	fieldValue, ok := value[string(cmd.Args[2])]
+	fieldValue, ok := value[string(field)]
 	if !ok {
 		conn.WriteNull()
 		return
@@ -1828,8 +1907,46 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	key := cmd.Args[1]
+	field := cmd.Args[2]
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	ctx := context.Background()
+
+	// Fast path: direct wide-column field existence check. ExistsAt
+	// is cheaper than GetAt since we don't need the value payload.
+	hit, alive, err := r.hashFieldFastExists(ctx, key, field, readTS)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+	if hit {
+		if alive {
+			conn.WriteInt(1)
+		} else {
+			conn.WriteInt(0)
+		}
+		return
+	}
+	r.hexistsSlow(conn, ctx, key, field, readTS)
+}
+
+func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte, readTS uint64) (hit, alive bool, err error) {
+	exists, err := r.store.ExistsAt(ctx, store.HashFieldKey(key, field), readTS)
+	if err != nil {
+		return false, false, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return false, false, nil
+	}
+	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	if expErr != nil {
+		return false, false, cockerrors.WithStack(expErr)
+	}
+	return true, !expired, nil
+}
+
+func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1842,13 +1959,12 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+	value, err := r.loadHashAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	if _, ok := value[string(cmd.Args[2])]; ok {
+	if _, ok := value[string(field)]; ok {
 		conn.WriteInt(1)
 		return
 	}
