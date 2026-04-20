@@ -32,12 +32,23 @@ const (
 	// leader candidate. See docs/lease_read_design.md for the safety argument.
 	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
-	// allows per peer before waiting for an ACK (etcd/raft default: 256).
-	// It also sets the per-peer dispatch channel capacity; total buffered memory
-	// is bounded by O(numPeers × MaxInflightMsg × avgMsgSize).
-	// Increase via OpenConfig.MaxInflightMsg for deeper pipelining on
-	// high-bandwidth links; reduce it in memory-constrained clusters.
-	defaultMaxInflightMsg = 256
+	// allows per peer before waiting for an ACK. It also sizes the inbound
+	// stepCh, dispatchReportCh, and the per-peer outbound "normal" dispatch
+	// queue. Total buffered memory is bounded by
+	// O(numPeers × MaxInflightMsg × avgMsgSize).
+	//
+	// Raised from 256 → 1024 to absorb short CPU bursts without forcing
+	// peers to reject with "etcd raft inbound step queue is full".
+	// Under production congestion we observed the 256-slot inbound
+	// stepCh on followers filling up while their event loop was held
+	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
+	// #565 removed most of that CPU); 1024 is a 4× safety margin.
+	// Note that with the current defaultMaxSizePerMsg of 1 MiB, the
+	// true worst-case bound can be much larger (up to roughly 1 GiB
+	// per peer if every slot held a max-sized message). In practice,
+	// typical MsgApp payloads are far smaller, so expected steady-state
+	// memory remains much lower than that worst-case bound.
+	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
@@ -46,7 +57,14 @@ const (
 	// MsgAppResp is intentionally kept in the normal channel: followers — the
 	// only senders of MsgAppResp — do not send MsgApp, so there is no
 	// head-of-line blocking risk there.
-	defaultHeartbeatBufPerPeer = 64
+	//
+	// Raised from 64 → 512 after the leader logged heartbeat drops
+	// totalling 1.6M+ (dispatchDropCount) while the transport drained
+	// slower than heartbeat tick issuance. Heartbeats are tiny
+	// (< ~100 B), so 512 × numPeers is ≪ 1 MB total memory; the
+	// upside is that a ~5 s transient pause (election-timeout scale)
+	// no longer drops heartbeats and force the peers' lease to expire.
+	defaultHeartbeatBufPerPeer = 512
 	defaultSnapshotEvery       = 10_000
 	defaultSnapshotQueueSize   = 1
 	defaultAdminPollInterval   = 10 * time.Millisecond
