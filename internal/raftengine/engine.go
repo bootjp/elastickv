@@ -114,9 +114,10 @@ type LeaseProvider interface {
 	// that any new leader candidate cannot yet accept writes during
 	// that window.
 	//
-	// Returns the zero time when no quorum has been confirmed yet, or
-	// when the local node is not the leader. Single-node clusters
-	// report time.Now() unconditionally since self is the quorum.
+	// Returns the zero time when no quorum has been confirmed yet or
+	// when the local node is not the leader. Single-node LEADERS may
+	// return a recent time.Now() since self is the quorum; non-leader
+	// single-node replicas still return the zero time.
 	LastQuorumAck() time.Time
 	// RegisterLeaderLossCallback registers fn to be invoked whenever the
 	// local node leaves the leader role (graceful transfer, partition

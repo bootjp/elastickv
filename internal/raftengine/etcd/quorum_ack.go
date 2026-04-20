@@ -70,9 +70,12 @@ func (t *quorumAckTracker) recordAck(peerID uint64, followerQuorum int) {
 func (t *quorumAckTracker) removePeer(peerID uint64, followerQuorum int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.peerAcks[peerID]; !ok {
-		return
-	}
+	// delete is safe on a missing key. We still recompute even when
+	// peerID had no recorded entry: a shrink that reduces
+	// followerQuorum may let the remaining peers now satisfy the
+	// smaller threshold, and without an explicit recompute the
+	// published instant would stay at its stale value (or zero) until
+	// the next recordAck arrives.
 	delete(t.peerAcks, peerID)
 	if followerQuorum <= 0 {
 		return
