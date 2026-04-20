@@ -1048,6 +1048,34 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
+
+	// Fast path: attempt the string read directly instead of probing
+	// every possible Redis encoding first. rawKeyTypeAt issues up to
+	// ~17 pebble seeks (list meta + list delta + 3×wide-column probes
+	// each doing 3 seeks + hash/set/zset/stream/HLL/str/bare); that
+	// overhead dominated every GET on a hot cluster (see
+	// docs/lease_read_design.md). A live string key resolves in 1-2
+	// seeks here, and we only fall back to keyTypeAt when the string
+	// path returns ErrKeyNotFound (meaning either missing, expired,
+	// or a non-string type is present under this user-key).
+	//
+	// Use the snapshot variant: LeaseReadForKeyThrough above already
+	// established the ReadIndex fence, so a per-call VerifyLeaderForKey
+	// (inside leaderAwareGetAt) would duplicate the quorum work.
+	v, _, err := r.readRedisStringAtSnapshot(key, readTS)
+	if err == nil {
+		conn.WriteBulk(v)
+		return
+	}
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	// Slow path: disambiguate "missing / expired" from WRONGTYPE.
+	// keyTypeAt applies the TTL filter, so an expired string reports
+	// as redisTypeNone here and we return nil -- matching the
+	// pre-optimisation behaviour.
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -1057,22 +1085,16 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteNull()
 		return
 	}
-	if typ != redisTypeString {
-		conn.WriteError(wrongTypeMessage)
+	// If keyTypeAt disagrees with the fast path and classifies the key
+	// as a live string (e.g. a rare TTL-filter discrepancy between
+	// decodePrefixedStringWith/readBareLegacyStringWith and
+	// hasExpiredTTLAt), match the pre-optimisation behaviour and
+	// return nil rather than WRONGTYPE.
+	if typ == redisTypeString {
+		conn.WriteNull()
 		return
 	}
-
-	v, _, err := r.readRedisStringAt(key, readTS)
-	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			conn.WriteNull()
-		} else {
-			conn.WriteError(err.Error())
-		}
-		return
-	}
-
-	conn.WriteBulk(v)
+	conn.WriteError(wrongTypeMessage)
 }
 
 // leaderEmbeddedTTLExpired looks at !redis|str|<key> on the leader and, if the
