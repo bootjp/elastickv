@@ -197,6 +197,26 @@ func TestCoordinate_LeaseRead_FallbackWhenEngineLacksLeaseProvider(t *testing.T)
 
 // --- Leader-loss invalidation hook --------------------------------------
 
+func TestCoordinate_CloseDeregistersLeaderLossCallback(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 1, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+	require.Equal(t, int32(1), eng.registerLeaderLossCalled.Load())
+
+	require.NoError(t, c.Close())
+
+	// After Close, firing leader-loss must NOT invoke this Coordinate's
+	// invalidate (it must have been removed from the engine's slice).
+	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
+	require.True(t, c.lease.valid(time.Now()))
+	eng.fireLeaderLoss()
+	require.True(t, c.lease.valid(time.Now()),
+		"Close must remove the callback so subsequent leader-loss firings do NOT touch this Coordinate's lease")
+
+	// Close is idempotent.
+	require.NoError(t, c.Close())
+}
+
 func TestCoordinate_RegistersLeaderLossCallback(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 1, leaseDur: time.Hour}

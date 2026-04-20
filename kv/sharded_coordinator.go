@@ -113,43 +113,55 @@ type ShardedCoordinator struct {
 	clock        *HLC
 	store        store.MVCCStore
 	log          *slog.Logger
+	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
+	// registered at construction. See Coordinate.Close for the
+	// rationale.
+	deregisterLeaseCbs []func()
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	var deregisters []func()
 	for gid, g := range groups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
-		// per-shard lease. All dispatch paths (raw via router.Commit,
-		// dispatchSingleShardTxn, dispatchTxn 2PC, dispatchDelPrefix
-		// broadcast) flow through g.Txn so this single hook catches
-		// them all. Skip the wrap if this group is already wrapped --
-		// NewShardedCoordinator may be called more than once against
-		// the same ShardGroup in tests, and stacking wrappers would
-		// fire the refresh hook multiple times per commit.
+		// per-shard lease. Skip if already wrapped so repeat calls
+		// don't stack wrappers.
 		if _, already := g.Txn.(*leaseRefreshingTxn); !already {
 			g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
 		}
 		router.Register(gid, g.Txn, g.Store)
 		// Per-shard leader-loss hook: when this group's engine notices
 		// a state transition out of leader, drop the lease so the next
-		// LeaseReadForKey on that shard takes the slow path. The
-		// returned deregister is intentionally ignored; see the same
-		// rationale in NewCoordinatorWithEngine.
+		// LeaseReadForKey on that shard takes the slow path.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
-			_ = lp.RegisterLeaderLossCallback(g.lease.invalidate)
+			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
 		}
 	}
 	return &ShardedCoordinator{
-		engine:       engine,
-		router:       router,
-		groups:       groups,
-		defaultGroup: defaultGroup,
-		clock:        clock,
-		store:        st,
-		log:          slog.Default(),
+		engine:             engine,
+		router:             router,
+		groups:             groups,
+		defaultGroup:       defaultGroup,
+		clock:              clock,
+		store:              st,
+		log:                slog.Default(),
+		deregisterLeaseCbs: deregisters,
 	}
+}
+
+// Close releases per-shard engine-side registrations. Idempotent.
+func (c *ShardedCoordinator) Close() error {
+	if c == nil {
+		return nil
+	}
+	cbs := c.deregisterLeaseCbs
+	c.deregisterLeaseCbs = nil
+	for _, fn := range cbs {
+		fn()
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {

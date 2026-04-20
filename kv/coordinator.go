@@ -58,16 +58,30 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// Register a leader-loss hook so the lease is invalidated the instant
 	// the engine notices a state transition out of the leader role,
 	// rather than waiting for wall-clock expiry of the current lease.
-	// The deregister function returned by RegisterLeaderLossCallback is
-	// intentionally ignored because Coordinate's lifetime matches the
-	// engine's: the callback is released when the engine is closed.
-	// Tests that create short-lived coordinators against a shared
-	// engine should instead use RegisterLeaderLossCallback directly
-	// and call the returned deregister on cleanup.
+	// Keep the deregister func so Close() can release the callback
+	// slot; owners with a shorter lifetime than the engine (tests,
+	// one-shot tools) MUST call Close() to avoid leaking a closure
+	// pointing into this Coordinate.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
-		_ = lp.RegisterLeaderLossCallback(c.lease.invalidate)
+		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
 	}
 	return c
+}
+
+// Close releases any engine-side registrations (currently the
+// leader-loss callback) held by this Coordinate. It is safe to call
+// on a nil receiver and multiple times. Owners whose lifetime matches
+// the engine's do not need to call Close; owners who discard the
+// Coordinate before closing the engine MUST.
+func (c *Coordinate) Close() error {
+	if c == nil {
+		return nil
+	}
+	if c.deregisterLeaseCb != nil {
+		c.deregisterLeaseCb()
+		c.deregisterLeaseCb = nil
+	}
+	return nil
 }
 
 // hlcLeaseEntryLen is the byte length of a serialised HLC lease Raft entry:
@@ -94,6 +108,12 @@ type Coordinate struct {
 	connCache          GRPCConnCache
 	log                *slog.Logger
 	lease              leaseState
+	// deregisterLeaseCb removes the leader-loss callback registered
+	// against engine at construction. Long-lived Coordinates don't
+	// need to call it (the engine will be closed after them), but
+	// short-lived test coordinators sharing an engine MUST invoke
+	// Close() to release the callback slot.
+	deregisterLeaseCb func()
 }
 
 var _ Coordinator = (*Coordinate)(nil)
