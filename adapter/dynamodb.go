@@ -70,12 +70,12 @@ const (
 	// the HTTP client. Matches the order of magnitude of Redis's
 	// redisDispatchTimeout so both adapters give up at similar
 	// wall-clock budgets on quorum loss.
-	dynamoLeaseReadTimeout = 5 * time.Second
-	itemUpdateLockStripeCount   = 256
-	tableLockStripeCount        = 128
-	batchWriteItemMaxItems      = 25
-	transactGetItemsMaxItems    = 100
-	dynamoMaxRequestBodyBytes   = 1 << 20
+	dynamoLeaseReadTimeout    = 5 * time.Second
+	itemUpdateLockStripeCount = 256
+	tableLockStripeCount      = 128
+	batchWriteItemMaxItems    = 25
+	transactGetItemsMaxItems  = 100
+	dynamoMaxRequestBodyBytes = 1 << 20
 
 	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
 	dynamoTableGenerationPrefix = kv.DynamoTableGenerationPrefix
