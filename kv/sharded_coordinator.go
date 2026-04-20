@@ -767,7 +767,13 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	}
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		g.lease.invalidate()
+		// See Coordinate.LeaseRead: only real leadership-loss signals
+		// invalidate the lease. Deadlines, transport blips, and other
+		// transient errors must NOT force the remainder of the lease
+		// window onto the slow path.
+		if isLeadershipLossError(err) {
+			g.lease.invalidate()
+		}
 		return 0, err
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
