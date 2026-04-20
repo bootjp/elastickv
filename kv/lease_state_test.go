@@ -1,12 +1,56 @@
 package kv
 
 import (
+	"context"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
+	cockroachdberrors "github.com/cockroachdb/errors"
+	hashicorpraft "github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIsLeadershipLossError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated", errors.New("write conflict"), false},
+		{"context canceled", context.Canceled, false},
+		{"raftengine ErrNotLeader direct", raftengine.ErrNotLeader, true},
+		{"raftengine ErrLeadershipLost direct", raftengine.ErrLeadershipLost, true},
+		{"raftengine ErrLeadershipTransferInProgress direct", raftengine.ErrLeadershipTransferInProgress, true},
+		{
+			"hashicorp ErrNotLeader marked with raftengine sentinel",
+			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrNotLeader, raftengine.ErrNotLeader)),
+			true,
+		},
+		{
+			"hashicorp ErrLeadershipLost marked with raftengine sentinel",
+			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrLeadershipLost, raftengine.ErrLeadershipLost)),
+			true,
+		},
+		{
+			"bare hashicorp ErrNotLeader (no raftengine mark) is NOT detected",
+			hashicorpraft.ErrNotLeader,
+			false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, isLeadershipLossError(tc.err))
+		})
+	}
+}
 
 func TestLeaseState_NilReceiverIsAlwaysExpired(t *testing.T) {
 	t.Parallel()

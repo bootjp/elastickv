@@ -18,6 +18,24 @@ const unknownLastContact = time.Duration(-1)
 
 var errNilEngine = errors.New("raft engine is not configured")
 
+// translateLeadershipErr wraps hashicorp/raft leadership-related sentinels
+// with the shared raftengine sentinels so callers can use a single
+// errors.Is check across engine backends.
+func translateLeadershipErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, raft.ErrNotLeader):
+		return errors.WithStack(errors.Mark(err, raftengine.ErrNotLeader))
+	case errors.Is(err, raft.ErrLeadershipLost):
+		return errors.WithStack(errors.Mark(err, raftengine.ErrLeadershipLost))
+	case errors.Is(err, raft.ErrLeadershipTransferInProgress):
+		return errors.WithStack(errors.Mark(err, raftengine.ErrLeadershipTransferInProgress))
+	}
+	return errors.WithStack(err)
+}
+
 type Engine struct {
 	raft *raft.Raft
 
@@ -66,7 +84,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, errors.WithStack(err)
+		return nil, translateLeadershipErr(err)
 	}
 
 	return &raftengine.ProposalResult{
@@ -118,7 +136,7 @@ func (e *Engine) VerifyLeader(ctx context.Context) error {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return ctxErr
 		}
-		return errors.WithStack(err)
+		return translateLeadershipErr(err)
 	}
 	return nil
 }
@@ -136,7 +154,7 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 		return errors.WithStack(errNilEngine)
 	}
 	if e.State() != raftengine.StateLeader {
-		return errors.WithStack(raft.ErrNotLeader)
+		return errors.WithStack(errors.Mark(raft.ErrNotLeader, raftengine.ErrNotLeader))
 	}
 	return nil
 }
@@ -155,7 +173,7 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 		return 0, errors.WithStack(errNilEngine)
 	}
 	if e.raft.State() != raft.Leader {
-		return 0, errors.WithStack(raft.ErrNotLeader)
+		return 0, errors.WithStack(errors.Mark(raft.ErrNotLeader, raftengine.ErrNotLeader))
 	}
 
 	// Raft §5.4.2: ensure at least one Barrier has been issued in the
@@ -238,7 +256,7 @@ func (e *Engine) executeBarrier(ctx context.Context) (bool, error) {
 	}
 
 	if e.raft.State() != raft.Leader {
-		return false, errors.WithStack(raft.ErrNotLeader)
+		return false, errors.WithStack(errors.Mark(raft.ErrNotLeader, raftengine.ErrNotLeader))
 	}
 
 	timeout, err := timeoutFromContext(ctx)
@@ -249,7 +267,7 @@ func (e *Engine) executeBarrier(ctx context.Context) (bool, error) {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return false, ctxErr
 		}
-		return false, errors.WithStack(err)
+		return false, translateLeadershipErr(err)
 	}
 
 	e.barrierTerm.Store(term)

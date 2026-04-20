@@ -226,7 +226,16 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 // "any error from engine.Propose" as an invalidation trigger.
 func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
 	if err != nil {
-		c.lease.invalidate()
+		// Only invalidate on errors that actually signal leadership
+		// loss. Write conflicts and validation errors are business-
+		// logic failures that do NOT mean this node stopped being
+		// leader; invalidating for them would force every subsequent
+		// read into the slow LinearizableRead path and defeat the
+		// lease. Engine.RegisterLeaderLossCallback and the fast-path
+		// State() == StateLeader guard cover real leader loss.
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
 		return
 	}
 	if resp == nil || resp.CommitIndex == 0 {
