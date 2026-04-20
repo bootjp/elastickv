@@ -610,14 +610,13 @@ func (e *Engine) AppliedIndex() uint64 {
 // Lease-read callers use this to invalidate cached lease state so the
 // next read takes the slow path.
 //
-// Callbacks run on detached goroutines rather than inline from
-// refreshStatus / shutdown / fail, so a buggy callback cannot stall
-// the Raft main loop or the teardown path. A panic inside a callback
-// is contained and logged. Ordering between concurrent callbacks is
-// unspecified; each should be a fast, lock-free invalidation. Callers
-// MUST NOT assume a callback has already run by the time a subsequent
-// read or write sees the transition; the lease's time-bound remains
-// the ultimate safety net.
+// Callbacks run synchronously from refreshStatus / shutdown / fail
+// and MUST be non-blocking (each should be a fast, lock-free
+// invalidation). A panic inside a callback is contained and logged
+// so a bug in one holder cannot crash the engine or break other
+// callbacks. LeaseRead also guards its fast path on
+// engine.State() == StateLeader so the small window between the
+// transition and this callback completing cannot serve stale reads.
 //
 // The returned deregister function removes this specific registration
 // and is safe to call multiple times. Long-lived callers (coordinators
@@ -667,18 +666,16 @@ type leaderLossSlot struct {
 	fn func()
 }
 
-// fireLeaderLossCallbacks invokes all registered callbacks in fresh
-// goroutines so a slow or misbehaving callback cannot stall the
-// caller. refreshStatus runs inside the Raft engine's main loop, and
-// shutdown / fail run on the teardown path; in neither case is it
-// acceptable for a third-party callback to hold up progress for an
-// unbounded time. Ordering between callbacks is intentionally
-// unspecified -- each callback's job is to flip a lock-free flag
-// (typically lease invalidation) and is order-independent.
+// fireLeaderLossCallbacks invokes all registered callbacks
+// synchronously. The registered-callback contract requires each fn
+// to be non-blocking (a lock-free lease-invalidate flag flip), so
+// inline execution is safe and avoids spawning an unbounded number
+// of goroutines per leader-loss event when many shards / coordinators
+// are registered.
 //
 // A panicking callback is still contained (see
 // invokeLeaderLossCallback) so a bug in one holder cannot break
-// others or crash the process.
+// subsequent callbacks or crash the process.
 func (e *Engine) fireLeaderLossCallbacks() {
 	e.leaderLossCbsMu.Lock()
 	cbs := make([]func(), len(e.leaderLossCbs))
@@ -687,7 +684,7 @@ func (e *Engine) fireLeaderLossCallbacks() {
 	}
 	e.leaderLossCbsMu.Unlock()
 	for _, fn := range cbs {
-		go e.invokeLeaderLossCallback(fn)
+		e.invokeLeaderLossCallback(fn)
 	}
 }
 
