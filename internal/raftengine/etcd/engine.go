@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
@@ -332,6 +333,18 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Surface a misconfiguration where the tick settings produce a
+	// non-positive lease window: lease reads would never hit the fast
+	// path. Don't fail Open -- the engine is still functional via the
+	// slow LinearizableRead path -- but make the degradation visible.
+	if lease := engine.LeaseDuration(); lease <= 0 {
+		slog.Warn("etcd raft engine: lease read disabled (non-positive LeaseDuration)",
+			slog.Duration("tick_interval", engine.tickInterval),
+			slog.Int("election_tick", engine.electionTick),
+			slog.Duration("lease_safety_margin", leaseSafetyMargin),
+			slog.Duration("computed_lease", lease),
+		)
+	}
 
 	go engine.run()
 
@@ -608,11 +621,19 @@ func (e *Engine) fireLeaderLossCallbacks() {
 func (e *Engine) invokeLeaderLossCallback(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			// A buggy lease holder must not crash the node. Drop the
-			// panic here; it has already marked the lease invalid (or
-			// would have, if the panic didn't interrupt it) so the
-			// next read takes the slow path and re-verifies leadership.
-			_ = r
+			// A buggy lease holder must not crash the node. Log the
+			// recovery so operators can see lease-invalidation hooks
+			// misbehaving in production; swallow the panic so the
+			// engine status loop / shutdown path continues. Safety is
+			// preserved because callbacks that fail to run leave the
+			// lease alone, and the next read takes the slow path and
+			// re-verifies leadership via LinearizableRead.
+			slog.Error("etcd raft engine: leader-loss callback panicked",
+				slog.String("node_id", e.localID),
+				slog.Uint64("raft_node_id", e.nodeID),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
 		}
 	}()
 	fn()
@@ -1784,6 +1805,7 @@ func (e *Engine) fail(err error) {
 		)
 	}
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	if err != nil {
 		e.runErr = err
 	}
@@ -1798,6 +1820,14 @@ func (e *Engine) fail(err error) {
 	_ = closePersist(e.persist)
 	_ = e.transport.Close()
 	e.failPending(e.currentErrorOrClosed())
+	// LeaseProvider contract: fire leader-loss callbacks on shutdown if
+	// we were leader. fail() is the error-shutdown twin of shutdown();
+	// without firing here, a run() -> fail() path that bypasses
+	// refreshStatus's Leader -> non-Leader edge leaves lease holders
+	// serving fast-path reads from stale state for up to LeaseDuration.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) failPending(err error) {

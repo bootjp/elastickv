@@ -159,12 +159,24 @@ over (1) and (2).
 
 The lease is invalidated (set to nil) on:
 
-1. State transition out of leader. `refreshStatus` in
-   `internal/raftengine/etcd/engine.go:1577` already detects this; we add a
-   coordinator hook.
-2. Any error returned by `engine.Propose` or `engine.LinearizableRead`.
-3. Detection of a term change since last refresh (defensive; should not
-   normally fire because (1) covers leader loss).
+1. State transition out of leader. `refreshStatus` fires registered
+   `RegisterLeaderLossCallback` hooks on the `Leader -> non-Leader` edge,
+   and `fail()` / `shutdown()` fire the same hooks when tearing down a
+   node that was still leader, so the error-shutdown path does not leave
+   lease holders serving stale state.
+2. Any error returned by `engine.Propose` or `engine.LinearizableRead`
+   from inside `LeaseRead` / `groupLeaseRead`. Implemented via
+   `c.lease.invalidate()` on the slow-path error branch.
+3. A no-op Raft commit (`resp.CommitIndex == 0`): the underlying
+   `TransactionManager.{Commit,Abort}` can short-circuit on empty input
+   or no-op abort without going through Raft. `leaseRefreshingTxn` and
+   `Coordinate.Dispatch` only refresh the lease when `CommitIndex > 0`
+   to avoid extending based on an operation that never reached quorum.
+
+Note: the previous draft of this doc listed "term-change detection" as
+a separate defensive trigger. That is not implemented; (1) covers the
+only case term changes matter (an old leader being demoted), and
+adding an explicit term check would be redundant.
 
 ### 3.5 API
 
