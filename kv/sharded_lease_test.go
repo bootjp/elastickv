@@ -3,6 +3,8 @@ package kv
 import (
 	"context"
 	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +150,45 @@ func (f *fixedTransactional) Commit(_ []*pb.Request) (*TransactionResponse, erro
 
 func (f *fixedTransactional) Abort(_ []*pb.Request) (*TransactionResponse, error) {
 	return f.response, nil
+}
+
+// closableTransactional satisfies both Transactional and io.Closer so
+// the Close-delegation test can observe whether the wrapper forwards
+// Close to the inner value.
+type closableTransactional struct {
+	fixedTransactional
+	closed atomic.Bool
+}
+
+func (c *closableTransactional) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func TestLeaseRefreshingTxn_ForwardsClose(t *testing.T) {
+	t.Parallel()
+	inner := &closableTransactional{
+		fixedTransactional: fixedTransactional{response: &TransactionResponse{}},
+	}
+	wrapper := &leaseRefreshingTxn{inner: inner, g: &ShardGroup{}}
+
+	// ShardStore.closeGroup does `g.Txn.(io.Closer).Close()`. After
+	// wrapping, the same assertion must still discover a Close method
+	// that reaches the inner Transactional.
+	closer, ok := interface{}(wrapper).(io.Closer)
+	require.True(t, ok, "leaseRefreshingTxn must implement io.Closer")
+	require.NoError(t, closer.Close())
+	require.True(t, inner.closed.Load(),
+		"Close must delegate to the wrapped Transactional so ShardStore.closeGroup can release its resources")
+}
+
+func TestLeaseRefreshingTxn_CloseNoopWhenInnerIsNotCloser(t *testing.T) {
+	t.Parallel()
+	// fixedTransactional does NOT implement io.Closer. The wrapper's
+	// Close must be a safe no-op rather than panicking.
+	inner := &fixedTransactional{response: &TransactionResponse{}}
+	wrapper := &leaseRefreshingTxn{inner: inner, g: &ShardGroup{}}
+	require.NoError(t, wrapper.Close())
 }
 
 func TestShardedCoordinator_RegistersPerShardLeaderLossCallback(t *testing.T) {

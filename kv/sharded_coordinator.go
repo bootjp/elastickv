@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"slices"
 	"sync"
@@ -71,6 +72,23 @@ func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.
 		return
 	}
 	t.g.lease.extend(start.Add(lp.LeaseDuration()))
+}
+
+// Close forwards to the wrapped Transactional if it implements
+// io.Closer. ShardStore.closeGroup relies on the type assertion
+// `g.Txn.(io.Closer)` to release per-shard resources (e.g. the gRPC
+// connection cached by LeaderProxy). Without this pass-through, the
+// wrapping would silently swallow the Closer capability and leak
+// connections / goroutines at shutdown.
+func (t *leaseRefreshingTxn) Close() error {
+	closer, ok := t.inner.(io.Closer)
+	if !ok {
+		return nil
+	}
+	if err := closer.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 const (

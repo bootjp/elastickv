@@ -981,19 +981,18 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// Bounded context: LeaseReadForKey's slow path runs LinearizableRead,
-	// which can block until quorum is reached. Without a deadline a
-	// stalled Raft makes the GET hang indefinitely; cap it the same way
-	// the proxy path does.
-	leaseCtx, leaseCancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	if _, err := r.coordinator.LeaseReadForKey(leaseCtx, key); err != nil {
-		leaseCancel()
+	// Single bounded context for the whole request handler. The lease
+	// check and the subsequent local-only keyTypeAt / readRedisStringAt
+	// calls all respect the same deadline so a stalled Raft cannot
+	// leave the handler running past it.
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	defer cancel()
+	if _, err := r.coordinator.LeaseReadForKey(ctx, key); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
-	leaseCancel()
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
