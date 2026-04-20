@@ -1258,10 +1258,12 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
-	// Derive ctx from the server's base context so Close() cancels any
-	// in-flight probe instead of leaving it on a detached Background().
-	// The timeout bounds the worst case across multiple keys and any
-	// follower-side leader proxy hop.
+	// Derive ctx from the server's base context so shutdown cancels
+	// the ctx-aware branches of this handler. Note: the string
+	// fast-path (readRedisStringAt -> doGetAt) currently issues its
+	// pebble GetAt against context.Background, so cancellation only
+	// bounds logicalExistsAt's ctx-aware probes and the per-key
+	// loader. Plumbing ctx through doGetAt is tracked separately.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	count := 0
@@ -1286,12 +1288,21 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 // existsAtFast is a string-first fast path for EXISTS-style liveness
 // checks. Strings dominate real workloads, and a string key resolves
 // here in 1-2 seeks against redisStrKey (with TTL filtering applied
-// by readRedisStringAtSnapshot) versus the ~17 seeks of a full
+// by readRedisStringAt) versus the ~17 seeks of a full
 // logicalExistsAt probe. When the string path reports ErrKeyNotFound
 // (missing, expired, or a non-string type is present) we fall back to
 // the full probe.
+//
+// Uses readRedisStringAt (the leader-aware variant), NOT the snapshot
+// variant: EXISTS does no up-front LeaseReadForKeyThrough like GET
+// does, so the snapshot variant would violate its caller-contract
+// ("must have VerifyLeader'd first"). The leader-aware path handles
+// the follower case by proxying to the leader inside doGetAt, and
+// matches the liveness semantics of the pre-optimisation EXISTS flow
+// (logicalExistsAt → keyTypeAt → store.ExistsAt) which also did not
+// take the snapshot shortcut.
 func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	if _, _, err := r.readRedisStringAtSnapshot(key, readTS); err == nil {
+	if _, _, err := r.readRedisStringAt(key, readTS); err == nil {
 		return true, nil
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return false, errors.WithStack(err)
