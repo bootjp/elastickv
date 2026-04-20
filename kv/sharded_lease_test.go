@@ -58,7 +58,7 @@ func TestShardedCoordinator_LeaseReadForKey_PerShardIsolation(t *testing.T) {
 
 	// Pre-extend shard 1's lease only.
 	g1 := coord.groups[1]
-	g1.lease.extend(time.Now().Add(time.Hour))
+	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
 
 	idx, err := coord.LeaseReadForKey(context.Background(), []byte("apple"))
 	require.NoError(t, err)
@@ -88,8 +88,8 @@ func TestShardedCoordinator_LeaseReadForKey_ErrorOnlyInvalidatesShard(t *testing
 
 	g1 := coord.groups[1]
 	g2 := coord.groups[2]
-	g1.lease.extend(time.Now().Add(time.Hour))
-	g2.lease.extend(time.Now().Add(time.Hour))
+	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
+	g2.lease.extend(time.Now().Add(time.Hour), g2.lease.generation())
 	g2.lease.invalidate() // force shard 2 onto slow path
 
 	_, err := coord.LeaseReadForKey(context.Background(), []byte("zebra"))
@@ -205,8 +205,8 @@ func TestShardedCoordinator_RegistersPerShardLeaderLossCallback(t *testing.T) {
 
 	g1 := coord.groups[1]
 	g2 := coord.groups[2]
-	g1.lease.extend(time.Now().Add(time.Hour))
-	g2.lease.extend(time.Now().Add(time.Hour))
+	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
+	g2.lease.extend(time.Now().Add(time.Hour), g2.lease.generation())
 
 	eng1.fireLeaderLoss()
 	require.False(t, g1.lease.valid(time.Now()),

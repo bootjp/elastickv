@@ -43,27 +43,32 @@ type leaseRefreshingTxn struct {
 
 func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
 	start := time.Now()
+	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(reqs)
 	if err != nil {
 		return resp, errors.WithStack(err)
 	}
-	t.maybeRefresh(resp, start)
+	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
 }
 
 func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 	start := time.Now()
+	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Abort(reqs)
 	if err != nil {
 		return resp, errors.WithStack(err)
 	}
-	t.maybeRefresh(resp, start)
+	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
 }
 
 // maybeRefresh extends the per-shard lease only when the operation
-// actually produced a Raft commit. See the struct doc comment for why.
-func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time) {
+// actually produced a Raft commit. expectedGen is sampled BEFORE the
+// underlying Commit/Abort so an invalidation that fires during that
+// call observes a generation mismatch inside extend and the refresh
+// is rejected. See the struct doc comment for why.
+func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time, expectedGen uint64) {
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
@@ -71,7 +76,7 @@ func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.
 	if !ok {
 		return
 	}
-	t.g.lease.extend(start.Add(lp.LeaseDuration()))
+	t.g.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 }
 
 // Close forwards to the wrapped Transactional if it implements
@@ -706,9 +711,11 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	if !ok {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Single time.Now() sample shared by both the fast-path validity
-	// check and the slow-path extend base, mirroring Coordinate.LeaseRead.
+	// Single time.Now() and generation sample before any quorum work,
+	// mirroring Coordinate.LeaseRead. expectedGen guards against a
+	// leader-loss invalidation that fires during LinearizableRead.
 	now := time.Now()
+	expectedGen := g.lease.generation()
 	if g.lease.valid(now) {
 		return lp.AppliedIndex(), nil
 	}
@@ -717,7 +724,7 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 		g.lease.invalidate()
 		return 0, err
 	}
-	g.lease.extend(now.Add(lp.LeaseDuration()))
+	g.lease.extend(now.Add(lp.LeaseDuration()), expectedGen)
 	return idx, nil
 }
 

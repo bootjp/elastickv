@@ -624,10 +624,15 @@ func (e *Engine) invokeLeaderLossCallback(fn func()) {
 			// A buggy lease holder must not crash the node. Log the
 			// recovery so operators can see lease-invalidation hooks
 			// misbehaving in production; swallow the panic so the
-			// engine status loop / shutdown path continues. Safety is
-			// preserved because callbacks that fail to run leave the
-			// lease alone, and the next read takes the slow path and
-			// re-verifies leadership via LinearizableRead.
+			// engine status loop / shutdown path continues.
+			//
+			// Note: if a callback panics before it invalidates its
+			// lease, fast-path reads on that lease keep succeeding
+			// until wall-clock expiry. Safety is then bounded by the
+			// lease duration (strictly shorter than electionTimeout),
+			// not by the slow-path re-verification. The slow path
+			// re-verifies leadership only once the lease has
+			// naturally expired.
 			slog.Error("etcd raft engine: leader-loss callback panicked",
 				slog.String("node_id", e.localID),
 				slog.Uint64("raft_node_id", e.nodeID),

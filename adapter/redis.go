@@ -981,10 +981,11 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// Single bounded context for the whole request handler. The lease
-	// check and the subsequent local-only keyTypeAt / readRedisStringAt
-	// calls all respect the same deadline so a stalled Raft cannot
-	// leave the handler running past it.
+	// Single bounded context for the slow paths in this handler.
+	// Only LeaseReadForKey and keyTypeAt accept a context;
+	// readRedisStringAt is a local-store read that does not take one.
+	// The shared deadline still bounds the only branches that can
+	// actually block on quorum / I/O.
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := r.coordinator.LeaseReadForKey(ctx, key); err != nil {

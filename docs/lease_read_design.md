@@ -143,13 +143,27 @@ safety buffer.
 
 ### 3.3 Refresh triggers
 
-The lease is refreshed (set to `time.Now() + LeaseDuration()`) on:
+The lease is refreshed on:
 
 1. Any successful `engine.LinearizableRead(ctx)` returning without error.
    The ReadIndex protocol confirmed quorum at that moment.
 2. Any successful `engine.Propose(ctx, data)` whose result indicates commit.
    A committed entry implies majority append + ack, which is a stronger
    confirmation than ReadIndex.
+
+Both refresh base the new expiry on `preOpInstant + LeaseDuration()`,
+where `preOpInstant` is captured BEFORE the quorum operation starts, not
+after it returns. This is strictly conservative: any real quorum
+confirmation must happen at or after `preOpInstant`, so the lease window
+can only be shorter than the true safety window, never longer.
+Post-operation sampling would let apply-queue depth / scheduling jitter
+push the window past `electionTimeout`.
+
+Alongside the instant, the caller also captures the lease generation via
+`leaseState.generation()` and passes both to `extend(until, expectedGen)`.
+The generation guard prevents a leader-loss invalidation that fires
+during the quorum operation from being silently overwritten by the
+caller's post-op extend.
 
 Heartbeat ack tracking is intentionally not used. It would require deep
 hooks into etcd/raft's internals and gives only a small marginal benefit
@@ -283,13 +297,14 @@ replaced.
 ### 4.3 Refresh-vs-ack gap
 
 The design refreshes the lease on `LinearizableRead` and `Propose`
-completion, not on individual heartbeat acks. This widens the gap between
-the actual quorum confirmation event and the lease extension event by at
-most one round-trip plus goroutine scheduling.
-
-This gap is included in `leaseSafetyMargin`. Specifically, if the round-trip
-plus scheduling delay is bounded by `D`, then `margin >= D + clock_skew_bound`
-preserves the invariant.
+completion, not on individual heartbeat acks. The ambiguity of exactly
+when quorum was confirmed during the operation is bounded by sampling
+the lease base BEFORE the operation starts (see 3.3): any real quorum
+confirmation happens at or after that sample, so the computed window
+can only be shorter than the true safety window, never longer. The
+`leaseSafetyMargin` still absorbs bounded wall-clock skew between the
+leader's local clock and a partition's successor leader's clock; it no
+longer has to absorb the round-trip latency of the quorum operation.
 
 ### 4.4 Comparison to current state
 

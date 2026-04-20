@@ -130,16 +130,18 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		reqs.CommitTS = 0
 	}
 
-	// Sample the clock BEFORE dispatching and use this pre-dispatch
-	// instant as the lease-extension base on success. Any real quorum
-	// confirmation necessarily happens at or after this instant, so
-	// basing the lease here is strictly conservative -- the effective
-	// window can only be SHORTER than the actual safety window, never
-	// longer. Without this, apply-queue depth / scheduling jitter
-	// between Propose return and the lease extend call could push the
-	// window past electionTimeout and let a stale leader serve reads
-	// beyond the safety bound.
+	// Sample the clock AND the lease generation BEFORE dispatching.
+	//   * dispatchStart: any real quorum confirmation happens at or
+	//     after this instant, so using it as the lease-extension base
+	//     is strictly conservative (window can only be SHORTER than
+	//     the actual safety window, never longer).
+	//   * expectedGen: if a leader-loss callback fires between this
+	//     sample and the post-dispatch extend, the generation will
+	//     have advanced; extend(expectedGen) will see the mismatch
+	//     and refuse to resurrect the lease. Capturing gen INSIDE
+	//     extend would observe the post-invalidate value as current.
 	dispatchStart := time.Now()
+	expectedGen := c.lease.generation()
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
@@ -147,7 +149,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	} else {
 		resp, err = c.dispatchRaw(reqs.Elems)
 	}
-	c.refreshLeaseAfterDispatch(resp, err, dispatchStart)
+	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
 }
 
@@ -156,7 +158,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 // transaction manager short-circuited (empty-input Commit, no-op
 // Abort), and refreshing would be unsound because no quorum
 // confirmation happened.
-func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time) {
+func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
 	if err != nil || resp == nil || resp.CommitIndex == 0 {
 		return
 	}
@@ -164,7 +166,7 @@ func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err err
 	if !ok {
 		return
 	}
-	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()))
+	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
 }
 
 func (c *Coordinate) IsLeader() bool {
@@ -266,27 +268,23 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	if !ok {
 		return c.LinearizableRead(ctx)
 	}
-	// Capture time.Now() exactly once so the fast-path validity check
-	// and the slow-path lease-extend base share the same instant. A
-	// second sampling would let the fast path accept a read whose
-	// instant is slightly after expiry (and, conversely, shorten the
-	// slow-path lease window by the same delta).
+	// Capture time.Now() and the lease generation exactly once before
+	// any quorum work. `now` is reused for both the fast-path validity
+	// check and (on slow path) the extend base; `expectedGen` guards
+	// against a leader-loss invalidation that fires during
+	// LinearizableRead from being overwritten by this caller's extend.
+	// See Coordinate.Dispatch for the same rationale.
 	now := time.Now()
+	expectedGen := c.lease.generation()
 	if c.lease.valid(now) {
 		return lp.AppliedIndex(), nil
 	}
-	// The captured `now` also serves as the lease-extension base: it
-	// is sampled strictly before LinearizableRead runs, so any real
-	// quorum confirmation LinearizableRead witnesses happens at or
-	// after `now`. The resulting lease window is therefore strictly
-	// conservative (can only shorten, never overextend). See
-	// Coordinate.Dispatch for the same rationale.
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
 		c.lease.invalidate()
 		return 0, err
 	}
-	c.lease.extend(now.Add(lp.LeaseDuration()))
+	c.lease.extend(now.Add(lp.LeaseDuration()), expectedGen)
 	return idx, nil
 }
 

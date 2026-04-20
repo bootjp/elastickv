@@ -102,7 +102,7 @@ func TestCoordinate_LeaseRead_FastPathSkipsEngine(t *testing.T) {
 	eng := &fakeLeaseEngine{applied: 100, leaseDur: time.Hour}
 	c := NewCoordinatorWithEngine(nil, eng)
 
-	c.lease.extend(time.Now().Add(time.Hour))
+	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
 
 	idx, err := c.LeaseRead(context.Background())
 	require.NoError(t, err)
@@ -134,7 +134,7 @@ func TestCoordinate_LeaseRead_ErrorInvalidatesLease(t *testing.T) {
 	eng := &fakeLeaseEngine{applied: 7, leaseDur: time.Hour, linearizableErr: sentinel}
 	c := NewCoordinatorWithEngine(nil, eng)
 
-	c.lease.extend(time.Now().Add(time.Hour))
+	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
 	c.lease.invalidate() // force slow path
 
 	_, err := c.LeaseRead(context.Background())
@@ -173,7 +173,7 @@ func TestCoordinate_RegistersLeaderLossCallback(t *testing.T) {
 	c := NewCoordinatorWithEngine(nil, eng)
 	require.Equal(t, int32(1), eng.registerLeaderLossCalled.Load())
 
-	c.lease.extend(time.Now().Add(time.Hour))
+	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
 	require.True(t, c.lease.valid(time.Now()))
 
 	eng.fireLeaderLoss()
