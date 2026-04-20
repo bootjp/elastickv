@@ -752,13 +752,18 @@ func (o redisSetOptions) allows(exists bool) bool {
 }
 
 func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
-	// rawTyp (TTL-unaware) detects lingering internal keys for cleanup.
-	rawTyp, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	// Probe type ONCE (rawKeyTypeAt issues up to ~17 pebble seeks),
+	// then derive both the raw and TTL-filtered views from it. The
+	// previous implementation called rawKeyTypeAt + keyTypeAt, which
+	// called rawKeyTypeAt again inside -- doubling every SET to ~34
+	// seeks for purely redundant work.
+	ctx := context.Background()
+	rawTyp, err := r.rawKeyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return redisSetState{}, err
 	}
 	// typ (TTL-aware) drives NX/XX/GET Redis semantics: expired keys are "gone".
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.applyTTLFilter(ctx, key, readTS, rawTyp)
 	if err != nil {
 		return redisSetState{}, err
 	}
@@ -1254,9 +1259,10 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
+	ctx := context.Background()
 	count := 0
 	for _, key := range cmd.Args[1:] {
-		ok, err := r.logicalExistsAt(context.Background(), key, readTS)
+		ok, err := r.existsAtFast(ctx, key, readTS)
 		if err != nil {
 			conn.WriteError(err.Error())
 			return
@@ -1271,6 +1277,22 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		}
 	}
 	conn.WriteInt(count)
+}
+
+// existsAtFast is a string-first fast path for EXISTS-style liveness
+// checks. Strings dominate real workloads, and a string key resolves
+// here in 1-2 seeks against redisStrKey (with TTL filtering applied
+// by readRedisStringAtSnapshot) versus the ~17 seeks of a full
+// logicalExistsAt probe. When the string path reports ErrKeyNotFound
+// (missing, expired, or a non-string type is present) we fall back to
+// the full probe.
+func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	if _, _, err := r.readRedisStringAtSnapshot(key, readTS); err == nil {
+		return true, nil
+	} else if !errors.Is(err, store.ErrKeyNotFound) {
+		return false, errors.WithStack(err)
+	}
+	return r.logicalExistsAt(ctx, key, readTS)
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
