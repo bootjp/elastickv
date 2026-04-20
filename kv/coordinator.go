@@ -144,15 +144,24 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	} else {
 		resp, err = c.dispatchRaw(reqs.Elems)
 	}
-	if err == nil {
-		// A successful dispatch implies majority append + ack; treat it as a
-		// fresh quorum confirmation and extend the lease using the
-		// pre-dispatch timestamp.
-		if lp, ok := c.engine.(raftengine.LeaseProvider); ok {
-			c.lease.extend(dispatchStart.Add(lp.LeaseDuration()))
-		}
-	}
+	c.refreshLeaseAfterDispatch(resp, err, dispatchStart)
 	return resp, err
+}
+
+// refreshLeaseAfterDispatch extends the lease only when the dispatch
+// produced a real Raft commit. CommitIndex == 0 means the underlying
+// transaction manager short-circuited (empty-input Commit, no-op
+// Abort), and refreshing would be unsound because no quorum
+// confirmation happened.
+func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time) {
+	if err != nil || resp == nil || resp.CommitIndex == 0 {
+		return
+	}
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()))
 }
 
 func (c *Coordinate) IsLeader() bool {

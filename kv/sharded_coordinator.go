@@ -24,10 +24,17 @@ type ShardGroup struct {
 	lease  leaseState
 }
 
-// leaseRefreshingTxn wraps a Transactional so every successful Commit /
-// Abort extends its shard's lease, treating committed Raft entries as
-// fresh quorum confirmations. Mirrors Coordinate.Dispatch's lease hook
-// for the per-shard case.
+// leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
+// produced a real Raft commit extends its shard's lease. Mirrors
+// Coordinate.Dispatch's lease hook for the per-shard case.
+//
+// Both TransactionManager.Commit and .Abort can return success WITHOUT
+// going through Raft -- Commit short-circuits on empty input, Abort
+// short-circuits when every request's abortRequestFor is nil (nothing
+// to release). Refreshing the lease in those cases would be unsound:
+// no quorum confirmation happened. We gate the refresh on
+// resp.CommitIndex > 0, which the underlying manager sets to the
+// last applied index only when at least one proposal went through.
 type leaseRefreshingTxn struct {
 	inner Transactional
 	g     *ShardGroup
@@ -39,9 +46,7 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	if err != nil {
 		return resp, errors.WithStack(err)
 	}
-	if lp, ok := t.g.Engine.(raftengine.LeaseProvider); ok {
-		t.g.lease.extend(start.Add(lp.LeaseDuration()))
-	}
+	t.maybeRefresh(resp, start)
 	return resp, nil
 }
 
@@ -51,10 +56,21 @@ func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, er
 	if err != nil {
 		return resp, errors.WithStack(err)
 	}
-	if lp, ok := t.g.Engine.(raftengine.LeaseProvider); ok {
-		t.g.lease.extend(start.Add(lp.LeaseDuration()))
-	}
+	t.maybeRefresh(resp, start)
 	return resp, nil
+}
+
+// maybeRefresh extends the per-shard lease only when the operation
+// actually produced a Raft commit. See the struct doc comment for why.
+func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time) {
+	if resp == nil || resp.CommitIndex == 0 {
+		return
+	}
+	lp, ok := t.g.Engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	t.g.lease.extend(start.Add(lp.LeaseDuration()))
 }
 
 const (

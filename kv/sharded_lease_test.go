@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,6 +96,58 @@ func TestShardedCoordinator_LeaseReadForKey_ErrorOnlyInvalidatesShard(t *testing
 		"shard 2 lease must be invalidated after error")
 	require.True(t, g1.lease.valid(time.Now()),
 		"shard 1 lease must NOT be touched by shard 2's failure")
+}
+
+func TestShardedCoordinator_LeaseRefreshingTxn_SkipsWhenCommitIndexZero(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	g1 := coord.groups[1]
+	// A response with CommitIndex == 0 signals "no Raft proposal
+	// happened" (TransactionManager short-circuits on empty input /
+	// no-op abort). Refreshing in that case would be unsound.
+	noRaftResp := &TransactionResponse{CommitIndex: 0}
+	txn, ok := g1.Txn.(*leaseRefreshingTxn)
+	require.True(t, ok, "NewShardedCoordinator wraps Txn in leaseRefreshingTxn")
+	txn.inner = &fixedTransactional{response: noRaftResp}
+
+	require.False(t, g1.lease.valid(time.Now()))
+
+	// Commit with empty input returns success with CommitIndex=0.
+	_, err := g1.Txn.Commit(nil)
+	require.NoError(t, err)
+	require.False(t, g1.lease.valid(time.Now()),
+		"lease must NOT be refreshed when no Raft commit happened")
+
+	// Same for Abort.
+	_, err = g1.Txn.Abort(nil)
+	require.NoError(t, err)
+	require.False(t, g1.lease.valid(time.Now()))
+
+	// A response with CommitIndex > 0 refreshes the lease.
+	realResp := &TransactionResponse{CommitIndex: 42}
+	txn.inner = &fixedTransactional{response: realResp}
+	_, err = g1.Txn.Commit(nil)
+	require.NoError(t, err)
+	require.True(t, g1.lease.valid(time.Now()),
+		"lease must be refreshed after a real Raft commit")
+}
+
+// fixedTransactional is a minimal Transactional whose Commit/Abort
+// always return the same response. Used to drive the lease-refresh
+// gating tests deterministically.
+type fixedTransactional struct {
+	response *TransactionResponse
+}
+
+func (f *fixedTransactional) Commit(_ []*pb.Request) (*TransactionResponse, error) {
+	return f.response, nil
+}
+
+func (f *fixedTransactional) Abort(_ []*pb.Request) (*TransactionResponse, error) {
+	return f.response, nil
 }
 
 func TestShardedCoordinator_RegistersPerShardLeaderLossCallback(t *testing.T) {
