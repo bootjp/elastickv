@@ -1085,6 +1085,15 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteNull()
 		return
 	}
+	// If keyTypeAt disagrees with the fast path and classifies the key
+	// as a live string (e.g. a rare TTL-filter discrepancy between
+	// decodePrefixedStringWith/readBareLegacyStringWith and
+	// hasExpiredTTLAt), match the pre-optimisation behaviour and
+	// return nil rather than WRONGTYPE.
+	if typ == redisTypeString {
+		conn.WriteNull()
+		return
+	}
 	conn.WriteError(wrongTypeMessage)
 }
 
