@@ -1058,7 +1058,11 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// seeks here, and we only fall back to keyTypeAt when the string
 	// path returns ErrKeyNotFound (meaning either missing, expired,
 	// or a non-string type is present under this user-key).
-	v, _, err := r.readRedisStringAt(key, readTS)
+	//
+	// Use the snapshot variant: LeaseReadForKeyThrough above already
+	// established the ReadIndex fence, so a per-call VerifyLeaderForKey
+	// (inside leaderAwareGetAt) would duplicate the quorum work.
+	v, _, err := r.readRedisStringAtSnapshot(key, readTS)
 	if err == nil {
 		conn.WriteBulk(v)
 		return
