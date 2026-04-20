@@ -25,9 +25,12 @@ which usually means the adapter wiring was not updated on that node.
 
 Added in this PR:
 
-- `elastickv_lease_read_total{outcome="hit|miss"}` -- counter on
-  `kv.Coordinate.LeaseRead` / `kv.ShardedCoordinator.groupLeaseRead`.
-  Wired via `kv.WithLeaseReadObserver` (single-group) and
+- `elastickv_lease_read_total{outcome="hit|miss"}` -- counter
+  incremented at the lease-read call sites in `kv/coordinator.go`
+  (`Coordinate.LeaseRead`, `Coordinate.LeaseReadForKey`) and the
+  shared `kv.groupLeaseRead` helper used by
+  `ShardedCoordinator.LeaseRead` / `LeaseReadForKey`. Wired via the
+  `kv.WithLeaseReadObserver` option on `Coordinate` and
   `ShardedCoordinator.WithLeaseReadObserver`.
 - `elastickv_raft_dispatch_dropped_total{group}` -- mirrors the etcd
   raft engine's `dispatchDropCount`.
