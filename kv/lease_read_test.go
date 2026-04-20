@@ -79,10 +79,17 @@ func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 			e.leaderLossCallbacksMu.Lock()
 			defer e.leaderLossCallbacksMu.Unlock()
 			for i, c := range e.leaderLossCallbacks {
-				if c.id == slot {
-					e.leaderLossCallbacks = append(e.leaderLossCallbacks[:i], e.leaderLossCallbacks[i+1:]...)
-					return
+				if c.id != slot {
+					continue
 				}
+				// Zero the tail before truncating so the removed
+				// callback's captured *Coordinate can be GC'd.
+				// Mirrors the production etcd engine.
+				last := len(e.leaderLossCallbacks) - 1
+				copy(e.leaderLossCallbacks[i:], e.leaderLossCallbacks[i+1:])
+				e.leaderLossCallbacks[last] = fakeLeaseEngineCb{}
+				e.leaderLossCallbacks = e.leaderLossCallbacks[:last]
+				return
 			}
 		})
 	}

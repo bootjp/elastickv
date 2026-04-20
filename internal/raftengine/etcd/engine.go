@@ -630,10 +630,20 @@ func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
 			e.leaderLossCbsMu.Lock()
 			defer e.leaderLossCbsMu.Unlock()
 			for i, c := range e.leaderLossCbs {
-				if c.id == slot {
-					e.leaderLossCbs = append(e.leaderLossCbs[:i], e.leaderLossCbs[i+1:]...)
-					return
+				if c.id != slot {
+					continue
 				}
+				// Remove without leaving a dangling reference at the
+				// tail of the underlying array. The removed slot's fn
+				// typically captures a *Coordinate; a plain
+				// `append(cbs[:i], cbs[i+1:]...)` would keep the old
+				// backing cell alive and prevent GC of the associated
+				// Coordinate until the engine itself is dropped.
+				last := len(e.leaderLossCbs) - 1
+				copy(e.leaderLossCbs[i:], e.leaderLossCbs[i+1:])
+				e.leaderLossCbs[last] = leaderLossSlot{}
+				e.leaderLossCbs = e.leaderLossCbs[:last]
+				return
 			}
 		})
 	}
