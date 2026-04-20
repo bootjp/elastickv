@@ -1235,17 +1235,18 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byte, readTS uint64) (hit, alive bool, err error) {
-	// String-priority guard; see hashFieldFastLookup for rationale.
-	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
-		return false, false, hErr
-	} else if higher {
-		return false, false, nil
-	}
+	// Probe FIRST; guard only on hit. See hashFieldFastLookup for the
+	// regression rationale.
 	exists, err := r.store.ExistsAt(ctx, store.SetMemberKey(key, member), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
 	}
 	if !exists {
+		return false, false, nil
+	}
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return false, false, hErr
+	} else if higher {
 		return false, false, nil
 	}
 	expired, expErr := r.hasExpired(ctx, key, readTS, true)
@@ -1692,17 +1693,25 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 // would cost ~3-5 extra seeks per fast-path hit, which would negate
 // most of the gain over the ~17-seek keyTypeAt slow path.
 func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte, readTS uint64) (raw []byte, hit, alive bool, err error) {
-	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
-		return nil, false, false, hErr
-	} else if higher {
-		return nil, false, false, nil
-	}
+	// Probe the wide-column field FIRST so the priority guard only
+	// runs on a hit. Placing the guard before the probe made every
+	// miss (nonexistent key, legacy-blob hash, or wrong-type) pay an
+	// unnecessary ExistsAt on redisStrKey -- pure overhead for the
+	// common negative-lookup case and for any workload that still
+	// carries legacy-blob encodings. See the PR #565 independent
+	// review for the Medium-severity regression this addresses.
 	raw, err = r.store.GetAt(ctx, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, false, nil
 		}
 		return nil, false, false, cockerrors.WithStack(err)
+	}
+	// Only pay the guard seek when we actually have a hit to defer.
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return nil, false, false, hErr
+	} else if higher {
+		return nil, false, false, nil
 	}
 	expired, expErr := r.hasExpired(ctx, key, readTS, true)
 	if expErr != nil {
@@ -1974,17 +1983,18 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte, readTS uint64) (hit, alive bool, err error) {
-	// String-priority guard; see hashFieldFastLookup for rationale.
-	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
-		return false, false, hErr
-	} else if higher {
-		return false, false, nil
-	}
+	// Probe FIRST; guard only on hit. See hashFieldFastLookup for the
+	// regression rationale.
 	exists, err := r.store.ExistsAt(ctx, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
 	}
 	if !exists {
+		return false, false, nil
+	}
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return false, false, hErr
+	} else if higher {
 		return false, false, nil
 	}
 	expired, expErr := r.hasExpired(ctx, key, readTS, true)
