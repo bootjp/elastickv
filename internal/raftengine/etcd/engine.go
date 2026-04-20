@@ -180,6 +180,12 @@ type Engine struct {
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
+	// stepQueueFullCount tracks the number of inbound raft messages
+	// (from remote peers and local handlers) that were dropped because
+	// stepCh was full. Surfaced to Prometheus as
+	// elastickv_raft_step_queue_full_total so operators can correlate
+	// seek-storm goroutine spikes with raft backpressure.
+	stepQueueFullCount atomic.Uint64
 
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
@@ -602,6 +608,42 @@ func (e *Engine) AppliedIndex() uint64 {
 		return 0
 	}
 	return e.appliedIndex.Load()
+}
+
+// DispatchDropCount returns the total number of outbound raft messages
+// dropped before hitting the transport because the per-peer normal or
+// heartbeat channel was full. Monotonic across the life of the engine.
+// Surfaced to Prometheus via the monitoring package so the hot-path
+// dashboard can graph stepCh saturation alongside LinearizableRead
+// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+func (e *Engine) DispatchDropCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dispatchDropCount.Load()
+}
+
+// DispatchErrorCount returns the total number of outbound raft
+// dispatches that reached the transport but failed (network errors,
+// remote shutdown, etc.). Monotonic across the life of the engine.
+func (e *Engine) DispatchErrorCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dispatchErrorCount.Load()
+}
+
+// StepQueueFullCount returns the total number of inbound raft messages
+// that could not be enqueued into stepCh because the channel was at
+// capacity. This is the "etcd raft inbound step queue is full" signal
+// from the task description: a spike indicates the local raft loop
+// is starved, usually by something blocking the apply path such as
+// the pre-#560 rawKeyTypeAt seek storm.
+func (e *Engine) StepQueueFullCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.stepQueueFullCount.Load()
 }
 
 // RegisterLeaderLossCallback registers fn to fire every time the local
@@ -2367,6 +2409,7 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 	case e.stepCh <- msg:
 		return nil
 	default:
+		e.stepQueueFullCount.Add(1)
 		return errors.WithStack(errStepQueueFull)
 	}
 }

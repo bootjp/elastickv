@@ -458,9 +458,20 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 	}
 	engine.stepCh <- raftpb.Message{Type: raftpb.MsgHeartbeat}
 
+	require.Equal(t, uint64(0), engine.StepQueueFullCount())
+
 	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
+
+	// The Prometheus hot-path dashboard relies on StepQueueFullCount
+	// advancing exactly once per rejected enqueue so the scraped rate
+	// equals the true drop rate, not a multiple of it.
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	require.Error(t, err)
+	require.Equal(t, uint64(2), engine.StepQueueFullCount())
 }
 
 func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {

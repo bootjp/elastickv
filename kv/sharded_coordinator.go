@@ -132,6 +132,19 @@ type ShardedCoordinator struct {
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
 	deregisterLeaseCbs []func()
+	// leaseObserver records lease-read hit/miss for every shard the
+	// coordinator owns. Nil-safe; see Coordinate.leaseObserver.
+	leaseObserver LeaseReadObserver
+}
+
+// WithShardedLeaseReadObserver wires a LeaseReadObserver onto a
+// ShardedCoordinator. Applied after construction because the
+// NewShardedCoordinator signature is already heavily overloaded;
+// see Coordinate.WithLeaseReadObserver for the equivalent option on
+// the single-group coordinator.
+func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
+	c.leaseObserver = observer
+	return c
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
@@ -727,7 +740,7 @@ func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return groupLeaseRead(ctx, g)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
 // LeaseReadForKey performs the lease check on the shard group that owns key.
@@ -738,10 +751,10 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return groupLeaseRead(ctx, g)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
-func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
+func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
 	lp, ok := engine.(raftengine.LeaseProvider)
 	if !ok {
@@ -763,7 +776,13 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	// State() is refreshed every tick and catches transitions
 	// sooner. See Coordinate.LeaseRead for details.
 	if g.lease.valid(now) && engine.State() == raftengine.StateLeader {
+		if observer != nil {
+			observer.ObserveLeaseRead(true)
+		}
 		return lp.AppliedIndex(), nil
+	}
+	if observer != nil {
+		observer.ObserveLeaseRead(false)
 	}
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {

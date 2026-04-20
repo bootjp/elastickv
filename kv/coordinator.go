@@ -41,6 +41,33 @@ func WithHLC(hlc *HLC) CoordinatorOption {
 	}
 }
 
+// LeaseReadObserver records lease-read fast-path vs slow-path outcomes
+// without coupling kv to a concrete monitoring backend. It is called once
+// per LeaseRead invocation that actually evaluates the lease (the initial
+// type-assertion/LeaseDuration==0 short-circuits are NOT counted because
+// they indicate the engine does not participate in lease reads at all).
+//
+// Implementations MUST be safe for concurrent use and MUST NOT block; the
+// observer is invoked on the Redis GET hot path.
+type LeaseReadObserver interface {
+	// ObserveLeaseRead is called with hit=true when the lease fast path
+	// served the read from local AppliedIndex, or hit=false when the
+	// coordinator fell back to a full LinearizableRead (expired lease,
+	// engine reported non-leader, or leader-loss callback raced with
+	// the request).
+	ObserveLeaseRead(hit bool)
+}
+
+// WithLeaseReadObserver wires a LeaseReadObserver onto a Coordinate.
+// This is the mechanism monitoring uses to surface the lease-hit ratio
+// panel on the Redis hot-path dashboard (see
+// monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
+	return func(c *Coordinate) {
+		c.leaseObserver = observer
+	}
+}
+
 func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {
 	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r), opts...)
 }
@@ -114,6 +141,11 @@ type Coordinate struct {
 	// short-lived test coordinators sharing an engine MUST invoke
 	// Close() to release the callback slot.
 	deregisterLeaseCb func()
+	// leaseObserver records lease-read hit/miss outcomes for metrics
+	// (nil when no observer is attached; LeaseRead short-circuits the
+	// nil check so production does not pay an interface call when
+	// monitoring is disabled).
+	leaseObserver LeaseReadObserver
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -374,7 +406,13 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	// knows it's not leader, force the slow path (which will fail
 	// fast via LinearizableRead and invalidate the lease).
 	if c.lease.valid(now) && c.engine.State() == raftengine.StateLeader {
+		if c.leaseObserver != nil {
+			c.leaseObserver.ObserveLeaseRead(true)
+		}
 		return lp.AppliedIndex(), nil
+	}
+	if c.leaseObserver != nil {
+		c.leaseObserver.ObserveLeaseRead(false)
 	}
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
