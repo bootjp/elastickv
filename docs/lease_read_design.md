@@ -91,7 +91,8 @@ holds:
 
 ```go
 type leaseState struct {
-    expiry atomic.Pointer[time.Time]  // nil or zero-value = expired
+    gen    atomic.Uint64                // bumped by invalidate()
+    expiry atomic.Pointer[time.Time]    // nil = expired / invalidated
 }
 ```
 
@@ -100,9 +101,16 @@ type leaseState struct {
   success.
 - `time.Now() < *expiry`: lease is valid. `LeaseRead` returns immediately
   without contacting the Raft layer.
+- `invalidate()` increments `gen` before clearing `expiry`. `extend()`
+  captures `gen` at entry and, after its CAS lands, undoes its own
+  write (via CAS on the pointer it stored) iff `gen` has moved. This
+  prevents a Dispatch that succeeded just before a leader-loss
+  invalidate from resurrecting the lease milliseconds after it was
+  cleared. A fresh `extend()` that captured the post-invalidate
+  generation is left intact because it stored a different pointer.
 
-The pointer-swap form lets readers be lock-free: each `LeaseRead` does one
-atomic load + one wall-clock compare.
+The lock-free form lets readers do one atomic load + one wall-clock compare
+on the fast path.
 
 ### 3.2 Lease duration
 

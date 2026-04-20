@@ -672,18 +672,18 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	if !ok {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	if g.lease.valid(time.Now()) {
+	// Single time.Now() sample shared by both the fast-path validity
+	// check and the slow-path extend base, mirroring Coordinate.LeaseRead.
+	now := time.Now()
+	if g.lease.valid(now) {
 		return lp.AppliedIndex(), nil
 	}
-	// Sample BEFORE LinearizableRead; the lease window must start at the
-	// quorum confirmation instant, not after the read returned.
-	readStart := time.Now()
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
 		g.lease.invalidate()
 		return 0, err
 	}
-	g.lease.extend(readStart.Add(lp.LeaseDuration()))
+	g.lease.extend(now.Add(lp.LeaseDuration()))
 	return idx, nil
 }
 

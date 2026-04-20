@@ -1367,7 +1367,13 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := d.coordinator.LeaseRead(r.Context()); err != nil {
+	// Use LeaseReadForKey with the table-meta key so sharded
+	// deployments consult the shard that actually owns the table's
+	// metadata rather than falling back to the default group. The
+	// item-specific key is not known until after schema resolution;
+	// the table-meta key is a deterministic proxy for the shard that
+	// hosts this table.
+	if _, err := d.coordinator.LeaseReadForKey(r.Context(), dynamoTableMetaKey(in.TableName)); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
 	}

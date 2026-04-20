@@ -254,19 +254,25 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	if !ok {
 		return c.LinearizableRead(ctx)
 	}
-	if c.lease.valid(time.Now()) {
+	// Capture time.Now() exactly once so the fast-path validity check
+	// and the slow-path lease-extend base share the same instant. A
+	// second sampling would let the fast path accept a read whose
+	// instant is slightly after expiry (and, conversely, shorten the
+	// slow-path lease window by the same delta).
+	now := time.Now()
+	if c.lease.valid(now) {
 		return lp.AppliedIndex(), nil
 	}
-	// Sample BEFORE LinearizableRead so the lease window starts at the
-	// real quorum confirmation instant, not after the heartbeat round
-	// returned. See Coordinate.Dispatch for the same rationale.
-	readStart := time.Now()
+	// The captured `now` also serves as readStart: it is strictly
+	// before LinearizableRead returns, so the lease window starts at
+	// the real quorum confirmation instant, not after the heartbeat
+	// round returned. See Coordinate.Dispatch for the same rationale.
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
 		c.lease.invalidate()
 		return 0, err
 	}
-	c.lease.extend(readStart.Add(lp.LeaseDuration()))
+	c.lease.extend(now.Add(lp.LeaseDuration()))
 	return idx, nil
 }
 
