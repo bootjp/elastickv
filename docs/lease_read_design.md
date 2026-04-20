@@ -199,7 +199,10 @@ adding an explicit term check would be redundant.
 type LeaseProvider interface {
     LeaseDuration() time.Duration
     AppliedIndex() uint64
-    RegisterLeaderLossCallback(fn func())
+    // RegisterLeaderLossCallback returns a deregister closure so
+    // short-lived holders can release their slot. Long-lived holders
+    // whose lifetime matches the engine's may ignore the return.
+    RegisterLeaderLossCallback(fn func()) (deregister func())
 }
 
 // kv/coordinator.go
@@ -208,6 +211,10 @@ type Coordinator interface {
     LeaseRead(ctx context.Context) (uint64, error)
     LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
 }
+
+// Concrete *Coordinate / *ShardedCoordinator additionally expose
+// Close() which calls the stored deregister. Close is NOT on the
+// Coordinator interface to keep adapter test stubs unchanged.
 ```
 
 Returned index is the engine's applied index at the moment of return. Callers
@@ -223,12 +230,16 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
     if !ok {
         return c.LinearizableRead(ctx) // hashicorp engine, test stubs
     }
-    // Capture time.Now() exactly once. Reused for both the fast-path
-    // validity check and (on the slow path) the lease-extension base:
-    // a second sample would let the fast path accept a read whose
-    // instant slightly exceeds the intended expiry boundary, while
-    // also shortening the slow-path window by the same delta.
+    if d := lp.LeaseDuration(); d <= 0 {
+        // Misconfigured tick settings disable the lease entirely.
+        return c.LinearizableRead(ctx)
+    }
+    // Capture time.Now() AND lease.generation() exactly once before
+    // any quorum work. The generation guard prevents a leader-loss
+    // callback that fires during LinearizableRead from being
+    // silently overwritten by the post-op extend.
     now := time.Now()
+    expectedGen := c.lease.generation()
     if c.lease.valid(now) {
         return lp.AppliedIndex(), nil
     }
@@ -238,10 +249,10 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
         return 0, err
     }
     // `now` was sampled strictly before LinearizableRead ran, so the
-    // resulting lease window is strictly conservative (any real
-    // quorum confirmation LinearizableRead witnessed happens at or
-    // after `now`). extend uses a monotonic CAS to reject regressions.
-    c.lease.extend(now.Add(lp.LeaseDuration()))
+    // resulting lease window is strictly conservative. `expectedGen`
+    // is the pre-op generation; extend rejects the CAS if invalidate
+    // advanced it during the quorum operation.
+    c.lease.extend(now.Add(lp.LeaseDuration()), expectedGen)
     return idx, nil
 }
 ```
