@@ -307,10 +307,6 @@ func (r *RedisServer) legacyIndexTTLAt(ctx context.Context, userKey []byte, read
 	return &ttl, nil
 }
 
-func (r *RedisServer) hasExpiredTTLAt(ctx context.Context, userKey []byte, readTS uint64) (bool, error) {
-	return r.hasExpired(ctx, userKey, readTS, false)
-}
-
 // hasExpired checks TTL expiry. When nonStringOnly is true, the embedded-TTL
 // probe is skipped and only the !redis|ttl| index is consulted, avoiding a
 // wasted GetAt on !redis|str|<key> for non-string types.

@@ -755,6 +755,15 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
+// observeLeaseRead forwards a hit / miss signal to observer when it
+// is non-nil. Kept as a package-level helper so both ShardedCoordinator
+// and any future sharded caller share one nil-safe entrypoint.
+func observeLeaseRead(observer LeaseReadObserver, hit bool) {
+	if observer != nil {
+		observer.ObserveLeaseRead(hit)
+	}
+}
+
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
 	lp, ok := engine.(raftengine.LeaseProvider)
@@ -763,34 +772,25 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	}
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		// Lease disabled by tick configuration. Always take the slow
-		// path without mutating g.lease.
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Single time.Now() and generation sample before any quorum work,
-	// mirroring Coordinate.LeaseRead. expectedGen guards against a
-	// leader-loss invalidation that fires during LinearizableRead.
+	// Single time.Now() sample so primary/secondary/extension all see
+	// the same instant. Clock-skew safety delegated to
+	// engineLeaseAckValid (see Coordinate.LeaseRead).
 	now := time.Now()
-	expectedGen := g.lease.generation()
-	// Defense-in-depth: also check the shard engine's current state.
-	// Async callbacks may not have flipped the lease yet, but
-	// State() is refreshed every tick and catches transitions
-	// sooner. See Coordinate.LeaseRead for details.
-	if g.lease.valid(now) && engine.State() == raftengine.StateLeader {
-		if observer != nil {
-			observer.ObserveLeaseRead(true)
-		}
+	state := engine.State()
+	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		observeLeaseRead(observer, true)
 		return lp.AppliedIndex(), nil
 	}
-	if observer != nil {
-		observer.ObserveLeaseRead(false)
+	expectedGen := g.lease.generation()
+	if g.lease.valid(now) && state == raftengine.StateLeader {
+		observeLeaseRead(observer, true)
+		return lp.AppliedIndex(), nil
 	}
+	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		// See Coordinate.LeaseRead: only real leadership-loss signals
-		// invalidate the lease. Deadlines, transport blips, and other
-		// transient errors must NOT force the remainder of the lease
-		// window onto the slow path.
 		if isLeadershipLossError(err) {
 			g.lease.invalidate()
 		}
