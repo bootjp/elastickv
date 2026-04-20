@@ -156,6 +156,28 @@ func TestCoordinate_LeaseRead_ErrorInvalidatesLease(t *testing.T) {
 	require.Equal(t, int32(2), eng.linearizableCalls.Load())
 }
 
+func TestCoordinate_LeaseRead_FallbackWhenLeaseDurationZero(t *testing.T) {
+	t.Parallel()
+	// Misconfigured tick settings can produce LeaseDuration <= 0.
+	// The implementation must short-circuit to LinearizableRead
+	// without touching lease state; otherwise extend(now+0, ...) would
+	// run on every slow-path call for no benefit.
+	eng := &fakeLeaseEngine{applied: 3, leaseDur: 0}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	idx, err := c.LeaseRead(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), idx)
+	require.Equal(t, int32(1), eng.linearizableCalls.Load())
+	require.False(t, c.lease.valid(time.Now()),
+		"lease must not have been extended when LeaseDuration <= 0")
+
+	// Every subsequent call must still take the slow path.
+	_, err = c.LeaseRead(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int32(2), eng.linearizableCalls.Load())
+}
+
 func TestCoordinate_LeaseRead_FallbackWhenEngineLacksLeaseProvider(t *testing.T) {
 	t.Parallel()
 	eng := &nonLeaseEngine{}

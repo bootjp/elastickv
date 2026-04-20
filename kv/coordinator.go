@@ -274,6 +274,13 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	if !ok {
 		return c.LinearizableRead(ctx)
 	}
+	leaseDur := lp.LeaseDuration()
+	if leaseDur <= 0 {
+		// Misconfigured tick settings (Engine.Open warned about this):
+		// the lease can never be valid. Fall back without touching
+		// lease state so we do not waste extend/invalidate work.
+		return c.LinearizableRead(ctx)
+	}
 	// Capture time.Now() and the lease generation exactly once before
 	// any quorum work. `now` is reused for both the fast-path validity
 	// check and (on slow path) the extend base; `expectedGen` guards
@@ -290,7 +297,7 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 		c.lease.invalidate()
 		return 0, err
 	}
-	c.lease.extend(now.Add(lp.LeaseDuration()), expectedGen)
+	c.lease.extend(now.Add(leaseDur), expectedGen)
 	return idx, nil
 }
 

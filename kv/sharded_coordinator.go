@@ -718,6 +718,12 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	if !ok {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
+	leaseDur := lp.LeaseDuration()
+	if leaseDur <= 0 {
+		// Lease disabled by tick configuration. Always take the slow
+		// path without mutating g.lease.
+		return linearizableReadEngineCtx(ctx, engine)
+	}
 	// Single time.Now() and generation sample before any quorum work,
 	// mirroring Coordinate.LeaseRead. expectedGen guards against a
 	// leader-loss invalidation that fires during LinearizableRead.
@@ -731,7 +737,7 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 		g.lease.invalidate()
 		return 0, err
 	}
-	g.lease.extend(now.Add(lp.LeaseDuration()), expectedGen)
+	g.lease.extend(now.Add(leaseDur), expectedGen)
 	return idx, nil
 }
 
