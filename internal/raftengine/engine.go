@@ -67,6 +67,39 @@ type LeaderView interface {
 	LinearizableRead(ctx context.Context) (uint64, error)
 }
 
+// LeaseProvider is an optional capability implemented by engines that support
+// leader-local lease reads. Callers that want lease-based reads should
+// type-assert to this interface and fall back to LinearizableRead when the
+// underlying engine does not implement it.
+type LeaseProvider interface {
+	// LeaseDuration returns the time during which a lease holder can serve
+	// reads from local state without re-confirming leadership via ReadIndex.
+	LeaseDuration() time.Duration
+	// AppliedIndex returns the highest log index applied to the local FSM.
+	AppliedIndex() uint64
+	// RegisterLeaderLossCallback registers fn to be invoked whenever the
+	// local node leaves the leader role (graceful transfer, partition
+	// step-down, or shutdown). Callers use this to invalidate any
+	// leader-local lease they hold so the next read takes the slow path.
+	// Multiple callbacks can be registered.
+	//
+	// Callbacks fire synchronously from the engine's status-refresh
+	// / shutdown path and MUST be non-blocking -- each should be a
+	// lock-free flag flip (e.g. atomic invalidate). A panicking
+	// callback is contained so a bug in one holder cannot break
+	// others, but a blocking callback would stall the engine's main
+	// loop, so the contract is strict. Lease-read fast paths also
+	// guard on engine.State() to close the narrow race between a
+	// transition and this callback completing.
+	//
+	// The returned function deregisters this callback and is safe to
+	// call multiple times. Callers whose lifetime is shorter than the
+	// engine's (ephemeral Coordinators in tests, for example) MUST
+	// invoke the returned deregister when they are done so the engine
+	// does not accumulate dead callbacks.
+	RegisterLeaderLossCallback(fn func()) (deregister func())
+}
+
 type StatusReader interface {
 	Status() Status
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"math"
 	"net"
@@ -264,6 +265,15 @@ type RedisServer struct {
 	relayConnCache  kv.GRPCConnCache
 	requestObserver monitoring.RedisRequestObserver
 	luaObserver     monitoring.LuaScriptObserver
+	// baseCtx is the parent context for per-request handlers.
+	// NewRedisServer creates a cancelable context here; Stop() cancels
+	// it so in-flight handlers abort promptly instead of running
+	// unbounded on context.Background(). Test stubs that construct
+	// RedisServer literals directly (bypassing NewRedisServer) may
+	// leave baseCtx nil; handlerContext() falls back to
+	// context.Background() in that case.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
 	// TODO manage membership from raft log
 	leaderRedis map[raft.ServerAddress]string
 
@@ -359,6 +369,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	if relay == nil {
 		relay = NewRedisPubSubRelay()
 	}
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
@@ -371,6 +382,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		baseCtx:         baseCtx,
+		baseCancel:      baseCancel,
 	}
 	r.relay.Bind(r.publishLocal)
 
@@ -525,6 +538,31 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 	default:
 		handler(conn, cmd)
 	}
+}
+
+// handlerContext returns the base context for a request handler.
+// Falls back to context.Background() when the server was constructed
+// by a test stub that bypassed NewRedisServer. Handlers that need a
+// deadline should wrap this via context.WithTimeout.
+func (r *RedisServer) handlerContext() context.Context {
+	if r == nil || r.baseCtx == nil {
+		return context.Background()
+	}
+	return r.baseCtx
+}
+
+// Close cancels the base context, signalling all in-flight handlers to
+// abort. Idempotent. The underlying redcon listener is still owned by
+// the caller; Close does NOT touch it so shutdown orchestration can
+// remain with the server owner.
+func (r *RedisServer) Close() error {
+	if r == nil {
+		return nil
+	}
+	if r.baseCancel != nil {
+		r.baseCancel()
+	}
+	return nil
 }
 
 func (r *RedisServer) Run() error {
@@ -809,8 +847,23 @@ func (r *RedisServer) observeRedisSuccess(command string, dur time.Duration) {
 }
 
 func (r *RedisServer) Stop() {
-	_ = r.relayConnCache.Close()
-	_ = r.listen.Close()
+	// Cancel baseCtx first so in-flight handlers observe a cancelled
+	// context before their network connections are torn down.
+	_ = r.Close()
+	if err := r.relayConnCache.Close(); err != nil {
+		slog.Warn("redis server: relay conn cache close",
+			slog.String("addr", r.redisAddr),
+			slog.Any("err", err),
+		)
+	}
+	if r.listen != nil {
+		if err := r.listen.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			slog.Warn("redis server: listener close",
+				slog.String("addr", r.redisAddr),
+				slog.Any("err", err),
+			)
+		}
+	}
 }
 
 func (r *RedisServer) publishLocal(channel, message []byte) int64 {
@@ -948,7 +1001,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	if opts.isFastPath() && r.trySetFastPath(conn, ctx, cmd.Args[1], cmd.Args[2], opts.ttl) {
@@ -981,8 +1034,21 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	// Single bounded context for the slow paths in this handler,
+	// derived from the server's base context so Close() cancels any
+	// in-flight handler instead of leaving it running on a detached
+	// context.Background(). Only LeaseReadForKey and keyTypeAt accept
+	// a context; readRedisStringAt is a local-store read that does
+	// not take one. The shared deadline bounds the only branches
+	// that can actually block on quorum / I/O.
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -1080,7 +1146,7 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 	// If this path is unavailable we fall back to raw-KV probing, which is
 	// best-effort and may lag unflushed buffer-only TTL updates.
 	if cli, err := r.leaderClientForKey(key); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 		defer cancel()
 		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
 			return count > 0
@@ -1138,7 +1204,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	err := r.retryRedisWrite(ctx, func() error {
@@ -1454,7 +1520,7 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	keys, err := cli.Keys(ctx, string(pattern)).Result()
@@ -1523,7 +1589,7 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 	}
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	cmds, err := r.execTxPipeline(ctx, cli, queue)
@@ -2325,7 +2391,7 @@ func (t *txnContext) commit() error {
 		CommitTS: commitTS,
 		ReadKeys: readKeys,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
 		return errors.WithStack(err)
@@ -2571,7 +2637,7 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
-	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	dispatchCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	var results []redisResult
@@ -3086,7 +3152,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
@@ -3110,7 +3176,7 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.RPush(ctx, string(key), args...).Result()
@@ -3134,7 +3200,7 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LPush(ctx, string(key), args...).Result()
@@ -3189,7 +3255,7 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	args := make([]interface{}, len(cmd.Args))
@@ -3266,7 +3332,7 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisRelayPublishTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisRelayPublishTimeout)
 	defer cancel()
 
 	cli := pb.NewRawKVClient(conn)

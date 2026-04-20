@@ -213,11 +213,12 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 }
 
 func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptContext, error) {
-	// LinearizableRead confirms leadership via quorum AND waits for the local
-	// FSM to apply all committed entries, so startTS reflects the latest
-	// committed state. All subsequent reads within the script use snapshotGetAt
-	// (no per-call VerifyLeader), making VerifyLeader O(1) per script.
-	if _, err := server.coordinator.LinearizableRead(ctx); err != nil {
+	// LeaseRead confirms leadership at most once per LeaseDuration window;
+	// inside the window it returns immediately without a Raft round-trip.
+	// All subsequent reads within the script use snapshotGetAt at startTS,
+	// so leadership is verified at most once per script and amortised across
+	// scripts via the lease.
+	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	startTS := server.readTS()

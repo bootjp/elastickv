@@ -62,6 +62,14 @@ func (s *stubLeaderCoordinator) LinearizableReadForKey(ctx context.Context, _ []
 	return s.LinearizableRead(ctx)
 }
 
+func (s *stubLeaderCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
+
+func (s *stubLeaderCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return s.LinearizableRead(ctx)
+}
+
 func (s *stubLeaderCoordinator) Clock() *HLC {
 	if s.clock == nil {
 		s.clock = NewHLC()

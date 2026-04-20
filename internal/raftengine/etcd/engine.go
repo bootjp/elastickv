@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
@@ -24,6 +25,12 @@ const (
 	defaultTickInterval  = 10 * time.Millisecond
 	defaultHeartbeatTick = 10  // 100ms at 10ms interval
 	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
+	// leaseSafetyMargin is subtracted from electionTimeout when computing the
+	// duration of a leader-local read lease. It absorbs goroutine scheduling
+	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
+	// and bounded wall-clock skew between the leader and a partition's new
+	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK (etcd/raft default: 256).
 	// It also sets the per-peer dispatch channel capacity; total buffered memory
@@ -108,6 +115,7 @@ type Engine struct {
 	dataDir      string
 	fsmSnapDir   string
 	tickInterval time.Duration
+	electionTick int
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -151,6 +159,13 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// appliedIndex mirrors the current applied-entry index for
+	// lock-free readers on the lease-read fast path. Writers inside
+	// the Raft run loop update both `applied` (protected by the run
+	// loop's single-writer invariant) and `appliedIndex.Store(...)`.
+	// AppliedIndex() reads via atomic.Load so it does not contend
+	// with refreshStatus's write lock.
+	appliedIndex atomic.Uint64
 	// configIndex tracks the highest configuration index durably published to
 	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
@@ -164,6 +179,19 @@ type Engine struct {
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
+
+	// leaderLossCbsMu guards the slice of callbacks invoked when the node
+	// transitions out of the leader role (graceful transfer, partition
+	// step-down, shutdown). Callbacks fire synchronously from the
+	// leader-loss handling path and MUST be non-blocking; a slow
+	// callback would hold up refreshStatus / shutdown / fail. See
+	// RegisterLeaderLossCallback for the full contract. Each entry
+	// carries a sentinel pointer so that the deregister closure
+	// returned by RegisterLeaderLossCallback can identify THIS
+	// specific registration even if the same fn is registered
+	// multiple times.
+	leaderLossCbsMu sync.Mutex
+	leaderLossCbs   []leaderLossSlot
 
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
@@ -290,6 +318,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		dataDir:          prepared.cfg.DataDir,
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
+		electionTick:     prepared.cfg.ElectionTick,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
@@ -314,9 +343,22 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingConfigs:   map[uint64]adminRequest{},
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Surface a misconfiguration where the tick settings produce a
+	// non-positive lease window: lease reads would never hit the fast
+	// path. Don't fail Open -- the engine is still functional via the
+	// slow LinearizableRead path -- but make the degradation visible.
+	if lease := engine.LeaseDuration(); lease <= 0 {
+		slog.Warn("etcd raft engine: lease read disabled (non-positive LeaseDuration)",
+			slog.Duration("tick_interval", engine.tickInterval),
+			slog.Int("election_tick", engine.electionTick),
+			slog.Duration("lease_safety_margin", leaseSafetyMargin),
+			slog.Duration("computed_lease", lease),
+		)
+	}
 
 	go engine.run()
 
@@ -519,6 +561,159 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return e.submitRead(ctx, true)
+}
+
+// LeaseDuration returns the time during which a lease holder can serve
+// reads from local state without re-confirming leadership via ReadIndex.
+// It is bounded by electionTimeout - leaseSafetyMargin so that the lease
+// expires before a successor leader could realistically be elected and
+// accept new writes elsewhere.
+func (e *Engine) LeaseDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	tick := e.tickInterval
+	if tick <= 0 {
+		tick = defaultTickInterval
+	}
+	election := e.electionTick
+	if election <= 0 {
+		election = defaultElectionTick
+	}
+	d := time.Duration(election)*tick - leaseSafetyMargin
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// AppliedIndex returns the highest log index applied to the local FSM.
+// Suitable for callers that need a non-blocking read fence equivalent
+// to what LinearizableRead would have returned, paired with an
+// external quorum confirmation (e.g. a valid lease).
+//
+// Lock-free: reads the mirrored atomic.Uint64 written by the run
+// loop's apply path (and by Restore's snapshot installation), so the
+// lease-read fast path does not contend with refreshStatus's write
+// lock under high read concurrency.
+func (e *Engine) AppliedIndex() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.appliedIndex.Load()
+}
+
+// RegisterLeaderLossCallback registers fn to fire every time the local
+// node's Raft state transitions out of leader (CheckQuorum step-down,
+// graceful transfer completion, partition-induced demotion) and also
+// on shutdown() while the node was still leader. Callbacks are NOT
+// fired at the moment a transfer starts (LeadTransferee != 0); they
+// only fire once the transfer completes and state flips to follower.
+// Lease-read callers use this to invalidate cached lease state so the
+// next read takes the slow path.
+//
+// Callbacks run synchronously from refreshStatus / shutdown / fail
+// and MUST be non-blocking (each should be a fast, lock-free
+// invalidation). A panic inside a callback is contained and logged
+// so a bug in one holder cannot crash the engine or break other
+// callbacks. LeaseRead also guards its fast path on
+// engine.State() == StateLeader so the small window between the
+// transition and this callback completing cannot serve stale reads.
+//
+// The returned deregister function removes this specific registration
+// and is safe to call multiple times. Long-lived callers (coordinators
+// whose lifetime matches the engine's) may ignore it; shorter-lived
+// callers MUST invoke it to avoid accumulating dead callbacks in the
+// engine's slice.
+func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
+	if e == nil || fn == nil {
+		return func() {}
+	}
+	// Allocate a unique sentinel pointer so the deregister closure can
+	// identify THIS specific registration even if the same fn is
+	// registered multiple times.
+	slot := &struct{ fn func() }{fn: fn}
+	e.leaderLossCbsMu.Lock()
+	e.leaderLossCbs = append(e.leaderLossCbs, leaderLossSlot{id: slot, fn: fn})
+	e.leaderLossCbsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.leaderLossCbsMu.Lock()
+			defer e.leaderLossCbsMu.Unlock()
+			for i, c := range e.leaderLossCbs {
+				if c.id != slot {
+					continue
+				}
+				// Remove without leaving a dangling reference at the
+				// tail of the underlying array. The removed slot's fn
+				// typically captures a *Coordinate; a plain
+				// `append(cbs[:i], cbs[i+1:]...)` would keep the old
+				// backing cell alive and prevent GC of the associated
+				// Coordinate until the engine itself is dropped.
+				last := len(e.leaderLossCbs) - 1
+				copy(e.leaderLossCbs[i:], e.leaderLossCbs[i+1:])
+				e.leaderLossCbs[last] = leaderLossSlot{}
+				e.leaderLossCbs = e.leaderLossCbs[:last]
+				return
+			}
+		})
+	}
+}
+
+// leaderLossSlot pairs a registered callback with an id-only sentinel
+// pointer so deregister can distinguish identical fn values.
+type leaderLossSlot struct {
+	id *struct{ fn func() }
+	fn func()
+}
+
+// fireLeaderLossCallbacks invokes all registered callbacks
+// synchronously. The registered-callback contract requires each fn
+// to be non-blocking (a lock-free lease-invalidate flag flip), so
+// inline execution is safe and avoids spawning an unbounded number
+// of goroutines per leader-loss event when many shards / coordinators
+// are registered.
+//
+// A panicking callback is still contained (see
+// invokeLeaderLossCallback) so a bug in one holder cannot break
+// subsequent callbacks or crash the process.
+func (e *Engine) fireLeaderLossCallbacks() {
+	e.leaderLossCbsMu.Lock()
+	cbs := make([]func(), len(e.leaderLossCbs))
+	for i, c := range e.leaderLossCbs {
+		cbs[i] = c.fn
+	}
+	e.leaderLossCbsMu.Unlock()
+	for _, fn := range cbs {
+		e.invokeLeaderLossCallback(fn)
+	}
+}
+
+func (e *Engine) invokeLeaderLossCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			// A buggy lease holder must not crash the node. Log the
+			// recovery so operators can see lease-invalidation hooks
+			// misbehaving in production; swallow the panic so the
+			// engine status loop / shutdown path continues.
+			//
+			// Note: if a callback panics before it invalidates its
+			// lease, fast-path reads on that lease keep succeeding
+			// until wall-clock expiry. Safety is then bounded by the
+			// lease duration (strictly shorter than electionTimeout),
+			// not by the slow-path re-verification. The slow path
+			// re-verifies leadership only once the lease has
+			// naturally expired.
+			slog.Error("etcd raft engine: leader-loss callback panicked",
+				slog.String("node_id", e.localID),
+				slog.Uint64("raft_node_id", e.nodeID),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {
@@ -1116,6 +1311,7 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 			snapshot.Metadata.Index, snapshot.Metadata.Term)
 	}
 	e.applied = snapshot.Metadata.Index
+	e.appliedIndex.Store(snapshot.Metadata.Index)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
 	return nil
 }
@@ -1186,7 +1382,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 		switch entry.Type {
 		case raftpb.EntryNormal:
 			response := e.applyNormalEntry(entry)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 			e.resolveProposal(entry.Index, entry.Data, response)
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
@@ -1199,7 +1395,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
 			if err := cc.Unmarshal(entry.Data); err != nil {
@@ -1211,12 +1407,21 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChangeV2(cc, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		default:
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		}
 	}
 	return nil
+}
+
+// setApplied advances both the run-loop-owned `applied` field and the
+// lock-free atomic mirror in a single place. Called exclusively from
+// the Raft run loop, so no synchronization between the two writes is
+// required beyond the single-writer invariant.
+func (e *Engine) setApplied(index uint64) {
+	e.applied = index
+	e.appliedIndex.Store(index)
 }
 
 func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
@@ -1610,6 +1815,11 @@ func (e *Engine) refreshStatus() {
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
+		// Notify lease holders so they invalidate any cached lease;
+		// without this hook, a former leader keeps serving fast-path
+		// reads from local state for up to LeaseDuration after a
+		// successor leader is already accepting writes.
+		e.fireLeaderLossCallbacks()
 	}
 }
 
@@ -1632,14 +1842,29 @@ func (e *Engine) requestShutdown() {
 
 func (e *Engine) shutdown() {
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(errors.WithStack(errClosed))
+	// LeaseProvider contract promises callbacks fire on shutdown too.
+	// refreshStatus only fires them on the leader -> non-leader edge,
+	// which can be missed when shutdown short-circuits the status loop.
+	// Always fire here so lease holders invalidate even on engine close
+	// initiated while still leader, on shutdown after fail(), or via
+	// Close() racing against the run loop.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) fail(err error) {
@@ -1672,6 +1897,7 @@ func (e *Engine) fail(err error) {
 		)
 	}
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	if err != nil {
 		e.runErr = err
 	}
@@ -1684,8 +1910,21 @@ func (e *Engine) fail(err error) {
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(e.currentErrorOrClosed())
+	// LeaseProvider contract: fire leader-loss callbacks on shutdown if
+	// we were leader. fail() is the error-shutdown twin of shutdown();
+	// without firing here, a run() -> fail() path that bypasses
+	// refreshStatus's Leader -> non-Leader edge leaves lease holders
+	// serving fast-path reads from stale state for up to LeaseDuration.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) failPending(err error) {
