@@ -347,4 +347,3 @@ func TestCoordinate_LeaseRead_ObserverSeparatesHitsFromMisses(t *testing.T) {
 	require.Equal(t, int32(5), obs.hits.Load())
 	require.Equal(t, int32(1), obs.misses.Load())
 }
-
