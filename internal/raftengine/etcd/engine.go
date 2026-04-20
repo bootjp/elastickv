@@ -573,10 +573,14 @@ func (e *Engine) AppliedIndex() uint64 {
 	return e.status.AppliedIndex
 }
 
-// RegisterLeaderLossCallback registers fn to fire on every transition
-// out of the leader role (including LeadTransferee != 0 hand-off,
-// CheckQuorum step-down, and shutdown). Used by lease-read callers to
-// invalidate cached lease state so the next read takes the slow path.
+// RegisterLeaderLossCallback registers fn to fire every time the local
+// node's Raft state transitions out of leader (CheckQuorum step-down,
+// graceful transfer completion, partition-induced demotion) and also
+// on shutdown() while the node was still leader. Callbacks are NOT
+// fired at the moment a transfer starts (LeadTransferee != 0); they
+// only fire once the transfer completes and state flips to follower.
+// Lease-read callers use this to invalidate cached lease state so the
+// next read takes the slow path.
 func (e *Engine) RegisterLeaderLossCallback(fn func()) {
 	if e == nil || fn == nil {
 		return
