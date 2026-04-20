@@ -81,8 +81,16 @@ type LeaseProvider interface {
 	// local node leaves the leader role (graceful transfer, partition
 	// step-down, or shutdown). Callers use this to invalidate any
 	// leader-local lease they hold so the next read takes the slow path.
-	// Multiple callbacks can be registered; each fires synchronously from
-	// the engine's status refresh and must not block.
+	// Multiple callbacks can be registered.
+	//
+	// Callbacks are fired on detached goroutines so a slow or buggy
+	// holder cannot stall the engine's main loop or shutdown path.
+	// Ordering between callbacks is unspecified; each callback's job
+	// should be a lock-free flag flip (e.g. atomic invalidate). Callers
+	// MUST NOT assume that by the time a subsequent read happens the
+	// callback has already run -- it may race with the transition that
+	// scheduled it. The lease's time-bound remains the ultimate safety
+	// net.
 	//
 	// The returned function deregisters this callback and is safe to
 	// call multiple times. Callers whose lifetime is shorter than the

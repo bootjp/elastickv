@@ -598,6 +598,15 @@ func (e *Engine) AppliedIndex() uint64 {
 // Lease-read callers use this to invalidate cached lease state so the
 // next read takes the slow path.
 //
+// Callbacks run on detached goroutines rather than inline from
+// refreshStatus / shutdown / fail, so a buggy callback cannot stall
+// the Raft main loop or the teardown path. A panic inside a callback
+// is contained and logged. Ordering between concurrent callbacks is
+// unspecified; each should be a fast, lock-free invalidation. Callers
+// MUST NOT assume a callback has already run by the time a subsequent
+// read or write sees the transition; the lease's time-bound remains
+// the ultimate safety net.
+//
 // The returned deregister function removes this specific registration
 // and is safe to call multiple times. Long-lived callers (coordinators
 // whose lifetime matches the engine's) may ignore it; shorter-lived

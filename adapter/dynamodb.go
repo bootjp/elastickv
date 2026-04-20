@@ -1398,7 +1398,28 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// the most recent confirmed commit.
 	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 
-	current, found, err := d.readLogicalItemAt(r.Context(), schema, in.Key, readTS)
+	// Re-verify the schema generation at readTS. If a table migration
+	// committed between the tentative schema load and the lease
+	// confirmation, the itemKey we lease-checked was computed against
+	// the OLD generation and may belong to a different shard than the
+	// one now holding the item. Rather than read stale data from the
+	// wrong shard, fail so the client retries with fresh schema.
+	finalSchema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
+	if err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+		return
+	}
+	if !exists {
+		writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+		return
+	}
+	if finalSchema.Generation != schema.Generation {
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal,
+			"table migrated during read; please retry")
+		return
+	}
+
+	current, found, err := d.readLogicalItemAt(r.Context(), finalSchema, in.Key, readTS)
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
 		return
