@@ -1242,7 +1242,7 @@ func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byt
 	if !exists {
 		return false, false, nil
 	}
-	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
 	if expErr != nil {
 		return false, false, cockerrors.WithStack(expErr)
 	}
@@ -1675,7 +1675,7 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 		}
 		return nil, false, false, cockerrors.WithStack(err)
 	}
-	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
 	if expErr != nil {
 		return nil, false, false, cockerrors.WithStack(expErr)
 	}
@@ -1938,7 +1938,7 @@ func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte
 	if !exists {
 		return false, false, nil
 	}
-	expired, expErr := r.hasExpiredTTLAt(ctx, key, readTS)
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
 	if expErr != nil {
 		return false, false, cockerrors.WithStack(expErr)
 	}
