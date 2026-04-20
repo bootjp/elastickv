@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -39,6 +40,57 @@ func WithHLC(hlc *HLC) CoordinatorOption {
 	return func(c *Coordinate) {
 		c.clock = hlc
 	}
+}
+
+// LeaseReadObserver records lease-read fast-path vs slow-path outcomes
+// without coupling kv to a concrete monitoring backend. It is called once
+// per LeaseRead invocation that actually evaluates the lease (the initial
+// type-assertion/LeaseDuration==0 short-circuits are NOT counted because
+// they indicate the engine does not participate in lease reads at all).
+//
+// Implementations MUST be safe for concurrent use and MUST NOT block; the
+// observer is invoked on the Redis GET hot path.
+type LeaseReadObserver interface {
+	// ObserveLeaseRead is called with hit=true when the lease fast path
+	// served the read from local AppliedIndex, or hit=false when the
+	// coordinator fell back to a full LinearizableRead (expired lease,
+	// engine reported non-leader, or leader-loss callback raced with
+	// the request).
+	ObserveLeaseRead(hit bool)
+}
+
+// WithLeaseReadObserver wires a LeaseReadObserver onto a Coordinate.
+// This is the mechanism monitoring uses to surface the lease-hit ratio
+// panel on the Redis hot-path dashboard (see
+// monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+//
+// Typed-nil guard: a caller passing a typed-nil pointer
+// (e.g. `var o *myObserver; WithLeaseReadObserver(o)`) produces an
+// interface value that is NOT equal to nil under the normal `!= nil`
+// check, yet invoking ObserveLeaseRead would panic. Normalise here
+// with reflect.Value.IsNil so the hot-path nil check in LeaseRead
+// stays a single branch on a real nil interface.
+func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
+	return func(c *Coordinate) {
+		c.leaseObserver = normalizeLeaseObserver(observer)
+	}
+}
+
+// normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
+// untyped nil interface so downstream `observer != nil` checks behave
+// as expected.
+func normalizeLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
+	if observer == nil {
+		return nil
+	}
+	v := reflect.ValueOf(observer)
+	switch v.Kind() { //nolint:exhaustive
+	case reflect.Ptr, reflect.Interface, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice:
+		if v.IsNil() {
+			return nil
+		}
+	}
+	return observer
 }
 
 func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {
@@ -114,6 +166,11 @@ type Coordinate struct {
 	// short-lived test coordinators sharing an engine MUST invoke
 	// Close() to release the callback slot.
 	deregisterLeaseCb func()
+	// leaseObserver records lease-read hit/miss outcomes for metrics
+	// (nil when no observer is attached; LeaseRead short-circuits the
+	// nil check so production does not pay an interface call when
+	// monitoring is disabled).
+	leaseObserver LeaseReadObserver
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -376,6 +433,7 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	now := time.Now()
 	state := c.engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		c.observeLeaseRead(true)
 		return lp.AppliedIndex(), nil
 	}
 	// Secondary: caller-side lease warmed by a previous successful
@@ -385,8 +443,10 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	// quorum heartbeat round has landed).
 	expectedGen := c.lease.generation()
 	if c.lease.valid(now) && state == raftengine.StateLeader {
+		c.observeLeaseRead(true)
 		return lp.AppliedIndex(), nil
 	}
+	c.observeLeaseRead(false)
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
 		if isLeadershipLossError(err) {
@@ -396,6 +456,16 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	}
 	c.lease.extend(now.Add(leaseDur), expectedGen)
 	return idx, nil
+}
+
+// observeLeaseRead forwards a hit / miss signal to the configured
+// LeaseReadObserver. Nil-safe so the LeaseRead hot path stays a
+// single branch on a real nil interface (typed-nil is normalised at
+// wiring time in WithLeaseReadObserver).
+func (c *Coordinate) observeLeaseRead(hit bool) {
+	if c.leaseObserver != nil {
+		c.leaseObserver.ObserveLeaseRead(hit)
+	}
 }
 
 // engineLeaseAckValid returns whether the engine-driven lease anchor

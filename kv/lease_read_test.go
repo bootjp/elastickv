@@ -399,3 +399,38 @@ func TestCoordinate_LeaseRead_AmortizesLinearizableRead(t *testing.T) {
 	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
 		"100 LeaseRead calls inside the lease window should trigger exactly 1 LinearizableRead")
 }
+
+// countingLeaseObserver records hits and misses for assertion purposes.
+type countingLeaseObserver struct {
+	hits   atomic.Int32
+	misses atomic.Int32
+}
+
+func (o *countingLeaseObserver) ObserveLeaseRead(hit bool) {
+	if hit {
+		o.hits.Add(1)
+		return
+	}
+	o.misses.Add(1)
+}
+
+func TestCoordinate_LeaseRead_ObserverSeparatesHitsFromMisses(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 77, leaseDur: time.Hour}
+	obs := &countingLeaseObserver{}
+	c := NewCoordinatorWithEngine(nil, eng, WithLeaseReadObserver(obs))
+
+	// First call: lease not yet extended → slow path, MISS.
+	_, err := c.LeaseRead(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int32(0), obs.hits.Load())
+	require.Equal(t, int32(1), obs.misses.Load())
+
+	// The slow path refreshed the lease; the next N calls must all be hits.
+	for i := 0; i < 5; i++ {
+		_, err := c.LeaseRead(context.Background())
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(5), obs.hits.Load())
+	require.Equal(t, int32(1), obs.misses.Load())
+}

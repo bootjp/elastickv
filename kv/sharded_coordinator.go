@@ -132,6 +132,20 @@ type ShardedCoordinator struct {
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
 	deregisterLeaseCbs []func()
+	// leaseObserver records lease-read hit/miss for every shard the
+	// coordinator owns. Nil-safe; see Coordinate.leaseObserver.
+	leaseObserver LeaseReadObserver
+}
+
+// WithLeaseReadObserver wires a LeaseReadObserver onto a
+// ShardedCoordinator. Applied after construction because the
+// NewShardedCoordinator signature is already heavily overloaded;
+// see Coordinate.WithLeaseReadObserver for the equivalent option on
+// the single-group coordinator, including the typed-nil guard
+// rationale.
+func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
+	c.leaseObserver = normalizeLeaseObserver(observer)
+	return c
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
@@ -727,7 +741,7 @@ func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return groupLeaseRead(ctx, g)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
 // LeaseReadForKey performs the lease check on the shard group that owns key.
@@ -738,10 +752,19 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return groupLeaseRead(ctx, g)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
-func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
+// observeLeaseRead forwards a hit / miss signal to observer when it
+// is non-nil. Kept as a package-level helper so both ShardedCoordinator
+// and any future sharded caller share one nil-safe entrypoint.
+func observeLeaseRead(observer LeaseReadObserver, hit bool) {
+	if observer != nil {
+		observer.ObserveLeaseRead(hit)
+	}
+}
+
+func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
 	lp, ok := engine.(raftengine.LeaseProvider)
 	if !ok {
@@ -757,12 +780,15 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	now := time.Now()
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		observeLeaseRead(observer, true)
 		return lp.AppliedIndex(), nil
 	}
 	expectedGen := g.lease.generation()
 	if g.lease.valid(now) && state == raftengine.StateLeader {
+		observeLeaseRead(observer, true)
 		return lp.AppliedIndex(), nil
 	}
+	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
 		if isLeadershipLossError(err) {
