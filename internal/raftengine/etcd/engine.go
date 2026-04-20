@@ -42,9 +42,16 @@ const (
 	// Under production congestion we observed the 256-slot inbound
 	// stepCh on followers filling up while their event loop was held
 	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
-	// #565 removed most of that CPU); 1024 is a 4× safety margin that
-	// still keeps worst-case memory under a few MB per engine at the
-	// current defaultMaxSizePerMsg of 1 MiB.
+	// #565 removed most of that CPU); 1024 is a 4× safety margin.
+	//
+	// Memory note: worst-case steady-state bound is O(numPeers ×
+	// MaxInflightMsg × msgSize). With the current defaultMaxSizePerMsg
+	// of 1 MiB, the absolute worst case is ~1 GiB per peer (1024 full
+	// MsgApp slots simultaneously), but that requires every slot to
+	// be a max-sized batch -- typical MsgApp payloads are
+	// kilobytes-scale, so expected steady-state memory is orders of
+	// magnitude lower. Deployments bottlenecked on memory should lower
+	// MaxInflightMsg via OpenConfig.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
@@ -60,7 +67,8 @@ const (
 	// slower than heartbeat tick issuance. Heartbeats are tiny
 	// (< ~100 B), so 512 × numPeers is ≪ 1 MB total memory; the
 	// upside is that a ~5 s transient pause (election-timeout scale)
-	// no longer drops heartbeats and force the peers' lease to expire.
+	// no longer drops heartbeats and forces the peers' lease to
+	// expire.
 	defaultHeartbeatBufPerPeer = 512
 	defaultSnapshotEvery       = 10_000
 	defaultSnapshotQueueSize   = 1
@@ -1301,7 +1309,8 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 // MsgAppResp is intentionally excluded: it is sent by followers, which never
 // send MsgApp, so it faces no head-of-line blocking in the normal channel.
 // Keeping it out of the priority queue preserves the low-frequency invariant
-// that justifies defaultHeartbeatBufPerPeer = 64.
+// that lets defaultHeartbeatBufPerPeer stay small relative to the normal
+// channel's MaxInflightMsg capacity.
 func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
 		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
