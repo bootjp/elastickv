@@ -2480,17 +2480,19 @@ func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEn
 }
 
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
+	if len(args) < 2 { //nolint:mnd
+		return luaReply{}, errors.New("ERR wrong number of arguments for 'zscore' command")
+	}
 	key := []byte(args[0])
 	member := args[1]
-	// In-script cache first: a prior ZADD / ZINCRBY / ZREM in this
-	// Eval already loaded the zset into c.zsets and may carry
-	// unflushed score mutations the fast path would miss. Matches the
-	// HGET / HEXISTS / SISMEMBER pattern added in PR #567.
-	if st, ok := c.zsets[string(key)]; ok {
-		return c.zscoreFromZSetState(st, key, member)
+	// See cmdHGet: defer to the slow path whenever cachedType has an
+	// authoritative answer (loaded zset from a prior ZADD / ZREM in
+	// this Eval, explicit DEL tombstone, or a different type from a
+	// prior SET on the same key). Only "unknown" cachedType proceeds
+	// to the pebble fast-path.
+	if _, cached := c.cachedType(key); cached {
+		return zscoreFromSlowPath(c, key, member)
 	}
-	// Fast path: direct wide-column score lookup, bypassing the
-	// ~8-seek keyTypeAt probe inside zsetState.
 	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
 	if err != nil {
 		return luaReply{}, err
@@ -2501,8 +2503,14 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		}
 		return luaStringReply(formatRedisFloat(score)), nil
 	}
-	// Miss: fall back to the full zsetState path so legacy-blob zsets
-	// and nil / WRONGTYPE disambiguation behave exactly as before.
+	return zscoreFromSlowPath(c, key, member)
+}
+
+// zscoreFromSlowPath runs the legacy zsetState-based ZSCORE,
+// preserving the script-local cache and WRONGTYPE / nil behaviour
+// unchanged. Handles legacy-blob zsets via ensureZSetLoaded inside
+// memberScore.
+func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
