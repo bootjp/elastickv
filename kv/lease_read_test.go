@@ -65,6 +65,15 @@ func (e *fakeLeaseEngine) Close() error                 { return nil }
 func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
 func (e *fakeLeaseEngine) LastQuorumAck() time.Time {
+	// Honor the raftengine.LeaseProvider contract that non-leaders
+	// return the zero time, mirroring the production etcd engine. A
+	// test that sets a fresh ack and a non-leader state MUST still
+	// see the slow path taken; a divergent fake would hide regressions
+	// where production code stops gating on engine.State() before
+	// consulting LastQuorumAck.
+	if e.State() != raftengine.StateLeader {
+		return time.Time{}
+	}
 	ns := e.lastQuorumAckUnixNano.Load()
 	if ns == 0 {
 		return time.Time{}

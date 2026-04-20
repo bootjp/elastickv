@@ -1318,10 +1318,25 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if clusterSize <= 1 {
 		return
 	}
-	// Followers needed for majority = floor(clusterSize / 2): 1 for a
-	// 3-node cluster, 2 for 5-node, matching raft quorum semantics.
-	followerQuorum := clusterSize / 2 //nolint:mnd
-	e.ackTracker.recordAck(msg.From, followerQuorum)
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+}
+
+// followerQuorumForClusterSize returns the number of non-self peer
+// acks required to form a Raft majority for a cluster of the given
+// size. Centralising the formula keeps ackTracker callers (handleStep
+// and removePeer) consistent and avoids scattered //nolint:mnd
+// suppressions. clusterSize is the total voter count INCLUDING self;
+// the result is floor((clusterSize - 1) / 2) + 1 − 1 = clusterSize / 2
+// for odd sizes (3 → 1, 5 → 2, 7 → 3) and clusterSize / 2 for even
+// sizes (4 → 2, 6 → 3) where a strict majority still requires
+// (N/2)+1 voters total, i.e. (N/2) followers beyond self.
+func followerQuorumForClusterSize(clusterSize int) int {
+	if clusterSize <= 1 {
+		return 0
+	}
+	// The Raft majority for a cluster of size N is floor(N/2)+1 voters
+	// INCLUDING self, which means the leader needs N/2 OTHER acks.
+	return clusterSize / 2 //nolint:mnd
 }
 
 // isFollowerResponse reports whether a Raft message type represents a
@@ -2831,7 +2846,7 @@ func (e *Engine) removePeer(nodeID uint64) {
 	if postRemovalClusterSize <= 1 {
 		e.ackTracker.reset()
 	} else {
-		e.ackTracker.removePeer(nodeID, postRemovalClusterSize/2) //nolint:mnd
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
 	}
 
 	if e.transport != nil {
