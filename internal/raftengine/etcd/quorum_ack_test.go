@@ -61,6 +61,43 @@ func TestQuorumAckTracker_QuorumAckIsOldestOfTopN(t *testing.T) {
 	require.False(t, third.Before(second), "quorum instant must not regress")
 }
 
+// TestQuorumAckTracker_RemovedPeerCannotSatisfyQuorum exercises the
+// safety invariant: a peer that leaves the cluster must have its
+// recorded ack pruned, otherwise a shrink-then-grow that ends with
+// fresh peers who have not yet acked could let the removed peer's
+// pre-removal ack falsely satisfy the new cluster's majority.
+func TestQuorumAckTracker_RemovedPeerCannotSatisfyQuorum(t *testing.T) {
+	t.Parallel()
+	var tr quorumAckTracker
+	// 5-node cluster, followerQuorum = 2. Peers 2 and 3 ack.
+	tr.recordAck(2, 2)
+	tr.recordAck(3, 2)
+	require.False(t, tr.load().IsZero(), "baseline: 5-node quorum satisfied")
+
+	// Cluster shrinks to 3 (followerQuorum = 1). After removing both
+	// acked peers we have zero recorded entries -- not enough to
+	// satisfy even the smaller quorum.
+	tr.removePeer(2, 1)
+	tr.removePeer(3, 1)
+	require.Equal(t, time.Time{}, tr.load(),
+		"after removing every acked peer the quorum instant must clear")
+}
+
+func TestQuorumAckTracker_RemovePeerZeroQuorumKeepsCurrent(t *testing.T) {
+	t.Parallel()
+	var tr quorumAckTracker
+	tr.recordAck(2, 1)
+	before := tr.load()
+	require.False(t, before.IsZero())
+
+	// followerQuorum = 0 means the caller doesn't have the post-
+	// removal size yet. Entry is dropped but the published instant is
+	// retained; the next recordAck will refresh it.
+	tr.removePeer(2, 0)
+	require.Equal(t, before, tr.load(),
+		"removePeer with followerQuorum=0 must not clobber the current instant")
+}
+
 func TestQuorumAckTracker_ResetClearsState(t *testing.T) {
 	t.Parallel()
 	var tr quorumAckTracker

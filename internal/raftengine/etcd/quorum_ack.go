@@ -18,27 +18,15 @@ import (
 // amortise reads whose own latency exceeded LeaseDuration (the bug
 // that kept production GET at ~1 s under step-queue congestion).
 //
-// Correctness anchor: we record time.Now() when the leader OBSERVES
-// a follower response, not the follower's local ack time. That makes
-// our recorded instant an UPPER bound on the follower's true
-// last-contact, which is the conservative direction for lease
-// safety: lease = recorded_instant + lease_duration can only be
-// LATER than follower_last_contact + lease_duration, and
-// follower_last_contact + electionTimeout is the earliest time the
-// follower would vote for a new leader, so lease_duration <
-// electionTimeout - safety keeps the lease strictly inside the
-// no-new-leader window.
-//
-// Wait -- that's unsafe. A later observation means a LARGER recorded
-// instant, which makes lease_expiry later. We actually need a LOWER
-// bound on follower_last_contact to bound lease_expiry conservatively.
-// Because network/scheduling delay makes leader_observation >=
-// follower_ack_sent_time, using leader_observation is an OVERestimate
-// of follower_ack_sent_time, which in turn is an overestimate of
-// follower_ack_received_time. That means lease extends slightly past
-// the strictly-safe boundary by at most the one-way delay + scheduling
-// slop -- which is exactly what leaseSafetyMargin is sized to cover.
-// See docs/lease_read_design.md for the full argument.
+// Safety: we record time.Now() when the leader OBSERVES the follower
+// response, which is an UPPER bound on the follower's true ack time.
+// Because lease = recorded_instant + lease_duration, that upper bound
+// makes the lease extend slightly past the strictly-safe
+// follower_ack_time + electionTimeout boundary by at most the one-way
+// network delay plus scheduling slop. leaseSafetyMargin is sized to
+// cover that overshoot, so leaseDuration = electionTimeout -
+// leaseSafetyMargin keeps the lease strictly inside the no-new-leader
+// window. See docs/lease_read_design.md for the full argument.
 type quorumAckTracker struct {
 	mu       sync.Mutex
 	peerAcks map[uint64]int64 // peer ID → last ack unix nano observed on leader
@@ -66,8 +54,39 @@ func (t *quorumAckTracker) recordAck(peerID uint64, followerQuorum int) {
 		t.peerAcks = make(map[uint64]int64)
 	}
 	t.peerAcks[peerID] = now
+	t.recomputeLocked(followerQuorum)
+}
+
+// removePeer drops peerID's recorded ack. Call when a peer leaves the
+// cluster so its pre-removal ack time can no longer satisfy the
+// majority threshold after a configuration change: a shrink-then-grow
+// that ends with fresh peers who have not yet acked would otherwise
+// let the removed peer's last ack falsely advance the quorum instant,
+// which is a lease-safety violation.
+//
+// followerQuorum is the POST-removal follower quorum so the published
+// instant is recomputed against the current cluster. Passing 0 keeps
+// the current instant; the next recordAck will refresh it.
+func (t *quorumAckTracker) removePeer(peerID uint64, followerQuorum int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.peerAcks[peerID]; !ok {
+		return
+	}
+	delete(t.peerAcks, peerID)
+	if followerQuorum <= 0 {
+		return
+	}
+	t.recomputeLocked(followerQuorum)
+}
+
+// recomputeLocked publishes the followerQuorum-th most recent ack as
+// the quorum instant, or clears it if we lack that many recorded
+// peers. Caller must hold t.mu.
+func (t *quorumAckTracker) recomputeLocked(followerQuorum int) {
 	if len(t.peerAcks) < followerQuorum {
-		// Not enough peers have reported yet to form a majority.
+		// Not enough peers have reported to form a majority yet.
+		t.quorumAckUnixNano.Store(0)
 		return
 	}
 	acks := make([]int64, 0, len(t.peerAcks))
@@ -75,8 +94,8 @@ func (t *quorumAckTracker) recordAck(peerID uint64, followerQuorum int) {
 		acks = append(acks, a)
 	}
 	// Sort descending so acks[0] is the most recent. The followerQuorum-th
-	// entry (1-indexed) is the oldest ack among the top quorum -- i.e. the
-	// boundary instant by which majority liveness was confirmed.
+	// entry (1-indexed) is the oldest ack among the top quorum -- i.e.
+	// the boundary instant by which majority liveness was confirmed.
 	sort.Slice(acks, func(i, j int) bool { return acks[i] > acks[j] })
 	t.quorumAckUnixNano.Store(acks[followerQuorum-1])
 }

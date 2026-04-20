@@ -27,7 +27,6 @@ type fakeLeaseEngine struct {
 	registerLeaderLossCalled atomic.Int32
 }
 
-
 // fakeLeaseEngineCb pairs a callback with a unique sentinel pointer so
 // deregister can target THIS specific registration even when callbacks
 // are removed out of order, matching the production etcd engine.
@@ -146,7 +145,77 @@ func (e *nonLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalR
 }
 func (e *nonLeaseEngine) Close() error { return nil }
 
+// setQuorumAck is a test helper that drives the engine-driven lease
+// anchor on the fake engine so tests can exercise the new PRIMARY
+// fast path (LastQuorumAck + State==Leader) independently of the
+// caller-side lease state.
+func (e *fakeLeaseEngine) setQuorumAck(t time.Time) {
+	if t.IsZero() {
+		e.lastQuorumAckUnixNano.Store(0)
+		return
+	}
+	e.lastQuorumAckUnixNano.Store(t.UnixNano())
+}
+
 // --- Coordinate.LeaseRead -----------------------------------------------
+
+// TestCoordinate_LeaseRead_EngineAckFastPath covers the engine-driven
+// primary path introduced in feat/engine-driven-lease: a fresh
+// LastQuorumAck alone (cold caller-side lease, no prior
+// LinearizableRead) must satisfy LeaseRead without consulting the
+// engine's slow-path read API.
+func TestCoordinate_LeaseRead_EngineAckFastPath(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 123, leaseDur: time.Hour}
+	eng.setQuorumAck(time.Now())
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	require.False(t, c.lease.valid(time.Now()),
+		"caller-side lease must start cold so the fast-path hit is attributable to the engine ack")
+
+	idx, err := c.LeaseRead(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(123), idx)
+	require.Equal(t, int32(0), eng.linearizableCalls.Load(),
+		"engine-driven ack alone must skip LinearizableRead")
+	require.False(t, c.lease.valid(time.Now()),
+		"engine-driven fast path must not warm the caller-side lease")
+}
+
+// TestCoordinate_LeaseRead_EngineAckStaleFallsThrough covers the
+// stale-ack case: if the engine's ack has aged past LeaseDuration we
+// must NOT serve from AppliedIndex alone, and instead take the slow
+// path through LinearizableRead.
+func TestCoordinate_LeaseRead_EngineAckStaleFallsThrough(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 7, leaseDur: 50 * time.Millisecond}
+	// Set the ack far enough in the past that time.Since(ack) > leaseDur.
+	eng.setQuorumAck(time.Now().Add(-time.Hour))
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	_, err := c.LeaseRead(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"stale engine ack must fall through to LinearizableRead")
+}
+
+// TestCoordinate_LeaseRead_EngineAckIgnoredWhenNotLeader covers the
+// engine-state guard: even with a fresh ack, if the engine reports a
+// non-leader role the fast path must NOT fire -- the ack could be
+// inherited state from a just-lost leader term.
+func TestCoordinate_LeaseRead_EngineAckIgnoredWhenNotLeader(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("not leader")
+	eng := &fakeLeaseEngine{applied: 7, leaseDur: time.Hour, linearizableErr: sentinel}
+	eng.setQuorumAck(time.Now())
+	eng.state.Store(raftengine.StateFollower)
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	_, err := c.LeaseRead(context.Background())
+	require.ErrorIs(t, err, sentinel)
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"non-leader state must bypass the engine ack fast path")
+}
 
 func TestCoordinate_LeaseRead_FastPathSkipsEngine(t *testing.T) {
 	t.Parallel()

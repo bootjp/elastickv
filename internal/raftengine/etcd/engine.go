@@ -187,6 +187,13 @@ type Engine struct {
 	// and updated inside the single event-loop goroutine from
 	// handleStep when a follower response arrives.
 	ackTracker quorumAckTracker
+	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// single-node leader path: self IS the quorum, so there are no
+	// follower responses to observe. refreshStatus keeps this value
+	// current (set to time.Now().UnixNano() each tick while leader and
+	// cluster size is 1; cleared otherwise) so the lease-read hot path
+	// never has to acquire e.mu to check peer count or leader state.
+	singleNodeLeaderAckUnixNano atomic.Int64
 
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
@@ -614,31 +621,18 @@ func (e *Engine) AppliedIndex() uint64 {
 // LastQuorumAck returns the wall-clock instant by which a majority of
 // followers most recently responded to the leader, or the zero time
 // when no such observation exists (follower / candidate / startup).
-// Single-node clusters short-circuit to time.Now() while this node is
-// leader because self is the quorum.
 //
-// Lock-free: reads the atomic.Int64 published by recordQuorumAck
-// inside the event-loop goroutine. See raftengine.LeaseProvider for
-// the lease-read correctness contract.
+// Lock-free: reads atomic.Int64 values published by recordQuorumAck
+// (multi-node cluster) or refreshStatus (single-node cluster keeps
+// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
+// the hot lease-read path performs zero lock work). See
+// raftengine.LeaseProvider for the lease-read correctness contract.
 func (e *Engine) LastQuorumAck() time.Time {
 	if e == nil {
 		return time.Time{}
 	}
-	// Fast answer for single-node clusters: we're always our own
-	// quorum while we're leader. Peeking at e.peers from outside the
-	// event loop is safe for the small-cluster check because peer
-	// membership is only updated during config changes and reading a
-	// momentarily stale size at most defers switching to the
-	// majority-ack pathway until the next LeaseRead.
-	e.mu.RLock()
-	clusterSize := len(e.peers)
-	state := e.status.State
-	e.mu.RUnlock()
-	if clusterSize <= 1 {
-		if state == raftengine.StateLeader {
-			return time.Now()
-		}
-		return time.Time{}
+	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
+		return time.Unix(0, ns)
 	}
 	return e.ackTracker.load()
 }
@@ -1906,7 +1900,18 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
+	clusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Keep the lock-free single-node fast path in sync with the current
+	// role: populate while leader of a 1-node cluster, clear otherwise
+	// (including on leader loss, so LastQuorumAck transitions to the
+	// multi-node tracker or zero time atomically).
+	if status.State == raftengine.StateLeader && clusterSize <= 1 {
+		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+	} else {
+		e.singleNodeLeaderAckUnixNano.Store(0)
+	}
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
@@ -2774,7 +2779,17 @@ func (e *Engine) removePeer(nodeID uint64) {
 		delete(e.peers, nodeID)
 	}
 	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
+	postRemovalClusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Drop the peer's recorded ack so a reconfiguration cannot leave a
+	// stale entry that falsely satisfies the new cluster's majority.
+	// followerQuorum is computed against the POST-removal cluster.
+	followerQuorum := 0
+	if postRemovalClusterSize > 1 {
+		followerQuorum = postRemovalClusterSize / 2 //nolint:mnd
+	}
+	e.ackTracker.removePeer(nodeID, followerQuorum)
 
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)
