@@ -749,28 +749,23 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	}
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		// Lease disabled by tick configuration. Always take the slow
-		// path without mutating g.lease.
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Single time.Now() and generation sample before any quorum work,
-	// mirroring Coordinate.LeaseRead. expectedGen guards against a
-	// leader-loss invalidation that fires during LinearizableRead.
+	// Engine-driven lease anchor -- see Coordinate.LeaseRead for why
+	// this is the primary check.
+	state := engine.State()
+	if state == raftengine.StateLeader {
+		if ack := lp.LastQuorumAck(); !ack.IsZero() && time.Since(ack) < leaseDur {
+			return lp.AppliedIndex(), nil
+		}
+	}
 	now := time.Now()
 	expectedGen := g.lease.generation()
-	// Defense-in-depth: also check the shard engine's current state.
-	// Async callbacks may not have flipped the lease yet, but
-	// State() is refreshed every tick and catches transitions
-	// sooner. See Coordinate.LeaseRead for details.
-	if g.lease.valid(now) && engine.State() == raftengine.StateLeader {
+	if g.lease.valid(now) && state == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil
 	}
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		// See Coordinate.LeaseRead: only real leadership-loss signals
-		// invalidate the lease. Deadlines, transport blips, and other
-		// transient errors must NOT force the remainder of the lease
-		// window onto the slow path.
 		if isLeadershipLossError(err) {
 			g.lease.invalidate()
 		}

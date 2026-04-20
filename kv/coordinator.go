@@ -340,12 +340,23 @@ func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint
 }
 
 // LeaseRead returns a read fence backed by a leader-local lease when
-// available, falling back to a full LinearizableRead when the lease has
-// expired or the underlying engine does not implement LeaseProvider.
+// available, falling back to a full LinearizableRead when the engine
+// has not observed a fresh majority ack or does not implement
+// LeaseProvider.
 //
-// The returned index is the engine's current applied index (fast path) or
-// the index returned by LinearizableRead (slow path). Callers that resolve
-// timestamps via store.LastCommitTS may discard the value.
+// The lease is maintained inside the engine from ongoing
+// MsgAppResp / MsgHeartbeatResp traffic, so callers do not sample
+// time.Now() before the slow path to "extend" a lease afterwards.
+// That earlier pre-read sampling was racy under congestion: if a
+// LinearizableRead took longer than LeaseDuration, the extension
+// would land already expired and the lease never warmed up. The
+// engine-driven anchor is refreshed every heartbeat independent of
+// read latency.
+//
+// The returned index is the engine's current applied index (fast
+// path) or the index returned by LinearizableRead (slow path).
+// Callers that resolve timestamps via store.LastCommitTS may discard
+// the value.
 func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	lp, ok := c.engine.(raftengine.LeaseProvider)
 	if !ok {
@@ -353,38 +364,33 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	}
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		// Misconfigured tick settings (Engine.Open warned about this):
-		// the lease can never be valid. Fall back without touching
-		// lease state so we do not waste extend/invalidate work.
+		// Misconfigured tick settings: lease is disabled.
 		return c.LinearizableRead(ctx)
 	}
-	// Capture time.Now() and the lease generation exactly once before
-	// any quorum work. `now` is reused for both the fast-path validity
-	// check and (on slow path) the extend base; `expectedGen` guards
-	// against a leader-loss invalidation that fires during
-	// LinearizableRead from being overwritten by this caller's extend.
-	// See Coordinate.Dispatch for the same rationale.
+	// Primary: engine-driven lease. The engine refreshes LastQuorumAck
+	// on every MsgHeartbeatResp / MsgAppResp it receives while leader,
+	// so a read that itself takes longer than LeaseDuration does not
+	// prevent the window from being kept warm -- which is exactly the
+	// production congestion pathology the pre-engine-driven lease
+	// could not amortise out of.
+	state := c.engine.State()
+	if state == raftengine.StateLeader {
+		if ack := lp.LastQuorumAck(); !ack.IsZero() && time.Since(ack) < leaseDur {
+			return lp.AppliedIndex(), nil
+		}
+	}
+	// Secondary: caller-side lease warmed by a previous successful
+	// slow-path read. Preserved so tests can prime the lease directly
+	// and so we still benefit on paths where LastQuorumAck is not yet
+	// populated (e.g. very first read after startup before the first
+	// quorum heartbeat round has landed).
 	now := time.Now()
 	expectedGen := c.lease.generation()
-	// Defense-in-depth against the narrow race between an engine
-	// state transition out of leader and the async leader-loss
-	// callback flipping the lease: check the engine's current view
-	// too. State() is updated every Raft tick (~10 ms), which is
-	// tighter than the lease's time-bound. If the engine already
-	// knows it's not leader, force the slow path (which will fail
-	// fast via LinearizableRead and invalidate the lease).
-	if c.lease.valid(now) && c.engine.State() == raftengine.StateLeader {
+	if c.lease.valid(now) && state == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil
 	}
 	idx, err := c.LinearizableRead(ctx)
 	if err != nil {
-		// Only invalidate on real leadership-loss signals. A context
-		// deadline or transient transport error is NOT leadership loss;
-		// forcing invalidation for those would push every subsequent
-		// read onto the slow path for the remainder of the lease
-		// window, mirroring the production regression the write-path
-		// guard fixed. RegisterLeaderLossCallback plus the
-		// State()==StateLeader fast-path check cover real transitions.
 		if isLeadershipLossError(err) {
 			c.lease.invalidate()
 		}

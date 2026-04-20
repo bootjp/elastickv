@@ -181,6 +181,13 @@ type Engine struct {
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
 
+	// ackTracker records per-peer last-response times on the leader and
+	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// read lock-free from LastQuorumAck() on the hot lease-read path
+	// and updated inside the single event-loop goroutine from
+	// handleStep when a follower response arrives.
+	ackTracker quorumAckTracker
+
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
 	// step-down, shutdown). Callbacks fire synchronously from the
@@ -602,6 +609,38 @@ func (e *Engine) AppliedIndex() uint64 {
 		return 0
 	}
 	return e.appliedIndex.Load()
+}
+
+// LastQuorumAck returns the wall-clock instant by which a majority of
+// followers most recently responded to the leader, or the zero time
+// when no such observation exists (follower / candidate / startup).
+// Single-node clusters short-circuit to time.Now() while this node is
+// leader because self is the quorum.
+//
+// Lock-free: reads the atomic.Int64 published by recordQuorumAck
+// inside the event-loop goroutine. See raftengine.LeaseProvider for
+// the lease-read correctness contract.
+func (e *Engine) LastQuorumAck() time.Time {
+	if e == nil {
+		return time.Time{}
+	}
+	// Fast answer for single-node clusters: we're always our own
+	// quorum while we're leader. Peeking at e.peers from outside the
+	// event loop is safe for the small-cluster check because peer
+	// membership is only updated during config changes and reading a
+	// momentarily stale size at most defers switching to the
+	// majority-ack pathway until the next LeaseRead.
+	e.mu.RLock()
+	clusterSize := len(e.peers)
+	state := e.status.State
+	e.mu.RUnlock()
+	if clusterSize <= 1 {
+		if state == raftengine.StateLeader {
+			return time.Now()
+		}
+		return time.Time{}
+	}
+	return e.ackTracker.load()
 }
 
 // RegisterLeaderLossCallback registers fn to fire every time the local
@@ -1222,12 +1261,51 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		return
 	}
 	e.recordLeaderContact(msg)
+	e.recordQuorumAck(msg)
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			return
 		}
 		e.fail(errors.WithStack(err))
 	}
+}
+
+// recordQuorumAck updates the per-peer last-response time when msg is
+// a follower -> leader response, so LastQuorumAck() reflects ongoing
+// majority liveness without requiring a fresh ReadIndex.
+//
+// Called inside the event-loop goroutine (single writer to e.peers
+// and to the raft state), so the len(e.peers) read and the
+// leader-state check are race-free. We intentionally do not gate the
+// observation itself on BasicStatus() -- a MsgAppResp / MsgHeartbeatResp
+// only ever lands at a leader via the transport layer, and refreshing
+// the per-peer map from follower/candidate state would just be dead
+// data later cleared by reset() on role transition.
+func (e *Engine) recordQuorumAck(msg raftpb.Message) {
+	if !isFollowerResponse(msg.Type) {
+		return
+	}
+	if msg.From == 0 || msg.From == e.nodeID {
+		return
+	}
+	clusterSize := len(e.peers)
+	if clusterSize <= 1 {
+		return
+	}
+	// Followers needed for majority = floor(clusterSize / 2): 1 for a
+	// 3-node cluster, 2 for 5-node, matching raft quorum semantics.
+	followerQuorum := clusterSize / 2 //nolint:mnd
+	e.ackTracker.recordAck(msg.From, followerQuorum)
+}
+
+// isFollowerResponse reports whether a Raft message type represents a
+// follower acknowledging the leader. We use only the two response
+// types that ALL committed replication traffic passes through:
+// MsgAppResp (log append ack) and MsgHeartbeatResp (passive heartbeat
+// ack). Either one is proof that the peer's election timer has been
+// reset, which is what the lease relies on.
+func isFollowerResponse(t raftpb.MessageType) bool {
+	return t == raftpb.MsgAppResp || t == raftpb.MsgHeartbeatResp
 }
 
 func (e *Engine) sendMessages(messages []raftpb.Message) error {
@@ -1835,6 +1913,10 @@ func (e *Engine) refreshStatus() {
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
+		// Drop the per-peer ack map so a future re-election cannot
+		// surface a stale majority-ack instant before the new term's
+		// heartbeats have actually confirmed liveness.
+		e.ackTracker.reset()
 		// Notify lease holders so they invalidate any cached lease;
 		// without this hook, a former leader keeps serving fast-path
 		// reads from local state for up to LeaseDuration after a

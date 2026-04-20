@@ -21,10 +21,12 @@ type fakeLeaseEngine struct {
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
 	state                    atomic.Value // stores raftengine.State; default Leader
+	lastQuorumAckUnixNano    atomic.Int64 // 0 = no ack yet. Updated by ackNow().
 	leaderLossCallbacksMu    sync.Mutex
 	leaderLossCallbacks      []fakeLeaseEngineCb
 	registerLeaderLossCalled atomic.Int32
 }
+
 
 // fakeLeaseEngineCb pairs a callback with a unique sentinel pointer so
 // deregister can target THIS specific registration even when callbacks
@@ -63,6 +65,13 @@ func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.Proposal
 func (e *fakeLeaseEngine) Close() error                 { return nil }
 func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
+func (e *fakeLeaseEngine) LastQuorumAck() time.Time {
+	ns := e.lastQuorumAckUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
 func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 	e.registerLeaderLossCalled.Add(1)
 	// Unique sentinel per registration so deregister can target THIS

@@ -94,6 +94,24 @@ type LeaseProvider interface {
 	LeaseDuration() time.Duration
 	// AppliedIndex returns the highest log index applied to the local FSM.
 	AppliedIndex() uint64
+	// LastQuorumAck returns the instant at which the engine most recently
+	// observed majority liveness on the leader -- i.e. the wall-clock time
+	// by which a quorum of follower Progress entries had responded. The
+	// engine maintains this in the background from MsgHeartbeatResp /
+	// MsgAppResp traffic on the leader, so a fast-path lease read does
+	// not need to issue its own ReadIndex to "warm" the lease.
+	//
+	// Safety: callers must verify the lease with
+	//   time.Since(LastQuorumAck()) < LeaseDuration() &&
+	//   engine.State() == raftengine.StateLeader
+	// before serving a leader-local read. The LeaseDuration is bounded
+	// by electionTimeout - safety_margin, which guarantees that any new
+	// leader candidate cannot yet accept writes during that window.
+	//
+	// Returns the zero time when no quorum has been confirmed yet, or
+	// when the local node is not the leader. Single-node clusters
+	// report time.Now() unconditionally since self is the quorum.
+	LastQuorumAck() time.Time
 	// RegisterLeaderLossCallback registers fn to be invoked whenever the
 	// local node leaves the leader role (graceful transfer, partition
 	// step-down, or shutdown). Callers use this to invalidate any
