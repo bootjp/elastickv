@@ -1,9 +1,42 @@
 package kv
 
 import (
+	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
+
+// isLeadershipLossError reports whether err signals that this node has
+// lost leadership and a successor should be contacted. Propose/Commit
+// errors that are NOT leadership-related (write conflict, validation,
+// deadline on a non-ReadIndex path) must NOT trigger lease
+// invalidation -- doing so forces every subsequent read into the slow
+// LinearizableRead path and defeats the lease's purpose.
+//
+// The underlying engines surface leadership loss via distinct
+// sentinel errors; we recognize the hashicorp variant directly and
+// match the etcd engine's "not leader" string via errors.Is /
+// substring match so a future rename in etcd/raft does not silently
+// reintroduce the over-invalidation bug.
+func isLeadershipLossError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) ||
+		errors.Is(err, raft.ErrLeadershipTransferInProgress) {
+		return true
+	}
+	msg := err.Error()
+	// etcd engine errors (cockroachdb/errors wraps them, so Is may
+	// not traverse reliably across package boundaries; fall back to
+	// substring match against the sentinel messages).
+	return strings.Contains(msg, "not leader") ||
+		strings.Contains(msg, "leadership transfer") ||
+		strings.Contains(msg, "leadership lost")
+}
 
 // leaseState tracks the wall-clock expiry of a leader-local read lease.
 // All operations are lock-free via atomic.Pointer plus a generation
