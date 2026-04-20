@@ -1383,11 +1383,14 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	}
 	// Lease-check the shard that actually owns the ITEM key with a
 	// bounded timeout so a stalled Raft cannot hang this handler
-	// indefinitely if the client never cancels.
+	// indefinitely if the client never cancels. Use defer so the
+	// cancel runs even if LeaseReadForKey panics or a future
+	// refactor inserts an early return; the cost of keeping ctx
+	// alive until handler exit is negligible because the next
+	// in-handler calls are local store reads.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
-	_, err := d.coordinator.LeaseReadForKey(leaseCtx, itemKey)
-	leaseCancel()
-	if err != nil {
+	defer leaseCancel()
+	if _, err := d.coordinator.LeaseReadForKey(leaseCtx, itemKey); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
 	}
