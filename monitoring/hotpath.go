@@ -16,8 +16,8 @@ import (
 // string-dominated workload while GET p99 stays flat or improves, and
 // the lease-hit ratio approaches 1.0 once leases are steady.
 //
-// Names follow the existing elastickv_* prefix convention. All
-// counters are monotonic; gauges are set directly.
+// Names follow the existing elastickv_* prefix convention. The
+// metrics defined in this file are all monotonic counters.
 
 const (
 	leaseReadOutcomeHit  = "hit"

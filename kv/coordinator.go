@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -62,10 +63,34 @@ type LeaseReadObserver interface {
 // This is the mechanism monitoring uses to surface the lease-hit ratio
 // panel on the Redis hot-path dashboard (see
 // monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+//
+// Typed-nil guard: a caller passing a typed-nil pointer
+// (e.g. `var o *myObserver; WithLeaseReadObserver(o)`) produces an
+// interface value that is NOT equal to nil under the normal `!= nil`
+// check, yet invoking ObserveLeaseRead would panic. Normalise here
+// with reflect.Value.IsNil so the hot-path nil check in LeaseRead
+// stays a single branch on a real nil interface.
 func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
 	return func(c *Coordinate) {
-		c.leaseObserver = observer
+		c.leaseObserver = normaliseLeaseObserver(observer)
 	}
+}
+
+// normaliseLeaseObserver flattens a typed-nil LeaseReadObserver to an
+// untyped nil interface so downstream `observer != nil` checks behave
+// as expected.
+func normaliseLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
+	if observer == nil {
+		return nil
+	}
+	v := reflect.ValueOf(observer)
+	switch v.Kind() { //nolint:exhaustive
+	case reflect.Ptr, reflect.Interface, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice:
+		if v.IsNil() {
+			return nil
+		}
+	}
+	return observer
 }
 
 func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {

@@ -141,9 +141,10 @@ type ShardedCoordinator struct {
 // ShardedCoordinator. Applied after construction because the
 // NewShardedCoordinator signature is already heavily overloaded;
 // see Coordinate.WithLeaseReadObserver for the equivalent option on
-// the single-group coordinator.
+// the single-group coordinator, including the typed-nil guard
+// rationale.
 func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
-	c.leaseObserver = observer
+	c.leaseObserver = normaliseLeaseObserver(observer)
 	return c
 }
 
