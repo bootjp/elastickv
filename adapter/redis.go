@@ -1259,11 +1259,10 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	// Derive ctx from the server's base context so shutdown cancels
-	// the ctx-aware branches of this handler. Note: the string
-	// fast-path (readRedisStringAt -> doGetAt) currently issues its
-	// pebble GetAt against context.Background, so cancellation only
-	// bounds logicalExistsAt's ctx-aware probes and the per-key
-	// loader. Plumbing ctx through doGetAt is tracked separately.
+	// in-flight probes. Both the fast path (existsAtFast →
+	// store.GetAt / legacyIndexTTLAt) and the slow fallback
+	// (logicalExistsAt) are ctx-aware, so the deadline bounds every
+	// per-key branch we can reach.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	count := 0
@@ -1310,8 +1309,10 @@ func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint6
 		if alive {
 			return true, nil
 		}
-		// Expired / undecodable: fall through so other encodings still
-		// get their chance.
+		// Expired: fall through so other encodings still get their
+		// chance. Undecodable payloads are already propagated as an
+		// error by stringPayloadIsLive above -- they're a corruption
+		// signal, not a "try something else" case.
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return false, errors.WithStack(err)
 	}
