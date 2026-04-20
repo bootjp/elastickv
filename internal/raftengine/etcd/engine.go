@@ -176,9 +176,12 @@ type Engine struct {
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
 	// step-down, shutdown). Callbacks fire synchronously from
-	// refreshStatus and must not block.
+	// refreshStatus and must not block. Each entry carries a sentinel
+	// pointer so that the deregister closure returned by
+	// RegisterLeaderLossCallback can identify THIS specific
+	// registration even if the same fn is registered multiple times.
 	leaderLossCbsMu sync.Mutex
-	leaderLossCbs   []func()
+	leaderLossCbs   []leaderLossSlot
 
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
@@ -594,13 +597,43 @@ func (e *Engine) AppliedIndex() uint64 {
 // only fire once the transfer completes and state flips to follower.
 // Lease-read callers use this to invalidate cached lease state so the
 // next read takes the slow path.
-func (e *Engine) RegisterLeaderLossCallback(fn func()) {
+//
+// The returned deregister function removes this specific registration
+// and is safe to call multiple times. Long-lived callers (coordinators
+// whose lifetime matches the engine's) may ignore it; shorter-lived
+// callers MUST invoke it to avoid accumulating dead callbacks in the
+// engine's slice.
+func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
 	if e == nil || fn == nil {
-		return
+		return func() {}
 	}
+	// Allocate a unique sentinel pointer so the deregister closure can
+	// identify THIS specific registration even if the same fn is
+	// registered multiple times.
+	slot := &struct{ fn func() }{fn: fn}
 	e.leaderLossCbsMu.Lock()
-	e.leaderLossCbs = append(e.leaderLossCbs, fn)
+	e.leaderLossCbs = append(e.leaderLossCbs, leaderLossSlot{id: slot, fn: fn})
 	e.leaderLossCbsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.leaderLossCbsMu.Lock()
+			defer e.leaderLossCbsMu.Unlock()
+			for i, c := range e.leaderLossCbs {
+				if c.id == slot {
+					e.leaderLossCbs = append(e.leaderLossCbs[:i], e.leaderLossCbs[i+1:]...)
+					return
+				}
+			}
+		})
+	}
+}
+
+// leaderLossSlot pairs a registered callback with an id-only sentinel
+// pointer so deregister can distinguish identical fn values.
+type leaderLossSlot struct {
+	id *struct{ fn func() }
+	fn func()
 }
 
 // fireLeaderLossCallbacks invokes all registered callbacks. Safe to call
@@ -611,7 +644,9 @@ func (e *Engine) RegisterLeaderLossCallback(fn func()) {
 func (e *Engine) fireLeaderLossCallbacks() {
 	e.leaderLossCbsMu.Lock()
 	cbs := make([]func(), len(e.leaderLossCbs))
-	copy(cbs, e.leaderLossCbs)
+	for i, c := range e.leaderLossCbs {
+		cbs[i] = c.fn
+	}
 	e.leaderLossCbsMu.Unlock()
 	for _, fn := range cbs {
 		e.invokeLeaderLossCallback(fn)

@@ -49,11 +49,19 @@ func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.Proposal
 func (e *fakeLeaseEngine) Close() error                 { return nil }
 func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
-func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) {
+func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 	e.registerLeaderLossCalled.Add(1)
 	e.leaderLossCallbacksMu.Lock()
+	idx := len(e.leaderLossCallbacks)
 	e.leaderLossCallbacks = append(e.leaderLossCallbacks, fn)
 	e.leaderLossCallbacksMu.Unlock()
+	return func() {
+		e.leaderLossCallbacksMu.Lock()
+		defer e.leaderLossCallbacksMu.Unlock()
+		if idx < len(e.leaderLossCallbacks) {
+			e.leaderLossCallbacks = append(e.leaderLossCallbacks[:idx], e.leaderLossCallbacks[idx+1:]...)
+		}
+	}
 }
 
 func (e *fakeLeaseEngine) fireLeaderLoss() {

@@ -58,8 +58,14 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// Register a leader-loss hook so the lease is invalidated the instant
 	// the engine notices a state transition out of the leader role,
 	// rather than waiting for wall-clock expiry of the current lease.
+	// The deregister function returned by RegisterLeaderLossCallback is
+	// intentionally ignored because Coordinate's lifetime matches the
+	// engine's: the callback is released when the engine is closed.
+	// Tests that create short-lived coordinators against a shared
+	// engine should instead use RegisterLeaderLossCallback directly
+	// and call the returned deregister on cleanup.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
-		lp.RegisterLeaderLossCallback(c.lease.invalidate)
+		_ = lp.RegisterLeaderLossCallback(c.lease.invalidate)
 	}
 	return c
 }

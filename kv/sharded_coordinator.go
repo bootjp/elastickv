@@ -124,14 +124,21 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		// per-shard lease. All dispatch paths (raw via router.Commit,
 		// dispatchSingleShardTxn, dispatchTxn 2PC, dispatchDelPrefix
 		// broadcast) flow through g.Txn so this single hook catches
-		// them all.
-		g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+		// them all. Skip the wrap if this group is already wrapped --
+		// NewShardedCoordinator may be called more than once against
+		// the same ShardGroup in tests, and stacking wrappers would
+		// fire the refresh hook multiple times per commit.
+		if _, already := g.Txn.(*leaseRefreshingTxn); !already {
+			g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+		}
 		router.Register(gid, g.Txn, g.Store)
 		// Per-shard leader-loss hook: when this group's engine notices
 		// a state transition out of leader, drop the lease so the next
-		// LeaseReadForKey on that shard takes the slow path.
+		// LeaseReadForKey on that shard takes the slow path. The
+		// returned deregister is intentionally ignored; see the same
+		// rationale in NewCoordinatorWithEngine.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
-			lp.RegisterLeaderLossCallback(g.lease.invalidate)
+			_ = lp.RegisterLeaderLossCallback(g.lease.invalidate)
 		}
 	}
 	return &ShardedCoordinator{

@@ -83,7 +83,13 @@ type LeaseProvider interface {
 	// leader-local lease they hold so the next read takes the slow path.
 	// Multiple callbacks can be registered; each fires synchronously from
 	// the engine's status refresh and must not block.
-	RegisterLeaderLossCallback(fn func())
+	//
+	// The returned function deregisters this callback and is safe to
+	// call multiple times. Callers whose lifetime is shorter than the
+	// engine's (ephemeral Coordinators in tests, for example) MUST
+	// invoke the returned deregister when they are done so the engine
+	// does not accumulate dead callbacks.
+	RegisterLeaderLossCallback(fn func()) (deregister func())
 }
 
 type StatusReader interface {
