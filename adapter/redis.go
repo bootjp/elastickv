@@ -751,13 +751,12 @@ func (o redisSetOptions) allows(exists bool) bool {
 	return true
 }
 
-func (r *RedisServer) loadRedisSetState(key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
+func (r *RedisServer) loadRedisSetState(ctx context.Context, key []byte, readTS uint64, returnOld bool) (redisSetState, error) {
 	// Probe type ONCE (rawKeyTypeAt issues up to ~17 pebble seeks),
 	// then derive both the raw and TTL-filtered views from it. The
 	// previous implementation called rawKeyTypeAt + keyTypeAt, which
 	// called rawKeyTypeAt again inside -- doubling every SET to ~34
 	// seeks for purely redundant work.
-	ctx := context.Background()
 	rawTyp, err := r.rawKeyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return redisSetState{}, err
@@ -806,7 +805,7 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 	var result redisSetExecution
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		state, err := r.loadRedisSetState(key, readTS, opts.returnOld)
+		state, err := r.loadRedisSetState(ctx, key, readTS, opts.returnOld)
 		if err != nil {
 			return err
 		}
@@ -1259,7 +1258,12 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
-	ctx := context.Background()
+	// Derive ctx from the server's base context so Close() cancels any
+	// in-flight probe instead of leaving it on a detached Background().
+	// The timeout bounds the worst case across multiple keys and any
+	// follower-side leader proxy hop.
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
 	count := 0
 	for _, key := range cmd.Args[1:] {
 		ok, err := r.existsAtFast(ctx, key, readTS)
