@@ -1286,28 +1286,56 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 }
 
 // existsAtFast is a string-first fast path for EXISTS-style liveness
-// checks. Strings dominate real workloads, and a string key resolves
-// here in 1-2 seeks against redisStrKey (with TTL filtering applied
-// by readRedisStringAt) versus the ~17 seeks of a full
-// logicalExistsAt probe. When the string path reports ErrKeyNotFound
-// (missing, expired, or a non-string type is present) we fall back to
-// the full probe.
+// checks. Strings dominate real workloads, and a live string key
+// resolves here in 1-2 seeks against redisStrKey (with TTL filtering
+// applied inline) versus the ~17 seeks of a full logicalExistsAt
+// probe. When the redisStrKey probe misses we fall back to the full
+// type-probe.
 //
-// Uses readRedisStringAt (the leader-aware variant), NOT the snapshot
-// variant: EXISTS does no up-front LeaseReadForKeyThrough like GET
-// does, so the snapshot variant would violate its caller-contract
-// ("must have VerifyLeader'd first"). The leader-aware path handles
-// the follower case by proxying to the leader inside doGetAt, and
-// matches the liveness semantics of the pre-optimisation EXISTS flow
-// (logicalExistsAt → keyTypeAt → store.ExistsAt) which also did not
-// take the snapshot shortcut.
+// The probe goes directly to the local store. EXISTS tolerates stale-
+// positive reads on followers by design -- the pre-optimisation flow
+// (logicalExistsAt → keyTypeAt → local store.ExistsAt) never proxied
+// to the leader for the probe itself; proxying is reserved for the
+// negative-result fallback (tryLeaderLogicalExists in the caller).
+// Routing through readRedisStringAt here would instead issue a Raft
+// round-trip per key on every follower, regressing EXISTS latency on
+// workloads that were previously all-local.
 func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	if _, _, err := r.readRedisStringAt(key, readTS); err == nil {
-		return true, nil
+	raw, err := r.store.GetAt(ctx, redisStrKey(key), readTS)
+	if err == nil {
+		alive, decErr := r.stringPayloadIsLive(ctx, key, raw, readTS)
+		if decErr != nil {
+			return false, errors.WithStack(decErr)
+		}
+		if alive {
+			return true, nil
+		}
+		// Expired / undecodable: fall through so other encodings still
+		// get their chance.
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return false, errors.WithStack(err)
 	}
 	return r.logicalExistsAt(ctx, key, readTS)
+}
+
+// stringPayloadIsLive reports whether a redisStrKey payload is still
+// TTL-alive. New-format payloads carry their expiry inline; legacy-
+// format payloads need the !redis|ttl| index consulted for the TTL.
+// Both paths use the LOCAL store, matching existsAtFast's no-proxy
+// contract.
+func (r *RedisServer) stringPayloadIsLive(ctx context.Context, key, raw []byte, readTS uint64) (bool, error) {
+	if isNewRedisStrFormat(raw) {
+		_, expireAt, err := decodeRedisStr(raw)
+		if err != nil {
+			return false, err
+		}
+		return expireAt == nil || expireAt.After(time.Now()), nil
+	}
+	ttl, err := r.legacyIndexTTLAt(ctx, key, readTS)
+	if err != nil {
+		return false, err
+	}
+	return ttl == nil || ttl.After(time.Now()), nil
 }
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
