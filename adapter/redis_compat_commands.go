@@ -1675,18 +1675,22 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 
 // hashFieldFastLookup probes the wide-column field entry directly and
 // reports whether it is present and TTL-alive. Returns hit=false when
-// the wide-column key is absent OR when a higher-priority encoding
-// (string / list) exists on the same user key, so the caller falls
-// through to hgetSlow and ends up with the keyTypeAt-consistent
-// WRONGTYPE / nil response.
+// the wide-column key is absent, or when the narrow string-encoding
+// guard in hasHigherPriorityStringEncoding fires, so the caller
+// falls through to hgetSlow.
 //
-// The priority guard costs a single ExistsAt on redisStrKey, covering
-// the most common dual-encoding corruption (SET on a key that
-// previously held a hash, where cleanup did not run). Rarer legacy
-// corruption mixing hash with HLL / bare-key / list encodings will
-// still let this fast-path hit; those workloads should take the slow
-// path too, but in normal operation at most one encoding exists per
-// user key and the guard is a guaranteed miss.
+// Priority-alignment scope: this fast path does NOT fully mirror
+// rawKeyTypeAt / keyTypeAt's priority checks. The guard only probes
+// redisStrKey (the common SET-over-previous-hash corruption case);
+// rarer dual-encoding corruption involving HLL, legacy bare keys, or
+// list meta / delta entries is NOT caught here and will surface the
+// wide-column hash answer instead of the WRONGTYPE / nil response
+// keyTypeAt would produce. In normal operation at most one encoding
+// exists per user key, so the guard is a guaranteed miss and the
+// priority-alignment gap is invisible; pre-existing writers already
+// clean up the old encoding before switching types. A full check
+// would cost ~3-5 extra seeks per fast-path hit, which would negate
+// most of the gain over the ~17-seek keyTypeAt slow path.
 func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte, readTS uint64) (raw []byte, hit, alive bool, err error) {
 	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
 		return nil, false, false, hErr
