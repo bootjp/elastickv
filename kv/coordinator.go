@@ -72,14 +72,14 @@ type LeaseReadObserver interface {
 // stays a single branch on a real nil interface.
 func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
 	return func(c *Coordinate) {
-		c.leaseObserver = normaliseLeaseObserver(observer)
+		c.leaseObserver = normalizeLeaseObserver(observer)
 	}
 }
 
-// normaliseLeaseObserver flattens a typed-nil LeaseReadObserver to an
+// normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
 // untyped nil interface so downstream `observer != nil` checks behave
 // as expected.
-func normaliseLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
+func normalizeLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
 	if observer == nil {
 		return nil
 	}

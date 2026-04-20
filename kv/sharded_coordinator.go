@@ -144,7 +144,7 @@ type ShardedCoordinator struct {
 // the single-group coordinator, including the typed-nil guard
 // rationale.
 func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
-	c.leaseObserver = normaliseLeaseObserver(observer)
+	c.leaseObserver = normalizeLeaseObserver(observer)
 	return c
 }
 
