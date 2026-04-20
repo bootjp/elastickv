@@ -1725,6 +1725,36 @@ func (r *RedisServer) hasHigherPriorityStringEncoding(ctx context.Context, key [
 	return exists, nil
 }
 
+// zsetMemberFastScore probes the wide-column score entry for (key,
+// member) directly and reports whether it is present and TTL-alive.
+// The priority-alignment scope mirrors hashFieldFastLookup: only the
+// redisStrKey dual-encoding case is guarded. Callers must fall back
+// to the full zsetState loader on hit=false to cover legacy-blob
+// zsets and nil / WRONGTYPE disambiguation.
+func (r *RedisServer) zsetMemberFastScore(ctx context.Context, key, member []byte, readTS uint64) (score float64, hit, alive bool, err error) {
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return 0, false, false, hErr
+	} else if higher {
+		return 0, false, false, nil
+	}
+	raw, err := r.store.GetAt(ctx, store.ZSetMemberKey(key, member), readTS)
+	if err != nil {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
+			return 0, false, false, nil
+		}
+		return 0, false, false, cockerrors.WithStack(err)
+	}
+	score, err = store.UnmarshalZSetScore(raw)
+	if err != nil {
+		return 0, false, false, cockerrors.WithStack(err)
+	}
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
+	if expErr != nil {
+		return 0, false, false, cockerrors.WithStack(expErr)
+	}
+	return score, true, !expired, nil
+}
+
 // hgetSlow falls back to the type-probing path when hashFieldFastLookup
 // misses. Handles legacy-blob hashes and nil / WRONGTYPE disambiguation.
 func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {

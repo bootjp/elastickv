@@ -2460,6 +2460,28 @@ func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEn
 
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 	key := []byte(args[0])
+	member := args[1]
+	// In-script cache first: a prior ZADD / ZINCRBY / ZREM in this
+	// Eval already loaded the zset into c.zsets and may carry
+	// unflushed score mutations the fast path would miss. Matches the
+	// HGET / HEXISTS / SISMEMBER pattern added in PR #567.
+	if st, ok := c.zsets[string(key)]; ok {
+		return c.zscoreFromZSetState(st, key, member)
+	}
+	// Fast path: direct wide-column score lookup, bypassing the
+	// ~8-seek keyTypeAt probe inside zsetState.
+	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(formatRedisFloat(score)), nil
+	}
+	// Miss: fall back to the full zsetState path so legacy-blob zsets
+	// and nil / WRONGTYPE disambiguation behave exactly as before.
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2467,10 +2489,16 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
+	return c.zscoreFromZSetState(st, key, member)
+}
+
+// zscoreFromZSetState returns the Redis reply for ZSCORE against a
+// loaded luaZSetState, matching the legacy cmdZScore semantics.
+func (c *luaScriptContext) zscoreFromZSetState(st *luaZSetState, key []byte, member string) (luaReply, error) {
 	if !st.exists {
 		return luaNilReply(), nil
 	}
-	score, ok, err := c.memberScore(st, key, args[1])
+	score, ok, err := c.memberScore(st, key, member)
 	if err != nil {
 		return luaReply{}, err
 	}

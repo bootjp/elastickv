@@ -251,6 +251,115 @@ func TestLua_SISMEMBER_Miss(t *testing.T) {
 	require.Equal(t, int64(0), got)
 }
 
+func TestLua_ZSCORE_FastPathHit(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:z:fast", redis.Z{Score: 42, Member: "m"}).Err())
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], ARGV[1])`,
+		[]string{"lua:z:fast"}, "m",
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, "42", got)
+}
+
+func TestLua_ZSCORE_HonorsInScriptZAdd(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// ZADD followed by ZSCORE in the same Eval: the fast path must NOT
+	// bypass the unflushed mutation, it must read through c.zsets.
+	got, err := rdb.Eval(ctx, `
+redis.call("ZADD", KEYS[1], ARGV[1], ARGV[2])
+return redis.call("ZSCORE", KEYS[1], ARGV[2])
+`, []string{"lua:z:rw"}, "7", "m").Result()
+	require.NoError(t, err)
+	require.Equal(t, "7", got)
+}
+
+func TestLua_ZSCORE_Miss(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], ARGV[1])`,
+		[]string{"lua:z:missing"}, "m",
+	).Result()
+	require.ErrorIs(t, err, redis.Nil, "ZSCORE on nonexistent zset from Lua must surface as nil")
+}
+
+func TestLua_ZSCORE_UnknownMember(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:z:known", redis.Z{Score: 1, Member: "a"}).Err())
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], ARGV[1])`,
+		[]string{"lua:z:known"}, "b",
+	).Result()
+	require.ErrorIs(t, err, redis.Nil, "ZSCORE on an existing zset but unknown member must surface as nil")
+}
+
+func TestLua_ZSCORE_WRONGTYPE(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Set(ctx, "lua:z:str", "x", 0).Err())
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], "m")`,
+		[]string{"lua:z:str"},
+	).Result()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "WRONGTYPE")
+}
+
+func TestLua_ZSCORE_TTLExpired(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:z:ttl", redis.Z{Score: 1, Member: "m"}).Err())
+	require.NoError(t, rdb.PExpire(ctx, "lua:z:ttl", luaFastPathTTL).Err())
+	waitForLuaTTL()
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], "m")`,
+		[]string{"lua:z:ttl"},
+	).Result()
+	require.ErrorIs(t, err, redis.Nil, "ZSCORE on an expired zset from Lua must surface as nil")
+}
+
 func TestLua_SISMEMBER_WRONGTYPE(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
