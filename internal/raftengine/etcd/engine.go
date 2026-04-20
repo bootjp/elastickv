@@ -591,16 +591,31 @@ func (e *Engine) RegisterLeaderLossCallback(fn func()) {
 }
 
 // fireLeaderLossCallbacks invokes all registered callbacks. Safe to call
-// from refreshStatus while holding no engine locks; callbacks run
-// synchronously and must not block.
+// from refreshStatus / shutdown while holding no engine locks;
+// callbacks run synchronously and must not block. A panicking callback
+// is contained so it cannot take down the raft engine loop or the
+// shutdown path; the remaining callbacks still fire.
 func (e *Engine) fireLeaderLossCallbacks() {
 	e.leaderLossCbsMu.Lock()
 	cbs := make([]func(), len(e.leaderLossCbs))
 	copy(cbs, e.leaderLossCbs)
 	e.leaderLossCbsMu.Unlock()
 	for _, fn := range cbs {
-		fn()
+		e.invokeLeaderLossCallback(fn)
 	}
+}
+
+func (e *Engine) invokeLeaderLossCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			// A buggy lease holder must not crash the node. Drop the
+			// panic here; it has already marked the lease invalid (or
+			// would have, if the panic didn't interrupt it) so the
+			// next read takes the slow path and re-verifies leadership.
+			_ = r
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {

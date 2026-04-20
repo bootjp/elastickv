@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,8 +20,8 @@ type fakeLeaseEngine struct {
 	leaseDur                 time.Duration
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
+	leaderLossCallbacksMu    sync.Mutex
 	leaderLossCallbacks      []func()
-	leaderLossCallbacksMu    atomic.Bool
 	registerLeaderLossCalled atomic.Int32
 }
 
@@ -50,17 +51,15 @@ func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
 func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) {
 	e.registerLeaderLossCalled.Add(1)
-	for !e.leaderLossCallbacksMu.CompareAndSwap(false, true) {
-	}
+	e.leaderLossCallbacksMu.Lock()
 	e.leaderLossCallbacks = append(e.leaderLossCallbacks, fn)
-	e.leaderLossCallbacksMu.Store(false)
+	e.leaderLossCallbacksMu.Unlock()
 }
 
 func (e *fakeLeaseEngine) fireLeaderLoss() {
-	for !e.leaderLossCallbacksMu.CompareAndSwap(false, true) {
-	}
+	e.leaderLossCallbacksMu.Lock()
 	cbs := append([]func(){}, e.leaderLossCallbacks...)
-	e.leaderLossCallbacksMu.Store(false)
+	e.leaderLossCallbacksMu.Unlock()
 	for _, cb := range cbs {
 		cb()
 	}
