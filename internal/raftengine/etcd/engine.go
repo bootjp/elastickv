@@ -2822,12 +2822,17 @@ func (e *Engine) removePeer(nodeID uint64) {
 
 	// Drop the peer's recorded ack so a reconfiguration cannot leave a
 	// stale entry that falsely satisfies the new cluster's majority.
-	// followerQuorum is computed against the POST-removal cluster.
-	followerQuorum := 0
-	if postRemovalClusterSize > 1 {
-		followerQuorum = postRemovalClusterSize / 2 //nolint:mnd
+	// followerQuorum is computed against the POST-removal cluster; a
+	// shrink to <=1 would otherwise pass 0 here, which
+	// quorumAckTracker.removePeer treats as "keep the current instant"
+	// and would surface stale liveness to LastQuorumAck if the cluster
+	// subsequently grew back. Clear the tracker explicitly in that
+	// case so any future multi-node membership starts fresh.
+	if postRemovalClusterSize <= 1 {
+		e.ackTracker.reset()
+	} else {
+		e.ackTracker.removePeer(nodeID, postRemovalClusterSize/2) //nolint:mnd
 	}
-	e.ackTracker.removePeer(nodeID, followerQuorum)
 
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)

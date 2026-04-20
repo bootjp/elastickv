@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -122,6 +123,9 @@ func TestQuorumAckTracker_ConcurrentRecordAndLoad(t *testing.T) {
 
 	// Recorder alternates between two peer IDs so a 3-node followerQuorum
 	// always has at least one entry and the sort path runs.
+	// runtime.Gosched between iterations keeps the loops from pegging a
+	// core under `-race` while still interleaving enough recordAck /
+	// load pairs to exercise the atomic-pointer invariants.
 	go func() {
 		defer wg.Done()
 		for {
@@ -131,6 +135,7 @@ func TestQuorumAckTracker_ConcurrentRecordAndLoad(t *testing.T) {
 			default:
 				tr.recordAck(2, 1)
 				tr.recordAck(3, 1)
+				runtime.Gosched()
 			}
 		}
 	}()
@@ -142,6 +147,7 @@ func TestQuorumAckTracker_ConcurrentRecordAndLoad(t *testing.T) {
 				return
 			default:
 				_ = tr.load()
+				runtime.Gosched()
 			}
 		}
 	}()

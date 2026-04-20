@@ -30,6 +30,11 @@ import (
 type quorumAckTracker struct {
 	mu       sync.Mutex
 	peerAcks map[uint64]int64 // peer ID → last ack unix nano observed on leader
+	// ackBuf is reused by recomputeLocked to avoid allocating a fresh
+	// []int64 on every MsgAppResp / MsgHeartbeatResp. Sized to
+	// len(peerAcks) on first use and grown via append when the cluster
+	// expands. Caller must hold t.mu.
+	ackBuf []int64
 	// quorumAckUnixNano is the Nth-most-recent peer ack where N equals
 	// the number of follower acks required for majority (clusterSize/2).
 	// Updated under mu; read lock-free via atomic.Load.
@@ -86,21 +91,30 @@ func (t *quorumAckTracker) removePeer(peerID uint64, followerQuorum int) {
 // recomputeLocked publishes the followerQuorum-th most recent ack as
 // the quorum instant, or clears it if we lack that many recorded
 // peers. Caller must hold t.mu.
+//
+// Reuses t.ackBuf across calls so the hot path (one call per
+// MsgAppResp / MsgHeartbeatResp) does not allocate on steady state.
+// The buffer is re-sliced in place and the sort is done on that
+// slice; a cluster growing past the previous capacity picks up a
+// single growth step via append, not a fresh allocation per call.
 func (t *quorumAckTracker) recomputeLocked(followerQuorum int) {
 	if len(t.peerAcks) < followerQuorum {
 		// Not enough peers have reported to form a majority yet.
 		t.quorumAckUnixNano.Store(0)
 		return
 	}
-	acks := make([]int64, 0, len(t.peerAcks))
+	t.ackBuf = t.ackBuf[:0]
 	for _, a := range t.peerAcks {
-		acks = append(acks, a)
+		t.ackBuf = append(t.ackBuf, a)
 	}
-	// Sort descending so acks[0] is the most recent. The followerQuorum-th
-	// entry (1-indexed) is the oldest ack among the top quorum -- i.e.
-	// the boundary instant by which majority liveness was confirmed.
-	sort.Slice(acks, func(i, j int) bool { return acks[i] > acks[j] })
-	t.quorumAckUnixNano.Store(acks[followerQuorum-1])
+	// Sort descending so ackBuf[0] is the most recent. The
+	// followerQuorum-th entry (1-indexed) is the oldest ack among the
+	// top quorum -- i.e. the boundary instant by which majority
+	// liveness was confirmed. Cluster size is small in practice (3-5
+	// peers), so sort.Slice is cheaper than a quickselect once the
+	// buffer is reused.
+	sort.Slice(t.ackBuf, func(i, j int) bool { return t.ackBuf[i] > t.ackBuf[j] })
+	t.quorumAckUnixNano.Store(t.ackBuf[followerQuorum-1])
 }
 
 // reset clears all recorded peer acks. Call when the local node
@@ -110,6 +124,7 @@ func (t *quorumAckTracker) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.peerAcks = nil
+	t.ackBuf = t.ackBuf[:0]
 	t.quorumAckUnixNano.Store(0)
 }
 
