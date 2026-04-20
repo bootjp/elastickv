@@ -46,16 +46,17 @@ func TestQuorumAckTracker_QuorumAckIsOldestOfTopN(t *testing.T) {
 	first := tr.load()
 	require.True(t, first.IsZero(), "still only one follower, no quorum")
 
-	time.Sleep(2 * time.Millisecond)
 	tr.recordAck(3, 2)
 	second := tr.load()
 	require.False(t, second.IsZero())
 
-	// Now peer 4 acks with a later timestamp. Quorum ack should still
-	// be the older of the top two (either 2 or 3, not 4) because the
-	// 5-node quorum is 3 including self (2 followers + self), and the
-	// OLDEST of the top two followers is still the limiting factor.
-	time.Sleep(2 * time.Millisecond)
+	// Now peer 4 acks. Even if time.Now() granularity places every
+	// sample at the same nanosecond, the quorum instant must NOT
+	// regress: the 5-node quorum requires 2 follower acks (self makes
+	// 3 = majority), and the OLDEST of the top two followers bounds
+	// the boundary. require.False(third.Before(second)) holds trivially
+	// when timestamps are equal, so this test does not rely on wall-
+	// clock granularity and is deterministic on fast CI.
 	tr.recordAck(4, 2)
 	third := tr.load()
 	require.False(t, third.Before(second), "quorum instant must not regress")

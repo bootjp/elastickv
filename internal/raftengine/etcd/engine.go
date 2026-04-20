@@ -194,6 +194,14 @@ type Engine struct {
 	// cluster size is 1; cleared otherwise) so the lease-read hot path
 	// never has to acquire e.mu to check peer count or leader state.
 	singleNodeLeaderAckUnixNano atomic.Int64
+	// isLeader mirrors status.State == StateLeader for lock-free reads
+	// on the hot path. refreshStatus writes it on every tick;
+	// recordQuorumAck reads it before admitting a follower response
+	// into ackTracker (so late MsgAppResp / MsgHeartbeatResp arriving
+	// after a step-down cannot repopulate the tracker), and
+	// LastQuorumAck reads it to honor the LeaseProvider contract
+	// ("zero time when the local node is not the leader").
+	isLeader atomic.Bool
 
 	// leaderLossCbsMu guards the slice of callbacks invoked when the node
 	// transitions out of the leader role (graceful transfer, partition
@@ -629,6 +637,14 @@ func (e *Engine) AppliedIndex() uint64 {
 // raftengine.LeaseProvider for the lease-read correctness contract.
 func (e *Engine) LastQuorumAck() time.Time {
 	if e == nil {
+		return time.Time{}
+	}
+	// Honor the LeaseProvider contract that non-leaders always return
+	// the zero time. Without this guard a late MsgAppResp that sneaks
+	// past recordQuorumAck (or a tracker entry that survived a brief
+	// step-down/step-up window) could leak stale liveness into the
+	// caller's fast-path validation.
+	if !e.isLeader.Load() {
 		return time.Time{}
 	}
 	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
@@ -1269,17 +1285,23 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 // majority liveness without requiring a fresh ReadIndex.
 //
 // Called inside the event-loop goroutine (single writer to e.peers
-// and to the raft state), so the len(e.peers) read and the
-// leader-state check are race-free. We intentionally do not gate the
-// observation itself on BasicStatus() -- a MsgAppResp / MsgHeartbeatResp
-// only ever lands at a leader via the transport layer, and refreshing
-// the per-peer map from follower/candidate state would just be dead
-// data later cleared by reset() on role transition.
+// and to the raft state), so the e.peers read is race-free.
+//
+// Gated on the atomic isLeader mirror: a transport-level MsgAppResp /
+// MsgHeartbeatResp can land shortly after a step-down (reset() has
+// already cleared ackTracker); admitting it here would repopulate
+// the tracker and leak a stale liveness instant into the next
+// re-election as a non-zero LastQuorumAck(). isLeader is written by
+// refreshStatus on every tick, which catches every role transition
+// before the next handleStep runs.
 func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if !isFollowerResponse(msg.Type) {
 		return
 	}
 	if msg.From == 0 || msg.From == e.nodeID {
+		return
+	}
+	if !e.isLeader.Load() {
 		return
 	}
 	// Reject acks from peers not in the current membership. Without
@@ -1917,6 +1939,12 @@ func (e *Engine) refreshStatus() {
 	// role: populate while leader of a 1-node cluster, clear otherwise
 	// (including on leader loss, so LastQuorumAck transitions to the
 	// multi-node tracker or zero time atomically).
+	// Publish leader state atomically so recordQuorumAck / LastQuorumAck
+	// can gate on it without acquiring e.mu. MUST run before the
+	// single-node ack store below, otherwise a brand-new leader tick
+	// could publish a ack instant while isLeader is still false.
+	e.isLeader.Store(status.State == raftengine.StateLeader)
+
 	if status.State == raftengine.StateLeader && clusterSize <= 1 {
 		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
 	} else {
