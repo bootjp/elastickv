@@ -986,7 +986,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	if opts.isFastPath() && r.trySetFastPath(conn, ctx, cmd.Args[1], cmd.Args[2], opts.ttl) {
@@ -1131,7 +1131,7 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 	// If this path is unavailable we fall back to raw-KV probing, which is
 	// best-effort and may lag unflushed buffer-only TTL updates.
 	if cli, err := r.leaderClientForKey(key); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 		defer cancel()
 		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
 			return count > 0
@@ -1189,7 +1189,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	err := r.retryRedisWrite(ctx, func() error {
@@ -1505,7 +1505,7 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	keys, err := cli.Keys(ctx, string(pattern)).Result()
@@ -1574,7 +1574,7 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 	}
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	cmds, err := r.execTxPipeline(ctx, cli, queue)
@@ -2376,7 +2376,7 @@ func (t *txnContext) commit() error {
 		CommitTS: commitTS,
 		ReadKeys: readKeys,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
 		return errors.WithStack(err)
@@ -2622,7 +2622,7 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
-	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	dispatchCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	var results []redisResult
@@ -3137,7 +3137,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
@@ -3161,7 +3161,7 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.RPush(ctx, string(key), args...).Result()
@@ -3185,7 +3185,7 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LPush(ctx, string(key), args...).Result()
@@ -3240,7 +3240,7 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 
 	args := make([]interface{}, len(cmd.Args))
@@ -3317,7 +3317,7 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisRelayPublishTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisRelayPublishTimeout)
 	defer cancel()
 
 	cli := pb.NewRawKVClient(conn)
