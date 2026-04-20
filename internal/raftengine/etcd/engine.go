@@ -42,9 +42,12 @@ const (
 	// Under production congestion we observed the 256-slot inbound
 	// stepCh on followers filling up while their event loop was held
 	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
-	// #565 removed most of that CPU); 1024 is a 4× safety margin that
-	// still keeps worst-case memory under a few MB per engine at the
-	// current defaultMaxSizePerMsg of 1 MiB.
+	// #565 removed most of that CPU); 1024 is a 4× safety margin.
+	// Note that with the current defaultMaxSizePerMsg of 1 MiB, the
+	// true worst-case bound can be much larger (up to roughly 1 GiB
+	// per peer if every slot held a max-sized message). In practice,
+	// typical MsgApp payloads are far smaller, so expected steady-state
+	// memory remains much lower than that worst-case bound.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
