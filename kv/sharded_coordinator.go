@@ -751,15 +751,14 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup) (uint64, error) {
 	if leaseDur <= 0 {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Engine-driven lease anchor -- see Coordinate.LeaseRead for why
-	// this is the primary check.
-	state := engine.State()
-	if state == raftengine.StateLeader {
-		if ack := lp.LastQuorumAck(); !ack.IsZero() && time.Since(ack) < leaseDur {
-			return lp.AppliedIndex(), nil
-		}
-	}
+	// Single time.Now() sample so primary/secondary/extension all see
+	// the same instant. Clock-skew safety delegated to
+	// engineLeaseAckValid (see Coordinate.LeaseRead).
 	now := time.Now()
+	state := engine.State()
+	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		return lp.AppliedIndex(), nil
+	}
 	expectedGen := g.lease.generation()
 	if g.lease.valid(now) && state == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil

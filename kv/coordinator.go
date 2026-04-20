@@ -340,18 +340,22 @@ func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint
 }
 
 // LeaseRead returns a read fence backed by a leader-local lease when
-// available, falling back to a full LinearizableRead when the engine
-// has not observed a fresh majority ack or does not implement
-// LeaseProvider.
+// available, falling back to a full LinearizableRead when no fast
+// path is live or the engine does not implement LeaseProvider.
 //
-// The lease is maintained inside the engine from ongoing
-// MsgAppResp / MsgHeartbeatResp traffic, so callers do not sample
-// time.Now() before the slow path to "extend" a lease afterwards.
-// That earlier pre-read sampling was racy under congestion: if a
-// LinearizableRead took longer than LeaseDuration, the extension
-// would land already expired and the lease never warmed up. The
-// engine-driven anchor is refreshed every heartbeat independent of
-// read latency.
+// The PRIMARY lease path is maintained inside the engine from ongoing
+// MsgAppResp / MsgHeartbeatResp traffic, so that path does not rely
+// on callers sampling time.Now() before the slow path to "extend" a
+// lease afterwards. The earlier pre-read sampling was racy under
+// congestion: if a LinearizableRead took longer than LeaseDuration,
+// the extension would land already expired and the lease never
+// warmed up. The engine-driven anchor is refreshed every heartbeat
+// independent of read latency.
+//
+// The SECONDARY caller-side lease remains as a rollout fallback,
+// still populated by the original pre-read sampling; it covers the
+// narrow window between startup and the first quorum heartbeat round
+// landing on the engine.
 //
 // The returned index is the engine's current applied index (fast
 // path) or the index returned by LinearizableRead (slow path).
@@ -367,24 +371,18 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 		// Misconfigured tick settings: lease is disabled.
 		return c.LinearizableRead(ctx)
 	}
-	// Primary: engine-driven lease. The engine refreshes LastQuorumAck
-	// on every MsgHeartbeatResp / MsgAppResp it receives while leader,
-	// so a read that itself takes longer than LeaseDuration does not
-	// prevent the window from being kept warm -- which is exactly the
-	// production congestion pathology the pre-engine-driven lease
-	// could not amortise out of.
+	// Single time.Now() sample so the primary, secondary, and
+	// extension steps all reason about the same instant.
+	now := time.Now()
 	state := c.engine.State()
-	if state == raftengine.StateLeader {
-		if ack := lp.LastQuorumAck(); !ack.IsZero() && time.Since(ack) < leaseDur {
-			return lp.AppliedIndex(), nil
-		}
+	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		return lp.AppliedIndex(), nil
 	}
 	// Secondary: caller-side lease warmed by a previous successful
 	// slow-path read. Preserved so tests can prime the lease directly
 	// and so we still benefit on paths where LastQuorumAck is not yet
 	// populated (e.g. very first read after startup before the first
 	// quorum heartbeat round has landed).
-	now := time.Now()
 	expectedGen := c.lease.generation()
 	if c.lease.valid(now) && state == raftengine.StateLeader {
 		return lp.AppliedIndex(), nil
@@ -398,6 +396,22 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 	}
 	c.lease.extend(now.Add(leaseDur), expectedGen)
 	return idx, nil
+}
+
+// engineLeaseAckValid returns whether the engine-driven lease anchor
+// published via LastQuorumAck is fresh enough to serve a leader-local
+// read. Enforces the safety contract from raftengine.LeaseProvider:
+//   - local state must be Leader
+//   - ack must be non-zero (a quorum was ever observed)
+//   - ack must not be after now (clock-skew guard: LastQuorumAck is
+//     rebuilt from UnixNano with no monotonic component, so a
+//     backwards wall-clock step could otherwise let a stale ack pass)
+//   - now − ack must be strictly less than leaseDur
+func engineLeaseAckValid(state raftengine.State, ack, now time.Time, leaseDur time.Duration) bool {
+	if state != raftengine.StateLeader || ack.IsZero() || ack.After(now) {
+		return false
+	}
+	return now.Sub(ack) < leaseDur
 }
 
 func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {

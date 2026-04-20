@@ -101,12 +101,18 @@ type LeaseProvider interface {
 	// MsgAppResp traffic on the leader, so a fast-path lease read does
 	// not need to issue its own ReadIndex to "warm" the lease.
 	//
-	// Safety: callers must verify the lease with
-	//   time.Since(LastQuorumAck()) < LeaseDuration() &&
-	//   engine.State() == raftengine.StateLeader
-	// before serving a leader-local read. The LeaseDuration is bounded
-	// by electionTimeout - safety_margin, which guarantees that any new
-	// leader candidate cannot yet accept writes during that window.
+	// Safety: callers must verify the lease against a single
+	// `now := time.Now()` sample:
+	//   state == raftengine.StateLeader &&
+	//   !ack.IsZero() && !ack.After(now) && now.Sub(ack) < LeaseDuration()
+	//
+	// The !ack.After(now) guard matters because LastQuorumAck() may be
+	// reconstructed from UnixNano (no monotonic component): a backwards
+	// wall-clock adjustment would otherwise make now.Sub(ack) negative
+	// and pass the duration check against a stale ack. The LeaseDuration
+	// is bounded by electionTimeout - safety_margin, which guarantees
+	// that any new leader candidate cannot yet accept writes during
+	// that window.
 	//
 	// Returns the zero time when no quorum has been confirmed yet, or
 	// when the local node is not the leader. Single-node clusters
