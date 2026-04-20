@@ -184,8 +184,17 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 // transaction manager short-circuited (empty-input Commit, no-op
 // Abort), and refreshing would be unsound because no quorum
 // confirmation happened.
+//
+// On err != nil the lease is invalidated: a Propose error commonly
+// signals leadership loss (non-leader rejection, transfer in
+// progress, quorum lost, etc.) and the design doc lists
+// "any error from engine.Propose" as an invalidation trigger.
 func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
-	if err != nil || resp == nil || resp.CommitIndex == 0 {
+	if err != nil {
+		c.lease.invalidate()
+		return
+	}
+	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
 	lp, ok := c.engine.(raftengine.LeaseProvider)

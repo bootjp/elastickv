@@ -46,6 +46,10 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(reqs)
 	if err != nil {
+		// Propose failures commonly signal leadership loss; follow
+		// the design doc and invalidate so the next read takes the
+		// slow path and re-verifies.
+		t.g.lease.invalidate()
 		return resp, errors.WithStack(err)
 	}
 	t.maybeRefresh(resp, start, expectedGen)
@@ -57,6 +61,7 @@ func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, er
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Abort(reqs)
 	if err != nil {
+		t.g.lease.invalidate()
 		return resp, errors.WithStack(err)
 	}
 	t.maybeRefresh(resp, start, expectedGen)

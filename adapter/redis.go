@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"math"
 	"net"
@@ -264,11 +265,13 @@ type RedisServer struct {
 	relayConnCache  kv.GRPCConnCache
 	requestObserver monitoring.RedisRequestObserver
 	luaObserver     monitoring.LuaScriptObserver
-	// baseCtx is the parent context for per-request handlers. It is
-	// derived from the server's lifecycle so Close() cancels all
-	// in-flight handlers instead of letting them run unbounded on
-	// context.Background(). Falls back to context.Background() if
-	// SetBaseContext was never called (existing test stubs).
+	// baseCtx is the parent context for per-request handlers.
+	// NewRedisServer creates a cancelable context here; Stop() cancels
+	// it so in-flight handlers abort promptly instead of running
+	// unbounded on context.Background(). Test stubs that construct
+	// RedisServer literals directly (bypassing NewRedisServer) may
+	// leave baseCtx nil; handlerContext() falls back to
+	// context.Background() in that case.
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 	// TODO manage membership from raft log
@@ -847,8 +850,20 @@ func (r *RedisServer) Stop() {
 	// Cancel baseCtx first so in-flight handlers observe a cancelled
 	// context before their network connections are torn down.
 	_ = r.Close()
-	_ = r.relayConnCache.Close()
-	_ = r.listen.Close()
+	if err := r.relayConnCache.Close(); err != nil {
+		slog.Warn("redis server: relay conn cache close",
+			slog.String("addr", r.redisAddr),
+			slog.Any("err", err),
+		)
+	}
+	if r.listen != nil {
+		if err := r.listen.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			slog.Warn("redis server: listener close",
+				slog.String("addr", r.redisAddr),
+				slog.Any("err", err),
+			)
+		}
+	}
 }
 
 func (r *RedisServer) publishLocal(channel, message []byte) int64 {

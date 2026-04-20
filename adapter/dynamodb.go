@@ -65,6 +65,12 @@ const (
 	transactRetryMaxBackoff     = 10 * time.Millisecond
 	transactRetryBackoffFactor  = 2
 	tableCleanupAsyncTimeout    = 5 * time.Minute
+	// dynamoLeaseReadTimeout bounds how long LeaseReadForKey's slow
+	// path (LinearizableRead) may block before returning an error to
+	// the HTTP client. Matches the order of magnitude of Redis's
+	// redisDispatchTimeout so both adapters give up at similar
+	// wall-clock budgets on quorum loss.
+	dynamoLeaseReadTimeout = 5 * time.Second
 	itemUpdateLockStripeCount   = 256
 	tableLockStripeCount        = 128
 	batchWriteItemMaxItems      = 25
@@ -1367,21 +1373,30 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
-	schema, itemKey, ok := d.resolveGetItemTarget(w, r, in, readTS)
+	// Tentative TS for schema resolution only; schemas change rarely
+	// so a slight pre-lease stale is acceptable. The item read below
+	// is sampled AFTER the lease check.
+	tentativeTS := d.resolveDynamoReadTS(in.ConsistentRead)
+	schema, itemKey, ok := d.resolveGetItemTarget(w, r, in, tentativeTS)
 	if !ok {
 		return
 	}
-	// Lease-check the shard that actually owns the ITEM key, not the
-	// table-meta key. In a sharded deployment items are routed per
-	// primary key, which may land on a different shard than the
-	// table's metadata; confirming only the table-meta shard's
-	// leadership would leave the item-shard read linearizability
-	// gap wide open.
-	if _, err := d.coordinator.LeaseReadForKey(r.Context(), itemKey); err != nil {
+	// Lease-check the shard that actually owns the ITEM key with a
+	// bounded timeout so a stalled Raft cannot hang this handler
+	// indefinitely if the client never cancels.
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	_, err := d.coordinator.LeaseReadForKey(leaseCtx, itemKey)
+	leaseCancel()
+	if err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return
 	}
+	// Re-sample readTS AFTER the lease confirmation so that any write
+	// that completed on the same shard BEFORE the confirmation is
+	// visible. Sampling earlier would violate linearizability for
+	// ConsistentRead=false reads by returning a snapshot from before
+	// the most recent confirmed commit.
+	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 
 	current, found, err := d.readLogicalItemAt(r.Context(), schema, in.Key, readTS)
 	if err != nil {

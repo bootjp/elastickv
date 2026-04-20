@@ -636,11 +636,18 @@ type leaderLossSlot struct {
 	fn func()
 }
 
-// fireLeaderLossCallbacks invokes all registered callbacks. Safe to call
-// from refreshStatus / shutdown while holding no engine locks;
-// callbacks run synchronously and must not block. A panicking callback
-// is contained so it cannot take down the raft engine loop or the
-// shutdown path; the remaining callbacks still fire.
+// fireLeaderLossCallbacks invokes all registered callbacks in fresh
+// goroutines so a slow or misbehaving callback cannot stall the
+// caller. refreshStatus runs inside the Raft engine's main loop, and
+// shutdown / fail run on the teardown path; in neither case is it
+// acceptable for a third-party callback to hold up progress for an
+// unbounded time. Ordering between callbacks is intentionally
+// unspecified -- each callback's job is to flip a lock-free flag
+// (typically lease invalidation) and is order-independent.
+//
+// A panicking callback is still contained (see
+// invokeLeaderLossCallback) so a bug in one holder cannot break
+// others or crash the process.
 func (e *Engine) fireLeaderLossCallbacks() {
 	e.leaderLossCbsMu.Lock()
 	cbs := make([]func(), len(e.leaderLossCbs))
@@ -649,7 +656,7 @@ func (e *Engine) fireLeaderLossCallbacks() {
 	}
 	e.leaderLossCbsMu.Unlock()
 	for _, fn := range cbs {
-		e.invokeLeaderLossCallback(fn)
+		go e.invokeLeaderLossCallback(fn)
 	}
 }
 
@@ -1802,7 +1809,12 @@ func (e *Engine) shutdown() {
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(errors.WithStack(errClosed))
 	// LeaseProvider contract promises callbacks fire on shutdown too.
 	// refreshStatus only fires them on the leader -> non-leader edge,
@@ -1858,7 +1870,12 @@ func (e *Engine) fail(err error) {
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(e.currentErrorOrClosed())
 	// LeaseProvider contract: fire leader-loss callbacks on shutdown if
 	// we were leader. fail() is the error-shutdown twin of shutdown();

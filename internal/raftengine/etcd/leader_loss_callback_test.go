@@ -3,6 +3,7 @@ package etcd
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -10,6 +11,8 @@ import (
 // TestFireLeaderLossCallbacks_ContainsPanic verifies that a panicking
 // callback does NOT take down the raft engine loop: the remaining
 // callbacks still fire and the method returns normally.
+// Callbacks now run on detached goroutines, so we wait (with a bounded
+// timeout) for the two sibling counters to update before asserting.
 func TestFireLeaderLossCallbacks_ContainsPanic(t *testing.T) {
 	t.Parallel()
 
@@ -19,13 +22,12 @@ func TestFireLeaderLossCallbacks_ContainsPanic(t *testing.T) {
 	e.RegisterLeaderLossCallback(func() { panic("lease holder bug") })
 	e.RegisterLeaderLossCallback(func() { after.Add(1) })
 
-	// Must not panic out of the call.
 	require.NotPanics(t, e.fireLeaderLossCallbacks)
 
-	require.Equal(t, int32(1), before.Load(),
-		"callbacks registered before the panicking one must have fired")
-	require.Equal(t, int32(1), after.Load(),
-		"callbacks registered after the panicking one must still fire")
+	require.Eventually(t, func() bool {
+		return before.Load() == 1 && after.Load() == 1
+	}, time.Second, time.Millisecond,
+		"both non-panicking callbacks must fire on detached goroutines")
 }
 
 // TestFireLeaderLossCallbacks_NoCallbacksIsSafe exercises the empty-list
