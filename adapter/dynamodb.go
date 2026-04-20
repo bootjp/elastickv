@@ -1377,7 +1377,7 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// so a slight pre-lease stale is acceptable. The item read below
 	// is sampled AFTER the lease check.
 	tentativeTS := d.resolveDynamoReadTS(in.ConsistentRead)
-	schema, itemKey, ok := d.resolveGetItemTarget(w, r, in, tentativeTS)
+	_, itemKey, ok := d.resolveGetItemTarget(w, r, in, tentativeTS)
 	if !ok {
 		return
 	}
@@ -1398,24 +1398,20 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// the most recent confirmed commit.
 	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
 
-	// Re-verify the schema generation at readTS. If a table migration
-	// committed between the tentative schema load and the lease
-	// confirmation, the itemKey we lease-checked was computed against
-	// the OLD generation and may belong to a different shard than the
-	// one now holding the item. Rather than read stale data from the
-	// wrong shard, fail so the client retries with fresh schema.
-	finalSchema, exists, err := d.loadTableSchemaAt(r.Context(), in.TableName, readTS)
-	if err != nil {
-		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+	// Re-resolve schema + itemKey at readTS and verify that the key
+	// we lease-checked is STILL the key that will be read. A table
+	// migration that commits between the tentative schema load and
+	// the lease confirmation may shift the item to a different shard
+	// even if the request parameters are unchanged, so comparing the
+	// computed item keys (not just generation) catches any future
+	// schema change that alters item routing.
+	finalSchema, freshItemKey, ok := d.resolveGetItemTarget(w, r, in, readTS)
+	if !ok {
 		return
 	}
-	if !exists {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
-		return
-	}
-	if finalSchema.Generation != schema.Generation {
+	if !bytes.Equal(freshItemKey, itemKey) {
 		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal,
-			"table migrated during read; please retry")
+			"table routing changed during read; please retry")
 		return
 	}
 
