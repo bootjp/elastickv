@@ -1346,16 +1346,21 @@ func (c *luaScriptContext) renameStreamValue(src, dst []byte) error {
 func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	field := args[1]
-	// Fast path is only safe when cachedType has NO authoritative
-	// script-local answer. A cached entry (loaded hash / string / list
-	// / etc. OR an explicit c.deleted entry from a prior DEL / RENAME)
-	// means another command in this Eval has either (a) mutated the
-	// hash so c.hashes[key] holds the unflushed view, (b) changed the
-	// logical type so hashState() must produce WRONGTYPE, or (c)
-	// deleted the key so the correct answer is nil. In all three cases
-	// the slow path's hashState -> keyType -> cachedType chain produces
-	// the right answer; bypassing it would silently read pre-script
-	// pebble state and leak stale data.
+	// Fast path is only safe when there is NO authoritative
+	// script-local answer. Two separate signals to check:
+	//
+	//   (a) cachedType() covers loaded state for OTHER types (string /
+	//       list / ...) AND the explicit c.deleted entry from a prior
+	//       DEL / RENAME. Bypassing would leak pre-script pebble state.
+	//   (b) c.hashes[key] already loaded (even with exists=false for
+	//       a confirmed miss) means a prior command already paid the
+	//       type-probe tax. Re-running the fast path would just do
+	//       another wide-column probe for the same negative answer.
+	//       Reuse the loaded state via the slow path, which returns
+	//       immediately when c.hashes[key] is present.
+	if luaHashAlreadyLoaded(c, key) {
+		return hgetFromSlowPath(c, key, field)
+	}
 	if _, cached := c.cachedType(key); cached {
 		return hgetFromSlowPath(c, key, field)
 	}
@@ -1377,6 +1382,22 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 	// Miss: fall back to the full hashState path so legacy-blob hashes
 	// and nil / WRONGTYPE disambiguation behave exactly as before.
 	return hgetFromSlowPath(c, key, field)
+}
+
+// luaHashAlreadyLoaded reports whether a prior command in this Eval
+// already populated c.hashes[key] and resolved its exists/loaded
+// flags. A loaded state -- even one representing a known miss --
+// makes the fast path redundant: the slow path returns immediately
+// by reading the cached luaHashState, skipping a wide-column probe.
+func luaHashAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.hashes[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// luaSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.sets.
+func luaSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.sets[string(key)]
+	return ok && st != nil && st.loaded
 }
 
 // hgetFromSlowPath runs the legacy hashState-based HGET, preserving
@@ -1556,9 +1577,14 @@ func (c *luaScriptContext) cmdHDel(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	field := args[1]
-	// See cmdHGet: defer to the slow path whenever cachedType has an
-	// authoritative answer, so prior DEL / RENAME / SET / HSET within
-	// this Eval is honored before the pebble probe fires.
+	// See cmdHGet: defer to the slow path whenever the key already has
+	// an authoritative answer locally, so prior DEL / RENAME / SET /
+	// HSET within this Eval is honored, AND so a confirmed-missing
+	// hash loaded earlier in the script does not re-run the
+	// wide-column probe on every subsequent HEXISTS.
+	if luaHashAlreadyLoaded(c, key) {
+		return hexistsFromSlowPath(c, key, field)
+	}
 	if _, cached := c.cachedType(key); cached {
 		return hexistsFromSlowPath(c, key, field)
 	}
@@ -2125,8 +2151,12 @@ func finalizeSetLikeRemoval(c *luaScriptContext, key string, removed int, empty 
 func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	member := args[1]
-	// See cmdHGet: defer to the slow path whenever cachedType has an
-	// authoritative answer.
+	// See cmdHGet: defer to the slow path whenever the set has an
+	// authoritative script-local answer (loaded state incl. miss, or
+	// cachedType reporting a different-type / deleted key).
+	if luaSetAlreadyLoaded(c, key) {
+		return sismemberFromSlowPath(c, key, member)
+	}
 	if _, cached := c.cachedType(key); cached {
 		return sismemberFromSlowPath(c, key, member)
 	}

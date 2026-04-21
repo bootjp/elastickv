@@ -528,6 +528,26 @@ return redis.call("ZSCORE", KEYS[1], "m")
 	require.ErrorIs(t, err, redis.Nil)
 }
 
+// TestLua_ZSCORE_ArityTooMany rejects a ZSCORE invocation with
+// trailing extra arguments. Real Redis enforces arity == 3 (command +
+// 2 args); silently ignoring extras hides bugs in caller scripts.
+func TestLua_ZSCORE_ArityTooMany(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZSCORE", KEYS[1], "m", "extra")`,
+		[]string{"lua:z:aritymany"},
+	).Result()
+	require.Error(t, err, "ZSCORE with extra arguments must be rejected, not silently ignored")
+	require.Contains(t, err.Error(), "wrong number of arguments")
+}
+
 // ZSCORE arity: the legacy handler returned nil when only the key was
 // given because the missing-key check fired first. The fast path
 // indexed args[1] unconditionally, which would panic on a 1-arg call.
@@ -571,4 +591,35 @@ return a .. "|" .. b .. "|" .. c
 `, []string{"lua:h:twofield"}).Result()
 	require.NoError(t, err)
 	require.Equal(t, "old|newval|nil", got)
+}
+
+// TestLua_HGET_RepeatedMissReusesLoadedState pins the optimisation
+// that a missing hash loaded once should NOT re-run the wide-column
+// probe on every subsequent HGET in the same Eval. The script does
+// N HGETs on the same missing key; if the fast-path guard correctly
+// honors an already-loaded luaHashState (even with exists=false),
+// only the first call reaches Pebble.
+func TestLua_HGET_RepeatedMissReusesLoadedState(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// 4 HGETs on the same missing key; the script must return nil for
+	// each and complete without divergent results. Correctness check
+	// only -- the optimisation itself is a seek-count saving that
+	// needs pprof to verify; this test guards against the guard
+	// regressing into returning wrong answers.
+	got, err := rdb.Eval(ctx, `
+local a = redis.call("HGET", KEYS[1], "f") or "nil"
+local b = redis.call("HGET", KEYS[1], "f") or "nil"
+local c = redis.call("HGET", KEYS[1], "f") or "nil"
+local d = redis.call("HGET", KEYS[1], "f") or "nil"
+return a .. "|" .. b .. "|" .. c .. "|" .. d
+`, []string{"lua:h:repeatedmiss"}).Result()
+	require.NoError(t, err)
+	require.Equal(t, "nil|nil|nil|nil", got)
 }
