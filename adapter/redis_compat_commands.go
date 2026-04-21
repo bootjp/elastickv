@@ -1809,6 +1809,14 @@ func (r *RedisServer) zsetRangeByScoreFast(
 	if eligible, err := r.zsetFastPathEligible(ctx, key, readTS); err != nil || !eligible {
 		return nil, false, err
 	}
+	// Large-offset short-circuit: once offset >= maxWideScanLimit,
+	// the fast path can only scan maxWideScanLimit rows then skip all
+	// of them -- guaranteed wasted I/O. Defer to the slow path
+	// immediately so it can answer from the full member load without
+	// the redundant score-index scan.
+	if offset >= maxWideScanLimit {
+		return nil, false, nil
+	}
 	scanLimit := zsetFastScanLimit(offset, limit)
 	if scanLimit <= 0 || bytes.Compare(startKey, endKey) >= 0 {
 		return r.zsetRangeEmptyFastResult(ctx, key, readTS)

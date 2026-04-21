@@ -1037,6 +1037,35 @@ func TestLua_ZRANGEBYSCORE_NegInfExactMatch(t *testing.T) {
 		"ZRANGEBYSCORE -inf -inf must return only members with score = -inf")
 }
 
+// TestLua_ZRANGEBYSCORE_LargeOffsetShortCircuit checks that a LIMIT
+// offset at or above maxWideScanLimit still returns the correct
+// result (empty because the offset exceeds the member count), via
+// the slow-path short-circuit rather than a wasteful score-index
+// scan + full skip.
+func TestLua_ZRANGEBYSCORE_LargeOffsetShortCircuit(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 3; i++ {
+		require.NoError(t, rdb.ZAdd(ctx, "lua:zr:largeoffset",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf", "LIMIT", "200000", "10")`,
+		[]string{"lua:zr:largeoffset"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got,
+		"large offset beyond member count must return empty, not panic or misroute")
+}
+
 // TestLua_ZRANGEBYSCORE_PosInfExactMatch pins the fast-path handling
 // of ZRANGEBYSCORE key +inf +inf: members with score = +inf MUST be
 // returned.
