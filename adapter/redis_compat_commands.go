@@ -1808,9 +1808,9 @@ func (r *RedisServer) zsetRangeByScoreFast(
 	offset, limit int,
 	scoreFilter func(float64) bool,
 	readTS uint64,
-) ([]redisZSetEntry, bool, string, error) {
+) ([]redisZSetEntry, bool, monitoring.LuaFastPathFallbackReason, error) {
 	if eligible, err := r.zsetFastPathEligible(ctx, key, readTS); err != nil || !eligible {
-		return nil, false, monitoring.LuaFastPathOutcomeFallbackIneligible, err
+		return nil, false, monitoring.LuaFastPathFallbackIneligible, err
 	}
 	// Large-offset short-circuit: once offset >= maxWideScanLimit,
 	// the fast path can only scan maxWideScanLimit rows then skip all
@@ -1818,7 +1818,7 @@ func (r *RedisServer) zsetRangeByScoreFast(
 	// immediately so it can answer from the full member load without
 	// the redundant score-index scan.
 	if offset >= maxWideScanLimit {
-		return nil, false, monitoring.LuaFastPathOutcomeFallbackLargeOffset, nil
+		return nil, false, monitoring.LuaFastPathFallbackLargeOffset, nil
 	}
 	scanLimit := zsetFastScanLimit(offset, limit)
 	if scanLimit <= 0 || bytes.Compare(startKey, endKey) >= 0 {
@@ -1827,7 +1827,7 @@ func (r *RedisServer) zsetRangeByScoreFast(
 	}
 	kvs, err := r.zsetScoreScan(ctx, startKey, endKey, scanLimit, reverse, readTS)
 	if err != nil {
-		return nil, false, monitoring.LuaFastPathOutcomeFallbackOther, err
+		return nil, false, monitoring.LuaFastPathFallbackOther, err
 	}
 	return r.finalizeZSetFastRange(ctx, key, kvs, offset, limit, scanLimit, scoreFilter, readTS)
 }
@@ -1846,15 +1846,15 @@ func (r *RedisServer) zsetRangeByScoreFast(
 func (r *RedisServer) finalizeZSetFastRange(
 	ctx context.Context, key []byte, kvs []*store.KVPair,
 	offset, limit, scanLimit int, scoreFilter func(float64) bool, readTS uint64,
-) ([]redisZSetEntry, bool, string, error) {
+) ([]redisZSetEntry, bool, monitoring.LuaFastPathFallbackReason, error) {
 	// Priority guard runs after a candidate hit (mirrors post-PR #565
 	// ordering). Skip it on empty result -- the empty-result tail
 	// handles disambiguation.
 	if len(kvs) > 0 {
 		if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
-			return nil, false, monitoring.LuaFastPathOutcomeFallbackOther, hErr
+			return nil, false, monitoring.LuaFastPathFallbackOther, hErr
 		} else if higher {
-			return nil, false, monitoring.LuaFastPathOutcomeFallbackWrongType, nil
+			return nil, false, monitoring.LuaFastPathFallbackWrongType, nil
 		}
 	}
 	entries := decodeZSetScoreRange(key, kvs, offset, limit, scoreFilter)
@@ -1862,7 +1862,7 @@ func (r *RedisServer) finalizeZSetFastRange(
 	// not get a satisfied result. Entries beyond the window may
 	// exist; defer to the slow path for correctness.
 	if zsetFastPathTruncated(len(kvs), scanLimit, len(entries), limit) {
-		return nil, false, monitoring.LuaFastPathOutcomeFallbackTruncated, nil
+		return nil, false, monitoring.LuaFastPathFallbackTruncated, nil
 	}
 	if len(entries) == 0 {
 		hit, reason, err := r.zsetRangeEmptyFastResult(ctx, key, readTS)
@@ -1870,7 +1870,7 @@ func (r *RedisServer) finalizeZSetFastRange(
 	}
 	expired, expErr := r.hasExpired(ctx, key, readTS, true)
 	if expErr != nil {
-		return nil, false, monitoring.LuaFastPathOutcomeFallbackOther, cockerrors.WithStack(expErr)
+		return nil, false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(expErr)
 	}
 	if expired {
 		return nil, true, "", nil
@@ -2017,25 +2017,25 @@ func decodeZSetScoreRange(
 // range is simply empty (callers return an empty array and no
 // fallback); hit=false carries a specific fallback reason so the
 // caller can route its slow-path observation accordingly.
-func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, readTS uint64) (bool, string, error) {
+func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, readTS uint64) (bool, monitoring.LuaFastPathFallbackReason, error) {
 	_, zsetExists, err := r.resolveZSetMeta(ctx, key, readTS)
 	if err != nil {
-		return false, monitoring.LuaFastPathOutcomeFallbackOther, cockerrors.WithStack(err)
+		return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(err)
 	}
 	if !zsetExists {
-		return false, monitoring.LuaFastPathOutcomeFallbackMissingKey, nil
+		return false, monitoring.LuaFastPathFallbackMissingKey, nil
 	}
 	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
-		return false, monitoring.LuaFastPathOutcomeFallbackOther, hErr
+		return false, monitoring.LuaFastPathFallbackOther, hErr
 	} else if higher {
-		return false, monitoring.LuaFastPathOutcomeFallbackWrongType, nil
+		return false, monitoring.LuaFastPathFallbackWrongType, nil
 	}
 	// hasExpired is called for its error-surfacing side effect only:
 	// whether the zset is expired or not, a live zset with no members
 	// in range returns an empty hit=true result. Keep the call so
 	// storage errors during TTL resolution still propagate.
 	if _, expErr := r.hasExpired(ctx, key, readTS, true); expErr != nil {
-		return false, monitoring.LuaFastPathOutcomeFallbackOther, cockerrors.WithStack(expErr)
+		return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(expErr)
 	}
 	return true, "", nil
 }

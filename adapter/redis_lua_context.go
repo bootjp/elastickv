@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -2466,7 +2467,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 // file are migrated incrementally.
 func (c *luaScriptContext) zrangeByScoreFastPath(
 	key []byte, options luaZRangeByScoreOptions, reverse bool,
-) ([]redisZSetEntry, bool, string, error) {
+) ([]redisZSetEntry, bool, monitoring.LuaFastPathFallbackReason, error) {
 	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
 	filter := func(score float64) bool {
 		return scoreInRange(score, options.minBound, options.maxBound)

@@ -37,8 +37,8 @@ func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
 	cmd.ObserveHit()
 	cmd.ObserveHit()
 	cmd.ObserveSkipLoaded()
-	cmd.ObserveFallback(LuaFastPathOutcomeFallbackMissingKey)
-	cmd.ObserveFallback(LuaFastPathOutcomeFallbackTruncated)
+	cmd.ObserveFallback(LuaFastPathFallbackMissingKey)
+	cmd.ObserveFallback(LuaFastPathFallbackTruncated)
 	cmd.ObserveFallback("bogus-reason") // routes to fallback_other
 
 	err := testutil.GatherAndCompare(
@@ -68,7 +68,7 @@ func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
 		cmd.ObserveHit()
 		cmd.ObserveSkipLoaded()
 		cmd.ObserveSkipCachedType()
-		cmd.ObserveFallback(LuaFastPathOutcomeFallbackMissingKey)
+		cmd.ObserveFallback(LuaFastPathFallbackMissingKey)
 		cmd.ObserveFallback("")
 	})
 }

@@ -44,15 +44,30 @@ const (
 	LuaFastPathOutcomeHit            = "hit"
 	LuaFastPathOutcomeSkipLoaded     = "skip_loaded"
 	LuaFastPathOutcomeSkipCachedType = "skip_cached_type"
-	// Server-side hit=false reasons. Subdivide "fallback" so operators
-	// can tell why the fast path gave up and route the fix accordingly
-	// (eligibility check, truncation, empty-key short-circuit, etc.).
-	LuaFastPathOutcomeFallbackIneligible  = "fallback_ineligible"
-	LuaFastPathOutcomeFallbackMissingKey  = "fallback_missing_key"
-	LuaFastPathOutcomeFallbackWrongType   = "fallback_wrong_type"
-	LuaFastPathOutcomeFallbackTruncated   = "fallback_truncated"
-	LuaFastPathOutcomeFallbackLargeOffset = "fallback_large_offset"
-	LuaFastPathOutcomeFallbackOther       = "fallback_other"
+)
+
+// LuaFastPathFallbackReason is the typed label for server-side
+// hit=false branches. A dedicated type (instead of a bare string)
+// lets Go catch typos in call sites — producers in adapter/ and the
+// switch in ObserveFallback stay in lockstep with the constants
+// below, and the Prometheus label value is derived directly from the
+// underlying string via string(reason).
+type LuaFastPathFallbackReason string
+
+// Known fallback reasons. Subdivides the generic "fallback" outcome
+// so operators can tell WHY the fast path gave up and route the fix
+// accordingly (eligibility check, truncation, empty-key
+// short-circuit, etc.).
+const (
+	LuaFastPathFallbackIneligible  LuaFastPathFallbackReason = "fallback_ineligible"
+	LuaFastPathFallbackMissingKey  LuaFastPathFallbackReason = "fallback_missing_key"
+	LuaFastPathFallbackWrongType   LuaFastPathFallbackReason = "fallback_wrong_type"
+	LuaFastPathFallbackTruncated   LuaFastPathFallbackReason = "fallback_truncated"
+	LuaFastPathFallbackLargeOffset LuaFastPathFallbackReason = "fallback_large_offset"
+	LuaFastPathFallbackOther       LuaFastPathFallbackReason = "fallback_other"
+	// LuaFastPathFallbackNone is the sentinel returned alongside
+	// hit=true; callers must not record it.
+	LuaFastPathFallbackNone LuaFastPathFallbackReason = ""
 )
 
 func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
@@ -147,12 +162,12 @@ func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
 		hit:                 vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
 		skipLoaded:          vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
 		skipCachedType:      vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
-		fallbackIneligible:  vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackIneligible),
-		fallbackMissingKey:  vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackMissingKey),
-		fallbackWrongType:   vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackWrongType),
-		fallbackTruncated:   vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackTruncated),
-		fallbackLargeOffset: vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackLargeOffset),
-		fallbackOther:       vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackOther),
+		fallbackIneligible:  vec.WithLabelValues(cmd, string(LuaFastPathFallbackIneligible)),
+		fallbackMissingKey:  vec.WithLabelValues(cmd, string(LuaFastPathFallbackMissingKey)),
+		fallbackWrongType:   vec.WithLabelValues(cmd, string(LuaFastPathFallbackWrongType)),
+		fallbackTruncated:   vec.WithLabelValues(cmd, string(LuaFastPathFallbackTruncated)),
+		fallbackLargeOffset: vec.WithLabelValues(cmd, string(LuaFastPathFallbackLargeOffset)),
+		fallbackOther:       vec.WithLabelValues(cmd, string(LuaFastPathFallbackOther)),
 	}
 }
 
@@ -177,21 +192,24 @@ func (c LuaFastPathCmd) ObserveSkipCachedType() {
 }
 
 // ObserveFallback routes to the counter for the given reason. Use
-// LuaFastPathOutcomeFallback* constants; unknown values land on the
-// "other" bucket so cardinality stays bounded.
-func (c LuaFastPathCmd) ObserveFallback(reason string) {
+// the LuaFastPathFallback* constants; unknown values (including the
+// zero value LuaFastPathFallbackNone, which should never reach here)
+// land on the "other" bucket so cardinality stays bounded.
+func (c LuaFastPathCmd) ObserveFallback(reason LuaFastPathFallbackReason) {
 	var counter prometheus.Counter
 	switch reason {
-	case LuaFastPathOutcomeFallbackIneligible:
+	case LuaFastPathFallbackIneligible:
 		counter = c.fallbackIneligible
-	case LuaFastPathOutcomeFallbackMissingKey:
+	case LuaFastPathFallbackMissingKey:
 		counter = c.fallbackMissingKey
-	case LuaFastPathOutcomeFallbackWrongType:
+	case LuaFastPathFallbackWrongType:
 		counter = c.fallbackWrongType
-	case LuaFastPathOutcomeFallbackTruncated:
+	case LuaFastPathFallbackTruncated:
 		counter = c.fallbackTruncated
-	case LuaFastPathOutcomeFallbackLargeOffset:
+	case LuaFastPathFallbackLargeOffset:
 		counter = c.fallbackLargeOffset
+	case LuaFastPathFallbackOther, LuaFastPathFallbackNone:
+		counter = c.fallbackOther
 	default:
 		counter = c.fallbackOther
 	}
