@@ -44,7 +44,15 @@ const (
 	LuaFastPathOutcomeHit            = "hit"
 	LuaFastPathOutcomeSkipLoaded     = "skip_loaded"
 	LuaFastPathOutcomeSkipCachedType = "skip_cached_type"
-	LuaFastPathOutcomeFallback       = "fallback"
+	// Server-side hit=false reasons. Subdivide "fallback" so operators
+	// can tell why the fast path gave up and route the fix accordingly
+	// (eligibility check, truncation, empty-key short-circuit, etc.).
+	LuaFastPathOutcomeFallbackIneligible  = "fallback_ineligible"
+	LuaFastPathOutcomeFallbackMissingKey  = "fallback_missing_key"
+	LuaFastPathOutcomeFallbackWrongType   = "fallback_wrong_type"
+	LuaFastPathOutcomeFallbackTruncated   = "fallback_truncated"
+	LuaFastPathOutcomeFallbackLargeOffset = "fallback_large_offset"
+	LuaFastPathOutcomeFallbackOther       = "fallback_other"
 )
 
 func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
@@ -80,7 +88,7 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 		luaFastPathTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_lua_cmd_fastpath_total",
-				Help: "Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback.",
+				Help: "Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback_* (subdivided by reason: ineligible, missing_key, wrong_type, truncated, large_offset, other).",
 			},
 			[]string{"cmd", "outcome"},
 		),
@@ -116,10 +124,15 @@ type LuaFastPathObserver struct {
 // LuaFastPathObserver.ForCommand(cmd) at server startup; call the
 // Observe* methods per redis.call(). Safe to copy.
 type LuaFastPathCmd struct {
-	hit            prometheus.Counter
-	skipLoaded     prometheus.Counter
-	skipCachedType prometheus.Counter
-	fallback       prometheus.Counter
+	hit                 prometheus.Counter
+	skipLoaded          prometheus.Counter
+	skipCachedType      prometheus.Counter
+	fallbackIneligible  prometheus.Counter
+	fallbackMissingKey  prometheus.Counter
+	fallbackWrongType   prometheus.Counter
+	fallbackTruncated   prometheus.Counter
+	fallbackLargeOffset prometheus.Counter
+	fallbackOther       prometheus.Counter
 }
 
 // ForCommand pre-resolves the counter handles for cmd. Returns a
@@ -131,15 +144,19 @@ func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
 	}
 	vec := o.metrics.luaFastPathTotal
 	return LuaFastPathCmd{
-		hit:            vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
-		skipLoaded:     vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
-		skipCachedType: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
-		fallback:       vec.WithLabelValues(cmd, LuaFastPathOutcomeFallback),
+		hit:                 vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
+		skipLoaded:          vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
+		skipCachedType:      vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
+		fallbackIneligible:  vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackIneligible),
+		fallbackMissingKey:  vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackMissingKey),
+		fallbackWrongType:   vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackWrongType),
+		fallbackTruncated:   vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackTruncated),
+		fallbackLargeOffset: vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackLargeOffset),
+		fallbackOther:       vec.WithLabelValues(cmd, LuaFastPathOutcomeFallbackOther),
 	}
 }
 
-// ObserveHit / ObserveSkipLoaded / ObserveSkipCachedType /
-// ObserveFallback record one outcome. Each is a single atomic
+// Observe* methods record one outcome. Each is a single atomic
 // increment when the counter is wired; a no-op on the zero value.
 func (c LuaFastPathCmd) ObserveHit() {
 	if c.hit != nil {
@@ -159,9 +176,27 @@ func (c LuaFastPathCmd) ObserveSkipCachedType() {
 	}
 }
 
-func (c LuaFastPathCmd) ObserveFallback() {
-	if c.fallback != nil {
-		c.fallback.Inc()
+// ObserveFallback routes to the counter for the given reason. Use
+// LuaFastPathOutcomeFallback* constants; unknown values land on the
+// "other" bucket so cardinality stays bounded.
+func (c LuaFastPathCmd) ObserveFallback(reason string) {
+	var counter prometheus.Counter
+	switch reason {
+	case LuaFastPathOutcomeFallbackIneligible:
+		counter = c.fallbackIneligible
+	case LuaFastPathOutcomeFallbackMissingKey:
+		counter = c.fallbackMissingKey
+	case LuaFastPathOutcomeFallbackWrongType:
+		counter = c.fallbackWrongType
+	case LuaFastPathOutcomeFallbackTruncated:
+		counter = c.fallbackTruncated
+	case LuaFastPathOutcomeFallbackLargeOffset:
+		counter = c.fallbackLargeOffset
+	default:
+		counter = c.fallbackOther
+	}
+	if counter != nil {
+		counter.Inc()
 	}
 }
 

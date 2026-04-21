@@ -2438,12 +2438,12 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		zrangeMetrics.ObserveSkipCachedType()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
-	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
+	entries, hit, fallbackReason, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
 	if fastErr != nil {
 		return luaReply{}, fastErr
 	}
 	if !hit {
-		zrangeMetrics.ObserveFallback()
+		zrangeMetrics.ObserveFallback(fallbackReason)
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	zrangeMetrics.ObserveHit()
@@ -2466,7 +2466,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 // file are migrated incrementally.
 func (c *luaScriptContext) zrangeByScoreFastPath(
 	key []byte, options luaZRangeByScoreOptions, reverse bool,
-) ([]redisZSetEntry, bool, error) {
+) ([]redisZSetEntry, bool, string, error) {
 	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
 	filter := func(score float64) bool {
 		return scoreInRange(score, options.minBound, options.maxBound)
