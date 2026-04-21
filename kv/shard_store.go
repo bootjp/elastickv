@@ -57,7 +57,16 @@ func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView)
 	if !isLeaderEngine(engine) {
 		return false
 	}
-	_, err := linearizableReadEngineCtx(ctx, engine)
+	// Lease-aware fence: when the engine's quorum-ack lease is fresh,
+	// leaseReadEngineCtx returns the current AppliedIndex without
+	// issuing a new read-index request. Previously this path always
+	// called LinearizableRead per GetAt, which funnelled every
+	// in-script redis.call through the single raft dispatch worker
+	// and starved heartbeats under sustained Lua load. The lease
+	// guarantees no concurrent leader exists within LeaseDuration,
+	// so the local applied index is still safe to serve; the slow
+	// read-index is only paid on lease miss.
+	_, err := leaseReadEngineCtx(ctx, engine)
 	return err == nil
 }
 
@@ -491,9 +500,10 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 	}
 
 	// Avoid returning a stale watermark when our local raft instance is a
-	// deposed leader.
+	// deposed leader. Lease-aware: on lease hit we skip the read-index
+	// round-trip (same rationale as isLinearizableRaftLeader).
 	if engine := engineForGroup(g); isLeaderEngine(engine) {
-		if _, err := linearizableReadEngineCtx(ctx, engine); err == nil {
+		if _, err := leaseReadEngineCtx(ctx, engine); err == nil {
 			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 			if err != nil {
 				return 0, false, errors.WithStack(err)
