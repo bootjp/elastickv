@@ -37,14 +37,21 @@ func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
 	cmd.ObserveHit()
 	cmd.ObserveHit()
 	cmd.ObserveSkipLoaded()
-	cmd.ObserveFallback()
+	cmd.ObserveFallback(LuaFastPathFallbackMissingKey)
+	cmd.ObserveFallback(LuaFastPathFallbackTruncated)
+	cmd.ObserveFallback("bogus-reason") // routes to fallback_other
 
 	err := testutil.GatherAndCompare(
 		registry.Gatherer(),
 		strings.NewReader(`
-# HELP elastickv_lua_cmd_fastpath_total Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback.
+# HELP elastickv_lua_cmd_fastpath_total Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback_* (subdivided by reason: ineligible, missing_key, wrong_type, truncated, large_offset, other).
 # TYPE elastickv_lua_cmd_fastpath_total counter
-elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback"} 1
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_ineligible"} 0
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_large_offset"} 0
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_missing_key"} 1
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_other"} 1
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_truncated"} 1
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback_wrong_type"} 0
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="hit"} 2
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_cached_type"} 0
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_loaded"} 1
@@ -61,7 +68,8 @@ func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
 		cmd.ObserveHit()
 		cmd.ObserveSkipLoaded()
 		cmd.ObserveSkipCachedType()
-		cmd.ObserveFallback()
+		cmd.ObserveFallback(LuaFastPathFallbackMissingKey)
+		cmd.ObserveFallback("")
 	})
 }
 
