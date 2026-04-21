@@ -204,17 +204,36 @@ func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte
 
 func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
-	if err != nil || typ == redisTypeNone {
+	if err != nil {
 		return typ, err
 	}
-	expired, err := r.hasExpiredTTLAt(ctx, key, readTS)
+	return r.applyTTLFilter(ctx, key, readTS, typ)
+}
+
+// applyTTLFilter takes a raw (TTL-unaware) type and returns the
+// TTL-filtered equivalent. Callers that need BOTH the raw and filtered
+// types (SET NX/XX/GET against a possibly-expired key) can reuse a
+// single rawKeyTypeAt result and skip the duplicate ~17-seek probe
+// that keyTypeAt would otherwise issue.
+//
+// For non-string raw types we skip the embedded-TTL probe that
+// hasExpired does by default: the embedded TTL only lives under
+// !redis|str|<key>, so probing it for a hash/set/zset/stream/list is
+// a guaranteed-miss GetAt. Passing nonStringOnly=true jumps straight
+// to the !redis|ttl| secondary index, saving one pebble seek per
+// non-string SET / type check.
+func (r *RedisServer) applyTTLFilter(ctx context.Context, key []byte, readTS uint64, rawTyp redisValueType) (redisValueType, error) {
+	if rawTyp == redisTypeNone {
+		return rawTyp, nil
+	}
+	expired, err := r.hasExpired(ctx, key, readTS, rawTyp != redisTypeString)
 	if err != nil {
 		return redisTypeNone, err
 	}
 	if expired {
 		return redisTypeNone, nil
 	}
-	return typ, nil
+	return rawTyp, nil
 }
 
 func (r *RedisServer) keyType(ctx context.Context, key []byte) (redisValueType, error) {
