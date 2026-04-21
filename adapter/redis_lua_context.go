@@ -2431,7 +2431,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	// Counter (see WithLuaFastPathObserver).
 	zrangeMetrics := c.server.luaFastPathZRange
 	if luaZSetAlreadyLoaded(c, key) {
-		zrangeMetrics.ObserveSkipAlreadyLoaded()
+		zrangeMetrics.ObserveSkipLoaded()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	if _, cached := c.cachedType(key); cached {

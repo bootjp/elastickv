@@ -36,7 +36,7 @@ func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
 
 	cmd.ObserveHit()
 	cmd.ObserveHit()
-	cmd.ObserveSkipAlreadyLoaded()
+	cmd.ObserveSkipLoaded()
 	cmd.ObserveFallback()
 
 	err := testutil.GatherAndCompare(
@@ -59,7 +59,7 @@ func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
 	cmd := observer.ForCommand("zrangebyscore")
 	require.NotPanics(t, func() {
 		cmd.ObserveHit()
-		cmd.ObserveSkipAlreadyLoaded()
+		cmd.ObserveSkipLoaded()
 		cmd.ObserveSkipCachedType()
 		cmd.ObserveFallback()
 	})

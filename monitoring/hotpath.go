@@ -42,7 +42,7 @@ type HotPathMetrics struct {
 // ZSCORE, HGET, etc.) actually takes the fast path vs falls back.
 const (
 	LuaFastPathOutcomeHit             = "hit"
-	LuaFastPathOutcomeSkipAlreadyLoad = "skip_loaded"
+	LuaFastPathOutcomeSkipLoaded = "skip_loaded"
 	LuaFastPathOutcomeSkipCachedType  = "skip_cached_type"
 	LuaFastPathOutcomeFallback        = "fallback"
 )
@@ -100,11 +100,13 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 // inside Lua scripts. The zero value is safe and silently drops
 // samples so tests can pass LuaFastPathObserver{} as a stub.
 //
-// Hot-path shape: each ObserveLuaFastPath-on-handle call is a single
-// atomic increment on a pre-resolved prometheus.Counter. Callers
-// resolve one LuaFastPathCmd per command at server construction to
-// avoid CounterVec.WithLabelValues (mutex-guarded map lookup) on the
-// hot path.
+// Hot-path shape: each Observe* call on a LuaFastPathCmd handle is a
+// single non-blocking atomic increment on a pre-resolved
+// prometheus.Counter (client_golang's default Counter uses
+// sync/atomic internally). Callers resolve one LuaFastPathCmd per
+// command at server construction to avoid
+// CounterVec.WithLabelValues (mutex-guarded map lookup) on the hot
+// path.
 type LuaFastPathObserver struct {
 	metrics *HotPathMetrics
 }
@@ -115,7 +117,7 @@ type LuaFastPathObserver struct {
 // Observe* methods per redis.call(). Safe to copy.
 type LuaFastPathCmd struct {
 	hit             prometheus.Counter
-	skipAlreadyLoad prometheus.Counter
+	skipLoaded prometheus.Counter
 	skipCachedType  prometheus.Counter
 	fallback        prometheus.Counter
 }
@@ -130,13 +132,13 @@ func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
 	vec := o.metrics.luaFastPathTotal
 	return LuaFastPathCmd{
 		hit:             vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
-		skipAlreadyLoad: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipAlreadyLoad),
+		skipLoaded: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
 		skipCachedType:  vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
 		fallback:        vec.WithLabelValues(cmd, LuaFastPathOutcomeFallback),
 	}
 }
 
-// ObserveHit / ObserveSkipAlreadyLoaded / ObserveSkipCachedType /
+// ObserveHit / ObserveSkipLoaded / ObserveSkipCachedType /
 // ObserveFallback record one outcome. Each is a single atomic
 // increment when the counter is wired; a no-op on the zero value.
 func (c LuaFastPathCmd) ObserveHit() {
@@ -145,9 +147,9 @@ func (c LuaFastPathCmd) ObserveHit() {
 	}
 }
 
-func (c LuaFastPathCmd) ObserveSkipAlreadyLoaded() {
-	if c.skipAlreadyLoad != nil {
-		c.skipAlreadyLoad.Inc()
+func (c LuaFastPathCmd) ObserveSkipLoaded() {
+	if c.skipLoaded != nil {
+		c.skipLoaded.Inc()
 	}
 }
 
