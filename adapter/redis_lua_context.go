@@ -2411,7 +2411,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	// Defensive bound on LIMIT offset: negative offsets produce no
 	// well-defined Redis behaviour, so treat them as syntax error.
 	if options.offset < 0 {
-		return luaReply{}, errors.New("ERR syntax error")
+		return luaReply{}, errors.New("ERR value is out of range, must be positive")
 	}
 	// Redis treats ANY negative LIMIT count as "no limit" (return all
 	// elements from offset). parseZRangeByScoreTail's default is -1;
