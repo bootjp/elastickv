@@ -2414,7 +2414,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	// guards the fast path's offset/limit arithmetic (zsetFastScanLimit
 	// + decodeZSetScoreRange) against panics on hostile script input
 	// and keeps maxWideScanLimit meaningful as a memory bound.
-	if options.offset < 0 || (options.limit < 0 && options.limit != -1) {
+	if options.offset < 0 || options.limit < -1 {
 		return luaReply{}, errors.New("ERR syntax error")
 	}
 	// Fast path eligibility: no script-local mutation / deletion /
@@ -2453,7 +2453,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 func (c *luaScriptContext) zrangeByScoreFastPath(
 	key []byte, options luaZRangeByScoreOptions, reverse bool,
 ) ([]redisZSetEntry, bool, error) {
-	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound, reverse)
+	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
 	filter := func(score float64) bool {
 		return scoreInRange(score, options.minBound, options.maxBound)
 	}
@@ -2523,12 +2523,11 @@ func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByS
 //	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
 //	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
 //
-// Reverse scans use the same [start, end) endpoints; ReverseScanAt
-// iterates from endKey downward.
-func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound, reverse bool) (startKey, endKey []byte) {
+// The same [start, end) endpoints drive both forward and reverse
+// scans; ReverseScanAt iterates from endKey downward.
+func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound) (startKey, endKey []byte) {
 	full := store.ZSetScoreScanPrefix(key)
 	fullEnd := store.PrefixScanEnd(full)
-	_ = reverse
 	switch minBound.kind {
 	case zBoundNegInf:
 		startKey = full
