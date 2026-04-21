@@ -2393,6 +2393,55 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 
 func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaReply, error) {
 	key := []byte(args[0])
+	options, err := parseZRangeByScoreOptions(args, reverse)
+	if err != nil {
+		return luaReply{}, err
+	}
+	// Fast path eligibility: no script-local mutation / deletion /
+	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
+	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
+	if luaZSetAlreadyLoaded(c, key) {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
+	if fastErr != nil {
+		return luaReply{}, fastErr
+	}
+	if !hit {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if len(entries) == 0 {
+		return luaArrayReply(), nil
+	}
+	return zsetRangeReply(entries, options.withScores), nil
+}
+
+// zrangeByScoreFastPath translates the caller's min/max bounds into a
+// bounded score-index scan through zsetRangeByScoreFast and returns
+// the decoded entries. hit=false means the server-side helper wants
+// the slow path (legacy-blob zset, string-encoding corruption, or
+// empty-result-but-zset-is-missing so WRONGTYPE disambiguation is
+// needed).
+func (c *luaScriptContext) zrangeByScoreFastPath(
+	key []byte, options luaZRangeByScoreOptions, reverse bool,
+) ([]redisZSetEntry, bool, error) {
+	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound, reverse)
+	filter := func(score float64) bool {
+		return scoreInRange(score, options.minBound, options.maxBound)
+	}
+	return c.server.zsetRangeByScoreFast(
+		context.Background(), key, startKey, endKey, reverse,
+		options.offset, options.limit, filter, c.startTS,
+	)
+}
+
+// cmdZRangeByScoreSlow is the legacy full-load path, preserved for
+// fall-through cases (in-script mutations, legacy-blob encoding,
+// ambiguous empty results).
+func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByScoreOptions, reverse bool) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2406,12 +2455,6 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if err := c.ensureZSetLoaded(st, key); err != nil {
 		return luaReply{}, err
 	}
-
-	options, err := parseZRangeByScoreOptions(args, reverse)
-	if err != nil {
-		return luaReply{}, err
-	}
-
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
@@ -2422,6 +2465,52 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaArrayReply(), nil
 	}
 	return zsetRangeReply(selected, options.withScores), nil
+}
+
+// zsetScoreScanBounds maps zScoreBound pairs to an over-approximated
+// [startKey, endKey) byte-range on the score index. Exclusive bounds
+// and equality edges are handled post-scan by scoreInRange; this
+// helper just picks scan endpoints that bracket the range without
+// accidentally excluding eligible entries.
+//
+// The score index is lex-sorted by (userKey, sortableScore, member).
+// For a forward scan, the scan bound conventions are:
+//
+//	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)
+//	minBound = value (inc or exc)-> startKey = ZSetScoreRangeScanPrefix(key, score)
+//	                                (exclusive edge dropped post-scan)
+//	maxBound = +Inf              -> endKey   = PrefixScanEnd(ZSetScoreScanPrefix(key))
+//	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
+//
+// Reverse scans use the same [start, end) endpoints; ReverseScanAt
+// iterates from endKey downward.
+func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound, reverse bool) (startKey, endKey []byte) {
+	full := store.ZSetScoreScanPrefix(key)
+	fullEnd := store.PrefixScanEnd(full)
+	_ = reverse
+	switch minBound.kind {
+	case zBoundNegInf:
+		startKey = full
+	case zBoundValue:
+		startKey = store.ZSetScoreRangeScanPrefix(key, minBound.score)
+	case zBoundPosInf:
+		startKey = fullEnd
+	}
+	switch maxBound.kind {
+	case zBoundNegInf:
+		endKey = full
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, maxBound.score)
+		if maxBound.inclusive {
+			endKey = store.PrefixScanEnd(scorePrefix)
+		} else {
+			endKey = scorePrefix
+		}
+	case zBoundPosInf:
+		endKey = fullEnd
+	}
+	return startKey, endKey
 }
 
 type luaZRangeByScoreOptions struct {

@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1777,6 +1778,169 @@ func (r *RedisServer) zsetMemberFastScore(ctx context.Context, key, member []byt
 		return 0, false, false, cockerrors.WithStack(expErr)
 	}
 	return score, true, !expired, nil
+}
+
+// zsetRangeByScoreFast streams the score index for key over the
+// caller-supplied [startKey, endKey) byte range, returning the
+// decoded entries up to offset+limit. This replaces the
+// load-the-whole-zset path used by cmdZRangeByScore / cmdZRevRangeByScore
+// when the caller has no script-local mutations and the zset is in
+// wide-column form. For a delay-queue poll ("next 10 jobs due by
+// now") the cost goes from O(N) member GetAts to O(range_width +
+// offset + limit) score-index entries.
+//
+// hit=false means the fast path cannot safely answer (legacy-blob
+// zset present, string-encoding corruption, or empty-result case
+// where we cannot distinguish "zset is empty in this range" from
+// "key exists as another type / is missing"). Callers MUST take
+// the slow path on hit=false so keyTypeAt disambiguation fires.
+//
+// scoreInRange filter is applied post-scan for exclusive bound
+// edge cases; the caller supplies precomputed scan bounds that
+// over-approximate toward INclusive and lets this helper filter.
+func (r *RedisServer) zsetRangeByScoreFast(
+	ctx context.Context,
+	key, startKey, endKey []byte,
+	reverse bool,
+	offset, limit int,
+	scoreFilter func(float64) bool,
+	readTS uint64,
+) ([]redisZSetEntry, bool, error) {
+	if eligible, err := r.zsetFastPathEligible(ctx, key, readTS); err != nil || !eligible {
+		return nil, false, err
+	}
+	scanLimit := zsetFastScanLimit(offset, limit)
+	if scanLimit <= 0 || bytes.Compare(startKey, endKey) >= 0 {
+		return r.zsetRangeEmptyFastResult(ctx, key, readTS)
+	}
+	kvs, err := r.zsetScoreScan(ctx, startKey, endKey, scanLimit, reverse, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return r.finalizeZSetFastRange(ctx, key, kvs, offset, limit, scoreFilter, readTS)
+}
+
+// finalizeZSetFastRange runs the post-scan priority guard, decodes
+// the candidate score rows into redisZSetEntry, and applies the TTL
+// filter. Factored out so zsetRangeByScoreFast stays under the
+// cyclomatic-complexity cap.
+func (r *RedisServer) finalizeZSetFastRange(
+	ctx context.Context, key []byte, kvs []*store.KVPair,
+	offset, limit int, scoreFilter func(float64) bool, readTS uint64,
+) ([]redisZSetEntry, bool, error) {
+	// Priority guard runs after a candidate hit (mirrors post-PR #565
+	// ordering). Skip it on empty result -- the empty-result tail
+	// handles disambiguation via ZSetMetaKey.
+	if len(kvs) > 0 {
+		if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+			return nil, false, hErr
+		} else if higher {
+			return nil, false, nil
+		}
+	}
+	entries := decodeZSetScoreRange(key, kvs, offset, limit, scoreFilter)
+	if len(entries) == 0 {
+		return r.zsetRangeEmptyFastResult(ctx, key, readTS)
+	}
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
+	if expErr != nil {
+		return nil, false, cockerrors.WithStack(expErr)
+	}
+	if expired {
+		return nil, true, nil
+	}
+	return entries, true, nil
+}
+
+// zsetFastPathEligible returns false (without error) when a legacy-
+// blob zset is present; the caller must take the slow path so
+// ensureZSetLoaded / blob decoding runs.
+func (r *RedisServer) zsetFastPathEligible(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	legacyExists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	return !legacyExists, nil
+}
+
+// zsetFastScanLimit clamps offset+limit to maxWideScanLimit so an
+// unbounded or malicious LIMIT cannot force an O(N) scan of a large
+// zset. A negative limit means "unbounded" at the Redis level; cap it
+// at the collection OOM limit.
+func zsetFastScanLimit(offset, limit int) int {
+	if limit < 0 {
+		return maxWideScanLimit
+	}
+	scanLimit := offset + limit
+	if scanLimit > maxWideScanLimit {
+		return maxWideScanLimit
+	}
+	return scanLimit
+}
+
+// zsetScoreScan picks Forward / Reverse ScanAt based on direction.
+func (r *RedisServer) zsetScoreScan(
+	ctx context.Context, startKey, endKey []byte, scanLimit int, reverse bool, readTS uint64,
+) ([]*store.KVPair, error) {
+	if reverse {
+		kvs, err := r.store.ReverseScanAt(ctx, startKey, endKey, scanLimit, readTS)
+		return kvs, cockerrors.WithStack(err)
+	}
+	kvs, err := r.store.ScanAt(ctx, startKey, endKey, scanLimit, readTS)
+	return kvs, cockerrors.WithStack(err)
+}
+
+// decodeZSetScoreRange decodes score-index scan results into
+// redisZSetEntry, applying the post-scan score filter (exclusive
+// bound edges) and the offset / limit pagination. Entries that fail
+// to decode are silently dropped -- they can only appear under data
+// corruption.
+func decodeZSetScoreRange(
+	key []byte, kvs []*store.KVPair, offset, limit int, scoreFilter func(float64) bool,
+) []redisZSetEntry {
+	entries := make([]redisZSetEntry, 0, len(kvs))
+	skipped := 0
+	for _, kv := range kvs {
+		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
+		if !ok {
+			continue
+		}
+		if scoreFilter != nil && !scoreFilter(score) {
+			continue
+		}
+		if skipped < offset {
+			skipped++
+			continue
+		}
+		if limit >= 0 && len(entries) >= limit {
+			break
+		}
+		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
+	}
+	return entries
+}
+
+// zsetRangeEmptyFastResult is the empty-result tail: either the
+// score range is genuinely empty on a live zset (return empty +
+// hit=true) or the zset does not exist in wide-column form (return
+// hit=false so the caller takes the slow path for WRONGTYPE / missing
+// disambiguation).
+func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, bool, error) {
+	metaExists, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS)
+	if err != nil {
+		return nil, false, cockerrors.WithStack(err)
+	}
+	if !metaExists {
+		return nil, false, nil
+	}
+	expired, expErr := r.hasExpired(ctx, key, readTS, true)
+	if expErr != nil {
+		return nil, false, cockerrors.WithStack(expErr)
+	}
+	if expired {
+		return nil, true, nil
+	}
+	return nil, true, nil
 }
 
 // hgetSlow falls back to the type-probing path when hashFieldFastLookup

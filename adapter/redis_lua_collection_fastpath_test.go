@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -629,4 +630,228 @@ func TestLua_ZSCORE_ArityTooMany(t *testing.T) {
 	).Result()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "wrong number of arguments")
+}
+
+// --- ZRANGEBYSCORE streaming fast-path (Phase B) ---
+
+// TestLua_ZRANGEBYSCORE_FastPathHit pins the hot-case BullMQ pattern:
+// a bounded delay-queue poll returns only the range entries, without
+// loading every member.
+func TestLua_ZRANGEBYSCORE_FastPathHit(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 10; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:fast",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], ARGV[1], ARGV[2])`,
+		[]string{"lua:zr:fast"}, "3", "6",
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m3", "m4", "m5", "m6"}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_FastPathHitWithScores(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:scores",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "2", "4", "WITHSCORES")`,
+		[]string{"lua:zr:scores"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m2", "2", "m3", "3", "m4", "4"}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_LimitOffset(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 10; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:limit",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	// LIMIT 2 3: skip first 2 matches, take next 3. Range 1..10 matches
+	// m1..m10; offset 2 drops m1 m2, limit 3 picks m3 m4 m5.
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf", "LIMIT", "2", "3")`,
+		[]string{"lua:zr:limit"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m3", "m4", "m5"}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_ExclusiveBounds(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:excl",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	// (2 (4 means strictly between 2 and 4 -> only m3.
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "(2", "(4")`,
+		[]string{"lua:zr:excl"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m3"}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_EmptyRange(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:emptyrange", redis.Z{Score: 5, Member: "m"}).Err())
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "10", "20")`,
+		[]string{"lua:zr:emptyrange"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_MissingKey(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:missing"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_WRONGTYPE(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Set(ctx, "lua:zr:str", "x", 0).Err())
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:str"},
+	).Result()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "WRONGTYPE")
+}
+
+func TestLua_ZRANGEBYSCORE_HonorsInScriptZAdd(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// Seed one member in pebble, add another in-script; both must
+	// appear in the subsequent ZRANGEBYSCORE inside the SAME Eval.
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:rw", redis.Z{Score: 1, Member: "seeded"}).Err())
+
+	got, err := rdb.Eval(ctx, `
+redis.call("ZADD", KEYS[1], "2", "newm")
+return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")
+`, []string{"lua:zr:rw"}).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"seeded", "newm"}, got)
+}
+
+func TestLua_ZREVRANGEBYSCORE_FastPathHit(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zrr:fast",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZREVRANGEBYSCORE", KEYS[1], "4", "2")`,
+		[]string{"lua:zrr:fast"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m4", "m3", "m2"}, got)
+}
+
+func TestLua_ZRANGEBYSCORE_TTLExpired(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:ttl", redis.Z{Score: 1, Member: "m"}).Err())
+	require.NoError(t, rdb.PExpire(ctx, "lua:zr:ttl", luaFastPathTTL).Err())
+	waitForLuaTTL()
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:ttl"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got)
 }
