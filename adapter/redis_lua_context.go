@@ -19,6 +19,16 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
+	// ctx is the request-scoped context captured at newLuaScriptContext
+	// time. New cmd* handlers should propagate it into store operations
+	// so the Eval's deadline and cancellation reach storage.
+	//
+	// Existing handlers in this file still use context.Background() at
+	// their store call sites -- a historical pattern from before we had
+	// a ctx available. Migrating those is tracked as a follow-up PR;
+	// see PR #570's review for the gemini note on scope.
+	ctx context.Context
+
 	redisCallDuration time.Duration
 	redisCallCount    int
 
@@ -226,6 +236,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		server:      server,
 		startTS:     startTS,
 		readPin:     server.pinReadTS(startTS),
+		ctx:         ctx,
 		touched:     map[string]struct{}{},
 		deleted:     map[string]bool{},
 		everDeleted: map[string]bool{},
@@ -2425,6 +2436,11 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 // the slow path (legacy-blob zset, string-encoding corruption, or
 // empty-result-but-zset-is-missing so WRONGTYPE disambiguation is
 // needed).
+//
+// Threads c.ctx into the server-side helper so the Eval's deadline
+// and cancellation reach the store layer. New cmd* handlers should
+// follow this pattern; historical Background() call sites in this
+// file are migrated incrementally.
 func (c *luaScriptContext) zrangeByScoreFastPath(
 	key []byte, options luaZRangeByScoreOptions, reverse bool,
 ) ([]redisZSetEntry, bool, error) {
@@ -2433,9 +2449,21 @@ func (c *luaScriptContext) zrangeByScoreFastPath(
 		return scoreInRange(score, options.minBound, options.maxBound)
 	}
 	return c.server.zsetRangeByScoreFast(
-		context.Background(), key, startKey, endKey, reverse,
+		c.scriptCtx(), key, startKey, endKey, reverse,
 		options.offset, options.limit, filter, c.startTS,
 	)
+}
+
+// scriptCtx returns the request-scoped context captured at script
+// construction, or context.Background() if the caller bypassed the
+// normal entry point (unit tests constructing a luaScriptContext
+// directly). New code should always have a real ctx, so this is a
+// defensive fallback.
+func (c *luaScriptContext) scriptCtx() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
 }
 
 // cmdZRangeByScoreSlow is the legacy full-load path, preserved for
