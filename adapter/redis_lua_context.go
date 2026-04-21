@@ -43,6 +43,11 @@ type luaScriptContext struct {
 	// populate the concrete-type state (c.strings/c.zsets/... with
 	// exists=true), which cachedType() returns first, so the negative
 	// cache is shadowed without needing explicit invalidation.
+	//
+	// Bounded by maxNegativeTypeCacheEntries to prevent a malicious or
+	// buggy script from probing unbounded unique non-existent keys and
+	// blowing up memory. Once full, further misses fall back to the
+	// server-side probe (still correct, just not cached).
 	negativeType map[string]bool
 
 	// keyTypeProbeCount counts how many times the server-side keyTypeAt
@@ -444,6 +449,13 @@ func hasLoadedStreamValue(st *luaStreamState) bool {
 	return st != nil && st.loaded && st.exists
 }
 
+// maxNegativeTypeCacheEntries caps the size of luaScriptContext.negativeType
+// so a malicious or buggy script probing unbounded unique non-existent keys
+// cannot balloon memory. Matches the magnitude of kv.maxReadKeys (10_000),
+// which already bounds the read-set of a single transaction; once the cache
+// is full, further keyTypeAt misses are correctly returned but not memoized.
+const maxNegativeTypeCacheEntries = 10_000
+
 func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	if typ, ok := c.cachedType(key); ok {
 		if typ != redisTypeNone {
@@ -453,15 +465,19 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	}
 
 	c.keyTypeProbeCount++
-	typ, err := c.server.keyTypeAt(context.Background(), key, c.startTS)
+	typ, err := c.server.keyTypeAt(c.scriptCtx(), key, c.startTS)
 	if err != nil {
 		return redisTypeNone, err
 	}
-	if typ == redisTypeNone {
+	if typ == redisTypeNone && len(c.negativeType) < maxNegativeTypeCacheEntries {
 		// Pin the absence result for the rest of this Eval so repeated
 		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
 		// does not re-run the ~8-seek rawKeyTypeAt probe on every
 		// redis.call.
+		//
+		// Bounded to keep adversarial scripts from growing the map
+		// unboundedly; once full, subsequent misses correctly fall
+		// through to the server probe without caching.
 		c.negativeType[string(key)] = true
 	}
 	return typ, nil
