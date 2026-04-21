@@ -40,12 +40,12 @@ For `EVAL`/`EVALSHA` on the adapter:
 5. After `state.PCall` returns, `runLuaScript` calls `scriptCtx.commit()`
    **exactly once**.
 6. `commit()`
-   (`adapter/redis_lua_context.go`, around line 3045) walks the sorted set of
+   (in the `commit()` method of `adapter/redis_lua_context.go`) walks the sorted set of
    touched keys, builds `luaKeyPlan` elements for each (via
    `commitPlanForKey` -> `zsetCommitPlan` / `hashCommitElems` /
    `listCommitPlan` / `setCommitElems` / `stringCommitElems` / ...), appends
    the non-string `!redis|ttl|` index entries, and issues **one**
-   `c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{ IsTxn: true, StartTS, CommitTS, Elems })`
+   `c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{ IsTxn: true, StartTS: startTS, CommitTS: commitTS, Elems: elems })`
    carrying the union of every key's elements across the whole script.
 
 A `grep` over `adapter/redis_lua_context.go` confirms exactly one `Dispatch`
@@ -97,7 +97,7 @@ not relevant here.
     `luaStreamState`, `luaTTLState`)
   - `newLuaScriptContext` / `Close` (lease-read + startTS pin + release)
   - `exec` (dispatch to `luaCommandHandlers`)
-  - `commit` (the single `coordinator.Dispatch` site, ~L3084)
+  - `commit` (the single coordinator.Dispatch site)
   - `commitPlanForKey`, `valueCommitPlan`, and the per-type
     `*CommitPlan` / `*CommitElems` helpers that assemble the shared `Elems`
     slice
