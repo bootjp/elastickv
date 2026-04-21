@@ -3545,7 +3545,15 @@ func sortedSetMembers(members map[string]struct{}) []string {
 }
 
 func zsetRangeReply(entries []redisZSetEntry, withScores bool) luaReply {
-	out := make([]luaReply, 0, len(entries))
+	// WITHSCORES doubles the output width (member + score per entry);
+	// size the slice accordingly to avoid an internal grow on large
+	// reply arrays. Bounded by maxWideScanLimit at the fast-path
+	// layer, so the allocation cannot be unbounded.
+	capacity := len(entries)
+	if withScores {
+		capacity *= 2
+	}
+	out := make([]luaReply, 0, capacity)
 	for _, entry := range entries {
 		out = append(out, luaStringReply(entry.Member))
 		if withScores {

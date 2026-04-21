@@ -2020,12 +2020,12 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 	} else if higher {
 		return nil, false, nil
 	}
-	expired, expErr := r.hasExpired(ctx, key, readTS, true)
-	if expErr != nil {
+	// hasExpired is called for its error-surfacing side effect only:
+	// whether the zset is expired or not, a live zset with no members
+	// in range returns an empty hit=true result. Keep the call so
+	// storage errors during TTL resolution still propagate.
+	if _, expErr := r.hasExpired(ctx, key, readTS, true); expErr != nil {
 		return nil, false, cockerrors.WithStack(expErr)
-	}
-	if expired {
-		return nil, true, nil
 	}
 	return nil, true, nil
 }
