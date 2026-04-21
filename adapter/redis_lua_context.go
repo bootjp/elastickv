@@ -669,6 +669,16 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	c.zsets[k] = st
 
+	// Script-local type override: if a prior DEL / SET / type-change
+	// in this Eval has cached a different type for this key, the
+	// pre-script storage probe in zsetStorageHintAt would leak stale
+	// state (e.g. returning a live ZSet after an in-script SET).
+	// Mirror the keyType() fallback order: cachedType first, storage
+	// second.
+	if st, handled, err := c.zsetStateFromCachedType(key, st); handled {
+		return st, err
+	}
+
 	// zsetStorageHintAt performs the member-prefix scan once, so we never need
 	// a second ScanAt after type detection.
 	h, err := c.server.zsetStorageHintAt(context.Background(), key, c.startTS)
@@ -706,6 +716,29 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	st.legacyBlobBase = blobExists
 	return st, nil
+}
+
+// zsetStateFromCachedType applies the script-local cached type (if
+// any) and returns (state, handled=true, err) when the answer is
+// determined entirely by in-script mutations. Returns handled=false
+// when the caller must fall through to the storage probe.
+func (c *luaScriptContext) zsetStateFromCachedType(key []byte, st *luaZSetState) (*luaZSetState, bool, error) {
+	typ, cached := c.cachedType(key)
+	if !cached {
+		return nil, false, nil
+	}
+	if typ == redisTypeNone {
+		st.loaded = true
+		return st, true, nil
+	}
+	if typ == redisTypeZSet {
+		// Live ZSet via in-script mutation — loadZSetAt under
+		// ensureZSetLoaded will surface the pre-script storage rows.
+		st.loaded = true
+		st.exists = true
+		return st, true, nil
+	}
+	return nil, true, wrongTypeError()
 }
 
 // ensureZSetLoaded loads all ZSet members from storage if not already loaded,

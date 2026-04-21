@@ -61,6 +61,23 @@ func normalizeStartTS(ts uint64) uint64 {
 // correctly detect collections whose fields were all deleted (metadata key exists but
 // no member keys) or newly created collections that only have delta keys.
 func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	if typ, err := r.detectWideColumnTypeSkipZSet(ctx, key, readTS); err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix); err != nil {
+		return redisTypeNone, err
+	} else if found {
+		return redisTypeZSet, nil
+	}
+	return redisTypeNone, nil
+}
+
+// detectWideColumnTypeSkipZSet runs the wide-column hash / set probes
+// only. Callers that have already eliminated ZSet (e.g.
+// rawZSetPhysTypeAt's fallback after the member-prefix and meta/delta
+// scans came back empty) use this to avoid re-issuing the three
+// ZSet-side probes detectWideColumnType would otherwise repeat.
+func (r *RedisServer) detectWideColumnTypeSkipZSet(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix); err != nil {
 		return redisTypeNone, err
 	} else if found {
@@ -70,11 +87,6 @@ func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, read
 		return redisTypeNone, err
 	} else if found {
 		return redisTypeSet, nil
-	}
-	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix); err != nil {
-		return redisTypeNone, err
-	} else if found {
-		return redisTypeZSet, nil
 	}
 	return redisTypeNone, nil
 }
@@ -165,9 +177,27 @@ func (r *RedisServer) rawZSetPhysTypeAt(ctx context.Context, key []byte, readTS 
 	if zsetOnly {
 		return redisTypeZSet, false, nil
 	}
-	// Not a wide-column ZSet — full detection for other types.
-	physType, err := r.rawKeyTypeAt(ctx, key, readTS)
+	// Not a wide-column ZSet — probe other types without re-scanning
+	// the three ZSet-side prefixes we already ruled out above.
+	physType, err := r.rawKeyTypeAtSkipZSet(ctx, key, readTS)
 	return physType, false, err
+}
+
+// rawKeyTypeAtSkipZSet is rawKeyTypeAt minus the ZSet wide-column
+// probes. Used by rawZSetPhysTypeAt when the caller has already
+// confirmed no ZSet member / meta / delta rows exist, so the three
+// ZSet probes inside detectWideColumnType would be pure redundant I/O.
+func (r *RedisServer) rawKeyTypeAtSkipZSet(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	if typ, found, err := r.probeStringTypes(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, found, err := r.probeListType(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, err := r.detectWideColumnTypeSkipZSet(ctx, key, readTS); err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.probeLegacyCollectionTypes(ctx, key, readTS)
 }
 
 // zsetMetaOrDeltaExistsAt reports whether a ZSet meta key or delta prefix exists.
