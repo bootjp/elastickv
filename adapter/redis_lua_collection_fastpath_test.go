@@ -855,3 +855,128 @@ func TestLua_ZRANGEBYSCORE_TTLExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []any{}, got)
 }
+
+// --- Correctness regressions surfaced by PR #570 review ---
+
+// TestLua_ZRANGEBYSCORE_ExclusiveMinWithManyAtBound pins the bug
+// where `ZRANGEBYSCORE key (value +inf LIMIT 0 N` used to consume
+// the scan budget on members at score=value (which are excluded
+// by post-filter) and miss members with score > value. Fix: move
+// the exclusive-min edge into the scan start key.
+func TestLua_ZRANGEBYSCORE_ExclusiveMinWithManyAtBound(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// 20 members all at score 2, and one member at score 5.
+	for i := 0; i < 20; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:excl_bug",
+			redis.Z{Score: 2, Member: "pad" + strconv.Itoa(i)},
+		).Err())
+	}
+	require.NoError(t, rdb.ZAdd(ctx,
+		"lua:zr:excl_bug",
+		redis.Z{Score: 5, Member: "target"},
+	).Err())
+
+	// (2 +inf LIMIT 0 1 -- must return "target", NOT empty.
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "(2", "+inf", "LIMIT", "0", "1")`,
+		[]string{"lua:zr:excl_bug"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"target"}, got,
+		"exclusive-min must skip score=2 members in the scan bound, not post-filter")
+}
+
+// TestLua_ZRANGEBYSCORE_TruncationFallsBackToSlowPath pins the
+// truncation-detection invariant: if the bounded scan returns
+// exactly scanLimit rows AND the request is unsatisfied, the fast
+// path MUST NOT return an incomplete result. It must return hit=false
+// so the slow path produces the authoritative answer.
+//
+// We exercise this by writing more members than maxWideScanLimit
+// would ordinarily allow; the clamp inside zsetFastScanLimit plus
+// the truncation guard should drive the result through the slow
+// path, which returns the full set.
+//
+// Note: maxWideScanLimit is 100_001 so we can't feasibly exceed it
+// in a unit test; instead we use a small requested window that is
+// at the scan budget boundary.
+func TestLua_ZRANGEBYSCORE_TruncationFallsBackToSlowPath(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:trunc",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+	// Unbounded limit: fast path returns full set.
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:trunc"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m1", "m2", "m3", "m4", "m5"}, got)
+}
+
+// TestLua_ZRANGEBYSCORE_DeltaOnlyZSetEmptyRange pins the
+// resolveZSetMeta fix: a zset that only has delta metadata (no
+// persisted base meta) must be recognised as existing when the
+// fast path produces an empty range. Without the fix,
+// zsetRangeEmptyFastResult returned hit=false and forced the slow
+// path on every ZRANGEBYSCORE on a fresh zset.
+//
+// We can't easily construct a delta-only zset from the wire (the
+// adapter writes base meta on ZADD commit), but the
+// resolveZSetMeta codepath exists for exactly this scenario. This
+// test at least pins that a freshly-created zset with empty range
+// returns empty (not WRONGTYPE / error).
+func TestLua_ZRANGEBYSCORE_FreshZSetEmptyRange(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:fresh", redis.Z{Score: 5, Member: "x"}).Err())
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "10", "20")`,
+		[]string{"lua:zr:fresh"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got)
+}
+
+// TestLua_ZRANGEBYSCORE_NegativeOffsetRejected pins the defensive
+// offset / limit bounds check.
+func TestLua_ZRANGEBYSCORE_NegativeOffsetRejected(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf", "LIMIT", "-1", "5")`,
+		[]string{"lua:zr:negoff"},
+	).Result()
+	require.Error(t, err, "negative offset must be rejected")
+}

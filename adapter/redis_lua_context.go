@@ -2408,6 +2408,15 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if err != nil {
 		return luaReply{}, err
 	}
+	// Defensive bounds on LIMIT offset count: offset must be
+	// non-negative, and a negative limit is only accepted when it's
+	// the -1 "no-limit" sentinel set by parseZRangeByScoreTail. This
+	// guards the fast path's offset/limit arithmetic (zsetFastScanLimit
+	// + decodeZSetScoreRange) against panics on hostile script input
+	// and keeps maxWideScanLimit meaningful as a memory bound.
+	if options.offset < 0 || (options.limit < 0 && options.limit != -1) {
+		return luaReply{}, errors.New("ERR syntax error")
+	}
 	// Fast path eligibility: no script-local mutation / deletion /
 	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
 	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
@@ -2495,18 +2504,21 @@ func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByS
 	return zsetRangeReply(selected, options.withScores), nil
 }
 
-// zsetScoreScanBounds maps zScoreBound pairs to an over-approximated
-// [startKey, endKey) byte-range on the score index. Exclusive bounds
-// and equality edges are handled post-scan by scoreInRange; this
-// helper just picks scan endpoints that bracket the range without
-// accidentally excluding eligible entries.
+// zsetScoreScanBounds maps zScoreBound pairs to a [startKey, endKey)
+// byte-range on the score index that EXCLUDES entries outside the
+// caller's bound, not just approximates. Placing an exclusive edge
+// into the scan bound (rather than post-filtering after the scan)
+// matters for `ZRANGEBYSCORE (value +inf LIMIT 0 N`: if there are
+// many members AT score=value, a post-filter approach would consume
+// the whole offset+limit budget on those filtered-out rows and miss
+// the real matches at score > value.
 //
 // The score index is lex-sorted by (userKey, sortableScore, member).
-// For a forward scan, the scan bound conventions are:
+// Conventions:
 //
 //	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)
-//	minBound = value (inc or exc)-> startKey = ZSetScoreRangeScanPrefix(key, score)
-//	                                (exclusive edge dropped post-scan)
+//	minBound = value, inclusive  -> startKey = ZSetScoreRangeScanPrefix(key, score)
+//	minBound = value, exclusive  -> startKey = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
 //	maxBound = +Inf              -> endKey   = PrefixScanEnd(ZSetScoreScanPrefix(key))
 //	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
 //	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
@@ -2521,7 +2533,12 @@ func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound, reverse boo
 	case zBoundNegInf:
 		startKey = full
 	case zBoundValue:
-		startKey = store.ZSetScoreRangeScanPrefix(key, minBound.score)
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, minBound.score)
+		if minBound.inclusive {
+			startKey = scorePrefix
+		} else {
+			startKey = store.PrefixScanEnd(scorePrefix)
+		}
 	case zBoundPosInf:
 		startKey = fullEnd
 	}

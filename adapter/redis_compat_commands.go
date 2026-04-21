@@ -1817,20 +1817,27 @@ func (r *RedisServer) zsetRangeByScoreFast(
 	if err != nil {
 		return nil, false, err
 	}
-	return r.finalizeZSetFastRange(ctx, key, kvs, offset, limit, scoreFilter, readTS)
+	return r.finalizeZSetFastRange(ctx, key, kvs, offset, limit, scanLimit, scoreFilter, readTS)
 }
 
 // finalizeZSetFastRange runs the post-scan priority guard, decodes
 // the candidate score rows into redisZSetEntry, and applies the TTL
 // filter. Factored out so zsetRangeByScoreFast stays under the
 // cyclomatic-complexity cap.
+//
+// Takes scanLimit so we can detect a saturated scan: if the scanner
+// returned exactly scanLimit rows AND the caller's request is not
+// satisfied (unbounded limit, or collected fewer entries than limit),
+// there MAY be more entries beyond the scan window. In that case we
+// return hit=false so the slow path can produce the authoritative
+// answer -- the fast path MUST NOT silently truncate.
 func (r *RedisServer) finalizeZSetFastRange(
 	ctx context.Context, key []byte, kvs []*store.KVPair,
-	offset, limit int, scoreFilter func(float64) bool, readTS uint64,
+	offset, limit, scanLimit int, scoreFilter func(float64) bool, readTS uint64,
 ) ([]redisZSetEntry, bool, error) {
 	// Priority guard runs after a candidate hit (mirrors post-PR #565
 	// ordering). Skip it on empty result -- the empty-result tail
-	// handles disambiguation via ZSetMetaKey.
+	// handles disambiguation.
 	if len(kvs) > 0 {
 		if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
 			return nil, false, hErr
@@ -1839,6 +1846,12 @@ func (r *RedisServer) finalizeZSetFastRange(
 		}
 	}
 	entries := decodeZSetScoreRange(key, kvs, offset, limit, scoreFilter)
+	// Truncation guard: the raw scanner hit its cap AND the caller did
+	// not get a satisfied result. Entries beyond the window may
+	// exist; defer to the slow path for correctness.
+	if zsetFastPathTruncated(len(kvs), scanLimit, len(entries), limit) {
+		return nil, false, nil
+	}
 	if len(entries) == 0 {
 		return r.zsetRangeEmptyFastResult(ctx, key, readTS)
 	}
@@ -1850,6 +1863,23 @@ func (r *RedisServer) finalizeZSetFastRange(
 		return nil, true, nil
 	}
 	return entries, true, nil
+}
+
+// zsetFastPathTruncated reports whether the bounded score-index scan
+// may have dropped entries that the caller's request would otherwise
+// include. Returns true when the scanner returned the full quota
+// (scannedRows == scanLimit) AND the caller's request is still
+// unsatisfied (unbounded limit or collectedEntries < limit). In that
+// case the caller must fall back to the slow full-load path to get
+// the authoritative result.
+func zsetFastPathTruncated(scannedRows, scanLimit, collectedEntries, limit int) bool {
+	if scannedRows < scanLimit {
+		return false
+	}
+	if limit < 0 {
+		return true
+	}
+	return collectedEntries < limit
 }
 
 // zsetFastPathEligible returns false (without error) when a legacy-
@@ -1925,12 +1955,24 @@ func decodeZSetScoreRange(
 // hit=true) or the zset does not exist in wide-column form (return
 // hit=false so the caller takes the slow path for WRONGTYPE / missing
 // disambiguation).
+//
+// Uses resolveZSetMeta so delta-only wide zsets (a fresh zset whose
+// base meta has not been persisted yet, only delta rows) are detected
+// as "exists". Using a plain ExistsAt on ZSetMetaKey would miss those
+// and force the slow path unnecessarily. Also runs the string-priority
+// guard so a corrupted redisStrKey + zset meta surfaces WRONGTYPE via
+// the slow path rather than an empty array.
 func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, readTS uint64) ([]redisZSetEntry, bool, error) {
-	metaExists, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS)
+	_, zsetExists, err := r.resolveZSetMeta(ctx, key, readTS)
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
-	if !metaExists {
+	if !zsetExists {
+		return nil, false, nil
+	}
+	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
+		return nil, false, hErr
+	} else if higher {
 		return nil, false, nil
 	}
 	expired, expErr := r.hasExpired(ctx, key, readTS, true)
