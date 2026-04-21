@@ -187,6 +187,9 @@ func run() error {
 	if collector := metricsRegistry.DispatchCollector(); collector != nil {
 		collector.Start(runCtx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
 	}
+	if collector := metricsRegistry.PebbleCollector(); collector != nil {
+		collector.Start(runCtx, pebbleMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -442,6 +445,30 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 			GroupID:      runtime.spec.id,
 			StatusReader: runtime.engine,
 			ConfigReader: runtime.engine,
+		})
+	}
+	return out
+}
+
+// pebbleMonitorSources extracts the MVCC stores that expose
+// *pebble.DB.Metrics() so monitoring can poll LSM internals (L0
+// sublevels, compaction debt, memtable, block cache) for the
+// elastickv_pebble_* metrics family. Stores that do not satisfy the
+// interface (non-Pebble backends, if any are added later) are skipped
+// silently.
+func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSource {
+	out := make([]monitoring.PebbleSource, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(monitoring.PebbleMetricsSource)
+		if !ok {
+			continue
+		}
+		out = append(out, monitoring.PebbleSource{
+			GroupID: runtime.spec.id,
+			Source:  src,
 		})
 	}
 	return out

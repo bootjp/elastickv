@@ -1790,3 +1790,22 @@ func (s *pebbleStore) Close() error {
 	defer s.dbMu.Unlock()
 	return errors.WithStack(s.db.Close())
 }
+
+// Metrics returns a snapshot of the underlying Pebble DB's operational
+// metrics (LSM shape, compaction debt, memtable, block cache). The
+// return value is a freshly allocated *pebble.Metrics owned by the
+// caller.
+//
+// Returns nil while the store is closed or between a Restore/swap (no
+// current DB). Callers must handle nil.
+//
+// Safe for concurrent use: takes the dbMu read lock to protect against
+// Restore/Close swapping the DB pointer.
+func (s *pebbleStore) Metrics() *pebble.Metrics {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.db == nil {
+		return nil
+	}
+	return s.db.Metrics()
+}
