@@ -20,6 +20,11 @@ const luaInitialGlobalsHint = 64
 // scratch slice in resetPooledLuaState.
 const luaResetKeySlack = 8
 
+// luaWhitelistedTableHint is a capacity hint for the tableSnapshots
+// map -- one entry per nested table value at init (math, string,
+// table, redis, cjson, cmsgpack).
+const luaWhitelistedTableHint = 8
+
 // luaStatePool pools *lua.LState instances to cut heap/GC pressure on
 // high-rate EVAL / EVALSHA workloads (e.g. BullMQ ~10 scripts/s, where
 // each fresh state allocs ~34% of in-use heap via newFuncContext,
@@ -28,15 +33,30 @@ const luaResetKeySlack = 8
 // Security invariant: no state must leak between scripts. Each pooled
 // state is initialised with a fixed set of base globals (redis, cjson,
 // cmsgpack, table/string/math + base lib helpers, and nil-ed loaders).
-// A snapshot of that initial global table is captured at construction
-// time. On release, the reset routine
+// Two snapshots are captured at construction time:
 //
-//  1. walks the current global table and deletes every key that is
-//     not present in the snapshot (removes user-added globals such as
-//     KEYS, ARGV and any GLOBAL_LEAK a script may have set), and
-//  2. restores every snapshot key to its original value (so a script
-//     that did `table = nil` or `redis = evil` cannot poison the next
-//     script).
+//   - globalsSnapshot: the full (*any*-keyed) _G map at init. Using an
+//     LValue-keyed map lets the reset path catch non-string-keyed
+//     leaks like `_G[42] = "secret"` or `_G[true] = "bad"`, which
+//     would otherwise survive a naive string-only wipe.
+//   - tableSnapshots: a shallow map from each whitelisted nested
+//     table (string, math, table, redis, cjson, cmsgpack) to its
+//     init-time field set. This is what blocks table-poisoning
+//     attacks such as `string.upper = function() return "pwned" end`
+//     -- merely restoring the `string` *reference* on _G would leave
+//     the shared table's fields still mutated.
+//
+// On release, the reset routine
+//
+//  1. walks each snapshotted nested table and restores its contents
+//     (deletes script-added fields, rebinds original fields),
+//  2. walks the current global table and deletes every key -- of any
+//     type -- that is not present in the globals snapshot (removes
+//     user-added globals such as KEYS, ARGV, GLOBAL_LEAK, _G[42]),
+//     and
+//  3. restores every globals-snapshot key to its original value (so a
+//     script that did `table = nil` or `redis = evil` cannot poison
+//     the next script).
 //
 // Additionally the value stack is truncated to 0 and the script
 // context binding is cleared so the redis.call/pcall closures cannot
@@ -62,11 +82,24 @@ type luaStatePool struct {
 // removed on release.
 type pooledLuaState struct {
 	state *lua.LState
-	// globalsSnapshot is a copy of state.G.Global keyed by string.
-	// Only string keys can be set from the scripts we accept
-	// (state.SetGlobal is string-keyed), which makes string-key
-	// snapshotting sufficient for the safety invariant.
-	globalsSnapshot map[string]lua.LValue
+	// globalsSnapshot is a copy of every entry reachable via the
+	// state's global table at init, keyed by LValue (not just string)
+	// so scripts cannot smuggle state across evals via non-string
+	// keys such as _G[42] = "secret".
+	globalsSnapshot map[lua.LValue]lua.LValue
+	// tableSnapshots holds the shallow field sets of well-known
+	// whitelisted tables (string, math, table, redis, cjson,
+	// cmsgpack) captured at init. On reset we restore each to its
+	// original contents so a script doing e.g.
+	// `string.upper = function() return "pwned" end` cannot poison
+	// subsequent pooled reuses.
+	//
+	// The outer map is keyed by the *LTable pointer of the parent
+	// (e.g. the `string` table) so tableSnapshots survives even if a
+	// script rebinds the global name (`string = nil`) -- the reset
+	// restores the global name first, then restores the table's
+	// internal contents from this snapshot.
+	tableSnapshots map[*lua.LTable]map[lua.LValue]lua.LValue
 }
 
 // luaStateBindings maps a pooled *lua.LState to the per-eval
@@ -156,62 +189,144 @@ func newPooledLuaState() *pooledLuaState {
 		}
 	}
 
+	globalsSnapshot, tableSnapshots := snapshotGlobals(state)
 	return &pooledLuaState{
 		state:           state,
-		globalsSnapshot: snapshotGlobals(state),
+		globalsSnapshot: globalsSnapshot,
+		tableSnapshots:  tableSnapshots,
 	}
 }
 
-// snapshotGlobals shallow-copies every string-keyed entry from the
-// state's global table. Values inside tables (e.g. table.insert) are
-// retained by reference -- that is fine because the reset path does
-// not attempt to deep-clone them; if a script mutates
-// `table.insert = nil`, the restore re-binds the original function
-// value which is still alive.
-func snapshotGlobals(state *lua.LState) map[string]lua.LValue {
+// snapshotGlobals captures the full set of globals (string AND
+// non-string keys) plus shallow snapshots of every nested table value
+// reachable from _G. Returning both lets resetPooledLuaState defeat two
+// classes of pool-state leaks:
+//
+//  1. Non-string-keyed globals. Lua allows any non-nil, non-NaN value
+//     as a table key. A malicious script doing `_G[42] = "secret"` or
+//     `_G[true] = "bad"` would persist across pool reuse if we only
+//     snapshotted string keys. Iterating with ForEach over LValue keys
+//     closes this hole.
+//
+//  2. Table poisoning. Standard-library tables are mutable in
+//     gopher-lua, and the snapshot only holds a reference to the
+//     table object. A script doing `string.upper = function() return
+//     "pwned" end` mutates the shared table in place; merely
+//     re-binding the global name `string` to its original LTable
+//     value on reset is not enough. We therefore shallow-snapshot
+//     every LTable-typed global's contents at init time and restore
+//     them on reset. Inner tables are not recursed into -- they are
+//     expected to hold leaf values (functions, numbers, strings) in
+//     the libraries we install; if that ever changes, extend this.
+//
+// We deliberately skip snapshotting _G's own contents as a "table
+// snapshot": _G IS the globals table, so that entry would be
+// redundant with the outer globals snapshot. Any other self-reference
+// is handled the same way (by *LTable identity).
+func snapshotGlobals(state *lua.LState) (map[lua.LValue]lua.LValue, map[*lua.LTable]map[lua.LValue]lua.LValue) {
 	globals := state.G.Global
-	snapshot := make(map[string]lua.LValue, luaInitialGlobalsHint)
+	snapshot := make(map[lua.LValue]lua.LValue, luaInitialGlobalsHint)
+	tableSnaps := make(map[*lua.LTable]map[lua.LValue]lua.LValue, luaWhitelistedTableHint)
+
 	globals.ForEach(func(k, v lua.LValue) {
-		if ks, ok := k.(lua.LString); ok {
-			snapshot[string(ks)] = v
+		snapshot[k] = v
+		if tbl, ok := v.(*lua.LTable); ok && tbl != globals {
+			// Shallow copy the table's contents. Keys may be
+			// non-string (e.g. array-like entries).
+			inner := make(map[lua.LValue]lua.LValue, tbl.Len()+luaResetKeySlack)
+			tbl.ForEach(func(ik, iv lua.LValue) {
+				inner[ik] = iv
+			})
+			tableSnaps[tbl] = inner
 		}
 	})
-	return snapshot
+	return snapshot, tableSnaps
 }
 
 // resetPooledLuaState wipes all user-introduced globals and restores
-// the whitelisted ones, then truncates the value stack. It is the
-// heart of the security invariant: anything the script did to globals
-// must not be observable by the next user.
+// the whitelisted ones (including the contents of nested tables like
+// `string`, `math`, `redis`), then truncates the value stack. It is
+// the heart of the security invariant: anything the script did to
+// globals must not be observable by the next user.
+//
+// Ordering matters:
+//  1. Reset nested whitelisted tables first. Doing this BEFORE
+//     restoring the globals' top-level bindings means we mutate the
+//     ORIGINAL table objects (the ones snapshot still references by
+//     pointer), even if the script rebound `string = nil` at the
+//     global level -- the original LTable is still alive and held
+//     via our tableSnapshots map key.
+//  2. Delete top-level globals not in the snapshot (KEYS, ARGV,
+//     GLOBAL_LEAK, _G[42], etc). We iterate ALL key types, not just
+//     strings, so non-string-keyed leaks (`_G[42] = "secret"`) do not
+//     survive.
+//  3. Restore top-level whitelisted globals. This fixes e.g.
+//     `redis = nil` by re-binding `redis` to the original module
+//     table.
 func (p *pooledLuaState) reset() {
 	globals := p.state.G.Global
 
-	// Collect all current string keys first; mutating the table in
-	// ForEach is unsafe.
-	currentKeys := make([]string, 0, len(p.globalsSnapshot)+luaResetKeySlack)
+	// (1) Restore inner contents of every snapshotted whitelisted
+	// table. This defeats poisoning attacks like
+	// `string.upper = function() return "pwned" end`.
+	for tbl, originalFields := range p.tableSnapshots {
+		resetTableContents(tbl, originalFields)
+	}
+
+	// (2) Collect all current global keys (of any type). Mutating
+	// the table inside ForEach is unsafe, so snapshot keys first.
+	currentKeys := make([]lua.LValue, 0, len(p.globalsSnapshot)+luaResetKeySlack)
 	globals.ForEach(func(k, _ lua.LValue) {
-		if ks, ok := k.(lua.LString); ok {
-			currentKeys = append(currentKeys, string(ks))
-		}
+		currentKeys = append(currentKeys, k)
 	})
 
-	// Delete any key not in the snapshot: these are user-introduced
-	// globals (KEYS, ARGV, GLOBAL_LEAK, ...).
+	// Delete any key not in the init-time snapshot: these are
+	// user-introduced globals (KEYS, ARGV, GLOBAL_LEAK, _G[42],
+	// _G[true], ...).
+	//
+	// We use RawSet (not RawSetH) because gopher-lua stores integer
+	// keys in an internal `array` slice rather than `dict`; RawSetH
+	// only touches `dict`, so a call like RawSetH(LNumber(42), LNil)
+	// leaves the array entry intact. RawSet dispatches to the right
+	// storage by key type.
 	for _, k := range currentKeys {
 		if _, keep := p.globalsSnapshot[k]; !keep {
-			globals.RawSetString(k, lua.LNil)
+			globals.RawSet(k, lua.LNil)
 		}
 	}
 
-	// Restore every whitelisted global to its original value. This
-	// covers the case where a script rebinds an allowed global
-	// (e.g. redis = something) -- we simply put the original back.
+	// (3) Restore every whitelisted global to its original value.
+	// This covers the case where a script rebinds an allowed global
+	// (e.g. `redis = something`) -- we simply put the original back.
 	for k, v := range p.globalsSnapshot {
-		globals.RawSetString(k, v)
+		globals.RawSet(k, v)
 	}
 
 	// Drop anything the script may have left on the value stack.
 	p.state.SetTop(0)
+}
+
+// resetTableContents restores tbl's entries so that it exactly
+// matches originalFields: extra keys added by the script are deleted,
+// and every original key is re-bound to its original value. Inner
+// tables are treated as shallow: if a script mutated `string.upper`,
+// the original function value (still alive via originalFields) is
+// put back; if a script added a new field (`string.pwn = 1`), the
+// field is deleted.
+func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValue) {
+	// Gather current keys first to avoid mutating during ForEach.
+	currentKeys := make([]lua.LValue, 0, len(originalFields)+luaResetKeySlack)
+	tbl.ForEach(func(k, _ lua.LValue) {
+		currentKeys = append(currentKeys, k)
+	})
+	for _, k := range currentKeys {
+		if _, keep := originalFields[k]; !keep {
+			tbl.RawSet(k, lua.LNil)
+		}
+	}
+	for k, v := range originalFields {
+		tbl.RawSet(k, v)
+	}
 }
 
 // get acquires a pooled state and binds the given *luaScriptContext
@@ -260,7 +375,11 @@ func registerPooledRedisModule(state *lua.LState) {
 	state.SetFuncs(module, map[string]lua.LGFunction{
 		"call": func(scriptState *lua.LState) int {
 			ctx, ok := luaLookupContext(scriptState)
-			if !ok {
+			// Must guard against ctx == nil as well as !ok: the
+			// bench path and misuse can luaBindContext(nil), which
+			// stores a (nil, true) entry. Dereferencing that in
+			// luaRedisCommand would panic.
+			if !ok || ctx == nil {
 				scriptState.RaiseError("redis.call invoked without an active script context")
 				return 0
 			}
@@ -268,7 +387,7 @@ func registerPooledRedisModule(state *lua.LState) {
 		},
 		"pcall": func(scriptState *lua.LState) int {
 			ctx, ok := luaLookupContext(scriptState)
-			if !ok {
+			if !ok || ctx == nil {
 				scriptState.Push(luaErrorTable(scriptState, "redis.pcall invoked without an active script context"))
 				return 1
 			}

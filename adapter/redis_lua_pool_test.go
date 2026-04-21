@@ -174,6 +174,123 @@ func TestLua_PoolRecordsReuseVsAllocation(t *testing.T) {
 		"pool reported zero hits across %d cycles -- reuse not happening", iters)
 }
 
+// TestLua_VMReuseNonStringGlobalKeysAreWiped guards against a leak
+// vector missed by the original reset: globals keyed by types other
+// than string. Lua permits any non-nil, non-NaN value as a table key,
+// so a script doing `_G[42] = "leak"` or `_G[true] = "bad"` bypasses a
+// naive string-only snapshot/wipe. The LValue-keyed snapshot + the
+// RawSetH-based reset in pool.reset must catch these.
+func TestLua_VMReuseNonStringGlobalKeysAreWiped(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	plsA := pool.get(nil)
+	// Set non-string-keyed globals directly via _G. This is the
+	// attack surface being regression-tested.
+	require.NoError(t, plsA.state.DoString(`_G[42] = "leak"; _G[true] = "bad"`))
+	// Sanity: script A sees what it set.
+	require.NoError(t, plsA.state.DoString(`assert(_G[42] == "leak" and _G[true] == "bad")`))
+	pool.put(plsA)
+
+	plsB := pool.get(nil)
+	defer pool.put(plsB)
+	// If either leaks, DoString errors out via Lua's assert and
+	// the test fails with the error message.
+	require.NoError(t, plsB.state.DoString(
+		`assert(_G[42] == nil and _G[true] == nil, "non-string-keyed global leaked across pool reuse")`))
+}
+
+// TestLua_VMReuseDoesNotPoisonStringLib regression-tests the table
+// poisoning fix. Script A mutates `string.upper` in place (not via
+// rebinding the `string` global), which survives a naive snapshot
+// that only restores the top-level `string` reference. The new
+// tableSnapshots mechanism must restore the original `string.upper`
+// function so script B's string.upper("x") == "X" holds.
+func TestLua_VMReuseDoesNotPoisonStringLib(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	plsA := pool.get(nil)
+	require.NoError(t, plsA.state.DoString(`
+string.upper = function() return "pwned" end
+-- Sanity: script A sees its own sabotage.
+assert(string.upper("x") == "pwned")
+-- Add a rogue field too -- must also be cleaned up.
+string.pwn = 1
+`))
+	pool.put(plsA)
+
+	plsB := pool.get(nil)
+	defer pool.put(plsB)
+	require.NoError(t, plsB.state.DoString(`
+assert(string.upper("x") == "X", "string.upper was poisoned across pool reuse")
+assert(string.pwn == nil, "script-added field on string leaked across pool reuse")
+-- Same for other whitelisted tables.
+assert(type(math.floor) == "function", "math.floor was wiped")
+assert(type(table.insert) == "function", "table.insert was wiped")
+`))
+}
+
+// TestLua_VMReuseDoesNotPoisonRedisModule covers the same poisoning
+// class but on the pool-registered `redis` table itself. A script
+// that replaces redis.sha1hex with a sabotaged implementation must
+// not affect subsequent scripts.
+func TestLua_VMReuseDoesNotPoisonRedisModule(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	plsA := pool.get(nil)
+	require.NoError(t, plsA.state.DoString(`
+redis.sha1hex = function() return "deadbeef" end
+assert(redis.sha1hex("x") == "deadbeef")
+`))
+	pool.put(plsA)
+
+	plsB := pool.get(nil)
+	defer pool.put(plsB)
+	// Any non-"deadbeef" digest proves the original sha1hex is back.
+	require.NoError(t, plsB.state.DoString(`
+local got = redis.sha1hex("x")
+assert(got ~= "deadbeef", "redis.sha1hex remained poisoned after pool reuse: " .. tostring(got))
+assert(#got == 40, "redis.sha1hex returned non-hex value after reset: " .. tostring(got))
+`))
+}
+
+// TestLua_PoolNilContextProducesErrorNotPanic is the regression test
+// for the nil-context nil-pointer deref. Before the fix, calling
+// redis.call with a pool entry bound to a nil *luaScriptContext --
+// which happens in the bench path via pool.get(nil) -- would panic in
+// luaRedisCommand. After the fix it surfaces as a clean Lua error.
+func TestLua_PoolNilContextProducesErrorNotPanic(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	pls := pool.get(nil) // explicit nil context
+	defer pool.put(pls)
+
+	// redis.call must raise a Lua error rather than panicking in
+	// Go; the returned error wraps the Lua error message.
+	err := pls.state.DoString(`redis.call("GET", "x")`)
+	require.Error(t, err, "redis.call with nil context should return an error")
+	require.Contains(t, err.Error(), "redis.call invoked without an active script context")
+
+	// redis.pcall must not panic either; it should push a Lua
+	// error table. The DoString itself returns no Go error --
+	// pcall is the pcall path -- but the returned value carries
+	// the err field.
+	require.NoError(t, pls.state.DoString(`
+local reply = redis.pcall("GET", "x")
+assert(type(reply) == "table", "redis.pcall should return a table even with nil context")
+assert(type(reply.err) == "string", "redis.pcall error reply must carry .err")
+assert(reply.err:find("redis.pcall invoked without an active script context") ~= nil,
+    "redis.pcall error reply text mismatch: " .. tostring(reply.err))
+`))
+}
+
 // TestRedis_LuaPoolNoGlobalLeakEndToEnd drives the full EVAL path on
 // a live RedisServer to make sure the pool integration (not just the
 // pool in isolation) holds the security invariant. Script A tries to
