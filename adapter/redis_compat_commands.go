@@ -1904,6 +1904,14 @@ func (r *RedisServer) zsetFastPathEligible(ctx context.Context, key []byte, read
 // `scanLimit <= 0` branch to misroute a live zset into the
 // empty-result tail.
 func zsetFastScanLimit(offset, limit int) int {
+	// limit == 0: the caller wants zero entries regardless of offset.
+	// Return 0 so the caller's `scanLimit <= 0` branch routes to the
+	// empty-result tail (which still runs resolveZSetMeta for proper
+	// WRONGTYPE / existence disambiguation) instead of a pointless
+	// full-quota scan.
+	if limit == 0 {
+		return 0
+	}
 	if limit < 0 {
 		return maxWideScanLimit
 	}
@@ -1962,12 +1970,17 @@ func decodeZSetScoreRange(
 		if scoreFilter != nil && !scoreFilter(score) {
 			continue
 		}
+		// Check limit saturation BEFORE the offset skip so a small
+		// limit with a large offset exits immediately instead of
+		// burning offset iterations on the skip branch. Correct for
+		// any (offset, limit): once len(entries) >= limit we are done
+		// regardless of remaining skip budget.
+		if limit >= 0 && len(entries) >= limit {
+			break
+		}
 		if skipped < offset {
 			skipped++
 			continue
-		}
-		if limit >= 0 && len(entries) >= limit {
-			break
 		}
 		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
 	}
