@@ -177,9 +177,9 @@ type PebbleCollector struct {
 }
 
 type pebbleSnapshot struct {
-	compactCount    int64
-	blockCacheHits  int64
-	blockCacheMisse int64
+	compactCount     int64
+	blockCacheHits   int64
+	blockCacheMisses int64
 }
 
 func newPebbleCollector(metrics *PebbleMetrics) *PebbleCollector {
@@ -258,9 +258,9 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 		// silently without emitting negative.
 		prev := c.previous[src.GroupID]
 		curr := pebbleSnapshot{
-			compactCount:    snap.Compact.Count,
-			blockCacheHits:  snap.BlockCache.Hits,
-			blockCacheMisse: snap.BlockCache.Misses,
+			compactCount:     snap.Compact.Count,
+			blockCacheHits:   snap.BlockCache.Hits,
+			blockCacheMisses: snap.BlockCache.Misses,
 		}
 		if curr.compactCount > prev.compactCount {
 			c.metrics.compactCountTotal.WithLabelValues(group).Add(float64(curr.compactCount - prev.compactCount))
@@ -268,8 +268,8 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 		if curr.blockCacheHits > prev.blockCacheHits {
 			c.metrics.blockCacheHitsTotal.WithLabelValues(group).Add(float64(curr.blockCacheHits - prev.blockCacheHits))
 		}
-		if curr.blockCacheMisse > prev.blockCacheMisse {
-			c.metrics.blockCacheMissTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisse - prev.blockCacheMisse))
+		if curr.blockCacheMisses > prev.blockCacheMisses {
+			c.metrics.blockCacheMissTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
 		}
 		c.previous[src.GroupID] = curr
 	}
