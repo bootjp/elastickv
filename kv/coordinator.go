@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -41,6 +42,57 @@ func WithHLC(hlc *HLC) CoordinatorOption {
 	}
 }
 
+// LeaseReadObserver records lease-read fast-path vs slow-path outcomes
+// without coupling kv to a concrete monitoring backend. It is called once
+// per LeaseRead invocation that actually evaluates the lease (the initial
+// type-assertion/LeaseDuration==0 short-circuits are NOT counted because
+// they indicate the engine does not participate in lease reads at all).
+//
+// Implementations MUST be safe for concurrent use and MUST NOT block; the
+// observer is invoked on the Redis GET hot path.
+type LeaseReadObserver interface {
+	// ObserveLeaseRead is called with hit=true when the lease fast path
+	// served the read from local AppliedIndex, or hit=false when the
+	// coordinator fell back to a full LinearizableRead (expired lease,
+	// engine reported non-leader, or leader-loss callback raced with
+	// the request).
+	ObserveLeaseRead(hit bool)
+}
+
+// WithLeaseReadObserver wires a LeaseReadObserver onto a Coordinate.
+// This is the mechanism monitoring uses to surface the lease-hit ratio
+// panel on the Redis hot-path dashboard (see
+// monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+//
+// Typed-nil guard: a caller passing a typed-nil pointer
+// (e.g. `var o *myObserver; WithLeaseReadObserver(o)`) produces an
+// interface value that is NOT equal to nil under the normal `!= nil`
+// check, yet invoking ObserveLeaseRead would panic. Normalise here
+// with reflect.Value.IsNil so the hot-path nil check in LeaseRead
+// stays a single branch on a real nil interface.
+func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
+	return func(c *Coordinate) {
+		c.leaseObserver = normalizeLeaseObserver(observer)
+	}
+}
+
+// normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
+// untyped nil interface so downstream `observer != nil` checks behave
+// as expected.
+func normalizeLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
+	if observer == nil {
+		return nil
+	}
+	v := reflect.ValueOf(observer)
+	switch v.Kind() { //nolint:exhaustive
+	case reflect.Ptr, reflect.Interface, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice:
+		if v.IsNil() {
+			return nil
+		}
+	}
+	return observer
+}
+
 func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {
 	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r), opts...)
 }
@@ -55,7 +107,33 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	for _, opt := range opts {
 		opt(c)
 	}
+	// Register a leader-loss hook so the lease is invalidated the instant
+	// the engine notices a state transition out of the leader role,
+	// rather than waiting for wall-clock expiry of the current lease.
+	// Keep the deregister func so Close() can release the callback
+	// slot; owners with a shorter lifetime than the engine (tests,
+	// one-shot tools) MUST call Close() to avoid leaking a closure
+	// pointing into this Coordinate.
+	if lp, ok := engine.(raftengine.LeaseProvider); ok {
+		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
+	}
 	return c
+}
+
+// Close releases any engine-side registrations (currently the
+// leader-loss callback) held by this Coordinate. It is safe to call
+// on a nil receiver and multiple times. Owners whose lifetime matches
+// the engine's do not need to call Close; owners who discard the
+// Coordinate before closing the engine MUST.
+func (c *Coordinate) Close() error {
+	if c == nil {
+		return nil
+	}
+	if c.deregisterLeaseCb != nil {
+		c.deregisterLeaseCb()
+		c.deregisterLeaseCb = nil
+	}
+	return nil
 }
 
 // hlcLeaseEntryLen is the byte length of a serialised HLC lease Raft entry:
@@ -81,6 +159,18 @@ type Coordinate struct {
 	clock              *HLC
 	connCache          GRPCConnCache
 	log                *slog.Logger
+	lease              leaseState
+	// deregisterLeaseCb removes the leader-loss callback registered
+	// against engine at construction. Long-lived Coordinates don't
+	// need to call it (the engine will be closed after them), but
+	// short-lived test coordinators sharing an engine MUST invoke
+	// Close() to release the callback slot.
+	deregisterLeaseCb func()
+	// leaseObserver records lease-read hit/miss outcomes for metrics
+	// (nil when no observer is attached; LeaseRead short-circuits the
+	// nil check so production does not pay an interface call when
+	// monitoring is disabled).
+	leaseObserver LeaseReadObserver
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -95,6 +185,43 @@ type Coordinator interface {
 	VerifyLeaderForKey(key []byte) error
 	RaftLeaderForKey(key []byte) raft.ServerAddress
 	Clock() *HLC
+}
+
+// LeaseReadableCoordinator is the optional capability implemented by
+// coordinators that participate in the leader-local lease read path
+// (see docs/lease_read_design.md). Callers that want lease reads
+// should type-assert to this interface and fall back to
+// LinearizableRead when the assertion fails, following the same
+// pattern as raftengine.LeaseProvider. Keeping the lease methods OFF
+// the Coordinator interface avoids breaking existing external
+// implementations that predate the lease-read feature.
+type LeaseReadableCoordinator interface {
+	LeaseRead(ctx context.Context) (uint64, error)
+	LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
+}
+
+// LeaseReadThrough is a helper that calls LeaseRead when the
+// coordinator supports it, falling back to LinearizableRead otherwise.
+// Adapter call sites use this so they don't have to repeat the
+// type-assertion dance.
+func LeaseReadThrough(c Coordinator, ctx context.Context) (uint64, error) {
+	if lr, ok := c.(LeaseReadableCoordinator); ok {
+		idx, err := lr.LeaseRead(ctx)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
+}
+
+// LeaseReadForKeyThrough is the key-routed counterpart of
+// LeaseReadThrough.
+func LeaseReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) (uint64, error) {
+	if lr, ok := c.(LeaseReadableCoordinator); ok {
+		idx, err := lr.LeaseReadForKey(ctx, key)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
 }
 
 func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -121,11 +248,65 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		reqs.CommitTS = 0
 	}
 
+	// Sample the clock AND the lease generation BEFORE dispatching.
+	//   * dispatchStart: any real quorum confirmation happens at or
+	//     after this instant, so using it as the lease-extension base
+	//     is strictly conservative (window can only be SHORTER than
+	//     the actual safety window, never longer).
+	//   * expectedGen: if a leader-loss callback fires between this
+	//     sample and the post-dispatch extend, the generation will
+	//     have advanced; extend(expectedGen) will see the mismatch
+	//     and refuse to resurrect the lease. Capturing gen INSIDE
+	//     extend would observe the post-invalidate value as current.
+	dispatchStart := time.Now()
+	expectedGen := c.lease.generation()
+	var resp *CoordinateResponse
+	var err error
 	if reqs.IsTxn {
-		return c.dispatchTxn(reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+	} else {
+		resp, err = c.dispatchRaw(reqs.Elems)
 	}
+	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
+	return resp, err
+}
 
-	return c.dispatchRaw(reqs.Elems)
+// refreshLeaseAfterDispatch extends the lease only when the dispatch
+// produced a real Raft commit. CommitIndex == 0 means the underlying
+// transaction manager short-circuited (empty-input Commit, no-op
+// Abort), and refreshing would be unsound because no quorum
+// confirmation happened.
+//
+// On err != nil the lease is invalidated ONLY when isLeadershipLossError
+// reports a real leadership-loss signal (non-leader rejection,
+// ErrLeadershipLost, transfer-in-progress). Business-logic failures
+// such as write conflicts or validation errors are NOT leadership
+// signals and must not invalidate the lease -- doing so would force
+// every subsequent read onto the slow LinearizableRead path and defeat
+// the lease's purpose. RegisterLeaderLossCallback plus the
+// State()==StateLeader fast-path guard cover real leader loss.
+func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
+	if err != nil {
+		// Only invalidate on errors that actually signal leadership
+		// loss. Write conflicts and validation errors are business-
+		// logic failures that do NOT mean this node stopped being
+		// leader; invalidating for them would force every subsequent
+		// read into the slow LinearizableRead path and defeat the
+		// lease. Engine.RegisterLeaderLossCallback and the fast-path
+		// State() == StateLeader guard cover real leader loss.
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
+		return
+	}
+	if resp == nil || resp.CommitIndex == 0 {
+		return
+	}
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
 }
 
 func (c *Coordinate) IsLeader() bool {
@@ -213,6 +394,98 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 
 func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return c.LinearizableRead(ctx)
+}
+
+// LeaseRead returns a read fence backed by a leader-local lease when
+// available, falling back to a full LinearizableRead when no fast
+// path is live or the engine does not implement LeaseProvider.
+//
+// The PRIMARY lease path is maintained inside the engine from ongoing
+// MsgAppResp / MsgHeartbeatResp traffic, so that path does not rely
+// on callers sampling time.Now() before the slow path to "extend" a
+// lease afterwards. The earlier pre-read sampling was racy under
+// congestion: if a LinearizableRead took longer than LeaseDuration,
+// the extension would land already expired and the lease never
+// warmed up. The engine-driven anchor is refreshed every heartbeat
+// independent of read latency.
+//
+// The SECONDARY caller-side lease remains as a rollout fallback,
+// still populated by the original pre-read sampling; it covers the
+// narrow window between startup and the first quorum heartbeat round
+// landing on the engine.
+//
+// The returned index is the engine's current applied index (fast
+// path) or the index returned by LinearizableRead (slow path).
+// Callers that resolve timestamps via store.LastCommitTS may discard
+// the value.
+func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return c.LinearizableRead(ctx)
+	}
+	leaseDur := lp.LeaseDuration()
+	if leaseDur <= 0 {
+		// Misconfigured tick settings: lease is disabled.
+		return c.LinearizableRead(ctx)
+	}
+	// Single time.Now() sample so the primary, secondary, and
+	// extension steps all reason about the same instant.
+	now := time.Now()
+	state := c.engine.State()
+	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		c.observeLeaseRead(true)
+		return lp.AppliedIndex(), nil
+	}
+	// Secondary: caller-side lease warmed by a previous successful
+	// slow-path read. Preserved so tests can prime the lease directly
+	// and so we still benefit on paths where LastQuorumAck is not yet
+	// populated (e.g. very first read after startup before the first
+	// quorum heartbeat round has landed).
+	expectedGen := c.lease.generation()
+	if c.lease.valid(now) && state == raftengine.StateLeader {
+		c.observeLeaseRead(true)
+		return lp.AppliedIndex(), nil
+	}
+	c.observeLeaseRead(false)
+	idx, err := c.LinearizableRead(ctx)
+	if err != nil {
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
+		return 0, err
+	}
+	c.lease.extend(now.Add(leaseDur), expectedGen)
+	return idx, nil
+}
+
+// observeLeaseRead forwards a hit / miss signal to the configured
+// LeaseReadObserver. Nil-safe so the LeaseRead hot path stays a
+// single branch on a real nil interface (typed-nil is normalised at
+// wiring time in WithLeaseReadObserver).
+func (c *Coordinate) observeLeaseRead(hit bool) {
+	if c.leaseObserver != nil {
+		c.leaseObserver.ObserveLeaseRead(hit)
+	}
+}
+
+// engineLeaseAckValid returns whether the engine-driven lease anchor
+// published via LastQuorumAck is fresh enough to serve a leader-local
+// read. Enforces the safety contract from raftengine.LeaseProvider:
+//   - local state must be Leader
+//   - ack must be non-zero (a quorum was ever observed)
+//   - ack must not be after now (clock-skew guard: LastQuorumAck is
+//     rebuilt from UnixNano with no monotonic component, so a
+//     backwards wall-clock step could otherwise let a stale ack pass)
+//   - now − ack must be strictly less than leaseDur
+func engineLeaseAckValid(state raftengine.State, ack, now time.Time, leaseDur time.Duration) bool {
+	if state != raftengine.StateLeader || ack.IsZero() || ack.After(now) {
+		return false
+	}
+	return now.Sub(ack) < leaseDur
+}
+
+func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LeaseRead(ctx)
 }
 
 func (c *Coordinate) nextStartTS() uint64 {

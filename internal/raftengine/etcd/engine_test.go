@@ -458,9 +458,20 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 	}
 	engine.stepCh <- raftpb.Message{Type: raftpb.MsgHeartbeat}
 
+	require.Equal(t, uint64(0), engine.StepQueueFullCount())
+
 	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
+
+	// The Prometheus hot-path dashboard relies on StepQueueFullCount
+	// advancing exactly once per rejected enqueue so the scraped rate
+	// equals the true drop rate, not a multiple of it.
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	require.Error(t, err)
+	require.Equal(t, uint64(2), engine.StepQueueFullCount())
 }
 
 func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
@@ -1610,4 +1621,17 @@ func mustRawNode(t *testing.T, storage *etcdraft.MemoryStorage, nodeID uint64) *
 	})
 	require.NoError(t, err)
 	return rawNode
+}
+
+// TestErrNotLeaderMatchesRaftEngineSentinel pins the invariant that the
+// etcd engine's internal leadership-loss errors are marked against the
+// shared raftengine sentinels. The lease-read fast path in package kv
+// relies on a single cross-backend errors.Is(err, raftengine.ErrNotLeader)
+// check; a future refactor that forgets to mark these errors would
+// silently force every read onto the slow LinearizableRead path.
+func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
+	t.Parallel()
+	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
 }

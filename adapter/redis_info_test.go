@@ -35,6 +35,12 @@ func (c *infoTestCoordinator) Clock() *kv.HLC {
 }
 
 func (c *infoTestCoordinator) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
+func (c *infoTestCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
+func (c *infoTestCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
 
 func TestRedisServer_Info_LeaderRole(t *testing.T) {
 	r := &RedisServer{

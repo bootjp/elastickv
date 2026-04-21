@@ -557,6 +557,13 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	engine := hashicorpraftengine.New(r)
 	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
 	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
+	defer func() {
+		// Release the leader-loss callback slot on the engine before
+		// the process exits. The engine itself is closed elsewhere in
+		// the shutdown path; both orderings are safe, but releasing
+		// the closure here matches the symmetric construction order.
+		_ = coordinator.Close()
+	}()
 	distEngine := distribution.NewEngineWithDefaultRoute()
 	distCatalog := distribution.NewCatalogStore(st)
 	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {

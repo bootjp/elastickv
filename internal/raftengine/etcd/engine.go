@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
@@ -24,13 +25,30 @@ const (
 	defaultTickInterval  = 10 * time.Millisecond
 	defaultHeartbeatTick = 10  // 100ms at 10ms interval
 	defaultElectionTick  = 100 // 1s at 10ms interval (10x heartbeat, etcd/raft recommended ratio)
+	// leaseSafetyMargin is subtracted from electionTimeout when computing the
+	// duration of a leader-local read lease. It absorbs goroutine scheduling
+	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
+	// and bounded wall-clock skew between the leader and a partition's new
+	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
-	// allows per peer before waiting for an ACK (etcd/raft default: 256).
-	// It also sets the per-peer dispatch channel capacity; total buffered memory
-	// is bounded by O(numPeers × MaxInflightMsg × avgMsgSize).
-	// Increase via OpenConfig.MaxInflightMsg for deeper pipelining on
-	// high-bandwidth links; reduce it in memory-constrained clusters.
-	defaultMaxInflightMsg = 256
+	// allows per peer before waiting for an ACK. It also sizes the inbound
+	// stepCh, dispatchReportCh, and the per-peer outbound "normal" dispatch
+	// queue. Total buffered memory is bounded by
+	// O(numPeers × MaxInflightMsg × avgMsgSize).
+	//
+	// Raised from 256 → 1024 to absorb short CPU bursts without forcing
+	// peers to reject with "etcd raft inbound step queue is full".
+	// Under production congestion we observed the 256-slot inbound
+	// stepCh on followers filling up while their event loop was held
+	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
+	// #565 removed most of that CPU); 1024 is a 4× safety margin.
+	// Note that with the current defaultMaxSizePerMsg of 1 MiB, the
+	// true worst-case bound can be much larger (up to roughly 1 GiB
+	// per peer if every slot held a max-sized message). In practice,
+	// typical MsgApp payloads are far smaller, so expected steady-state
+	// memory remains much lower than that worst-case bound.
+	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
@@ -39,7 +57,14 @@ const (
 	// MsgAppResp is intentionally kept in the normal channel: followers — the
 	// only senders of MsgAppResp — do not send MsgApp, so there is no
 	// head-of-line blocking risk there.
-	defaultHeartbeatBufPerPeer = 64
+	//
+	// Raised from 64 → 512 after the leader logged heartbeat drops
+	// totalling 1.6M+ (dispatchDropCount) while the transport drained
+	// slower than heartbeat tick issuance. Heartbeats are tiny
+	// (< ~100 B), so 512 × numPeers is ≪ 1 MB total memory; the
+	// upside is that a ~5 s transient pause (election-timeout scale)
+	// no longer drops heartbeats and force the peers' lease to expire.
+	defaultHeartbeatBufPerPeer = 512
 	defaultSnapshotEvery       = 10_000
 	defaultSnapshotQueueSize   = 1
 	defaultAdminPollInterval   = 10 * time.Millisecond
@@ -54,23 +79,24 @@ const (
 )
 
 var (
-	errNilEngine                   = errors.New("raft engine is not configured")
-	errClosed                      = errors.New("etcd raft engine is closed")
-	errNotLeader                   = errors.New("etcd raft engine is not leader")
-	errNodeIDRequired              = errors.New("etcd raft node id is required")
-	errDataDirRequired             = errors.New("etcd raft data dir is required")
-	errStateMachineUnset           = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired            = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull               = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch             = errors.New("etcd raft persisted cluster does not match configured peers")
-	errConfigIndexMismatch         = errors.New("etcd raft configuration index does not match")
-	errConfChangeContextTooLarge   = errors.New("etcd raft conf change context is too large")
-	errLeadershipTransferTarget    = errors.New("etcd raft leadership transfer target is required")
-	errLeadershipTransferNotReady  = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted   = errors.New("etcd raft leadership transfer aborted")
-	errLeadershipTransferRejected  = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
-	errLeadershipTransferNotLeader = errors.New("etcd raft leadership transfer requires the local node to be leader")
-	errTooManyPendingConfigs       = errors.New("etcd raft engine has too many pending config changes")
+	errNilEngine                    = errors.New("raft engine is not configured")
+	errClosed                       = errors.New("etcd raft engine is closed")
+	errNotLeader                    = errors.Mark(errors.New("etcd raft engine is not leader"), raftengine.ErrNotLeader)
+	errNodeIDRequired               = errors.New("etcd raft node id is required")
+	errDataDirRequired              = errors.New("etcd raft data dir is required")
+	errStateMachineUnset            = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired             = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull                = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch              = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch          = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge    = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget     = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady   = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted    = errors.New("etcd raft leadership transfer aborted")
+	errLeadershipTransferRejected   = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errLeadershipTransferNotLeader  = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
+	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
+	errTooManyPendingConfigs        = errors.New("etcd raft engine has too many pending config changes")
 )
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
@@ -108,6 +134,7 @@ type Engine struct {
 	dataDir      string
 	fsmSnapDir   string
 	tickInterval time.Duration
+	electionTick int
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -151,6 +178,13 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// appliedIndex mirrors the current applied-entry index for
+	// lock-free readers on the lease-read fast path. Writers inside
+	// the Raft run loop update both `applied` (protected by the run
+	// loop's single-writer invariant) and `appliedIndex.Store(...)`.
+	// AppliedIndex() reads via atomic.Load so it does not contend
+	// with refreshStatus's write lock.
+	appliedIndex atomic.Uint64
 	// configIndex tracks the highest configuration index durably published to
 	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
@@ -164,6 +198,47 @@ type Engine struct {
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
+	// stepQueueFullCount tracks the number of inbound raft messages
+	// (from remote peers and local handlers) that were dropped because
+	// stepCh was full. Surfaced to Prometheus as
+	// elastickv_raft_step_queue_full_total so operators can correlate
+	// seek-storm goroutine spikes with raft backpressure.
+	stepQueueFullCount atomic.Uint64
+
+	// ackTracker records per-peer last-response times on the leader and
+	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// read lock-free from LastQuorumAck() on the hot lease-read path
+	// and updated inside the single event-loop goroutine from
+	// handleStep when a follower response arrives.
+	ackTracker quorumAckTracker
+	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// single-node leader path: self IS the quorum, so there are no
+	// follower responses to observe. refreshStatus keeps this value
+	// current (set to time.Now().UnixNano() each tick while leader and
+	// cluster size is 1; cleared otherwise) so the lease-read hot path
+	// never has to acquire e.mu to check peer count or leader state.
+	singleNodeLeaderAckUnixNano atomic.Int64
+	// isLeader mirrors status.State == StateLeader for lock-free reads
+	// on the hot path. refreshStatus writes it on every tick;
+	// recordQuorumAck reads it before admitting a follower response
+	// into ackTracker (so late MsgAppResp / MsgHeartbeatResp arriving
+	// after a step-down cannot repopulate the tracker), and
+	// LastQuorumAck reads it to honor the LeaseProvider contract
+	// ("zero time when the local node is not the leader").
+	isLeader atomic.Bool
+
+	// leaderLossCbsMu guards the slice of callbacks invoked when the node
+	// transitions out of the leader role (graceful transfer, partition
+	// step-down, shutdown). Callbacks fire synchronously from the
+	// leader-loss handling path and MUST be non-blocking; a slow
+	// callback would hold up refreshStatus / shutdown / fail. See
+	// RegisterLeaderLossCallback for the full contract. Each entry
+	// carries a sentinel pointer so that the deregister closure
+	// returned by RegisterLeaderLossCallback can identify THIS
+	// specific registration even if the same fn is registered
+	// multiple times.
+	leaderLossCbsMu sync.Mutex
+	leaderLossCbs   []leaderLossSlot
 
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
@@ -290,6 +365,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		dataDir:          prepared.cfg.DataDir,
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
+		electionTick:     prepared.cfg.ElectionTick,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
@@ -314,9 +390,22 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingConfigs:   map[uint64]adminRequest{},
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Surface a misconfiguration where the tick settings produce a
+	// non-positive lease window: lease reads would never hit the fast
+	// path. Don't fail Open -- the engine is still functional via the
+	// slow LinearizableRead path -- but make the degradation visible.
+	if lease := engine.LeaseDuration(); lease <= 0 {
+		slog.Warn("etcd raft engine: lease read disabled (non-positive LeaseDuration)",
+			slog.Duration("tick_interval", engine.tickInterval),
+			slog.Int("election_tick", engine.electionTick),
+			slog.Duration("lease_safety_margin", leaseSafetyMargin),
+			slog.Duration("computed_lease", lease),
+		)
+	}
 
 	go engine.run()
 
@@ -519,6 +608,222 @@ func (e *Engine) CheckServing(ctx context.Context) error {
 
 func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return e.submitRead(ctx, true)
+}
+
+// LeaseDuration returns the time during which a lease holder can serve
+// reads from local state without re-confirming leadership via ReadIndex.
+// It is bounded by electionTimeout - leaseSafetyMargin so that the lease
+// expires before a successor leader could realistically be elected and
+// accept new writes elsewhere.
+func (e *Engine) LeaseDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	tick := e.tickInterval
+	if tick <= 0 {
+		tick = defaultTickInterval
+	}
+	election := e.electionTick
+	if election <= 0 {
+		election = defaultElectionTick
+	}
+	d := time.Duration(election)*tick - leaseSafetyMargin
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// AppliedIndex returns the highest log index applied to the local FSM.
+// Suitable for callers that need a non-blocking read fence equivalent
+// to what LinearizableRead would have returned, paired with an
+// external quorum confirmation (e.g. a valid lease).
+//
+// Lock-free: reads the mirrored atomic.Uint64 written by the run
+// loop's apply path (and by Restore's snapshot installation), so the
+// lease-read fast path does not contend with refreshStatus's write
+// lock under high read concurrency.
+func (e *Engine) AppliedIndex() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.appliedIndex.Load()
+}
+
+// LastQuorumAck returns the wall-clock instant by which a majority of
+// followers most recently responded to the leader, or the zero time
+// when no such observation exists (follower / candidate / startup).
+//
+// Lock-free: reads atomic.Int64 values published by recordQuorumAck
+// (multi-node cluster) or refreshStatus (single-node cluster keeps
+// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
+// the hot lease-read path performs zero lock work). See
+// raftengine.LeaseProvider for the lease-read correctness contract.
+func (e *Engine) LastQuorumAck() time.Time {
+	if e == nil {
+		return time.Time{}
+	}
+	// Honor the LeaseProvider contract that non-leaders always return
+	// the zero time. Without this guard a late MsgAppResp that sneaks
+	// past recordQuorumAck (or a tracker entry that survived a brief
+	// step-down/step-up window) could leak stale liveness into the
+	// caller's fast-path validation.
+	if !e.isLeader.Load() {
+		return time.Time{}
+	}
+	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
+		return time.Unix(0, ns)
+	}
+	return e.ackTracker.load()
+}
+
+// DispatchDropCount returns the total number of outbound raft messages
+// dropped before hitting the transport because the per-peer normal or
+// heartbeat channel was full. Monotonic across the life of the engine.
+// Surfaced to Prometheus via the monitoring package so the hot-path
+// dashboard can graph stepCh saturation alongside LinearizableRead
+// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+func (e *Engine) DispatchDropCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dispatchDropCount.Load()
+}
+
+// DispatchErrorCount returns the total number of outbound raft
+// dispatches that reached the transport but failed (network errors,
+// remote shutdown, etc.). Monotonic across the life of the engine.
+func (e *Engine) DispatchErrorCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.dispatchErrorCount.Load()
+}
+
+// StepQueueFullCount returns the total number of inbound raft messages
+// that could not be enqueued into stepCh because the channel was at
+// capacity. This is the "etcd raft inbound step queue is full" signal
+// from the task description: a spike indicates the local raft loop
+// is starved, usually by something blocking the apply path such as
+// the pre-#560 rawKeyTypeAt seek storm.
+func (e *Engine) StepQueueFullCount() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.stepQueueFullCount.Load()
+}
+
+// RegisterLeaderLossCallback registers fn to fire every time the local
+// node's Raft state transitions out of leader (CheckQuorum step-down,
+// graceful transfer completion, partition-induced demotion) and also
+// on shutdown() while the node was still leader. Callbacks are NOT
+// fired at the moment a transfer starts (LeadTransferee != 0); they
+// only fire once the transfer completes and state flips to follower.
+// Lease-read callers use this to invalidate cached lease state so the
+// next read takes the slow path.
+//
+// Callbacks run synchronously from refreshStatus / shutdown / fail
+// and MUST be non-blocking (each should be a fast, lock-free
+// invalidation). A panic inside a callback is contained and logged
+// so a bug in one holder cannot crash the engine or break other
+// callbacks. LeaseRead also guards its fast path on
+// engine.State() == StateLeader so the small window between the
+// transition and this callback completing cannot serve stale reads.
+//
+// The returned deregister function removes this specific registration
+// and is safe to call multiple times. Long-lived callers (coordinators
+// whose lifetime matches the engine's) may ignore it; shorter-lived
+// callers MUST invoke it to avoid accumulating dead callbacks in the
+// engine's slice.
+func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
+	if e == nil || fn == nil {
+		return func() {}
+	}
+	// Allocate a unique sentinel pointer so the deregister closure can
+	// identify THIS specific registration even if the same fn is
+	// registered multiple times.
+	slot := &struct{ fn func() }{fn: fn}
+	e.leaderLossCbsMu.Lock()
+	e.leaderLossCbs = append(e.leaderLossCbs, leaderLossSlot{id: slot, fn: fn})
+	e.leaderLossCbsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.leaderLossCbsMu.Lock()
+			defer e.leaderLossCbsMu.Unlock()
+			for i, c := range e.leaderLossCbs {
+				if c.id != slot {
+					continue
+				}
+				// Remove without leaving a dangling reference at the
+				// tail of the underlying array. The removed slot's fn
+				// typically captures a *Coordinate; a plain
+				// `append(cbs[:i], cbs[i+1:]...)` would keep the old
+				// backing cell alive and prevent GC of the associated
+				// Coordinate until the engine itself is dropped.
+				last := len(e.leaderLossCbs) - 1
+				copy(e.leaderLossCbs[i:], e.leaderLossCbs[i+1:])
+				e.leaderLossCbs[last] = leaderLossSlot{}
+				e.leaderLossCbs = e.leaderLossCbs[:last]
+				return
+			}
+		})
+	}
+}
+
+// leaderLossSlot pairs a registered callback with an id-only sentinel
+// pointer so deregister can distinguish identical fn values.
+type leaderLossSlot struct {
+	id *struct{ fn func() }
+	fn func()
+}
+
+// fireLeaderLossCallbacks invokes all registered callbacks
+// synchronously. The registered-callback contract requires each fn
+// to be non-blocking (a lock-free lease-invalidate flag flip), so
+// inline execution is safe and avoids spawning an unbounded number
+// of goroutines per leader-loss event when many shards / coordinators
+// are registered.
+//
+// A panicking callback is still contained (see
+// invokeLeaderLossCallback) so a bug in one holder cannot break
+// subsequent callbacks or crash the process.
+func (e *Engine) fireLeaderLossCallbacks() {
+	e.leaderLossCbsMu.Lock()
+	cbs := make([]func(), len(e.leaderLossCbs))
+	for i, c := range e.leaderLossCbs {
+		cbs[i] = c.fn
+	}
+	e.leaderLossCbsMu.Unlock()
+	for _, fn := range cbs {
+		e.invokeLeaderLossCallback(fn)
+	}
+}
+
+func (e *Engine) invokeLeaderLossCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			// A buggy lease holder must not crash the node. Log the
+			// recovery so operators can see lease-invalidation hooks
+			// misbehaving in production; swallow the panic so the
+			// engine status loop / shutdown path continues.
+			//
+			// Note: if a callback panics before it invalidates its
+			// lease, fast-path reads on that lease keep succeeding
+			// until wall-clock expiry. Safety is then bounded by the
+			// lease duration (strictly shorter than electionTimeout),
+			// not by the slow-path re-verification. The slow path
+			// re-verifies leadership only once the lease has
+			// naturally expired.
+			slog.Error("etcd raft engine: leader-loss callback panicked",
+				slog.String("node_id", e.localID),
+				slog.Uint64("raft_node_id", e.nodeID),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {
@@ -831,6 +1136,15 @@ func (e *Engine) handleProposal(req proposalRequest) {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
 		return
 	}
+	// etcd/raft drops proposals while a leadership transfer is in flight
+	// (LeadTransferee != 0) and returns ErrProposalDropped. Map that to
+	// the shared ErrLeadershipTransferInProgress sentinel so callers
+	// (lease-read invalidation, proxy retry, etc.) can recognise it via
+	// errors.Is instead of getting a generic dropped-proposal error.
+	if e.rawNode.BasicStatus().LeadTransferee != 0 {
+		req.done <- proposalResult{err: errors.WithStack(errLeadershipTransferInProgress)}
+		return
+	}
 	e.storePendingProposal(req)
 	if err := e.rawNode.Propose(encodeProposalEnvelope(req.id, req.payload)); err != nil {
 		e.cancelPendingProposal(req.id)
@@ -845,6 +1159,16 @@ func (e *Engine) handleRead(req readRequest) {
 	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- readResult{err: errors.WithStack(errNotLeader)}
+		return
+	}
+	// etcd/raft silently drops MsgReadIndex while a leadership transfer
+	// is in flight (LeadTransferee != 0) -- ReadIndex does not return an
+	// error on drop, so without this fast-fail the caller would block on
+	// req.done until ctx deadline. Surface the drop as
+	// ErrLeadershipTransferInProgress so LeaseRead falls through to the
+	// new leader instead of stalling ~electionTimeout.
+	if e.rawNode.BasicStatus().LeadTransferee != 0 {
+		req.done <- readResult{err: errors.WithStack(errLeadershipTransferInProgress)}
 		return
 	}
 	e.storePendingRead(req)
@@ -1007,12 +1331,82 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		return
 	}
 	e.recordLeaderContact(msg)
+	e.recordQuorumAck(msg)
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			return
 		}
 		e.fail(errors.WithStack(err))
 	}
+}
+
+// recordQuorumAck updates the per-peer last-response time when msg is
+// a follower -> leader response, so LastQuorumAck() reflects ongoing
+// majority liveness without requiring a fresh ReadIndex.
+//
+// Called inside the event-loop goroutine (single writer to e.peers
+// and to the raft state), so the e.peers read is race-free.
+//
+// Gated on the atomic isLeader mirror: a transport-level MsgAppResp /
+// MsgHeartbeatResp can land shortly after a step-down (reset() has
+// already cleared ackTracker); admitting it here would repopulate
+// the tracker and leak a stale liveness instant into the next
+// re-election as a non-zero LastQuorumAck(). isLeader is written by
+// refreshStatus on every tick, which catches every role transition
+// before the next handleStep runs.
+func (e *Engine) recordQuorumAck(msg raftpb.Message) {
+	if !isFollowerResponse(msg.Type) {
+		return
+	}
+	if msg.From == 0 || msg.From == e.nodeID {
+		return
+	}
+	if !e.isLeader.Load() {
+		return
+	}
+	// Reject acks from peers not in the current membership. Without
+	// this filter, a late MsgAppResp from a just-removed peer (which
+	// rawNode.Step will immediately reject with ErrStepPeerNotFound)
+	// would still land an ack in the tracker -- resurrecting the
+	// "ghost" entry that removePeer just pruned. Since we run on the
+	// event-loop goroutine (the sole writer to e.peers), the map read
+	// here is race-free.
+	if _, ok := e.peers[msg.From]; !ok {
+		return
+	}
+	clusterSize := len(e.peers)
+	if clusterSize <= 1 {
+		return
+	}
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+}
+
+// followerQuorumForClusterSize returns the number of non-self peer
+// acks required to form a Raft majority for a cluster of the given
+// size. Centralising the formula keeps ackTracker callers (handleStep
+// and removePeer) consistent and avoids scattered //nolint:mnd
+// suppressions. clusterSize is the total voter count INCLUDING self;
+// the result is floor((clusterSize - 1) / 2) + 1 − 1 = clusterSize / 2
+// for odd sizes (3 → 1, 5 → 2, 7 → 3) and clusterSize / 2 for even
+// sizes (4 → 2, 6 → 3) where a strict majority still requires
+// (N/2)+1 voters total, i.e. (N/2) followers beyond self.
+func followerQuorumForClusterSize(clusterSize int) int {
+	if clusterSize <= 1 {
+		return 0
+	}
+	// The Raft majority for a cluster of size N is floor(N/2)+1 voters
+	// INCLUDING self, which means the leader needs N/2 OTHER acks.
+	return clusterSize / 2 //nolint:mnd
+}
+
+// isFollowerResponse reports whether a Raft message type represents a
+// follower acknowledging the leader. We use only the two response
+// types that ALL committed replication traffic passes through:
+// MsgAppResp (log append ack) and MsgHeartbeatResp (passive heartbeat
+// ack). Either one is proof that the peer's election timer has been
+// reset, which is what the lease relies on.
+func isFollowerResponse(t raftpb.MessageType) bool {
+	return t == raftpb.MsgAppResp || t == raftpb.MsgHeartbeatResp
 }
 
 func (e *Engine) sendMessages(messages []raftpb.Message) error {
@@ -1116,6 +1510,7 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 			snapshot.Metadata.Index, snapshot.Metadata.Term)
 	}
 	e.applied = snapshot.Metadata.Index
+	e.appliedIndex.Store(snapshot.Metadata.Index)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
 	return nil
 }
@@ -1186,7 +1581,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 		switch entry.Type {
 		case raftpb.EntryNormal:
 			response := e.applyNormalEntry(entry)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 			e.resolveProposal(entry.Index, entry.Data, response)
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
@@ -1199,7 +1594,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
 			if err := cc.Unmarshal(entry.Data); err != nil {
@@ -1211,12 +1606,21 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 				return err
 			}
 			e.applyConfigChangeV2(cc, entry.Index)
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		default:
-			e.applied = entry.Index
+			e.setApplied(entry.Index)
 		}
 	}
 	return nil
+}
+
+// setApplied advances both the run-loop-owned `applied` field and the
+// lock-free atomic mirror in a single place. Called exclusively from
+// the Raft run loop, so no synchronization between the two writes is
+// required beyond the single-writer invariant.
+func (e *Engine) setApplied(index uint64) {
+	e.applied = index
+	e.appliedIndex.Store(index)
 }
 
 func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
@@ -1603,13 +2007,39 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
+	clusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Keep the lock-free single-node fast path in sync with the current
+	// role: populate while leader of a 1-node cluster, clear otherwise
+	// (including on leader loss, so LastQuorumAck transitions to the
+	// multi-node tracker or zero time atomically).
+	// Publish leader state atomically so recordQuorumAck / LastQuorumAck
+	// can gate on it without acquiring e.mu. MUST run before the
+	// single-node ack store below, otherwise a brand-new leader tick
+	// could publish a ack instant while isLeader is still false.
+	e.isLeader.Store(status.State == raftengine.StateLeader)
+
+	if status.State == raftengine.StateLeader && clusterSize <= 1 {
+		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+	} else {
+		e.singleNodeLeaderAckUnixNano.Store(0)
+	}
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
+		// Drop the per-peer ack map so a future re-election cannot
+		// surface a stale majority-ack instant before the new term's
+		// heartbeats have actually confirmed liveness.
+		e.ackTracker.reset()
+		// Notify lease holders so they invalidate any cached lease;
+		// without this hook, a former leader keeps serving fast-path
+		// reads from local state for up to LeaseDuration after a
+		// successor leader is already accepting writes.
+		e.fireLeaderLossCallbacks()
 	}
 }
 
@@ -1632,14 +2062,29 @@ func (e *Engine) requestShutdown() {
 
 func (e *Engine) shutdown() {
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(errors.WithStack(errClosed))
+	// LeaseProvider contract promises callbacks fire on shutdown too.
+	// refreshStatus only fires them on the leader -> non-leader edge,
+	// which can be missed when shutdown short-circuits the status loop.
+	// Always fire here so lease holders invalidate even on engine close
+	// initiated while still leader, on shutdown after fail(), or via
+	// Close() racing against the run loop.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) fail(err error) {
@@ -1672,6 +2117,7 @@ func (e *Engine) fail(err error) {
 		)
 	}
 	e.mu.Lock()
+	wasLeader := e.status.State == raftengine.StateLeader
 	if err != nil {
 		e.runErr = err
 	}
@@ -1684,8 +2130,21 @@ func (e *Engine) fail(err error) {
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
-	_ = e.transport.Close()
+	if err := e.transport.Close(); err != nil {
+		slog.Warn("etcd raft engine: transport close",
+			slog.String("node_id", e.localID),
+			slog.Any("err", err),
+		)
+	}
 	e.failPending(e.currentErrorOrClosed())
+	// LeaseProvider contract: fire leader-loss callbacks on shutdown if
+	// we were leader. fail() is the error-shutdown twin of shutdown();
+	// without firing here, a run() -> fail() path that bypasses
+	// refreshStatus's Leader -> non-Leader edge leaves lease holders
+	// serving fast-path reads from stale state for up to LeaseDuration.
+	if wasLeader {
+		e.fireLeaderLossCallbacks()
+	}
 }
 
 func (e *Engine) failPending(err error) {
@@ -2108,6 +2567,7 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 	case e.stepCh <- msg:
 		return nil
 	default:
+		e.stepQueueFullCount.Add(1)
 		return errors.WithStack(errStepQueueFull)
 	}
 }
@@ -2433,7 +2893,22 @@ func (e *Engine) removePeer(nodeID uint64) {
 		delete(e.peers, nodeID)
 	}
 	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
+	postRemovalClusterSize := len(e.peers)
 	e.mu.Unlock()
+
+	// Drop the peer's recorded ack so a reconfiguration cannot leave a
+	// stale entry that falsely satisfies the new cluster's majority.
+	// followerQuorum is computed against the POST-removal cluster; a
+	// shrink to <=1 would otherwise pass 0 here, which
+	// quorumAckTracker.removePeer treats as "keep the current instant"
+	// and would surface stale liveness to LastQuorumAck if the cluster
+	// subsequently grew back. Clear the tracker explicitly in that
+	// case so any future multi-node membership starts fresh.
+	if postRemovalClusterSize <= 1 {
+		e.ackTracker.reset()
+	} else {
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
+	}
 
 	if e.transport != nil {
 		e.transport.RemovePeer(nodeID)

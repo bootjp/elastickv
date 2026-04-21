@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -18,6 +19,16 @@ type luaScriptContext struct {
 	server  *RedisServer
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
+
+	// ctx is the request-scoped context captured at newLuaScriptContext
+	// time. New cmd* handlers should propagate it into store operations
+	// so the Eval's deadline and cancellation reach storage.
+	//
+	// Existing handlers in this file still use context.Background() at
+	// their store call sites -- a historical pattern from before we had
+	// a ctx available. Migrating those is tracked as a follow-up PR;
+	// see PR #570's review for the gemini note on scope.
+	ctx context.Context
 
 	redisCallDuration time.Duration
 	redisCallCount    int
@@ -213,11 +224,12 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 }
 
 func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptContext, error) {
-	// LinearizableRead confirms leadership via quorum AND waits for the local
-	// FSM to apply all committed entries, so startTS reflects the latest
-	// committed state. All subsequent reads within the script use snapshotGetAt
-	// (no per-call VerifyLeader), making VerifyLeader O(1) per script.
-	if _, err := server.coordinator.LinearizableRead(ctx); err != nil {
+	// LeaseRead confirms leadership at most once per LeaseDuration window;
+	// inside the window it returns immediately without a Raft round-trip.
+	// All subsequent reads within the script use snapshotGetAt at startTS,
+	// so leadership is verified at most once per script and amortised across
+	// scripts via the lease.
+	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	startTS := server.readTS()
@@ -225,6 +237,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		server:      server,
 		startTS:     startTS,
 		readPin:     server.pinReadTS(startTS),
+		ctx:         ctx,
 		touched:     map[string]struct{}{},
 		deleted:     map[string]bool{},
 		everDeleted: map[string]bool{},
@@ -1343,21 +1356,92 @@ func (c *luaScriptContext) renameStreamValue(src, dst []byte) error {
 }
 
 func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// Fast path is only safe when there is NO authoritative
+	// script-local answer. Two separate signals to check:
+	//
+	//   (a) cachedType() covers loaded state for OTHER types (string /
+	//       list / ...) AND the explicit c.deleted entry from a prior
+	//       DEL / RENAME. Bypassing would leak pre-script pebble state.
+	//   (b) c.hashes[key] already loaded (even with exists=false for
+	//       a confirmed miss) means a prior command already paid the
+	//       type-probe tax. Re-running the fast path would just do
+	//       another wide-column probe for the same negative answer.
+	//       Reuse the loaded state via the slow path, which returns
+	//       immediately when c.hashes[key] is present.
+	if luaHashAlreadyLoaded(c, key) {
+		return hgetFromSlowPath(c, key, field)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return hgetFromSlowPath(c, key, field)
+	}
+	// Fast path: direct wide-column field lookup, bypassing the ~8-seek
+	// keyTypeAt probe inside hashState. This is the same pattern that
+	// the top-level HGET handler uses (see adapter/redis_compat_commands.go),
+	// reused verbatim here so BullMQ-style scripts that touch many
+	// hash keys stop paying the type-probe tax per redis.call.
+	raw, hit, alive, err := c.server.hashFieldFastLookup(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(string(raw)), nil
+	}
+	// Miss: fall back to the full hashState path so legacy-blob hashes
+	// and nil / WRONGTYPE disambiguation behave exactly as before.
+	return hgetFromSlowPath(c, key, field)
+}
+
+// luaHashAlreadyLoaded reports whether a prior command in this Eval
+// already populated c.hashes[key] and resolved its exists/loaded
+// flags. A loaded state -- even one representing a known miss --
+// makes the fast path redundant: the slow path returns immediately
+// by reading the cached luaHashState, skipping a wide-column probe.
+func luaHashAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.hashes[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// luaSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.sets.
+func luaSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.sets[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// luaZSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.zsets.
+func luaZSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.zsets[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// hgetFromSlowPath runs the legacy hashState-based HGET, preserving
+// the script-local cache and WRONGTYPE / nil behaviour unchanged.
+func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
 		}
 		return luaReply{}, err
 	}
+	return hgetFromHashState(st, field), nil
+}
+
+// hgetFromHashState reads field out of a loaded luaHashState in the
+// same way the legacy cmdHGet did.
+func hgetFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	value, ok := st.value[args[1]]
+	value, ok := st.value[field]
 	if !ok {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	return luaStringReply(value), nil
+	return luaStringReply(value)
 }
 
 func (c *luaScriptContext) cmdHSet(args []string) (luaReply, error) {
@@ -1509,21 +1593,53 @@ func (c *luaScriptContext) cmdHDel(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// See cmdHGet: defer to the slow path whenever the key already has
+	// an authoritative answer locally, so prior DEL / RENAME / SET /
+	// HSET within this Eval is honored, AND so a confirmed-missing
+	// hash loaded earlier in the script does not re-run the
+	// wide-column probe on every subsequent HEXISTS.
+	if luaHashAlreadyLoaded(c, key) {
+		return hexistsFromSlowPath(c, key, field)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return hexistsFromSlowPath(c, key, field)
+	}
+	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	return hexistsFromSlowPath(c, key, field)
+}
+
+func hexistsFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return hexistsFromHashState(st, field), nil
+}
+
+// hexistsFromHashState reports whether field is present in a loaded
+// luaHashState, matching the legacy cmdHExists semantics.
+func hexistsFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	_, ok := st.value[args[1]]
-	if ok {
-		return luaIntReply(1), nil
+	if _, ok := st.value[field]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func (c *luaScriptContext) cmdHLen(args []string) (luaReply, error) {
@@ -2051,20 +2167,52 @@ func finalizeSetLikeRemoval(c *luaScriptContext, key string, removed int, empty 
 }
 
 func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
-	st, err := c.setState([]byte(args[0]))
+	key := []byte(args[0])
+	member := args[1]
+	// See cmdHGet: defer to the slow path whenever the set has an
+	// authoritative script-local answer (loaded state incl. miss, or
+	// cachedType reporting a different-type / deleted key).
+	if luaSetAlreadyLoaded(c, key) {
+		return sismemberFromSlowPath(c, key, member)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return sismemberFromSlowPath(c, key, member)
+	}
+	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	return sismemberFromSlowPath(c, key, member)
+}
+
+func sismemberFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
+	st, err := c.setState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return sismemberFromSetState(st, member), nil
+}
+
+// sismemberFromSetState returns the Redis integer reply for SISMEMBER
+// against a loaded luaSetState, matching the legacy cmdSIsMember
+// semantics.
+func sismemberFromSetState(st *luaSetState, member string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	if _, ok := st.members[args[1]]; ok {
-		return luaIntReply(1), nil
+	if _, ok := st.members[member]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func parseLuaZAddArgs(args []string) (zaddFlags, []string, error) {
@@ -2257,6 +2405,95 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 
 func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaReply, error) {
 	key := []byte(args[0])
+	options, err := parseZRangeByScoreOptions(args, reverse)
+	if err != nil {
+		return luaReply{}, err
+	}
+	// Defensive bound on LIMIT offset: negative offsets produce no
+	// well-defined Redis behaviour, so treat them as syntax error.
+	if options.offset < 0 {
+		return luaReply{}, errors.New("ERR value is out of range, must be positive")
+	}
+	// Redis treats ANY negative LIMIT count as "no limit" (return all
+	// elements from offset). parseZRangeByScoreTail's default is -1;
+	// an explicit user-supplied negative value is coerced here so the
+	// downstream fast path (zsetFastScanLimit / decodeZSetScoreRange)
+	// sees a single "unbounded" sentinel.
+	if options.limit < 0 {
+		options.limit = -1
+	}
+	// Fast path eligibility: no script-local mutation / deletion /
+	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
+	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
+	//
+	// zrangeMetrics is a zero-value LuaFastPathCmd when no observer is
+	// wired (tests); Observe* methods on it are no-ops. When wired,
+	// each Observe* is a single atomic increment on a pre-resolved
+	// Counter (see WithLuaFastPathObserver).
+	zrangeMetrics := c.server.luaFastPathZRange
+	if luaZSetAlreadyLoaded(c, key) {
+		zrangeMetrics.ObserveSkipLoaded()
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if _, cached := c.cachedType(key); cached {
+		zrangeMetrics.ObserveSkipCachedType()
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	entries, hit, fallbackReason, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
+	if fastErr != nil {
+		return luaReply{}, fastErr
+	}
+	if !hit {
+		zrangeMetrics.ObserveFallback(fallbackReason)
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	zrangeMetrics.ObserveHit()
+	if len(entries) == 0 {
+		return luaArrayReply(), nil
+	}
+	return zsetRangeReply(entries, options.withScores), nil
+}
+
+// zrangeByScoreFastPath translates the caller's min/max bounds into a
+// bounded score-index scan through zsetRangeByScoreFast and returns
+// the decoded entries. hit=false means the server-side helper wants
+// the slow path (legacy-blob zset, string-encoding corruption, or
+// empty-result-but-zset-is-missing so WRONGTYPE disambiguation is
+// needed).
+//
+// Threads c.ctx into the server-side helper so the Eval's deadline
+// and cancellation reach the store layer. New cmd* handlers should
+// follow this pattern; historical Background() call sites in this
+// file are migrated incrementally.
+func (c *luaScriptContext) zrangeByScoreFastPath(
+	key []byte, options luaZRangeByScoreOptions, reverse bool,
+) ([]redisZSetEntry, bool, monitoring.LuaFastPathFallbackReason, error) {
+	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
+	filter := func(score float64) bool {
+		return scoreInRange(score, options.minBound, options.maxBound)
+	}
+	return c.server.zsetRangeByScoreFast(
+		c.scriptCtx(), key, startKey, endKey, reverse,
+		options.offset, options.limit, filter, c.startTS,
+	)
+}
+
+// scriptCtx returns the request-scoped context captured at script
+// construction, or context.Background() if the caller bypassed the
+// normal entry point (unit tests constructing a luaScriptContext
+// directly). New code should always have a real ctx, so this is a
+// defensive fallback.
+func (c *luaScriptContext) scriptCtx() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+// cmdZRangeByScoreSlow is the legacy full-load path, preserved for
+// fall-through cases (in-script mutations, legacy-blob encoding,
+// ambiguous empty results).
+func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByScoreOptions, reverse bool) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2270,12 +2507,6 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if err := c.ensureZSetLoaded(st, key); err != nil {
 		return luaReply{}, err
 	}
-
-	options, err := parseZRangeByScoreOptions(args, reverse)
-	if err != nil {
-		return luaReply{}, err
-	}
-
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
@@ -2286,6 +2517,67 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaArrayReply(), nil
 	}
 	return zsetRangeReply(selected, options.withScores), nil
+}
+
+// zsetScoreScanBounds maps zScoreBound pairs to a [startKey, endKey)
+// byte-range on the score index that EXCLUDES entries outside the
+// caller's bound, not just approximates. Placing an exclusive edge
+// into the scan bound (rather than post-filtering after the scan)
+// matters for `ZRANGEBYSCORE (value +inf LIMIT 0 N`: if there are
+// many members AT score=value, a post-filter approach would consume
+// the whole offset+limit budget on those filtered-out rows and miss
+// the real matches at score > value.
+//
+// The score index is lex-sorted by (userKey, sortableScore, member).
+// Conventions:
+//
+//	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)
+//	minBound = value, inclusive  -> startKey = ZSetScoreRangeScanPrefix(key, score)
+//	minBound = value, exclusive  -> startKey = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = +Inf              -> endKey   = PrefixScanEnd(ZSetScoreScanPrefix(key))
+//	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
+//
+// The same [start, end) endpoints drive both forward and reverse
+// scans; ReverseScanAt iterates from endKey downward.
+func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound) (startKey, endKey []byte) {
+	full := store.ZSetScoreScanPrefix(key)
+	fullEnd := store.PrefixScanEnd(full)
+	switch minBound.kind {
+	case zBoundNegInf:
+		startKey = full
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, minBound.score)
+		if minBound.inclusive {
+			startKey = scorePrefix
+		} else {
+			startKey = store.PrefixScanEnd(scorePrefix)
+		}
+	case zBoundPosInf:
+		// +Inf as minBound is a concrete "lower bound = +Inf" — only
+		// members with score = +Inf qualify. Use the +Inf score prefix
+		// as the scan start so those members are not silently dropped.
+		// Redis accepts ZADD key +inf m and ZRANGEBYSCORE key +inf +inf
+		// must return m.
+		startKey = store.ZSetScoreRangeScanPrefix(key, math.Inf(+1))
+	}
+	switch maxBound.kind {
+	case zBoundNegInf:
+		// -Inf as maxBound is a concrete "upper bound = -Inf" — only
+		// members with score = -Inf qualify. Bound the scan to the end
+		// of the -Inf score slot. Mirrors the +Inf-as-minBound case.
+		endKey = store.PrefixScanEnd(store.ZSetScoreRangeScanPrefix(key, math.Inf(-1)))
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, maxBound.score)
+		if maxBound.inclusive {
+			endKey = store.PrefixScanEnd(scorePrefix)
+		} else {
+			endKey = scorePrefix
+		}
+	case zBoundPosInf:
+		endKey = fullEnd
+	}
+	return startKey, endKey
 }
 
 type luaZRangeByScoreOptions struct {
@@ -2379,8 +2671,53 @@ func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEn
 	return trimmed
 }
 
+// zscoreArgCount pins the expected argument count for ZSCORE at the
+// Lua-context dispatch boundary. Using a named constant satisfies
+// the linter without a //nolint:mnd on the arity check and documents
+// that the command requires EXACTLY two arguments (any extras must
+// be rejected, matching Redis server semantics).
+const zscoreArgCount = 2
+
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
+	if len(args) != zscoreArgCount {
+		return luaReply{}, errors.New("ERR wrong number of arguments for 'zscore' command")
+	}
 	key := []byte(args[0])
+	member := args[1]
+	// See cmdHGet: defer to the slow path whenever the zset has an
+	// authoritative script-local answer. Two separate signals:
+	//
+	//   (a) luaZSetAlreadyLoaded: a prior cmdZScore / cmdZRange etc.
+	//       fully resolved the zset, even to a confirmed miss
+	//       (loaded=true, exists=false). Re-running the fast path
+	//       would do a redundant wide-column probe.
+	//   (b) cachedType: a prior ZADD / ZREM in this Eval OR a prior
+	//       DEL / type-change via SET. Without this guard the fast
+	//       path would leak pre-script pebble state.
+	if luaZSetAlreadyLoaded(c, key) {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(formatRedisFloat(score)), nil
+	}
+	return zscoreFromSlowPath(c, key, member)
+}
+
+// zscoreFromSlowPath runs the legacy zsetState-based ZSCORE,
+// preserving the script-local cache and WRONGTYPE / nil behaviour
+// unchanged. Handles legacy-blob zsets via ensureZSetLoaded inside
+// memberScore.
+func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2388,10 +2725,16 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
+	return c.zscoreFromZSetState(st, key, member)
+}
+
+// zscoreFromZSetState returns the Redis reply for ZSCORE against a
+// loaded luaZSetState, matching the legacy cmdZScore semantics.
+func (c *luaScriptContext) zscoreFromZSetState(st *luaZSetState, key []byte, member string) (luaReply, error) {
 	if !st.exists {
 		return luaNilReply(), nil
 	}
-	score, ok, err := c.memberScore(st, key, args[1])
+	score, ok, err := c.memberScore(st, key, member)
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -3213,7 +3556,15 @@ func sortedSetMembers(members map[string]struct{}) []string {
 }
 
 func zsetRangeReply(entries []redisZSetEntry, withScores bool) luaReply {
-	out := make([]luaReply, 0, len(entries))
+	// WITHSCORES doubles the output width (member + score per entry);
+	// size the slice accordingly to avoid an internal grow on large
+	// reply arrays. Bounded by maxWideScanLimit at the fast-path
+	// layer, so the allocation cannot be unbounded.
+	capacity := len(entries)
+	if withScores {
+		capacity *= 2
+	}
+	out := make([]luaReply, 0, capacity)
 	for _, entry := range entries {
 		out = append(out, luaStringReply(entry.Member))
 		if withScores {

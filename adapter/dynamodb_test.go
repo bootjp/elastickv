@@ -1859,3 +1859,11 @@ func (w *testCoordinatorWrapper) Clock() *kv.HLC {
 func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, error) {
 	return w.inner.LinearizableRead(ctx)
 }
+
+func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
+	return kv.LeaseReadThrough(w.inner, ctx)
+}
+
+func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	return kv.LeaseReadForKeyThrough(w.inner, ctx, key)
+}

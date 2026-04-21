@@ -85,6 +85,14 @@ func (c *retryOnceCoordinator) LinearizableRead(_ context.Context) (uint64, erro
 	return 0, nil
 }
 
+func (c *retryOnceCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
+
+func (c *retryOnceCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+	return c.LinearizableRead(ctx)
+}
+
 type recordingConn struct {
 	ctx  any
 	err  string
