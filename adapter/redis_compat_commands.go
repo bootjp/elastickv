@@ -1720,12 +1720,21 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 	return raw, true, !expired, nil
 }
 
-// hasHigherPriorityStringEncoding returns true iff a string-encoded
-// entry exists for key. Matches the "string wins" tiebreaker in
-// rawKeyTypeAt (see adapter/redis_compat_helpers.go), so a corrupt
-// dual-encoded key where both a string and a collection row are
-// present will take the slow path and return WRONGTYPE / nil from
-// keyTypeAt rather than the collection-specific fast-path answer.
+// hasHigherPriorityStringEncoding returns true iff the new-format
+// string encoding (redisStrKey) exists for key. This is NARROWER
+// than rawKeyTypeAt's full string-wins tiebreaker, which also covers
+// HyperLogLog (redisHLLKey) and the legacy bare key: those rarer
+// dual-encoding corruption cases still reach the wide-column fast
+// path and may return the collection-specific answer instead of
+// WRONGTYPE / nil.
+//
+// The narrow scope is deliberate -- expanding the guard to every
+// string-priority candidate (3 ExistsAt calls + the list-meta probe)
+// would cost ~4-5 extra seeks per fast-path hit, regressing the
+// negative case further than the ordering tweak in
+// hashFieldFastLookup / setMemberFastExists / hashFieldFastExists
+// already saved. Callers that require complete priority alignment
+// must take the keyTypeAt slow path explicitly.
 func (r *RedisServer) hasHigherPriorityStringEncoding(ctx context.Context, key []byte, readTS uint64) (bool, error) {
 	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
 	if err != nil {
