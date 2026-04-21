@@ -434,3 +434,79 @@ func TestCoordinate_LeaseRead_ObserverSeparatesHitsFromMisses(t *testing.T) {
 	require.Equal(t, int32(5), obs.hits.Load())
 	require.Equal(t, int32(1), obs.misses.Load())
 }
+
+// --- leaseReadEngineCtx -------------------------------------------------
+
+// TestLeaseReadEngineCtx_FastPath_SkipsLinearizableRead covers the
+// core invariant for ShardStore.GetAt: a fresh LastQuorumAck with
+// Leader state must return AppliedIndex directly, without calling
+// engine.LinearizableRead. This is the fix for the post-#573
+// read-index dispatcher saturation (each in-script redis.call was
+// going through LinearizableRead every time).
+func TestLeaseReadEngineCtx_FastPath_SkipsLinearizableRead(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 42, leaseDur: time.Hour}
+	eng.setQuorumAck(time.Now())
+
+	idx, err := leaseReadEngineCtx(context.Background(), eng)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), idx)
+	require.Equal(t, int32(0), eng.linearizableCalls.Load(),
+		"fresh engine-driven lease must skip the LinearizableRead round-trip")
+}
+
+// TestLeaseReadEngineCtx_StaleAck_FallsThroughToLinearizable makes
+// sure the fast path isn't taken when the engine's last quorum ack
+// has aged past LeaseDuration.
+func TestLeaseReadEngineCtx_StaleAck_FallsThroughToLinearizable(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 7, leaseDur: 50 * time.Millisecond}
+	eng.setQuorumAck(time.Now().Add(-time.Hour))
+
+	idx, err := leaseReadEngineCtx(context.Background(), eng)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), idx)
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"stale ack must take the slow path exactly once")
+}
+
+// TestLeaseReadEngineCtx_NotLeader_FallsThrough verifies that a
+// fresh ack alone is not sufficient — the engine must currently be
+// Leader. Mirrors engineLeaseAckValid's state guard.
+func TestLeaseReadEngineCtx_NotLeader_FallsThrough(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 99, leaseDur: time.Hour}
+	eng.setQuorumAck(time.Now())
+	eng.state.Store(raftengine.StateFollower)
+	// On a non-leader the fake honours the LeaseProvider contract and
+	// returns zero ack, so the engineLeaseAckValid state guard also
+	// fires — both layers must fail closed.
+	eng.linearizableErr = errors.New("not leader")
+
+	_, err := leaseReadEngineCtx(context.Background(), eng)
+	require.Error(t, err)
+	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
+		"non-leader must take the slow path; leader-only fast path must NOT serve")
+}
+
+// TestLeaseReadEngineCtx_NoLeaseProvider_FallsThrough covers engines
+// that do not implement LeaseProvider. The helper must still work by
+// routing every call through LinearizableRead.
+func TestLeaseReadEngineCtx_NoLeaseProvider_FallsThrough(t *testing.T) {
+	t.Parallel()
+	eng := &nonLeaseEngine{}
+
+	idx, err := leaseReadEngineCtx(context.Background(), eng)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), idx)
+}
+
+// TestLeaseReadEngineCtx_NilEngine returns ErrLeaderNotFound without
+// panicking. Protects against a regression where the nil guard is
+// removed.
+func TestLeaseReadEngineCtx_NilEngine(t *testing.T) {
+	t.Parallel()
+	_, err := leaseReadEngineCtx(context.Background(), nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+}
