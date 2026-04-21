@@ -96,22 +96,71 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 	return m
 }
 
-// LuaFastPathObserver records a fast-path outcome for a single
-// redis.call() inside a Lua script. The zero value is safe and
-// silently drops samples so tests can pass LuaFastPathObserver{} as a
-// stub.
+// LuaFastPathObserver records fast-path outcomes for redis.call()
+// inside Lua scripts. The zero value is safe and silently drops
+// samples so tests can pass LuaFastPathObserver{} as a stub.
+//
+// Hot-path shape: each ObserveLuaFastPath-on-handle call is a single
+// atomic increment on a pre-resolved prometheus.Counter. Callers
+// resolve one LuaFastPathCmd per command at server construction to
+// avoid CounterVec.WithLabelValues (mutex-guarded map lookup) on the
+// hot path.
 type LuaFastPathObserver struct {
 	metrics *HotPathMetrics
 }
 
-// ObserveLuaFastPath records (cmd, outcome). cmd should be the
-// lowercase command name (e.g. "zrangebyscore"); outcome should be
-// one of LuaFastPathOutcome*.
-func (o LuaFastPathObserver) ObserveLuaFastPath(cmd, outcome string) {
+// LuaFastPathCmd is a pre-resolved bundle of fast-path outcome
+// counters for a single Lua command. Construct once via
+// LuaFastPathObserver.ForCommand(cmd) at server startup; call the
+// Observe* methods per redis.call(). Safe to copy.
+type LuaFastPathCmd struct {
+	hit             prometheus.Counter
+	skipAlreadyLoad prometheus.Counter
+	skipCachedType  prometheus.Counter
+	fallback        prometheus.Counter
+}
+
+// ForCommand pre-resolves the counter handles for cmd. Returns a
+// zero-value LuaFastPathCmd when the observer is empty (tests),
+// which silently drops all Observe* calls.
+func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
 	if o.metrics == nil {
-		return
+		return LuaFastPathCmd{}
 	}
-	o.metrics.luaFastPathTotal.WithLabelValues(cmd, outcome).Inc()
+	vec := o.metrics.luaFastPathTotal
+	return LuaFastPathCmd{
+		hit:             vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
+		skipAlreadyLoad: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipAlreadyLoad),
+		skipCachedType:  vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
+		fallback:        vec.WithLabelValues(cmd, LuaFastPathOutcomeFallback),
+	}
+}
+
+// ObserveHit / ObserveSkipAlreadyLoaded / ObserveSkipCachedType /
+// ObserveFallback record one outcome. Each is a single atomic
+// increment when the counter is wired; a no-op on the zero value.
+func (c LuaFastPathCmd) ObserveHit() {
+	if c.hit != nil {
+		c.hit.Inc()
+	}
+}
+
+func (c LuaFastPathCmd) ObserveSkipAlreadyLoaded() {
+	if c.skipAlreadyLoad != nil {
+		c.skipAlreadyLoad.Inc()
+	}
+}
+
+func (c LuaFastPathCmd) ObserveSkipCachedType() {
+	if c.skipCachedType != nil {
+		c.skipCachedType.Inc()
+	}
+}
+
+func (c LuaFastPathCmd) ObserveFallback() {
+	if c.fallback != nil {
+		c.fallback.Inc()
+	}
 }
 
 // LeaseReadObserver implements kv.LeaseReadObserver by incrementing the

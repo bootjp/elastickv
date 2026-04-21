@@ -32,12 +32,12 @@ elastickv_lease_read_total{node_address="10.0.0.1:50051",node_id="n1",outcome="m
 
 func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
 	registry := NewRegistry("n1", "10.0.0.1:50051")
-	observer := registry.LuaFastPathObserver()
+	cmd := registry.LuaFastPathObserver().ForCommand("zrangebyscore")
 
-	observer.ObserveLuaFastPath("zrangebyscore", LuaFastPathOutcomeHit)
-	observer.ObserveLuaFastPath("zrangebyscore", LuaFastPathOutcomeHit)
-	observer.ObserveLuaFastPath("zrangebyscore", LuaFastPathOutcomeSkipAlreadyLoad)
-	observer.ObserveLuaFastPath("zrangebyscore", LuaFastPathOutcomeFallback)
+	cmd.ObserveHit()
+	cmd.ObserveHit()
+	cmd.ObserveSkipAlreadyLoaded()
+	cmd.ObserveFallback()
 
 	err := testutil.GatherAndCompare(
 		registry.Gatherer(),
@@ -46,6 +46,7 @@ func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
 # TYPE elastickv_lua_cmd_fastpath_total counter
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback"} 1
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="hit"} 2
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_cached_type"} 0
 elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_loaded"} 1
 `),
 		"elastickv_lua_cmd_fastpath_total",
@@ -55,8 +56,12 @@ elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:5005
 
 func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
 	var observer LuaFastPathObserver
+	cmd := observer.ForCommand("zrangebyscore")
 	require.NotPanics(t, func() {
-		observer.ObserveLuaFastPath("zrangebyscore", LuaFastPathOutcomeHit)
+		cmd.ObserveHit()
+		cmd.ObserveSkipAlreadyLoaded()
+		cmd.ObserveSkipCachedType()
+		cmd.ObserveFallback()
 	})
 }
 

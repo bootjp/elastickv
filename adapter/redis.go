@@ -266,6 +266,11 @@ type RedisServer struct {
 	requestObserver     monitoring.RedisRequestObserver
 	luaObserver         monitoring.LuaScriptObserver
 	luaFastPathObserver monitoring.LuaFastPathObserver
+	// luaFastPathZRange is the pre-resolved counter bundle for the
+	// ZRANGEBYSCORE / ZREVRANGEBYSCORE Lua fast path. Resolved once in
+	// WithLuaFastPathObserver so the hot path does not pay for
+	// CounterVec.WithLabelValues on every redis.call().
+	luaFastPathZRange monitoring.LuaFastPathCmd
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -324,11 +329,21 @@ func WithLuaObserver(observer monitoring.LuaScriptObserver) RedisServerOption {
 // WithLuaFastPathObserver enables per-redis.call() fast-path outcome
 // metrics inside Lua scripts. Used to diagnose fast-path hit ratios
 // for commands like ZRANGEBYSCORE / ZSCORE / HGET.
+//
+// Resolves per-command counter handles up front so the hot path
+// avoids CounterVec.WithLabelValues on every redis.call().
 func WithLuaFastPathObserver(observer monitoring.LuaFastPathObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.luaFastPathObserver = observer
+		r.luaFastPathZRange = observer.ForCommand(luaFastPathCmdZRangeByScore)
 	}
 }
+
+// luaFastPathCmdZRangeByScore is the shared label for ZRANGEBYSCORE
+// and ZREVRANGEBYSCORE fast-path outcomes. Both directions take the
+// same branch through zsetRangeByScoreFast so sharing one label
+// keeps the counter cardinality bounded.
+const luaFastPathCmdZRangeByScore = "zrangebyscore"
 
 // redisMetricsConn wraps a redcon.Conn to detect whether WriteError was called.
 type redisMetricsConn struct {
