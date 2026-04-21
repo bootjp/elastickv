@@ -2408,14 +2408,18 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if err != nil {
 		return luaReply{}, err
 	}
-	// Defensive bounds on LIMIT offset count: offset must be
-	// non-negative, and a negative limit is only accepted when it's
-	// the -1 "no-limit" sentinel set by parseZRangeByScoreTail. This
-	// guards the fast path's offset/limit arithmetic (zsetFastScanLimit
-	// + decodeZSetScoreRange) against panics on hostile script input
-	// and keeps maxWideScanLimit meaningful as a memory bound.
-	if options.offset < 0 || options.limit < -1 {
+	// Defensive bound on LIMIT offset: negative offsets produce no
+	// well-defined Redis behaviour, so treat them as syntax error.
+	if options.offset < 0 {
 		return luaReply{}, errors.New("ERR syntax error")
+	}
+	// Redis treats ANY negative LIMIT count as "no limit" (return all
+	// elements from offset). parseZRangeByScoreTail's default is -1;
+	// an explicit user-supplied negative value is coerced here so the
+	// downstream fast path (zsetFastScanLimit / decodeZSetScoreRange)
+	// sees a single "unbounded" sentinel.
+	if options.limit < 0 {
+		options.limit = -1
 	}
 	// Fast path eligibility: no script-local mutation / deletion /
 	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards

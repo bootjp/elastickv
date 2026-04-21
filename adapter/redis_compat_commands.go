@@ -1897,15 +1897,23 @@ func (r *RedisServer) zsetFastPathEligible(ctx context.Context, key []byte, read
 // unbounded or malicious LIMIT cannot force an O(N) scan of a large
 // zset. A negative limit means "unbounded" at the Redis level; cap it
 // at the collection OOM limit.
+//
+// Check bounds BEFORE adding to avoid signed-integer overflow on
+// hostile input (e.g. a Lua script passing offset=limit=math.MaxInt).
+// A wrap would produce a negative scanLimit and cause the caller's
+// `scanLimit <= 0` branch to misroute a live zset into the
+// empty-result tail.
 func zsetFastScanLimit(offset, limit int) int {
 	if limit < 0 {
 		return maxWideScanLimit
 	}
-	scanLimit := offset + limit
-	if scanLimit > maxWideScanLimit {
+	if offset >= maxWideScanLimit {
 		return maxWideScanLimit
 	}
-	return scanLimit
+	if limit > maxWideScanLimit-offset {
+		return maxWideScanLimit
+	}
+	return offset + limit
 }
 
 // zsetScoreScan picks Forward / Reverse ScanAt based on direction.
@@ -1920,6 +1928,22 @@ func (r *RedisServer) zsetScoreScan(
 	return kvs, cockerrors.WithStack(err)
 }
 
+// zsetDecodeAllocSize returns a tight upper bound on the collected
+// entry count for decodeZSetScoreRange: (kvLen - offset) capped by
+// limit, never negative. Avoiding a make([]...len(kvs)) saves up to
+// maxWideScanLimit entries of wasted slice capacity when the caller
+// asked for a small window at a large offset.
+func zsetDecodeAllocSize(kvLen, offset, limit int) int {
+	allocSize := kvLen - offset
+	if allocSize < 0 {
+		return 0
+	}
+	if limit >= 0 && limit < allocSize {
+		return limit
+	}
+	return allocSize
+}
+
 // decodeZSetScoreRange decodes score-index scan results into
 // redisZSetEntry, applying the post-scan score filter (exclusive
 // bound edges) and the offset / limit pagination. Entries that fail
@@ -1928,7 +1952,7 @@ func (r *RedisServer) zsetScoreScan(
 func decodeZSetScoreRange(
 	key []byte, kvs []*store.KVPair, offset, limit int, scoreFilter func(float64) bool,
 ) []redisZSetEntry {
-	entries := make([]redisZSetEntry, 0, len(kvs))
+	entries := make([]redisZSetEntry, 0, zsetDecodeAllocSize(len(kvs), offset, limit))
 	skipped := 0
 	for _, kv := range kvs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)

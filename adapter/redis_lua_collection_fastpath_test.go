@@ -980,3 +980,31 @@ func TestLua_ZRANGEBYSCORE_NegativeOffsetRejected(t *testing.T) {
 	).Result()
 	require.Error(t, err, "negative offset must be rejected")
 }
+
+// TestLua_ZRANGEBYSCORE_NegativeLimitReturnsAll verifies that a
+// negative LIMIT count (e.g. -1 or -2) is treated as "no limit" and
+// returns all matching entries, matching Redis server semantics.
+func TestLua_ZRANGEBYSCORE_NegativeLimitReturnsAll(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	for i := 1; i <= 3; i++ {
+		require.NoError(t, rdb.ZAdd(ctx,
+			"lua:zr:neglimit",
+			redis.Z{Score: float64(i), Member: "m" + strconv.Itoa(i)},
+		).Err())
+	}
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf", "LIMIT", "0", "-1")`,
+		[]string{"lua:zr:neglimit"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"m1", "m2", "m3"}, got,
+		"LIMIT offset -1 must return all matching entries (unbounded)")
+}
