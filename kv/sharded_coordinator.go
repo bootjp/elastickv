@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"slices"
 	"sync"
@@ -21,6 +22,93 @@ type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
+	lease  leaseState
+}
+
+// leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
+// produced a real Raft commit extends its shard's lease. Mirrors
+// Coordinate.Dispatch's lease hook for the per-shard case.
+//
+// Both TransactionManager.Commit and .Abort can return success WITHOUT
+// going through Raft -- Commit short-circuits on empty input, Abort
+// short-circuits when every request's abortRequestFor is nil (nothing
+// to release). Refreshing the lease in those cases would be unsound:
+// no quorum confirmation happened. We gate the refresh on
+// resp.CommitIndex > 0, which the underlying manager sets to the
+// last applied index only when at least one proposal went through.
+type leaseRefreshingTxn struct {
+	inner Transactional
+	g     *ShardGroup
+}
+
+func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+	start := time.Now()
+	expectedGen := t.g.lease.generation()
+	resp, err := t.inner.Commit(reqs)
+	if err != nil {
+		// Only invalidate on errors that actually signal a leadership
+		// change. Write-conflicts, validation errors, and deadline
+		// exceeded on non-ReadIndex paths do NOT imply the leader is
+		// gone; invalidating the lease for them forces every read
+		// into the slow LinearizableRead path and defeats the whole
+		// point of the lease. The engine's own leader-loss callback
+		// already handles true leadership loss, plus
+		// Coordinate.LeaseRead guards the fast path on
+		// engine.State() == StateLeader.
+		if isLeadershipLossError(err) {
+			t.g.lease.invalidate()
+		}
+		return resp, errors.WithStack(err)
+	}
+	t.maybeRefresh(resp, start, expectedGen)
+	return resp, nil
+}
+
+func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+	start := time.Now()
+	expectedGen := t.g.lease.generation()
+	resp, err := t.inner.Abort(reqs)
+	if err != nil {
+		if isLeadershipLossError(err) {
+			t.g.lease.invalidate()
+		}
+		return resp, errors.WithStack(err)
+	}
+	t.maybeRefresh(resp, start, expectedGen)
+	return resp, nil
+}
+
+// maybeRefresh extends the per-shard lease only when the operation
+// actually produced a Raft commit. expectedGen is sampled BEFORE the
+// underlying Commit/Abort so an invalidation that fires during that
+// call observes a generation mismatch inside extend and the refresh
+// is rejected. See the struct doc comment for why.
+func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time, expectedGen uint64) {
+	if resp == nil || resp.CommitIndex == 0 {
+		return
+	}
+	lp, ok := t.g.Engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	t.g.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
+}
+
+// Close forwards to the wrapped Transactional if it implements
+// io.Closer. ShardStore.closeGroup relies on the type assertion
+// `g.Txn.(io.Closer)` to release per-shard resources (e.g. the gRPC
+// connection cached by LeaderProxy). Without this pass-through, the
+// wrapping would silently swallow the Closer capability and leak
+// connections / goroutines at shutdown.
+func (t *leaseRefreshingTxn) Close() error {
+	closer, ok := t.inner.(io.Closer)
+	if !ok {
+		return nil
+	}
+	if err := closer.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 const (
@@ -40,24 +128,71 @@ type ShardedCoordinator struct {
 	clock        *HLC
 	store        store.MVCCStore
 	log          *slog.Logger
+	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
+	// registered at construction. See Coordinate.Close for the
+	// rationale.
+	deregisterLeaseCbs []func()
+	// leaseObserver records lease-read hit/miss for every shard the
+	// coordinator owns. Nil-safe; see Coordinate.leaseObserver.
+	leaseObserver LeaseReadObserver
+}
+
+// WithLeaseReadObserver wires a LeaseReadObserver onto a
+// ShardedCoordinator. Applied after construction because the
+// NewShardedCoordinator signature is already heavily overloaded;
+// see Coordinate.WithLeaseReadObserver for the equivalent option on
+// the single-group coordinator, including the typed-nil guard
+// rationale.
+func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
+	c.leaseObserver = normalizeLeaseObserver(observer)
+	return c
 }
 
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	var deregisters []func()
 	for gid, g := range groups {
+		// Wrap Txn so every successful Commit/Abort refreshes the
+		// per-shard lease. Leave nil transactions unchanged, and skip
+		// if already wrapped so repeat calls don't stack wrappers.
+		if g.Txn != nil {
+			if _, already := g.Txn.(*leaseRefreshingTxn); !already {
+				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+			}
+		}
 		router.Register(gid, g.Txn, g.Store)
+		// Per-shard leader-loss hook: when this group's engine notices
+		// a state transition out of leader, drop the lease so the next
+		// LeaseReadForKey on that shard takes the slow path.
+		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
+			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
+		}
 	}
 	return &ShardedCoordinator{
-		engine:       engine,
-		router:       router,
-		groups:       groups,
-		defaultGroup: defaultGroup,
-		clock:        clock,
-		store:        st,
-		log:          slog.Default(),
+		engine:             engine,
+		router:             router,
+		groups:             groups,
+		defaultGroup:       defaultGroup,
+		clock:              clock,
+		store:              st,
+		log:                slog.Default(),
+		deregisterLeaseCbs: deregisters,
 	}
+}
+
+// Close releases per-shard engine-side registrations. Idempotent.
+func (c *ShardedCoordinator) Close() error {
+	if c == nil {
+		return nil
+	}
+	cbs := c.deregisterLeaseCbs
+	c.deregisterLeaseCbs = nil
+	for _, fn := range cbs {
+		fn()
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -597,6 +732,72 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
+}
+
+// LeaseRead routes through the default group's lease. See Coordinate.LeaseRead
+// for semantics.
+func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	g, ok := c.groups[c.defaultGroup]
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
+// LeaseReadForKey performs the lease check on the shard group that owns key.
+// Each group maintains its own lease since each group has independent
+// leadership and term.
+func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
+// observeLeaseRead forwards a hit / miss signal to observer when it
+// is non-nil. Kept as a package-level helper so both ShardedCoordinator
+// and any future sharded caller share one nil-safe entrypoint.
+func observeLeaseRead(observer LeaseReadObserver, hit bool) {
+	if observer != nil {
+		observer.ObserveLeaseRead(hit)
+	}
+}
+
+func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
+	engine := engineForGroup(g)
+	lp, ok := engine.(raftengine.LeaseProvider)
+	if !ok {
+		return linearizableReadEngineCtx(ctx, engine)
+	}
+	leaseDur := lp.LeaseDuration()
+	if leaseDur <= 0 {
+		return linearizableReadEngineCtx(ctx, engine)
+	}
+	// Single time.Now() sample so primary/secondary/extension all see
+	// the same instant. Clock-skew safety delegated to
+	// engineLeaseAckValid (see Coordinate.LeaseRead).
+	now := time.Now()
+	state := engine.State()
+	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
+		observeLeaseRead(observer, true)
+		return lp.AppliedIndex(), nil
+	}
+	expectedGen := g.lease.generation()
+	if g.lease.valid(now) && state == raftengine.StateLeader {
+		observeLeaseRead(observer, true)
+		return lp.AppliedIndex(), nil
+	}
+	observeLeaseRead(observer, false)
+	idx, err := linearizableReadEngineCtx(ctx, engine)
+	if err != nil {
+		if isLeadershipLossError(err) {
+			g.lease.invalidate()
+		}
+		return 0, err
+	}
+	g.lease.extend(now.Add(leaseDur), expectedGen)
+	return idx, nil
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

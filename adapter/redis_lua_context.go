@@ -19,6 +19,19 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
+	// ctx is the request-scoped context captured at newLuaScriptContext
+	// time. New cmd* handlers should propagate it into store operations
+	// so the Eval's deadline and cancellation reach storage.
+	//
+	// Existing handlers in this file still use context.Background() at
+	// their store call sites -- a historical pattern from before we had
+	// a ctx available. Migrating those is tracked as a follow-up PR;
+	// see PR #570's review for the gemini note on scope.
+	ctx context.Context
+
+	redisCallDuration time.Duration
+	redisCallCount    int
+
 	touched     map[string]struct{}
 	deleted     map[string]bool
 	everDeleted map[string]bool
@@ -67,10 +80,26 @@ type luaSetState struct {
 }
 
 type luaZSetState struct {
-	loaded  bool
-	exists  bool
-	dirty   bool
-	members map[string]float64
+	loaded         bool
+	exists         bool
+	dirty          bool
+	membersLoaded  bool // all members loaded into st.members
+	legacyBlobBase bool // existing data is in legacy blob format
+	// physicallyExistsAtStart is true when the key had physical ZSet data in
+	// storage at script-start time, even if logically absent due to TTL expiry.
+	// It is used by zsetCommitPlan to force a full commit (and thus cleanup of
+	// stale wide-column rows) when recreating a TTL-expired ZSet.
+	physicallyExistsAtStart bool
+	members                 map[string]float64  // full member map (only when membersLoaded=true)
+	added                   map[string]float64  // members added/updated in this script (delta)
+	storageScores           map[string]*float64 // original scores from Pebble (nil ptr = absent)
+	removed                 map[string]struct{} // members explicitly removed in this script
+	lenDelta                int64               // net cardinality change (for delta commit)
+
+	// resolvedBaseCard caches the result of resolveZSetMeta (storage-level cardinality)
+	// so ZCARD does not re-scan delta keys on every call within the same script.
+	resolvedBaseCard       int64
+	resolvedBaseCardCached bool
 }
 
 type luaStreamState struct {
@@ -118,6 +147,12 @@ const (
 	zsetWithScoresArgIndex = 3
 	xAddMinArgs            = 3
 	xTrimMinArgs           = 4
+
+	// Element counts for ZSet commit slice pre-allocation.
+	zsetElemsPerMember  = 2 // PUT member key + PUT score index key
+	zsetMetaBaseElems   = 1 // PUT or DEL ZSetMetaKey
+	zsetElemsPerAdded   = 3 // optional DEL stale score key + PUT member key + PUT score key
+	zsetElemsPerRemoved = 2 // DEL member key + DEL score key
 )
 
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
@@ -187,12 +222,21 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 	redisTypeStream: (*luaScriptContext).renameStreamValue,
 }
 
-func newLuaScriptContext(server *RedisServer) *luaScriptContext {
+func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptContext, error) {
+	// LeaseRead confirms leadership at most once per LeaseDuration window;
+	// inside the window it returns immediately without a Raft round-trip.
+	// All subsequent reads within the script use snapshotGetAt at startTS,
+	// so leadership is verified at most once per script and amortised across
+	// scripts via the lease.
+	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	startTS := server.readTS()
 	return &luaScriptContext{
 		server:      server,
 		startTS:     startTS,
 		readPin:     server.pinReadTS(startTS),
+		ctx:         ctx,
 		touched:     map[string]struct{}{},
 		deleted:     map[string]bool{},
 		everDeleted: map[string]bool{},
@@ -203,7 +247,7 @@ func newLuaScriptContext(server *RedisServer) *luaScriptContext {
 		zsets:       map[string]*luaZSetState{},
 		streams:     map[string]*luaStreamState{},
 		ttls:        map[string]*luaTTLState{},
-	}
+	}, nil
 }
 
 func (c *luaScriptContext) Close() {
@@ -214,11 +258,17 @@ func (c *luaScriptContext) Close() {
 }
 
 func (c *luaScriptContext) exec(command string, args []string) (luaReply, error) {
+	execStart := time.Now()
+	c.redisCallCount++
+	var reply luaReply
+	var err error
 	if handler, ok := luaCommandHandlers[command]; ok {
-		return handler(c, args)
+		reply, err = handler(c, args)
+	} else {
+		err = errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
 	}
-
-	return luaReply{}, errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
+	c.redisCallDuration += time.Since(execStart)
+	return reply, err
 }
 
 func (c *luaScriptContext) markTouched(key []byte) {
@@ -304,7 +354,12 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 		st.loaded = true
 		st.exists = false
 		st.dirty = true
+		st.membersLoaded = true
 		st.members = map[string]float64{}
+		st.added = map[string]float64{}
+		st.removed = map[string]struct{}{}
+		st.storageScores = map[string]*float64{}
+		st.lenDelta = 0
 	}
 	if st, ok := c.streams[k]; ok {
 		st.loaded = true
@@ -428,7 +483,7 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.readRedisStringAt(key, c.startTS)
+	value, _, err := c.server.readRedisStringAtSnapshot(key, c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		return st, nil
@@ -607,35 +662,196 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	if st, ok := c.zsets[k]; ok {
 		return st, nil
 	}
-	st := &luaZSetState{}
+	st := &luaZSetState{
+		added:         map[string]float64{},
+		removed:       map[string]struct{}{},
+		storageScores: map[string]*float64{},
+	}
 	c.zsets[k] = st
 
 	typ, err := c.keyType(key)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
-		st.members = map[string]float64{}
 		return st, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	if typ == redisTypeNone {
+		// Check whether physical ZSet data exists despite the key being logically
+		// absent (TTL-expired). If so, mark physicallyExistsAtStart so that
+		// zsetCommitPlan can force a full commit to clean up stale storage rows.
+		rawTyp, rawErr := c.server.rawKeyTypeAt(context.Background(), key, c.startTS)
+		if rawErr != nil {
+			return nil, rawErr
+		}
+		st.physicallyExistsAtStart = rawTyp == redisTypeZSet
 		st.loaded = true
-		st.members = map[string]float64{}
 		return st, nil
 	}
 	if typ != redisTypeZSet {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.loadZSetAt(context.Background(), key, c.startTS)
+	// Probe for wide-column format with a single seek instead of a full scan.
+	prefix := store.ZSetMemberScanPrefix(key)
+	kvs, err := c.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), 1, c.startTS)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	st.loaded = true
 	st.exists = true
-	st.members = zsetEntriesToMap(value.Entries)
+	if len(kvs) > 0 {
+		return st, nil
+	}
+	// No !zs|mem| rows does not imply legacy-blob: a wide-column ZSet that had
+	// all members deleted leaves only meta/delta keys behind. Probe the legacy
+	// blob key directly to distinguish these cases.
+	blobExists, err := c.server.store.ExistsAt(context.Background(), redisZSetKey(key), c.startTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	st.legacyBlobBase = blobExists
 	return st, nil
+}
+
+// ensureZSetLoaded loads all ZSet members from storage if not already loaded,
+// merging any in-script delta (added/removed) into st.members.
+func (c *luaScriptContext) ensureZSetLoaded(st *luaZSetState, key []byte) error {
+	if st.membersLoaded {
+		return nil
+	}
+	members := map[string]float64{}
+	if st.exists {
+		value, _, err := c.server.loadZSetAt(context.Background(), key, c.startTS)
+		if err != nil {
+			return err
+		}
+		members = zsetEntriesToMap(value.Entries)
+	}
+	for member := range st.removed {
+		delete(members, member)
+	}
+	for member, score := range st.added {
+		members[member] = score
+	}
+	st.members = members
+	st.membersLoaded = true
+	return nil
+}
+
+// memberScore returns the current score of a ZSet member, preferring in-script
+// state over Pebble. For wide-column ZSets it performs an O(log N) point lookup
+// instead of loading the entire collection.
+func (c *luaScriptContext) memberScore(st *luaZSetState, key []byte, member string) (float64, bool, error) {
+	if st.membersLoaded {
+		score, ok := st.members[member]
+		return score, ok, nil
+	}
+	if score, ok, handled := zsetDeltaScore(st, member); handled {
+		return score, ok, nil
+	}
+	return c.memberScoreFromPebble(st, key, member)
+}
+
+// zsetDeltaScore checks the in-script delta state (removed/added/storageScores cache)
+// for a member. Returns (score, exists, handled); handled=false means the caller
+// must fall through to a Pebble point lookup.
+func zsetDeltaScore(st *luaZSetState, member string) (float64, bool, bool) {
+	if _, removed := st.removed[member]; removed {
+		return 0, false, true
+	}
+	if score, ok := st.added[member]; ok {
+		return score, true, true
+	}
+	if cached, ok := st.storageScores[member]; ok {
+		if cached == nil {
+			return 0, false, true
+		}
+		return *cached, true, true
+	}
+	return 0, false, false
+}
+
+// memberScoreFromPebble resolves a member score from Pebble storage.
+// For legacy-blob ZSets it triggers a full load; for wide-column it does an
+// O(log N) point lookup and caches the result in st.storageScores.
+func (c *luaScriptContext) memberScoreFromPebble(st *luaZSetState, key []byte, member string) (float64, bool, error) {
+	if !st.exists {
+		st.storageScores[member] = nil
+		return 0, false, nil
+	}
+	if st.legacyBlobBase {
+		if err := c.ensureZSetLoaded(st, key); err != nil {
+			return 0, false, err
+		}
+		score, ok := st.members[member]
+		return score, ok, nil
+	}
+	raw, err := c.server.store.GetAt(context.Background(), store.ZSetMemberKey(key, []byte(member)), c.startTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		st.storageScores[member] = nil
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	score, err := store.UnmarshalZSetScore(raw)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	st.storageScores[member] = &score
+	return score, true, nil
+}
+
+// zsetCard returns the ZSet cardinality. When members are fully loaded it uses
+// len(st.members); otherwise it reads the base metadata from storage and adds
+// the in-script lenDelta, which is O(log N). The storage-level result is cached
+// in st so repeated ZCARD calls within the same script do not re-scan delta keys.
+// For legacy-blob ZSets there is no wide-column ZSetMetaKey, so resolveZSetMeta
+// would return 0; ensureZSetLoaded is used instead to get the real count.
+func (c *luaScriptContext) zsetCard(st *luaZSetState, key []byte) (int64, error) {
+	if st.membersLoaded {
+		return int64(len(st.members)), nil
+	}
+	if !st.exists {
+		return 0, nil
+	}
+	if st.legacyBlobBase {
+		if err := c.ensureZSetLoaded(st, key); err != nil {
+			return 0, err
+		}
+		return int64(len(st.members)), nil
+	}
+	if !st.resolvedBaseCardCached {
+		baseLen, _, err := c.server.resolveZSetMeta(context.Background(), key, c.startTS)
+		if err != nil {
+			return 0, err
+		}
+		st.resolvedBaseCard = baseLen
+		st.resolvedBaseCardCached = true
+	}
+	return st.resolvedBaseCard + st.lenDelta, nil
+}
+
+// zsetStateForRead returns a fully-loaded ZSet state for commands that need the
+// complete member set (ZRANGE, ZCOUNT, ZPOPMIN, etc.). Returns (st, false, nil)
+// when the key does not exist; callers must check the bool before using st.
+func (c *luaScriptContext) zsetStateForRead(key []byte) (*luaZSetState, bool, error) {
+	st, err := c.zsetState(key)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !st.exists {
+		return st, false, nil
+	}
+	if err := c.ensureZSetLoaded(st, key); err != nil {
+		return nil, false, err
+	}
+	return st, true, nil
 }
 
 func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
@@ -744,7 +960,12 @@ func (c *luaScriptContext) markZSetValue(key []byte, members map[string]float64)
 	st.loaded = true
 	st.exists = true
 	st.dirty = true
+	st.membersLoaded = true
 	st.members = maps.Clone(members)
+	st.added = map[string]float64{}
+	st.removed = map[string]struct{}{}
+	st.storageScores = map[string]*float64{}
+	st.lenDelta = 0
 	c.markTouched(key)
 	c.deleted[string(key)] = false
 	return nil
@@ -1117,6 +1338,9 @@ func (c *luaScriptContext) renameZSetValue(src, dst []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := c.ensureZSetLoaded(st, src); err != nil {
+		return err
+	}
 	c.deleteLogical(dst)
 	return c.markZSetValue(dst, st.members)
 }
@@ -1131,21 +1355,92 @@ func (c *luaScriptContext) renameStreamValue(src, dst []byte) error {
 }
 
 func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// Fast path is only safe when there is NO authoritative
+	// script-local answer. Two separate signals to check:
+	//
+	//   (a) cachedType() covers loaded state for OTHER types (string /
+	//       list / ...) AND the explicit c.deleted entry from a prior
+	//       DEL / RENAME. Bypassing would leak pre-script pebble state.
+	//   (b) c.hashes[key] already loaded (even with exists=false for
+	//       a confirmed miss) means a prior command already paid the
+	//       type-probe tax. Re-running the fast path would just do
+	//       another wide-column probe for the same negative answer.
+	//       Reuse the loaded state via the slow path, which returns
+	//       immediately when c.hashes[key] is present.
+	if luaHashAlreadyLoaded(c, key) {
+		return hgetFromSlowPath(c, key, field)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return hgetFromSlowPath(c, key, field)
+	}
+	// Fast path: direct wide-column field lookup, bypassing the ~8-seek
+	// keyTypeAt probe inside hashState. This is the same pattern that
+	// the top-level HGET handler uses (see adapter/redis_compat_commands.go),
+	// reused verbatim here so BullMQ-style scripts that touch many
+	// hash keys stop paying the type-probe tax per redis.call.
+	raw, hit, alive, err := c.server.hashFieldFastLookup(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(string(raw)), nil
+	}
+	// Miss: fall back to the full hashState path so legacy-blob hashes
+	// and nil / WRONGTYPE disambiguation behave exactly as before.
+	return hgetFromSlowPath(c, key, field)
+}
+
+// luaHashAlreadyLoaded reports whether a prior command in this Eval
+// already populated c.hashes[key] and resolved its exists/loaded
+// flags. A loaded state -- even one representing a known miss --
+// makes the fast path redundant: the slow path returns immediately
+// by reading the cached luaHashState, skipping a wide-column probe.
+func luaHashAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.hashes[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// luaSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.sets.
+func luaSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.sets[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// luaZSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.zsets.
+func luaZSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.zsets[string(key)]
+	return ok && st != nil && st.loaded
+}
+
+// hgetFromSlowPath runs the legacy hashState-based HGET, preserving
+// the script-local cache and WRONGTYPE / nil behaviour unchanged.
+func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
 		}
 		return luaReply{}, err
 	}
+	return hgetFromHashState(st, field), nil
+}
+
+// hgetFromHashState reads field out of a loaded luaHashState in the
+// same way the legacy cmdHGet did.
+func hgetFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	value, ok := st.value[args[1]]
+	value, ok := st.value[field]
 	if !ok {
-		return luaNilReply(), nil
+		return luaNilReply()
 	}
-	return luaStringReply(value), nil
+	return luaStringReply(value)
 }
 
 func (c *luaScriptContext) cmdHSet(args []string) (luaReply, error) {
@@ -1297,21 +1592,53 @@ func (c *luaScriptContext) cmdHDel(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	key := []byte(args[0])
+	field := args[1]
+	// See cmdHGet: defer to the slow path whenever the key already has
+	// an authoritative answer locally, so prior DEL / RENAME / SET /
+	// HSET within this Eval is honored, AND so a confirmed-missing
+	// hash loaded earlier in the script does not re-run the
+	// wide-column probe on every subsequent HEXISTS.
+	if luaHashAlreadyLoaded(c, key) {
+		return hexistsFromSlowPath(c, key, field)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return hexistsFromSlowPath(c, key, field)
+	}
+	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	return hexistsFromSlowPath(c, key, field)
+}
+
+func hexistsFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
+	st, err := c.hashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return hexistsFromHashState(st, field), nil
+}
+
+// hexistsFromHashState reports whether field is present in a loaded
+// luaHashState, matching the legacy cmdHExists semantics.
+func hexistsFromHashState(st *luaHashState, field string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	_, ok := st.value[args[1]]
-	if ok {
-		return luaIntReply(1), nil
+	if _, ok := st.value[field]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func (c *luaScriptContext) cmdHLen(args []string) (luaReply, error) {
@@ -1839,20 +2166,52 @@ func finalizeSetLikeRemoval(c *luaScriptContext, key string, removed int, empty 
 }
 
 func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
-	st, err := c.setState([]byte(args[0]))
+	key := []byte(args[0])
+	member := args[1]
+	// See cmdHGet: defer to the slow path whenever the set has an
+	// authoritative script-local answer (loaded state incl. miss, or
+	// cachedType reporting a different-type / deleted key).
+	if luaSetAlreadyLoaded(c, key) {
+		return sismemberFromSlowPath(c, key, member)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return sismemberFromSlowPath(c, key, member)
+	}
+	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if alive {
+			return luaIntReply(1), nil
+		}
+		return luaIntReply(0), nil
+	}
+	return sismemberFromSlowPath(c, key, member)
+}
+
+func sismemberFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
+	st, err := c.setState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	return sismemberFromSetState(st, member), nil
+}
+
+// sismemberFromSetState returns the Redis integer reply for SISMEMBER
+// against a loaded luaSetState, matching the legacy cmdSIsMember
+// semantics.
+func sismemberFromSetState(st *luaSetState, member string) luaReply {
 	if !st.exists {
-		return luaIntReply(0), nil
+		return luaIntReply(0)
 	}
-	if _, ok := st.members[args[1]]; ok {
-		return luaIntReply(1), nil
+	if _, ok := st.members[member]; ok {
+		return luaIntReply(1)
 	}
-	return luaIntReply(0), nil
+	return luaIntReply(0)
 }
 
 func parseLuaZAddArgs(args []string) (zaddFlags, []string, error) {
@@ -1879,39 +2238,71 @@ func (c *luaScriptContext) cmdZAdd(args []string) (luaReply, error) {
 	if err != nil {
 		return luaReply{}, err
 	}
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		return luaReply{}, err
 	}
-	if !st.exists {
-		st.exists = true
-		st.members = map[string]float64{}
-	}
 	added := 0
+	changed := false
 	for j := 0; j < len(pairs); j += 2 {
 		score, err := strconv.ParseFloat(pairs[j], 64)
 		if err != nil {
 			return luaReply{}, errors.WithStack(err)
 		}
-		member := pairs[j+1]
-		oldScore, exists := st.members[member]
-		if !flags.allows(exists, oldScore, score) {
-			continue
+		isNew, mutated, err := c.applyZAddMember(st, key, flags, pairs[j+1], score)
+		if err != nil {
+			return luaReply{}, err
 		}
-		if !exists {
+		if isNew {
 			added++
 		}
-		st.members[member] = score
+		if mutated {
+			changed = true
+		}
 	}
-	st.loaded = true
-	st.dirty = true
-	c.markTouched([]byte(args[0]))
-	c.deleted[args[0]] = false
+	if changed {
+		if !st.exists {
+			st.exists = true
+		}
+		st.loaded = true
+		st.dirty = true
+		c.markTouched(key)
+		c.deleted[args[0]] = false
+	}
 	return luaIntReply(int64(added)), nil
 }
 
+// applyZAddMember applies a single ZADD member/score pair, updating the delta or
+// the full members map depending on load state. Returns (isNew, mutated, err):
+// isNew is true when the member did not previously exist; mutated is true when
+// any write was performed (false when flags like NX/XX prevented the operation).
+func (c *luaScriptContext) applyZAddMember(st *luaZSetState, key []byte, flags zaddFlags, member string, score float64) (bool, bool, error) {
+	oldScore, exists, err := c.memberScore(st, key, member)
+	if err != nil {
+		return false, false, err
+	}
+	if !flags.allows(exists, oldScore, score) {
+		return false, false, nil
+	}
+	isNew := !exists
+	if isNew && !st.membersLoaded {
+		st.lenDelta++
+	}
+	if st.membersLoaded {
+		if st.members == nil {
+			st.members = map[string]float64{}
+		}
+		st.members[member] = score
+	} else {
+		st.added[member] = score
+	}
+	return isNew, true, nil
+}
+
 func (c *luaScriptContext) cmdZCard(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -1921,11 +2312,16 @@ func (c *luaScriptContext) cmdZCard(args []string) (luaReply, error) {
 	if !st.exists {
 		return luaIntReply(0), nil
 	}
-	return luaIntReply(int64(len(st.members))), nil
+	n, err := c.zsetCard(st, key)
+	if err != nil {
+		return luaReply{}, err
+	}
+	return luaIntReply(n), nil
 }
 
 func (c *luaScriptContext) cmdZCount(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -1934,6 +2330,9 @@ func (c *luaScriptContext) cmdZCount(args []string) (luaReply, error) {
 	}
 	if !st.exists {
 		return luaIntReply(0), nil
+	}
+	if err := c.ensureZSetLoaded(st, key); err != nil {
+		return luaReply{}, err
 	}
 	minBound, err := parseZScoreBound(args[1])
 	if err != nil {
@@ -1969,7 +2368,8 @@ func (c *luaScriptContext) cmdZRevRangeByScore(args []string) (luaReply, error) 
 }
 
 func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -1978,6 +2378,9 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 	}
 	if !st.exists {
 		return luaArrayReply(), nil
+	}
+	if err := c.ensureZSetLoaded(st, key); err != nil {
+		return luaReply{}, err
 	}
 	start, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -2000,7 +2403,87 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 }
 
 func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	options, err := parseZRangeByScoreOptions(args, reverse)
+	if err != nil {
+		return luaReply{}, err
+	}
+	// Defensive bound on LIMIT offset: negative offsets produce no
+	// well-defined Redis behaviour, so treat them as syntax error.
+	if options.offset < 0 {
+		return luaReply{}, errors.New("ERR value is out of range, must be positive")
+	}
+	// Redis treats ANY negative LIMIT count as "no limit" (return all
+	// elements from offset). parseZRangeByScoreTail's default is -1;
+	// an explicit user-supplied negative value is coerced here so the
+	// downstream fast path (zsetFastScanLimit / decodeZSetScoreRange)
+	// sees a single "unbounded" sentinel.
+	if options.limit < 0 {
+		options.limit = -1
+	}
+	// Fast path eligibility: no script-local mutation / deletion /
+	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
+	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
+	if luaZSetAlreadyLoaded(c, key) {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
+	if fastErr != nil {
+		return luaReply{}, fastErr
+	}
+	if !hit {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if len(entries) == 0 {
+		return luaArrayReply(), nil
+	}
+	return zsetRangeReply(entries, options.withScores), nil
+}
+
+// zrangeByScoreFastPath translates the caller's min/max bounds into a
+// bounded score-index scan through zsetRangeByScoreFast and returns
+// the decoded entries. hit=false means the server-side helper wants
+// the slow path (legacy-blob zset, string-encoding corruption, or
+// empty-result-but-zset-is-missing so WRONGTYPE disambiguation is
+// needed).
+//
+// Threads c.ctx into the server-side helper so the Eval's deadline
+// and cancellation reach the store layer. New cmd* handlers should
+// follow this pattern; historical Background() call sites in this
+// file are migrated incrementally.
+func (c *luaScriptContext) zrangeByScoreFastPath(
+	key []byte, options luaZRangeByScoreOptions, reverse bool,
+) ([]redisZSetEntry, bool, error) {
+	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
+	filter := func(score float64) bool {
+		return scoreInRange(score, options.minBound, options.maxBound)
+	}
+	return c.server.zsetRangeByScoreFast(
+		c.scriptCtx(), key, startKey, endKey, reverse,
+		options.offset, options.limit, filter, c.startTS,
+	)
+}
+
+// scriptCtx returns the request-scoped context captured at script
+// construction, or context.Background() if the caller bypassed the
+// normal entry point (unit tests constructing a luaScriptContext
+// directly). New code should always have a real ctx, so this is a
+// defensive fallback.
+func (c *luaScriptContext) scriptCtx() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+// cmdZRangeByScoreSlow is the legacy full-load path, preserved for
+// fall-through cases (in-script mutations, legacy-blob encoding,
+// ambiguous empty results).
+func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByScoreOptions, reverse bool) (luaReply, error) {
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -2010,12 +2493,9 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if !st.exists {
 		return luaArrayReply(), nil
 	}
-
-	options, err := parseZRangeByScoreOptions(args, reverse)
-	if err != nil {
+	if err := c.ensureZSetLoaded(st, key); err != nil {
 		return luaReply{}, err
 	}
-
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
@@ -2026,6 +2506,67 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaArrayReply(), nil
 	}
 	return zsetRangeReply(selected, options.withScores), nil
+}
+
+// zsetScoreScanBounds maps zScoreBound pairs to a [startKey, endKey)
+// byte-range on the score index that EXCLUDES entries outside the
+// caller's bound, not just approximates. Placing an exclusive edge
+// into the scan bound (rather than post-filtering after the scan)
+// matters for `ZRANGEBYSCORE (value +inf LIMIT 0 N`: if there are
+// many members AT score=value, a post-filter approach would consume
+// the whole offset+limit budget on those filtered-out rows and miss
+// the real matches at score > value.
+//
+// The score index is lex-sorted by (userKey, sortableScore, member).
+// Conventions:
+//
+//	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)
+//	minBound = value, inclusive  -> startKey = ZSetScoreRangeScanPrefix(key, score)
+//	minBound = value, exclusive  -> startKey = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = +Inf              -> endKey   = PrefixScanEnd(ZSetScoreScanPrefix(key))
+//	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
+//
+// The same [start, end) endpoints drive both forward and reverse
+// scans; ReverseScanAt iterates from endKey downward.
+func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound) (startKey, endKey []byte) {
+	full := store.ZSetScoreScanPrefix(key)
+	fullEnd := store.PrefixScanEnd(full)
+	switch minBound.kind {
+	case zBoundNegInf:
+		startKey = full
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, minBound.score)
+		if minBound.inclusive {
+			startKey = scorePrefix
+		} else {
+			startKey = store.PrefixScanEnd(scorePrefix)
+		}
+	case zBoundPosInf:
+		// +Inf as minBound is a concrete "lower bound = +Inf" — only
+		// members with score = +Inf qualify. Use the +Inf score prefix
+		// as the scan start so those members are not silently dropped.
+		// Redis accepts ZADD key +inf m and ZRANGEBYSCORE key +inf +inf
+		// must return m.
+		startKey = store.ZSetScoreRangeScanPrefix(key, math.Inf(+1))
+	}
+	switch maxBound.kind {
+	case zBoundNegInf:
+		// -Inf as maxBound is a concrete "upper bound = -Inf" — only
+		// members with score = -Inf qualify. Bound the scan to the end
+		// of the -Inf score slot. Mirrors the +Inf-as-minBound case.
+		endKey = store.PrefixScanEnd(store.ZSetScoreRangeScanPrefix(key, math.Inf(-1)))
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, maxBound.score)
+		if maxBound.inclusive {
+			endKey = store.PrefixScanEnd(scorePrefix)
+		} else {
+			endKey = scorePrefix
+		}
+	case zBoundPosInf:
+		endKey = fullEnd
+	}
+	return startKey, endKey
 }
 
 type luaZRangeByScoreOptions struct {
@@ -2119,18 +2660,73 @@ func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEn
 	return trimmed
 }
 
+// zscoreArgCount pins the expected argument count for ZSCORE at the
+// Lua-context dispatch boundary. Using a named constant satisfies
+// the linter without a //nolint:mnd on the arity check and documents
+// that the command requires EXACTLY two arguments (any extras must
+// be rejected, matching Redis server semantics).
+const zscoreArgCount = 2
+
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	if len(args) != zscoreArgCount {
+		return luaReply{}, errors.New("ERR wrong number of arguments for 'zscore' command")
+	}
+	key := []byte(args[0])
+	member := args[1]
+	// See cmdHGet: defer to the slow path whenever the zset has an
+	// authoritative script-local answer. Two separate signals:
+	//
+	//   (a) luaZSetAlreadyLoaded: a prior cmdZScore / cmdZRange etc.
+	//       fully resolved the zset, even to a confirmed miss
+	//       (loaded=true, exists=false). Re-running the fast path
+	//       would do a redundant wide-column probe.
+	//   (b) cachedType: a prior ZADD / ZREM in this Eval OR a prior
+	//       DEL / type-change via SET. Without this guard the fast
+	//       path would leak pre-script pebble state.
+	if luaZSetAlreadyLoaded(c, key) {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(formatRedisFloat(score)), nil
+	}
+	return zscoreFromSlowPath(c, key, member)
+}
+
+// zscoreFromSlowPath runs the legacy zsetState-based ZSCORE,
+// preserving the script-local cache and WRONGTYPE / nil behaviour
+// unchanged. Handles legacy-blob zsets via ensureZSetLoaded inside
+// memberScore.
+func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
 		}
 		return luaReply{}, err
 	}
+	return c.zscoreFromZSetState(st, key, member)
+}
+
+// zscoreFromZSetState returns the Redis reply for ZSCORE against a
+// loaded luaZSetState, matching the legacy cmdZScore semantics.
+func (c *luaScriptContext) zscoreFromZSetState(st *luaZSetState, key []byte, member string) (luaReply, error) {
 	if !st.exists {
 		return luaNilReply(), nil
 	}
-	score, ok := st.members[args[1]]
+	score, ok, err := c.memberScore(st, key, member)
+	if err != nil {
+		return luaReply{}, err
+	}
 	if !ok {
 		return luaNilReply(), nil
 	}
@@ -2138,7 +2734,8 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdZRem(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2147,6 +2744,9 @@ func (c *luaScriptContext) cmdZRem(args []string) (luaReply, error) {
 	}
 	if !st.exists {
 		return luaIntReply(0), nil
+	}
+	if err := c.ensureZSetLoaded(st, key); err != nil {
+		return luaReply{}, err
 	}
 	removed := removeMembers(st.members, args[1:])
 	finalizeSetLikeRemoval(c, args[0], removed, len(st.members) == 0, func() {
@@ -2158,14 +2758,12 @@ func (c *luaScriptContext) cmdZRem(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdZPopMin(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, exists, err := c.zsetStateForRead(key)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return luaArrayReply(), nil
-		}
-		return luaReply{}, err
+		return luaArrayReply(), err
 	}
-	if !st.exists {
+	if !exists {
 		return luaArrayReply(), nil
 	}
 	count := 1
@@ -2199,7 +2797,8 @@ func (c *luaScriptContext) cmdZPopMin(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdZRemRangeByRank(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2208,6 +2807,9 @@ func (c *luaScriptContext) cmdZRemRangeByRank(args []string) (luaReply, error) {
 	}
 	if !st.exists {
 		return luaIntReply(0), nil
+	}
+	if err := c.ensureZSetLoaded(st, key); err != nil {
+		return luaReply{}, err
 	}
 	start, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -2239,14 +2841,12 @@ func (c *luaScriptContext) cmdZRemRangeByRank(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdZRemRangeByScore(args []string) (luaReply, error) {
-	st, err := c.zsetState([]byte(args[0]))
+	key := []byte(args[0])
+	st, exists, err := c.zsetStateForRead(key)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return luaIntReply(0), nil
-		}
-		return luaReply{}, err
+		return luaIntReply(0), err
 	}
-	if !st.exists {
+	if !exists {
 		return luaIntReply(0), nil
 	}
 	minBound, err := parseZScoreBound(args[1])
@@ -2544,8 +3144,7 @@ func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType,
 		elems, err := c.setCommitElems(key)
 		return luaCommitPlan{elems: elems}, err
 	case redisTypeZSet:
-		elems, err := c.zsetCommitElems(key)
-		return luaCommitPlan{elems: elems}, err
+		return c.zsetCommitPlan(key, commitTS)
 	case redisTypeStream:
 		elems, err := c.streamCommitElems(key)
 		return luaCommitPlan{elems: elems}, err
@@ -2747,16 +3346,145 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 	return elems, nil
 }
 
-func (c *luaScriptContext) zsetCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
-	st, err := c.zsetState([]byte(key))
-	if err != nil {
-		return nil, err
+// zsetCommitPlan decides between a full wide-column rewrite and an incremental
+// delta commit. Full rewrite is used when the key was ever deleted, when members
+// are fully loaded (triggered by any read command), or when the base data was in
+// legacy blob format (one-time migration). Delta commit is used for write-only
+// scripts (typically ZADD without prior reads) on an already-wide-column ZSet.
+func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommitPlan, error) {
+	st := c.zsets[key]
+	if st == nil || !st.dirty {
+		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
-	if err != nil {
-		return nil, err
+	// physicallyExistsAtStart is true when the key had physical ZSet data in
+	// storage at script start but was TTL-expired (logically absent). Force a
+	// full commit so deleteLogicalKeyElems removes stale wide-column rows
+	// (members, score-index, meta, TTL) that were left by the expired ZSet.
+	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
+		return c.zsetFullCommitWithMerge(key, st), nil
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisZSetKey([]byte(key)), Value: payload}}, nil
+	if st.legacyBlobBase {
+		// One-time migration: load legacy blob, write wide-column, let deleteLogicalKeyElems clean up.
+		if err := c.ensureZSetLoaded(st, []byte(key)); err != nil {
+			return luaCommitPlan{}, err
+		}
+		return luaCommitPlan{elems: c.zsetFullCommitElems(key)}, nil
+	}
+	// Delta path: write only changed members + score index + metadata delta.
+	return luaCommitPlan{preserveExisting: true, elems: c.zsetDeltaCommitElems(key, st, commitTS)}, nil
+}
+
+// zsetFullCommitWithMerge returns a full wide-column commit plan for key. When
+// the key was deleted during the script but delta members were added afterwards
+// (membersLoaded=false), st.added is merged into st.members so that
+// zsetFullCommitElems does not silently drop the newly added entries.
+func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState) luaCommitPlan {
+	if !st.membersLoaded && len(st.added) > 0 {
+		if st.members == nil {
+			st.members = make(map[string]float64, len(st.added))
+		}
+		for m, s := range st.added {
+			st.members[m] = s
+		}
+		st.added = map[string]float64{}
+	}
+	return luaCommitPlan{elems: c.zsetFullCommitElems(key)} // preserveExisting=false → deleteLogicalKeyElems called
+}
+
+// zsetFullCommitElems writes all members in wide-column format (member keys,
+// score index keys, and a base meta key). deleteLogicalKeyElems is responsible
+// for cleaning up any previous storage before these ops are applied.
+func (c *luaScriptContext) zsetFullCommitElems(key string) []*kv.Elem[kv.OP] {
+	st := c.zsets[key]
+	if st == nil || len(st.members) == 0 {
+		return nil
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)*zsetElemsPerMember+zsetMetaBaseElems)
+	for member, score := range st.members {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey([]byte(key), []byte(member)),
+				Value: store.MarshalZSetScore(score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey([]byte(key), score, []byte(member)),
+				Value: []byte{},
+			},
+		)
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaKey([]byte(key)),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(st.members))}),
+	})
+	return elems
+}
+
+// zsetDeltaCommitElems writes only the members that changed (added/updated/removed)
+// together with their score index entries and a cardinality delta key.
+// preserveExisting=true so deleteLogicalKeyElems is NOT called.
+func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, commitTS uint64) []*kv.Elem[kv.OP] {
+	if len(st.added) == 0 && len(st.removed) == 0 {
+		return nil
+	}
+	// Each added member: optionally DEL old score key + PUT member key + PUT score key.
+	// Each removed member: DEL member key + DEL score key.
+	// Plus one optional ZSetMetaDeltaKey.
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.added)*zsetElemsPerAdded+len(st.removed)*zsetElemsPerRemoved+zsetMetaBaseElems)
+	for member, score := range st.added {
+		if storageScore, ok := st.storageScores[member]; ok && storageScore != nil {
+			// Remove stale score index from storage.
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:  kv.Del,
+				Key: store.ZSetScoreKey([]byte(key), *storageScore, []byte(member)),
+			})
+		}
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey([]byte(key), []byte(member)),
+				Value: store.MarshalZSetScore(score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey([]byte(key), score, []byte(member)),
+				Value: []byte{},
+			},
+		)
+	}
+	for member := range st.removed {
+		storageScore, ok := st.storageScores[member]
+		if !ok || storageScore == nil {
+			continue
+		}
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey([]byte(key), []byte(member))},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey([]byte(key), *storageScore, []byte(member))},
+		)
+	}
+	elems = append(elems, c.zsetDeltaMetaElems([]byte(key), st, commitTS)...)
+	return elems
+}
+
+// zsetDeltaMetaElems returns the metadata element(s) for a delta commit.
+// It tries to fold existing delta keys inline (compaction); on error or when
+// below the threshold it falls back to writing a single new ZSetMetaDeltaKey.
+func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, commitTS uint64) []*kv.Elem[kv.OP] {
+	compactElems, compacted, err := c.server.zsetInlineMetaCompactionElems(
+		context.Background(), key, c.startTS, st.lenDelta)
+	if err == nil && compacted {
+		return compactElems
+	}
+	if st.lenDelta == 0 {
+		return nil
+	}
+	return []*kv.Elem[kv.OP]{{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+		Value: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: st.lenDelta}),
+	}}
 }
 
 func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
@@ -2783,7 +3511,16 @@ func (c *luaScriptContext) finalTTL(key []byte) (*time.Time, error) {
 	if st != nil && st.loaded {
 		return st.value, nil
 	}
-	return c.server.ttlAt(context.Background(), key, c.startTS)
+	ttl, err := c.server.ttlAt(context.Background(), key, c.startTS)
+	if err != nil {
+		return nil, err
+	}
+	// Treat an already-expired TTL as absent so a recreated key does not
+	// inherit the old expired timestamp (which would leave a stale TTL key).
+	if ttl != nil && !ttl.After(time.Now()) {
+		return nil, nil
+	}
+	return ttl, nil
 }
 
 func reverseStrings(values []string) {
@@ -2808,7 +3545,15 @@ func sortedSetMembers(members map[string]struct{}) []string {
 }
 
 func zsetRangeReply(entries []redisZSetEntry, withScores bool) luaReply {
-	out := make([]luaReply, 0, len(entries))
+	// WITHSCORES doubles the output width (member + score per entry);
+	// size the slice accordingly to avoid an internal grow on large
+	// reply arrays. Bounded by maxWideScanLimit at the fast-path
+	// layer, so the allocation cannot be unbounded.
+	capacity := len(entries)
+	if withScores {
+		capacity *= 2
+	}
+	out := make([]luaReply, 0, capacity)
 	for _, entry := range entries {
 		out = append(out, luaStringReply(entry.Member))
 		if withScores {

@@ -110,32 +110,77 @@ func (r *RedisServer) prefixExistsAt(ctx context.Context, prefix []byte, readTS 
 	return len(kvs) > 0, nil
 }
 
+// rawKeyTypeAt classifies the Redis encoding under which key is
+// currently stored. Probes run string-first because real workloads are
+// dominated by string keys: a live new-format string resolves in 1
+// pebble seek here, versus the ~17 seeks the prior collection-first
+// ordering required before falling through to the string block.
+//
+// Tiebreaker invariant when the same user key carries BOTH a string
+// and a collection entry (legal only during data-corruption recovery):
+// string wins. replaceWithStringTxn still uses the returned type as a
+// cleanup hint, so on corrupt input any lingering collection keys are
+// evicted by TTL or an explicit DEL rather than piggy-backing on SET.
+// In non-corrupt data at most one encoding exists per user key, so
+// the ordering is indistinguishable.
 func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	// Check list base metadata key first.
-	listMetaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
+	if typ, found, err := r.probeStringTypes(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, found, err := r.probeListType(ctx, key, readTS); err != nil || found {
+		return typ, err
+	}
+	if typ, err := r.detectWideColumnType(ctx, key, readTS); err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.probeLegacyCollectionTypes(ctx, key, readTS)
+}
+
+// probeStringTypes runs the three cheap point lookups against the
+// string-family prefixes. Returns (String, true, nil) on first hit.
+func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
+	candidates := [...][]byte{
+		redisStrKey(key), // new-format prefixed string
+		redisHLLKey(key), // HyperLogLog (reported as string)
+		key,              // legacy bare key (pre-migration)
+	}
+	for _, k := range candidates {
+		exists, err := r.store.ExistsAt(ctx, k, readTS)
+		if err != nil {
+			return redisTypeNone, false, errors.WithStack(err)
+		}
+		if exists {
+			return redisTypeString, true, nil
+		}
+	}
+	return redisTypeNone, false, nil
+}
+
+// probeListType detects lists via the base meta key or any delta key.
+// Delta scan is bounded to 1 result.
+func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
+	metaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
+		return redisTypeNone, false, errors.WithStack(err)
 	}
-	if listMetaExists {
-		return redisTypeList, nil
+	if metaExists {
+		return redisTypeList, true, nil
 	}
-	// Fallback: detect a delta-only list (base meta not yet written or
-	// already compacted away but deltas still present).
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
 	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
 	if err != nil {
-		return redisTypeNone, errors.WithStack(err)
+		return redisTypeNone, false, errors.WithStack(err)
 	}
 	if len(deltaKVs) > 0 {
-		return redisTypeList, nil
+		return redisTypeList, true, nil
 	}
+	return redisTypeNone, false, nil
+}
 
-	// Check wide-column hash and set types.
-	if typ, wideErr := r.detectWideColumnType(ctx, key, readTS); wideErr != nil || typ != redisTypeNone {
-		return typ, wideErr
-	}
-
+// probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
+// encodings left by pre-wide-column code paths.
+func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	checks := []struct {
 		typ redisValueType
 		key []byte
@@ -144,12 +189,6 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 		{typ: redisTypeSet, key: redisSetKey(key)},
 		{typ: redisTypeZSet, key: redisZSetKey(key)},
 		{typ: redisTypeStream, key: redisStreamKey(key)},
-		// HyperLogLog is a Redis string subtype. Treat it as "string" for TYPE.
-		{typ: redisTypeString, key: redisHLLKey(key)},
-		{typ: redisTypeString, key: redisStrKey(key)},
-		// Fallback: check bare key for legacy data written before the
-		// !redis|str| prefix migration.
-		{typ: redisTypeString, key: key},
 	}
 	for _, check := range checks {
 		exists, err := r.store.ExistsAt(ctx, check.key, readTS)
@@ -165,17 +204,36 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 
 func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	typ, err := r.rawKeyTypeAt(ctx, key, readTS)
-	if err != nil || typ == redisTypeNone {
+	if err != nil {
 		return typ, err
 	}
-	expired, err := r.hasExpiredTTLAt(ctx, key, readTS)
+	return r.applyTTLFilter(ctx, key, readTS, typ)
+}
+
+// applyTTLFilter takes a raw (TTL-unaware) type and returns the
+// TTL-filtered equivalent. Callers that need BOTH the raw and filtered
+// types (SET NX/XX/GET against a possibly-expired key) can reuse a
+// single rawKeyTypeAt result and skip the duplicate ~17-seek probe
+// that keyTypeAt would otherwise issue.
+//
+// For non-string raw types we skip the embedded-TTL probe that
+// hasExpired does by default: the embedded TTL only lives under
+// !redis|str|<key>, so probing it for a hash/set/zset/stream/list is
+// a guaranteed-miss GetAt. Passing nonStringOnly=true jumps straight
+// to the !redis|ttl| secondary index, saving one pebble seek per
+// non-string SET / type check.
+func (r *RedisServer) applyTTLFilter(ctx context.Context, key []byte, readTS uint64, rawTyp redisValueType) (redisValueType, error) {
+	if rawTyp == redisTypeNone {
+		return rawTyp, nil
+	}
+	expired, err := r.hasExpired(ctx, key, readTS, rawTyp != redisTypeString)
 	if err != nil {
 		return redisTypeNone, err
 	}
 	if expired {
 		return redisTypeNone, nil
 	}
-	return typ, nil
+	return rawTyp, nil
 }
 
 func (r *RedisServer) keyType(ctx context.Context, key []byte) (redisValueType, error) {
@@ -377,26 +435,37 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 // the legacy path does at most two extra reads (TTL index, then bare key).
 // Expiration is checked locally from the TTL we just decoded.
 func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	raw, err := r.leaderAwareGetAt(redisStrKey(key), readTS)
+	return r.readRedisStringWith(key, readTS, r.leaderAwareGetAt)
+}
+
+// readRedisStringAtSnapshot reads a string without re-verifying leadership on
+// every sub-call. The caller must have already called coordinator.VerifyLeader()
+// once before invoking this (e.g. at Lua script startTS acquisition time).
+func (r *RedisServer) readRedisStringAtSnapshot(key []byte, readTS uint64) ([]byte, *time.Time, error) {
+	return r.readRedisStringWith(key, readTS, r.snapshotGetAt)
+}
+
+func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+	raw, err := get(redisStrKey(key), readTS)
 	if err == nil {
-		return r.decodePrefixedString(key, raw, readTS)
+		return r.decodePrefixedStringWith(key, raw, readTS, get)
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
 	}
-	return r.readBareLegacyString(key, readTS)
+	return r.readBareLegacyStringWith(key, readTS, get)
 }
 
 // decodePrefixedString handles the !redis|str|<key> payload: new-format values
 // carry their TTL inline, while legacy-format payloads that still sit under
 // the prefixed key during rolling upgrade must consult the secondary index.
-func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]byte, *time.Time, error) {
+func (r *RedisServer) decodePrefixedStringWith(key, raw []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
 	userValue, ttl, err := decodeRedisStr(raw)
 	if err != nil {
 		return nil, nil, err
 	}
 	if !isNewRedisStrFormat(raw) {
-		legacyTTL, ttlErr := r.readLegacyTTL(key, readTS)
+		legacyTTL, ttlErr := r.readLegacyTTLWith(key, readTS, get)
 		if ttlErr != nil {
 			return nil, nil, ttlErr
 		}
@@ -408,27 +477,27 @@ func (r *RedisServer) decodePrefixedString(key, raw []byte, readTS uint64) ([]by
 	return userValue, ttl, nil
 }
 
-// readBareLegacyString handles pre-migration data still under the bare user
+// readBareLegacyStringWith handles pre-migration data still under the bare user
 // key: TTL in the secondary index, value at the bare key itself.
-func (r *RedisServer) readBareLegacyString(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	legacyTTL, err := r.readLegacyTTL(key, readTS)
+func (r *RedisServer) readBareLegacyStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+	legacyTTL, err := r.readLegacyTTLWith(key, readTS, get)
 	if err != nil {
 		return nil, nil, err
 	}
 	if legacyTTL != nil && !legacyTTL.After(time.Now()) {
 		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
-	legacy, err := r.leaderAwareGetAt(key, readTS)
+	legacy, err := get(key, readTS)
 	if err != nil {
 		return nil, nil, err
 	}
 	return legacy, legacyTTL, nil
 }
 
-// readLegacyTTL fetches the pre-migration !redis|ttl| entry, returning nil
+// readLegacyTTLWith fetches the pre-migration !redis|ttl| entry, returning nil
 // when no index is present.
-func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, error) {
-	raw, err := r.leaderAwareGetAt(redisTTLKey(key), readTS)
+func (r *RedisServer) readLegacyTTLWith(key []byte, readTS uint64, get rawGetFn) (*time.Time, error) {
+	raw, err := get(redisTTLKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -442,10 +511,25 @@ func (r *RedisServer) readLegacyTTL(key []byte, readTS uint64) (*time.Time, erro
 	return &ttl, nil
 }
 
+// rawGetFn is the signature shared by leaderAwareGetAt and snapshotGetAt so
+// that the string-read helpers can be parameterised without duplication.
+type rawGetFn func(key []byte, readTS uint64) ([]byte, error)
+
 // leaderAwareGetAt is a GetAt that honors the per-key leader routing readValueAt
 // uses, but without calling back into hasExpiredTTLAt. Callers are responsible
 // for handling expiration themselves using the TTL they just read.
 func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error) {
+	return r.doGetAt(key, readTS, true)
+}
+
+// snapshotGetAt reads at readTS without re-verifying leadership on every call.
+// The caller must have already called coordinator.VerifyLeader() once (e.g. at
+// Lua script startTS acquisition time) before using this method.
+func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
+	return r.doGetAt(key, readTS, false)
+}
+
+func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
 	// Leadership is partitioned by the logical user key, so strip the internal
 	// prefix before asking the coordinator.
 	routingKey := key
@@ -453,8 +537,10 @@ func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error
 		routingKey = userKey
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
-		if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
-			return nil, errors.WithStack(err)
+		if verify {
+			if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
+				return nil, errors.WithStack(err)
+			}
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)
 		return v, errors.WithStack(err)

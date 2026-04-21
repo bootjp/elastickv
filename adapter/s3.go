@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -31,15 +32,17 @@ import (
 )
 
 const (
-	s3HealthPath             = "/healthz"
-	s3ChunkSize              = 1 << 20
-	s3ChunkBatchOps          = 16
-	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion          = "us-east-1"
-	s3MaxKeys                = 1000
-	s3ListPageSize           = 256
-	s3ManifestCleanupTimeout = 2 * time.Minute
-	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
+	s3HealthPath                = "/healthz"
+	s3LeaderHealthPath          = "/healthz/leader"
+	s3HealthMaxRequestBodyBytes = 1024
+	s3ChunkSize                 = 1 << 20
+	s3ChunkBatchOps             = 16
+	s3XMLNamespace              = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion             = "us-east-1"
+	s3MaxKeys                   = 1000
+	s3ListPageSize              = 256
+	s3ManifestCleanupTimeout    = 2 * time.Minute
+	s3MaxObjectSizeBytes        = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -331,6 +334,9 @@ func (s *S3Server) Stop() {
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if serveS3Healthz(w, r) {
+		return
+	}
+	if s.serveS3LeaderHealthz(w, r) {
 		return
 	}
 	if s.maybeProxyToLeader(w, r) {
@@ -772,7 +778,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop,gocognit,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
+//nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
 	startTS := s.txnStartTS(readTS)
@@ -804,8 +810,12 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	validatePayloadSHA := expectedPayloadSHA != "" && !strings.EqualFold(expectedPayloadSHA, s3UnsignedPayload)
-	r.Body = http.MaxBytesReader(w, r.Body, s3MaxObjectSizeBytes)
+	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
+	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
+	if bodyErr != nil {
+		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
 	part := s3ObjectPart{PartNo: 1}
 	sizeBytes := int64(0)
 	chunkNo := uint64(0)
@@ -852,6 +862,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 					return
 				}
 			}
+			streamBody.writeDecoded(chunk)
 			chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, part.PartNo, chunkNo)
 			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
 			chunkSize, err := uint64FromInt(n)
@@ -876,9 +887,8 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		if readErr != nil {
 			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(readErr, &maxBytesErr) {
-				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "object exceeds maximum allowed size", bucket, objectKey)
+			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 				return
 			}
 			writeS3InternalError(w, readErr)
@@ -898,6 +908,11 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			return
 		}
 	}
+	if err := streamBody.verifyTrailer(); err != nil {
+		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
+		return
+	}
 
 	etag := hex.EncodeToString(hasher.Sum(nil))
 	part.ETag = etag
@@ -915,7 +930,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		SizeBytes:          sizeBytes,
 		LastModifiedHLC:    commitTS,
 		ContentType:        headerOrDefault(r.Header.Get("Content-Type"), "application/octet-stream"),
-		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		ContentEncoding:    cleanStoredContentEncoding(r.Header.Get("Content-Encoding")),
 		CacheControl:       r.Header.Get("Cache-Control"),
 		ContentDisposition: r.Header.Get("Content-Disposition"),
 		UserMetadata:       collectS3UserMetadata(r.Header),
@@ -1294,7 +1309,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, s3MaxPartSizeBytes)
+	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
+	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
+	if bodyErr != nil {
+		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
 
 	// Pre-allocate the part's commit timestamp before writing any blob chunks so
 	// that the same version identifier is used for every chunk in this attempt.
@@ -1343,9 +1363,8 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 				break
 			}
 			if readErr != nil {
-				var maxBytesErr *http.MaxBytesError
-				if errors.As(readErr, &maxBytesErr) {
-					writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+				if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+					writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 					return
 				}
 				writeS3InternalError(w, readErr)
@@ -1358,6 +1377,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			writeS3InternalError(w, err)
 			return
 		}
+		partStreamBody.writeDecoded(chunk)
 		chunkKey := s3keys.VersionedBlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
 		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
 		cs, err := uint64FromInt(n)
@@ -1378,9 +1398,8 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			break
 		}
 		if readErr != nil {
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(readErr, &maxBytesErr) {
-				writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "part exceeds maximum allowed size", bucket, objectKey)
+			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 				return
 			}
 			writeS3InternalError(w, readErr)
@@ -1389,6 +1408,10 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 	if err := flushBatch(); err != nil {
 		writeS3InternalError(w, err)
+		return
+	}
+	if err := partStreamBody.verifyTrailer(); err != nil {
+		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
 		return
 	}
 
@@ -2324,6 +2347,203 @@ func serveS3Healthz(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = io.WriteString(w, "ok")
 	}
 	return true
+}
+
+// serveS3LeaderHealthz returns 200 only when this node is the verified raft
+// leader. It mirrors the DynamoDB server's /healthz/leader so that an
+// upstream load balancer can route S3 traffic to the current leader without
+// hitting the (currently broken) follower-proxy SigV4 path.
+func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || r.URL == nil || r.URL.Path != s3LeaderHealthPath {
+		return false
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s3HealthMaxRequestBodyBytes)
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return true
+	}
+	status, body := http.StatusOK, "ok"
+	if !s.isVerifiedS3Leader() {
+		status, body = http.StatusServiceUnavailable, "not leader"
+	}
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, body)
+	}
+	return true
+}
+
+func (s *S3Server) isVerifiedS3Leader() bool {
+	if s.coordinator == nil || !s.coordinator.IsLeader() {
+		return false
+	}
+	return s.coordinator.VerifyLeader() == nil
+}
+
+// prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When
+// the request is a plain (non-streaming) PUT the body is only wrapped with
+// MaxBytesReader; the streaming-body context returned is the zero value and
+// its helpers become no-ops. The caller uses the returned context to feed
+// decoded chunks through the optional trailer hasher and to verify the
+// trailer checksum once EOF is reached.
+//
+//nolint:cyclop // Linear protocol preamble: reject unsupported markers, parse declared length, bind trailer, then hand off.
+func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded int64, payloadSHA, tooLargeMessage string) (*s3StreamingBody, *s3PutBodyError) {
+	// Reject signed streaming payload markers up-front. Accepting them
+	// without verifying the per-chunk chunk-signature= would silently
+	// downgrade the client's integrity guarantee to just the request
+	// header signature; better to respond 501 so the client can fall back
+	// to the unsigned streaming variant or non-streaming SHA.
+	if isS3SignedStreamingPayloadMarker(payloadSHA) {
+		return nil, &s3PutBodyError{Status: http.StatusNotImplemented, Code: "NotImplemented", Message: "signed streaming uploads (STREAMING-AWS4-HMAC-SHA256-PAYLOAD*) are not supported"}
+	}
+
+	hasAwsChunkedEncoding := contentEncodingContains(r.Header.Get("Content-Encoding"), "aws-chunked")
+	if !isS3StreamingPayloadMarker(payloadSHA) {
+		// A client that labels the transport as aws-chunked MUST also set
+		// a streaming payload marker; otherwise the server would store the
+		// raw framed bytes as-is (and cleanStoredContentEncoding would
+		// later drop the only hint that the object is still encoded).
+		if hasAwsChunkedEncoding {
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "Content-Encoding: aws-chunked requires a streaming X-Amz-Content-Sha256 marker"}
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDecoded)
+		return &s3StreamingBody{}, nil
+	}
+
+	declaredRaw := strings.TrimSpace(r.Header.Get("X-Amz-Decoded-Content-Length"))
+	declared := int64(-1)
+	if declaredRaw != "" {
+		parsed, err := strconv.ParseInt(declaredRaw, 10, 64)
+		if err != nil || parsed < 0 {
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "invalid X-Amz-Decoded-Content-Length"}
+		}
+		if parsed > maxDecoded {
+			return nil, &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: tooLargeMessage}
+		}
+		declared = parsed
+	}
+
+	// Bound the raw transport. maxDecoded/256 covers the worst realistic
+	// per-chunk header overhead (AWS recommends >= 8 KiB chunks, and
+	// unsigned framing adds ~6 bytes per chunk; the allowance tolerates
+	// chunks as small as ~32 bytes). When the client declared a
+	// Content-Length tighter than that, honour the smaller bound; when
+	// they declared one larger, keep our cap so a runaway stream hits
+	// MaxBytesReader well before RAM pressure.
+	rawMax := maxDecoded + maxDecoded/s3StreamingFramingDivisor + s3StreamingTrailerBytes
+	if r.ContentLength > 0 && r.ContentLength < rawMax {
+		rawMax = r.ContentLength
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, rawMax)
+
+	reader := newAwsChunkedReader(r.Body, declared, maxDecoded)
+	body := &s3StreamingBody{reader: reader}
+	// Preserve Close() on the outer body so net/http still drains and
+	// frees the underlying MaxBytesReader + transport when the handler
+	// returns (io.NopCloser would have dropped that on the floor).
+	r.Body = closeForwardingReader{Reader: reader, Closer: r.Body}
+
+	// X-Amz-Trailer is formally a comma-separated list per AWS docs; pick
+	// the first trailer whose checksum algorithm we support rather than
+	// treating the whole value as one header name.
+	for _, raw := range strings.Split(r.Header.Get("X-Amz-Trailer"), ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if h := newS3TrailerChecksumHasher(name); h != nil {
+			body.trailerName = canonicalTrailerName(name)
+			body.trailerHash = h
+			break
+		}
+	}
+	return body, nil
+}
+
+const (
+	// s3StreamingFramingDivisor bounds the per-chunk header overhead we
+	// allow over the decoded payload. maxDecoded / 256 allows up to ~0.4%
+	// of framing bytes, which comfortably covers the AWS-recommended 8 KiB
+	// chunk size (~6 bytes of framing per chunk) with generous headroom
+	// for smaller chunks.
+	s3StreamingFramingDivisor = 256
+	// s3StreamingTrailerBytes reserves room for the terminating 0-chunk
+	// plus advertised trailer headers (x-amz-checksum-* values etc.).
+	s3StreamingTrailerBytes = 4 * 1024
+)
+
+// contentEncodingContains reports whether the Content-Encoding header lists
+// the given token (case-insensitive). Per RFC 9110 the value is a
+// comma-separated list of coding names.
+func contentEncodingContains(raw, token string) bool {
+	for _, part := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// closeForwardingReader pairs a new Reader (typically a decoder built on
+// top of r.Body) with the original body's Close method so that when the
+// HTTP server calls r.Body.Close() at the end of the request, the
+// underlying MaxBytesReader / transport still gets the cleanup call.
+type closeForwardingReader struct {
+	io.Reader
+	io.Closer
+}
+
+// canonicalTrailerName returns the MIME-canonical form (e.g.
+// "X-Amz-Checksum-Crc32") of a trailer header name.
+func canonicalTrailerName(name string) string {
+	return textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
+}
+
+type s3PutBodyError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+// classifyS3BodyReadErr folds the recognised body-read failures into an
+// s3PutBodyError the caller can pass to writeS3Error. Returns nil, false
+// when the error is not one of the known shapes, so the caller falls back
+// to writeS3InternalError.
+func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, bool) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: tooLargeMessage}, true
+	}
+	var chunkedErr *awsChunkedError
+	if errors.As(err, &chunkedErr) {
+		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
+	}
+	return nil, false
+}
+
+// cleanStoredContentEncoding strips "aws-chunked" from the Content-Encoding
+// value that will be persisted on the object. AWS S3 treats aws-chunked as a
+// transport-layer signal and does not store it; preserving it would cause
+// subsequent GET responses to advertise a transport encoding that no client
+// ever asked for.
+func cleanStoredContentEncoding(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	kept := parts[:0]
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" || strings.EqualFold(trimmed, "aws-chunked") {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	return strings.Join(kept, ", ")
 }
 
 func encodeS3BucketMeta(meta *s3BucketMeta) ([]byte, error) {

@@ -2,8 +2,25 @@ package raftengine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
+)
+
+// Shared sentinel errors that both engine implementations should wrap
+// so callers can test with errors.Is across engine backends.
+var (
+	// ErrNotLeader indicates the operation was rejected because the
+	// local node is not the Raft leader for the target group.
+	// Callers that care about leadership (e.g. lease invalidation
+	// logic) should match via errors.Is.
+	ErrNotLeader = errors.New("raft engine: not leader")
+	// ErrLeadershipLost indicates the local node was leader when the
+	// operation began but lost leadership before it could complete.
+	ErrLeadershipLost = errors.New("raft engine: leadership lost")
+	// ErrLeadershipTransferInProgress indicates a leadership transfer
+	// is under way and proposals are being held back.
+	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
 )
 
 type State string
@@ -65,6 +82,64 @@ type LeaderView interface {
 	// LinearizableRead blocks until the returned index is safe to read from the
 	// local FSM on that node.
 	LinearizableRead(ctx context.Context) (uint64, error)
+}
+
+// LeaseProvider is an optional capability implemented by engines that support
+// leader-local lease reads. Callers that want lease-based reads should
+// type-assert to this interface and fall back to LinearizableRead when the
+// underlying engine does not implement it.
+type LeaseProvider interface {
+	// LeaseDuration returns the time during which a lease holder can serve
+	// reads from local state without re-confirming leadership via ReadIndex.
+	LeaseDuration() time.Duration
+	// AppliedIndex returns the highest log index applied to the local FSM.
+	AppliedIndex() uint64
+	// LastQuorumAck returns the instant at which the engine most recently
+	// observed majority liveness on the leader -- i.e. the wall-clock time
+	// by which a quorum of follower Progress entries had responded. The
+	// engine maintains this in the background from MsgHeartbeatResp /
+	// MsgAppResp traffic on the leader, so a fast-path lease read does
+	// not need to issue its own ReadIndex to "warm" the lease.
+	//
+	// Safety: callers must verify the lease against a single
+	// `now := time.Now()` sample:
+	//   state == raftengine.StateLeader &&
+	//   !ack.IsZero() && !ack.After(now) && now.Sub(ack) < LeaseDuration()
+	//
+	// The !ack.After(now) guard matters because LastQuorumAck() may be
+	// reconstructed from UnixNano (no monotonic component): a backwards
+	// wall-clock adjustment would otherwise make now.Sub(ack) negative
+	// and pass the duration check against a stale ack. The LeaseDuration
+	// is bounded by electionTimeout - safety_margin, which guarantees
+	// that any new leader candidate cannot yet accept writes during
+	// that window.
+	//
+	// Returns the zero time when no quorum has been confirmed yet or
+	// when the local node is not the leader. Single-node LEADERS may
+	// return a recent time.Now() since self is the quorum; non-leader
+	// single-node replicas still return the zero time.
+	LastQuorumAck() time.Time
+	// RegisterLeaderLossCallback registers fn to be invoked whenever the
+	// local node leaves the leader role (graceful transfer, partition
+	// step-down, or shutdown). Callers use this to invalidate any
+	// leader-local lease they hold so the next read takes the slow path.
+	// Multiple callbacks can be registered.
+	//
+	// Callbacks fire synchronously from the engine's status-refresh
+	// / shutdown path and MUST be non-blocking -- each should be a
+	// lock-free flag flip (e.g. atomic invalidate). A panicking
+	// callback is contained so a bug in one holder cannot break
+	// others, but a blocking callback would stall the engine's main
+	// loop, so the contract is strict. Lease-read fast paths also
+	// guard on engine.State() to close the narrow race between a
+	// transition and this callback completing.
+	//
+	// The returned function deregisters this callback and is safe to
+	// call multiple times. Callers whose lifetime is shorter than the
+	// engine's (ephemeral Coordinators in tests, for example) MUST
+	// invoke the returned deregister when they are done so the engine
+	// does not accumulate dead callbacks.
+	RegisterLeaderLossCallback(fn func()) (deregister func())
 }
 
 type StatusReader interface {
