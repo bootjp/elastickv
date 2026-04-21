@@ -1400,6 +1400,12 @@ func luaSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
 	return ok && st != nil && st.loaded
 }
 
+// luaZSetAlreadyLoaded mirrors luaHashAlreadyLoaded for c.zsets.
+func luaZSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
+	st, ok := c.zsets[string(key)]
+	return ok && st != nil && st.loaded
+}
+
 // hgetFromSlowPath runs the legacy hashState-based HGET, preserving
 // the script-local cache and WRONGTYPE / nil behaviour unchanged.
 func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
@@ -2509,8 +2515,53 @@ func applyZRangeLimit(entries []redisZSetEntry, offset, limit int) []redisZSetEn
 	return trimmed
 }
 
+// zscoreArgCount pins the expected argument count for ZSCORE at the
+// Lua-context dispatch boundary. Using a named constant satisfies
+// the linter without a //nolint:mnd on the arity check and documents
+// that the command requires EXACTLY two arguments (any extras must
+// be rejected, matching Redis server semantics).
+const zscoreArgCount = 2
+
 func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
+	if len(args) != zscoreArgCount {
+		return luaReply{}, errors.New("ERR wrong number of arguments for 'zscore' command")
+	}
 	key := []byte(args[0])
+	member := args[1]
+	// See cmdHGet: defer to the slow path whenever the zset has an
+	// authoritative script-local answer. Two separate signals:
+	//
+	//   (a) luaZSetAlreadyLoaded: a prior cmdZScore / cmdZRange etc.
+	//       fully resolved the zset, even to a confirmed miss
+	//       (loaded=true, exists=false). Re-running the fast path
+	//       would do a redundant wide-column probe.
+	//   (b) cachedType: a prior ZADD / ZREM in this Eval OR a prior
+	//       DEL / type-change via SET. Without this guard the fast
+	//       path would leak pre-script pebble state.
+	if luaZSetAlreadyLoaded(c, key) {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return zscoreFromSlowPath(c, key, member)
+	}
+	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if hit {
+		if !alive {
+			return luaNilReply(), nil
+		}
+		return luaStringReply(formatRedisFloat(score)), nil
+	}
+	return zscoreFromSlowPath(c, key, member)
+}
+
+// zscoreFromSlowPath runs the legacy zsetState-based ZSCORE,
+// preserving the script-local cache and WRONGTYPE / nil behaviour
+// unchanged. Handles legacy-blob zsets via ensureZSetLoaded inside
+// memberScore.
+func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2518,10 +2569,16 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		}
 		return luaReply{}, err
 	}
+	return c.zscoreFromZSetState(st, key, member)
+}
+
+// zscoreFromZSetState returns the Redis reply for ZSCORE against a
+// loaded luaZSetState, matching the legacy cmdZScore semantics.
+func (c *luaScriptContext) zscoreFromZSetState(st *luaZSetState, key []byte, member string) (luaReply, error) {
 	if !st.exists {
 		return luaNilReply(), nil
 	}
-	score, ok, err := c.memberScore(st, key, args[1])
+	score, ok, err := c.memberScore(st, key, member)
 	if err != nil {
 		return luaReply{}, err
 	}
