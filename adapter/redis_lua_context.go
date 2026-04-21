@@ -36,6 +36,19 @@ type luaScriptContext struct {
 	touched     map[string]struct{}
 	deleted     map[string]bool
 	everDeleted map[string]bool
+	// negativeType caches keys for which server.keyTypeAt() has already
+	// returned redisTypeNone during this Eval. Since startTS is pinned,
+	// MVCC guarantees the absence-at-startTS result is stable for the
+	// script's duration; in-script mutations that re-create the key
+	// populate the concrete-type state (c.strings/c.zsets/... with
+	// exists=true), which cachedType() returns first, so the negative
+	// cache is shadowed without needing explicit invalidation.
+	negativeType map[string]bool
+
+	// keyTypeProbeCount counts how many times the server-side keyTypeAt
+	// helper was invoked during this Eval. Only read by tests via
+	// luaScriptContext methods; ordinary production code never reads it.
+	keyTypeProbeCount int
 
 	strings map[string]*luaStringState
 	lists   map[string]*luaListState
@@ -234,20 +247,21 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	}
 	startTS := server.readTS()
 	return &luaScriptContext{
-		server:      server,
-		startTS:     startTS,
-		readPin:     server.pinReadTS(startTS),
-		ctx:         ctx,
-		touched:     map[string]struct{}{},
-		deleted:     map[string]bool{},
-		everDeleted: map[string]bool{},
-		strings:     map[string]*luaStringState{},
-		lists:       map[string]*luaListState{},
-		hashes:      map[string]*luaHashState{},
-		sets:        map[string]*luaSetState{},
-		zsets:       map[string]*luaZSetState{},
-		streams:     map[string]*luaStreamState{},
-		ttls:        map[string]*luaTTLState{},
+		server:       server,
+		startTS:      startTS,
+		readPin:      server.pinReadTS(startTS),
+		ctx:          ctx,
+		touched:      map[string]struct{}{},
+		deleted:      map[string]bool{},
+		everDeleted:  map[string]bool{},
+		negativeType: map[string]bool{},
+		strings:      map[string]*luaStringState{},
+		lists:        map[string]*luaListState{},
+		hashes:       map[string]*luaHashState{},
+		sets:         map[string]*luaSetState{},
+		zsets:        map[string]*luaZSetState{},
+		streams:      map[string]*luaStreamState{},
+		ttls:         map[string]*luaTTLState{},
 	}, nil
 }
 
@@ -380,6 +394,13 @@ func (c *luaScriptContext) cachedType(key []byte) (redisValueType, bool) {
 	if c.deleted[k] {
 		return redisTypeNone, true
 	}
+	// Negative (absent-at-startTS) probe result from a prior keyType call
+	// in this Eval. Consulted last so loaded-type and in-script DEL tombstones
+	// win; safe because in-script writes set cachedLoadedTypes[...].exists
+	// which short-circuits above, shadowing the stale negative entry.
+	if c.negativeType[k] {
+		return redisTypeNone, true
+	}
 	return redisTypeNone, false
 }
 
@@ -431,9 +452,17 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 		return typ, nil
 	}
 
+	c.keyTypeProbeCount++
 	typ, err := c.server.keyTypeAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return redisTypeNone, err
+	}
+	if typ == redisTypeNone {
+		// Pin the absence result for the rest of this Eval so repeated
+		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
+		// does not re-run the ~8-seek rawKeyTypeAt probe on every
+		// redis.call.
+		c.negativeType[string(key)] = true
 	}
 	return typ, nil
 }
@@ -1373,7 +1402,14 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 	if luaHashAlreadyLoaded(c, key) {
 		return hgetFromSlowPath(c, key, field)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Short-circuit for a cached-absent key: the slow path would just
+		// re-derive nil after allocating an empty luaHashState. Returning
+		// nil directly skips that work and keeps the BullMQ poll loop on
+		// the cheapest possible code path.
+		if typ == redisTypeNone {
+			return luaNilReply(), nil
+		}
 		return hgetFromSlowPath(c, key, field)
 	}
 	// Fast path: direct wide-column field lookup, bypassing the ~8-seek
@@ -1603,7 +1639,13 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 	if luaHashAlreadyLoaded(c, key) {
 		return hexistsFromSlowPath(c, key, field)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Short-circuit for a cached-absent key: HEXISTS on a missing
+		// hash is defined to return 0, matching the slow-path result
+		// without allocating an empty luaHashState.
+		if typ == redisTypeNone {
+			return luaIntReply(0), nil
+		}
 		return hexistsFromSlowPath(c, key, field)
 	}
 	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
@@ -2175,7 +2217,12 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 	if luaSetAlreadyLoaded(c, key) {
 		return sismemberFromSlowPath(c, key, member)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// SISMEMBER on a missing set returns 0; skip the slow path to
+		// avoid an empty luaSetState allocation on repeated misses.
+		if typ == redisTypeNone {
+			return luaIntReply(0), nil
+		}
 		return sismemberFromSlowPath(c, key, member)
 	}
 	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
@@ -2435,8 +2482,14 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		zrangeMetrics.ObserveSkipLoaded()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
 		zrangeMetrics.ObserveSkipCachedType()
+		// Negative-cache / in-script DEL / RENAME: returning an empty
+		// array directly matches the slow-path result without a second
+		// rawKeyTypeAt probe inside zsetState.
+		if typ == redisTypeNone {
+			return luaArrayReply(), nil
+		}
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	entries, hit, fallbackReason, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
@@ -2697,7 +2750,14 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 	if luaZSetAlreadyLoaded(c, key) {
 		return zscoreFromSlowPath(c, key, member)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Cached-absent key (incl. negative-cache hit from a prior probe):
+		// skip the slow path entirely and return nil directly. Mirrors the
+		// "missing zset" branch of zscoreFromSlowPath without paying for
+		// an empty luaZSetState allocation.
+		if typ == redisTypeNone {
+			return luaNilReply(), nil
+		}
 		return zscoreFromSlowPath(c, key, member)
 	}
 	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
