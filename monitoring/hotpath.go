@@ -41,10 +41,10 @@ type HotPathMetrics struct {
 // so operators can see how often a given command (ZRANGEBYSCORE,
 // ZSCORE, HGET, etc.) actually takes the fast path vs falls back.
 const (
-	LuaFastPathOutcomeHit             = "hit"
-	LuaFastPathOutcomeSkipLoaded = "skip_loaded"
-	LuaFastPathOutcomeSkipCachedType  = "skip_cached_type"
-	LuaFastPathOutcomeFallback        = "fallback"
+	LuaFastPathOutcomeHit            = "hit"
+	LuaFastPathOutcomeSkipLoaded     = "skip_loaded"
+	LuaFastPathOutcomeSkipCachedType = "skip_cached_type"
+	LuaFastPathOutcomeFallback       = "fallback"
 )
 
 func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
@@ -116,10 +116,10 @@ type LuaFastPathObserver struct {
 // LuaFastPathObserver.ForCommand(cmd) at server startup; call the
 // Observe* methods per redis.call(). Safe to copy.
 type LuaFastPathCmd struct {
-	hit             prometheus.Counter
-	skipLoaded prometheus.Counter
-	skipCachedType  prometheus.Counter
-	fallback        prometheus.Counter
+	hit            prometheus.Counter
+	skipLoaded     prometheus.Counter
+	skipCachedType prometheus.Counter
+	fallback       prometheus.Counter
 }
 
 // ForCommand pre-resolves the counter handles for cmd. Returns a
@@ -131,10 +131,10 @@ func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
 	}
 	vec := o.metrics.luaFastPathTotal
 	return LuaFastPathCmd{
-		hit:             vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
-		skipLoaded: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
-		skipCachedType:  vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
-		fallback:        vec.WithLabelValues(cmd, LuaFastPathOutcomeFallback),
+		hit:            vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
+		skipLoaded:     vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
+		skipCachedType: vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
+		fallback:       vec.WithLabelValues(cmd, LuaFastPathOutcomeFallback),
 	}
 }
 
