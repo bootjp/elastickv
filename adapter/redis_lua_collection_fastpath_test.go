@@ -419,3 +419,34 @@ func TestLua_SISMEMBER_WRONGTYPE(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "WRONGTYPE")
 }
+
+// TestLua_HGET_RepeatedMissReusesLoadedState pins the optimisation
+// that a missing hash loaded once should NOT re-run the wide-column
+// probe on every subsequent HGET in the same Eval. The script does
+// N HGETs on the same missing key; if the fast-path guard correctly
+// honors an already-loaded luaHashState (even with exists=false),
+// only the first call reaches Pebble.
+func TestLua_HGET_RepeatedMissReusesLoadedState(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	// 4 HGETs on the same missing key; the script must return nil for
+	// each and complete without divergent results. Correctness check
+	// only -- the optimisation itself is a seek-count saving that
+	// needs pprof to verify; this test guards against the guard
+	// regressing into returning wrong answers.
+	got, err := rdb.Eval(ctx, `
+local a = redis.call("HGET", KEYS[1], "f") or "nil"
+local b = redis.call("HGET", KEYS[1], "f") or "nil"
+local c = redis.call("HGET", KEYS[1], "f") or "nil"
+local d = redis.call("HGET", KEYS[1], "f") or "nil"
+return a .. "|" .. b .. "|" .. c .. "|" .. d
+`, []string{"lua:h:repeatedmiss"}).Result()
+	require.NoError(t, err)
+	require.Equal(t, "nil|nil|nil|nil", got)
+}
