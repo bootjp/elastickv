@@ -250,21 +250,22 @@ var argsLen = map[string]int{
 }
 
 type RedisServer struct {
-	listen          net.Listener
-	store           store.MVCCStore
-	coordinator     kv.Coordinator
-	readTracker     *kv.ActiveTimestampTracker
-	redisTranscoder *redisTranscoder
-	pubsub          *redisPubSub
-	scriptMu        sync.RWMutex
-	scriptCache     map[string]string
-	traceCommands   bool
-	traceSeq        atomic.Uint64
-	redisAddr       string
-	relay           *RedisPubSubRelay
-	relayConnCache  kv.GRPCConnCache
-	requestObserver monitoring.RedisRequestObserver
-	luaObserver     monitoring.LuaScriptObserver
+	listen              net.Listener
+	store               store.MVCCStore
+	coordinator         kv.Coordinator
+	readTracker         *kv.ActiveTimestampTracker
+	redisTranscoder     *redisTranscoder
+	pubsub              *redisPubSub
+	scriptMu            sync.RWMutex
+	scriptCache         map[string]string
+	traceCommands       bool
+	traceSeq            atomic.Uint64
+	redisAddr           string
+	relay               *RedisPubSubRelay
+	relayConnCache      kv.GRPCConnCache
+	requestObserver     monitoring.RedisRequestObserver
+	luaObserver         monitoring.LuaScriptObserver
+	luaFastPathObserver monitoring.LuaFastPathObserver
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -317,6 +318,15 @@ func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisSer
 func WithLuaObserver(observer monitoring.LuaScriptObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.luaObserver = observer
+	}
+}
+
+// WithLuaFastPathObserver enables per-redis.call() fast-path outcome
+// metrics inside Lua scripts. Used to diagnose fast-path hit ratios
+// for commands like ZRANGEBYSCORE / ZSCORE / HGET.
+func WithLuaFastPathObserver(observer monitoring.LuaFastPathObserver) RedisServerOption {
+	return func(r *RedisServer) {
+		r.luaFastPathObserver = observer
 	}
 }
 

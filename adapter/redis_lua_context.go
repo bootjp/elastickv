@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -2425,9 +2426,11 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
 	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
 	if luaZSetAlreadyLoaded(c, key) {
+		c.observeFastPathOutcome(luaCmdZRangeByScore, monitoring.LuaFastPathOutcomeSkipAlreadyLoad)
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	if _, cached := c.cachedType(key); cached {
+		c.observeFastPathOutcome(luaCmdZRangeByScore, monitoring.LuaFastPathOutcomeSkipCachedType)
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
@@ -2435,12 +2438,36 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaReply{}, fastErr
 	}
 	if !hit {
+		c.observeFastPathOutcome(luaCmdZRangeByScore, monitoring.LuaFastPathOutcomeFallback)
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
+	c.observeFastPathOutcome(luaCmdZRangeByScore, monitoring.LuaFastPathOutcomeHit)
 	if len(entries) == 0 {
 		return luaArrayReply(), nil
 	}
 	return zsetRangeReply(entries, options.withScores), nil
+}
+
+// luaCmdZRangeByScore is the metric label for ZRANGEBYSCORE /
+// ZREVRANGEBYSCORE fast-path outcomes. Both directions share one
+// label because the fast-path implementation is identical except for
+// scan direction.
+const luaCmdZRangeByScore = "zrangebyscore"
+
+// observeFastPathOutcome records one fast-path decision via the
+// server's observer. No-op when no observer is wired (tests, or a
+// scriptCtx constructed without a RedisServer).
+//
+// cmd is accepted as a parameter (rather than hard-coded) so the
+// next wave of fast-path commands (ZSCORE, HGET, HEXISTS, SISMEMBER)
+// can plug in without widening the helper signature.
+//
+//nolint:unparam // cmd will gain additional values in follow-up commits.
+func (c *luaScriptContext) observeFastPathOutcome(cmd, outcome string) {
+	if c.server == nil {
+		return
+	}
+	c.server.luaFastPathObserver.ObserveLuaFastPath(cmd, outcome)
 }
 
 // zrangeByScoreFastPath translates the caller's min/max bounds into a

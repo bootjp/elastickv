@@ -34,7 +34,18 @@ type HotPathMetrics struct {
 	dispatchDroppedTotal *prometheus.CounterVec
 	dispatchErrorsTotal  *prometheus.CounterVec
 	stepQueueFullTotal   *prometheus.CounterVec
+	luaFastPathTotal     *prometheus.CounterVec
 }
+
+// LuaFastPathOutcome labels tag each Lua-side read fast-path decision
+// so operators can see how often a given command (ZRANGEBYSCORE,
+// ZSCORE, HGET, etc.) actually takes the fast path vs falls back.
+const (
+	LuaFastPathOutcomeHit             = "hit"
+	LuaFastPathOutcomeSkipAlreadyLoad = "skip_loaded"
+	LuaFastPathOutcomeSkipCachedType  = "skip_cached_type"
+	LuaFastPathOutcomeFallback        = "fallback"
+)
 
 func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 	m := &HotPathMetrics{
@@ -66,6 +77,13 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			},
 			[]string{"group"},
 		),
+		luaFastPathTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_lua_cmd_fastpath_total",
+				Help: "Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback.",
+			},
+			[]string{"cmd", "outcome"},
+		),
 	}
 
 	registerer.MustRegister(
@@ -73,8 +91,27 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 		m.dispatchDroppedTotal,
 		m.dispatchErrorsTotal,
 		m.stepQueueFullTotal,
+		m.luaFastPathTotal,
 	)
 	return m
+}
+
+// LuaFastPathObserver records a fast-path outcome for a single
+// redis.call() inside a Lua script. The zero value is safe and
+// silently drops samples so tests can pass LuaFastPathObserver{} as a
+// stub.
+type LuaFastPathObserver struct {
+	metrics *HotPathMetrics
+}
+
+// ObserveLuaFastPath records (cmd, outcome). cmd should be the
+// lowercase command name (e.g. "zrangebyscore"); outcome should be
+// one of LuaFastPathOutcome*.
+func (o LuaFastPathObserver) ObserveLuaFastPath(cmd, outcome string) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.luaFastPathTotal.WithLabelValues(cmd, outcome).Inc()
 }
 
 // LeaseReadObserver implements kv.LeaseReadObserver by incrementing the

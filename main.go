@@ -553,6 +553,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
+		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
 	)
 	eg.Go(func() error {
