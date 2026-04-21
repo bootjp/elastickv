@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -1007,4 +1008,58 @@ func TestLua_ZRANGEBYSCORE_NegativeLimitReturnsAll(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []any{"m1", "m2", "m3"}, got,
 		"LIMIT offset -1 must return all matching entries (unbounded)")
+}
+
+// TestLua_ZRANGEBYSCORE_NegInfExactMatch pins the fast-path handling
+// of ZRANGEBYSCORE key -inf -inf: members with score = -inf MUST be
+// returned, not silently dropped by the score-index scan bounds.
+func TestLua_ZRANGEBYSCORE_NegInfExactMatch(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:neginf",
+		redis.Z{Score: math.Inf(-1), Member: "neg"},
+		redis.Z{Score: 0, Member: "zero"},
+		redis.Z{Score: math.Inf(+1), Member: "pos"},
+	).Err())
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "-inf")`,
+		[]string{"lua:zr:neginf"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"neg"}, got,
+		"ZRANGEBYSCORE -inf -inf must return only members with score = -inf")
+}
+
+// TestLua_ZRANGEBYSCORE_PosInfExactMatch pins the fast-path handling
+// of ZRANGEBYSCORE key +inf +inf: members with score = +inf MUST be
+// returned.
+func TestLua_ZRANGEBYSCORE_PosInfExactMatch(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:posinf",
+		redis.Z{Score: math.Inf(-1), Member: "neg"},
+		redis.Z{Score: 0, Member: "zero"},
+		redis.Z{Score: math.Inf(+1), Member: "pos"},
+	).Err())
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "+inf", "+inf")`,
+		[]string{"lua:zr:posinf"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"pos"}, got,
+		"ZRANGEBYSCORE +inf +inf must return only members with score = +inf")
 }

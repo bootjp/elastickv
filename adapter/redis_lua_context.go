@@ -2543,11 +2543,19 @@ func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound) (startKey, 
 			startKey = store.PrefixScanEnd(scorePrefix)
 		}
 	case zBoundPosInf:
-		startKey = fullEnd
+		// +Inf as minBound is a concrete "lower bound = +Inf" — only
+		// members with score = +Inf qualify. Use the +Inf score prefix
+		// as the scan start so those members are not silently dropped.
+		// Redis accepts ZADD key +inf m and ZRANGEBYSCORE key +inf +inf
+		// must return m.
+		startKey = store.ZSetScoreRangeScanPrefix(key, math.Inf(+1))
 	}
 	switch maxBound.kind {
 	case zBoundNegInf:
-		endKey = full
+		// -Inf as maxBound is a concrete "upper bound = -Inf" — only
+		// members with score = -Inf qualify. Bound the scan to the end
+		// of the -Inf score slot. Mirrors the +Inf-as-minBound case.
+		endKey = store.PrefixScanEnd(store.ZSetScoreRangeScanPrefix(key, math.Inf(-1)))
 	case zBoundValue:
 		scorePrefix := store.ZSetScoreRangeScanPrefix(key, maxBound.score)
 		if maxBound.inclusive {
