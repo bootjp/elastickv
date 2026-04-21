@@ -1510,27 +1510,20 @@ func isPriorityMsg(t raftpb.MessageType) bool {
 // partitions the non-heartbeat traffic so that MsgApp/MsgAppResp and MsgSnap
 // do not share a goroutine and cannot block each other.
 func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) chan dispatchRequest {
+	// Priority control traffic (heartbeats, votes, read-index, timeout-now)
+	// always rides the heartbeat lane in both layouts so it keeps its
+	// low-latency treatment and is never stuck behind MsgApp payloads.
+	if isPriorityMsg(msgType) {
+		return pd.heartbeat
+	}
 	if !e.dispatcherLanesEnabled {
-		if isPriorityMsg(msgType) {
-			return pd.heartbeat
-		}
 		return pd.normal
 	}
 	switch msgType {
-	case raftpb.MsgHeartbeat, raftpb.MsgHeartbeatResp:
-		return pd.heartbeat
 	case raftpb.MsgApp, raftpb.MsgAppResp:
 		return pd.replication
 	case raftpb.MsgSnap:
 		return pd.snapshot
-	case raftpb.MsgVote, raftpb.MsgVoteResp,
-		raftpb.MsgPreVote, raftpb.MsgPreVoteResp,
-		raftpb.MsgReadIndex, raftpb.MsgReadIndexResp,
-		raftpb.MsgTimeoutNow:
-		// Election / read-index traffic is small and latency-sensitive but
-		// rare; put it on the heartbeat lane so it keeps its priority
-		// treatment and, like today, is never stuck behind MsgApp.
-		return pd.heartbeat
 	default:
 		return pd.other
 	}
