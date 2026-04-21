@@ -112,6 +112,16 @@ func (r *Registry) LeaseReadObserver() LeaseReadObserver {
 	return LeaseReadObserver{metrics: r.hotPath}
 }
 
+// LuaFastPathObserver returns an observer for Lua-side redis.call()
+// fast-path outcomes (hit / skip / fallback per command). Zero-value
+// safe for tests and tools that do not wire a registry.
+func (r *Registry) LuaFastPathObserver() LuaFastPathObserver {
+	if r == nil {
+		return LuaFastPathObserver{}
+	}
+	return LuaFastPathObserver{metrics: r.hotPath}
+}
+
 // DispatchCollector returns a collector that polls the etcd raft
 // engine's dispatch counters and exports them to Prometheus. Start it
 // with the node's raft sources after engine Open() completes.

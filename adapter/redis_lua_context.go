@@ -2424,10 +2424,18 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	// Fast path eligibility: no script-local mutation / deletion /
 	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
 	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
+	//
+	// zrangeMetrics is a zero-value LuaFastPathCmd when no observer is
+	// wired (tests); Observe* methods on it are no-ops. When wired,
+	// each Observe* is a single atomic increment on a pre-resolved
+	// Counter (see WithLuaFastPathObserver).
+	zrangeMetrics := c.server.luaFastPathZRange
 	if luaZSetAlreadyLoaded(c, key) {
+		zrangeMetrics.ObserveSkipLoaded()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	if _, cached := c.cachedType(key); cached {
+		zrangeMetrics.ObserveSkipCachedType()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
@@ -2435,8 +2443,10 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaReply{}, fastErr
 	}
 	if !hit {
+		zrangeMetrics.ObserveFallback()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
+	zrangeMetrics.ObserveHit()
 	if len(entries) == 0 {
 		return luaArrayReply(), nil
 	}

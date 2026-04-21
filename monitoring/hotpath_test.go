@@ -30,6 +30,41 @@ elastickv_lease_read_total{node_address="10.0.0.1:50051",node_id="n1",outcome="m
 	require.NoError(t, err)
 }
 
+func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	cmd := registry.LuaFastPathObserver().ForCommand("zrangebyscore")
+
+	cmd.ObserveHit()
+	cmd.ObserveHit()
+	cmd.ObserveSkipLoaded()
+	cmd.ObserveFallback()
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_lua_cmd_fastpath_total Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback.
+# TYPE elastickv_lua_cmd_fastpath_total counter
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="fallback"} 1
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="hit"} 2
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_cached_type"} 0
+elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:50051",node_id="n1",outcome="skip_loaded"} 1
+`),
+		"elastickv_lua_cmd_fastpath_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
+	var observer LuaFastPathObserver
+	cmd := observer.ForCommand("zrangebyscore")
+	require.NotPanics(t, func() {
+		cmd.ObserveHit()
+		cmd.ObserveSkipLoaded()
+		cmd.ObserveSkipCachedType()
+		cmd.ObserveFallback()
+	})
+}
+
 func TestLeaseReadObserverZeroValueIsNoop(t *testing.T) {
 	// LeaseReadObserver{} is documented as safe; the Coordinator
 	// falls back to this when monitoring is disabled. Calling
