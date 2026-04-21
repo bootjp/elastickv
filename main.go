@@ -167,7 +167,8 @@ func run() error {
 	cleanup.Add(cancel)
 	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
 	cleanup.Add(func() { lockResolver.Close() })
-	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
+	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
+		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver())
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
 		return err
@@ -183,6 +184,9 @@ func run() error {
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
 	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
+	if collector := metricsRegistry.DispatchCollector(); collector != nil {
+		collector.Start(runCtx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -438,6 +442,29 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 			GroupID:      runtime.spec.id,
 			StatusReader: runtime.engine,
 			ConfigReader: runtime.engine,
+		})
+	}
+	return out
+}
+
+// dispatchMonitorSources extracts the raft engines that expose etcd
+// dispatch counters so monitoring can poll them for the hot-path
+// dashboard. Engines that do not satisfy the interface (hashicorp
+// backend today) are skipped silently; their groups simply won't
+// contribute to elastickv_raft_dispatch_* metrics.
+func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchSource {
+	out := make([]monitoring.DispatchSource, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.engine == nil {
+			continue
+		}
+		src, ok := runtime.engine.(monitoring.DispatchCounterSource)
+		if !ok {
+			continue
+		}
+		out = append(out, monitoring.DispatchSource{
+			GroupID: runtime.spec.id,
+			Source:  src,
 		})
 	}
 	return out

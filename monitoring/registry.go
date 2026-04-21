@@ -14,10 +14,11 @@ type Registry struct {
 	registerer   prometheus.Registerer
 	gatherer     prometheus.Gatherer
 
-	dynamo *DynamoDBMetrics
-	redis  *RedisMetrics
-	raft   *RaftMetrics
-	lua    *LuaMetrics
+	dynamo  *DynamoDBMetrics
+	redis   *RedisMetrics
+	raft    *RaftMetrics
+	lua     *LuaMetrics
+	hotPath *HotPathMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -37,6 +38,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.redis = newRedisMetrics(registerer)
 	r.raft = newRaftMetrics(registerer)
 	r.lua = newLuaMetrics(registerer)
+	r.hotPath = newHotPathMetrics(registerer)
 	return r
 }
 
@@ -97,4 +99,25 @@ func (r *Registry) RaftProposalObserver(groupID uint64) *raftProposalObserver {
 		metrics: r.raft,
 		group:   strconv.FormatUint(groupID, 10),
 	}
+}
+
+// LeaseReadObserver returns an observer for the kv coordinator's
+// LeaseRead fast-path counter. Returns a zero-value observer when the
+// registry is nil so callers can pass the result through without
+// checking; the zero value silently drops samples.
+func (r *Registry) LeaseReadObserver() LeaseReadObserver {
+	if r == nil {
+		return LeaseReadObserver{}
+	}
+	return LeaseReadObserver{metrics: r.hotPath}
+}
+
+// DispatchCollector returns a collector that polls the etcd raft
+// engine's dispatch counters and exports them to Prometheus. Start it
+// with the node's raft sources after engine Open() completes.
+func (r *Registry) DispatchCollector() *DispatchCollector {
+	if r == nil || r.hotPath == nil {
+		return nil
+	}
+	return newDispatchCollector(r.hotPath)
 }
