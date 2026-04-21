@@ -19,6 +19,16 @@ type luaScriptContext struct {
 	startTS uint64
 	readPin *kv.ActiveTimestampToken
 
+	// ctx is the request-scoped context captured at newLuaScriptContext
+	// time. New cmd* handlers should propagate it into store operations
+	// so the Eval's deadline and cancellation reach storage.
+	//
+	// Existing handlers in this file still use context.Background() at
+	// their store call sites -- a historical pattern from before we had
+	// a ctx available. Migrating those is tracked as a follow-up PR;
+	// see PR #570's review for the gemini note on scope.
+	ctx context.Context
+
 	redisCallDuration time.Duration
 	redisCallCount    int
 
@@ -226,6 +236,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		server:      server,
 		startTS:     startTS,
 		readPin:     server.pinReadTS(startTS),
+		ctx:         ctx,
 		touched:     map[string]struct{}{},
 		deleted:     map[string]bool{},
 		everDeleted: map[string]bool{},
@@ -2393,6 +2404,85 @@ func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, e
 
 func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaReply, error) {
 	key := []byte(args[0])
+	options, err := parseZRangeByScoreOptions(args, reverse)
+	if err != nil {
+		return luaReply{}, err
+	}
+	// Defensive bound on LIMIT offset: negative offsets produce no
+	// well-defined Redis behaviour, so treat them as syntax error.
+	if options.offset < 0 {
+		return luaReply{}, errors.New("ERR value is out of range, must be positive")
+	}
+	// Redis treats ANY negative LIMIT count as "no limit" (return all
+	// elements from offset). parseZRangeByScoreTail's default is -1;
+	// an explicit user-supplied negative value is coerced here so the
+	// downstream fast path (zsetFastScanLimit / decodeZSetScoreRange)
+	// sees a single "unbounded" sentinel.
+	if options.limit < 0 {
+		options.limit = -1
+	}
+	// Fast path eligibility: no script-local mutation / deletion /
+	// type-change on this key. Mirrors the cmdZScore / cmdHGet guards
+	// so in-script ZADD / ZREM / DEL / SET behave exactly as before.
+	if luaZSetAlreadyLoaded(c, key) {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if _, cached := c.cachedType(key); cached {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	entries, hit, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
+	if fastErr != nil {
+		return luaReply{}, fastErr
+	}
+	if !hit {
+		return c.cmdZRangeByScoreSlow(key, options, reverse)
+	}
+	if len(entries) == 0 {
+		return luaArrayReply(), nil
+	}
+	return zsetRangeReply(entries, options.withScores), nil
+}
+
+// zrangeByScoreFastPath translates the caller's min/max bounds into a
+// bounded score-index scan through zsetRangeByScoreFast and returns
+// the decoded entries. hit=false means the server-side helper wants
+// the slow path (legacy-blob zset, string-encoding corruption, or
+// empty-result-but-zset-is-missing so WRONGTYPE disambiguation is
+// needed).
+//
+// Threads c.ctx into the server-side helper so the Eval's deadline
+// and cancellation reach the store layer. New cmd* handlers should
+// follow this pattern; historical Background() call sites in this
+// file are migrated incrementally.
+func (c *luaScriptContext) zrangeByScoreFastPath(
+	key []byte, options luaZRangeByScoreOptions, reverse bool,
+) ([]redisZSetEntry, bool, error) {
+	startKey, endKey := zsetScoreScanBounds(key, options.minBound, options.maxBound)
+	filter := func(score float64) bool {
+		return scoreInRange(score, options.minBound, options.maxBound)
+	}
+	return c.server.zsetRangeByScoreFast(
+		c.scriptCtx(), key, startKey, endKey, reverse,
+		options.offset, options.limit, filter, c.startTS,
+	)
+}
+
+// scriptCtx returns the request-scoped context captured at script
+// construction, or context.Background() if the caller bypassed the
+// normal entry point (unit tests constructing a luaScriptContext
+// directly). New code should always have a real ctx, so this is a
+// defensive fallback.
+func (c *luaScriptContext) scriptCtx() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+// cmdZRangeByScoreSlow is the legacy full-load path, preserved for
+// fall-through cases (in-script mutations, legacy-blob encoding,
+// ambiguous empty results).
+func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByScoreOptions, reverse bool) (luaReply, error) {
 	st, err := c.zsetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2406,12 +2496,6 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 	if err := c.ensureZSetLoaded(st, key); err != nil {
 		return luaReply{}, err
 	}
-
-	options, err := parseZRangeByScoreOptions(args, reverse)
-	if err != nil {
-		return luaReply{}, err
-	}
-
 	entries := zsetMapToEntries(st.members)
 	if reverse {
 		reverseEntries(entries)
@@ -2422,6 +2506,67 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return luaArrayReply(), nil
 	}
 	return zsetRangeReply(selected, options.withScores), nil
+}
+
+// zsetScoreScanBounds maps zScoreBound pairs to a [startKey, endKey)
+// byte-range on the score index that EXCLUDES entries outside the
+// caller's bound, not just approximates. Placing an exclusive edge
+// into the scan bound (rather than post-filtering after the scan)
+// matters for `ZRANGEBYSCORE (value +inf LIMIT 0 N`: if there are
+// many members AT score=value, a post-filter approach would consume
+// the whole offset+limit budget on those filtered-out rows and miss
+// the real matches at score > value.
+//
+// The score index is lex-sorted by (userKey, sortableScore, member).
+// Conventions:
+//
+//	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)
+//	minBound = value, inclusive  -> startKey = ZSetScoreRangeScanPrefix(key, score)
+//	minBound = value, exclusive  -> startKey = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = +Inf              -> endKey   = PrefixScanEnd(ZSetScoreScanPrefix(key))
+//	maxBound = value, inclusive  -> endKey   = PrefixScanEnd(ZSetScoreRangeScanPrefix(key, score))
+//	maxBound = value, exclusive  -> endKey   = ZSetScoreRangeScanPrefix(key, score)
+//
+// The same [start, end) endpoints drive both forward and reverse
+// scans; ReverseScanAt iterates from endKey downward.
+func zsetScoreScanBounds(key []byte, minBound, maxBound zScoreBound) (startKey, endKey []byte) {
+	full := store.ZSetScoreScanPrefix(key)
+	fullEnd := store.PrefixScanEnd(full)
+	switch minBound.kind {
+	case zBoundNegInf:
+		startKey = full
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, minBound.score)
+		if minBound.inclusive {
+			startKey = scorePrefix
+		} else {
+			startKey = store.PrefixScanEnd(scorePrefix)
+		}
+	case zBoundPosInf:
+		// +Inf as minBound is a concrete "lower bound = +Inf" — only
+		// members with score = +Inf qualify. Use the +Inf score prefix
+		// as the scan start so those members are not silently dropped.
+		// Redis accepts ZADD key +inf m and ZRANGEBYSCORE key +inf +inf
+		// must return m.
+		startKey = store.ZSetScoreRangeScanPrefix(key, math.Inf(+1))
+	}
+	switch maxBound.kind {
+	case zBoundNegInf:
+		// -Inf as maxBound is a concrete "upper bound = -Inf" — only
+		// members with score = -Inf qualify. Bound the scan to the end
+		// of the -Inf score slot. Mirrors the +Inf-as-minBound case.
+		endKey = store.PrefixScanEnd(store.ZSetScoreRangeScanPrefix(key, math.Inf(-1)))
+	case zBoundValue:
+		scorePrefix := store.ZSetScoreRangeScanPrefix(key, maxBound.score)
+		if maxBound.inclusive {
+			endKey = store.PrefixScanEnd(scorePrefix)
+		} else {
+			endKey = scorePrefix
+		}
+	case zBoundPosInf:
+		endKey = fullEnd
+	}
+	return startKey, endKey
 }
 
 type luaZRangeByScoreOptions struct {
@@ -3400,7 +3545,15 @@ func sortedSetMembers(members map[string]struct{}) []string {
 }
 
 func zsetRangeReply(entries []redisZSetEntry, withScores bool) luaReply {
-	out := make([]luaReply, 0, len(entries))
+	// WITHSCORES doubles the output width (member + score per entry);
+	// size the slice accordingly to avoid an internal grow on large
+	// reply arrays. Bounded by maxWideScanLimit at the fast-path
+	// layer, so the allocation cannot be unbounded.
+	capacity := len(entries)
+	if withScores {
+		capacity *= 2
+	}
+	out := make([]luaReply, 0, capacity)
 	for _, entry := range entries {
 		out = append(out, luaStringReply(entry.Member))
 		if withScores {
