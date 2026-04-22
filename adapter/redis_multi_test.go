@@ -32,6 +32,10 @@ import (
 // gap deterministically without a timing-based sleep.
 func waitForListState(t *testing.T, n Node, key []byte, expectedLen int, expectedValues []string) {
 	t.Helper()
+	if expectedValues != nil && len(expectedValues) != expectedLen {
+		t.Fatalf("waitForListState: expectedValues length %d does not match expectedLen %d",
+			len(expectedValues), expectedLen)
+	}
 	require.Eventually(t, func() bool {
 		return listStateMatches(n, key, expectedLen, expectedValues)
 	}, 5*time.Second, 250*time.Millisecond,
