@@ -36,8 +36,23 @@ func waitForListState(t *testing.T, n Node, key []byte, expectedLen int, expecte
 	require.Eventually(t, func() bool {
 		readTS := n.redisServer.readTS()
 		meta, exists, err := n.redisServer.resolveListMeta(ctx, key, readTS)
-		if err != nil || !exists || meta.Len != int64(expectedLen) {
+		if err != nil {
 			return false
+		}
+		// Redis represents an empty / deleted list as the absence of
+		// the meta key. When the caller is verifying deletion
+		// (expectedLen == 0), !exists is the success signal;
+		// requiring exists==true would make this helper unusable for
+		// post-DEL waits. For non-empty expectations a missing meta
+		// still means "not yet applied" and should keep polling.
+		if expectedLen == 0 {
+			if exists && meta.Len != 0 {
+				return false
+			}
+		} else {
+			if !exists || meta.Len != int64(expectedLen) {
+				return false
+			}
 		}
 		kvs, err := n.redisServer.store.ScanAt(
 			ctx,
