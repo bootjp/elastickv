@@ -437,12 +437,24 @@
                             (some #(and (= :zincrby (:f %))
                                         (:unknown-score? %))
                                   coll))
-        ;; Uncertain score set when any ZINCRBY is concurrent/uncertain
-        ;; (its resulting score is unknown), OR when multiple concurrent
-        ;; increments could yield intermediate prefix-sum scores that
-        ;; are not in :scores.
+        ;; Count concurrent/uncertain ZINCRBYs. The resulting score of a
+        ;; read relative to ZINCRBYs depends on how many of them took
+        ;; effect before the read observed state.
+        ;;   * 0 uncertain ZINCRBYs: :scores is authoritative.
+        ;;   * 1 uncertain ZINCRBY whose final score is KNOWN (:ok):
+        ;;     the read can observe either the pre-op state (already in
+        ;;     :scores from candidates) or the post-op state (its known
+        ;;     final score, also added to :scores). :scores is complete.
+        ;;   * 1 uncertain ZINCRBY with UNKNOWN score (:info/:pending):
+        ;;     the post-op score is not recoverable from the history.
+        ;;     We must relax the strict score check.
+        ;;   * >=2 uncertain ZINCRBYs: their relative serialization
+        ;;     order produces prefix-sum intermediates that are not in
+        ;;     :scores (e.g. pre + delta1 before pre + delta1 + delta2).
+        ;;     Relax the strict score check.
+        uncertain-incrs (filter #(= :zincrby (:f %)) uncertain)
         unknown-score? (or (has-unknown-incr? uncertain)
-                           (some #(= :zincrby (:f %)) uncertain))
+                           (> (count uncertain-incrs) 1))
 
         any-candidate-write? (some write-op? candidates)
         any-candidate-zrem? (some #(= :zrem (:f %)) candidates)

@@ -75,6 +75,47 @@
         result  (run-checker history)]
     (is (not (:valid? result)) (str "expected mismatch, got: " result))))
 
+(deftest single-ok-concurrent-zincrby-still-validates-scores
+  ;; Codex P1: :unknown-score? must NOT be set when exactly one
+  ;; concurrent ZINCRBY is :ok (and therefore has a known resulting
+  ;; score). The read may observe either the pre-op score or the
+  ;; post-op score, both of which are in :scores. An arbitrary
+  ;; impossible score (e.g. 999.0) must still be flagged as a
+  ;; :score-mismatch, not waved through by `:unknown-score?`.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 1}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 5]   :index 2}
+                 {:type :invoke :process 0 :f :zrange-all                :index 3}
+                 ;; Read observes 999.0 — not 1.0 (pre) or 6.0 (post).
+                 {:type :ok     :process 0 :f :zrange-all
+                  :value [["m1" 999.0]] :index 4}
+                 ;; ZINCRBY eventually completes :ok with known score 6.
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 6.0] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected score-mismatch to still fire, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
+(deftest two-concurrent-zincrbys-relax-score-check
+  ;; Prefix-sum ordering matters: with two concurrent ZINCRBYs, the
+  ;; intermediate score (pre + one delta) is reachable and need not be
+  ;; in :scores. The checker must relax the strict score check.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 1}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 2]   :index 2}
+                 {:type :invoke :process 2 :f :zincrby :value ["m1" 3]   :index 3}
+                 {:type :invoke :process 0 :f :zrange-all                :index 4}
+                 ;; Intermediate 3.0 = 1 + 2 (before +3 applied).
+                 {:type :ok     :process 0 :f :zrange-all
+                  :value [["m1" 3.0]] :index 5}
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 3.0] :index 6}
+                 {:type :ok     :process 2 :f :zincrby :value ["m1" 6.0] :index 7}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected relaxation for >=2 concurrent ZINCRBYs, got: " result))))
+
 (deftest no-op-zrem-alone-does-not-false-positive
   ;; CI-observed false positive: a member whose only prior ops are no-op
   ;; ZREMs was classified as :score-mismatch with :allowed #{} instead
