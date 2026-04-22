@@ -7,9 +7,13 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
+	"math"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -264,5 +268,104 @@ func TestFanoutCurrentTargetsFallsBackToSeeds(t *testing.T) {
 	targets := f.currentTargets(ctx)
 	if len(targets) != 1 || targets[0] != seedAddr {
 		t.Fatalf("fallback targets = %v, want [%s]", targets, seedAddr)
+	}
+}
+
+// TestFanoutCurrentTargetsSingleflight asserts that concurrent refreshes after
+// cache expiry collapse into one GetClusterOverview call.
+func TestFanoutCurrentTargetsSingleflight(t *testing.T) {
+	t.Parallel()
+
+	peer := &fakeAdminServer{members: []string{"peer-1:1"}}
+	seedAddr := startFakeAdmin(t, peer)
+
+	f := newFanout([]string{seedAddr}, "", math.MaxInt64, insecure.NewCredentials())
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Warm: trigger first refresh serially so singleflight key exists.
+	_ = f.currentTargets(ctx)
+	if peer.calls.Load() != 1 {
+		t.Fatalf("warm-up calls = %d, want 1", peer.calls.Load())
+	}
+
+	// Force expiry by nil-ing the cache and then fire many concurrent refresh
+	// attempts. Because refreshInterval is effectively infinite, only the
+	// forced clear can cause a refresh, and singleflight should collapse the
+	// burst into a single RPC.
+	f.mu.Lock()
+	f.members = nil
+	f.mu.Unlock()
+
+	const concurrency = 20
+	done := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			_ = f.currentTargets(ctx)
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < concurrency; i++ {
+		<-done
+	}
+
+	// Expect exactly one additional RPC for the burst.
+	if got := peer.calls.Load(); got != 2 {
+		t.Fatalf("singleflight failed: calls = %d, want 2", got)
+	}
+}
+
+func TestHandleOverviewRejectsNonGET(t *testing.T) {
+	t.Parallel()
+	f := newFanout([]string{"127.0.0.1:0"}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/cluster/overview", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	f.handleOverview(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	var body struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("body.code = %d", body.Code)
+	}
+}
+
+func TestWriteJSONSurfacesEncodeFailure(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	// math.Inf(1) is not representable in JSON; encoding fails.
+	writeJSON(rec, http.StatusOK, math.Inf(1))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if !strings.Contains(rec.Body.String(), "internal server error") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+func TestWriteJSONSuccessPath(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]int{"n": 42})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var out map[string]int
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["n"] != 42 {
+		t.Fatalf("body = %v", out)
 	}
 }

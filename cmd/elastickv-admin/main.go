@@ -4,13 +4,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +21,8 @@ import (
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -34,11 +35,13 @@ const (
 	defaultBindAddr             = "127.0.0.1:8080"
 	defaultNodesRefreshInterval = 15 * time.Second
 	defaultGRPCRequestTimeout   = 10 * time.Second
+	discoveryRPCTimeout         = 2 * time.Second
 	readHeaderTimeout           = 5 * time.Second
 	readTimeout                 = 30 * time.Second
 	writeTimeout                = 30 * time.Second
 	idleTimeout                 = 120 * time.Second
 	shutdownTimeout             = 5 * time.Second
+	maxRequestBodyBytes         = 4 << 10
 )
 
 var (
@@ -123,7 +126,7 @@ func run() error {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown: %w", err)
+			return errors.Wrap(err, "shutdown")
 		}
 		return nil
 	case err := <-errCh:
@@ -155,11 +158,11 @@ func loadToken(path string, insecureMode bool) (string, error) {
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("resolve token path: %w", err)
+		return "", errors.Wrap(err, "resolve token path")
 	}
 	b, err := os.ReadFile(abs)
 	if err != nil {
-		return "", fmt.Errorf("read token file: %w", err)
+		return "", errors.Wrap(err, "read token file")
 	}
 	token := strings.TrimSpace(string(b))
 	if token == "" {
@@ -195,7 +198,7 @@ func loadTransportCredentials(
 		}
 		pem, err := os.ReadFile(caFile)
 		if err != nil {
-			return nil, fmt.Errorf("read node TLS CA file: %w", err)
+			return nil, errors.Wrap(err, "read node TLS CA file")
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
@@ -226,6 +229,11 @@ type fanout struct {
 	mu      sync.Mutex
 	clients map[string]*nodeClient
 	members *membership
+
+	// refreshGroup deduplicates concurrent membership refresh RPCs so a burst
+	// of browser requests immediately after cache expiry collapses into a
+	// single GetClusterOverview call against one seed.
+	refreshGroup singleflight.Group
 }
 
 func newFanout(
@@ -268,7 +276,7 @@ func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(f.creds))
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, errors.Wrapf(err, "dial %s", addr)
 	}
 	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn)}
 	f.clients[addr] = c
@@ -299,9 +307,11 @@ func (f *fanout) outgoingCtx(parent context.Context) context.Context {
 
 // currentTargets returns the list of node addresses to fan out to. If the
 // membership cache is fresh it is returned directly; otherwise the admin binary
-// queries one reachable seed via GetClusterOverview and caches the resulting
-// member list for refreshInterval. On total failure it falls back to seeds so
-// a single unreachable seed does not take the admin offline.
+// queries seeds via GetClusterOverview and caches the resulting member list
+// for refreshInterval. Concurrent refreshes are collapsed through singleflight
+// so a burst of requests after cache expiry hits only one seed. On total
+// failure it falls back to the static seed list so a single unreachable seed
+// does not take the admin offline.
 func (f *fanout) currentTargets(ctx context.Context) []string {
 	f.mu.Lock()
 	if f.members != nil && time.Since(f.members.fetchedAt) < f.refreshInterval {
@@ -311,13 +321,26 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 	}
 	f.mu.Unlock()
 
+	result, _, _ := f.refreshGroup.Do("members", func() (any, error) {
+		return f.refreshMembership(ctx), nil
+	})
+	addrs, _ := result.([]string)
+	return addrs
+}
+
+// refreshMembership performs the actual discovery RPC. It honours the caller's
+// context for overall cancellation but derives a short per-seed timeout from
+// discoveryRPCTimeout so a slow first seed does not stall the whole request.
+func (f *fanout) refreshMembership(ctx context.Context) []string {
 	for _, seed := range f.seeds {
 		cli, err := f.clientFor(seed)
 		if err != nil {
 			log.Printf("elastickv-admin: dial seed %s: %v", seed, err)
 			continue
 		}
-		resp, err := cli.client.GetClusterOverview(f.outgoingCtx(ctx), &pb.GetClusterOverviewRequest{})
+		rpcCtx, cancel := context.WithTimeout(ctx, discoveryRPCTimeout)
+		resp, err := cli.client.GetClusterOverview(f.outgoingCtx(rpcCtx), &pb.GetClusterOverviewRequest{})
+		cancel()
 		if err != nil {
 			if status.Code(err) == codes.Unavailable {
 				f.invalidateClient(seed)
@@ -364,6 +387,11 @@ func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
 }
 
 func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	ctx, cancel := context.WithTimeout(r.Context(), defaultGRPCRequestTimeout)
 	defer cancel()
 
@@ -408,13 +436,27 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": results})
 }
 
+// writeJSON marshals body into a buffer first, so an encoding failure can
+// still surface as a 500 instead of a truncated body under a committed 2xx
+// header. The admin API response bodies are small (bounded by rows/routes
+// caps in later phases), so buffering is safe.
 func writeJSON(w http.ResponseWriter, code int, body any) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	if err := enc.Encode(body); err != nil {
+		log.Printf("elastickv-admin: encode JSON response: %v", err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		const fallback = `{"code":500,"message":"internal server error"}` + "\n"
+		if _, werr := w.Write([]byte(fallback)); werr != nil {
+			log.Printf("elastickv-admin: write fallback response: %v", werr)
+		}
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	// Status code is already committed by WriteHeader; log encode failures so
-	// truncated or malformed responses remain visible to operators.
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Printf("elastickv-admin: encode JSON response: %v", err)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		log.Printf("elastickv-admin: write JSON response: %v", err)
 	}
 }
 
