@@ -20,12 +20,12 @@ type infoTestCoordinator struct {
 func (c *infoTestCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	return &kv.CoordinateResponse{}, nil
 }
-func (c *infoTestCoordinator) IsLeader() bool                             { return c.isLeader }
-func (c *infoTestCoordinator) VerifyLeader() error                        { return nil }
-func (c *infoTestCoordinator) RaftLeader() string             { return c.raftLeader }
-func (c *infoTestCoordinator) IsLeaderForKey([]byte) bool                 { return c.isLeader }
-func (c *infoTestCoordinator) VerifyLeaderForKey([]byte) error            { return nil }
-func (c *infoTestCoordinator) RaftLeaderForKey([]byte) string { return c.raftLeader }
+func (c *infoTestCoordinator) IsLeader() bool                  { return c.isLeader }
+func (c *infoTestCoordinator) VerifyLeader() error             { return nil }
+func (c *infoTestCoordinator) RaftLeader() string              { return c.raftLeader }
+func (c *infoTestCoordinator) IsLeaderForKey([]byte) bool      { return c.isLeader }
+func (c *infoTestCoordinator) VerifyLeaderForKey([]byte) error { return nil }
+func (c *infoTestCoordinator) RaftLeaderForKey([]byte) string  { return c.raftLeader }
 func (c *infoTestCoordinator) Clock() *kv.HLC {
 	if c.clock == nil {
 		c.clock = kv.NewHLC()

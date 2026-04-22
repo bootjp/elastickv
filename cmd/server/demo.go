@@ -50,18 +50,18 @@ var (
 )
 
 const (
-	kvParts               = 2
-	defaultFileMode       = 0755
-	joinRetries           = 20
-	joinWait              = 3 * time.Second
-	joinRetryInterval     = 1 * time.Second
-	joinRPCTimeout        = 3 * time.Second
-	raftObserveInterval   = 5 * time.Second
-	demoTickInterval      = 10 * time.Millisecond
-	demoHeartbeatTick     = 1
-	demoElectionTick      = 10
-	demoMaxSizePerMsg     = 1 << 20
-	demoMaxInflightMsg    = 256
+	kvParts             = 2
+	defaultFileMode     = 0755
+	joinRetries         = 20
+	joinWait            = 3 * time.Second
+	joinRetryInterval   = 1 * time.Second
+	joinRPCTimeout      = 3 * time.Second
+	raftObserveInterval = 5 * time.Second
+	demoTickInterval    = 10 * time.Millisecond
+	demoHeartbeatTick   = 1
+	demoElectionTick    = 10
+	demoMaxSizePerMsg   = 1 << 20
+	demoMaxInflightMsg  = 256
 )
 
 func init() {
@@ -483,6 +483,50 @@ func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, c
 	), nil
 }
 
+// openRaftEngine creates the etcd-backed raft engine for a demo node. It
+// resolves the data dir (using a temp dir when cfg.raftDataDir is empty)
+// and registers cleanup callbacks for the data dir, engine and factory
+// resources.
+func openRaftEngine(cfg config, fsm raftengine.StateMachine, cleanup *internalutil.CleanupStack) (*raftengine.FactoryResult, error) {
+	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   demoTickInterval,
+		HeartbeatTick:  demoHeartbeatTick,
+		ElectionTick:   demoElectionTick,
+		MaxSizePerMsg:  demoMaxSizePerMsg,
+		MaxInflightMsg: demoMaxInflightMsg,
+	})
+
+	raftDir := cfg.raftDataDir
+	if raftDir == "" {
+		tmp, err := os.MkdirTemp("", "elastickv-raft-*")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		cleanup.Add(func() { os.RemoveAll(tmp) })
+		raftDir = tmp
+	} else if err := os.MkdirAll(raftDir, defaultFileMode); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      cfg.raftID,
+		LocalAddress: cfg.address,
+		DataDir:      raftDir,
+		Bootstrap:    cfg.raftBootstrap,
+		StateMachine: fsm,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	cleanup.Add(func() {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
+		}
+	})
+	return result, nil
+}
+
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 	cleanup := internalutil.CleanupStack{}
@@ -497,42 +541,10 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	fsm := kv.NewKvFSMWithHLC(st, hlc)
 	readTracker := kv.NewActiveTimestampTracker()
 
-	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
-		TickInterval:   demoTickInterval,
-		HeartbeatTick:  demoHeartbeatTick,
-		ElectionTick:   demoElectionTick,
-		MaxSizePerMsg:  demoMaxSizePerMsg,
-		MaxInflightMsg: demoMaxInflightMsg,
-	})
-
-	raftDir := cfg.raftDataDir
-	if raftDir == "" {
-		tmp, err := os.MkdirTemp("", "elastickv-raft-*")
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		cleanup.Add(func() { os.RemoveAll(tmp) })
-		raftDir = tmp
-	} else if err := os.MkdirAll(raftDir, defaultFileMode); err != nil {
-		return errors.WithStack(err)
-	}
-
-	result, err := factory.Create(raftengine.FactoryConfig{
-		LocalID:      cfg.raftID,
-		LocalAddress: cfg.address,
-		DataDir:      raftDir,
-		Bootstrap:    cfg.raftBootstrap,
-		StateMachine: fsm,
-	})
+	result, err := openRaftEngine(cfg, fsm, &cleanup)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
-	cleanup.Add(func() {
-		_ = result.Engine.Close()
-		if result.Close != nil {
-			_ = result.Close()
-		}
-	})
 
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
@@ -680,7 +692,6 @@ func setupPprofHTTPServer(ctx context.Context, lc net.ListenConfig, pprofAddress
 	ps := monitoring.NewPprofServer(pprofToken)
 	return pprofL, ps, nil
 }
-
 
 func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
 	return func() error {

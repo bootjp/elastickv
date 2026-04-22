@@ -28,7 +28,7 @@ type raftEngineType string
 
 const (
 	raftEngineEtcd       raftEngineType = "etcd"
-	raftEngineMarkerFile                = "raft-engine"
+	raftEngineMarkerFile string         = "raft-engine"
 )
 
 var (

@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -138,7 +137,7 @@ func startRawKVServer(t *testing.T, svc pb.RawKVServer) (string, func()) {
 		grpcServer.Stop()
 		_ = lis.Close()
 	}
-	return string(lis.Addr().String()), stop
+	return lis.Addr().String(), stop
 }
 
 func TestLeaderRoutedStore_UsesLocalStoreWhenLeaderVerified(t *testing.T) {

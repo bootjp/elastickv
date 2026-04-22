@@ -107,8 +107,11 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 	})
 
 	// Wait briefly so the gRPC server is ready to serve.
+	dialer := &net.Dialer{Timeout: 100 * time.Millisecond}
 	require.Eventually(t, func() bool {
-		c, err := net.DialTimeout("tcp", lis.Addr().String(), 100*time.Millisecond)
+		dialCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		c, err := dialer.DialContext(dialCtx, "tcp", lis.Addr().String())
 		if err != nil {
 			return false
 		}
