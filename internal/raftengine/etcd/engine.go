@@ -1540,11 +1540,17 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 		return pd.other
 	case raftpb.MsgProp:
 		// DisableProposalForwarding=true (see raft.Config construction in this
-		// file) guarantees no outbound MsgProp is ever emitted, so this case
-		// is unreachable today. If it does fire, proposal forwarding was
-		// re-enabled and we must decide the correct lane explicitly rather
-		// than silently lumping proposals into pd.other.
-		panic("selectDispatchLane: outbound MsgProp requires explicit lane once DisableProposalForwarding is disabled")
+		// file) should guarantee no outbound MsgProp is ever emitted, so this
+		// case is unreachable today. If it does fire, either upstream
+		// etcd/raft semantics or our config changed; log loudly so operators
+		// notice, but keep the node up by routing to the catch-all lane
+		// rather than panicking inside a raft engine goroutine (which would
+		// crash the whole process).
+		slog.Error("selectDispatchLane: unexpected outbound MsgProp encountered",
+			slog.Uint64("raft_node_id", e.nodeID),
+			slog.String("type", msgType.String()),
+		)
+		return pd.other
 	}
 	// Fallback for any raftpb.MessageType added upstream that slips past
 	// skipDispatchMessage and isPriorityMsg. Routing unknown non-priority

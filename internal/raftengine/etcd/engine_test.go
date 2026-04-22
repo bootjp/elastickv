@@ -1700,6 +1700,26 @@ func TestSelectDispatchLane_FourLane(t *testing.T) {
 	}
 }
 
+// TestSelectDispatchLane_MsgPropFallsBackToOther verifies that, even though
+// DisableProposalForwarding=true should prevent outbound MsgProp from ever
+// reaching selectDispatchLane, an unexpected MsgProp is routed to the
+// catch-all lane rather than panicking. A panic in a raft engine goroutine
+// would crash the whole node; log-and-fallback keeps it running.
+func TestSelectDispatchLane_MsgPropFallsBackToOther(t *testing.T) {
+	t.Parallel()
+	engine := &Engine{nodeID: 1, dispatcherLanesEnabled: true}
+	pd := &peerQueues{
+		heartbeat:   make(chan dispatchRequest, 1),
+		replication: make(chan dispatchRequest, 1),
+		snapshot:    make(chan dispatchRequest, 1),
+		other:       make(chan dispatchRequest, 1),
+	}
+	require.NotPanics(t, func() {
+		got := engine.selectDispatchLane(pd, raftpb.MsgProp)
+		require.Equal(t, pd.other, got)
+	})
+}
+
 // TestFourLaneDispatcher_SnapshotDoesNotBlockReplication exercises the key
 // correctness invariant for the 4-lane layout: a stuck MsgSnap transfer must
 // not prevent MsgApp from being dispatched, because they now run on
