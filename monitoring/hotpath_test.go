@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -88,14 +89,35 @@ func TestLeaseReadObserverZeroValueIsNoop(t *testing.T) {
 // uint64s so tests can advance counters without touching the etcd
 // engine directly.
 type fakeDispatchSource struct {
-	drops     atomic.Uint64
-	errors    atomic.Uint64
-	stepFulls atomic.Uint64
+	drops      atomic.Uint64
+	errors     atomic.Uint64
+	stepFulls  atomic.Uint64
+	byCodeMu   sync.Mutex
+	byCodeVals map[string]uint64
 }
 
 func (f *fakeDispatchSource) DispatchDropCount() uint64  { return f.drops.Load() }
 func (f *fakeDispatchSource) DispatchErrorCount() uint64 { return f.errors.Load() }
 func (f *fakeDispatchSource) StepQueueFullCount() uint64 { return f.stepFulls.Load() }
+
+func (f *fakeDispatchSource) DispatchErrorCountsByCode() map[string]uint64 {
+	f.byCodeMu.Lock()
+	defer f.byCodeMu.Unlock()
+	if len(f.byCodeVals) == 0 {
+		return map[string]uint64{}
+	}
+	out := make(map[string]uint64, len(f.byCodeVals))
+	for k, v := range f.byCodeVals {
+		out[k] = v
+	}
+	return out
+}
+
+func (f *fakeDispatchSource) setByCode(m map[string]uint64) {
+	f.byCodeMu.Lock()
+	defer f.byCodeMu.Unlock()
+	f.byCodeVals = m
+}
 
 func TestDispatchCollectorMirrorsDeltas(t *testing.T) {
 	registry := NewRegistry("n1", "10.0.0.1:50051")
@@ -132,6 +154,46 @@ elastickv_raft_step_queue_full_total{group="1",node_address="10.0.0.1:50051",nod
 		"elastickv_raft_dispatch_dropped_total",
 		"elastickv_raft_dispatch_errors_total",
 		"elastickv_raft_step_queue_full_total",
+	)
+	require.NoError(t, err)
+}
+
+func TestDispatchCollectorEmitsPerCodeDeltas(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.DispatchCollector()
+	require.NotNil(t, collector)
+
+	src := &fakeDispatchSource{}
+	sources := []DispatchSource{{GroupID: 1, Source: src}}
+
+	// First pass initialises the delta baseline.
+	collector.ObserveOnce(sources)
+
+	// Advance aggregate + per-code counters in sync.
+	src.errors.Store(5)
+	src.setByCode(map[string]uint64{
+		"Unavailable":      3,
+		"DeadlineExceeded": 2,
+	})
+	collector.ObserveOnce(sources)
+
+	// Second delta: only Unavailable grows.
+	src.errors.Store(7)
+	src.setByCode(map[string]uint64{
+		"Unavailable":      5,
+		"DeadlineExceeded": 2,
+	})
+	collector.ObserveOnce(sources)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_raft_dispatch_errors_by_code_total elastickv_raft_dispatch_errors_total subdivided by grpc status code so operators can tell whether the transport is failing because peers are unreachable (Unavailable), slow (DeadlineExceeded), or flow-controlled (ResourceExhausted).
+# TYPE elastickv_raft_dispatch_errors_by_code_total counter
+elastickv_raft_dispatch_errors_by_code_total{code="DeadlineExceeded",group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
+elastickv_raft_dispatch_errors_by_code_total{code="Unavailable",group="1",node_address="10.0.0.1:50051",node_id="n1"} 5
+`),
+		"elastickv_raft_dispatch_errors_by_code_total",
 	)
 	require.NoError(t, err)
 }

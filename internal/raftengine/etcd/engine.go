@@ -21,6 +21,7 @@ import (
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -219,6 +220,14 @@ type Engine struct {
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
+	// dispatchErrorByCode subdivides dispatchErrorCount by the grpc
+	// status code returned from the transport (e.g. "Unavailable",
+	// "DeadlineExceeded"). Used to tell whether dispatch failures are
+	// network / backpressure / follower apply stalls. Surfaced to
+	// Prometheus via DispatchErrorCountsByCode() and the
+	// DispatchCollector poll loop.
+	dispatchErrorByCodeMu sync.Mutex
+	dispatchErrorByCode   map[string]uint64
 	// stepQueueFullCount tracks the number of inbound raft messages
 	// (from remote peers and local handlers) that were dropped because
 	// stepCh was full. Surfaced to Prometheus as
@@ -732,6 +741,45 @@ func (e *Engine) DispatchErrorCount() uint64 {
 		return 0
 	}
 	return e.dispatchErrorCount.Load()
+}
+
+// DispatchErrorCountsByCode returns a snapshot of dispatch-error
+// counts keyed by grpc status code ("Unavailable",
+// "DeadlineExceeded", "ResourceExhausted", ...). Sum of values
+// equals DispatchErrorCount(). A separate breakdown is needed to
+// tell whether failures are peer-down (Unavailable), leader under
+// load (DeadlineExceeded), or flow-control (ResourceExhausted).
+// Returns an empty map when e is nil. Safe for concurrent callers;
+// the returned map is a copy.
+func (e *Engine) DispatchErrorCountsByCode() map[string]uint64 {
+	if e == nil {
+		return map[string]uint64{}
+	}
+	e.dispatchErrorByCodeMu.Lock()
+	defer e.dispatchErrorByCodeMu.Unlock()
+	if len(e.dispatchErrorByCode) == 0 {
+		return map[string]uint64{}
+	}
+	out := make(map[string]uint64, len(e.dispatchErrorByCode))
+	for k, v := range e.dispatchErrorByCode {
+		out[k] = v
+	}
+	return out
+}
+
+// recordDispatchErrorCode atomically increments both the aggregate
+// dispatchErrorCount and the per-code bucket. code should be the
+// grpc status code string from the error; callers that cannot
+// extract one pass "Unknown".
+func (e *Engine) recordDispatchErrorCode(code string) uint64 {
+	count := e.dispatchErrorCount.Add(1)
+	e.dispatchErrorByCodeMu.Lock()
+	if e.dispatchErrorByCode == nil {
+		e.dispatchErrorByCode = map[string]uint64{}
+	}
+	e.dispatchErrorByCode[code]++
+	e.dispatchErrorByCodeMu.Unlock()
+	return count
 }
 
 // StepQueueFullCount returns the total number of inbound raft messages
@@ -2780,13 +2828,15 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
 		return
 	}
-	count := e.dispatchErrorCount.Add(1)
+	code := dispatchErrorCodeOf(dispatchErr)
+	count := e.recordDispatchErrorCode(code)
 	if shouldLogDispatchEvent(count) {
 		slog.Warn("etcd raft outbound dispatch failed",
 			"node_id", e.nodeID,
 			"to", req.msg.To,
 			"type", req.msg.Type.String(),
 			"dispatch_error_count", count,
+			"code", code,
 			"err", dispatchErr,
 		)
 	}
@@ -3066,6 +3116,26 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 			"drop_count", count,
 		)
 	}
+}
+
+// dispatchErrorCodeOf extracts the grpc status code name from err, or
+// returns a synthetic bucket ("Canceled" / "DeadlineExceeded" when the
+// Go stdlib error matches, "Unknown" otherwise). Keeps the label set
+// bounded to grpc's ~15 canonical codes + 1 fallback.
+func dispatchErrorCodeOf(err error) string {
+	if err == nil {
+		return "OK"
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Code().String()
+	}
+	if errors.Is(err, context.Canceled) {
+		return "Canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "DeadlineExceeded"
+	}
+	return "Unknown"
 }
 
 func (e *Engine) dispatchTransport(ctx context.Context, req dispatchRequest) error {

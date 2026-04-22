@@ -258,6 +258,8 @@ type RedisServer struct {
 	pubsub              *redisPubSub
 	scriptMu            sync.RWMutex
 	scriptCache         map[string]string
+	luaPool             *luaStatePool
+	luaPoolOnce         sync.Once
 	traceCommands       bool
 	traceSeq            atomic.Uint64
 	redisAddr           string
@@ -406,6 +408,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		leaderClients:   make(map[string]*redis.Client),
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
+		luaPool:         newLuaStatePool(),
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		baseCtx:         baseCtx,
 		baseCancel:      baseCancel,

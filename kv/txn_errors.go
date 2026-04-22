@@ -13,6 +13,7 @@ var (
 	ErrTxnLocked             = errors.New("txn locked")
 	ErrTxnCommitTSRequired   = errors.New("txn commit ts required")
 	ErrTxnAlreadyCommitted   = errors.New("txn already committed")
+	ErrTxnAlreadyAborted     = errors.New("txn already aborted")
 	ErrTxnPrimaryKeyRequired = errors.New("txn primary key required")
 )
 
