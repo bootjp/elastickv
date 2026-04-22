@@ -44,10 +44,10 @@ func TestWriteConflictCollectorEmitsPositiveDeltas(t *testing.T) {
 	src := &fakeWriteConflictSource{}
 	sources := []WriteConflictSource{{GroupID: 1, GroupIDStr: "1", Source: src}}
 
-	// Baseline: establishes the delta reference. No series emitted
-	// yet because every count equals its previous zero, so the
-	// collector skips strict-greater checks — but once the snapshot
-	// grows on the next tick, those buckets appear.
+	// Baseline: on the first observation, prevCount is implicitly zero,
+	// so any bucket with a non-zero count is emitted immediately.
+	// Subsequent observations only emit positive deltas relative to
+	// this snapshot, while brand-new buckets emit their whole count.
 	src.set(map[string]uint64{
 		"write|txn_rollback": 3,
 		"read|redis_string":  1,
