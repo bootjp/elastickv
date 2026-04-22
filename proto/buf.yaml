@@ -3,4 +3,4 @@ modules:
   - path: .
 breaking:
   use:
-    - FILE
+    - WIRE
