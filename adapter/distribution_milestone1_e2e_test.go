@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -246,15 +247,22 @@ func newSingleRaftForDistributionE2E(t *testing.T, id string, fsm raftengine.Sta
 	})
 	require.NoError(t, err)
 
+	// Register cleanup before the leader-wait so an Eventually timeout
+	// still closes the engine and the factory-owned transport / WAL.
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			_ = result.Engine.Close()
+			if result.Close != nil {
+				_ = result.Close()
+			}
+		})
+	}
+	t.Cleanup(stop)
+
 	require.Eventually(t, func() bool {
 		return result.Engine.State() == raftengine.StateLeader
 	}, 5*time.Second, 10*time.Millisecond)
 
-	stop := func() {
-		require.NoError(t, result.Engine.Close())
-		if result.Close != nil {
-			require.NoError(t, result.Close())
-		}
-	}
 	return result.Engine, stop
 }

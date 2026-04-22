@@ -216,7 +216,7 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 	t.Helper()
 	d := &net.Dialer{Timeout: time.Second}
 	for _, n := range nodes {
-		assert.Eventually(t, func() bool {
+		require.Eventually(t, func() bool {
 			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
 			if err != nil {
 				return false
@@ -242,7 +242,7 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// Nudge leadership onto node 0 if a different node won.
 	ensureNodeZeroIsLeader(t, nodes, peers, waitTimeout, waitInterval)
 
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
 		var leaderAddr string
 		for _, n := range nodes {
 			leader := n.engine.Leader().Address
@@ -277,7 +277,7 @@ func ensureNodeZeroIsLeader(t *testing.T, nodes []Node, peers []raftengine.Serve
 	targetAddr := peers[0].Address
 
 	// Step 1: wait until some node is leader so we know the cluster is live.
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
 		for _, n := range nodes {
 			if n.engine.State() == raftengine.StateLeader {
 				return true
@@ -290,7 +290,7 @@ func ensureNodeZeroIsLeader(t *testing.T, nodes []Node, peers []raftengine.Serve
 	// transfer leadership to it. This is best-effort — a transfer can
 	// race with another election, in which case the Eventually below
 	// will retry.
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
 		if nodes[0].engine.State() == raftengine.StateLeader {
 			return true
 		}

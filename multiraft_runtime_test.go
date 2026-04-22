@@ -194,4 +194,25 @@ func TestEnsureRaftEngineDataDir(t *testing.T) {
 		require.Equal(t, raftEngineEtcd, engineType)
 	})
 
+	t.Run("rejects legacy hashicorp raft.db", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
+	})
+
+	t.Run("rejects legacy hashicorp logs.dat", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "logs.dat"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
+	})
+
+	t.Run("rejects legacy hashicorp stable.dat", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "stable.dat"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
+	})
+
 }
