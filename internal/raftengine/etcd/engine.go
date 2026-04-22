@@ -2093,7 +2093,7 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 		slog.Warn("failed to purge old snap files", "error", purgeErr)
 	}
 	walDir := filepath.Join(e.dataDir, walDirName)
-	if purgeErr := purgeOldWALFiles(walDir, maxWALFilesFromEnv()); purgeErr != nil {
+	if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
 		slog.Warn("failed to purge old wal files", "error", purgeErr)
 	}
 	return nil
