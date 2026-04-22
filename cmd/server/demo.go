@@ -14,20 +14,17 @@ import (
 	"strings"
 	"time"
 
-	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
-	"github.com/bootjp/elastickv/internal/raftstore"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
@@ -53,14 +50,18 @@ var (
 )
 
 const (
-	raftSnapshotsRetain = 2
-	kvParts             = 2
-	defaultFileMode     = 0755
-	joinRetries         = 20
-	joinWait            = 3 * time.Second
-	joinRetryInterval   = 1 * time.Second
-	joinRPCTimeout      = 3 * time.Second
-	raftObserveInterval = 5 * time.Second
+	kvParts               = 2
+	defaultFileMode       = 0755
+	joinRetries           = 20
+	joinWait              = 3 * time.Second
+	joinRetryInterval     = 1 * time.Second
+	joinRPCTimeout        = 3 * time.Second
+	raftObserveInterval   = 5 * time.Second
+	demoTickInterval      = 10 * time.Millisecond
+	demoHeartbeatTick     = 1
+	demoElectionTick      = 10
+	demoMaxSizePerMsg     = 1 << 20
+	demoMaxInflightMsg    = 256
 )
 
 func init() {
@@ -334,43 +335,6 @@ func joinClusterWaitError(err error) error {
 	return err
 }
 
-func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
-	if dir == "" {
-		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
-	}
-	for _, legacy := range []string{"logs.dat", "stable.dat"} {
-		if _, err := os.Stat(filepath.Join(dir, legacy)); err == nil {
-			return nil, nil, nil, errors.WithStack(errors.Newf(
-				"legacy boltdb Raft storage %q found in %s; manual migration required before using Pebble-backed storage",
-				legacy, dir,
-			))
-		}
-	}
-	raftStore, err := raftstore.NewPebbleStore(filepath.Join(dir, "raft.db"))
-	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
-	if err != nil {
-		_ = raftStore.Close()
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	return raftStore, raftStore, fss, nil
-}
-
-// setupStores creates both the Raft log/stable/snapshot stores and the FSM MVCCStore.
-func setupStores(raftDataDir string, cleanup *internalutil.CleanupStack) (raft.LogStore, raft.StableStore, raft.SnapshotStore, store.MVCCStore, error) {
-	ldb, sdb, fss, err := setupStorage(raftDataDir)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	st, err := setupFSMStore(raftDataDir, cleanup)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	return ldb, sdb, fss, st, nil
-}
-
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
 // When raftDataDir is non-empty the store is persisted under that directory;
 // otherwise a temporary directory is used and registered for cleanup on exit.
@@ -397,33 +361,35 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(ctx context.Context, r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
-	tm.Register(s)
+	if registerTransport != nil {
+		registerTransport(s)
+	}
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
-	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock(), relay))
+	pb.RegisterInternalServer(s, adapter.NewInternalWithEngine(trx, engine, coordinator.Clock(), relay))
 	pb.RegisterDistributionServer(s, distServer)
-	internalraftadmin.RegisterOperationalServices(ctx, s, hashicorpraftengine.New(r), []string{"RawKV"})
+	internalraftadmin.RegisterOperationalServices(ctx, s, engine, []string{"RawKV"})
 	return s, gs
 }
 
 func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker, deltaCompactor *adapter.DeltaCompactor) (*adapter.RedisServer, error) {
-	leaderRedis := make(map[raft.ServerAddress]string)
+	leaderRedis := make(map[string]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
 		for part := range parts {
 			kv := strings.Split(part, "=")
 			if len(kv) == kvParts {
-				leaderRedis[raft.ServerAddress(kv[0])] = kv[1]
+				leaderRedis[kv[0]] = kv[1]
 			}
 		}
 	}
 	// Ensure self is in map (override if present)
-	leaderRedis[raft.ServerAddress(addr)] = redisAddr
+	leaderRedis[addr] = redisAddr
 
 	l, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
@@ -455,7 +421,7 @@ func setupS3(
 	if coordinator == nil {
 		return nil, errors.New("coordinator must not be nil")
 	}
-	leaderS3 := make(map[raft.ServerAddress]string)
+	leaderS3 := make(map[string]string)
 	if raftS3MapStr != "" {
 		parts := strings.SplitSeq(raftS3MapStr, ",")
 		for part := range parts {
@@ -468,10 +434,10 @@ func setupS3(
 				slog.Warn("ignoring invalid raft-s3 map entry; expected format addr=s3addr", "entry", part)
 				continue
 			}
-			leaderS3[raft.ServerAddress(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
+			leaderS3[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 		}
 	}
-	leaderS3[raft.ServerAddress(addr)] = s3Addr
+	leaderS3[addr] = s3Addr
 
 	l, err := lc.Listen(ctx, "tcp", s3Addr)
 	if err != nil {
@@ -496,16 +462,16 @@ func setupS3(
 }
 
 func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, dynamoAddr, raftDynamoMapStr string, observer monitoring.DynamoDBRequestObserver) (*adapter.DynamoDBServer, error) {
-	leaderDynamo := make(map[raft.ServerAddress]string)
+	leaderDynamo := make(map[string]string)
 	if raftDynamoMapStr != "" {
 		for part := range strings.SplitSeq(raftDynamoMapStr, ",") {
 			pair := strings.SplitN(part, "=", kvParts)
 			if len(pair) == kvParts {
-				leaderDynamo[raft.ServerAddress(pair[0])] = pair[1]
+				leaderDynamo[pair[0]] = pair[1]
 			}
 		}
 	}
-	leaderDynamo[raft.ServerAddress(addr)] = dynamoAddr
+	leaderDynamo[addr] = dynamoAddr
 	l, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -522,7 +488,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
-	ldb, sdb, fss, st, err := setupStores(cfg.raftDataDir, &cleanup)
+	st, err := setupFSMStore(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
 	}
@@ -531,30 +497,46 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	fsm := kv.NewKvFSMWithHLC(st, hlc)
 	readTracker := kv.NewActiveTimestampTracker()
 
-	// Config
-	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(cfg.raftID)
-	c.Logger = hclog.New(&hclog.LoggerOptions{
-		Name:       "raft-" + cfg.raftID,
-		JSONFormat: true,
-		Level:      hclog.Info,
+	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   demoTickInterval,
+		HeartbeatTick:  demoHeartbeatTick,
+		ElectionTick:   demoElectionTick,
+		MaxSizePerMsg:  demoMaxSizePerMsg,
+		MaxInflightMsg: demoMaxInflightMsg,
 	})
 
-	// Transport
-	tm := transport.New(raft.ServerAddress(cfg.address), internalutil.GRPCDialOptions())
-
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
-	if err != nil {
+	raftDir := cfg.raftDataDir
+	if raftDir == "" {
+		tmp, err := os.MkdirTemp("", "elastickv-raft-*")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		cleanup.Add(func() { os.RemoveAll(tmp) })
+		raftDir = tmp
+	} else if err := os.MkdirAll(raftDir, defaultFileMode); err != nil {
 		return errors.WithStack(err)
 	}
 
-	if err := bootstrapClusterIfNeeded(r, cfg); err != nil {
-		return err
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      cfg.raftID,
+		LocalAddress: cfg.address,
+		DataDir:      raftDir,
+		Bootstrap:    cfg.raftBootstrap,
+		StateMachine: fsm,
+	})
+	if err != nil {
+		return errors.WithStack(err)
 	}
+	cleanup.Add(func() {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
+		}
+	})
 
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
-	engine := hashicorpraftengine.New(r)
+	engine := result.Engine
 	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
 	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	defer func() {
@@ -590,7 +572,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(ctx, r, st, tm, coordinator, distServer, relay, proposalObserver)
+	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
@@ -699,24 +681,6 @@ func setupPprofHTTPServer(ctx context.Context, lc net.ListenConfig, pprofAddress
 	return pprofL, ps, nil
 }
 
-func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
-	if !cfg.raftBootstrap {
-		return nil
-	}
-	bootstrapCfg := raft.Configuration{
-		Servers: []raft.Server{
-			{
-				Suffrage: raft.Voter,
-				ID:       raft.ServerID(cfg.raftID),
-				Address:  raft.ServerAddress(cfg.address),
-			},
-		},
-	}
-	if err := r.BootstrapCluster(bootstrapCfg).Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
-		return errors.WithStack(err)
-	}
-	return nil
-}
 
 func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
 	return func() error {

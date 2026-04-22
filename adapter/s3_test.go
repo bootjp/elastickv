@@ -23,12 +23,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/bootjp/elastickv/distribution"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	json "github.com/goccy/go-json"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -103,8 +103,8 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	defer upstream.Close()
 
 	targetHost := strings.TrimPrefix(upstream.URL, "http://")
-	server := NewS3Server(nil, "", store.NewMVCCStore(), &followerS3Coordinator{}, map[raft.ServerAddress]string{
-		raft.ServerAddress("leader"): targetHost,
+	server := NewS3Server(nil, "", store.NewMVCCStore(), &followerS3Coordinator{}, map[string]string{
+		string("leader"): targetHost,
 	})
 
 	rec := httptest.NewRecorder()
@@ -500,8 +500,8 @@ func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
 		"",
 		store.NewMVCCStore(),
 		&followerS3Coordinator{},
-		map[raft.ServerAddress]string{
-			raft.ServerAddress("leader"): targetHost,
+		map[string]string{
+			string("leader"): targetHost,
 		},
 		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
 	)
@@ -540,15 +540,15 @@ func TestS3Server_ProxiesObjectRequestsUsingObjectRouteLeader(t *testing.T) {
 		localForKey: func(key []byte) bool {
 			return !bytes.HasPrefix(key, []byte(s3keys.RoutePrefix))
 		},
-		leaderForKey: func(key []byte) raft.ServerAddress {
+		leaderForKey: func(key []byte) string {
 			if bytes.HasPrefix(key, []byte(s3keys.RoutePrefix)) {
-				return raft.ServerAddress("object-leader")
+				return string("object-leader")
 			}
 			return ""
 		},
 	}
-	server := NewS3Server(nil, "", st, coord, map[raft.ServerAddress]string{
-		raft.ServerAddress("object-leader"): strings.TrimPrefix(upstream.URL, "http://"),
+	server := NewS3Server(nil, "", st, coord, map[string]string{
+		string("object-leader"): strings.TrimPrefix(upstream.URL, "http://"),
 	})
 
 	rec := httptest.NewRecorder()
@@ -644,8 +644,8 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	raft2, stop2 := newSingleRaftForS3Test(t, "g2", kv.NewKvFSMWithHLC(store2, hlc))
 	defer stop2()
 
-	engine1 := hashicorpraftengine.New(raft1)
-	engine2 := hashicorpraftengine.New(raft2)
+	engine1 := raft1
+	engine2 := raft2
 	groups := map[uint64]*kv.ShardGroup{
 		1: {Engine: engine1, Store: store1, Txn: kv.NewLeaderProxyWithEngine(engine1)},
 		2: {Engine: engine2, Store: store2, Txn: kv.NewLeaderProxyWithEngine(engine2)},
@@ -712,14 +712,14 @@ func (c *followerS3Coordinator) LeaseReadForKey(ctx context.Context, _ []byte) (
 	return c.LinearizableRead(ctx)
 }
 
-func (c *followerS3Coordinator) RaftLeader() raft.ServerAddress {
-	return raft.ServerAddress("leader")
+func (c *followerS3Coordinator) RaftLeader() string {
+	return string("leader")
 }
 
 type routeAwareS3Coordinator struct {
 	stubAdapterCoordinator
 	localForKey  func([]byte) bool
-	leaderForKey func([]byte) raft.ServerAddress
+	leaderForKey func([]byte) string
 }
 
 func (c *routeAwareS3Coordinator) IsLeaderForKey(key []byte) bool {
@@ -736,7 +736,7 @@ func (c *routeAwareS3Coordinator) VerifyLeaderForKey(key []byte) error {
 	return kv.ErrLeaderNotFound
 }
 
-func (c *routeAwareS3Coordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {
+func (c *routeAwareS3Coordinator) RaftLeaderForKey(key []byte) string {
 	if c.leaderForKey == nil {
 		return ""
 	}
@@ -797,37 +797,34 @@ func decodeListBucketResult(t *testing.T, body []byte) s3ListBucketResult {
 	return out
 }
 
-func newSingleRaftForS3Test(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
+func newSingleRaftForS3Test(t *testing.T, id string, fsm raftengine.StateMachine) (raftengine.Engine, func()) {
 	t.Helper()
 
-	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id))
-	cfg := raft.DefaultConfig()
-	cfg.LocalID = raft.ServerID(id)
-	cfg.HeartbeatTimeout = 50 * time.Millisecond
-	cfg.ElectionTimeout = 100 * time.Millisecond
-	cfg.LeaderLeaseTimeout = 50 * time.Millisecond
-
-	ldb := raft.NewInmemStore()
-	sdb := raft.NewInmemStore()
-	fss := raft.NewInmemSnapshotStore()
-	r, err := raft.NewRaft(cfg, fsm, ldb, sdb, fss, trans)
+	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   10 * time.Millisecond,
+		HeartbeatTick:  1,
+		ElectionTick:   10,
+		MaxSizePerMsg:  1 << 20,
+		MaxInflightMsg: 256,
+	})
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      id,
+		LocalAddress: id,
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
 	require.NoError(t, err)
-	require.NoError(t, r.BootstrapCluster(raft.Configuration{
-		Servers: []raft.Server{{
-			Suffrage: raft.Voter,
-			ID:       raft.ServerID(id),
-			Address:  addr,
-		}},
-	}).Error())
 
-	for range 100 {
-		if r.State() == raft.Leader {
-			break
+	require.Eventually(t, func() bool {
+		return result.Engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 10*time.Millisecond)
+	return result.Engine, func() {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	require.Equal(t, raft.Leader, r.State())
-	return r, func() { _ = r.Shutdown().Error() }
 }
 
 func md5Hex(v string) string {

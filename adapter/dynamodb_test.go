@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1836,7 +1835,7 @@ func (w *testCoordinatorWrapper) VerifyLeader() error {
 	return w.inner.VerifyLeader()
 }
 
-func (w *testCoordinatorWrapper) RaftLeader() raft.ServerAddress {
+func (w *testCoordinatorWrapper) RaftLeader() string {
 	return w.inner.RaftLeader()
 }
 
@@ -1848,7 +1847,7 @@ func (w *testCoordinatorWrapper) VerifyLeaderForKey(key []byte) error {
 	return w.inner.VerifyLeaderForKey(key)
 }
 
-func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) raft.ServerAddress {
+func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) string {
 	return w.inner.RaftLeaderForKey(key)
 }
 

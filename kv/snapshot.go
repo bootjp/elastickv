@@ -2,11 +2,12 @@ package kv
 
 import (
 	"encoding/binary"
+	"io"
 	"sync"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 // hlcSnapshotMagic is an 8-byte sentinel written at the start of every FSM
@@ -17,7 +18,7 @@ var hlcSnapshotMagic = [8]byte{'E', 'K', 'V', 'T', 'H', 'L', 'C', '1'}
 // hlcSnapshotHeaderLen is the total header size: 8 magic + 8 ceiling ms.
 const hlcSnapshotHeaderLen = 16 //nolint:mnd
 
-var _ raft.FSMSnapshot = (*kvFSMSnapshot)(nil)
+var _ raftengine.Snapshot = (*kvFSMSnapshot)(nil)
 
 type kvFSMSnapshot struct {
 	snapshot  store.Snapshot
@@ -26,29 +27,22 @@ type kvFSMSnapshot struct {
 	err       error
 }
 
-func (f *kvFSMSnapshot) Persist(sink raft.SnapshotSink) (err error) {
-	defer func() {
-		err = errors.CombineErrors(err, f.closeSnapshot())
-	}()
-
+func (f *kvFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 	// Write the 16-byte header: magic (8 bytes) + ceiling ms (8 bytes).
 	var hdr [hlcSnapshotHeaderLen]byte
 	copy(hdr[:8], hlcSnapshotMagic[:])
 	binary.BigEndian.PutUint64(hdr[8:], uint64(f.ceilingMs)) //nolint:gosec // ceiling is a Unix ms timestamp, always positive
-	if _, err = sink.Write(hdr[:]); err != nil {
-		cancelErr := sink.Cancel()
-		return errors.WithStack(errors.CombineErrors(errors.WithStack(err), errors.WithStack(cancelErr)))
+	n, err := w.Write(hdr[:])
+	if err != nil {
+		return int64(n), errors.WithStack(err)
 	}
 
-	if _, err = f.snapshot.WriteTo(sink); err != nil {
-		cancelErr := sink.Cancel()
-		return errors.WithStack(errors.CombineErrors(errors.WithStack(err), errors.WithStack(cancelErr)))
+	m, err := f.snapshot.WriteTo(w)
+	total := int64(n) + m
+	if err != nil {
+		return total, errors.WithStack(err)
 	}
-	return errors.WithStack(sink.Close())
-}
-
-func (f *kvFSMSnapshot) Release() {
-	_ = f.closeSnapshot()
+	return total, nil
 }
 
 func (f *kvFSMSnapshot) Close() error {

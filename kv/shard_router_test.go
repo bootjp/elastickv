@@ -4,117 +4,19 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 )
 
-// helper to create a multi-node raft cluster and return the leader
-func newTestRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
+// newTestRaft creates a single-node raft engine for tests. Historically this
+// built a 3-node in-memory hashicorp cluster; with the hashicorp backend
+// removed we simply delegate to the newSingleRaft helper used elsewhere.
+func newTestRaft(t *testing.T, id string, fsm FSM) (raftengine.Engine, func()) {
 	t.Helper()
-
-	const n = 3
-	addrs, trans := setupInmemTransports(id, n)
-	connectInmemTransports(addrs, trans)
-	cfg := buildRaftConfig(id, addrs)
-	rafts := initTestRafts(t, cfg, trans, fsm)
-	waitForLeader(t, id, rafts[0])
-
-	shutdown := func() {
-		for _, r := range rafts {
-			r.Shutdown()
-		}
-	}
-	return rafts[0], shutdown
-}
-
-func setupInmemTransports(id string, n int) ([]raft.ServerAddress, []*raft.InmemTransport) {
-	addrs := make([]raft.ServerAddress, n)
-	trans := make([]*raft.InmemTransport, n)
-	for i := range n {
-		addr, tr := raft.NewInmemTransport(raft.ServerAddress(fmt.Sprintf("%s-%d", id, i)))
-		addrs[i] = addr
-		trans[i] = tr
-	}
-	return addrs, trans
-}
-
-func connectInmemTransports(addrs []raft.ServerAddress, trans []*raft.InmemTransport) {
-	// fully connect transports
-	for i := range trans {
-		for j := i + 1; j < len(trans); j++ {
-			trans[i].Connect(addrs[j], trans[j])
-			trans[j].Connect(addrs[i], trans[i])
-		}
-	}
-}
-
-func buildRaftConfig(id string, addrs []raft.ServerAddress) raft.Configuration {
-	// cluster configuration
-	cfg := raft.Configuration{}
-	for i := range addrs {
-		cfg.Servers = append(cfg.Servers, raft.Server{
-			ID:      raft.ServerID(fmt.Sprintf("%s-%d", id, i)),
-			Address: addrs[i],
-		})
-	}
-	return cfg
-}
-
-func initTestRafts(t *testing.T, cfg raft.Configuration, trans []*raft.InmemTransport, fsm raft.FSM) []*raft.Raft {
-	t.Helper()
-
-	rafts := make([]*raft.Raft, len(trans))
-	for i := range trans {
-		c := raft.DefaultConfig()
-		c.LocalID = cfg.Servers[i].ID
-		if i == 0 {
-			c.HeartbeatTimeout = 200 * time.Millisecond
-			c.ElectionTimeout = 400 * time.Millisecond
-			c.LeaderLeaseTimeout = 100 * time.Millisecond
-		} else {
-			c.HeartbeatTimeout = 1 * time.Second
-			c.ElectionTimeout = 2 * time.Second
-			c.LeaderLeaseTimeout = 500 * time.Millisecond
-		}
-		ldb := raft.NewInmemStore()
-		sdb := raft.NewInmemStore()
-		fss := raft.NewInmemSnapshotStore()
-		var rfsm raft.FSM
-		if i == 0 {
-			rfsm = fsm
-		} else {
-			rfsm = NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC())
-		}
-		r, err := raft.NewRaft(c, rfsm, ldb, sdb, fss, trans[i])
-		if err != nil {
-			t.Fatalf("new raft %d: %v", i, err)
-		}
-		if err := r.BootstrapCluster(cfg).Error(); err != nil {
-			t.Fatalf("bootstrap %d: %v", i, err)
-		}
-		rafts[i] = r
-	}
-
-	return rafts
-}
-
-func waitForLeader(t *testing.T, id string, leader *raft.Raft) {
-	t.Helper()
-
-	// node 0 should become leader quickly during tests
-	for range 100 {
-		if leader.State() == raft.Leader {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if leader.State() != raft.Leader {
-		t.Fatalf("node %s-0 is not leader", id)
-	}
+	return newSingleRaft(t, id, fsm)
 }
 
 func TestShardRouterCommit(t *testing.T) {
@@ -130,13 +32,13 @@ func TestShardRouterCommit(t *testing.T) {
 	s1 := store.NewMVCCStore()
 	r1, stop1 := newTestRaft(t, "1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
-	router.Register(1, NewTransaction(r1), s1)
+	router.Register(1, NewTransactionWithProposer(r1), s1)
 
 	// group 2
 	s2 := store.NewMVCCStore()
 	r2, stop2 := newTestRaft(t, "2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
-	router.Register(2, NewTransaction(r2), s2)
+	router.Register(2, NewTransactionWithProposer(r2), s2)
 
 	reqs := []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
@@ -170,13 +72,13 @@ func TestShardRouterSplitAndMerge(t *testing.T) {
 	s1 := store.NewMVCCStore()
 	r1, stop1 := newTestRaft(t, "1", NewKvFSMWithHLC(s1, NewHLC()))
 	defer stop1()
-	router.Register(1, NewTransaction(r1), s1)
+	router.Register(1, NewTransactionWithProposer(r1), s1)
 
 	// group 2 (will be used after split)
 	s2 := store.NewMVCCStore()
 	r2, stop2 := newTestRaft(t, "2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
-	router.Register(2, NewTransaction(r2), s2)
+	router.Register(2, NewTransactionWithProposer(r2), s2)
 
 	// initial write routed to group 1
 	req := []*pb.Request{

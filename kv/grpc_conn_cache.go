@@ -5,7 +5,6 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 )
@@ -15,15 +14,15 @@ import (
 // already been closed (Shutdown).
 type GRPCConnCache struct {
 	mu    sync.Mutex
-	conns map[raft.ServerAddress]*grpc.ClientConn
+	conns map[string]*grpc.ClientConn
 }
 
-func (c *GRPCConnCache) cachedConn(addr raft.ServerAddress) *grpc.ClientConn {
+func (c *GRPCConnCache) cachedConn(addr string) *grpc.ClientConn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conns == nil {
-		c.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
+		c.conns = make(map[string]*grpc.ClientConn)
 	}
 
 	conn, ok := c.conns[addr]
@@ -42,12 +41,12 @@ func (c *GRPCConnCache) cachedConn(addr raft.ServerAddress) *grpc.ClientConn {
 	return conn
 }
 
-func (c *GRPCConnCache) storeConn(addr raft.ServerAddress, conn *grpc.ClientConn) *grpc.ClientConn {
+func (c *GRPCConnCache) storeConn(addr string, conn *grpc.ClientConn) *grpc.ClientConn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conns == nil {
-		c.conns = make(map[raft.ServerAddress]*grpc.ClientConn)
+		c.conns = make(map[string]*grpc.ClientConn)
 	}
 
 	existing, ok := c.conns[addr]
@@ -66,7 +65,7 @@ func (c *GRPCConnCache) storeConn(addr raft.ServerAddress, conn *grpc.ClientConn
 	return conn
 }
 
-func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, error) {
+func (c *GRPCConnCache) ConnFor(addr string) (*grpc.ClientConn, error) {
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
@@ -76,7 +75,7 @@ func (c *GRPCConnCache) ConnFor(addr raft.ServerAddress) (*grpc.ClientConn, erro
 	}
 
 	conn, err := grpc.NewClient(
-		string(addr),
+		addr,
 		append(internalutil.GRPCDialOptions(), grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))...,
 	)
 	if err != nil {

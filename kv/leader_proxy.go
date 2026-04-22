@@ -6,10 +6,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -22,11 +20,6 @@ type LeaderProxy struct {
 	tm     *TransactionManager
 
 	connCache GRPCConnCache
-}
-
-// NewLeaderProxy creates a leader-aware transactional proxy for a raft group.
-func NewLeaderProxy(r *raft.Raft, opts ...TransactionOption) *LeaderProxy {
-	return NewLeaderProxyWithEngine(hashicorpraftengine.New(r), opts...)
 }
 
 func NewLeaderProxyWithEngine(engine raftengine.Engine, opts ...TransactionOption) *LeaderProxy {

@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
@@ -14,7 +13,7 @@ import (
 
 type infoTestCoordinator struct {
 	isLeader   bool
-	raftLeader raft.ServerAddress
+	raftLeader string
 	clock      *kv.HLC
 }
 
@@ -23,10 +22,10 @@ func (c *infoTestCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP
 }
 func (c *infoTestCoordinator) IsLeader() bool                             { return c.isLeader }
 func (c *infoTestCoordinator) VerifyLeader() error                        { return nil }
-func (c *infoTestCoordinator) RaftLeader() raft.ServerAddress             { return c.raftLeader }
+func (c *infoTestCoordinator) RaftLeader() string             { return c.raftLeader }
 func (c *infoTestCoordinator) IsLeaderForKey([]byte) bool                 { return c.isLeader }
 func (c *infoTestCoordinator) VerifyLeaderForKey([]byte) error            { return nil }
-func (c *infoTestCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress { return c.raftLeader }
+func (c *infoTestCoordinator) RaftLeaderForKey([]byte) string { return c.raftLeader }
 func (c *infoTestCoordinator) Clock() *kv.HLC {
 	if c.clock == nil {
 		c.clock = kv.NewHLC()
@@ -45,7 +44,7 @@ func (c *infoTestCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (ui
 func TestRedisServer_Info_LeaderRole(t *testing.T) {
 	r := &RedisServer{
 		redisAddr:   "10.0.0.1:6379",
-		leaderRedis: map[raft.ServerAddress]string{"raft-1": "10.0.0.1:6379"},
+		leaderRedis: map[string]string{"raft-1": "10.0.0.1:6379"},
 		coordinator: &infoTestCoordinator{isLeader: true, raftLeader: "raft-1"},
 	}
 
@@ -63,7 +62,7 @@ func TestRedisServer_Info_LeaderRole(t *testing.T) {
 func TestRedisServer_Info_FollowerRole(t *testing.T) {
 	r := &RedisServer{
 		redisAddr: "10.0.0.2:6379",
-		leaderRedis: map[raft.ServerAddress]string{
+		leaderRedis: map[string]string{
 			"raft-1": "10.0.0.1:6379",
 			"raft-2": "10.0.0.2:6379",
 		},
@@ -88,7 +87,7 @@ func TestRedisServer_Info_FollowerRole(t *testing.T) {
 func TestRedisServer_Info_UnknownLeader(t *testing.T) {
 	r := &RedisServer{
 		redisAddr:   "10.0.0.3:6379",
-		leaderRedis: map[raft.ServerAddress]string{},
+		leaderRedis: map[string]string{},
 		coordinator: &infoTestCoordinator{isLeader: false, raftLeader: ""},
 	}
 

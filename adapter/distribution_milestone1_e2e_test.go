@@ -7,12 +7,12 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	cerrs "github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,15 +25,13 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 
 	hlc := kv.NewHLC()
 	group1Store := store.NewMVCCStore()
-	group1Raft, stopGroup1 := newSingleRaftForDistributionE2E(t, "group-1", kv.NewKvFSMWithHLC(group1Store, hlc))
+	group1Engine, stopGroup1 := newSingleRaftForDistributionE2E(t, "group-1", kv.NewKvFSMWithHLC(group1Store, hlc))
 	defer stopGroup1()
 
 	group2Store := store.NewMVCCStore()
-	group2Raft, stopGroup2 := newSingleRaftForDistributionE2E(t, "group-2", kv.NewKvFSMWithHLC(group2Store, hlc))
+	group2Engine, stopGroup2 := newSingleRaftForDistributionE2E(t, "group-2", kv.NewKvFSMWithHLC(group2Store, hlc))
 	defer stopGroup2()
 
-	group1Engine := hashicorpraftengine.New(group1Raft)
-	group2Engine := hashicorpraftengine.New(group2Raft)
 	groups := map[uint64]*kv.ShardGroup{
 		1: {Engine: group1Engine, Store: group1Store, Txn: kv.NewLeaderProxyWithEngine(group1Engine)},
 		2: {Engine: group2Engine, Store: group2Store, Txn: kv.NewLeaderProxyWithEngine(group2Engine)},
@@ -229,39 +227,34 @@ func requireValueAt(t *testing.T, st store.MVCCStore, key []byte, expected []byt
 	require.Equal(t, expected, actual)
 }
 
-func newSingleRaftForDistributionE2E(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
+func newSingleRaftForDistributionE2E(t *testing.T, id string, fsm raftengine.StateMachine) (raftengine.Engine, func()) {
 	t.Helper()
 
-	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id))
-	cfg := raft.DefaultConfig()
-	cfg.LocalID = raft.ServerID(id)
-	cfg.HeartbeatTimeout = 50 * time.Millisecond
-	cfg.ElectionTimeout = 100 * time.Millisecond
-	cfg.LeaderLeaseTimeout = 50 * time.Millisecond
-
-	logStore := raft.NewInmemStore()
-	stableStore := raft.NewInmemStore()
-	snapshotStore := raft.NewInmemSnapshotStore()
-	r, err := raft.NewRaft(cfg, fsm, logStore, stableStore, snapshotStore, trans)
+	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   10 * time.Millisecond,
+		HeartbeatTick:  1,
+		ElectionTick:   10,
+		MaxSizePerMsg:  1 << 20,
+		MaxInflightMsg: 256,
+	})
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      id,
+		LocalAddress: id,
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
 	require.NoError(t, err)
 
-	bootstrapErr := r.BootstrapCluster(raft.Configuration{
-		Servers: []raft.Server{
-			{
-				Suffrage: raft.Voter,
-				ID:       raft.ServerID(id),
-				Address:  addr,
-			},
-		},
-	}).Error()
-	require.NoError(t, bootstrapErr)
-
 	require.Eventually(t, func() bool {
-		return r.State() == raft.Leader
-	}, time.Second, 10*time.Millisecond)
+		return result.Engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 10*time.Millisecond)
 
 	stop := func() {
-		require.NoError(t, r.Shutdown().Error())
+		require.NoError(t, result.Engine.Close())
+		if result.Close != nil {
+			require.NoError(t, result.Close())
+		}
 	}
-	return r, stop
+	return result.Engine, stop
 }

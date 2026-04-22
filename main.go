@@ -19,13 +19,11 @@ import (
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -34,8 +32,6 @@ import (
 const (
 	heartbeatTimeout           = 200 * time.Millisecond
 	electionTimeout            = 2000 * time.Millisecond
-	leaderLease                = 100 * time.Millisecond
-	raftCommitTimeout          = 50 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
 	dirPerm                    = raftDirPerm
 
@@ -46,18 +42,8 @@ const (
 	etcdMaxInflightMsg    = 256
 )
 
-const snapshotRetainCount = 3
-
 func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {
 	switch engineType {
-	case raftEngineHashicorp:
-		return hashicorpraftengine.NewFactory(hashicorpraftengine.FactoryConfig{
-			CommitTimeout:       raftCommitTimeout,
-			HeartbeatTimeout:    heartbeatTimeout,
-			ElectionTimeout:     electionTimeout,
-			LeaderLeaseTimeout:  leaderLease,
-			SnapshotRetainCount: snapshotRetainCount,
-		}), nil
 	case raftEngineEtcd:
 		return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
 			TickInterval:   etcdTickInterval,
@@ -239,7 +225,7 @@ func run() error {
 	return nil
 }
 
-func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raft.Server, bool, error) {
+func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server, bool, error) {
 	if *raftId == "" {
 		return runtimeConfig{}, "", nil, false, errors.New("flag --raftId is required")
 	}
@@ -266,9 +252,9 @@ type runtimeConfig struct {
 	groups       []groupSpec
 	defaultGroup uint64
 	engine       *distribution.Engine
-	leaderRedis  map[raft.ServerAddress]string
-	leaderS3     map[raft.ServerAddress]string
-	leaderDynamo map[raft.ServerAddress]string
+	leaderRedis  map[string]string
+	leaderS3     map[string]string
+	leaderDynamo map[string]string
 	multi        bool
 }
 
@@ -319,15 +305,15 @@ func buildEngine(ranges []rangeSpec) *distribution.Engine {
 	return engine
 }
 
-func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) (map[raft.ServerAddress]string, error) {
+func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, redisAddr, raftRedisMap, parseRaftRedisMap)
 }
 
-func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[raft.ServerAddress]string, error) {
+func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, s3Addr, raftS3Map, parseRaftS3Map)
 }
 
-func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[raft.ServerAddress]string, error) {
+func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, dynamoAddr, raftDynamoMap, parseRaftDynamoMap)
 }
 
@@ -335,16 +321,15 @@ func buildLeaderAddrMap(
 	groups []groupSpec,
 	defaultAddr string,
 	rawMap string,
-	parse func(string) (map[raft.ServerAddress]string, error),
-) (map[raft.ServerAddress]string, error) {
+	parse func(string) (map[string]string, error),
+) (map[string]string, error) {
 	leaderAddrMap, err := parse(rawMap)
 	if err != nil {
 		return nil, err
 	}
 	for _, g := range groups {
-		addr := raft.ServerAddress(g.address)
-		if _, ok := leaderAddrMap[addr]; !ok {
-			leaderAddrMap[addr] = defaultAddr
+		if _, ok := leaderAddrMap[g.address]; !ok {
+			leaderAddrMap[g.address] = defaultAddr
 		}
 	}
 	return leaderAddrMap, nil
@@ -357,7 +342,7 @@ var (
 	ErrNoBootstrapMembersConfigured       = errors.New("no bootstrap members configured")
 )
 
-func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raft.Server, error) {
+func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raftengine.Server, error) {
 	if strings.TrimSpace(bootstrapMembers) == "" {
 		return nil, nil
 	}
@@ -375,10 +360,10 @@ func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers
 
 	localAddr := groups[0].address
 	for _, s := range servers {
-		if string(s.ID) != raftID {
+		if s.ID != raftID {
 			continue
 		}
-		if string(s.Address) != localAddr {
+		if s.Address != localAddr {
 			return nil, errors.Wrapf(ErrBootstrapMembersLocalAddrMismatch, "expected %q got %q", localAddr, s.Address)
 		}
 		return servers, nil
@@ -392,7 +377,7 @@ func buildShardGroups(
 	groups []groupSpec,
 	multi bool,
 	bootstrap bool,
-	bootstrapServers []raft.Server,
+	bootstrapServers []raftengine.Server,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -410,7 +395,7 @@ func buildShardGroups(
 		}
 		// Each shard FSM shares the same HLC so any shard's lease renewal advances
 		// the global physicalCeiling. The logical counter remains in-memory only.
-		sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSMWithHLC(st, clock))
+		sm := kv.NewKvFSMWithHLC(st, clock)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -571,7 +556,7 @@ func startRaftServers(
 	return nil
 }
 
-func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
@@ -605,7 +590,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[raft.ServerAddress]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
@@ -754,13 +739,13 @@ type runtimeServerRunner struct {
 	coordinate      kv.Coordinator
 	distServer      *adapter.DistributionServer
 	redisAddress    string
-	leaderRedis     map[raft.ServerAddress]string
+	leaderRedis     map[string]string
 	pubsubRelay     *adapter.RedisPubSubRelay
 	readTracker     *kv.ActiveTimestampTracker
 	dynamoAddress   string
-	leaderDynamo    map[raft.ServerAddress]string
+	leaderDynamo    map[string]string
 	s3Address       string
-	leaderS3        map[raft.ServerAddress]string
+	leaderS3        map[string]string
 	s3Region        string
 	s3CredsFile     string
 	s3PathStyleOnly bool

@@ -23,7 +23,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
 )
@@ -283,7 +282,7 @@ type RedisServer struct {
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 	// TODO manage membership from raft log
-	leaderRedis map[raft.ServerAddress]string
+	leaderRedis map[string]string
 
 	// leaderClients caches go-redis clients per leader address to avoid
 	// creating a new connection pool for every proxied request.
@@ -392,7 +391,7 @@ type redisResult struct {
 	err     error
 }
 
-func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[raft.ServerAddress]string, relay *RedisPubSubRelay, opts ...RedisServerOption) *RedisServer {
+func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *RedisPubSubRelay, opts ...RedisServerOption) *RedisServer {
 	if relay == nil {
 		relay = NewRedisPubSubRelay()
 	}
@@ -902,28 +901,28 @@ func (r *RedisServer) publishLocal(channel, message []byte) int64 {
 	return int64(r.pubsub.Publish(string(channel), string(message)))
 }
 
-func (r *RedisServer) relayPeers() []raft.ServerAddress {
+func (r *RedisServer) relayPeers() []string {
 	if len(r.leaderRedis) == 0 {
 		return nil
 	}
 
-	byRedis := make(map[string]raft.ServerAddress, len(r.leaderRedis))
+	byRedis := make(map[string]string, len(r.leaderRedis))
 	for addr, redisAddr := range r.leaderRedis {
 		if redisAddr == "" || redisAddr == r.redisAddr {
 			continue
 		}
 		prev, ok := byRedis[redisAddr]
-		if !ok || string(addr) < string(prev) {
+		if !ok || addr < prev {
 			byRedis[redisAddr] = addr
 		}
 	}
 
-	peers := make([]raft.ServerAddress, 0, len(byRedis))
+	peers := make([]string, 0, len(byRedis))
 	for _, addr := range byRedis {
 		peers = append(peers, addr)
 	}
 	sort.Slice(peers, func(i, j int) bool {
-		return string(peers[i]) < string(peers[j])
+		return peers[i] < peers[j]
 	})
 	return peers
 }
@@ -944,7 +943,7 @@ func (r *RedisServer) publishCluster(ctx context.Context, channel, message []byt
 	defer overallCancel()
 
 	for _, peer := range peers {
-		go func(peer raft.ServerAddress) {
+		go func(peer string) { //nolint:dupl
 			conn, err := r.relayConnCache.ConnFor(peer)
 			if err != nil {
 				log.Printf("redis relay publish dial peer=%s err=%v", peer, err)

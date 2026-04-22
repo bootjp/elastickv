@@ -6,53 +6,65 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
-func newSingleRaft(t *testing.T, id string, fsm raft.FSM) (*raft.Raft, func()) {
+const (
+	testSingleRaftTickInterval  = 10 * time.Millisecond
+	testSingleRaftHeartbeatTick = 1
+	testSingleRaftElectionTick  = 10
+	testSingleRaftMaxSizePerMsg = 1 << 20
+	testSingleRaftMaxInflight   = 256
+)
+
+func newSingleRaftFactory() raftengine.Factory {
+	return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   testSingleRaftTickInterval,
+		HeartbeatTick:  testSingleRaftHeartbeatTick,
+		ElectionTick:   testSingleRaftElectionTick,
+		MaxSizePerMsg:  testSingleRaftMaxSizePerMsg,
+		MaxInflightMsg: testSingleRaftMaxInflight,
+	})
+}
+
+func newSingleRaft(t *testing.T, id string, fsm FSM) (raftengine.Engine, func()) {
 	t.Helper()
 
-	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id))
-	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(id)
-	c.HeartbeatTimeout = 50 * time.Millisecond
-	c.ElectionTimeout = 100 * time.Millisecond
-	c.LeaderLeaseTimeout = 50 * time.Millisecond
-
-	ldb := raft.NewInmemStore()
-	sdb := raft.NewInmemStore()
-	fss := raft.NewInmemSnapshotStore()
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, trans)
+	factory := newSingleRaftFactory()
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      id,
+		LocalAddress: id,
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
 	if err != nil {
 		t.Fatalf("new raft: %v", err)
 	}
-	cfg := raft.Configuration{
-		Servers: []raft.Server{
-			{
-				Suffrage: raft.Voter,
-				ID:       raft.ServerID(id),
-				Address:  addr,
-			},
-		},
-	}
-	if err := r.BootstrapCluster(cfg).Error(); err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
 
-	for range 100 {
-		if r.State() == raft.Leader {
+	for range 200 {
+		if result.Engine.State() == raftengine.StateLeader {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if r.State() != raft.Leader {
+	if result.Engine.State() != raftengine.StateLeader {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
+		}
 		t.Fatalf("node %s is not leader", id)
 	}
 
-	return r, func() { r.Shutdown() }
+	return result.Engine, func() {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
+		}
+	}
 }
 
 func TestShardedCoordinatorDispatch(t *testing.T) {
@@ -70,8 +82,8 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 
-	e1 := hashicorpraftengine.New(r1)
-	e2 := hashicorpraftengine.New(r2)
+	e1 := r1
+	e2 := r2
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
 		2: {Engine: e2, Store: s2, Txn: NewLeaderProxyWithEngine(e2)},
@@ -124,8 +136,8 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(s2, NewHLC()))
 	defer stop2()
 
-	e1 := hashicorpraftengine.New(r1)
-	e2 := hashicorpraftengine.New(r2)
+	e1 := r1
+	e2 := r2
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: s1, Txn: NewLeaderProxyWithEngine(e1)},
 		2: {Engine: e2, Store: s2, Txn: NewLeaderProxyWithEngine(e2)},

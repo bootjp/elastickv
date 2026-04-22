@@ -19,7 +19,6 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -83,7 +82,7 @@ func (n *bootstrapE2ENode) close() error {
 }
 
 func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
-	for _, engineType := range []raftEngineType{raftEngineHashicorp, raftEngineEtcd} {
+	for _, engineType := range []raftEngineType{raftEngineEtcd} {
 		t.Run(string(engineType), func(t *testing.T) {
 			const (
 				startupAttempts = 5
@@ -422,7 +421,7 @@ func startRuntimeServersWithBoundListeners(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
-	leaderRedis map[raft.ServerAddress]string,
+	leaderRedis map[string]string,
 	listeners bootstrapE2EListeners,
 ) error {
 	if len(runtimes) != 1 {
@@ -430,7 +429,7 @@ func startRuntimeServersWithBoundListeners(
 	}
 	rt := runtimes[0]
 	relay := adapter.NewRedisPubSubRelay()
-	redisAddr := leaderRedis[raft.ServerAddress(rt.spec.address)]
+	redisAddr := leaderRedis[rt.spec.address]
 
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
@@ -509,7 +508,7 @@ func startBoundRedisServer(
 	listener net.Listener,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
-	leaderRedis map[raft.ServerAddress]string,
+	leaderRedis map[string]string,
 	redisAddr string,
 	relay *adapter.RedisPubSubRelay,
 ) error {

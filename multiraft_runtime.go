@@ -10,7 +10,6 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 )
 
@@ -28,22 +27,18 @@ const raftEngineMarkerPerm = 0o600
 type raftEngineType string
 
 const (
-	raftEngineHashicorp  raftEngineType = "hashicorp"
 	raftEngineEtcd       raftEngineType = "etcd"
 	raftEngineMarkerFile                = "raft-engine"
 )
 
 var (
-	ErrUnsupportedRaftEngine    = errors.New("unsupported raft engine")
-	ErrRaftEngineDataDir        = errors.New("raft data dir belongs to a different raft engine")
-	ErrMixedRaftEngineArtifacts = errors.New("raft data dir contains artifacts for multiple raft engines")
+	ErrUnsupportedRaftEngine = errors.New("unsupported raft engine")
+	ErrRaftEngineDataDir     = errors.New("raft data dir belongs to a different raft engine")
 )
 
 func parseRaftEngineType(raw string) (raftEngineType, error) {
 	switch engineType := raftEngineType(strings.ToLower(strings.TrimSpace(raw))); engineType {
-	case "", raftEngineHashicorp:
-		return raftEngineHashicorp, nil
-	case raftEngineEtcd:
+	case "", raftEngineEtcd:
 		return raftEngineEtcd, nil
 	default:
 		return "", errors.Wrapf(ErrUnsupportedRaftEngine, "%q", raw)
@@ -131,14 +126,6 @@ func readRaftEngineMarker(path string) (raftEngineType, bool, error) {
 }
 
 func detectRaftEngineFromDataDir(dir string) (raftEngineType, bool, error) {
-	hashicorpArtifacts, err := hasRaftArtifacts(dir,
-		"raft.db",
-		"logs.dat",
-		"stable.dat",
-	)
-	if err != nil {
-		return "", false, err
-	}
 	etcdArtifacts, err := hasRaftArtifacts(dir,
 		"wal",
 		"snap",
@@ -154,16 +141,10 @@ func detectRaftEngineFromDataDir(dir string) (raftEngineType, bool, error) {
 		return "", false, err
 	}
 
-	switch {
-	case hashicorpArtifacts && etcdArtifacts:
-		return "", false, errors.Wrapf(ErrMixedRaftEngineArtifacts, "%s", dir)
-	case hashicorpArtifacts:
-		return raftEngineHashicorp, true, nil
-	case etcdArtifacts:
+	if etcdArtifacts {
 		return raftEngineEtcd, true, nil
-	default:
-		return "", false, nil
 	}
+	return "", false, nil
 }
 
 func hasRaftArtifacts(dir string, paths ...string) (bool, error) {
@@ -196,25 +177,13 @@ func syncDataDir(path string) error {
 	return nil
 }
 
-func bootstrapPeersToServers(bootstrapServers []raft.Server) []raftengine.Server {
-	servers := make([]raftengine.Server, 0, len(bootstrapServers))
-	for _, s := range bootstrapServers {
-		servers = append(servers, raftengine.Server{
-			ID:       string(s.ID),
-			Address:  string(s.Address),
-			Suffrage: "voter",
-		})
-	}
-	return servers
-}
-
 func buildRuntimeForGroup(
 	raftID string,
 	group groupSpec,
 	baseDir string,
 	multi bool,
 	bootstrap bool,
-	bootstrapServers []raft.Server,
+	bootstrapServers []raftengine.Server,
 	st store.MVCCStore,
 	sm raftengine.StateMachine,
 	factory raftengine.Factory,
@@ -229,7 +198,7 @@ func buildRuntimeForGroup(
 		LocalID:      raftID,
 		LocalAddress: group.address,
 		DataDir:      dir,
-		Peers:        bootstrapPeersToServers(bootstrapServers),
+		Peers:        bootstrapServers,
 		Bootstrap:    bootstrap,
 		StateMachine: sm,
 	})

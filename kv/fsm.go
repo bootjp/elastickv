@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -32,7 +32,7 @@ type kvFSM struct {
 }
 
 type FSM interface {
-	raft.FSM
+	raftengine.StateMachine
 }
 
 // NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
@@ -49,7 +49,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC) FSM {
 }
 
 var _ FSM = (*kvFSM)(nil)
-var _ raft.FSM = (*kvFSM)(nil)
+var _ raftengine.StateMachine = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
 
@@ -57,16 +57,16 @@ type fsmApplyResponse struct {
 	results []error
 }
 
-func (f *kvFSM) Apply(l *raft.Log) any {
+func (f *kvFSM) Apply(data []byte) any {
 	// HLC lease entries advance only the physical ceiling; they do not touch
 	// the MVCC store. The logical counter continues to be managed in memory.
-	if len(l.Data) > 0 && l.Data[0] == raftEncodeHLCLease {
-		return f.applyHLCLease(l.Data[1:])
+	if len(data) > 0 && data[0] == raftEncodeHLCLease {
+		return f.applyHLCLease(data[1:])
 	}
 
 	ctx := context.TODO()
 
-	reqs, err := decodeRaftRequests(l.Data)
+	reqs, err := decodeRaftRequests(data)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -249,7 +249,7 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 
 var ErrNotImplemented = errors.New("not implemented")
 
-func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
+func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -261,9 +261,7 @@ func (f *kvFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}, nil
 }
 
-func (f *kvFSM) Restore(r io.ReadCloser) error {
-	defer r.Close()
-
+func (f *kvFSM) Restore(r io.Reader) error {
 	// Read the potential 16-byte header (magic + ceiling ms).
 	var hdr [hlcSnapshotHeaderLen]byte
 	n, err := io.ReadFull(r, hdr[:])
