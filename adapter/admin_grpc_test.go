@@ -70,6 +70,53 @@ func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	}
 }
 
+// TestGroupOrderingIsStable locks in deterministic ascending-by-RaftGroupId
+// ordering so admin UIs and diff-based tests do not see rows jump around.
+func TestGroupOrderingIsStable(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
+	for _, id := range []uint64{7, 2, 5, 3, 1} {
+		srv.RegisterGroup(id, fakeGroup{leaderID: "n1"})
+	}
+
+	groupsResp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotGroups := make([]uint64, 0, len(groupsResp.Groups))
+	for _, g := range groupsResp.Groups {
+		gotGroups = append(gotGroups, g.RaftGroupId)
+	}
+	wantGroups := []uint64{1, 2, 3, 5, 7}
+	if !equalU64s(gotGroups, wantGroups) {
+		t.Fatalf("GetRaftGroups order = %v, want %v", gotGroups, wantGroups)
+	}
+
+	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLeaders := make([]uint64, 0, len(overview.GroupLeaders))
+	for _, gl := range overview.GroupLeaders {
+		gotLeaders = append(gotLeaders, gl.RaftGroupId)
+	}
+	if !equalU64s(gotLeaders, wantGroups) {
+		t.Fatalf("GetClusterOverview leader order = %v, want %v", gotLeaders, wantGroups)
+	}
+}
+
+func equalU64s(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestAdminTokenAuth(t *testing.T) {
 	t.Parallel()
 	unary, _ := AdminTokenAuth("s3cret")

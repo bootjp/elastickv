@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"crypto/subtle"
+	"sort"
 	"strings"
 	"sync"
 
@@ -99,9 +100,11 @@ func (s *AdminServer) GetRaftGroups(
 	_ *pb.GetRaftGroupsRequest,
 ) (*pb.GetRaftGroupsResponse, error) {
 	s.groupsMu.RLock()
-	out := make([]*pb.RaftGroupState, 0, len(s.groups))
-	for id, g := range s.groups {
-		st := g.Status()
+	defer s.groupsMu.RUnlock()
+	ids := sortedGroupIDs(s.groups)
+	out := make([]*pb.RaftGroupState, 0, len(ids))
+	for _, id := range ids {
+		st := s.groups[id].Status()
 		out = append(out, &pb.RaftGroupState{
 			RaftGroupId:  id,
 			LeaderNodeId: st.Leader.ID,
@@ -110,16 +113,16 @@ func (s *AdminServer) GetRaftGroups(
 			AppliedIndex: st.AppliedIndex,
 		})
 	}
-	s.groupsMu.RUnlock()
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil
 }
 
 func (s *AdminServer) snapshotLeaders() []*pb.GroupLeader {
 	s.groupsMu.RLock()
 	defer s.groupsMu.RUnlock()
-	out := make([]*pb.GroupLeader, 0, len(s.groups))
-	for id, g := range s.groups {
-		st := g.Status()
+	ids := sortedGroupIDs(s.groups)
+	out := make([]*pb.GroupLeader, 0, len(ids))
+	for _, id := range ids {
+		st := s.groups[id].Status()
 		out = append(out, &pb.GroupLeader{
 			RaftGroupId:  id,
 			LeaderNodeId: st.Leader.ID,
@@ -127,6 +130,18 @@ func (s *AdminServer) snapshotLeaders() []*pb.GroupLeader {
 		})
 	}
 	return out
+}
+
+// sortedGroupIDs returns the map's keys in ascending order so Admin responses
+// are deterministic across calls — admin tooling and tests both rely on stable
+// ordering.
+func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
+	ids := make([]uint64, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
