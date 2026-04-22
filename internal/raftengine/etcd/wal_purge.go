@@ -90,26 +90,40 @@ func purgeOldWALFiles(walDir string, keep int) error {
 	victims := names[:len(names)-keep]
 	var combined error
 	for _, name := range victims {
-		full := filepath.Join(walDir, name)
-		// Try-lock so we never delete a segment the wal package still owns.
-		// If the lock fails (segment is active), skip it and continue: the
-		// next snapshot's purge pass will pick it up once Release advances.
-		l, lockErr := fileutil.TryLockFile(full, os.O_WRONLY, walLockMode)
-		if lockErr != nil {
-			slog.Debug("skipping locked wal segment", "path", full, "error", lockErr)
-			continue
-		}
-		if rmErr := os.Remove(full); rmErr != nil && !os.IsNotExist(rmErr) {
-			combined = errors.CombineErrors(combined, errors.WithStack(rmErr))
-			_ = l.Close()
-			continue
-		}
-		if closeErr := l.Close(); closeErr != nil {
-			combined = errors.CombineErrors(combined, errors.WithStack(closeErr))
+		if err := tryPurgeWALSegment(filepath.Join(walDir, name)); err != nil {
+			combined = errors.CombineErrors(combined, err)
 		}
 	}
 	combined = errors.CombineErrors(combined, syncDirIfExists(walDir))
 	return errors.WithStack(combined)
+}
+
+// tryPurgeWALSegment attempts to delete a single .wal segment, taking a
+// flock first so we never race the active writer. Returns nil on success
+// OR when the segment is skipped because it's still locked by the wal
+// package (a transient condition that the next purge pass will clear).
+// Non-lock errors (open/permission/I/O, rm, flock-close) are returned so
+// the caller can surface them; silently swallowing them would effectively
+// disable WAL retention under filesystem faults.
+func tryPurgeWALSegment(path string) error {
+	l, lockErr := fileutil.TryLockFile(path, os.O_WRONLY, walLockMode)
+	if lockErr != nil {
+		if errors.Is(lockErr, fileutil.ErrLocked) {
+			slog.Debug("skipping locked wal segment", "path", path)
+			return nil
+		}
+		slog.Warn("wal purge: TryLockFile failed with non-lock error",
+			"path", path, "error", lockErr)
+		return errors.WithStack(lockErr)
+	}
+	if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+		_ = l.Close()
+		return errors.WithStack(rmErr)
+	}
+	if closeErr := l.Close(); closeErr != nil {
+		return errors.WithStack(closeErr)
+	}
+	return nil
 }
 
 // collectWALNames returns the subset of entries that look like WAL segment
