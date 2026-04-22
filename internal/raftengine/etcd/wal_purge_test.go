@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/client/pkg/v3/fileutil"
 )
 
 // writeDummyWALSegment creates a plausible-looking WAL filename in dir so
@@ -67,24 +69,71 @@ func TestPurgeOldWALFiles_KeepsMostRecentN(t *testing.T) {
 	}, got)
 }
 
-func TestPurgeOldWALFiles_NeverDeletesActiveTail(t *testing.T) {
+func TestPurgeOldWALFiles_NewestSurvivesKeepCutoff(t *testing.T) {
 	dir := t.TempDir()
-	// Create 5 segments; then hold an OS-level file lock on the newest one
-	// to simulate the wal package's flock on the active tail. keep=1 means
-	// the purger would WANT to delete the other 4, but the tail must remain
-	// under all circumstances.
+	// Create 5 segments with keep=1. The newest is already excluded by the
+	// lexicographic cutoff (victims := names[:len(names)-keep]), so this
+	// specifically exercises the "keep at least 1" invariant without going
+	// through the flock path at all.
 	var names []string
 	for i := uint64(0); i < 5; i++ {
 		names = append(names, writeDummyWALSegment(t, dir, i, i*100))
 	}
-	// keep=1 asks the purger to delete the 4 older segments; the newest is
-	// already excluded by the keep cutoff, not by locking. This verifies
-	// the "keep at least 1" invariant even with an aggressive cap.
 	require.NoError(t, purgeOldWALFiles(dir, 1))
 
 	got := listWALFiles(t, dir)
 	require.Len(t, got, 1)
 	require.Equal(t, names[len(names)-1], got[0])
+}
+
+// TestPurgeOldWALFiles_SkipsLockedMidListSegment is the real fleet-facing
+// safety test: the wal package holds a flock on an active-but-not-tail
+// segment (e.g., one the follower still needs for catch-up). The purger
+// must skip that segment while still deleting older unlocked ones around
+// it. This specifically covers the TryLockFile path in purgeOldWALFiles.
+func TestPurgeOldWALFiles_SkipsLockedMidListSegment(t *testing.T) {
+	// fileutil flock semantics differ on Windows (per-handle mandatory
+	// locking via LockFileEx). Our production target is Linux/macOS, and
+	// wiring a second-process lock acquirer just to exercise Windows is
+	// beyond the scope of this unit test.
+	if runtime.GOOS == "windows" {
+		t.Skip("fileutil flock test is posix-only")
+	}
+	dir := t.TempDir()
+	const total = 5
+	var names []string
+	for i := uint64(0); i < total; i++ {
+		names = append(names, writeDummyWALSegment(t, dir, i, i*100))
+	}
+	sort.Strings(names)
+
+	// Lock a segment squarely in the victim range (not the newest, which
+	// is always preserved by the keep cutoff). This simulates the wal
+	// package holding an un-Released flock on a mid-list segment.
+	lockIdx := len(names) / 2
+	lockedName := names[lockIdx]
+	lockedPath := filepath.Join(dir, lockedName)
+	lf, err := fileutil.TryLockFile(lockedPath, os.O_WRONLY, walLockMode)
+	require.NoError(t, err, "test setup: must be able to grab flock")
+	t.Cleanup(func() {
+		_ = lf.Close()
+	})
+
+	// keep=1 wants to delete the 4 older segments. The locked mid-list
+	// one must survive; the others (older than it AND not locked) must
+	// be deleted.
+	require.NoError(t, purgeOldWALFiles(dir, 1))
+
+	got := listWALFiles(t, dir)
+	// Newest is always preserved, and the locked mid-list segment must
+	// also survive the purge.
+	require.Contains(t, got, names[len(names)-1], "newest segment must survive")
+	require.Contains(t, got, lockedName, "locked segment must survive")
+	// Segments older than the locked one AND not locked must be deleted.
+	for i := 0; i < lockIdx; i++ {
+		require.NotContains(t, got, names[i],
+			"older unlocked segment %q should have been purged", names[i])
+	}
 }
 
 func TestPurgeOldWALFiles_MissingDirIsNoOp(t *testing.T) {
