@@ -1796,11 +1796,14 @@ func (s *pebbleStore) Close() error {
 // return value is a freshly allocated *pebble.Metrics owned by the
 // caller.
 //
-// Returns nil while the store is closed or between a Restore/swap (no
-// current DB). Callers must handle nil.
+// Returns nil only before the first Open has installed a DB or after a
+// failed Open left s.db unset; callers during an in-flight Restore block
+// on dbMu (which Restore holds exclusively) rather than observing nil,
+// and Close() does not clear s.db. Callers must still handle nil for the
+// pre-Open case.
 //
 // Safe for concurrent use: takes the dbMu read lock to protect against
-// Restore/Close swapping the DB pointer.
+// Restore swapping the DB pointer.
 func (s *pebbleStore) Metrics() *pebble.Metrics {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()

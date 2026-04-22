@@ -16,7 +16,7 @@ import (
 // dashboard.
 //
 // The point-in-time fields (Sublevels, NumFiles, EstimatedDebt,
-// MemTable.*, NumInProgress, BlockCache.Size/Count) are exposed as
+// MemTable.*, NumInProgress, BlockCache.Size) are exposed as
 // Prometheus GAUGES — each poll overwrites the previous value.
 // Monotonic fields (Compact.Count, BlockCache.Hits/Misses) are exposed
 // as COUNTERS; the collector emits only the positive delta against the
@@ -47,9 +47,9 @@ type PebbleMetrics struct {
 	memtableZombieCount *prometheus.GaugeVec
 
 	// Block cache.
-	blockCacheSizeBytes *prometheus.GaugeVec
-	blockCacheHitsTotal *prometheus.CounterVec
-	blockCacheMissTotal *prometheus.CounterVec
+	blockCacheSizeBytes   *prometheus.GaugeVec
+	blockCacheHitsTotal   *prometheus.CounterVec
+	blockCacheMissesTotal *prometheus.CounterVec
 }
 
 func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
@@ -124,7 +124,7 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 			},
 			[]string{"group"},
 		),
-		blockCacheMissTotal: prometheus.NewCounterVec(
+		blockCacheMissesTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_pebble_block_cache_misses_total",
 				Help: "Cumulative block cache misses reported by Pebble.",
@@ -144,7 +144,7 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 		m.memtableZombieCount,
 		m.blockCacheSizeBytes,
 		m.blockCacheHitsTotal,
-		m.blockCacheMissTotal,
+		m.blockCacheMissesTotal,
 	)
 	return m
 }
@@ -272,7 +272,7 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 			c.metrics.blockCacheHitsTotal.WithLabelValues(group).Add(float64(curr.blockCacheHits - prev.blockCacheHits))
 		}
 		if curr.blockCacheMisses > prev.blockCacheMisses {
-			c.metrics.blockCacheMissTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
+			c.metrics.blockCacheMissesTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
 		}
 		c.previous[src.GroupID] = curr
 	}
