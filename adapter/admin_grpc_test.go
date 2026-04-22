@@ -124,7 +124,7 @@ func TestAdminTokenAuth(t *testing.T) {
 		t.Fatal("interceptor should be non-nil for configured token")
 	}
 
-	info := &grpc.UnaryServerInfo{FullMethod: "/Admin/GetClusterOverview"}
+	info := &grpc.UnaryServerInfo{FullMethod: "/" + pb.Admin_ServiceDesc.ServiceName + "/GetClusterOverview"}
 	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
 
 	cases := []struct {
