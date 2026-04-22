@@ -369,3 +369,29 @@ func TestWriteJSONSuccessPath(t *testing.T) {
 		t.Fatalf("body = %v", out)
 	}
 }
+
+// TestHandleOverviewUsesProtojson asserts that admin responses preserve the
+// proto3 JSON mapping (camelCase field names, zero-valued fields emitted) so
+// the browser sees stable field names regardless of encoding/json's behavior.
+func TestHandleOverviewUsesProtojson(t *testing.T) {
+	t.Parallel()
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	seedAddr := startFakeAdmin(t, peer)
+
+	f := newFanout([]string{seedAddr}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/cluster/overview", nil)
+	rec := httptest.NewRecorder()
+	f.handleOverview(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// protojson uses camelCase by default; encoding/json would emit
+	// "grpc_address" (proto name). Catch the regression explicitly.
+	if !strings.Contains(body, "grpcAddress") {
+		t.Fatalf("response missing protojson camelCase field; body=%q", body)
+	}
+}

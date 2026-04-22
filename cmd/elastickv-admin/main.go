@@ -29,6 +29,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -386,6 +388,29 @@ func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
 	return out
 }
 
+// perNodeResult wraps a fan-out response from one node. Data is stored as
+// json.RawMessage so it can be filled with a protojson-encoded protobuf
+// message — encoding/json would lose the proto3 field-name mapping and
+// well-known-type handling.
+type perNodeResult struct {
+	Node  string          `json:"node"`
+	OK    bool            `json:"ok"`
+	Error string          `json:"error,omitempty"`
+	Data  json.RawMessage `json:"data,omitempty"`
+}
+
+// marshalProto encodes a protobuf message with the JSON mapping that preserves
+// proto3 field names and well-known-type semantics.
+var protoMarshaler = protojson.MarshalOptions{EmitUnpopulated: true, UseProtoNames: false}
+
+func marshalProto(m proto.Message) (json.RawMessage, error) {
+	raw, err := protoMarshaler.Marshal(m)
+	if err != nil {
+		return nil, errors.Wrap(err, "protojson marshal")
+	}
+	return raw, nil
+}
+
 func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -396,21 +421,13 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	targets := f.currentTargets(ctx)
-
-	type perNode struct {
-		Node  string                         `json:"node"`
-		OK    bool                           `json:"ok"`
-		Error string                         `json:"error,omitempty"`
-		Data  *pb.GetClusterOverviewResponse `json:"data,omitempty"`
-	}
-
-	results := make([]perNode, len(targets))
+	results := make([]perNodeResult, len(targets))
 	var wg sync.WaitGroup
 	for i, addr := range targets {
 		wg.Add(1)
 		go func(i int, addr string) {
 			defer wg.Done()
-			entry := perNode{Node: addr}
+			entry := perNodeResult{Node: addr}
 			cli, err := f.clientFor(addr)
 			if err != nil {
 				entry.Error = err.Error()
@@ -426,8 +443,14 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 				results[i] = entry
 				return
 			}
+			data, mErr := marshalProto(resp)
+			if mErr != nil {
+				entry.Error = errors.Wrap(mErr, "marshal response").Error()
+				results[i] = entry
+				return
+			}
 			entry.OK = true
-			entry.Data = resp
+			entry.Data = data
 			results[i] = entry
 		}(i, addr)
 	}

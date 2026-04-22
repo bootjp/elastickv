@@ -217,6 +217,14 @@ Phase 3 persists compacted columns **distributed across the user Raft groups the
 
 This keeps the data-plane Raft-log overhead bounded by per-group load and fails independently when a single group is unavailable.
 
+**Partial-availability UX.** Distributing persistence across the user Raft groups trades the default-group single-point-of-failure for per-group independence, but it also means a single unavailable group cannot serve that key range's history. The UI copes with that explicitly rather than silently showing gaps:
+
+- The fan-out reader collects a per-group `{groupID, ok, error, fromRange, toRange}` status array alongside the merged matrix. The admin binary returns `status=PARTIAL` on the HTTP response when any group failed and forwards the status array unchanged.
+- Rows whose owning group is in `error` state are returned with `aggregate=true`, the constituent route list, and a `degraded=true` flag so the UI renders them hatched and labels them "historical data unavailable from group *N*" in the drawer. Live (in-memory) columns still flow for any node currently sampling, so the heatmap is never fully blank — only historical columns for the affected range degrade.
+- `GetKeyVizMatrix` and `GetRouteDetail` continue to return `200 OK` with the partial body plus the status array, so automation does not see a 5xx during a transient partial outage. An explicit `allGroupsHealthy` boolean and a `degradedGroups[]` list let callers gate on strict health when they need to.
+- Lineage lookups cache the last-known `(lineageID → group)` mapping in the admin binary for `--nodesRefreshInterval`, so a brief group flap does not drop the route from the heatmap entirely: the cached mapping is still used to annotate the row, and the fan-out reader retries on the next request.
+- When a group is permanently lost, operators recover by either restoring the group (history reappears on the next request) or invoking an out-of-band `elastickv-admin reassign-lineage` flow (deferred to Phase 4) that moves the lineage metadata to a healthy group; the design here only guarantees that the UI stays useful during the outage, not that history is automatically relocated.
+
 ### 5.7 Key preview labels
 
 Raw keys are binary. The UI needs a printable hint per bucket. Strategy:
