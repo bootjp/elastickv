@@ -291,14 +291,17 @@ func TestFSMAbort_AbortTSMustBeGreaterThanStartTS(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 }
 
-// TestFSMAbort_SecondAbortIsIdempotent pins the intended post-fix
-// behaviour: once a (primaryKey, startTS) pair has a rollback marker,
-// a subsequent abort against the same pair must return nil without
-// touching the store. The previous behaviour (write-conflict on the
+// TestFSMAbort_SecondAbortSameKeysIsIdempotent pins post-fix
+// behaviour: once a (primaryKey, startTS) abort has cleaned up its
+// keys and written the rollback marker, a subsequent abort over the
+// same mutation set must return nil without touching the store.
+// Idempotency is enforced per-key in shouldClearAbortKey (lock
+// already gone ⇒ skip) and by appendRollbackRecord (marker already
+// present ⇒ skip). The prior behaviour (write-conflict on the
 // rollback-marker Put) surfaced in prod as "secondary write failed"
 // log spam whenever dualwrite replay or the lock resolver raced a
 // completed abort.
-func TestFSMAbort_SecondAbortIsIdempotent(t *testing.T) {
+func TestFSMAbort_SecondAbortSameKeysIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -334,6 +337,146 @@ func TestFSMAbort_SecondAbortIsIdempotent(t *testing.T) {
 	// the first one completed.
 	err = abortTxn(t, fsm, primary, startTS, abortTS+100, [][]byte{primary, key})
 	require.NoError(t, err, "later-abortTS retry must be idempotent")
+}
+
+// TestFSMAbort_SecondAbortDifferentKeysCleansRemainder is the
+// regression test for the Copilot-flagged bug: the first abort's
+// mutation list contains only the primary key (writes rollback
+// marker + cleans the primary). A second abort carries a secondary
+// key with the same primaryKey and startTS. The secondary's
+// lock/intent MUST be cleaned up — a broad short-circuit on the
+// rollback marker's presence would orphan them.
+func TestFSMAbort_SecondAbortDifferentKeysCleansRemainder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(10)
+	abortTS := uint64(20)
+	primary := []byte("A")
+	secondaryB := []byte("B")
+	secondaryC := []byte("C")
+
+	// Prepare locks on A (primary), B, C.
+	prepareTxn(t, fsm, primary, startTS,
+		[][]byte{primary, secondaryB, secondaryC},
+		[][]byte{[]byte("va"), []byte("vb"), []byte("vc")})
+
+	// Sanity: all three locks exist.
+	for _, k := range [][]byte{primary, secondaryB, secondaryC} {
+		_, err := st.GetAt(ctx, txnLockKey(k), ^uint64(0))
+		require.NoError(t, err, "lock for %q must exist after prepare", string(k))
+	}
+
+	// First abort: mimics ShardStore.tryAbortExpiredPrimary — only
+	// the primary key is in the mutation list. This writes the
+	// rollback marker on the primary shard and cleans up A's lock.
+	err := abortTxn(t, fsm, primary, startTS, abortTS, [][]byte{primary})
+	require.NoError(t, err)
+
+	// Primary's lock/intent are gone.
+	_, err = st.GetAt(ctx, txnLockKey(primary), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, txnIntentKey(primary), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	// Rollback marker is present.
+	_, err = st.GetAt(ctx, txnRollbackKey(primary, startTS), ^uint64(0))
+	require.NoError(t, err)
+
+	// Secondaries' locks/intents are still present (first abort did
+	// not touch them).
+	_, err = st.GetAt(ctx, txnLockKey(secondaryB), ^uint64(0))
+	require.NoError(t, err, "B's lock must still exist before second abort")
+	_, err = st.GetAt(ctx, txnLockKey(secondaryC), ^uint64(0))
+	require.NoError(t, err, "C's lock must still exist before second abort")
+
+	// Second abort: mimics the lock-resolver path — same primaryKey
+	// and startTS, but mutations carry a secondary key. This MUST
+	// clean up B's lock/intent despite the rollback marker already
+	// existing.
+	err = abortTxn(t, fsm, primary, startTS, abortTS+1, [][]byte{secondaryB})
+	require.NoError(t, err)
+
+	_, err = st.GetAt(ctx, txnLockKey(secondaryB), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound,
+		"B's lock must be cleaned by the second abort; "+
+			"short-circuiting on rollback-marker presence would orphan it")
+	_, err = st.GetAt(ctx, txnIntentKey(secondaryB), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound,
+		"B's intent must be cleaned by the second abort")
+
+	// Third abort for C: same story.
+	err = abortTxn(t, fsm, primary, startTS, abortTS+2, [][]byte{secondaryC})
+	require.NoError(t, err)
+	_, err = st.GetAt(ctx, txnLockKey(secondaryC), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "C's lock must be cleaned")
+	_, err = st.GetAt(ctx, txnIntentKey(secondaryC), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "C's intent must be cleaned")
+
+	// Rollback marker still present (idempotent; no re-Put).
+	_, err = st.GetAt(ctx, txnRollbackKey(primary, startTS), ^uint64(0))
+	require.NoError(t, err)
+}
+
+// TestFSMAbort_LockResolverRaceLeavesNoOrphan simulates the prod
+// flow: tryAbortExpiredPrimary issues an abort with ONLY the primary
+// key, and then — racing that — lock resolvers for each secondary
+// arrive one at a time (each abort carries one secondary key, same
+// primaryKey, same startTS). After all of them have run, no lock or
+// intent for the transaction may remain.
+func TestFSMAbort_LockResolverRaceLeavesNoOrphan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(50)
+	abortTS := uint64(60)
+	primary := []byte("pk")
+	secondaries := [][]byte{[]byte("s1"), []byte("s2"), []byte("s3"), []byte("s4")}
+
+	allKeys := append([][]byte{primary}, secondaries...)
+	allValues := make([][]byte, 0, len(allKeys))
+	for range allKeys {
+		allValues = append(allValues, []byte("v"))
+	}
+
+	prepareTxn(t, fsm, primary, startTS, allKeys, allValues)
+
+	// tryAbortExpiredPrimary path: abort with only the primary key.
+	require.NoError(t, abortTxn(t, fsm, primary, startTS, abortTS, [][]byte{primary}))
+
+	// Per-secondary lock-resolver aborts (same primaryKey+startTS,
+	// one key each, increasing abortTS).
+	for i, k := range secondaries {
+		//nolint:gosec // loop index fits easily into uint64
+		bump := uint64(i) + 1
+		require.NoError(t, abortTxn(t, fsm, primary, startTS, abortTS+bump, [][]byte{k}))
+	}
+
+	// A redundant abort over all keys (a late dualwrite replay, say)
+	// must still be a no-op.
+	require.NoError(t, abortTxn(t, fsm, primary, startTS, abortTS+100, allKeys))
+
+	// No lock or intent for any key of the txn may remain.
+	for _, k := range allKeys {
+		_, err := st.GetAt(ctx, txnLockKey(k), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound,
+			"no orphan lock permitted for key %q", string(k))
+		_, err = st.GetAt(ctx, txnIntentKey(k), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound,
+			"no orphan intent permitted for key %q", string(k))
+	}
+	// Rollback marker is present exactly once; reading it at MaxTS
+	// must succeed.
+	_, err := st.GetAt(ctx, txnRollbackKey(primary, startTS), ^uint64(0))
+	require.NoError(t, err, "rollback marker must be present")
 }
 
 func TestFSMAbort_MissingPrimaryKeyReturnsError(t *testing.T) {

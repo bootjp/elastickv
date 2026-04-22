@@ -525,24 +525,17 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
-	// Idempotency short-circuit: if the rollback marker for this
-	// (primaryKey, startTS) already exists, a previous abort already
-	// completed the whole cleanup atomically (ApplyMutations writes the
-	// rollback marker together with the lock/intent deletes in one
-	// batch, so the marker's presence proves cleanup ran). Without this
-	// guard a retry or a concurrent second lock-resolver would re-emit
-	// Delete mutations on already-tombstoned lock/intent keys and a
-	// duplicate rollback-marker Put — all three would be rejected by
-	// the MVCC store as write conflicts (latestCommitTS > startTS) and
-	// surface in prod as "secondary write failed" log spam without
-	// changing any state. Rollback markers are deterministic
-	// ({txnRollbackVersion}) so second-writer-wins would be equivalent
-	// anyway; skipping the work is simpler and cheaper.
-	if _, err := f.store.GetAt(ctx, txnRollbackKey(meta.PrimaryKey, startTS), ^uint64(0)); err == nil {
-		return nil
-	} else if !errors.Is(err, store.ErrKeyNotFound) {
-		return errors.WithStack(err)
-	}
+	// NOTE: do NOT short-circuit the whole request on rollback-marker
+	// presence. The marker only proves that SOME prior abort for this
+	// (primaryKey, startTS) ran; it does not prove cleanup ran for the
+	// specific keys in *this* request. In particular
+	// ShardStore.tryAbortExpiredPrimary issues an ABORT whose mutation
+	// list contains only the primary key, so a later lock-resolver
+	// abort for a secondary key (same primaryKey, same startTS) would
+	// see the marker already present and must still clean up that
+	// secondary's lock/intent. Idempotency is enforced per-key in
+	// shouldClearAbortKey (lock-missing ⇒ nothing to do) and for the
+	// rollback-marker Put in appendRollbackRecord.
 
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
@@ -641,6 +634,23 @@ func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.
 }
 
 func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, startTS uint64, storeMuts *[]*store.KVPairMutation) error {
+	// Idempotent rollback: if the marker already exists for this
+	// (primaryKey, startTS), skip the Put. Rollback markers are
+	// deterministic ({txnRollbackVersion}) and a second Put against
+	// the already-tombstoned key would otherwise be rejected by the
+	// MVCC store as a write conflict (latestCommitTS > startTS).
+	//
+	// Safety: if the rollback marker is present, the commit record
+	// must be absent for this (primaryKey, startTS) because the
+	// commit-wins-over-rollback check below ran when the marker was
+	// first written, so we skip the commit check on the idempotent
+	// path.
+	if _, err := f.store.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0)); err == nil {
+		return nil
+	} else if !errors.Is(err, store.ErrKeyNotFound) {
+		return errors.WithStack(err)
+	}
+
 	// Don't allow rollback to win after commit record exists.
 	if _, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0)); err == nil {
 		return errors.WithStack(ErrTxnAlreadyCommitted)
@@ -792,11 +802,19 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 	return out, nil
 }
 
+// shouldClearAbortKey reports whether this abort request must emit
+// cleanup (lock+intent Delete) mutations for key. It returns false
+// when the lock is already missing: lock/intent are always written
+// and deleted together in a single ApplyMutations batch
+// (lock missing ⇔ intent missing), so missing lock means either
+// cleanup already ran for this (startTS, primaryKey) or the key was
+// never prepared. Emitting Deletes on already-tombstoned keys would
+// trigger MVCC write conflicts and has no observable effect.
 func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key, primaryKey []byte, startTS uint64) (bool, error) {
 	lockBytes, err := f.store.GetAt(ctx, txnLockKey(key), ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return true, nil
+			return false, nil
 		}
 		return false, errors.WithStack(err)
 	}
