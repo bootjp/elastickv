@@ -370,6 +370,38 @@ func TestWriteJSONSuccessPath(t *testing.T) {
 	}
 }
 
+// TestFanoutRefreshSurvivesFirstCallerCancel asserts that canceling the first
+// caller's context does not kill the shared singleflight refresh — subsequent
+// callers should still see a populated membership.
+func TestFanoutRefreshSurvivesFirstCallerCancel(t *testing.T) {
+	t.Parallel()
+
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	seedAddr := startFakeAdmin(t, peer)
+
+	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials())
+	defer f.Close()
+
+	// First caller cancels before the refresh completes.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = f.currentTargets(cancelled)
+
+	// A fresh caller a beat later must see the member list populated by the
+	// still-running background refresh rather than the raw seed list.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		targets := f.currentTargets(ctx)
+		cancel()
+		if len(targets) == 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("membership never populated; peer calls=%d", peer.calls.Load())
+}
+
 // TestHandleOverviewUsesProtojson asserts that admin responses preserve the
 // proto3 JSON mapping (camelCase field names, zero-valued fields emitted) so
 // the browser sees stable field names regardless of encoding/json's behavior.

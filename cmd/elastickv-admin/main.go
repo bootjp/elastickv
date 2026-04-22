@@ -38,12 +38,17 @@ const (
 	defaultNodesRefreshInterval = 15 * time.Second
 	defaultGRPCRequestTimeout   = 10 * time.Second
 	discoveryRPCTimeout         = 2 * time.Second
-	readHeaderTimeout           = 5 * time.Second
-	readTimeout                 = 30 * time.Second
-	writeTimeout                = 30 * time.Second
-	idleTimeout                 = 120 * time.Second
-	shutdownTimeout             = 5 * time.Second
-	maxRequestBodyBytes         = 4 << 10
+	// membershipRefreshBudget caps the detached background refresh so it
+	// cannot run forever even if every seed is slow. Sized for up to a few
+	// sequential discoveryRPCTimeout attempts before the singleflight
+	// collapses.
+	membershipRefreshBudget = 10 * time.Second
+	readHeaderTimeout       = 5 * time.Second
+	readTimeout             = 30 * time.Second
+	writeTimeout            = 30 * time.Second
+	idleTimeout             = 120 * time.Second
+	shutdownTimeout         = 5 * time.Second
+	maxRequestBodyBytes     = 4 << 10
 )
 
 var (
@@ -311,9 +316,12 @@ func (f *fanout) outgoingCtx(parent context.Context) context.Context {
 // membership cache is fresh it is returned directly; otherwise the admin binary
 // queries seeds via GetClusterOverview and caches the resulting member list
 // for refreshInterval. Concurrent refreshes are collapsed through singleflight
-// so a burst of requests after cache expiry hits only one seed. On total
-// failure it falls back to the static seed list so a single unreachable seed
-// does not take the admin offline.
+// so a burst of requests after cache expiry hits only one seed. The shared
+// refresh runs on a detached background context bounded by
+// membershipRefreshBudget so one caller canceling (e.g., browser tab close)
+// does not abort the work for every other concurrent waiter. On total failure
+// the admin binary falls back to the static seed list so a single unreachable
+// seed does not take the admin offline.
 func (f *fanout) currentTargets(ctx context.Context) []string {
 	f.mu.Lock()
 	if f.members != nil && time.Since(f.members.fetchedAt) < f.refreshInterval {
@@ -323,11 +331,27 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 	}
 	f.mu.Unlock()
 
-	result, _, _ := f.refreshGroup.Do("members", func() (any, error) {
-		return f.refreshMembership(ctx), nil
+	ch := f.refreshGroup.DoChan("members", func() (any, error) {
+		bgCtx, cancel := context.WithTimeout(context.Background(), membershipRefreshBudget)
+		defer cancel()
+		return f.refreshMembership(bgCtx), nil
 	})
-	addrs, _ := result.([]string)
-	return addrs
+	select {
+	case r := <-ch:
+		addrs, _ := r.Val.([]string)
+		return addrs
+	case <-ctx.Done():
+		// Caller bailed. Give them whatever targets we can assemble without
+		// blocking: the last cached membership if we have one, else seeds.
+		// The detached refresh continues in the background and will populate
+		// the cache for the next request.
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.members != nil {
+			return append([]string(nil), f.members.addrs...)
+		}
+		return append([]string(nil), f.seeds...)
+	}
 }
 
 // refreshMembership performs the actual discovery RPC. It honours the caller's
