@@ -1635,3 +1635,209 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
 }
+
+// TestSelectDispatchLane_LegacyTwoLane verifies that, when the 4-lane
+// dispatcher is disabled (default), messages are routed exactly as before:
+// priority control traffic → heartbeat lane, everything else → normal lane.
+func TestSelectDispatchLane_LegacyTwoLane(t *testing.T) {
+	t.Parallel()
+	engine := &Engine{dispatcherLanesEnabled: false}
+	pd := &peerQueues{
+		normal:    make(chan dispatchRequest, 1),
+		heartbeat: make(chan dispatchRequest, 1),
+	}
+
+	cases := map[raftpb.MessageType]chan dispatchRequest{
+		raftpb.MsgHeartbeat:     pd.heartbeat,
+		raftpb.MsgHeartbeatResp: pd.heartbeat,
+		raftpb.MsgReadIndex:     pd.heartbeat,
+		raftpb.MsgReadIndexResp: pd.heartbeat,
+		raftpb.MsgVote:          pd.heartbeat,
+		raftpb.MsgVoteResp:      pd.heartbeat,
+		raftpb.MsgPreVote:       pd.heartbeat,
+		raftpb.MsgPreVoteResp:   pd.heartbeat,
+		raftpb.MsgTimeoutNow:    pd.heartbeat,
+		raftpb.MsgApp:           pd.normal,
+		raftpb.MsgAppResp:       pd.normal,
+		raftpb.MsgSnap:          pd.normal,
+	}
+	for mt, want := range cases {
+		got := engine.selectDispatchLane(pd, mt)
+		require.Equalf(t, want, got, "legacy mode routing for %s", mt)
+	}
+}
+
+// TestSelectDispatchLane_FourLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
+// is enabled, MsgApp/MsgAppResp goes to the replication lane, MsgSnap goes to
+// the snapshot lane, and heartbeats/votes/read-index share the priority lane.
+func TestSelectDispatchLane_FourLane(t *testing.T) {
+	t.Parallel()
+	engine := &Engine{dispatcherLanesEnabled: true}
+	pd := &peerQueues{
+		heartbeat:   make(chan dispatchRequest, 1),
+		replication: make(chan dispatchRequest, 1),
+		snapshot:    make(chan dispatchRequest, 1),
+		other:       make(chan dispatchRequest, 1),
+	}
+
+	cases := map[raftpb.MessageType]chan dispatchRequest{
+		raftpb.MsgHeartbeat:     pd.heartbeat,
+		raftpb.MsgHeartbeatResp: pd.heartbeat,
+		raftpb.MsgVote:          pd.heartbeat,
+		raftpb.MsgVoteResp:      pd.heartbeat,
+		raftpb.MsgPreVote:       pd.heartbeat,
+		raftpb.MsgPreVoteResp:   pd.heartbeat,
+		raftpb.MsgReadIndex:     pd.heartbeat,
+		raftpb.MsgReadIndexResp: pd.heartbeat,
+		raftpb.MsgTimeoutNow:    pd.heartbeat,
+		raftpb.MsgApp:           pd.replication,
+		raftpb.MsgAppResp:       pd.replication,
+		raftpb.MsgSnap:          pd.snapshot,
+	}
+	for mt, want := range cases {
+		got := engine.selectDispatchLane(pd, mt)
+		require.Equalf(t, want, got, "4-lane mode routing for %s", mt)
+	}
+}
+
+// TestSelectDispatchLane_MsgPropReachesDefaultFallback verifies that MsgProp,
+// which is unreachable in practice because DisableProposalForwarding=true
+// prevents outbound proposals, is routed to the catch-all lane by the default
+// fallback if it ever slips through. This guards against a regression that
+// would panic or misroute MsgProp inside a raft engine goroutine.
+func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
+	t.Parallel()
+	engine := &Engine{nodeID: 1, dispatcherLanesEnabled: true}
+	pd := &peerQueues{
+		heartbeat:   make(chan dispatchRequest, 1),
+		replication: make(chan dispatchRequest, 1),
+		snapshot:    make(chan dispatchRequest, 1),
+		other:       make(chan dispatchRequest, 1),
+	}
+	require.NotPanics(t, func() {
+		got := engine.selectDispatchLane(pd, raftpb.MsgProp)
+		require.Equal(t, pd.other, got)
+	})
+}
+
+// TestFourLaneDispatcher_SnapshotDoesNotBlockReplication exercises the key
+// correctness invariant for the 4-lane layout: a stuck MsgSnap transfer must
+// not prevent MsgApp from being dispatched, because they now run on
+// independent goroutines.
+func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	replicationDone := make(chan struct{}, 1)
+	snapshotBlocking := make(chan struct{})
+	engine := &Engine{
+		nodeID:                 1,
+		peerDispatchers:        make(map[uint64]*peerQueues),
+		perPeerQueueSize:       4,
+		dispatcherLanesEnabled: true,
+		dispatchStopCh:         make(chan struct{}),
+		dispatchCtx:            ctx,
+		dispatchCancel:         cancel,
+	}
+	engine.dispatchFn = func(dctx context.Context, req dispatchRequest) error {
+		switch req.msg.Type { //nolint:exhaustive // test only exercises MsgSnap and MsgApp; other types are irrelevant here
+		case raftpb.MsgSnap:
+			// Block the snapshot lane until the test releases it. The
+			// replication lane should keep flowing in the meantime.
+			select {
+			case <-snapshotBlocking:
+			case <-dctx.Done():
+			}
+		case raftpb.MsgApp:
+			replicationDone <- struct{}{}
+		default:
+			// Other MessageType values are not exercised by this test.
+		}
+		return nil
+	}
+
+	engine.upsertPeer(Peer{NodeID: 2, ID: "peer2", Address: "localhost:2"})
+	pd, ok := engine.peerDispatchers[2]
+	require.True(t, ok)
+	require.NotNil(t, pd.replication)
+	require.NotNil(t, pd.snapshot)
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgSnap, To: 2}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+
+	select {
+	case <-replicationDone:
+	case <-time.After(time.Second):
+		t.Fatal("MsgApp did not dispatch while MsgSnap was stuck — lanes are not independent")
+	}
+
+	close(snapshotBlocking)
+	close(engine.dispatchStopCh)
+	engine.dispatchCancel()
+	engine.dispatchWG.Wait()
+}
+
+// TestFourLaneDispatcher_RemovePeerClosesAllLanes confirms removePeer closes
+// every lane (not just normal/heartbeat) so no worker goroutine leaks under
+// the opt-in 4-lane layout.
+func TestFourLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
+	stopCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	pd := &peerQueues{
+		heartbeat:   make(chan dispatchRequest, 4),
+		replication: make(chan dispatchRequest, 4),
+		snapshot:    make(chan dispatchRequest, 4),
+		other:       make(chan dispatchRequest, 4),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	engine := &Engine{
+		nodeID:                 1,
+		peers:                  map[uint64]Peer{2: {NodeID: 2, ID: "peer2"}},
+		peerDispatchers:        map[uint64]*peerQueues{2: pd},
+		dispatchStopCh:         stopCh,
+		dispatcherLanesEnabled: true,
+	}
+	engine.dispatchWG.Add(4)
+	go engine.runDispatchWorker(ctx, pd.heartbeat)
+	go engine.runDispatchWorker(ctx, pd.replication)
+	go engine.runDispatchWorker(ctx, pd.snapshot)
+	go engine.runDispatchWorker(ctx, pd.other)
+
+	engine.removePeer(2)
+
+	done := make(chan struct{})
+	go func() {
+		engine.dispatchWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("4-lane dispatch workers did not exit after peer removal")
+	}
+
+	// Subsequent sends to the removed peer must be dropped without panic.
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+}
+
+// TestDispatcherLanesEnabledFromEnv pins env-var parsing so a regression in
+// the feature flag can't silently flip the default.
+func TestDispatcherLanesEnabledFromEnv(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{"false", false},
+		{"yes", false},
+	}
+	for _, c := range cases {
+		t.Setenv(dispatcherLanesEnvVar, c.val)
+		require.Equalf(t, c.want, dispatcherLanesEnabledFromEnv(), "env=%q", c.val)
+	}
+}
