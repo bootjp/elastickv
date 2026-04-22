@@ -1720,7 +1720,7 @@ func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 		dispatchCancel:         cancel,
 	}
 	engine.dispatchFn = func(dctx context.Context, req dispatchRequest) error {
-		switch req.msg.Type {
+		switch req.msg.Type { //nolint:exhaustive // test only exercises MsgSnap and MsgApp; other types are irrelevant here
 		case raftpb.MsgSnap:
 			// Block the snapshot lane until the test releases it. The
 			// replication lane should keep flowing in the meantime.
@@ -1730,6 +1730,8 @@ func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 			}
 		case raftpb.MsgApp:
 			replicationDone <- struct{}{}
+		default:
+			// Other MessageType values are not exercised by this test.
 		}
 		return nil
 	}

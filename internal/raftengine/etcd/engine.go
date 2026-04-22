@@ -65,7 +65,7 @@ const (
 	// slower than heartbeat tick issuance. Heartbeats are tiny
 	// (< ~100 B), so 512 × numPeers is ≪ 1 MB total memory; the
 	// upside is that a ~5 s transient pause (election-timeout scale)
-	// no longer drops heartbeats and force the peers' lease to expire.
+	// no longer drops heartbeats and forces the peers' lease to expire.
 	defaultHeartbeatBufPerPeer = 512
 	// defaultSnapshotLaneBufPerPeer sizes the per-peer MsgSnap lane when the
 	// 4-lane dispatcher mode is enabled (see ELASTICKV_RAFT_DISPATCHER_LANES).
@@ -1520,7 +1520,7 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	if !e.dispatcherLanesEnabled {
 		return pd.normal
 	}
-	switch msgType {
+	switch msgType { //nolint:exhaustive // only MsgApp/MsgAppResp/MsgSnap need dedicated lanes; the rest falls through to pd.other
 	case raftpb.MsgApp, raftpb.MsgAppResp:
 		return pd.replication
 	case raftpb.MsgSnap:
