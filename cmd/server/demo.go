@@ -88,6 +88,11 @@ type config struct {
 	raftRedisMap   string
 	raftS3Map      string
 	raftDynamoMap  string
+	// raftPeers, when non-empty, seeds the etcd raft factory with the
+	// full cluster membership. Demo mode populates it for every node so
+	// non-bootstrap nodes start with a known peer list instead of
+	// failing with "no persisted peers and no peer list was supplied".
+	raftPeers []raftengine.Server
 }
 
 func main() {
@@ -177,10 +182,16 @@ func main() {
 		var redisMapParts []string
 		var s3MapParts []string
 		var dynamoMapParts []string
+		peers := make([]raftengine.Server, 0, len(nodes))
 		for _, n := range nodes {
 			redisMapParts = append(redisMapParts, n.address+"="+n.redisAddress)
 			s3MapParts = append(s3MapParts, n.address+"="+n.s3Address)
 			dynamoMapParts = append(dynamoMapParts, n.address+"="+n.dynamoAddress)
+			peers = append(peers, raftengine.Server{
+				Suffrage: "voter",
+				ID:       n.raftID,
+				Address:  n.address,
+			})
 		}
 		raftRedisMapStr := strings.Join(redisMapParts, ",")
 		raftS3MapStr := strings.Join(s3MapParts, ",")
@@ -190,6 +201,12 @@ func main() {
 			n.raftRedisMap = raftRedisMapStr
 			n.raftS3Map = raftS3MapStr
 			n.raftDynamoMap = raftDynamoMapStr
+			n.raftPeers = peers
+			// etcd raft requires every member of a fresh cluster to
+			// bootstrap with the same peer list. Override the per-node
+			// raftBootstrap flag in demo mode so n2/n3 don't fail with
+			// "no persisted peers and no peer list was supplied".
+			n.raftBootstrap = true
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
@@ -484,9 +501,9 @@ func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, c
 }
 
 // openRaftEngine creates the etcd-backed raft engine for a demo node. It
-// resolves the data dir (using a temp dir when cfg.raftDataDir is empty)
-// and registers cleanup callbacks for the data dir, engine and factory
-// resources.
+// resolves the data dir (using a temp dir when cfg.raftDataDir is empty),
+// refuses to start on top of legacy hashicorp/raft state, and registers
+// cleanup callbacks for the data dir, engine and factory resources.
 func openRaftEngine(cfg config, fsm raftengine.StateMachine, cleanup *internalutil.CleanupStack) (*raftengine.FactoryResult, error) {
 	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
 		TickInterval:   demoTickInterval,
@@ -508,10 +525,24 @@ func openRaftEngine(cfg config, fsm raftengine.StateMachine, cleanup *internalut
 		return nil, errors.WithStack(err)
 	}
 
+	// Refuse to start on top of hashicorp/raft artifacts from a previous
+	// deployment. The backend has been removed and silently overwriting
+	// its state with etcd markers could commit to an incompatible engine
+	// over committed data. Fail fast so operators have to migrate
+	// explicitly.
+	for _, legacy := range []string{"raft.db", "logs.dat", "stable.dat"} {
+		if _, err := os.Stat(filepath.Join(raftDir, legacy)); err == nil {
+			return nil, errors.WithStack(errors.Newf("legacy hashicorp/raft artifact %q found in %s; hashicorp backend has been removed, manual migration required", legacy, raftDir))
+		} else if !os.IsNotExist(err) {
+			return nil, errors.WithStack(err)
+		}
+	}
+
 	result, err := factory.Create(raftengine.FactoryConfig{
 		LocalID:      cfg.raftID,
 		LocalAddress: cfg.address,
 		DataDir:      raftDir,
+		Peers:        cfg.raftPeers,
 		Bootstrap:    cfg.raftBootstrap,
 		StateMachine: fsm,
 	})

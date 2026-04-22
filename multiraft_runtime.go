@@ -32,8 +32,9 @@ const (
 )
 
 var (
-	ErrUnsupportedRaftEngine = errors.New("unsupported raft engine")
-	ErrRaftEngineDataDir     = errors.New("raft data dir belongs to a different raft engine")
+	ErrUnsupportedRaftEngine  = errors.New("unsupported raft engine")
+	ErrRaftEngineDataDir      = errors.New("raft data dir belongs to a different raft engine")
+	ErrLegacyHashicorpDataDir = errors.New("raft data dir contains legacy hashicorp/raft artifacts; hashicorp backend has been removed, manual migration to etcd is required")
 )
 
 func parseRaftEngineType(raw string) (raftEngineType, error) {
@@ -90,6 +91,17 @@ func ensureRaftEngineDataDir(dir string, engineType raftEngineType) error {
 		return errors.WithStack(err)
 	}
 
+	// Refuse to start on top of a dir that still holds hashicorp/raft
+	// artifacts. The hashicorp backend has been removed and silently
+	// overwriting its state with etcd markers would commit to an
+	// incompatible engine over committed data. Fail fast; operators must
+	// migrate the dir explicitly before restarting.
+	if hashicorpArtifacts, err := hasHashicorpRaftArtifacts(dir); err != nil {
+		return err
+	} else if hashicorpArtifacts {
+		return errors.Wrapf(ErrLegacyHashicorpDataDir, "%s", dir)
+	}
+
 	markerPath := filepath.Join(dir, raftEngineMarkerFile)
 	if current, ok, err := readRaftEngineMarker(markerPath); err != nil {
 		return err
@@ -108,6 +120,14 @@ func ensureRaftEngineDataDir(dir string, engineType raftEngineType) error {
 		return errors.Wrapf(ErrRaftEngineDataDir, "%s contains %s state, not %s", dir, detected, engineType)
 	}
 	return writeRaftEngineMarker(markerPath, engineType)
+}
+
+// hasHashicorpRaftArtifacts reports whether dir contains any files that
+// were produced by the removed hashicorp/raft backend (raft.db plus the
+// boltdb log/stable files). Used to refuse startup on a legacy data dir
+// rather than silently overwriting it with an etcd-shaped cluster.
+func hasHashicorpRaftArtifacts(dir string) (bool, error) {
+	return hasRaftArtifacts(dir, "raft.db", "logs.dat", "stable.dat")
 }
 
 func readRaftEngineMarker(path string) (raftEngineType, bool, error) {
