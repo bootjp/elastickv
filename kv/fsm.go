@@ -472,10 +472,12 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 		// No commit record yet: reject if a rollback marker is present.
 		// This catches out-of-order apply (COMMIT after ABORT), buggy
 		// clients, and replay races.
-		if _, rerr := f.store.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0)); rerr == nil {
-			return 0, errors.WithStack(ErrTxnAlreadyAborted)
-		} else if !errors.Is(rerr, store.ErrKeyNotFound) {
+		exists, rerr := f.store.ExistsAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0))
+		if rerr != nil {
 			return 0, errors.WithStack(rerr)
+		}
+		if exists {
+			return 0, errors.WithStack(ErrTxnAlreadyAborted)
 		}
 		return startTS, nil
 	}
@@ -661,10 +663,8 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 	// deterministic ({txnRollbackVersion}) and a second Put against
 	// the already-tombstoned key would otherwise be rejected by the
 	// MVCC store as a write conflict (latestCommitTS > startTS).
-	markerPresent := false
-	if _, err := f.store.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0)); err == nil {
-		markerPresent = true
-	} else if !errors.Is(err, store.ErrKeyNotFound) {
+	markerPresent, err := f.store.ExistsAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -673,10 +673,12 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 	// write (or confirm) a rollback marker. This catches out-of-order
 	// apply where a COMMIT somehow landed after a prior ABORT, as
 	// well as the normal "commit wins over rollback" race.
-	if _, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0)); err == nil {
-		return errors.WithStack(ErrTxnAlreadyCommitted)
-	} else if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
+	commitExists, err := f.store.ExistsAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
+	if err != nil {
 		return errors.WithStack(err)
+	}
+	if commitExists {
+		return errors.WithStack(ErrTxnAlreadyCommitted)
 	}
 
 	if markerPresent {
