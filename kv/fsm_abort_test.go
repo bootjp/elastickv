@@ -291,7 +291,14 @@ func TestFSMAbort_AbortTSMustBeGreaterThanStartTS(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 }
 
-func TestFSMAbort_SecondAbortSameTimestampConflicts(t *testing.T) {
+// TestFSMAbort_SecondAbortIsIdempotent pins the intended post-fix
+// behaviour: once a (primaryKey, startTS) pair has a rollback marker,
+// a subsequent abort against the same pair must return nil without
+// touching the store. The previous behaviour (write-conflict on the
+// rollback-marker Put) surfaced in prod as "secondary write failed"
+// log spam whenever dualwrite replay or the lock resolver raced a
+// completed abort.
+func TestFSMAbort_SecondAbortIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -318,10 +325,15 @@ func TestFSMAbort_SecondAbortSameTimestampConflicts(t *testing.T) {
 	_, err = st.GetAt(ctx, txnRollbackKey(primary, startTS), ^uint64(0))
 	require.NoError(t, err)
 
-	// Second abort with the same abortTS triggers a write conflict from the
-	// MVCC store because the rollback key was already written at abortTS.
+	// Same-abortTS retry: used to conflict; now must be a no-op.
 	err = abortTxn(t, fsm, primary, startTS, abortTS, [][]byte{primary, key})
-	require.Error(t, err, "second abort at the same abortTS should conflict")
+	require.NoError(t, err, "same-abortTS retry must be idempotent")
+
+	// Later-abortTS retry (HLC-monotonic): also no-op. This is the
+	// prod path where a second lock resolver arrives seconds after
+	// the first one completed.
+	err = abortTxn(t, fsm, primary, startTS, abortTS+100, [][]byte{primary, key})
+	require.NoError(t, err, "later-abortTS retry must be idempotent")
 }
 
 func TestFSMAbort_MissingPrimaryKeyReturnsError(t *testing.T) {

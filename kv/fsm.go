@@ -525,6 +525,25 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
+	// Idempotency short-circuit: if the rollback marker for this
+	// (primaryKey, startTS) already exists, a previous abort already
+	// completed the whole cleanup atomically (ApplyMutations writes the
+	// rollback marker together with the lock/intent deletes in one
+	// batch, so the marker's presence proves cleanup ran). Without this
+	// guard a retry or a concurrent second lock-resolver would re-emit
+	// Delete mutations on already-tombstoned lock/intent keys and a
+	// duplicate rollback-marker Put — all three would be rejected by
+	// the MVCC store as write conflicts (latestCommitTS > startTS) and
+	// surface in prod as "secondary write failed" log spam without
+	// changing any state. Rollback markers are deterministic
+	// ({txnRollbackVersion}) so second-writer-wins would be equivalent
+	// anyway; skipping the work is simpler and cheaper.
+	if _, err := f.store.GetAt(ctx, txnRollbackKey(meta.PrimaryKey, startTS), ^uint64(0)); err == nil {
+		return nil
+	} else if !errors.Is(err, store.ErrKeyNotFound) {
+		return errors.WithStack(err)
+	}
+
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
