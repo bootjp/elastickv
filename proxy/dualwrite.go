@@ -319,6 +319,8 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 // structured warning with enough context to diagnose EVALSHA timeouts.
 func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapsed time.Duration, attempts int, usedNOSCRIPTFallback bool, sErr error) {
 	d.metrics.SecondaryWriteErrors.Inc()
+	reason := classifySecondaryWriteError(sErr)
+	d.metrics.SecondaryWriteErrorsByReason.WithLabelValues(cmd, reason).Inc()
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "error").Inc()
 	fingerprint := fmt.Sprintf("secondary_write_%s", cmd)
 	if d.sentry.ShouldReport(fingerprint) {
@@ -487,4 +489,32 @@ func argsToBytes(iArgs []any) [][]byte {
 		}
 	}
 	return out
+}
+
+// classifySecondaryWriteError maps a secondary-write error to a small fixed set
+// of reason labels suitable for a Prometheus counter. The elastickv secondary
+// backend is in-house, so matching on substrings of the error message is safe.
+//
+// Order matters: "retry limit exceeded" is checked before "write conflict"
+// because the retry-limit message embeds the underlying conflict string, and
+// we want the outer (retry_limit) classification to win.
+func classifySecondaryWriteError(err error) string {
+	if err == nil {
+		return "other"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "retry limit exceeded"):
+		return "retry_limit"
+	case strings.Contains(msg, "write conflict"):
+		return "write_conflict"
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(msg, "deadline exceeded"):
+		return "deadline_exceeded"
+	case strings.Contains(msg, "not leader"):
+		return "not_leader"
+	case strings.Contains(msg, "txn already committed") || strings.Contains(msg, "txn already aborted"):
+		return "txn_already_finalized"
+	default:
+		return "other"
+	}
 }

@@ -7,12 +7,13 @@ type ProxyMetrics struct {
 	CommandTotal    *prometheus.CounterVec
 	CommandDuration *prometheus.HistogramVec
 
-	PrimaryWriteErrors   prometheus.Counter
-	SecondaryWriteErrors prometheus.Counter
-	PrimaryReadErrors    prometheus.Counter
-	ShadowReadErrors     prometheus.Counter
-	Divergences          *prometheus.CounterVec
-	MigrationGaps        *prometheus.CounterVec
+	PrimaryWriteErrors           prometheus.Counter
+	SecondaryWriteErrors         prometheus.Counter
+	SecondaryWriteErrorsByReason *prometheus.CounterVec
+	PrimaryReadErrors            prometheus.Counter
+	ShadowReadErrors             prometheus.Counter
+	Divergences                  *prometheus.CounterVec
+	MigrationGaps                *prometheus.CounterVec
 
 	ActiveConnections prometheus.Gauge
 
@@ -48,6 +49,11 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 			Name:      "secondary_write_errors_total",
 			Help:      "Total write errors from the secondary backend.",
 		}),
+		SecondaryWriteErrorsByReason: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "proxy",
+			Name:      "secondary_write_errors_by_reason_total",
+			Help:      "secondary write failures broken out by redis command and error classification (write_conflict / retry_limit / not_leader / deadline_exceeded / other)",
+		}, []string{"cmd", "reason"}),
 		PrimaryReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "proxy",
 			Name:      "primary_read_errors_total",
@@ -98,6 +104,7 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		m.CommandDuration,
 		m.PrimaryWriteErrors,
 		m.SecondaryWriteErrors,
+		m.SecondaryWriteErrorsByReason,
 		m.PrimaryReadErrors,
 		m.ShadowReadErrors,
 		m.Divergences,
