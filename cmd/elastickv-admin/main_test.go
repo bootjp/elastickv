@@ -156,6 +156,71 @@ func writePEMCert(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+func TestLoadTokenRejectsOversizedFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "huge")
+	// One byte past the cap: exact boundary plus one.
+	payload := strings.Repeat("x", maxTokenFileBytes+1)
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadToken(path, false)
+	if err == nil || !strings.Contains(err.Error(), "maximum is") {
+		t.Fatalf("expected size-cap error, got %v", err)
+	}
+}
+
+func TestMembersFromCapsAtMaxDiscoveredNodes(t *testing.T) {
+	t.Parallel()
+	resp := &pb.GetClusterOverviewResponse{
+		Self: &pb.NodeIdentity{GrpcAddress: "self:1"},
+	}
+	// Return way more members than the cap allows.
+	for i := 0; i < maxDiscoveredNodes+50; i++ {
+		resp.Members = append(resp.Members, &pb.NodeIdentity{
+			GrpcAddress: "node-" + strconvItoa(i) + ":1",
+		})
+	}
+	got := membersFrom("seed:1", resp)
+	if len(got) != maxDiscoveredNodes {
+		t.Fatalf("len = %d, want %d (cap)", len(got), maxDiscoveredNodes)
+	}
+}
+
+// small helper to avoid pulling strconv into the test file just for one call.
+func strconvItoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var digits []byte
+	for i > 0 {
+		digits = append([]byte{byte('0' + i%10)}, digits...)
+		i /= 10
+	}
+	return string(digits)
+}
+
+func TestFanoutClientCacheEvictsWhenFull(t *testing.T) {
+	t.Parallel()
+	f := newFanout([]string{"seed:1"}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	// Fill the cache past the cap. New dials should not error out and the
+	// map must stay bounded.
+	for i := 0; i < maxCachedClients+5; i++ {
+		if _, err := f.clientFor("node-" + strconvItoa(i) + ":1"); err != nil {
+			t.Fatalf("clientFor[%d]: %v", i, err)
+		}
+	}
+	f.mu.Lock()
+	size := len(f.clients)
+	f.mu.Unlock()
+	if size > maxCachedClients {
+		t.Fatalf("cache size = %d, exceeds cap %d", size, maxCachedClients)
+	}
+}
+
 func TestMembersFromDeduplicatesAndIncludesSeed(t *testing.T) {
 	t.Parallel()
 	resp := &pb.GetClusterOverviewResponse{

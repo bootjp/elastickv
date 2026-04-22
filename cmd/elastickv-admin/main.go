@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -49,6 +50,19 @@ const (
 	idleTimeout             = 120 * time.Second
 	shutdownTimeout         = 5 * time.Second
 	maxRequestBodyBytes     = 4 << 10
+	// maxTokenFileBytes caps the admin-token file so a misconfigured path
+	// pointing at a huge file (for example a log) cannot force the admin
+	// process to allocate arbitrary memory before the bearer-token check.
+	maxTokenFileBytes = 4 << 10
+	// maxCachedClients caps the fanout's cached gRPC connections so a cluster
+	// with high node churn or a malicious discovery response cannot leak file
+	// descriptors indefinitely. Sized to cover tested cluster sizes while
+	// staying well below typical ulimits.
+	maxCachedClients = 256
+	// maxDiscoveredNodes bounds the member list returned by a peer's
+	// GetClusterOverview so a malicious or misconfigured node cannot force
+	// the admin binary to spawn unbounded goroutines / gRPC calls.
+	maxDiscoveredNodes = 512
 )
 
 var (
@@ -167,6 +181,15 @@ func loadToken(path string, insecureMode bool) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "resolve token path")
 	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", errors.Wrap(err, "stat token file")
+	}
+	if info.Size() > maxTokenFileBytes {
+		return "", fmt.Errorf("token file %s is %d bytes; maximum is %d — refusing to load",
+			abs, info.Size(), maxTokenFileBytes)
+	}
+	// Size is bounded above, so materializing the file is safe.
 	b, err := os.ReadFile(abs)
 	if err != nil {
 		return "", errors.Wrap(err, "read token file")
@@ -297,6 +320,27 @@ func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 	if c, ok := f.clients[addr]; ok {
 		return c, nil
 	}
+	// Bound the cache so a high-churn cluster or a stream of hostile
+	// discovery responses cannot leak file descriptors. Evict any one entry
+	// (map iteration is randomized) to make room; the evicted target will be
+	// re-dialed on demand if it comes back. Never evict an address that is in
+	// the active seeds list.
+	if len(f.clients) >= maxCachedClients {
+		seeds := map[string]struct{}{}
+		for _, s := range f.seeds {
+			seeds[s] = struct{}{}
+		}
+		for victim, vc := range f.clients {
+			if _, keep := seeds[victim]; keep {
+				continue
+			}
+			delete(f.clients, victim)
+			if err := vc.conn.Close(); err != nil {
+				log.Printf("elastickv-admin: evict %s: close: %v", victim, err)
+			}
+			break
+		}
+	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(f.creds))
 	if err != nil {
 		return nil, errors.Wrapf(err, "dial %s", addr)
@@ -407,16 +451,23 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 
 // membersFrom extracts a deduplicated address list from a cluster overview
 // response, always including the node that answered so the answering seed is
-// still queried even if it omits itself from members.
+// still queried even if it omits itself from members. The result is capped at
+// maxDiscoveredNodes so a malicious or misconfigured peer cannot inflate the
+// fan-out.
 func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(resp.GetMembers())+1)
+	truncated := false
 	add := func(addr string) {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			return
 		}
 		if _, dup := seen[addr]; dup {
+			return
+		}
+		if len(out) >= maxDiscoveredNodes {
+			truncated = true
 			return
 		}
 		seen[addr] = struct{}{}
@@ -428,6 +479,9 @@ func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
 	}
 	for _, m := range resp.GetMembers() {
 		add(m.GetGrpcAddress())
+	}
+	if truncated {
+		log.Printf("elastickv-admin: discovery response exceeded %d nodes; truncating (peer=%s)", maxDiscoveredNodes, seed)
 	}
 	return out
 }
