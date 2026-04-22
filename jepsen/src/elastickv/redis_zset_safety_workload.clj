@@ -341,9 +341,15 @@
     mutations-by-m))
 
 (defn- concurrent-mutations-for-member
-  "All mutations (ok or info) that are concurrent with the read window."
+  "All mutations concurrent with the read window that could have taken
+  effect. :fail completions are excluded: in Jepsen, :fail means the op
+  definitively did NOT execute, so it contributes neither an allowed
+  score nor uncertainty about presence. :ok and :info/:pending are
+  included (either may be visible to the read)."
   [muts read-inv-idx read-cmp-idx]
-  (filter #(concurrent? % read-inv-idx read-cmp-idx) muts))
+  (filter #(and (not= :fail (:type %))
+                (concurrent? % read-inv-idx read-cmp-idx))
+          muts))
 
 (defn- write-op?
   "True iff the mutation adds/updates the member's score (i.e. would

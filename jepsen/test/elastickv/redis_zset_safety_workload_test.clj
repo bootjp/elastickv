@@ -334,6 +334,56 @@
         (str "expected :missing-member, got kinds=" kinds))))
 
 ;; ---------------------------------------------------------------------------
+;; Failed-concurrent mutations must not contribute to uncertainty (codex P1)
+;; ---------------------------------------------------------------------------
+
+(deftest failed-concurrent-zrem-does-not-relax-must-be-present
+  ;; codex P1: a concurrent ZREM that completes with :fail did NOT take
+  ;; effect. Its window must NOT make the member's presence uncertain,
+  ;; so a read that omits the member (which was ZADDed and committed
+  ;; beforehand) must be flagged as :missing-member.
+  (let [history [;; ZADD m1 committed before the read.
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 ;; ZREM m1 is invoked concurrently with the read but
+                 ;; ultimately :fails -- the op definitively did NOT run.
+                 {:type :invoke :process 1 :f :zrem :value "m1" :index 2}
+                 {:type :invoke :process 0 :f :zrange-all :index 3}
+                 ;; Read observes m1 ABSENT -- without the fix, the
+                 ;; failed ZREM would admit this as "possibly removed".
+                 {:type :ok     :process 0 :f :zrange-all :value [] :index 4}
+                 {:type :fail   :process 1 :f :zrem :value "m1" :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected :missing-member despite failed ZREM, got: " result))
+    (is (contains? kinds :missing-member)
+        (str "expected :missing-member, got kinds=" kinds))))
+
+(deftest failed-concurrent-zadd-does-not-contribute-allowed-score
+  ;; codex P1: a concurrent ZADD that completes with :fail did NOT take
+  ;; effect. Its score must NOT be added to the allowed set. A read
+  ;; observing that score must be flagged as :score-mismatch rather than
+  ;; being waved through by the failed ZADD's ghost contribution.
+  (let [history [;; ZADD m1 at score 1 committed before the read.
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 ;; Concurrent ZADD m1 at score 42 ultimately :fails.
+                 {:type :invoke :process 1 :f :zadd :value ["m1" 42] :index 2}
+                 {:type :invoke :process 0 :f :zrange-all :index 3}
+                 ;; Read observes score 42 -- only valid if the failed
+                 ;; ZADD is (incorrectly) admitted as a possible write.
+                 {:type :ok     :process 0 :f :zrange-all
+                  :value [["m1" 42.0]] :index 4}
+                 {:type :fail   :process 1 :f :zadd :value ["m1" 42] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected :score-mismatch ignoring failed ZADD, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
+;; ---------------------------------------------------------------------------
 ;; Infinity score parsing
 ;; ---------------------------------------------------------------------------
 
