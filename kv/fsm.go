@@ -457,12 +457,26 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 // commitApplyStartTS resolves the startTS to use for MVCC conflict detection
 // during a COMMIT. If a commit record already exists for the primary key it
 // returns commitTS (making the apply idempotent); otherwise it returns startTS.
+//
+// It is also the symmetric guard to appendRollbackRecord: if a rollback marker
+// already exists for (primaryKey, startTS) the commit is rejected with
+// ErrTxnAlreadyAborted. Together with the commit-record check in
+// appendRollbackRecord, this enforces the invariant that at most one of
+// {rollback marker, commit record} is present for any (primaryKey, startTS).
 func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, startTS, commitTS uint64) (uint64, error) {
 	recordedCommitTS, committed, err := f.txnCommitTS(ctx, primaryKey, startTS)
 	if err != nil {
 		return 0, err
 	}
 	if !committed {
+		// No commit record yet: reject if a rollback marker is present.
+		// This catches out-of-order apply (COMMIT after ABORT), buggy
+		// clients, and replay races.
+		if _, rerr := f.store.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0)); rerr == nil {
+			return 0, errors.WithStack(ErrTxnAlreadyAborted)
+		} else if !errors.Is(rerr, store.ErrKeyNotFound) {
+			return 0, errors.WithStack(rerr)
+		}
 		return startTS, nil
 	}
 	if recordedCommitTS != commitTS {
@@ -634,28 +648,39 @@ func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.
 }
 
 func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, startTS uint64, storeMuts *[]*store.KVPairMutation) error {
+	// Desired invariant: for any (primaryKey, startTS) pair, at most
+	// one of {rollback marker, commit record} is present. The invariant
+	// holds when aborts/commits flow through the symmetric guards in
+	// this function and handleCommitRequest, but we cannot *assume* it
+	// on entry (a buggy client, replay, or race may violate it), so we
+	// verify it in-line below on both the first-time and idempotent
+	// paths.
+	//
 	// Idempotent rollback: if the marker already exists for this
 	// (primaryKey, startTS), skip the Put. Rollback markers are
 	// deterministic ({txnRollbackVersion}) and a second Put against
 	// the already-tombstoned key would otherwise be rejected by the
 	// MVCC store as a write conflict (latestCommitTS > startTS).
-	//
-	// Safety: if the rollback marker is present, the commit record
-	// must be absent for this (primaryKey, startTS) because the
-	// commit-wins-over-rollback check below ran when the marker was
-	// first written, so we skip the commit check on the idempotent
-	// path.
+	markerPresent := false
 	if _, err := f.store.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0)); err == nil {
-		return nil
+		markerPresent = true
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return errors.WithStack(err)
 	}
 
-	// Don't allow rollback to win after commit record exists.
+	// Verify the invariant regardless of marker presence: if a commit
+	// record is present for this (primaryKey, startTS), refuse to
+	// write (or confirm) a rollback marker. This catches out-of-order
+	// apply where a COMMIT somehow landed after a prior ABORT, as
+	// well as the normal "commit wins over rollback" race.
 	if _, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0)); err == nil {
 		return errors.WithStack(ErrTxnAlreadyCommitted)
 	} else if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return errors.WithStack(err)
+	}
+
+	if markerPresent {
+		return nil
 	}
 
 	*storeMuts = append(*storeMuts, &store.KVPairMutation{

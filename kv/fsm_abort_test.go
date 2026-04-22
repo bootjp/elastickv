@@ -294,7 +294,9 @@ func TestFSMAbort_AbortTSMustBeGreaterThanStartTS(t *testing.T) {
 // TestFSMAbort_SecondAbortSameKeysIsIdempotent pins post-fix
 // behaviour: once a (primaryKey, startTS) abort has cleaned up its
 // keys and written the rollback marker, a subsequent abort over the
-// same mutation set must return nil without touching the store.
+// same mutation set must return nil without performing additional
+// writes or store mutations (reads are allowed — the idempotent path
+// still probes for the rollback marker and commit record via GetAt).
 // Idempotency is enforced per-key in shouldClearAbortKey (lock
 // already gone ⇒ skip) and by appendRollbackRecord (marker already
 // present ⇒ skip). The prior behaviour (write-conflict on the
@@ -502,6 +504,53 @@ func TestFSMAbort_MissingPrimaryKeyReturnsError(t *testing.T) {
 	err := applyFSMRequest(t, fsm, req)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
+}
+
+// TestFSMAbort_CommitAfterAbortIsRejected pins the symmetric guard in
+// commitApplyStartTS: if a rollback marker is already present for a
+// (primaryKey, startTS), an incoming COMMIT must be rejected with
+// ErrTxnAlreadyAborted instead of silently creating the inconsistent
+// (marker + commit record both exist) state.
+func TestFSMAbort_CommitAfterAbortIsRejected(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	startTS := uint64(10)
+	abortTS := uint64(20)
+	commitTS := uint64(30)
+	primary := []byte("pk")
+
+	// Prepare, then abort — marker is now written.
+	prepareTxn(t, fsm, primary, startTS, [][]byte{primary}, [][]byte{[]byte("v")})
+	require.NoError(t, abortTxn(t, fsm, primary, startTS, abortTS, [][]byte{primary}))
+
+	// Confirm marker exists and no commit record exists.
+	_, err := st.GetAt(ctx, txnRollbackKey(primary, startTS), ^uint64(0))
+	require.NoError(t, err, "rollback marker must exist after abort")
+	_, err = st.GetAt(ctx, txnCommitKey(primary, startTS), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "commit record must NOT exist after abort")
+
+	// A COMMIT for the same (primaryKey, startTS) must be rejected.
+	commitReq := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primary, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primary},
+		},
+	}
+	err = applyFSMRequest(t, fsm, commitReq)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnAlreadyAborted)
+
+	// Invariant check: commit record must still be absent after the rejection.
+	_, err = st.GetAt(ctx, txnCommitKey(primary, startTS), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "commit record must not have been written after rejection")
 }
 
 func TestFSMAbort_EmptyMutationsReturnsError(t *testing.T) {
