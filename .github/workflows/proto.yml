@@ -1,0 +1,53 @@
+on:
+  push:
+    paths:
+      - 'proto/**'
+      - '.github/workflows/proto.yml'
+  pull_request:
+    paths:
+      - 'proto/**'
+      - '.github/workflows/proto.yml'
+
+name: Proto
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proto:
+    runs-on: ubuntu-latest
+    env:
+      BUF_VERSION: 1.55.1
+      PROTOC_GEN_GO_VERSION: v1.36.11
+      PROTOC_GEN_GO_GRPC_VERSION: v1.6.1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Install buf
+        run: go install github.com/bufbuild/buf/cmd/buf@v${{ env.BUF_VERSION }}
+      - name: Install protoc-gen-go
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+      - name: Install protoc-gen-go-grpc
+        run: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
+      - name: buf breaking (against main)
+        if: github.ref != 'refs/heads/main'
+        working-directory: proto
+        run: buf breaking --against '../.git#subdir=proto,branch=main'
+      - name: buf generate
+        working-directory: proto
+        run: buf generate
+      - name: Fail on regenerated diff
+        run: |
+          if ! git diff --exit-code -- proto/; then
+            echo "::error::Generated proto files differ from committed output. Run 'make -C proto gen' and commit the result."
+            exit 1
+          fi
+      - name: go build
+        run: go build ./...

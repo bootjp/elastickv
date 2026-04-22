@@ -1,39 +1,41 @@
-PROTOC_VERSION := libprotoc 29.3
-PROTOC_GEN_GO_VERSION := protoc-gen-go v1.36.11
-PROTOC_GEN_GO_GRPC_VERSION := protoc-gen-go-grpc 1.6.1
+BUF_VERSION := 1.55.1
+PROTOC_GEN_GO_VERSION := v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION := 1.6.1
 
-.PHONY: all gen check-tools
+BUF ?= buf
+BREAKING_AGAINST ?= ../.git#subdir=proto,branch=main
+
+.PHONY: all gen check-tools breaking
 
 all: gen
 
 check-tools:
-	@if [ "$$(protoc --version)" != "$(PROTOC_VERSION)" ]; then \
-		echo "expected $(PROTOC_VERSION), got $$(protoc --version)"; \
+	@command -v $(BUF) >/dev/null 2>&1 || { \
+		echo "buf not found; install with:"; \
+		echo "  go install github.com/bufbuild/buf/cmd/buf@v$(BUF_VERSION)"; \
 		exit 1; \
+	}
+	@installed_buf=$$($(BUF) --version 2>/dev/null); \
+	if [ "$$installed_buf" != "$(BUF_VERSION)" ]; then \
+		echo "warning: buf version mismatch (expected $(BUF_VERSION), got $$installed_buf)"; \
 	fi
-	@if [ "$$(protoc-gen-go --version)" != "$(PROTOC_GEN_GO_VERSION)" ]; then \
-		echo "expected $(PROTOC_GEN_GO_VERSION), got $$(protoc-gen-go --version)"; \
+	@command -v protoc-gen-go >/dev/null 2>&1 || { \
+		echo "protoc-gen-go not found; install with:"; \
+		echo "  go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)"; \
 		exit 1; \
-	fi
-	@if [ "$$(protoc-gen-go-grpc --version)" != "$(PROTOC_GEN_GO_GRPC_VERSION)" ]; then \
-		echo "expected $(PROTOC_GEN_GO_GRPC_VERSION), got $$(protoc-gen-go-grpc --version)"; \
+	}
+	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || { \
+		echo "protoc-gen-go-grpc not found; install with:"; \
+		echo "  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)"; \
 		exit 1; \
+	}
+
+breaking: check-tools
+	@if git -C .. rev-parse --verify main >/dev/null 2>&1; then \
+		$(BUF) breaking --against '$(BREAKING_AGAINST)'; \
+	else \
+		echo "skip breaking check: main branch not found"; \
 	fi
 
-gen: check-tools
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    service.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    distribution.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    dynamodb_internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    redis_internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    etcd_raft.proto
+gen: check-tools breaking
+	$(BUF) generate
