@@ -58,7 +58,7 @@ func TestPebbleCollectorMirrorsGaugesAndCounters(t *testing.T) {
 	require.NotNil(t, collector)
 
 	src := &fakePebbleSource{}
-	sources := []PebbleSource{{GroupID: 1, Source: src}}
+	sources := []PebbleSource{{GroupID: 1, GroupIDStr: "1", Source: src}}
 
 	// Baseline tick: initial counter values establish the delta
 	// baseline, gauges reflect the snapshot immediately.
@@ -143,7 +143,7 @@ func TestPebbleCollectorHandlesSourceReset(t *testing.T) {
 	require.NotNil(t, collector)
 
 	src := &fakePebbleSource{}
-	sources := []PebbleSource{{GroupID: 7, Source: src}}
+	sources := []PebbleSource{{GroupID: 7, GroupIDStr: "7", Source: src}}
 
 	src.set(newFakeMetrics(0, 0, 0, 0, 10, 0, 0, 0, 0, 100, 5))
 	collector.ObserveOnce(sources) // baseline: 10 compactions, 100 hits
@@ -179,11 +179,11 @@ func TestPebbleCollectorSkipsNilSnapshot(t *testing.T) {
 	require.NotNil(t, collector)
 
 	src := &fakePebbleSource{}
-	sources := []PebbleSource{{GroupID: 9, Source: src}}
+	sources := []PebbleSource{{GroupID: 9, GroupIDStr: "9", Source: src}}
 
 	// Both nil-source and nil-snapshot should be safe.
 	require.NotPanics(t, func() { collector.ObserveOnce(sources) })
-	require.NotPanics(t, func() { collector.ObserveOnce([]PebbleSource{{GroupID: 1, Source: nil}}) })
+	require.NotPanics(t, func() { collector.ObserveOnce([]PebbleSource{{GroupID: 1, GroupIDStr: "1", Source: nil}}) })
 
 	// No gauges or counters should exist yet.
 	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.l0Sublevels))

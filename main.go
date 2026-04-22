@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -467,8 +468,9 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 			continue
 		}
 		out = append(out, monitoring.PebbleSource{
-			GroupID: runtime.spec.id,
-			Source:  src,
+			GroupID:    runtime.spec.id,
+			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			Source:     src,
 		})
 	}
 	return out

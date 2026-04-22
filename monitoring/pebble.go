@@ -2,7 +2,6 @@ package monitoring
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"time"
 
@@ -160,9 +159,13 @@ type PebbleMetricsSource interface {
 
 // PebbleSource binds a raft group ID to its Pebble store. Multiple
 // groups can be polled by a single collector on a sharded node.
+// GroupIDStr is the pre-formatted decimal form of GroupID used as the
+// "group" Prometheus label; pre-computing it avoids a per-tick
+// strconv.FormatUint allocation in observeOnce.
 type PebbleSource struct {
-	GroupID uint64
-	Source  PebbleMetricsSource
+	GroupID    uint64
+	GroupIDStr string
+	Source     PebbleMetricsSource
 }
 
 // PebbleCollector polls each registered Pebble store on a fixed
@@ -235,7 +238,7 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 		if snap == nil {
 			continue
 		}
-		group := strconv.FormatUint(src.GroupID, 10)
+		group := src.GroupIDStr
 
 		// L0 pressure: gauges, overwritten each tick.
 		c.metrics.l0Sublevels.WithLabelValues(group).Set(float64(snap.Levels[0].Sublevels))
