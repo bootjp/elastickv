@@ -235,6 +235,13 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server, waitTimeout, waitInterval time.Duration) {
 	t.Helper()
 
+	// Existing tests assume hosts[0] (node 0) is the cluster leader — the
+	// previous hashicorp setup ensured this by giving node 0 an immediate
+	// election timeout while others waited 10s. etcd/raft elections are
+	// randomised, so whoever wins the first election is effectively random.
+	// Nudge leadership onto node 0 if a different node won.
+	ensureNodeZeroIsLeader(t, nodes, peers, waitTimeout, waitInterval)
+
 	assert.Eventually(t, func() bool {
 		var leaderAddr string
 		for _, n := range nodes {
@@ -256,6 +263,52 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 		}
 		return false
 	}, waitTimeout, waitInterval)
+}
+
+// ensureNodeZeroIsLeader waits for any node to become leader, then (if
+// necessary) triggers a leadership transfer to node 0 so downstream
+// tests that assume hosts[0] is authoritative keep working.
+func ensureNodeZeroIsLeader(t *testing.T, nodes []Node, peers []raftengine.Server, waitTimeout, waitInterval time.Duration) {
+	t.Helper()
+
+	if len(nodes) == 0 || len(peers) == 0 {
+		return
+	}
+	targetAddr := peers[0].Address
+
+	// Step 1: wait until some node is leader so we know the cluster is live.
+	assert.Eventually(t, func() bool {
+		for _, n := range nodes {
+			if n.engine.State() == raftengine.StateLeader {
+				return true
+			}
+		}
+		return false
+	}, waitTimeout, waitInterval, "no node became leader")
+
+	// Step 2: if node 0 isn't already leader, ask the current leader to
+	// transfer leadership to it. This is best-effort — a transfer can
+	// race with another election, in which case the Eventually below
+	// will retry.
+	assert.Eventually(t, func() bool {
+		if nodes[0].engine.State() == raftengine.StateLeader {
+			return true
+		}
+		for _, n := range nodes {
+			if n.engine.State() != raftengine.StateLeader {
+				continue
+			}
+			admin, ok := n.engine.(raftengine.Admin)
+			if !ok {
+				return false
+			}
+			transferCtx, cancel := context.WithTimeout(context.Background(), waitInterval)
+			_ = admin.TransferLeadershipToServer(transferCtx, peers[0].ID, targetAddr)
+			cancel()
+			break
+		}
+		return false
+	}, waitTimeout, waitInterval, "node 0 did not become leader")
 }
 
 func assignPorts(n int) []portsAdress {
