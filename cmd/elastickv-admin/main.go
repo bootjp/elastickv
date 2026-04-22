@@ -39,6 +39,11 @@ const (
 	defaultNodesRefreshInterval = 15 * time.Second
 	defaultGRPCRequestTimeout   = 10 * time.Second
 	discoveryRPCTimeout         = 2 * time.Second
+	// discoveryWaitBudget is how long a request handler is willing to wait
+	// for the singleflight membership refresh before falling back to the
+	// cached (or static seed) list. Kept well below defaultGRPCRequestTimeout
+	// so a slow discovery cannot starve the subsequent per-node fan-out.
+	discoveryWaitBudget = 3 * time.Second
 	// membershipRefreshBudget caps the detached background refresh so it
 	// cannot run forever even if every seed is slow. Sized for up to a few
 	// sequential discoveryRPCTimeout attempts before the singleflight
@@ -515,10 +520,16 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+
+	// Split the discovery and per-node fan-out budgets. Reusing one ctx for
+	// both lets a slow membership refresh consume the entire deadline and
+	// leave the fan-out with an already-canceled context, so separate them.
+	discoveryCtx, discoveryCancel := context.WithTimeout(r.Context(), discoveryWaitBudget)
+	targets := f.currentTargets(discoveryCtx)
+	discoveryCancel()
+
 	ctx, cancel := context.WithTimeout(r.Context(), defaultGRPCRequestTimeout)
 	defer cancel()
-
-	targets := f.currentTargets(ctx)
 	results := make([]perNodeResult, len(targets))
 	var wg sync.WaitGroup
 	for i, addr := range targets {
