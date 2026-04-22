@@ -140,3 +140,79 @@
         result  (run-checker history)]
     (is (:valid? result)
         (str "expected :info-before-read to skip strict score check, got: " result))))
+
+;; ---------------------------------------------------------------------------
+;; Stale-read / phantom / superseded-committed checks (gemini HIGH)
+;; ---------------------------------------------------------------------------
+
+(deftest phantom-member-is-flagged
+  ;; gemini HIGH: a read that observes a member which was never added
+  ;; (no ZADD/ZINCRBY/true-ZREM anywhere) must be rejected.
+  (let [history [{:type :invoke :process 0 :f :zrange-all :index 0}
+                 {:type :ok     :process 0 :f :zrange-all
+                  :value [["never-added" 42.0]] :index 1}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result)) (str "expected phantom error, got: " result))
+    (is (contains? kinds :unexpected-presence)
+        (str "expected :unexpected-presence, got kinds=" kinds))))
+
+(deftest stale-read-after-committed-zrem-is-flagged
+  ;; gemini HIGH: once a ZADD and a subsequent real (:removed? true) ZREM
+  ;; have BOTH committed (with no concurrent re-add), a later read that
+  ;; still sees the member must be rejected as a stale read.
+  (let [history [;; Add then remove m1 — both committed before any read.
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 {:type :invoke :process 0 :f :zrem :value "m1" :index 2}
+                 {:type :ok     :process 0 :f :zrem :value ["m1" true] :index 3}
+                 ;; Stale read: m1 somehow still appears.
+                 {:type :invoke :process 1 :f :zrange-all :index 4}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0]] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result)) (str "expected stale-read error, got: " result))
+    (is (contains? kinds :unexpected-presence)
+        (str "expected :unexpected-presence, got kinds=" kinds))))
+
+(deftest superseded-committed-score-is-not-allowed
+  ;; gemini HIGH: a ZADD committed BEFORE another ZADD for the same
+  ;; member whose invoke strictly followed it should not be treated as
+  ;; a valid post-state score. Only the latest committed score (plus
+  ;; concurrent in-flight) may be observed.
+  (let [history [;; ZADD m1 1 commits first ...
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 ;; ... then ZADD m1 2 is invoked strictly after, and
+                 ;; also commits before the read.
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 2] :index 2}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 2] :index 3}
+                 ;; Read observing the SUPERSEDED score 1.0 — invalid.
+                 {:type :invoke :process 1 :f :zrange-all :index 4}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0]] :index 5}]
+        result  (run-checker history)]
+    (is (not (:valid? result))
+        (str "expected superseded-score mismatch, got: " result))))
+
+;; ---------------------------------------------------------------------------
+;; Infinity score parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-withscores-handles-inf-strings
+  ;; gemini HIGH: Redis returns "inf" / "+inf" / "-inf" for infinite
+  ;; ZSET scores. Double/parseDouble expects "Infinity"; the workload's
+  ;; parser must normalize both encodings instead of throwing.
+  (let [flat ["m-pos"  "inf"
+              "m-pos2" "+inf"
+              "m-neg"  "-inf"
+              "m-jvm"  "Infinity"
+              "m-num"  "3.5"]
+        parsed (#'workload/parse-withscores flat)]
+    (is (= [["m-pos"  Double/POSITIVE_INFINITY]
+            ["m-pos2" Double/POSITIVE_INFINITY]
+            ["m-neg"  Double/NEGATIVE_INFINITY]
+            ["m-jvm"  Double/POSITIVE_INFINITY]
+            ["m-num"  3.5]]
+           parsed))))

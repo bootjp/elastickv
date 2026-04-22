@@ -68,6 +68,24 @@
 ;; Client
 ;; ---------------------------------------------------------------------------
 
+(defn- parse-double-safe
+  "Parse a Redis score string into a Double. Redis serializes infinite
+  scores as \"inf\" / \"+inf\" / \"-inf\", which Java's Double/parseDouble
+  does not accept (it expects \"Infinity\" / \"-Infinity\"). Handle both
+  encodings so the checker doesn't throw on infinite ZSET scores."
+  [s]
+  (let [raw   (str s)
+        lower (str/lower-case raw)]
+    (cond
+      (or (= lower "inf") (= lower "+inf") (= lower "infinity") (= lower "+infinity"))
+      Double/POSITIVE_INFINITY
+
+      (or (= lower "-inf") (= lower "-infinity"))
+      Double/NEGATIVE_INFINITY
+
+      :else
+      (Double/parseDouble raw))))
+
 (defn- parse-withscores
   "Carmine returns a flat [member score member score ...] vector for
   ZRANGE WITHSCORES. Convert to a sorted vector of [member (double score)]
@@ -77,7 +95,7 @@
        (partition 2)
        (mapv (fn [[m s]]
                [(if (bytes? m) (String. ^bytes m) (str m))
-                (Double/parseDouble (str s))]))))
+                (parse-double-safe s)]))))
 
 (defrecord ElastickvRedisZSetSafetyClient [node->port conn-spec]
   client/Client
@@ -113,7 +131,7 @@
           (let [[member delta] (:value op)
                 new-score (car/wcar cs (car/zincrby zset-key (double delta) member))]
             (assoc op :type :ok
-                   :value [member (Double/parseDouble (str new-score))]))
+                   :value [member (parse-double-safe new-score)]))
 
           :zrem
           (let [member (:value op)
@@ -327,33 +345,65 @@
   [muts read-inv-idx read-cmp-idx]
   (filter #(concurrent? % read-inv-idx read-cmp-idx) muts))
 
+(defn- write-op?
+  "True iff the mutation adds/updates the member's score (i.e. would
+  make the member present). :zrem is NOT a write-op here."
+  [m]
+  (#{:zadd :zincrby} (:f m)))
+
+(defn- existence-evidence?
+  "A mutation proves that the member existed at some point iff it is a
+  write-op, or a ZREM whose :removed? flag is true. No-op ZREMs
+  (:removed? false) do NOT prove existence."
+  [m]
+  (case (:f m)
+    (:zadd :zincrby) true
+    :zrem            (boolean (:removed? m))
+    false))
+
 (defn- allowed-scores-for-member
   "Compute the set of scores considered valid for `member` by a read
   whose window is [read-inv-idx, read-cmp-idx], based on committed state
-  and any concurrent mutations.
+  and any concurrent/uncertain mutations.
+
+  Linearizability demands a read observes either (a) the latest committed
+  state in real-time order, or (b) the effect of a write still concurrent
+  with the read. We therefore restrict the committed score set to
+  'candidates' — committed mutations NOT strictly followed in real time
+  by another committed mutation (i.e. no other committed op's invoke
+  comes after this op's completion). Scores from strictly superseded
+  committed mutations are NOT admissible.
 
   Returns:
-    :scores            - set of acceptable scores (committed + concurrent
-                         :zadd / :ok :zincrby).
-    :unknown-score?    - true iff any concurrent ZINCRBY's resulting score
-                         is unknown (in-flight or :info). When set, the
-                         caller MUST skip the strict score-membership
+    :scores            - set of acceptable scores (from candidate
+                         committed ops + pre-read :info + concurrent
+                         writes with a known score).
+    :unknown-score?    - true iff any concurrent / pre-read :info
+                         ZINCRBY's resulting score is unknown. When set,
+                         the caller MUST skip the strict score-membership
                          check to stay sound.
-    :must-be-present?  - committed state says present and no concurrent
-                         mutation could have removed/changed it.
-    :any-known?        - some op claims to have touched this member."
+    :can-be-present?   - true iff the member may legitimately appear in
+                         the read (some candidate/concurrent/pre-read
+                         :info op is a write, OR a concurrent/pre-read
+                         :info ZREM leaves presence uncertain).
+    :must-be-present?  - true iff a candidate committed state says
+                         present and nothing concurrent/pre-read :info
+                         could have removed it."
   [mutations-by-m member read-inv-idx read-cmp-idx]
   (let [muts (get mutations-by-m member [])
-        ;; :ok mutations that completed strictly before the read. They
-        ;; may have overlapped with each other in wall-clock time, so
-        ;; the serialization order among them is ambiguous.
-        committed (->> muts
+        ;; :ok mutations that completed strictly before the read.
+        preceding (->> muts
                        (filter #(and (= :ok (:type %))
                                      (some? (:complete-idx %))
                                      (< (:complete-idx %) read-inv-idx))))
+        ;; Real-time "last-wins" candidate filter: a preceding mutation
+        ;; m is admissible iff no OTHER preceding mutation m' has
+        ;; m'.invoke-idx > m.complete-idx (i.e. m' strictly follows m).
+        ;; Equivalent: m.complete-idx >= max(invoke-idx) over preceding.
+        max-inv (reduce max -1 (map :invoke-idx preceding))
+        candidates (filterv #(>= (:complete-idx %) max-inv) preceding)
         ;; :info mutations that completed before the read: they may or
-        ;; may not have taken effect server-side. We must account for
-        ;; their possible scores just like concurrent ones.
+        ;; may not have taken effect server-side.
         pre-read-info (->> muts
                            (filter #(and (= :info (:type %))
                                          (some? (:complete-idx %))
@@ -361,61 +411,55 @@
         ;; Concurrent mutations: windows overlap the read. Include both
         ;; :ok and :info since either may have taken effect.
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
-        ;; A conservative last-wins linearization for the must-be-present?
-        ;; check only. Ambiguous when committed writes overlap each other.
-        committed-sorted (sort-by :complete-idx committed)
-        committed-state (reduce apply-mutation-to-state nil committed-sorted)
-        committed-overlap? (boolean
-                             (some (fn [[a b]]
-                                     (and (not (identical? a b))
-                                          (<= (:invoke-idx a) (:complete-idx b))
-                                          (<= (:invoke-idx b) (:complete-idx a))))
-                                   (for [a committed, b committed] [a b])))
-        ;; Union of every score that any committed / pre-read :info /
-        ;; concurrent op could have produced. This over-approximates the
-        ;; legitimate post-state set when writes overlap, keeping the
-        ;; checker sound at the cost of being slightly less strict on
-        ;; overlapping concurrent writers.
+
         add-scores (fn [acc m]
                      (case (:f m)
                        :zadd    (conj acc (:score m))
                        :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
                        :zrem    acc))
+        ;; Admissible scores: candidate committed + pre-read :info +
+        ;; concurrent writes (with a known score).
         scores (as-> #{} s
-                 (reduce add-scores s committed)
+                 (reduce add-scores s candidates)
                  (reduce add-scores s pre-read-info)
                  (reduce add-scores s concurrent))
-        unknown-score? (or
-                         (some #(and (= :zincrby (:f %)) (:unknown-score? %))
-                               concurrent)
-                         (some #(and (= :zincrby (:f %)) (:unknown-score? %))
-                               pre-read-info))
-        ;; any-known? must only be true when something provides evidence
-        ;; the member actually existed at some point. A no-op ZREM
-        ;; (:removed? false) does NOT prove existence.
-        existence-evidence? (or (some #(case (:f %)
-                                         (:zadd :zincrby) true
-                                         :zrem            (:removed? %))
-                                      committed)
-                                (some #(case (:f %)
-                                         (:zadd :zincrby) true
-                                         :zrem            (:removed? %))
-                                      pre-read-info)
-                                (some #(case (:f %)
-                                         (:zadd :zincrby) true
-                                         :zrem            (:removed? %))
-                                      concurrent))]
-      {:scores scores
-       :unknown-score? (boolean unknown-score?)
-       ;; must-be-present? is relaxed when committed writes overlap
-       ;; among themselves or when any :info / concurrent mutation could
-       ;; have removed the member before the read.
-       :must-be-present? (boolean (and committed-state
-                                       (:present? committed-state)
-                                       (not committed-overlap?)
+
+        has-unknown-incr? (fn [coll]
+                            (some #(and (= :zincrby (:f %))
+                                        (:unknown-score? %))
+                                  coll))
+        unknown-score? (or (has-unknown-incr? concurrent)
+                           (has-unknown-incr? pre-read-info))
+
+        ;; Did any candidate commit establish presence (write, or
+        ;; ZREM with :removed? -- either way the member existed)?
+        candidate-state (reduce apply-mutation-to-state nil
+                                (sort-by :complete-idx candidates))
+        candidate-present? (boolean (:present? candidate-state))
+
+        any-concurrent-could-write? (or (some write-op? concurrent)
+                                        (some write-op? pre-read-info))
+        any-concurrent-could-remove? (or (some #(= :zrem (:f %)) concurrent)
+                                         (some #(= :zrem (:f %)) pre-read-info))
+
+        can-be-present? (or candidate-present?
+                            any-concurrent-could-write?
+                            ;; A :zrem with :removed? true still proves
+                            ;; existence; if a concurrent ZREM raced
+                            ;; with an earlier write whose window is
+                            ;; not captured as a candidate, presence is
+                            ;; uncertain rather than forbidden.
+                            (and (some existence-evidence? (concat concurrent
+                                                                   pre-read-info))
+                                 any-concurrent-could-remove?))
+
+        must-be-present? (boolean (and candidate-present?
                                        (empty? pre-read-info)
-                                       (empty? concurrent)))
-       :any-known? (boolean existence-evidence?)}))
+                                       (empty? concurrent)))]
+    {:scores           scores
+     :unknown-score?   (boolean unknown-score?)
+     :can-be-present?  (boolean can-be-present?)
+     :must-be-present? must-be-present?}))
 
 (defn- duplicate-members
   "Return the set of members that appear more than once in entries."
@@ -445,13 +489,16 @@
         (swap! errors conj {:kind :duplicate-members
                             :index cmp-idx
                             :members dupes})))
-    ;; 2. For each observed (member,score): validate score and non-phantom
+    ;; 2. For each observed (member,score): validate presence + score.
+    ;;    can-be-present? catches both phantoms (member never existed)
+    ;;    and stale reads (member committed-removed before the read
+    ;;    with no concurrent re-add).
     (doseq [[member score] entries]
-      (let [{:keys [scores any-known? unknown-score?]}
+      (let [{:keys [scores can-be-present? unknown-score?]}
             (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
         (cond
-          (not any-known?)
-          (swap! errors conj {:kind :phantom
+          (not can-be-present?)
+          (swap! errors conj {:kind :unexpected-presence
                               :index cmp-idx
                               :member member
                               :score score})
@@ -504,11 +551,11 @@
                             :bounds bounds
                             :member member
                             :score score}))
-      (let [{:keys [scores any-known? unknown-score?]}
+      (let [{:keys [scores can-be-present? unknown-score?]}
             (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
         (cond
-          (not any-known?)
-          (swap! errors conj {:kind :phantom-range
+          (not can-be-present?)
+          (swap! errors conj {:kind :unexpected-presence-range
                               :index cmp-idx
                               :member member
                               :score score})
