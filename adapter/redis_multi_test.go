@@ -32,34 +32,74 @@ import (
 // gap deterministically without a timing-based sleep.
 func waitForListState(t *testing.T, n Node, key []byte, expectedLen int, expectedValues []string) {
 	t.Helper()
-	ctx := context.Background()
+	if expectedValues != nil && len(expectedValues) != expectedLen {
+		t.Fatalf("waitForListState: expectedValues length %d does not match expectedLen %d",
+			len(expectedValues), expectedLen)
+	}
 	require.Eventually(t, func() bool {
-		readTS := n.redisServer.readTS()
-		meta, exists, err := n.redisServer.resolveListMeta(ctx, key, readTS)
-		if err != nil || !exists || meta.Len != int64(expectedLen) {
-			return false
-		}
-		kvs, err := n.redisServer.store.ScanAt(
-			ctx,
-			store.ListItemKey(key, math.MinInt64),
-			store.ListItemKey(key, math.MaxInt64),
-			expectedLen+1,
-			readTS,
-		)
-		if err != nil || len(kvs) != expectedLen {
-			return false
-		}
-		if expectedValues == nil {
-			return true
-		}
-		for i, kvp := range kvs {
-			if string(kvp.Value) != expectedValues[i] {
-				return false
-			}
-		}
-		return true
+		return listStateMatches(n, key, expectedLen, expectedValues)
 	}, 5*time.Second, 250*time.Millisecond,
 		"node did not catch up to expected list state for key %q (len=%d)", string(key), expectedLen)
+}
+
+// listStateMatches reports whether this node's applied state for key resolves
+// to expectedLen items whose values match expectedValues (when non-nil). It is
+// the single-shot check driving waitForListState's poll loop.
+func listStateMatches(n Node, key []byte, expectedLen int, expectedValues []string) bool {
+	ctx := context.Background()
+	readTS := n.redisServer.readTS()
+	if !listMetaMatches(ctx, n, key, expectedLen, readTS) {
+		return false
+	}
+	kvs, ok := scanListItems(ctx, n, key, expectedLen, readTS)
+	if !ok {
+		return false
+	}
+	return listValuesMatch(kvs, expectedValues)
+}
+
+// listMetaMatches checks the list meta key. For expectedLen == 0 the Redis
+// semantics of "empty list == absent meta" are honored; for non-empty
+// expectations both existence and length must match.
+func listMetaMatches(ctx context.Context, n Node, key []byte, expectedLen int, readTS uint64) bool {
+	meta, exists, err := n.redisServer.resolveListMeta(ctx, key, readTS)
+	if err != nil {
+		return false
+	}
+	if expectedLen == 0 {
+		return !exists || meta.Len == 0
+	}
+	return exists && meta.Len == int64(expectedLen)
+}
+
+// scanListItems reads the list items at readTS and returns them when the
+// observed length matches expectedLen.
+func scanListItems(ctx context.Context, n Node, key []byte, expectedLen int, readTS uint64) ([]*store.KVPair, bool) {
+	kvs, err := n.redisServer.store.ScanAt(
+		ctx,
+		store.ListItemKey(key, math.MinInt64),
+		store.ListItemKey(key, math.MaxInt64),
+		expectedLen+1,
+		readTS,
+	)
+	if err != nil || len(kvs) != expectedLen {
+		return nil, false
+	}
+	return kvs, true
+}
+
+// listValuesMatch returns true when expectedValues is nil (no value check
+// requested) or every scanned value equals its expected counterpart.
+func listValuesMatch(kvs []*store.KVPair, expectedValues []string) bool {
+	if expectedValues == nil {
+		return true
+	}
+	for i, kvp := range kvs {
+		if string(kvp.Value) != expectedValues[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRedis_MultiExecAtomic(t *testing.T) {
