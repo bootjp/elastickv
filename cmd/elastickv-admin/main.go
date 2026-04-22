@@ -236,12 +236,18 @@ type fanout struct {
 	mu      sync.Mutex
 	clients map[string]*nodeClient
 	members *membership
+	closed  bool
 
 	// refreshGroup deduplicates concurrent membership refresh RPCs so a burst
 	// of browser requests immediately after cache expiry collapses into a
 	// single GetClusterOverview call against one seed.
 	refreshGroup singleflight.Group
 }
+
+// errFanoutClosed is returned by clientFor when Close has already run, so
+// callers can treat it as a graceful shutdown signal instead of bubbling up as
+// a generic map-panic.
+var errFanoutClosed = errors.New("admin fanout is closed")
 
 func newFanout(
 	seeds []string,
@@ -267,17 +273,27 @@ func newFanout(
 func (f *fanout) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
+	f.closed = true
 	for _, c := range f.clients {
 		if err := c.conn.Close(); err != nil {
 			log.Printf("elastickv-admin: close gRPC connection to %s: %v", c.addr, err)
 		}
 	}
-	f.clients = nil
+	// Replace with an empty map rather than nil so the remaining
+	// closed-guarded accessors can still iterate or lookup without panicking
+	// while still releasing the client references for GC.
+	f.clients = map[string]*nodeClient{}
 }
 
 func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return nil, errFanoutClosed
+	}
 	if c, ok := f.clients[addr]; ok {
 		return c, nil
 	}
@@ -294,6 +310,10 @@ func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 // Unavailable so the next request re-dials or skips the removed node.
 func (f *fanout) invalidateClient(addr string) {
 	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
 	c, ok := f.clients[addr]
 	delete(f.clients, addr)
 	f.members = nil

@@ -370,6 +370,21 @@ func TestWriteJSONSuccessPath(t *testing.T) {
 	}
 }
 
+// TestFanoutClientForAfterCloseIsSafe asserts that clientFor and
+// invalidateClient do not panic when invoked concurrently with Close — a
+// shutdown-time race that otherwise hits a nil-map write in clientFor.
+func TestFanoutClientForAfterCloseIsSafe(t *testing.T) {
+	t.Parallel()
+	f := newFanout([]string{"127.0.0.1:1"}, "", time.Second, insecure.NewCredentials())
+	f.Close()
+
+	if _, err := f.clientFor("127.0.0.1:2"); err == nil {
+		t.Fatal("expected error after Close, got nil")
+	}
+	f.invalidateClient("127.0.0.1:2") // must be a no-op, not panic
+	f.Close()                         // idempotent
+}
+
 // TestFanoutRefreshSurvivesFirstCallerCancel asserts that canceling the first
 // caller's context does not kill the shared singleflight refresh — subsequent
 // callers should still see a populated membership.
