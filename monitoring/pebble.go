@@ -47,9 +47,10 @@ type PebbleMetrics struct {
 	memtableZombieCount *prometheus.GaugeVec
 
 	// Block cache.
-	blockCacheSizeBytes   *prometheus.GaugeVec
-	blockCacheHitsTotal   *prometheus.CounterVec
-	blockCacheMissesTotal *prometheus.CounterVec
+	blockCacheSizeBytes     *prometheus.GaugeVec
+	blockCacheCapacityBytes *prometheus.GaugeVec
+	blockCacheHitsTotal     *prometheus.CounterVec
+	blockCacheMissesTotal   *prometheus.CounterVec
 }
 
 func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
@@ -117,6 +118,13 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 			},
 			[]string{"group"},
 		),
+		blockCacheCapacityBytes: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_pebble_block_cache_capacity_bytes",
+				Help: "Configured maximum size of Pebble's block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.",
+			},
+			[]string{"group"},
+		),
 		blockCacheHitsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_pebble_block_cache_hits_total",
@@ -143,6 +151,7 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 		m.memtableSizeBytes,
 		m.memtableZombieCount,
 		m.blockCacheSizeBytes,
+		m.blockCacheCapacityBytes,
 		m.blockCacheHitsTotal,
 		m.blockCacheMissesTotal,
 	)
@@ -155,6 +164,17 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 // allowed; the collector will skip that group for the tick.
 type PebbleMetricsSource interface {
 	Metrics() *pebble.Metrics
+}
+
+// PebbleCacheCapacitySource is an optional companion to PebbleMetricsSource:
+// sources that expose the configured block-cache capacity (in bytes) are
+// queried by the collector to populate
+// elastickv_pebble_block_cache_capacity_bytes. Implementations return 0 to
+// indicate "not known / store closed"; the collector then leaves the gauge
+// at its last observed value for that tick. The concrete *store pebbleStore
+// satisfies this via BlockCacheCapacityBytes(); tests can omit it.
+type PebbleCacheCapacitySource interface {
+	BlockCacheCapacityBytes() int64
 }
 
 // PebbleSource binds a raft group ID to its Pebble store. Multiple
@@ -238,42 +258,58 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 		if snap == nil {
 			continue
 		}
-		group := src.GroupIDStr
-
-		// L0 pressure: gauges, overwritten each tick.
-		c.metrics.l0Sublevels.WithLabelValues(group).Set(float64(snap.Levels[0].Sublevels))
-		c.metrics.l0NumFiles.WithLabelValues(group).Set(float64(snap.Levels[0].TablesCount))
-
-		// Compaction.
-		c.metrics.compactEstimatedDebt.WithLabelValues(group).Set(float64(snap.Compact.EstimatedDebt))
-		c.metrics.compactInProgress.WithLabelValues(group).Set(float64(snap.Compact.NumInProgress))
-
-		// Memtable.
-		c.metrics.memtableCount.WithLabelValues(group).Set(float64(snap.MemTable.Count))
-		c.metrics.memtableSizeBytes.WithLabelValues(group).Set(float64(snap.MemTable.Size))
-		c.metrics.memtableZombieCount.WithLabelValues(group).Set(float64(snap.MemTable.ZombieCount))
-
-		// Block cache gauge.
-		c.metrics.blockCacheSizeBytes.WithLabelValues(group).Set(float64(snap.BlockCache.Size))
-
-		// Monotonic counters: emit only the positive delta. A smaller
-		// value means the source was reset (store reopened); rebase
-		// silently without emitting negative.
-		prev := c.previous[src.GroupID]
-		curr := pebbleSnapshot{
-			compactCount:     snap.Compact.Count,
-			blockCacheHits:   snap.BlockCache.Hits,
-			blockCacheMisses: snap.BlockCache.Misses,
-		}
-		if curr.compactCount > prev.compactCount {
-			c.metrics.compactCountTotal.WithLabelValues(group).Add(float64(curr.compactCount - prev.compactCount))
-		}
-		if curr.blockCacheHits > prev.blockCacheHits {
-			c.metrics.blockCacheHitsTotal.WithLabelValues(group).Add(float64(curr.blockCacheHits - prev.blockCacheHits))
-		}
-		if curr.blockCacheMisses > prev.blockCacheMisses {
-			c.metrics.blockCacheMissesTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
-		}
-		c.previous[src.GroupID] = curr
+		c.observeSource(src, snap)
 	}
+}
+
+// observeSource publishes a single source's snapshot into the Prometheus
+// vectors. Split out of observeOnce to keep that function's control flow
+// (nil-guards + source loop) below the cyclomatic-complexity budget.
+func (c *PebbleCollector) observeSource(src PebbleSource, snap *pebble.Metrics) {
+	group := src.GroupIDStr
+
+	// L0 pressure: gauges, overwritten each tick.
+	c.metrics.l0Sublevels.WithLabelValues(group).Set(float64(snap.Levels[0].Sublevels))
+	c.metrics.l0NumFiles.WithLabelValues(group).Set(float64(snap.Levels[0].TablesCount))
+
+	// Compaction.
+	c.metrics.compactEstimatedDebt.WithLabelValues(group).Set(float64(snap.Compact.EstimatedDebt))
+	c.metrics.compactInProgress.WithLabelValues(group).Set(float64(snap.Compact.NumInProgress))
+
+	// Memtable.
+	c.metrics.memtableCount.WithLabelValues(group).Set(float64(snap.MemTable.Count))
+	c.metrics.memtableSizeBytes.WithLabelValues(group).Set(float64(snap.MemTable.Size))
+	c.metrics.memtableZombieCount.WithLabelValues(group).Set(float64(snap.MemTable.ZombieCount))
+
+	// Block cache gauges: current usage (always) + configured capacity
+	// (when the source exposes it). Capacity is static for the lifetime
+	// of a DB in practice, but we re-read each tick so operators observe
+	// the new value immediately after a restart with a different
+	// ELASTICKV_PEBBLE_CACHE_MB.
+	c.metrics.blockCacheSizeBytes.WithLabelValues(group).Set(float64(snap.BlockCache.Size))
+	if capSrc, ok := src.Source.(PebbleCacheCapacitySource); ok {
+		if capBytes := capSrc.BlockCacheCapacityBytes(); capBytes > 0 {
+			c.metrics.blockCacheCapacityBytes.WithLabelValues(group).Set(float64(capBytes))
+		}
+	}
+
+	// Monotonic counters: emit only the positive delta. A smaller value
+	// means the source was reset (store reopened); rebase silently
+	// without emitting negative.
+	prev := c.previous[src.GroupID]
+	curr := pebbleSnapshot{
+		compactCount:     snap.Compact.Count,
+		blockCacheHits:   snap.BlockCache.Hits,
+		blockCacheMisses: snap.BlockCache.Misses,
+	}
+	if curr.compactCount > prev.compactCount {
+		c.metrics.compactCountTotal.WithLabelValues(group).Add(float64(curr.compactCount - prev.compactCount))
+	}
+	if curr.blockCacheHits > prev.blockCacheHits {
+		c.metrics.blockCacheHitsTotal.WithLabelValues(group).Add(float64(curr.blockCacheHits - prev.blockCacheHits))
+	}
+	if curr.blockCacheMisses > prev.blockCacheMisses {
+		c.metrics.blockCacheMissesTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
+	}
+	c.previous[src.GroupID] = curr
 }
