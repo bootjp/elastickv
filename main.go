@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -183,10 +184,7 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
-	if collector := metricsRegistry.DispatchCollector(); collector != nil {
-		collector.Start(runCtx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
-	}
+	startMonitoringCollectors(runCtx, metricsRegistry, runtimes)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -447,6 +445,31 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 	return out
 }
 
+// pebbleMonitorSources extracts the MVCC stores that expose
+// *pebble.DB.Metrics() so monitoring can poll LSM internals (L0
+// sublevels, compaction debt, memtable, block cache) for the
+// elastickv_pebble_* metrics family. Stores that do not satisfy the
+// interface (non-Pebble backends, if any are added later) are skipped
+// silently.
+func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSource {
+	out := make([]monitoring.PebbleSource, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(monitoring.PebbleMetricsSource)
+		if !ok {
+			continue
+		}
+		out = append(out, monitoring.PebbleSource{
+			GroupID:    runtime.spec.id,
+			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			Source:     src,
+		})
+	}
+	return out
+}
+
 // dispatchMonitorSources extracts the raft engines that expose etcd
 // dispatch counters so monitoring can poll them for the hot-path
 // dashboard. Engines that do not satisfy the interface (hashicorp
@@ -465,6 +488,49 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 		out = append(out, monitoring.DispatchSource{
 			GroupID: runtime.spec.id,
 			Source:  src,
+		})
+	}
+	return out
+}
+
+// startMonitoringCollectors wires up the per-tick Prometheus
+// collectors (raft dispatch, Pebble LSM, store-layer OCC conflicts)
+// on top of the running raft runtimes. Kept separate from run() so
+// the latter stays under the cyclop complexity budget and so new
+// collectors can be added without widening run() further.
+func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
+	if collector := reg.DispatchCollector(); collector != nil {
+		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if collector := reg.PebbleCollector(); collector != nil {
+		collector.Start(ctx, pebbleMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if collector := reg.WriteConflictCollector(); collector != nil {
+		collector.Start(ctx, writeConflictMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+}
+
+// writeConflictMonitorSources extracts the MVCC stores that expose
+// per-(kind, key_prefix) OCC conflict counters so monitoring can poll
+// them for the elastickv_store_write_conflict_total metric. Every
+// store.MVCCStore implements WriteConflictCountsByPrefix(); stores
+// that do not track conflicts return an empty map and simply do not
+// contribute series.
+func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.WriteConflictSource {
+	out := make([]monitoring.WriteConflictSource, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(monitoring.WriteConflictCounterSource)
+		if !ok {
+			continue
+		}
+		out = append(out, monitoring.WriteConflictSource{
+			GroupID:    runtime.spec.id,
+			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			Source:     src,
 		})
 	}
 	return out
@@ -553,6 +619,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
+		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
 	)
 	eg.Go(func() error {

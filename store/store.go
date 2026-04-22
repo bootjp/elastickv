@@ -158,6 +158,13 @@ type MVCCStore interface {
 	DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
+	// WriteConflictCountsByPrefix returns a snapshot of the MVCC
+	// write-conflict counters keyed by "<kind>|<key_prefix>" where
+	// kind is "read" or "write" and key_prefix is a bounded
+	// classification of the conflicting key. The map is a copy; the
+	// caller may mutate it freely. Implementations that do not track
+	// conflicts may return an empty (non-nil) map.
+	WriteConflictCountsByPrefix() map[string]uint64
 	// Compact removes versions older than minTS that are no longer needed.
 	Compact(ctx context.Context, minTS uint64) error
 	Snapshot() (Snapshot, error)

@@ -1092,3 +1092,75 @@ func TestLua_ZRANGEBYSCORE_PosInfExactMatch(t *testing.T) {
 	require.Equal(t, []any{"pos"}, got,
 		"ZRANGEBYSCORE +inf +inf must return only members with score = +inf")
 }
+
+// TestLua_ZRANGEBYSCORE_MissingKeyReturnsEmptyViaFastPath pins the
+// empty-result short-circuit for a key that does not exist at all.
+// Redis returns an empty array for ZRANGEBYSCORE on a missing key;
+// the fast path must serve that directly instead of punting to the
+// slow path, which was the dominant call pattern on BullMQ-style
+// workloads polling empty delayed queues.
+func TestLua_ZRANGEBYSCORE_MissingKeyReturnsEmptyViaFastPath(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	got, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:absent"},
+	).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{}, got,
+		"ZRANGEBYSCORE on a missing key must return empty array")
+}
+
+// TestLua_ZRANGEBYSCORE_StringKeyReturnsWrongType verifies that when
+// the key exists as a string (not a zset), ZRANGEBYSCORE still yields
+// WRONGTYPE. The fast-path short-circuit must only short-circuit when
+// the key is truly absent; a wrong-type existence must surface the
+// error via the slow path.
+func TestLua_ZRANGEBYSCORE_StringKeyReturnsWrongType(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Set(ctx, "lua:zr:wrongtype", "notzset", 0).Err())
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:wrongtype"},
+	).Result()
+	require.Error(t, err, "ZRANGEBYSCORE on a string key must return an error")
+	require.Contains(t, err.Error(), "WRONGTYPE",
+		"error must be WRONGTYPE, not the fast-path empty-array short-circuit")
+}
+
+// TestLua_ZRANGEBYSCORE_ListKeyReturnsWrongType mirrors the string
+// test for list-typed keys, covering the non-string collection arm
+// of keyTypeAt in the wrong-type short-circuit.
+func TestLua_ZRANGEBYSCORE_ListKeyReturnsWrongType(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.RPush(ctx, "lua:zr:wronglist", "a", "b").Err())
+
+	_, err := rdb.Eval(ctx,
+		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+		[]string{"lua:zr:wronglist"},
+	).Result()
+	require.Error(t, err, "ZRANGEBYSCORE on a list key must return an error")
+	require.Contains(t, err.Error(), "WRONGTYPE",
+		"error must be WRONGTYPE for list-encoded key")
+}

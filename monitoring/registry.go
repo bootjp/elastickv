@@ -14,11 +14,13 @@ type Registry struct {
 	registerer   prometheus.Registerer
 	gatherer     prometheus.Gatherer
 
-	dynamo  *DynamoDBMetrics
-	redis   *RedisMetrics
-	raft    *RaftMetrics
-	lua     *LuaMetrics
-	hotPath *HotPathMetrics
+	dynamo        *DynamoDBMetrics
+	redis         *RedisMetrics
+	raft          *RaftMetrics
+	lua           *LuaMetrics
+	hotPath       *HotPathMetrics
+	pebble        *PebbleMetrics
+	writeConflict *WriteConflictMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -39,6 +41,8 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.raft = newRaftMetrics(registerer)
 	r.lua = newLuaMetrics(registerer)
 	r.hotPath = newHotPathMetrics(registerer)
+	r.pebble = newPebbleMetrics(registerer)
+	r.writeConflict = newWriteConflictMetrics(registerer)
 	return r
 }
 
@@ -112,6 +116,16 @@ func (r *Registry) LeaseReadObserver() LeaseReadObserver {
 	return LeaseReadObserver{metrics: r.hotPath}
 }
 
+// LuaFastPathObserver returns an observer for Lua-side redis.call()
+// fast-path outcomes (hit / skip / fallback per command). Zero-value
+// safe for tests and tools that do not wire a registry.
+func (r *Registry) LuaFastPathObserver() LuaFastPathObserver {
+	if r == nil {
+		return LuaFastPathObserver{}
+	}
+	return LuaFastPathObserver{metrics: r.hotPath}
+}
+
 // DispatchCollector returns a collector that polls the etcd raft
 // engine's dispatch counters and exports them to Prometheus. Start it
 // with the node's raft sources after engine Open() completes.
@@ -120,4 +134,28 @@ func (r *Registry) DispatchCollector() *DispatchCollector {
 		return nil
 	}
 	return newDispatchCollector(r.hotPath)
+}
+
+// PebbleCollector returns a collector that polls each Pebble store's
+// Metrics() snapshot and mirrors the operationally useful fields
+// (L0 sublevels, compaction debt, memtable, block cache) into
+// Prometheus. Start it with the node's Pebble sources after the
+// stores have been opened.
+func (r *Registry) PebbleCollector() *PebbleCollector {
+	if r == nil || r.pebble == nil {
+		return nil
+	}
+	return newPebbleCollector(r.pebble)
+}
+
+// WriteConflictCollector returns a collector that polls each MVCC
+// store's per-(kind, key_prefix) OCC conflict counters and mirrors
+// them into the elastickv_store_write_conflict_total Prometheus
+// counter vector. Start it with the node's MVCC sources after the
+// stores have been opened.
+func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
+	if r == nil || r.writeConflict == nil {
+		return nil
+	}
+	return newWriteConflictCollector(r.writeConflict)
 }

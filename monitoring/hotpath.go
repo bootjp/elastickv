@@ -30,11 +30,46 @@ const (
 // GET hot-path dashboard. Kept in its own type so the Registry can hold
 // a single instance and hand out scoped observer/collector objects.
 type HotPathMetrics struct {
-	leaseReadsTotal      *prometheus.CounterVec
-	dispatchDroppedTotal *prometheus.CounterVec
-	dispatchErrorsTotal  *prometheus.CounterVec
-	stepQueueFullTotal   *prometheus.CounterVec
+	leaseReadsTotal           *prometheus.CounterVec
+	dispatchDroppedTotal      *prometheus.CounterVec
+	dispatchErrorsTotal       *prometheus.CounterVec
+	dispatchErrorsByCodeTotal *prometheus.CounterVec
+	stepQueueFullTotal        *prometheus.CounterVec
+	luaFastPathTotal          *prometheus.CounterVec
 }
+
+// LuaFastPathOutcome labels tag each Lua-side read fast-path decision
+// so operators can see how often a given command (ZRANGEBYSCORE,
+// ZSCORE, HGET, etc.) actually takes the fast path vs falls back.
+const (
+	LuaFastPathOutcomeHit            = "hit"
+	LuaFastPathOutcomeSkipLoaded     = "skip_loaded"
+	LuaFastPathOutcomeSkipCachedType = "skip_cached_type"
+)
+
+// LuaFastPathFallbackReason is the typed label for server-side
+// hit=false branches. A dedicated type (instead of a bare string)
+// lets Go catch typos in call sites — producers in adapter/ and the
+// switch in ObserveFallback stay in lockstep with the constants
+// below, and the Prometheus label value is derived directly from the
+// underlying string via string(reason).
+type LuaFastPathFallbackReason string
+
+// Known fallback reasons. Subdivides the generic "fallback" outcome
+// so operators can tell WHY the fast path gave up and route the fix
+// accordingly (eligibility check, truncation, empty-key
+// short-circuit, etc.).
+const (
+	LuaFastPathFallbackIneligible  LuaFastPathFallbackReason = "fallback_ineligible"
+	LuaFastPathFallbackMissingKey  LuaFastPathFallbackReason = "fallback_missing_key"
+	LuaFastPathFallbackWrongType   LuaFastPathFallbackReason = "fallback_wrong_type"
+	LuaFastPathFallbackTruncated   LuaFastPathFallbackReason = "fallback_truncated"
+	LuaFastPathFallbackLargeOffset LuaFastPathFallbackReason = "fallback_large_offset"
+	LuaFastPathFallbackOther       LuaFastPathFallbackReason = "fallback_other"
+	// LuaFastPathFallbackNone is the sentinel returned alongside
+	// hit=true; callers must not record it.
+	LuaFastPathFallbackNone LuaFastPathFallbackReason = ""
+)
 
 func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 	m := &HotPathMetrics{
@@ -66,15 +101,130 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			},
 			[]string{"group"},
 		),
+		dispatchErrorsByCodeTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_dispatch_errors_by_code_total",
+				Help: "elastickv_raft_dispatch_errors_total subdivided by grpc status code so operators can tell whether the transport is failing because peers are unreachable (Unavailable), slow (DeadlineExceeded), or flow-controlled (ResourceExhausted).",
+			},
+			[]string{"group", "code"},
+		),
+		luaFastPathTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_lua_cmd_fastpath_total",
+				Help: "Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback_* (subdivided by reason: ineligible, missing_key, wrong_type, truncated, large_offset, other).",
+			},
+			[]string{"cmd", "outcome"},
+		),
 	}
 
 	registerer.MustRegister(
 		m.leaseReadsTotal,
 		m.dispatchDroppedTotal,
 		m.dispatchErrorsTotal,
+		m.dispatchErrorsByCodeTotal,
 		m.stepQueueFullTotal,
+		m.luaFastPathTotal,
 	)
 	return m
+}
+
+// LuaFastPathObserver records fast-path outcomes for redis.call()
+// inside Lua scripts. The zero value is safe and silently drops
+// samples so tests can pass LuaFastPathObserver{} as a stub.
+//
+// Hot-path shape: each Observe* call on a LuaFastPathCmd handle is a
+// single non-blocking atomic increment on a pre-resolved
+// prometheus.Counter (client_golang's default Counter uses
+// sync/atomic internally). Callers resolve one LuaFastPathCmd per
+// command at server construction to avoid
+// CounterVec.WithLabelValues (mutex-guarded map lookup) on the hot
+// path.
+type LuaFastPathObserver struct {
+	metrics *HotPathMetrics
+}
+
+// LuaFastPathCmd is a pre-resolved bundle of fast-path outcome
+// counters for a single Lua command. Construct once via
+// LuaFastPathObserver.ForCommand(cmd) at server startup; call the
+// Observe* methods per redis.call(). Safe to copy.
+type LuaFastPathCmd struct {
+	hit                 prometheus.Counter
+	skipLoaded          prometheus.Counter
+	skipCachedType      prometheus.Counter
+	fallbackIneligible  prometheus.Counter
+	fallbackMissingKey  prometheus.Counter
+	fallbackWrongType   prometheus.Counter
+	fallbackTruncated   prometheus.Counter
+	fallbackLargeOffset prometheus.Counter
+	fallbackOther       prometheus.Counter
+}
+
+// ForCommand pre-resolves the counter handles for cmd. Returns a
+// zero-value LuaFastPathCmd when the observer is empty (tests),
+// which silently drops all Observe* calls.
+func (o LuaFastPathObserver) ForCommand(cmd string) LuaFastPathCmd {
+	if o.metrics == nil {
+		return LuaFastPathCmd{}
+	}
+	vec := o.metrics.luaFastPathTotal
+	return LuaFastPathCmd{
+		hit:                 vec.WithLabelValues(cmd, LuaFastPathOutcomeHit),
+		skipLoaded:          vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipLoaded),
+		skipCachedType:      vec.WithLabelValues(cmd, LuaFastPathOutcomeSkipCachedType),
+		fallbackIneligible:  vec.WithLabelValues(cmd, string(LuaFastPathFallbackIneligible)),
+		fallbackMissingKey:  vec.WithLabelValues(cmd, string(LuaFastPathFallbackMissingKey)),
+		fallbackWrongType:   vec.WithLabelValues(cmd, string(LuaFastPathFallbackWrongType)),
+		fallbackTruncated:   vec.WithLabelValues(cmd, string(LuaFastPathFallbackTruncated)),
+		fallbackLargeOffset: vec.WithLabelValues(cmd, string(LuaFastPathFallbackLargeOffset)),
+		fallbackOther:       vec.WithLabelValues(cmd, string(LuaFastPathFallbackOther)),
+	}
+}
+
+// Observe* methods record one outcome. Each is a single atomic
+// increment when the counter is wired; a no-op on the zero value.
+func (c LuaFastPathCmd) ObserveHit() {
+	if c.hit != nil {
+		c.hit.Inc()
+	}
+}
+
+func (c LuaFastPathCmd) ObserveSkipLoaded() {
+	if c.skipLoaded != nil {
+		c.skipLoaded.Inc()
+	}
+}
+
+func (c LuaFastPathCmd) ObserveSkipCachedType() {
+	if c.skipCachedType != nil {
+		c.skipCachedType.Inc()
+	}
+}
+
+// ObserveFallback routes to the counter for the given reason. Use
+// the LuaFastPathFallback* constants; unknown values (including the
+// zero value LuaFastPathFallbackNone, which should never reach here)
+// land on the "other" bucket so cardinality stays bounded.
+func (c LuaFastPathCmd) ObserveFallback(reason LuaFastPathFallbackReason) {
+	var counter prometheus.Counter
+	switch reason {
+	case LuaFastPathFallbackIneligible:
+		counter = c.fallbackIneligible
+	case LuaFastPathFallbackMissingKey:
+		counter = c.fallbackMissingKey
+	case LuaFastPathFallbackWrongType:
+		counter = c.fallbackWrongType
+	case LuaFastPathFallbackTruncated:
+		counter = c.fallbackTruncated
+	case LuaFastPathFallbackLargeOffset:
+		counter = c.fallbackLargeOffset
+	case LuaFastPathFallbackOther, LuaFastPathFallbackNone:
+		counter = c.fallbackOther
+	default:
+		counter = c.fallbackOther
+	}
+	if counter != nil {
+		counter.Inc()
+	}
 }
 
 // LeaseReadObserver implements kv.LeaseReadObserver by incrementing the
@@ -106,6 +256,12 @@ type DispatchCounterSource interface {
 	DispatchDropCount() uint64
 	DispatchErrorCount() uint64
 	StepQueueFullCount() uint64
+	// DispatchErrorCountsByCode returns a snapshot of dispatch error
+	// counts keyed by grpc status code ("Unavailable",
+	// "DeadlineExceeded", ...). Sum of values equals
+	// DispatchErrorCount(). Implementations that do not break out by
+	// code may return an empty map.
+	DispatchErrorCountsByCode() map[string]uint64
 }
 
 // DispatchSource binds a raft group ID to its counter source. Multiple
@@ -132,6 +288,10 @@ type dispatchSnapshot struct {
 	drops     uint64
 	errors    uint64
 	stepFulls uint64
+	// byCode keeps the last-seen per-grpc-code error totals so the
+	// collector can emit monotonic deltas per code on each poll. nil
+	// until the first observation.
+	byCode map[string]uint64
 }
 
 func newDispatchCollector(metrics *HotPathMetrics) *DispatchCollector {
@@ -186,6 +346,7 @@ func (c *DispatchCollector) observeOnce(sources []DispatchSource) {
 			drops:     src.Source.DispatchDropCount(),
 			errors:    src.Source.DispatchErrorCount(),
 			stepFulls: src.Source.StepQueueFullCount(),
+			byCode:    src.Source.DispatchErrorCountsByCode(),
 		}
 		prev := c.previous[src.GroupID]
 		group := strconv.FormatUint(src.GroupID, 10)
@@ -203,6 +364,11 @@ func (c *DispatchCollector) observeOnce(sources []DispatchSource) {
 		}
 		if curr.stepFulls > prev.stepFulls {
 			c.metrics.stepQueueFullTotal.WithLabelValues(group).Add(float64(curr.stepFulls - prev.stepFulls))
+		}
+		for code, count := range curr.byCode {
+			if prevCount := prev.byCode[code]; count > prevCount {
+				c.metrics.dispatchErrorsByCodeTotal.WithLabelValues(group, code).Add(float64(count - prevCount))
+			}
 		}
 		c.previous[src.GroupID] = curr
 	}

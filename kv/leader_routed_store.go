@@ -279,6 +279,16 @@ func (s *LeaderRoutedStore) LastCommitTS() uint64 {
 	return s.local.LastCommitTS()
 }
 
+// WriteConflictCountsByPrefix delegates to the local MVCC store. The
+// leader-routed wrapper does not add cross-group conflict detection of
+// its own, so the node-local view IS the authoritative view.
+func (s *LeaderRoutedStore) WriteConflictCountsByPrefix() map[string]uint64 {
+	if s == nil || s.local == nil {
+		return map[string]uint64{}
+	}
+	return s.local.WriteConflictCountsByPrefix()
+}
+
 const globalLastCommitTSTimeout = 200 * time.Millisecond
 
 // GlobalLastCommitTS returns the most recently committed HLC timestamp from
