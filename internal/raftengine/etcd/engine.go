@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2706,11 +2707,17 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 }
 
 // dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has
-// been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. Any value
-// other than "" and "0" enables it so operators can use "1", "true", etc.
+// been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. The value
+// is parsed with strconv.ParseBool, which accepts the standard tokens
+// (1, t, T, TRUE, true, True enable; 0, f, F, FALSE, false, False disable).
+// An empty string or any unrecognized value disables the feature.
 func dispatcherLanesEnabledFromEnv() bool {
-	v := os.Getenv(dispatcherLanesEnvVar)
-	return v != "" && v != "0"
+	v := strings.TrimSpace(os.Getenv(dispatcherLanesEnvVar))
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return enabled
 }
 
 // closePeerLanes closes every non-nil dispatch channel on pd so that the

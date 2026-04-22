@@ -1806,7 +1806,9 @@ func TestDispatcherLanesEnabledFromEnv(t *testing.T) {
 		{"0", false},
 		{"1", true},
 		{"true", true},
-		{"yes", true},
+		{"TRUE", true},
+		{"false", false},
+		{"yes", false},
 	}
 	for _, c := range cases {
 		t.Setenv(dispatcherLanesEnvVar, c.val)
