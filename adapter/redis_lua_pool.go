@@ -7,6 +7,15 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
+// luaCtxRegistryKey is the fixed registry key under which each pooled
+// *lua.LState stores a pre-allocated *lua.LUserData whose .Value holds
+// the per-eval *luaScriptContext. Putting the binding in the state's
+// own registry (instead of a global map guarded by sync.RWMutex) means
+// every redis.call / redis.pcall lookup is O(1), lock-free, and local
+// to the state -- no cross-state contention even under high fan-out
+// workloads like BullMQ (~50 lookups/s/script).
+const luaCtxRegistryKey = "elastickv_ctx"
+
 // luaInitialGlobalsHint is the expected number of string-keyed
 // globals present on a freshly initialised pooled state (base lib
 // helpers + string/math/table tables + redis/cjson/cmsgpack + the
@@ -63,11 +72,14 @@ const luaWhitelistedTableHint = 8
 // be invoked against a stale context.
 //
 // The redis / cjson / cmsgpack closures are registered ONCE at pool
-// fill time and read the per-eval *luaScriptContext out of
-// luaStateBindings, which is set on acquire and cleared on release.
-// Closures that would otherwise capture a fresh context per eval no
-// longer need to be re-registered, which is what makes pooling safe
-// and cheap.
+// fill time and read the per-eval *luaScriptContext out of each
+// state's own Lua registry (see luaCtxRegistryKey / ctxBinding),
+// which is set on acquire and cleared on release. Closures that
+// would otherwise capture a fresh context per eval no longer need
+// to be re-registered, which is what makes pooling safe and cheap.
+// The registry-backed binding is also the reason redis.call is
+// lock-free in the hot path, unlike the first iteration which used
+// a package-level map guarded by sync.RWMutex.
 type luaStatePool struct {
 	pool sync.Pool
 
@@ -100,39 +112,52 @@ type pooledLuaState struct {
 	// restores the global name first, then restores the table's
 	// internal contents from this snapshot.
 	tableSnapshots map[*lua.LTable]map[lua.LValue]lua.LValue
+	// ctxBinding is a pre-allocated *LUserData stashed in the state's
+	// registry under luaCtxRegistryKey. Its .Value holds the active
+	// *luaScriptContext for the duration of an eval. Using the state's
+	// own registry (instead of a global map + sync.RWMutex) keeps the
+	// redis.call / redis.pcall lookup lock-free and local, which is
+	// critical for high-concurrency workloads where a single script
+	// may issue dozens of redis.call invocations.
+	ctxBinding *lua.LUserData
+	// scratchKeys is a reusable slice for collecting table keys during
+	// reset / resetTableContents. Each reset leaves it sliced to
+	// [:0] so subsequent resets reuse the underlying array. If a
+	// pathological script inflates it past luaScratchKeysMaxCap we
+	// drop the backing array to avoid pinning unbounded memory on
+	// pooled states.
+	scratchKeys []lua.LValue
 }
 
-// luaStateBindings maps a pooled *lua.LState to the per-eval
-// *luaScriptContext. The pre-registered redis.call / redis.pcall
-// closures look up the binding on every invocation, which means the
-// state does not have to be rewired with fresh closures each time it
-// leaves the pool.
+// luaScratchKeysMaxCap bounds the backing array retained by
+// scratchKeys across resets. Beyond this we drop the slice so one
+// rogue script does not inflate the pool's per-state footprint
+// indefinitely. Chosen to cover typical EVAL globals comfortably
+// (base stdlib + redis/cjson/cmsgpack + a handful of user globals).
+const luaScratchKeysMaxCap = 1024
+
+// luaLookupContext returns the *luaScriptContext bound to state for
+// the current eval, reading it from the state's own registry. Because
+// each pooled *lua.LState is used by at most one goroutine at a time,
+// this lookup needs no synchronisation -- unlike the previous global
+// map guarded by sync.RWMutex, which under BullMQ-style workloads
+// (dozens of redis.call invocations per script, thousands of scripts/s)
+// became a global RLock contention point.
 //
-// Access is guarded by a sync.RWMutex because a single pooled state
-// is only ever used by one goroutine at a time, but different pooled
-// states are looked up concurrently.
-var luaStateBindings = struct {
-	sync.RWMutex
-	m map[*lua.LState]*luaScriptContext
-}{m: map[*lua.LState]*luaScriptContext{}}
-
-func luaBindContext(state *lua.LState, ctx *luaScriptContext) {
-	luaStateBindings.Lock()
-	luaStateBindings.m[state] = ctx
-	luaStateBindings.Unlock()
-}
-
-func luaUnbindContext(state *lua.LState) {
-	luaStateBindings.Lock()
-	delete(luaStateBindings.m, state)
-	luaStateBindings.Unlock()
-}
-
+// The registry entry is a pre-allocated *LUserData (see
+// pooledLuaState.ctxBinding) whose .Value is mutated by bind/unbind.
+// Reading it therefore amortises to a single pointer load + type
+// assertion per redis.call.
 func luaLookupContext(state *lua.LState) (*luaScriptContext, bool) {
-	luaStateBindings.RLock()
-	ctx, ok := luaStateBindings.m[state]
-	luaStateBindings.RUnlock()
-	return ctx, ok
+	ud, ok := state.GetField(state.Get(lua.RegistryIndex), luaCtxRegistryKey).(*lua.LUserData)
+	if !ok || ud == nil {
+		return nil, false
+	}
+	ctx, ok := ud.Value.(*luaScriptContext)
+	if !ok || ctx == nil {
+		return nil, false
+	}
+	return ctx, true
 }
 
 // getLuaPool returns the RedisServer's pooled lua state pool,
@@ -163,8 +188,9 @@ func newLuaStatePool() *luaStatePool {
 }
 
 // newPooledLuaState builds a fresh pooled state: base libs, dangerous
-// loaders nil-ed, redis/cjson/cmsgpack closures wired to the global
-// binding table, and a snapshot of globals for leak-free reset.
+// loaders nil-ed, a per-state ctxBinding userdata stashed in the Lua
+// registry, redis/cjson/cmsgpack closures wired to that binding, and a
+// snapshot of globals for leak-free reset.
 func newPooledLuaState() *pooledLuaState {
 	state := lua.NewState(lua.Options{SkipOpenLibs: true})
 	openLuaLib(state, lua.BaseLibName, lua.OpenBase)
@@ -175,6 +201,13 @@ func newPooledLuaState() *pooledLuaState {
 	for _, name := range []string{"dofile", "load", "loadfile", "loadstring", "module", "require"} {
 		state.SetGlobal(name, lua.LNil)
 	}
+
+	// Pre-allocate the per-state context binding and stash it in the
+	// state's registry. redis.call / redis.pcall read this userdata
+	// (lock-free, per-state) to find the active *luaScriptContext for
+	// the current eval.
+	ctxBinding := state.NewUserData()
+	state.SetField(state.Get(lua.RegistryIndex), luaCtxRegistryKey, ctxBinding)
 
 	registerPooledRedisModule(state)
 	registerCJSONModule(state)
@@ -194,6 +227,7 @@ func newPooledLuaState() *pooledLuaState {
 		state:           state,
 		globalsSnapshot: globalsSnapshot,
 		tableSnapshots:  tableSnapshots,
+		ctxBinding:      ctxBinding,
 	}
 }
 
@@ -269,15 +303,21 @@ func (p *pooledLuaState) reset() {
 	// (1) Restore inner contents of every snapshotted whitelisted
 	// table. This defeats poisoning attacks like
 	// `string.upper = function() return "pwned" end`.
+	//
+	// resetTableContents borrows p.scratchKeys as a working slice.
+	// We pass it in and receive the (possibly grown) backing array
+	// back so successive calls within the same reset share one
+	// allocation.
+	scratch := p.scratchKeys[:0]
 	for tbl, originalFields := range p.tableSnapshots {
-		resetTableContents(tbl, originalFields)
+		scratch = resetTableContents(tbl, originalFields, scratch[:0])
 	}
 
 	// (2) Collect all current global keys (of any type). Mutating
 	// the table inside ForEach is unsafe, so snapshot keys first.
-	currentKeys := make([]lua.LValue, 0, len(p.globalsSnapshot)+luaResetKeySlack)
+	scratch = scratch[:0]
 	globals.ForEach(func(k, _ lua.LValue) {
-		currentKeys = append(currentKeys, k)
+		scratch = append(scratch, k)
 	})
 
 	// Delete any key not in the init-time snapshot: these are
@@ -289,7 +329,7 @@ func (p *pooledLuaState) reset() {
 	// only touches `dict`, so a call like RawSetH(LNumber(42), LNil)
 	// leaves the array entry intact. RawSet dispatches to the right
 	// storage by key type.
-	for _, k := range currentKeys {
+	for _, k := range scratch {
 		if _, keep := p.globalsSnapshot[k]; !keep {
 			globals.RawSet(k, lua.LNil)
 		}
@@ -304,6 +344,17 @@ func (p *pooledLuaState) reset() {
 
 	// Drop anything the script may have left on the value stack.
 	p.state.SetTop(0)
+
+	// Retain scratch for the next reset, but bound the backing array
+	// so a pathological script that created thousands of globals does
+	// not permanently bloat every pooled state. If we exceeded the
+	// cap, drop the slice -- the next reset will reallocate at the
+	// modest default size.
+	if cap(scratch) > luaScratchKeysMaxCap {
+		p.scratchKeys = nil
+	} else {
+		p.scratchKeys = scratch[:0]
+	}
 }
 
 // resetTableContents restores tbl's entries so that it exactly
@@ -313,9 +364,13 @@ func (p *pooledLuaState) reset() {
 // the original function value (still alive via originalFields) is
 // put back; if a script added a new field (`string.pwn = 1`), the
 // field is deleted.
-func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValue) {
-	// Gather current keys first to avoid mutating during ForEach.
-	currentKeys := make([]lua.LValue, 0, len(originalFields)+luaResetKeySlack)
+//
+// scratch is a caller-provided slice used to buffer the current key
+// set (we cannot mutate a table while ForEach iterates it). The
+// (possibly grown) slice is returned so the caller can keep reusing
+// the underlying array across invocations.
+func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValue, scratch []lua.LValue) []lua.LValue {
+	currentKeys := scratch[:0]
 	tbl.ForEach(func(k, _ lua.LValue) {
 		currentKeys = append(currentKeys, k)
 	})
@@ -327,10 +382,13 @@ func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValu
 	for k, v := range originalFields {
 		tbl.RawSet(k, v)
 	}
+	return currentKeys
 }
 
 // get acquires a pooled state and binds the given *luaScriptContext
-// so that redis.call / redis.pcall can see it.
+// so that redis.call / redis.pcall can see it. Binding is a single
+// pointer write to the state-local ctxBinding userdata -- no lock,
+// no global map.
 func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
 	pls, ok := p.pool.Get().(*pooledLuaState)
 	if !ok || pls == nil {
@@ -340,7 +398,7 @@ func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
 	} else {
 		p.hits.Add(1)
 	}
-	luaBindContext(pls.state, ctx)
+	pls.ctxBinding.Value = ctx
 	return pls
 }
 
@@ -351,7 +409,12 @@ func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls == nil || pls.state == nil {
 		return
 	}
-	luaUnbindContext(pls.state)
+	// Clear the binding so a stale *luaScriptContext cannot be
+	// observed via a pooled state that is briefly re-acquired by a
+	// future get() before the caller writes a fresh context.
+	if pls.ctxBinding != nil {
+		pls.ctxBinding.Value = nil
+	}
 	if pls.state.IsClosed() {
 		return
 	}

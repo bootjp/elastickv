@@ -2,6 +2,8 @@ package adapter
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
@@ -323,4 +325,138 @@ end`, nil).Result()
 	out2, err := rdb.Eval(ctx, `return cjson.encode({a = 1})`, nil).Result()
 	require.NoError(t, err)
 	require.Equal(t, `{"a":1}`, out2)
+}
+
+// TestLua_PoolConcurrentContextIsolation is the regression test for
+// the HIGH-priority concurrency fix. It asserts that when many
+// goroutines concurrently get / bind / lookup / put pooled states,
+// each goroutine's redis.call closure observes *its own*
+// *luaScriptContext -- never another goroutine's context.
+//
+// Before the fix, the global luaStateBindings map + sync.RWMutex was
+// a single contention point on every redis.call. After the fix, each
+// state reads an *LUserData from its own registry, which must never
+// point at a different goroutine's context even under heavy
+// interleaving. Run with `go test -race -count=5 -run TestLua_Pool`.
+func TestLua_PoolConcurrentContextIsolation(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	const (
+		goroutines    = 64
+		lookupsPerScr = 100
+	)
+
+	var (
+		mismatches atomic.Int64
+		wg         sync.WaitGroup
+	)
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			// Each goroutine uses a distinct context pointer so that
+			// observing a wrong-valued pointer is a detectable bug.
+			ownCtx := &luaScriptContext{}
+			pls := pool.get(ownCtx)
+			// Simulate many redis.call lookups inside one script.
+			for i := 0; i < lookupsPerScr; i++ {
+				observed, ok := luaLookupContext(pls.state)
+				if !ok || observed != ownCtx {
+					mismatches.Add(1)
+				}
+			}
+			pool.put(pls)
+		}()
+	}
+	wg.Wait()
+
+	require.EqualValues(t, 0, mismatches.Load(),
+		"concurrent goroutines observed a wrong context via luaLookupContext -- state-local binding is broken")
+}
+
+// TestLua_PoolContextIsRegistryBacked asserts the binding lives in the
+// state's own Lua registry -- the very thing that frees us from the
+// global sync.RWMutex. If a refactor ever reintroduces a global map,
+// this test pins down the contract.
+func TestLua_PoolContextIsRegistryBacked(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+	ctx := &luaScriptContext{}
+	pls := pool.get(ctx)
+	defer pool.put(pls)
+
+	ud, ok := pls.state.GetField(pls.state.Get(lua.RegistryIndex), luaCtxRegistryKey).(*lua.LUserData)
+	require.True(t, ok, "ctx binding userdata missing from state registry")
+	require.Same(t, pls.ctxBinding, ud, "registry userdata differs from pooledLuaState.ctxBinding")
+	storedCtx, ok := ud.Value.(*luaScriptContext)
+	require.True(t, ok, "registry userdata value is not a *luaScriptContext")
+	require.Same(t, ctx, storedCtx,
+		"registry userdata value does not point at the bound script context")
+}
+
+// TestLua_PoolScratchKeysReused verifies the MEDIUM allocation fix.
+// After a reset, pooledLuaState.scratchKeys must retain a non-nil
+// backing array (sliced to zero length) so the next reset reuses it
+// instead of minting a new one. We also verify the luaScratchKeysMaxCap
+// bound kicks in for pathological scripts.
+func TestLua_PoolScratchKeysReused(t *testing.T) {
+	t.Parallel()
+
+	pls := newPooledLuaState()
+
+	// First reset primes scratchKeys from nil to a real backing array.
+	pls.reset()
+	require.NotNil(t, pls.scratchKeys,
+		"scratchKeys still nil after reset; no reuse buffer was retained")
+	require.Equal(t, 0, len(pls.scratchKeys),
+		"scratchKeys must be reset to zero length for reuse")
+	firstCap := cap(pls.scratchKeys)
+	require.Greater(t, firstCap, 0, "scratchKeys capacity must be > 0 after priming")
+
+	// Second reset must reuse the same backing array (cap unchanged
+	// or grown, never shrunk).
+	pls.reset()
+	require.GreaterOrEqual(t, cap(pls.scratchKeys), firstCap,
+		"scratchKeys backing array was discarded between resets; no reuse")
+
+	// Force the cap-bound path: manually push scratchKeys past the
+	// bound, reset, and assert it is dropped.
+	pls.scratchKeys = make([]lua.LValue, 0, luaScratchKeysMaxCap+16)
+	pls.reset()
+	require.LessOrEqual(t, cap(pls.scratchKeys), luaScratchKeysMaxCap,
+		"scratchKeys was not bounded; pathological scripts can pin unbounded memory")
+}
+
+// BenchmarkLuaLookupContext_Concurrent measures the cost of the
+// redis.call context lookup under high fan-out. This is the bench the
+// Gemini reviewer called out: ~50 lookups/script/s across concurrent
+// scripts used to hammer a global RWMutex. Now it should be a
+// lock-free per-state read.
+//
+//	go test -run='^$' -bench=BenchmarkLuaLookupContext_Concurrent -benchtime=5s ./adapter/
+func BenchmarkLuaLookupContext_Concurrent(b *testing.B) {
+	pool := newLuaStatePool()
+	// Prime a handful of states so pool.Get is warm.
+	for i := 0; i < 8; i++ {
+		pool.put(pool.get(&luaScriptContext{}))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		ctx := &luaScriptContext{}
+		for pb.Next() {
+			pls := pool.get(ctx)
+			// Simulate 5 redis.call invocations per script.
+			for i := 0; i < 5; i++ {
+				if got, ok := luaLookupContext(pls.state); !ok || got != ctx {
+					b.Fatalf("wrong ctx observed: got=%p want=%p ok=%v", got, ctx, ok)
+				}
+			}
+			pool.put(pls)
+		}
+	})
 }
