@@ -1700,12 +1700,12 @@ func TestSelectDispatchLane_FourLane(t *testing.T) {
 	}
 }
 
-// TestSelectDispatchLane_MsgPropFallsBackToOther verifies that, even though
-// DisableProposalForwarding=true should prevent outbound MsgProp from ever
-// reaching selectDispatchLane, an unexpected MsgProp is routed to the
-// catch-all lane rather than panicking. A panic in a raft engine goroutine
-// would crash the whole node; log-and-fallback keeps it running.
-func TestSelectDispatchLane_MsgPropFallsBackToOther(t *testing.T) {
+// TestSelectDispatchLane_MsgPropReachesDefaultFallback verifies that MsgProp,
+// which is unreachable in practice because DisableProposalForwarding=true
+// prevents outbound proposals, is routed to the catch-all lane by the default
+// fallback if it ever slips through. This guards against a regression that
+// would panic or misroute MsgProp inside a raft engine goroutine.
+func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{nodeID: 1, dispatcherLanesEnabled: true}
 	pd := &peerQueues{

@@ -1524,32 +1524,17 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	// filtered by skipDispatchMessage (etcdraft.IsLocalMsg: MsgHup, MsgBeat,
 	// MsgUnreachable, MsgSnapStatus, MsgCheckQuorum, MsgStorageAppend/Resp,
 	// MsgStorageApply/Resp) is dropped before this switch is reached.
-	// MsgProp is also unreachable: DisableProposalForwarding is set and
-	// handleProposal rejects non-leader proposals, so no outbound MsgProp
-	// is ever emitted. Priority control traffic (MsgHeartbeat/Resp, votes,
-	// read-index, MsgTimeoutNow) is short-circuited by the isPriorityMsg
-	// branch above. The exhaustive lint is suppressed because exhaustively
-	// listing the filtered types would reintroduce the dead cases this
-	// refactor removed.
-	switch msgType { //nolint:exhaustive // filtered types handled by skipDispatchMessage + isPriorityMsg; see comment above.
+	// Priority control traffic (MsgHeartbeat/Resp, votes, read-index,
+	// MsgTimeoutNow) is short-circuited by the isPriorityMsg branch above.
+	// MsgProp is not listed: DisableProposalForwarding=true ensures no
+	// outbound MsgProp from this engine; if that assumption ever breaks the
+	// message falls through to the pd.other return below.
+	switch msgType { //nolint:exhaustive // see skipDispatchMessage / DisableProposalForwarding
 	case raftpb.MsgApp, raftpb.MsgAppResp:
 		return pd.replication
 	case raftpb.MsgSnap:
 		return pd.snapshot
 	case raftpb.MsgTransferLeader, raftpb.MsgForgetLeader:
-		return pd.other
-	case raftpb.MsgProp:
-		// DisableProposalForwarding=true (see raft.Config construction in this
-		// file) should guarantee no outbound MsgProp is ever emitted, so this
-		// case is unreachable today. If it does fire, either upstream
-		// etcd/raft semantics or our config changed; log loudly so operators
-		// notice, but keep the node up by routing to the catch-all lane
-		// rather than panicking inside a raft engine goroutine (which would
-		// crash the whole process).
-		slog.Error("selectDispatchLane: unexpected outbound MsgProp encountered",
-			slog.Uint64("raft_node_id", e.nodeID),
-			slog.String("type", msgType.String()),
-		)
 		return pd.other
 	}
 	// Fallback for any raftpb.MessageType added upstream that slips past
