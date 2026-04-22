@@ -384,6 +384,110 @@
         (str "expected :score-mismatch, got kinds=" kinds))))
 
 ;; ---------------------------------------------------------------------------
+;; Chained committed ZINCRBYs: only the linearization-chain tail is a
+;; valid final score. Earlier intermediate return values are stale. (codex P1)
+;; ---------------------------------------------------------------------------
+
+(deftest chained-committed-zincrby-rejects-stale-intermediate
+  ;; codex P1: sequential committed ZINCRBYs form a forced linearization
+  ;; chain. The first ZINCRBY's return value is an intermediate that no
+  ;; post-chain read may observe. Expect :score-mismatch on the stale
+  ;; intermediate.
+  (let [history [;; Start with score 1.
+                 {:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+                 ;; ZINCRBY +2 -> ok=3 (committed).
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 2]    :index 2}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 3.0]  :index 3}
+                 ;; ZINCRBY +3 -> ok=6 (committed). Strictly follows the
+                 ;; previous ZINCRBY in real time (invoke 4 > complete 3).
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 3]    :index 4}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 6.0]  :index 5}
+                 ;; Read AFTER the whole chain observes the stale
+                 ;; intermediate 3.0 -- not admissible under any
+                 ;; linearization.
+                 {:type :invoke :process 1 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 3.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected stale-intermediate to be flagged, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
+(deftest chained-committed-zincrby-accepts-latest
+  ;; codex P1: same history but the read observes the LATEST chain tail
+  ;; (6.0) -- accept as valid.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 2]    :index 2}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 3.0]  :index 3}
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 3]    :index 4}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 6.0]  :index 5}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 6.0]] :index 7}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected chain-tail score to be accepted, got: " result))))
+
+(deftest concurrent-zincrby-both-admissible
+  ;; codex P1: two overlapping-in-real-time ZINCRBYs whose returned
+  ;; scores are BOTH candidate final states under some linearization.
+  ;; Read observing either value must be accepted.
+  ;; Overlap: A=[inv=2, cmp=5], B=[inv=3, cmp=4].
+  (let [base [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+              {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+              {:type :invoke :process 1 :f :zincrby :value ["m1" 2]    :index 2}
+              {:type :invoke :process 2 :f :zincrby :value ["m1" 3]    :index 3}
+              ;; B completes first with ok=4 (delta applied to score 1).
+              {:type :ok     :process 2 :f :zincrby :value ["m1" 4.0]  :index 4}
+              ;; A completes with ok=6 (delta applied after B).
+              {:type :ok     :process 1 :f :zincrby :value ["m1" 6.0]  :index 5}]
+        read-a (conj base
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 4.0]] :index 7})
+        read-b (conj base
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 6.0]] :index 7})]
+    (is (:valid? (run-checker read-a))
+        "expected B's return value (4.0) admissible under overlap")
+    (is (:valid? (run-checker read-b))
+        "expected A's return value (6.0) admissible under overlap")))
+
+(deftest zadd-resets-zincrby-chain
+  ;; codex P1: a committed ZADD between ZINCRBYs resets the chain --
+  ;; subsequent ZINCRBYs operate on the new ZADD'd value. The pre-reset
+  ;; ZINCRBY score is NOT a valid read after the chain completes.
+  (let [base [;; ZADD m1 1
+              {:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+              {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+              ;; ZINCRBY +2 -> 3
+              {:type :invoke :process 0 :f :zincrby :value ["m1" 2]    :index 2}
+              {:type :ok     :process 0 :f :zincrby :value ["m1" 3.0]  :index 3}
+              ;; ZADD m1 10 -- chain reset to absolute value.
+              {:type :invoke :process 0 :f :zadd    :value ["m1" 10]   :index 4}
+              {:type :ok     :process 0 :f :zadd    :value ["m1" 10]   :index 5}
+              ;; ZINCRBY +1 -> 11
+              {:type :invoke :process 0 :f :zincrby :value ["m1" 1]    :index 6}
+              {:type :ok     :process 0 :f :zincrby :value ["m1" 11.0] :index 7}]
+        read-ok (conj base
+                  {:type :invoke :process 1 :f :zrange-all :index 8}
+                  {:type :ok     :process 1 :f :zrange-all
+                   :value [["m1" 11.0]] :index 9})
+        read-bad (conj base
+                   {:type :invoke :process 1 :f :zrange-all :index 8}
+                   {:type :ok     :process 1 :f :zrange-all
+                    :value [["m1" 3.0]] :index 9})]
+    (is (:valid? (run-checker read-ok))
+        "expected post-reset chain tail (11.0) to be accepted")
+    (is (not (:valid? (run-checker read-bad)))
+        "expected pre-reset intermediate (3.0) to be flagged")))
+
+;; ---------------------------------------------------------------------------
 ;; Infinity score parsing
 ;; ---------------------------------------------------------------------------
 

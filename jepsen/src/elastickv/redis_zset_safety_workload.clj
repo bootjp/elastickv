@@ -407,12 +407,26 @@
                        (filter #(and (= :ok (:type %))
                                      (some? (:complete-idx %))
                                      (< (:complete-idx %) read-inv-idx))))
-        ;; Real-time "last-wins" candidate filter: a preceding mutation
-        ;; m is admissible iff no OTHER preceding mutation m' has
-        ;; m'.invoke-idx > m.complete-idx (i.e. m' strictly follows m).
-        ;; Equivalent: m.complete-idx >= max(invoke-idx) over preceding.
-        ;; When multiple candidates remain, they have overlapping
-        ;; windows and may serialize in any real-time-consistent order.
+        ;; Real-time "last-wins" / chain-tail candidate filter: a
+        ;; preceding mutation m is admissible iff no OTHER preceding
+        ;; mutation m' has m'.invoke-idx > m.complete-idx (i.e. m'
+        ;; strictly follows m in real time). Equivalent:
+        ;; m.complete-idx >= max(invoke-idx) over preceding.
+        ;;
+        ;; Importantly this applies to :zincrby as well: a sequentially
+        ;; committed ZINCRBY chain has a forced linearization (each
+        ;; :ok :zincrby pins the pre-op and post-op states), so only
+        ;; the latest chain tail's return value is a valid final score
+        ;; for a post-chain read. An intermediate ZINCRBY's return
+        ;; value is NOT admissible once another mutation strictly
+        ;; follows it and commits before the read. A ZADD that strictly
+        ;; follows a ZINCRBY likewise resets the chain (the ZADD's
+        ;; absolute score becomes the only candidate).
+        ;;
+        ;; When multiple candidates remain (their invoke/complete
+        ;; windows overlap), they may serialize in any real-time-
+        ;; consistent order and any of their return values is a valid
+        ;; final state.
         max-inv (reduce max -1 (map :invoke-idx preceding))
         candidates (filterv #(>= (:complete-idx %) max-inv) preceding)
         ;; :info mutations that completed before the read: they may or
