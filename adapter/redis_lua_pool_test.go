@@ -109,13 +109,10 @@ func TestLua_VMReuseDoesNotLeakGlobals(t *testing.T) {
 	pool.put(plsB)
 
 	// NOTE: we intentionally do NOT assert pool.Hits() >= 1 here.
-	// sync.Pool may evict items between Put and Get under GC pressure
-	// (same non-determinism acknowledged in the comment above line
-	// 80), so the Script-B Get may be a fresh allocation even though
-	// Script A's plsA was just Put. CI on GitHub Actions has
-	// reproduced this as a flake. Pool effectiveness is covered
-	// deterministically by TestLua_PoolRecordsReuseVsAllocation,
-	// which asserts hits + misses rather than hits alone.
+	// As noted at line 81, sync.Pool may evict items under GC pressure,
+	// making a single-iteration hit assertion non-deterministic.
+	// Pool effectiveness is covered by TestLua_PoolRecordsReuseVsAllocation,
+	// which uses a loop to ensure reuse occurs.
 }
 
 // TestLua_VMReuseRestoresRebindsWhitelistedGlobals guards against a
