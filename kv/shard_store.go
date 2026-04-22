@@ -1174,6 +1174,23 @@ func (s *ShardStore) LastCommitTS() uint64 {
 	return max
 }
 
+// WriteConflictCountsByPrefix aggregates OCC conflict counts across
+// every shard group owned by this ShardStore. Per-shard counts share
+// the same "<kind>|<key_prefix>" label schema, so a simple sum gives
+// the node-wide view. The result is always non-nil.
+func (s *ShardStore) WriteConflictCountsByPrefix() map[string]uint64 {
+	out := map[string]uint64{}
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		for label, count := range g.Store.WriteConflictCountsByPrefix() {
+			out[label] += count
+		}
+	}
+	return out
+}
+
 func (s *ShardStore) Compact(ctx context.Context, minTS uint64) error {
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {

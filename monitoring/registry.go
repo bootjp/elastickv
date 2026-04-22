@@ -14,12 +14,13 @@ type Registry struct {
 	registerer   prometheus.Registerer
 	gatherer     prometheus.Gatherer
 
-	dynamo  *DynamoDBMetrics
-	redis   *RedisMetrics
-	raft    *RaftMetrics
-	lua     *LuaMetrics
-	hotPath *HotPathMetrics
-	pebble  *PebbleMetrics
+	dynamo        *DynamoDBMetrics
+	redis         *RedisMetrics
+	raft          *RaftMetrics
+	lua           *LuaMetrics
+	hotPath       *HotPathMetrics
+	pebble        *PebbleMetrics
+	writeConflict *WriteConflictMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -41,6 +42,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.lua = newLuaMetrics(registerer)
 	r.hotPath = newHotPathMetrics(registerer)
 	r.pebble = newPebbleMetrics(registerer)
+	r.writeConflict = newWriteConflictMetrics(registerer)
 	return r
 }
 
@@ -144,4 +146,16 @@ func (r *Registry) PebbleCollector() *PebbleCollector {
 		return nil
 	}
 	return newPebbleCollector(r.pebble)
+}
+
+// WriteConflictCollector returns a collector that polls each MVCC
+// store's per-(kind, key_prefix) OCC conflict counters and mirrors
+// them into the elastickv_store_write_conflict_total Prometheus
+// counter vector. Start it with the node's MVCC sources after the
+// stores have been opened.
+func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
+	if r == nil || r.writeConflict == nil {
+		return nil
+	}
+	return newWriteConflictCollector(r.writeConflict)
 }

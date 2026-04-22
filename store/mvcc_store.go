@@ -65,6 +65,11 @@ type mvccStore struct {
 	log           *slog.Logger
 	lastCommitTS  uint64
 	minRetainedTS uint64
+	// writeConflicts mirrors the per-(kind, key_prefix) counter from
+	// the pebble-backed store so the in-memory implementation shows up
+	// in the same Prometheus series (even if the counts are usually
+	// zero because tests rarely race ApplyMutations).
+	writeConflicts *writeConflictCounter
 }
 
 // LastCommitTS exposes the latest commit timestamp for read snapshot selection.
@@ -106,6 +111,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
+		writeConflicts: newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -493,15 +499,29 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 func (s *mvccStore) checkConflictsLocked(mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
 	for _, mut := range mutations {
 		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
+			s.writeConflicts.record(WriteConflictKindWrite, classifyWriteConflictKey(mut.Key))
 			return NewWriteConflictError(mut.Key)
 		}
 	}
 	for _, key := range readKeys {
 		if latestVer, ok := s.latestVersionLocked(key); ok && latestVer.TS > startTS {
+			s.writeConflicts.record(WriteConflictKindRead, classifyWriteConflictKey(key))
 			return NewWriteConflictError(key)
 		}
 	}
 	return nil
+}
+
+// WriteConflictCountsByPrefix returns a snapshot of OCC conflicts
+// observed by this in-memory store. See pebbleStore for semantics.
+func (s *mvccStore) WriteConflictCountsByPrefix() map[string]uint64 {
+	return s.writeConflicts.snapshot()
+}
+
+// WriteConflictCount returns the aggregate OCC conflict count across
+// all (kind, key_prefix) buckets.
+func (s *mvccStore) WriteConflictCount() uint64 {
+	return s.writeConflicts.total()
 }
 
 // DeletePrefixAt deletes all visible keys matching prefix by writing tombstones
