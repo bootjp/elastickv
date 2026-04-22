@@ -26,11 +26,13 @@ func TestClassifySecondaryWriteError(t *testing.T) {
 		},
 		{"not leader", errors.New("not leader"), "not_leader"},
 		{"linearizable read not leader", errors.New("linearizable read: not leader"), "not_leader"},
+		{"leader not found (ErrLeaderNotFound message)", errors.New("leader not found"), "not_leader"},
 		{"context deadline exceeded via errors.Is", context.DeadlineExceeded, "deadline_exceeded"},
 		{"wrapped deadline exceeded", fmt.Errorf("dispatch failed: %w", context.DeadlineExceeded), "deadline_exceeded"},
 		{"deadline exceeded substring only", errors.New("rpc: deadline exceeded"), "deadline_exceeded"},
 		{"txn already committed", errors.New("txn already committed"), "txn_already_finalized"},
 		{"txn already aborted", errors.New("txn already aborted"), "txn_already_finalized"},
+		{"txn locked", errors.New("key: foo: txn locked"), "txn_locked"},
 		{"unknown", errors.New("some random failure"), "other"},
 	}
 

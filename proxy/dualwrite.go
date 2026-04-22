@@ -491,30 +491,41 @@ func argsToBytes(iArgs []any) [][]byte {
 	return out
 }
 
+// secondaryWriteErrorPatterns maps substrings found in secondary-write error
+// messages to their Prometheus reason label. The list is scanned in order so
+// more-specific patterns (e.g. "retry limit exceeded" which embeds "write
+// conflict") must precede the generic ones to win the classification.
+var secondaryWriteErrorPatterns = []struct {
+	substr string
+	reason string
+}{
+	{"retry limit exceeded", "retry_limit"},
+	{"write conflict", "write_conflict"},
+	{"deadline exceeded", "deadline_exceeded"},
+	{"not leader", "not_leader"},
+	{"leader not found", "not_leader"},
+	{"txn already committed", "txn_already_finalized"},
+	{"txn already aborted", "txn_already_finalized"},
+	{"txn locked", "txn_locked"},
+}
+
 // classifySecondaryWriteError maps a secondary-write error to a small fixed set
 // of reason labels suitable for a Prometheus counter. The elastickv secondary
 // backend is in-house, so matching on substrings of the error message is safe.
 //
-// Order matters: "retry limit exceeded" is checked before "write conflict"
-// because the retry-limit message embeds the underlying conflict string, and
-// we want the outer (retry_limit) classification to win.
+// Order in secondaryWriteErrorPatterns matters (see its doc).
 func classifySecondaryWriteError(err error) string {
 	if err == nil {
 		return "other"
 	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "retry limit exceeded"):
-		return "retry_limit"
-	case strings.Contains(msg, "write conflict"):
-		return "write_conflict"
-	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(msg, "deadline exceeded"):
+	if errors.Is(err, context.DeadlineExceeded) {
 		return "deadline_exceeded"
-	case strings.Contains(msg, "not leader"):
-		return "not_leader"
-	case strings.Contains(msg, "txn already committed") || strings.Contains(msg, "txn already aborted"):
-		return "txn_already_finalized"
-	default:
-		return "other"
 	}
+	msg := err.Error()
+	for _, p := range secondaryWriteErrorPatterns {
+		if strings.Contains(msg, p.substr) {
+			return p.reason
+		}
+	}
+	return "other"
 }

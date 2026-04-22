@@ -52,7 +52,7 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		SecondaryWriteErrorsByReason: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "proxy",
 			Name:      "secondary_write_errors_by_reason_total",
-			Help:      "secondary write failures broken out by redis command and error classification (write_conflict / retry_limit / not_leader / deadline_exceeded / txn_already_finalized / other)",
+			Help:      "secondary write failures broken out by redis command and error classification (write_conflict / retry_limit / not_leader / deadline_exceeded / txn_already_finalized / txn_locked / other)",
 		}, []string{"cmd", "reason"}),
 		PrimaryReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "proxy",
