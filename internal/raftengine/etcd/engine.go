@@ -1520,14 +1520,37 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	if !e.dispatcherLanesEnabled {
 		return pd.normal
 	}
-	switch msgType { //nolint:exhaustive // only MsgApp/MsgAppResp/MsgSnap need dedicated lanes; the rest falls through to pd.other
+	// Enumerate every raftpb.MessageType explicitly so that future additions
+	// to the enum surface as exhaustive-lint failures instead of being
+	// silently routed to pd.other. Priority control traffic is handled by
+	// the isPriorityMsg branch above; listing those types here would be
+	// unreachable, so they are grouped into the heartbeat case for
+	// documentation only and defensively return pd.heartbeat.
+	switch msgType {
 	case raftpb.MsgApp, raftpb.MsgAppResp:
 		return pd.replication
-	case raftpb.MsgSnap:
+	case raftpb.MsgSnap, raftpb.MsgSnapStatus:
 		return pd.snapshot
-	default:
+	case raftpb.MsgHeartbeat, raftpb.MsgHeartbeatResp,
+		raftpb.MsgVote, raftpb.MsgVoteResp,
+		raftpb.MsgPreVote, raftpb.MsgPreVoteResp,
+		raftpb.MsgReadIndex, raftpb.MsgReadIndexResp,
+		raftpb.MsgTimeoutNow:
+		// Unreachable: isPriorityMsg already short-circuited these above.
+		// Listed for exhaustiveness; keep them on the heartbeat lane so any
+		// future refactor that removes the short-circuit stays correct.
+		return pd.heartbeat
+	case raftpb.MsgHup, raftpb.MsgBeat, raftpb.MsgProp,
+		raftpb.MsgUnreachable, raftpb.MsgCheckQuorum, raftpb.MsgTransferLeader,
+		raftpb.MsgStorageAppend, raftpb.MsgStorageAppendResp,
+		raftpb.MsgStorageApply, raftpb.MsgStorageApplyResp,
+		raftpb.MsgForgetLeader:
 		return pd.other
 	}
+	// If a new raftpb.MessageType is added upstream, the exhaustive linter
+	// will flag the switch above. This fallback keeps runtime behaviour
+	// backwards-compatible with the previous default branch.
+	return pd.other
 }
 
 func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
