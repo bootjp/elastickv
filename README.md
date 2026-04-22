@@ -5,7 +5,7 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 
 **THIS PROJECT IS CURRENTLY UNDER DEVELOPMENT AND IS NOT READY FOR PRODUCTION USE.**
 
-## Implemented Features (Verified)
+## Implemented Features
 - **Raft-based Data Replication**: KV state replication is implemented on Raft, with leader-based commit and follower forwarding paths.
 - **Shard-aware Data Plane**: Static shard ranges across multiple Raft groups with shard routing/coordinator are implemented.
 - **Durable Route Control Plane (Milestone 1)**: Durable route catalog, versioned route snapshot apply, watcher-based route refresh, and manual `ListRoutes`/`SplitRange` (same-group split) are implemented.
@@ -14,6 +14,7 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 - **DynamoDB Compatibility Scope**: `CreateTable`/`DeleteTable`/`DescribeTable`/`ListTables`/`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems` are implemented.
 - **S3 Compatibility Scope**: `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`, `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, and `ListObjectsV2` (path-style) are implemented. AWS Signature Version 4 authentication with static credentials is supported. The server exposes an S3-compatible HTTP endpoint via `--s3Address`.
 - **Basic Consistency Behaviors**: Write-after-read checks, leader redirection/forwarding paths, and OCC conflict detection for transactional writes are covered by tests.
+- **Hybrid Logical Clock (HLC)**: Transactions are ordered by a 64-bit HLC split into an upper 48-bit physical component (Unix milliseconds) and a lower 16-bit logical counter. The logical half advances in memory with atomic CAS on every `Next()` call — no Raft round-trip per timestamp — so timestamp issuance stays in the nanosecond range. The physical half is bounded by a leader-lease style ceiling: the leader periodically commits a lease entry (`hlcRenewalInterval ≈ 1s`, window `hlcPhysicalWindowMs = 3s`) so that a newly elected leader inherits a safe lower bound and never issues timestamps overlapping the previous leader's window, without blocking per-request on consensus. See `docs/architecture_overview.md` §4 for details.
 
 ## Planned Features
 - **Dynamic Node Scaling**: Automatic node/range scaling based on load is not yet implemented (current sharding operations are configuration/manual driven).
@@ -97,32 +98,6 @@ go run . \
   --raftId "n1" \
   --raftBootstrap
 ```
-
-### Migrating Legacy BoltDB Raft Storage
-
-Recent versions store Raft logs and stable state in Pebble (`raft.db`) instead of
-the legacy BoltDB files (`logs.dat` and `stable.dat`). If startup fails with:
-
-```text
-legacy boltdb Raft storage "logs.dat" found in ...
-```
-
-stop the node and run the offline migrator against the directory shown in the
-error:
-
-```bash
-go run ./cmd/raft-migrate --dir /var/lib/elastickv/n1
-mv /var/lib/elastickv/n1/logs.dat /var/lib/elastickv/n1/logs.dat.bak
-mv /var/lib/elastickv/n1/stable.dat /var/lib/elastickv/n1/stable.dat.bak
-```
-
-For multi-group layouts, pass the exact group directory from the error message
-(for example `/var/lib/elastickv/n1/group-1`).
-
-After that, start Elastickv normally. The migrator leaves the legacy files in
-place as a backup, but they must be moved or removed before startup because the
-server intentionally refuses to run while `logs.dat` or `stable.dat` are still
-present.
 
 To expose metrics on a dedicated port:
 ```bash

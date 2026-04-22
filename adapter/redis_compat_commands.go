@@ -2023,7 +2023,29 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 		return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(err)
 	}
 	if !zsetExists {
-		return false, monitoring.LuaFastPathFallbackMissingKey, nil
+		// The key has no ZSet encoding at readTS. Redis semantics:
+		//   - key truly absent  → ZRANGEBYSCORE returns empty
+		//   - key is another type → ZRANGEBYSCORE returns WRONGTYPE
+		// Production metric (PR #572) showed this branch is the
+		// hot-path dominant outcome (~96% of ZRANGEBYSCORE calls on
+		// BullMQ-style workloads that poll an empty delayed queue).
+		// Punting every such call to the slow path repeats the same
+		// 3-probe member/meta/delta scan we just did and then
+		// re-probes all other types anyway -- pure duplicate I/O.
+		//
+		// Short-circuit: use keyTypeAt (logical type after TTL check)
+		// to distinguish "truly absent" from "wrong type". If None,
+		// return hit=true with an empty result -- that is the correct
+		// Redis answer and saves the slow-path round-trip. Otherwise
+		// fall back so the slow path can produce WRONGTYPE.
+		typ, typErr := r.keyTypeAt(ctx, key, readTS)
+		if typErr != nil {
+			return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(typErr)
+		}
+		if typ == redisTypeNone {
+			return true, "", nil
+		}
+		return false, monitoring.LuaFastPathFallbackWrongType, nil
 	}
 	if higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS); hErr != nil {
 		return false, monitoring.LuaFastPathFallbackOther, hErr

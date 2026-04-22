@@ -41,6 +41,10 @@ flowchart TB
       FSM["KV FSM (kv/fsm.go)"]
       MV["MVCC Store (store/mvcc_store.go or store/lsm_store.go)"]
     end
+
+    subgraph Clock["Timestamp Oracle"]
+      HLC["HLC (kv/hlc.go)"]
+    end
   end
 
   RC --> RS
@@ -71,6 +75,10 @@ flowchart TB
   CS --> MV
   CW --> CS
   CW --> DE
+
+  SCC -- "Next() timestamps" --> HLC
+  FSM -- "apply HLC lease: SetPhysicalCeiling" --> HLC
+  SCC -- "propose HLC lease (leader)" --> RG
 ```
 
 ## 2. Overall Runtime Architecture
@@ -146,8 +154,37 @@ sequenceDiagram
   DS-->>Op: "SplitRangeResponse(left,right,catalogVersion)"
 ```
 
-## 4. Notes
+## 4. Hybrid Logical Clock (HLC)
+
+Transactional reads and writes are ordered by a Hybrid Logical Clock (`kv/hlc.go`).
+A 64-bit timestamp packs a 48-bit physical component (Unix milliseconds) and a
+16-bit in-memory logical counter. The physical component is bounded by a
+Raft-agreed ceiling so that a newly elected leader never issues timestamps that
+overlap the previous leader's window.
+
+```mermaid
+sequenceDiagram
+  participant L as "Leader Coordinator"
+  participant RG as "Default Raft Group"
+  participant F as "KV FSM (all nodes)"
+  participant H as "HLC (all nodes)"
+  participant Tx as "Txn / MVCC read-write path"
+
+  loop "every hlcRenewalInterval (<3s)"
+    L->>RG: "Propose HLC lease (now + hlcPhysicalWindowMs)"
+    RG-->>F: "Apply HLC lease entry"
+    F->>H: "SetPhysicalCeiling(ms)"
+  end
+
+  Tx->>H: "Next()"
+  H-->>Tx: "ts = max(wall, ceiling)<<16 | logical_counter"
+```
+
+## 5. Notes
 
 1. Route catalog is persisted in reserved internal keys in the default Raft group.
 2. `distribution.Engine` is an in-memory read path cache and is refreshed by watcher.
 3. Milestone 1 split is same-group only. Cross-group migration is out of scope.
+4. HLC physical ceiling is replicated via the default Raft group; the logical
+   counter advances in memory with no Raft round-trip. Coordinator and FSM share
+   the same `*HLC` instance (wired via `WithHLC` / `NewKvFSMWithHLC`).

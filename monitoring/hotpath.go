@@ -30,11 +30,12 @@ const (
 // GET hot-path dashboard. Kept in its own type so the Registry can hold
 // a single instance and hand out scoped observer/collector objects.
 type HotPathMetrics struct {
-	leaseReadsTotal      *prometheus.CounterVec
-	dispatchDroppedTotal *prometheus.CounterVec
-	dispatchErrorsTotal  *prometheus.CounterVec
-	stepQueueFullTotal   *prometheus.CounterVec
-	luaFastPathTotal     *prometheus.CounterVec
+	leaseReadsTotal           *prometheus.CounterVec
+	dispatchDroppedTotal      *prometheus.CounterVec
+	dispatchErrorsTotal       *prometheus.CounterVec
+	dispatchErrorsByCodeTotal *prometheus.CounterVec
+	stepQueueFullTotal        *prometheus.CounterVec
+	luaFastPathTotal          *prometheus.CounterVec
 }
 
 // LuaFastPathOutcome labels tag each Lua-side read fast-path decision
@@ -100,6 +101,13 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			},
 			[]string{"group"},
 		),
+		dispatchErrorsByCodeTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_dispatch_errors_by_code_total",
+				Help: "elastickv_raft_dispatch_errors_total subdivided by grpc status code so operators can tell whether the transport is failing because peers are unreachable (Unavailable), slow (DeadlineExceeded), or flow-controlled (ResourceExhausted).",
+			},
+			[]string{"group", "code"},
+		),
 		luaFastPathTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_lua_cmd_fastpath_total",
@@ -113,6 +121,7 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 		m.leaseReadsTotal,
 		m.dispatchDroppedTotal,
 		m.dispatchErrorsTotal,
+		m.dispatchErrorsByCodeTotal,
 		m.stepQueueFullTotal,
 		m.luaFastPathTotal,
 	)
@@ -247,6 +256,12 @@ type DispatchCounterSource interface {
 	DispatchDropCount() uint64
 	DispatchErrorCount() uint64
 	StepQueueFullCount() uint64
+	// DispatchErrorCountsByCode returns a snapshot of dispatch error
+	// counts keyed by grpc status code ("Unavailable",
+	// "DeadlineExceeded", ...). Sum of values equals
+	// DispatchErrorCount(). Implementations that do not break out by
+	// code may return an empty map.
+	DispatchErrorCountsByCode() map[string]uint64
 }
 
 // DispatchSource binds a raft group ID to its counter source. Multiple
@@ -273,6 +288,10 @@ type dispatchSnapshot struct {
 	drops     uint64
 	errors    uint64
 	stepFulls uint64
+	// byCode keeps the last-seen per-grpc-code error totals so the
+	// collector can emit monotonic deltas per code on each poll. nil
+	// until the first observation.
+	byCode map[string]uint64
 }
 
 func newDispatchCollector(metrics *HotPathMetrics) *DispatchCollector {
@@ -327,6 +346,7 @@ func (c *DispatchCollector) observeOnce(sources []DispatchSource) {
 			drops:     src.Source.DispatchDropCount(),
 			errors:    src.Source.DispatchErrorCount(),
 			stepFulls: src.Source.StepQueueFullCount(),
+			byCode:    src.Source.DispatchErrorCountsByCode(),
 		}
 		prev := c.previous[src.GroupID]
 		group := strconv.FormatUint(src.GroupID, 10)
@@ -344,6 +364,11 @@ func (c *DispatchCollector) observeOnce(sources []DispatchSource) {
 		}
 		if curr.stepFulls > prev.stepFulls {
 			c.metrics.stepQueueFullTotal.WithLabelValues(group).Add(float64(curr.stepFulls - prev.stepFulls))
+		}
+		for code, count := range curr.byCode {
+			if prevCount := prev.byCode[code]; count > prevCount {
+				c.metrics.dispatchErrorsByCodeTotal.WithLabelValues(group, code).Add(float64(count - prevCount))
+			}
 		}
 		c.previous[src.GroupID] = curr
 	}

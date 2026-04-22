@@ -36,6 +36,24 @@ type luaScriptContext struct {
 	touched     map[string]struct{}
 	deleted     map[string]bool
 	everDeleted map[string]bool
+	// negativeType caches keys for which server.keyTypeAt() has already
+	// returned redisTypeNone during this Eval. Since startTS is pinned,
+	// MVCC guarantees the absence-at-startTS result is stable for the
+	// script's duration; in-script mutations that re-create the key
+	// populate the concrete-type state (c.strings/c.zsets/... with
+	// exists=true), which cachedType() returns first, so the negative
+	// cache is shadowed without needing explicit invalidation.
+	//
+	// Bounded by maxNegativeTypeCacheEntries to prevent a malicious or
+	// buggy script from probing unbounded unique non-existent keys and
+	// blowing up memory. Once full, further misses fall back to the
+	// server-side probe (still correct, just not cached).
+	negativeType map[string]bool
+
+	// keyTypeProbeCount counts how many times the server-side keyTypeAt
+	// helper was invoked during this Eval. Only read by tests via
+	// luaScriptContext methods; ordinary production code never reads it.
+	keyTypeProbeCount int
 
 	strings map[string]*luaStringState
 	lists   map[string]*luaListState
@@ -234,20 +252,21 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	}
 	startTS := server.readTS()
 	return &luaScriptContext{
-		server:      server,
-		startTS:     startTS,
-		readPin:     server.pinReadTS(startTS),
-		ctx:         ctx,
-		touched:     map[string]struct{}{},
-		deleted:     map[string]bool{},
-		everDeleted: map[string]bool{},
-		strings:     map[string]*luaStringState{},
-		lists:       map[string]*luaListState{},
-		hashes:      map[string]*luaHashState{},
-		sets:        map[string]*luaSetState{},
-		zsets:       map[string]*luaZSetState{},
-		streams:     map[string]*luaStreamState{},
-		ttls:        map[string]*luaTTLState{},
+		server:       server,
+		startTS:      startTS,
+		readPin:      server.pinReadTS(startTS),
+		ctx:          ctx,
+		touched:      map[string]struct{}{},
+		deleted:      map[string]bool{},
+		everDeleted:  map[string]bool{},
+		negativeType: map[string]bool{},
+		strings:      map[string]*luaStringState{},
+		lists:        map[string]*luaListState{},
+		hashes:       map[string]*luaHashState{},
+		sets:         map[string]*luaSetState{},
+		zsets:        map[string]*luaZSetState{},
+		streams:      map[string]*luaStreamState{},
+		ttls:         map[string]*luaTTLState{},
 	}, nil
 }
 
@@ -380,6 +399,13 @@ func (c *luaScriptContext) cachedType(key []byte) (redisValueType, bool) {
 	if c.deleted[k] {
 		return redisTypeNone, true
 	}
+	// Negative (absent-at-startTS) probe result from a prior keyType call
+	// in this Eval. Consulted last so loaded-type and in-script DEL tombstones
+	// win; safe because in-script writes set cachedLoadedTypes[...].exists
+	// which short-circuits above, shadowing the stale negative entry.
+	if c.negativeType[k] {
+		return redisTypeNone, true
+	}
 	return redisTypeNone, false
 }
 
@@ -423,6 +449,13 @@ func hasLoadedStreamValue(st *luaStreamState) bool {
 	return st != nil && st.loaded && st.exists
 }
 
+// maxNegativeTypeCacheEntries caps the size of luaScriptContext.negativeType
+// so a malicious or buggy script probing unbounded unique non-existent keys
+// cannot balloon memory. Matches the magnitude of kv.maxReadKeys (10_000),
+// which already bounds the read-set of a single transaction; once the cache
+// is full, further keyTypeAt misses are correctly returned but not memoized.
+const maxNegativeTypeCacheEntries = 10_000
+
 func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	if typ, ok := c.cachedType(key); ok {
 		if typ != redisTypeNone {
@@ -431,9 +464,21 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 		return typ, nil
 	}
 
-	typ, err := c.server.keyTypeAt(context.Background(), key, c.startTS)
+	c.keyTypeProbeCount++
+	typ, err := c.server.keyTypeAt(c.scriptCtx(), key, c.startTS)
 	if err != nil {
 		return redisTypeNone, err
+	}
+	if typ == redisTypeNone && len(c.negativeType) < maxNegativeTypeCacheEntries {
+		// Pin the absence result for the rest of this Eval so repeated
+		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
+		// does not re-run the ~8-seek rawKeyTypeAt probe on every
+		// redis.call.
+		//
+		// Bounded to keep adversarial scripts from growing the map
+		// unboundedly; once full, subsequent misses correctly fall
+		// through to the server probe without caching.
+		c.negativeType[string(key)] = true
 	}
 	return typ, nil
 }
@@ -670,50 +715,76 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	c.zsets[k] = st
 
-	typ, err := c.keyType(key)
-	if errors.Is(err, store.ErrKeyNotFound) {
-		st.loaded = true
-		return st, nil
+	// Script-local type override: if a prior DEL / SET / type-change
+	// in this Eval has cached a different type for this key, the
+	// pre-script storage probe in zsetStorageHintAt would leak stale
+	// state (e.g. returning a live ZSet after an in-script SET).
+	// Mirror the keyType() fallback order: cachedType first, storage
+	// second.
+	if st, handled, err := c.zsetStateFromCachedType(key, st); handled {
+		return st, err
 	}
+
+	// zsetStorageHintAt performs the member-prefix scan once, so we never need
+	// a second ScanAt after type detection.
+	h, err := c.server.zsetStorageHintAt(context.Background(), key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
-	if typ == redisTypeNone {
-		// Check whether physical ZSet data exists despite the key being logically
-		// absent (TTL-expired). If so, mark physicallyExistsAtStart so that
-		// zsetCommitPlan can force a full commit to clean up stale storage rows.
-		rawTyp, rawErr := c.server.rawKeyTypeAt(context.Background(), key, c.startTS)
-		if rawErr != nil {
-			return nil, rawErr
-		}
-		st.physicallyExistsAtStart = rawTyp == redisTypeZSet
+	switch {
+	case h.physType == redisTypeNone:
+		// Truly absent: brand-new key.
 		st.loaded = true
 		return st, nil
-	}
-	if typ != redisTypeZSet {
+	case h.logType == redisTypeNone:
+		// TTL-expired: physical ZSet data exists but the key is logically absent.
+		// physicallyExistsAtStart tells zsetCommitPlan to force a full commit so
+		// deleteLogicalKeyElems can remove the stale storage rows.
+		st.physicallyExistsAtStart = true
+		st.loaded = true
+		return st, nil
+	case h.logType != redisTypeZSet:
 		return nil, wrongTypeError()
 	}
 
-	// Probe for wide-column format with a single seek instead of a full scan.
-	prefix := store.ZSetMemberScanPrefix(key)
-	kvs, err := c.server.store.ScanAt(context.Background(), prefix, store.PrefixScanEnd(prefix), 1, c.startTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	// Key is a live ZSet.
 	st.loaded = true
 	st.exists = true
-	if len(kvs) > 0 {
+	if h.memberFound {
+		// Member keys present → wide-column format (not legacy blob).
 		return st, nil
 	}
-	// No !zs|mem| rows does not imply legacy-blob: a wide-column ZSet that had
-	// all members deleted leaves only meta/delta keys behind. Probe the legacy
-	// blob key directly to distinguish these cases.
+	// No !zs|mem| rows: either wide-column with all members deleted (meta/delta
+	// only) or legacy blob. Probe the legacy blob key to distinguish.
 	blobExists, err := c.server.store.ExistsAt(context.Background(), redisZSetKey(key), c.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	st.legacyBlobBase = blobExists
 	return st, nil
+}
+
+// zsetStateFromCachedType applies the script-local cached type (if
+// any) and returns (state, handled=true, err) when the answer is
+// determined entirely by in-script mutations. Returns handled=false
+// when the caller must fall through to the storage probe.
+func (c *luaScriptContext) zsetStateFromCachedType(key []byte, st *luaZSetState) (*luaZSetState, bool, error) {
+	typ, cached := c.cachedType(key)
+	if !cached {
+		return nil, false, nil
+	}
+	if typ == redisTypeNone {
+		st.loaded = true
+		return st, true, nil
+	}
+	if typ == redisTypeZSet {
+		// Live ZSet via in-script mutation — loadZSetAt under
+		// ensureZSetLoaded will surface the pre-script storage rows.
+		st.loaded = true
+		st.exists = true
+		return st, true, nil
+	}
+	return nil, true, wrongTypeError()
 }
 
 // ensureZSetLoaded loads all ZSet members from storage if not already loaded,
@@ -1373,7 +1444,14 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 	if luaHashAlreadyLoaded(c, key) {
 		return hgetFromSlowPath(c, key, field)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Short-circuit for a cached-absent key: the slow path would just
+		// re-derive nil after allocating an empty luaHashState. Returning
+		// nil directly skips that work and keeps the BullMQ poll loop on
+		// the cheapest possible code path.
+		if typ == redisTypeNone {
+			return luaNilReply(), nil
+		}
 		return hgetFromSlowPath(c, key, field)
 	}
 	// Fast path: direct wide-column field lookup, bypassing the ~8-seek
@@ -1603,7 +1681,13 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 	if luaHashAlreadyLoaded(c, key) {
 		return hexistsFromSlowPath(c, key, field)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Short-circuit for a cached-absent key: HEXISTS on a missing
+		// hash is defined to return 0, matching the slow-path result
+		// without allocating an empty luaHashState.
+		if typ == redisTypeNone {
+			return luaIntReply(0), nil
+		}
 		return hexistsFromSlowPath(c, key, field)
 	}
 	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
@@ -2175,7 +2259,12 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 	if luaSetAlreadyLoaded(c, key) {
 		return sismemberFromSlowPath(c, key, member)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// SISMEMBER on a missing set returns 0; skip the slow path to
+		// avoid an empty luaSetState allocation on repeated misses.
+		if typ == redisTypeNone {
+			return luaIntReply(0), nil
+		}
 		return sismemberFromSlowPath(c, key, member)
 	}
 	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
@@ -2435,8 +2524,14 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		zrangeMetrics.ObserveSkipLoaded()
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
 		zrangeMetrics.ObserveSkipCachedType()
+		// Negative-cache / in-script DEL / RENAME: returning an empty
+		// array directly matches the slow-path result without a second
+		// rawKeyTypeAt probe inside zsetState.
+		if typ == redisTypeNone {
+			return luaArrayReply(), nil
+		}
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	entries, hit, fallbackReason, fastErr := c.zrangeByScoreFastPath(key, options, reverse)
@@ -2697,7 +2792,14 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 	if luaZSetAlreadyLoaded(c, key) {
 		return zscoreFromSlowPath(c, key, member)
 	}
-	if _, cached := c.cachedType(key); cached {
+	if typ, cached := c.cachedType(key); cached {
+		// Cached-absent key (incl. negative-cache hit from a prior probe):
+		// skip the slow path entirely and return nil directly. Mirrors the
+		// "missing zset" branch of zscoreFromSlowPath without paying for
+		// an empty luaZSetState allocation.
+		if typ == redisTypeNone {
+			return luaNilReply(), nil
+		}
 		return zscoreFromSlowPath(c, key, member)
 	}
 	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
