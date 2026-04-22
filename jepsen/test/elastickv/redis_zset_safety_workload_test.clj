@@ -200,6 +200,102 @@
 ;; Infinity score parsing
 ;; ---------------------------------------------------------------------------
 
+;; ---------------------------------------------------------------------------
+;; Linearization of concurrent ops / uncertain mutations (gemini HIGH batch 2)
+;; ---------------------------------------------------------------------------
+
+(deftest concurrent-zadd-zrem-both-completed-accepts-either-outcome
+  ;; gemini HIGH: ZADD and ZREM for the same member whose invoke/complete
+  ;; windows overlap (both commit before the read) have ambiguous
+  ;; linearization. A linearizable store may serialize either one last,
+  ;; so the read legitimately observes EITHER [["m1" 1.0]] OR [].
+  ;; Windows: ZADD=[inv=0, cmp=3], ZREM=[inv=1, cmp=2] — overlap.
+  (let [base [{:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+              {:type :invoke :process 1 :f :zrem :value "m1" :index 1}
+              {:type :ok     :process 1 :f :zrem :value ["m1" true] :index 2}
+              {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 3}]
+        hist-present (conj base
+                        {:type :invoke :process 2 :f :zrange-all :index 4}
+                        {:type :ok     :process 2 :f :zrange-all
+                         :value [["m1" 1.0]] :index 5})
+        hist-absent (conj base
+                       {:type :invoke :process 2 :f :zrange-all :index 4}
+                       {:type :ok     :process 2 :f :zrange-all
+                        :value [] :index 5})]
+    (is (:valid? (run-checker hist-present))
+        "expected read observing ZADD's outcome to be accepted")
+    (is (:valid? (run-checker hist-absent))
+        "expected read observing ZREM's outcome (absent) to be accepted")))
+
+(deftest info-zrem-concurrent-with-read-allows-missing-member
+  ;; gemini HIGH: an :info ZREM that might have applied before a read
+  ;; leaves the member's presence uncertain. A ZRANGE that omits the
+  ;; member must NOT be flagged as a completeness failure.
+  (let [history [;; ZADD m1 committed before the read.
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 ;; ZREM m1 is invoked, then the read runs, then the
+                 ;; ZREM response is lost (:info). The ZREM may or may
+                 ;; not have applied server-side.
+                 {:type :invoke :process 1 :f :zrem :value "m1" :index 2}
+                 {:type :invoke :process 0 :f :zrange-all :index 3}
+                 {:type :ok     :process 0 :f :zrange-all :value [] :index 4}
+                 {:type :info   :process 1 :f :zrem :value "m1" :index 5}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected :info ZREM to make absence acceptable, got: " result))))
+
+(deftest info-zincrby-does-not-flag-zrangebyscore-completeness
+  ;; gemini HIGH: a pre-read :info / concurrent ZINCRBY leaves the
+  ;; resulting score unknown. ZRANGEBYSCORE filtering on a specific
+  ;; range must not flag the member as missing, because its score may
+  ;; have moved outside [lo, hi].
+  (let [history [;; ZADD m1 at score 1 (committed well before read).
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 ;; ZINCRBY m1 +100 — response lost (:info) BEFORE read.
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 100] :index 2}
+                 {:type :info   :process 1 :f :zincrby :value ["m1" 100] :index 3}
+                 ;; ZRANGEBYSCORE [0, 10] — m1's score is uncertain; it
+                 ;; may now be 101 (outside range) or still 1. The
+                 ;; checker must not complain about m1's absence.
+                 {:type :invoke :process 2 :f :zrangebyscore :value [0.0 10.0] :index 4}
+                 {:type :ok     :process 2 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0] :members []} :index 5}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected :info ZINCRBY to skip completeness, got: " result))))
+
+(deftest zrangebyscore-completeness-still-detects-truly-missing-member
+  ;; Sanity: when NO uncertainty exists and a model member's committed
+  ;; score is definitively inside [lo, hi], its absence IS flagged.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 5] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 5] :index 1}
+                 {:type :invoke :process 0 :f :zrangebyscore :value [0.0 10.0] :index 2}
+                 {:type :ok     :process 0 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0] :members []} :index 3}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result)) (str "expected missing-member-range, got: " result))
+    (is (contains? kinds :missing-member-range)
+        (str "expected :missing-member-range, got kinds=" kinds))))
+
+(deftest zrange-completeness-still-detects-truly-missing-member
+  ;; Sanity: no uncertainty, member committed-present. Absence flagged.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 5] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 5] :index 1}
+                 {:type :invoke :process 0 :f :zrange-all :index 2}
+                 {:type :ok     :process 0 :f :zrange-all :value [] :index 3}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result)) (str "expected missing-member, got: " result))
+    (is (contains? kinds :missing-member)
+        (str "expected :missing-member, got kinds=" kinds))))
+
+;; ---------------------------------------------------------------------------
+;; Infinity score parsing
+;; ---------------------------------------------------------------------------
+
 (deftest parse-withscores-handles-inf-strings
   ;; gemini HIGH: Redis returns "inf" / "+inf" / "-inf" for infinite
   ;; ZSET scores. Double/parseDouble expects "Infinity"; the workload's
