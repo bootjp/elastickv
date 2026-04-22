@@ -296,7 +296,7 @@ func TestFSMAbort_AbortTSMustBeGreaterThanStartTS(t *testing.T) {
 // keys and written the rollback marker, a subsequent abort over the
 // same mutation set must return nil without performing additional
 // writes or store mutations (reads are allowed — the idempotent path
-// still probes for the rollback marker and commit record via GetAt).
+// still probes for the rollback marker and commit record via ExistsAt).
 // Idempotency is enforced per-key in shouldClearAbortKey (lock
 // already gone ⇒ skip) and by appendRollbackRecord (marker already
 // present ⇒ skip). The prior behaviour (write-conflict on the

@@ -660,9 +660,10 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 	//
 	// Idempotent rollback: if the marker already exists for this
 	// (primaryKey, startTS), skip the Put. Rollback markers are
-	// deterministic ({txnRollbackVersion}) and a second Put against
-	// the already-tombstoned key would otherwise be rejected by the
-	// MVCC store as a write conflict (latestCommitTS > startTS).
+	// deterministic ({txnRollbackVersion}) and are written as normal
+	// values via Put; a second Put with applyStartTS=startTS would be
+	// rejected by the MVCC store as a write conflict because the key's
+	// latestCommitTS is already greater than startTS.
 	markerPresent, err := f.store.ExistsAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0))
 	if err != nil {
 		return errors.WithStack(err)
