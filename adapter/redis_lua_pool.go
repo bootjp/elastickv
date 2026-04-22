@@ -42,7 +42,7 @@ const luaWhitelistedTableHint = 8
 // Security invariant: no state must leak between scripts. Each pooled
 // state is initialised with a fixed set of base globals (redis, cjson,
 // cmsgpack, table/string/math + base lib helpers, and nil-ed loaders).
-// Two snapshots are captured at construction time:
+// Three snapshots are captured at construction time:
 //
 //   - globalsSnapshot: the full (*any*-keyed) _G map at init. Using an
 //     LValue-keyed map lets the reset path catch non-string-keyed
@@ -54,16 +54,25 @@ const luaWhitelistedTableHint = 8
 //     attacks such as `string.upper = function() return "pwned" end`
 //     -- merely restoring the `string` *reference* on _G would leave
 //     the shared table's fields still mutated.
+//   - metatableSnapshots: the init-time raw metatable of _G plus of
+//     every whitelisted nested table. Without this, a script calling
+//     `setmetatable(_G, { __index = function() return "pwned" end })`
+//     could leak a poisoned fallback into the next pooled eval via
+//     any undefined-global access. Same risk for `setmetatable(string,
+//     ...)` etc.
 //
 // On release, the reset routine
 //
-//  1. walks each snapshotted nested table and restores its contents
+//  1. restores the raw metatable of _G and every whitelisted table
+//     (LNil if there was none originally), neutering setmetatable
+//     poisoning,
+//  2. walks each snapshotted nested table and restores its contents
 //     (deletes script-added fields, rebinds original fields),
-//  2. walks the current global table and deletes every key -- of any
+//  3. walks the current global table and deletes every key -- of any
 //     type -- that is not present in the globals snapshot (removes
 //     user-added globals such as KEYS, ARGV, GLOBAL_LEAK, _G[42]),
 //     and
-//  3. restores every globals-snapshot key to its original value (so a
+//  4. restores every globals-snapshot key to its original value (so a
 //     script that did `table = nil` or `redis = evil` cannot poison
 //     the next script).
 //
@@ -112,6 +121,17 @@ type pooledLuaState struct {
 	// restores the global name first, then restores the table's
 	// internal contents from this snapshot.
 	tableSnapshots map[*lua.LTable]map[lua.LValue]lua.LValue
+	// metatableSnapshots holds the init-time raw metatable of every
+	// snapshotted table (the globals table _G plus each entry in
+	// tableSnapshots). gopher-lua's base lib exposes setmetatable, so
+	// a script can do `setmetatable(_G, { __index = function()
+	// return "pwned" end })` -- the next pooled eval reading any
+	// undefined global would then fall through the poisoned __index.
+	// The same risk applies to the standard-library tables (string,
+	// math, ...). We restore each table's metatable on reset; if the
+	// original had none, we restore lua.LNil (which strips any
+	// metatable installed by the script).
+	metatableSnapshots map[*lua.LTable]lua.LValue
 	// ctxBinding is a pre-allocated *LUserData stashed in the state's
 	// registry under luaCtxRegistryKey. Its .Value holds the active
 	// *luaScriptContext for the duration of an eval. Using the state's
@@ -222,19 +242,21 @@ func newPooledLuaState() *pooledLuaState {
 		}
 	}
 
-	globalsSnapshot, tableSnapshots := snapshotGlobals(state)
+	globalsSnapshot, tableSnapshots, metatableSnapshots := snapshotGlobals(state)
 	return &pooledLuaState{
-		state:           state,
-		globalsSnapshot: globalsSnapshot,
-		tableSnapshots:  tableSnapshots,
-		ctxBinding:      ctxBinding,
+		state:              state,
+		globalsSnapshot:    globalsSnapshot,
+		tableSnapshots:     tableSnapshots,
+		metatableSnapshots: metatableSnapshots,
+		ctxBinding:         ctxBinding,
 	}
 }
 
 // snapshotGlobals captures the full set of globals (string AND
 // non-string keys) plus shallow snapshots of every nested table value
-// reachable from _G. Returning both lets resetPooledLuaState defeat two
-// classes of pool-state leaks:
+// reachable from _G, AND the raw metatable of each of those tables
+// (plus _G itself). Returning all three lets resetPooledLuaState
+// defeat three classes of pool-state leaks:
 //
 //  1. Non-string-keyed globals. Lua allows any non-nil, non-NaN value
 //     as a table key. A malicious script doing `_G[42] = "secret"` or
@@ -253,14 +275,39 @@ func newPooledLuaState() *pooledLuaState {
 //     expected to hold leaf values (functions, numbers, strings) in
 //     the libraries we install; if that ever changes, extend this.
 //
+//  3. Metatable poisoning. gopher-lua's base library exposes
+//     setmetatable, so a script can do
+//     `setmetatable(_G, { __index = function() return "pwned" end })`
+//     and the next pooled eval that reads any undefined global (which
+//     triggers __index) would observe attacker-controlled behaviour.
+//     The same risk applies to every whitelisted table (string, math,
+//     ...). Snapshotting each table's raw metatable at init lets
+//     reset put the original back; when a table had no metatable,
+//     the snapshot holds lua.LNil and reset strips whatever the
+//     script installed.
+//
 // We deliberately skip snapshotting _G's own contents as a "table
 // snapshot": _G IS the globals table, so that entry would be
 // redundant with the outer globals snapshot. Any other self-reference
-// is handled the same way (by *LTable identity).
-func snapshotGlobals(state *lua.LState) (map[lua.LValue]lua.LValue, map[*lua.LTable]map[lua.LValue]lua.LValue) {
+// is handled the same way (by *LTable identity). _G's metatable is
+// still captured, because the poisoning surface applies to _G too.
+//
+// We read each table's metatable via the exported LTable.Metatable
+// field (not state.GetMetatable) to avoid dispatching through
+// __metatable -- we want the raw pointer so SetMetatable can restore
+// it verbatim.
+func snapshotGlobals(state *lua.LState) (
+	map[lua.LValue]lua.LValue,
+	map[*lua.LTable]map[lua.LValue]lua.LValue,
+	map[*lua.LTable]lua.LValue,
+) {
 	globals := state.G.Global
 	snapshot := make(map[lua.LValue]lua.LValue, luaInitialGlobalsHint)
 	tableSnaps := make(map[*lua.LTable]map[lua.LValue]lua.LValue, luaWhitelistedTableHint)
+	metaSnaps := make(map[*lua.LTable]lua.LValue, luaWhitelistedTableHint+1)
+
+	// _G itself is a poisoning target (setmetatable(_G, ...)).
+	metaSnaps[globals] = rawMetatable(globals)
 
 	globals.ForEach(func(k, v lua.LValue) {
 		snapshot[k] = v
@@ -272,9 +319,30 @@ func snapshotGlobals(state *lua.LState) (map[lua.LValue]lua.LValue, map[*lua.LTa
 				inner[ik] = iv
 			})
 			tableSnaps[tbl] = inner
+			// Capture the raw metatable exactly once per *LTable.
+			// A given library table appears in _G under one name, so
+			// there is no duplication risk here in practice; even if
+			// there were, the value would be identical.
+			if _, seen := metaSnaps[tbl]; !seen {
+				metaSnaps[tbl] = rawMetatable(tbl)
+			}
 		}
 	})
-	return snapshot, tableSnaps
+	return snapshot, tableSnaps, metaSnaps
+}
+
+// rawMetatable returns the LTable's raw metatable field, normalising a
+// Go nil into lua.LNil so callers can pass the result straight to
+// state.SetMetatable (which requires an LValue, not an untyped nil).
+// We bypass state.GetMetatable deliberately: that path respects the
+// __metatable field and can return something other than the real
+// metatable, which would corrupt restore-on-reset if a script set
+// __metatable = "blocked".
+func rawMetatable(tbl *lua.LTable) lua.LValue {
+	if tbl.Metatable == nil {
+		return lua.LNil
+	}
+	return tbl.Metatable
 }
 
 // resetPooledLuaState wipes all user-introduced globals and restores
@@ -284,23 +352,38 @@ func snapshotGlobals(state *lua.LState) (map[lua.LValue]lua.LValue, map[*lua.LTa
 // globals must not be observable by the next user.
 //
 // Ordering matters:
-//  1. Reset nested whitelisted tables first. Doing this BEFORE
+//  1. Restore every snapshotted table's metatable FIRST. A poisoned
+//     __index / __newindex would otherwise intercept the subsequent
+//     RawSet / ForEach work we do to clean up fields. In practice
+//     RawSet bypasses metamethods already, but restoring the
+//     metatable first keeps any future code that uses non-raw access
+//     safe-by-construction.
+//  2. Reset nested whitelisted tables' field sets. Doing this BEFORE
 //     restoring the globals' top-level bindings means we mutate the
 //     ORIGINAL table objects (the ones snapshot still references by
 //     pointer), even if the script rebound `string = nil` at the
 //     global level -- the original LTable is still alive and held
 //     via our tableSnapshots map key.
-//  2. Delete top-level globals not in the snapshot (KEYS, ARGV,
+//  3. Delete top-level globals not in the snapshot (KEYS, ARGV,
 //     GLOBAL_LEAK, _G[42], etc). We iterate ALL key types, not just
 //     strings, so non-string-keyed leaks (`_G[42] = "secret"`) do not
 //     survive.
-//  3. Restore top-level whitelisted globals. This fixes e.g.
+//  4. Restore top-level whitelisted globals. This fixes e.g.
 //     `redis = nil` by re-binding `redis` to the original module
 //     table.
 func (p *pooledLuaState) reset() {
 	globals := p.state.G.Global
 
-	// (1) Restore inner contents of every snapshotted whitelisted
+	// (1) Restore the raw metatable of every snapshotted table.
+	// This blocks setmetatable(_G, {__index=...}) and
+	// setmetatable(string, {...}) from leaking a poisoned fallback
+	// into the next eval. SetMetatable with lua.LNil strips any
+	// metatable the script installed where there was none originally.
+	for tbl, mt := range p.metatableSnapshots {
+		p.state.SetMetatable(tbl, mt)
+	}
+
+	// (2) Restore inner contents of every snapshotted whitelisted
 	// table. This defeats poisoning attacks like
 	// `string.upper = function() return "pwned" end`.
 	//
@@ -313,7 +396,7 @@ func (p *pooledLuaState) reset() {
 		scratch = resetTableContents(tbl, originalFields, scratch[:0])
 	}
 
-	// (2) Collect all current global keys (of any type). Mutating
+	// (3) Collect all current global keys (of any type). Mutating
 	// the table inside ForEach is unsafe, so snapshot keys first.
 	scratch = scratch[:0]
 	globals.ForEach(func(k, _ lua.LValue) {
@@ -335,7 +418,7 @@ func (p *pooledLuaState) reset() {
 		}
 	}
 
-	// (3) Restore every whitelisted global to its original value.
+	// (4) Restore every whitelisted global to its original value.
 	// This covers the case where a script rebinds an allowed global
 	// (e.g. `redis = something`) -- we simply put the original back.
 	for k, v := range p.globalsSnapshot {

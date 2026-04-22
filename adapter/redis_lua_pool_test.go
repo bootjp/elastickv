@@ -181,7 +181,10 @@ func TestLua_PoolRecordsReuseVsAllocation(t *testing.T) {
 // than string. Lua permits any non-nil, non-NaN value as a table key,
 // so a script doing `_G[42] = "leak"` or `_G[true] = "bad"` bypasses a
 // naive string-only snapshot/wipe. The LValue-keyed snapshot + the
-// RawSetH-based reset in pool.reset must catch these.
+// RawSet-based reset in pool.reset must catch these. RawSet (rather
+// than RawSetH) matters because gopher-lua stores integer keys in the
+// array part, and only RawSet dispatches to the right storage by key
+// type.
 func TestLua_VMReuseNonStringGlobalKeysAreWiped(t *testing.T) {
 	t.Parallel()
 
@@ -258,6 +261,79 @@ assert(redis.sha1hex("x") == "deadbeef")
 local got = redis.sha1hex("x")
 assert(got ~= "deadbeef", "redis.sha1hex remained poisoned after pool reuse: " .. tostring(got))
 assert(#got == 40, "redis.sha1hex returned non-hex value after reset: " .. tostring(got))
+`))
+}
+
+// TestLua_VMReuseDoesNotPoisonGlobalsMetatable regression-tests the
+// metatable-snapshot fix. gopher-lua's base lib exposes setmetatable,
+// so a script can install an __index handler on _G and poison every
+// subsequent pooled eval's view of undefined globals. We verify that
+// after Script A poisons _G's metatable, Script B -- acquired from
+// the pool after A's state is released -- reads `_G.undefined` as
+// genuine nil rather than the attacker-supplied sentinel.
+//
+// The test also pokes `_G[nonExisting]` via a local to make sure the
+// leak path is _G's __index specifically and not something else (e.g.
+// a leftover global called "undefined"). We use a freshly-minted
+// symbol name on both sides to avoid interference with any snapshot
+// entry the fix itself would restore.
+func TestLua_VMReuseDoesNotPoisonGlobalsMetatable(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	plsA := pool.get(nil)
+	require.NoError(t, plsA.state.DoString(`
+setmetatable(_G, { __index = function() return "leak" end })
+-- Sanity: script A sees its own poisoned __index.
+assert(_G.some_never_defined_symbol == "leak",
+    "setmetatable on _G did not take effect inside script A")
+`))
+	pool.put(plsA)
+
+	plsB := pool.get(nil)
+	defer pool.put(plsB)
+	require.NoError(t, plsB.state.DoString(`
+-- An undefined global must read as nil, not the attacker sentinel.
+local v = _G.some_never_defined_symbol
+assert(v == nil,
+    "globals metatable leaked across pool reuse: got " .. tostring(v))
+-- And installing a fresh metatable on _G must still work (we didn't
+-- accidentally lock _G via __metatable or anything similar).
+setmetatable(_G, nil)
+`))
+}
+
+// TestLua_VMReuseDoesNotPoisonStringMetatable covers the same
+// metatable-poisoning risk, but applied to the string library table.
+// gopher-lua resolves method-style calls on string literals (e.g.
+// `("x"):upper()`) via the string builtin metatable, not via the
+// string table's metatable -- so this test specifically guards
+// against a script that installs an __index on the string table and
+// relies on subsequent scripts fetching fields off that table (e.g.
+// in code that walks the library dynamically).
+func TestLua_VMReuseDoesNotPoisonStringMetatable(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+
+	plsA := pool.get(nil)
+	require.NoError(t, plsA.state.DoString(`
+setmetatable(string, { __index = function() return "leak" end })
+-- Sanity: the poisoned __index fires on absent fields.
+assert(string.no_such_function == "leak",
+    "setmetatable on string did not take effect inside script A")
+`))
+	pool.put(plsA)
+
+	plsB := pool.get(nil)
+	defer pool.put(plsB)
+	require.NoError(t, plsB.state.DoString(`
+local v = string.no_such_function
+assert(v == nil,
+    "string metatable leaked across pool reuse: got " .. tostring(v))
+-- string.upper must still be the genuine builtin.
+assert(string.upper("x") == "X", "string.upper was damaged by reset")
 `))
 }
 
