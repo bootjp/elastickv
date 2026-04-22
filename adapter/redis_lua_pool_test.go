@@ -571,3 +571,56 @@ func BenchmarkLuaLookupContext_Concurrent(b *testing.B) {
 		}
 	})
 }
+
+// TestLua_VMReuseClearsContext verifies that a pooled *lua.LState
+// does NOT retain a reference to a previous request's
+// context.Context after it has been returned to the pool via
+// pool.put.
+//
+// runLuaScript binds a per-request context onto the state with
+// LState.SetContext (redis_lua.go). If pooledLuaState.reset() fails
+// to clear that binding, the pooled VM keeps the prior ctx alive
+// until it is either reused or garbage collected -- that retains
+// any timers / cancel funcs / attached values referenced by the
+// context. The reset() path must call LState.RemoveContext (or
+// equivalently SetContext(context.Background())) to prevent this.
+//
+// We check both conditions:
+//  1. After put, LState.Context() must NOT return the original
+//     request ctx (identity compare).
+//  2. After put, LState.Context() must be nil (RemoveContext's
+//     documented post-state).
+func TestLua_VMReuseClearsContext(t *testing.T) {
+	t.Parallel()
+
+	pool := newLuaStatePool()
+	pls := pool.get(nil)
+
+	// Simulate what runLuaScript does: attach a request-scoped ctx
+	// to the state. Use WithCancel so we have a distinct, non-Background
+	// identity that the state would measurably retain if reset() is
+	// broken.
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pls.state.SetContext(reqCtx)
+
+	// Sanity: the binding was actually observed by the state.
+	require.Same(t, reqCtx, pls.state.Context(),
+		"precondition: SetContext must bind the given ctx identity")
+
+	// Release back to the pool. This is the code path that must
+	// clear the ctx retention.
+	pool.put(pls)
+
+	// After put, the pooled state must have dropped the ctx reference.
+	got := pls.state.Context()
+	require.Nil(t, got,
+		"pooled LState must not retain a ctx reference after reset/put")
+	// Belt-and-braces identity check: even if a future gopher-lua
+	// version ever returns a non-nil Background-style ctx here, it
+	// must NOT be the original request ctx.
+	if got != nil {
+		require.NotSame(t, reqCtx, got,
+			"pooled LState leaked the original request ctx across put")
+	}
+}

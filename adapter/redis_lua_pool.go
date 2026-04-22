@@ -428,6 +428,17 @@ func (p *pooledLuaState) reset() {
 	// Drop anything the script may have left on the value stack.
 	p.state.SetTop(0)
 
+	// Clear any request-scoped context bound to the state via
+	// LState.SetContext (done in runLuaScript). Without this, the
+	// pooled *lua.LState keeps a reference to the previous request's
+	// context.Context -- and transitively anything the context retains
+	// (timers, cancel funcs, attached values) -- until the state is
+	// reused or garbage-collected. That causes memory retention and
+	// delays cancellation propagation for the prior request's chain.
+	// RemoveContext is the canonical API for this and is preferred over
+	// SetContext(context.Background()) for clearer intent.
+	p.state.RemoveContext()
+
 	// Retain scratch for the next reset, but bound the backing array
 	// so a pathological script that created thousands of globals does
 	// not permanently bloat every pooled state. If we exceeded the
