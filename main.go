@@ -184,13 +184,7 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	metricsRegistry.RaftObserver().Start(runCtx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
-	if collector := metricsRegistry.DispatchCollector(); collector != nil {
-		collector.Start(runCtx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
-	}
-	if collector := metricsRegistry.PebbleCollector(); collector != nil {
-		collector.Start(runCtx, pebbleMonitorSources(runtimes), raftMetricsObserveInterval)
-	}
+	startMonitoringCollectors(runCtx, metricsRegistry, runtimes)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -494,6 +488,49 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 		out = append(out, monitoring.DispatchSource{
 			GroupID: runtime.spec.id,
 			Source:  src,
+		})
+	}
+	return out
+}
+
+// startMonitoringCollectors wires up the per-tick Prometheus
+// collectors (raft dispatch, Pebble LSM, store-layer OCC conflicts)
+// on top of the running raft runtimes. Kept separate from run() so
+// the latter stays under the cyclop complexity budget and so new
+// collectors can be added without widening run() further.
+func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
+	if collector := reg.DispatchCollector(); collector != nil {
+		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if collector := reg.PebbleCollector(); collector != nil {
+		collector.Start(ctx, pebbleMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if collector := reg.WriteConflictCollector(); collector != nil {
+		collector.Start(ctx, writeConflictMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+}
+
+// writeConflictMonitorSources extracts the MVCC stores that expose
+// per-(kind, key_prefix) OCC conflict counters so monitoring can poll
+// them for the elastickv_store_write_conflict_total metric. Every
+// store.MVCCStore implements WriteConflictCountsByPrefix(); stores
+// that do not track conflicts return an empty map and simply do not
+// contribute series.
+func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.WriteConflictSource {
+	out := make([]monitoring.WriteConflictSource, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(monitoring.WriteConflictCounterSource)
+		if !ok {
+			continue
+		}
+		out = append(out, monitoring.WriteConflictSource{
+			GroupID:    runtime.spec.id,
+			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			Source:     src,
 		})
 	}
 	return out

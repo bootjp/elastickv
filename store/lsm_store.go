@@ -63,6 +63,10 @@ type pebbleStore struct {
 	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu        sync.Mutex
 	dir                  string
+	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
+	// detected inside ApplyMutations. Polled by the monitoring
+	// WriteConflictCollector; not part of the authoritative OCC path.
+	writeConflicts *writeConflictCounter
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
@@ -102,6 +106,7 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
+		writeConflicts: newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -860,6 +865,11 @@ func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMut
 			return err
 		}
 		if exists && ts > startTS {
+			// Record the first conflicting key's bucket only — a single
+			// failing ApplyMutations corresponds to one OCC conflict
+			// regardless of how many subsequent mutations would also
+			// collide, which matches the Prometheus rate semantics.
+			s.writeConflicts.record(WriteConflictKindWrite, classifyWriteConflictKey(mut.Key))
 			return NewWriteConflictError(mut.Key)
 		}
 	}
@@ -873,10 +883,28 @@ func (s *pebbleStore) checkReadConflicts(ctx context.Context, readKeys [][]byte,
 			return err
 		}
 		if exists && ts > startTS {
+			s.writeConflicts.record(WriteConflictKindRead, classifyWriteConflictKey(key))
 			return NewWriteConflictError(key)
 		}
 	}
 	return nil
+}
+
+// WriteConflictCountsByPrefix returns a snapshot of the OCC conflict
+// counts keyed by "<kind>|<key_prefix>" (see EncodeWriteConflictLabel).
+// Counts are monotonic for the lifetime of this *pebbleStore; a store
+// reopen starts them back at zero, which the monitoring collector
+// absorbs by rebasing its delta baseline.
+func (s *pebbleStore) WriteConflictCountsByPrefix() map[string]uint64 {
+	return s.writeConflicts.snapshot()
+}
+
+// WriteConflictCount is the aggregate across every (kind, key_prefix)
+// bucket. Primarily useful for tests and for quick single-number
+// sanity checks; Prometheus exports the per-bucket view via
+// WriteConflictCountsByPrefix.
+func (s *pebbleStore) WriteConflictCount() uint64 {
+	return s.writeConflicts.total()
 }
 
 func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64) error {
