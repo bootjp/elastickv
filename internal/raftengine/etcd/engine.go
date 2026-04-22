@@ -181,15 +181,26 @@ type Engine struct {
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
 	dispatcherLanesEnabled bool
-	dispatchStopCh         chan struct{}
-	dispatchCtx            context.Context
-	dispatchCancel         context.CancelFunc
-	snapshotReqCh          chan snapshotRequest
-	snapshotResCh          chan snapshotResult
-	snapshotStopCh         chan struct{}
-	closeCh                chan struct{}
-	doneCh                 chan struct{}
-	startedCh              chan struct{}
+	// snapshotEvery is the FSM-snapshot trigger threshold captured once at
+	// Open from ELASTICKV_RAFT_SNAPSHOT_COUNT. maybePersistLocalSnapshot
+	// runs on every Ready-drain pass, so re-parsing the env var (and
+	// potentially emitting a warning on malformed input) on every call
+	// would flood logs and burn CPU on the raft hot path. Cache it once.
+	snapshotEvery uint64
+	// maxWALFiles is the WAL retention cap captured once at Open from
+	// ELASTICKV_RAFT_MAX_WAL_FILES. Purges are relatively rare (only after
+	// snapshot release) but caching avoids a second warning-per-invalid
+	// call site and keeps the knob consistent across the engine lifetime.
+	maxWALFiles    int
+	dispatchStopCh chan struct{}
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
+	snapshotReqCh  chan snapshotRequest
+	snapshotResCh  chan snapshotResult
+	snapshotStopCh chan struct{}
+	closeCh        chan struct{}
+	doneCh         chan struct{}
+	startedCh      chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -437,6 +448,13 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 		pendingConfigs:   map[uint64]adminRequest{},
+		// Parse env-tunable retention/snapshot knobs once at Open. Both
+		// are consulted on hot paths (maybePersistLocalSnapshot runs per
+		// Ready-drain; purge runs after each snapshot persist) and the
+		// underlying env parsers emit warnings on malformed input, so
+		// re-reading them would flood logs under a misconfiguration.
+		snapshotEvery: snapshotEveryFromEnv(),
+		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
@@ -1668,7 +1686,7 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < snapshotEveryFromEnv() {
+	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < e.snapshotThreshold() {
 		return nil
 	}
 	snapshot, err := e.fsm.Snapshot()
@@ -2779,6 +2797,31 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 }
 
+// walRetention returns the WAL segment retention cap for this engine. As
+// with snapshotThreshold, the value is cached at Open so the purge path
+// does not re-parse ELASTICKV_RAFT_MAX_WAL_FILES on every snapshot release.
+// A zero cache (tests that bypass Open) falls back to defaultMaxWALFiles.
+func (e *Engine) walRetention() int {
+	if e.maxWALFiles == 0 {
+		return defaultMaxWALFiles
+	}
+	return e.maxWALFiles
+}
+
+// snapshotThreshold returns the FSM-snapshot trigger threshold for this
+// engine. The value is cached once at Open via snapshotEveryFromEnv so the
+// hot path (maybePersistLocalSnapshot runs per Ready-drain) does not re-parse
+// the env var or re-emit warnings on every loop iteration. When the engine is
+// constructed directly (e.g. in unit tests that bypass Open) snapshotEvery is
+// zero; fall back to defaultSnapshotEvery rather than treating zero as "never
+// snapshot", which would silently break those tests.
+func (e *Engine) snapshotThreshold() uint64 {
+	if e.snapshotEvery == 0 {
+		return defaultSnapshotEvery
+	}
+	return e.snapshotEvery
+}
+
 // snapshotEveryFromEnv returns the FSM-snapshot trigger threshold (in applied
 // raft entries past the last snapshot). Operators can override via
 // ELASTICKV_RAFT_SNAPSHOT_COUNT; invalid or missing values fall back to
@@ -3289,7 +3332,7 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 			slog.Warn("failed to purge old snap files", "error", purgeErr)
 		}
 		walDir := filepath.Join(e.dataDir, walDirName)
-		if purgeErr := purgeOldWALFiles(walDir, maxWALFilesFromEnv()); purgeErr != nil {
+		if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
 			slog.Warn("failed to purge old wal files", "error", purgeErr)
 		}
 		return nil
