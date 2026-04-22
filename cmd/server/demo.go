@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -52,10 +51,6 @@ var (
 const (
 	kvParts             = 2
 	defaultFileMode     = 0755
-	joinRetries         = 20
-	joinWait            = 3 * time.Second
-	joinRetryInterval   = 1 * time.Second
-	joinRPCTimeout      = 3 * time.Second
 	raftObserveInterval = 5 * time.Second
 	demoTickInterval    = 10 * time.Millisecond
 	demoHeartbeatTick   = 1
@@ -214,39 +209,14 @@ func main() {
 			}
 		}
 
-		// Wait for n1 to be ready then join others?
-		// Actually, standard bootstrap expects a configuration.
-		// If we only bootstrap n1, we need to join n2 and n3.
-		// For simplicity in this demo, let's bootstrap n1 with just n1, and have n2/n3 join.
-		// Or better: bootstrap n1 with {n1, n2, n3}.
-		// But run() logic for bootstrap only adds *raftID to configuration.
-
-		// Let's modify bootstrapping logic in run() slightly or just rely on manual join?
-		// The original demo likely used raftadmin to join or predefined bootstrap.
-		// Since we can't easily change run() logic too much without breaking Jepsen,
-		// let's use a separate goroutine to join n2/n3 to n1 after a delay.
-
-		eg.Go(func() error {
-			// Wait a bit for n1 to start
-			// This is hacky but sufficient for a demo
-			// Better would be to wait for gRPC readiness
-			// But standard 'sleep' is unavailable here without import time
-			// We can use a simple retry loop to join.
-
-			// Actually, let's keep it simple: just start them.
-			// If n1 bootstraps as a single node cluster, n2 and n3 won't be part of it automatically.
-			// We need to issue 'add_voter' commands.
-			// Let's rely on an external script or add a helper here?
-
-			// For this specific demo restoration, we'll assume the external script might handle joins
-			// OR we check if the CI script does it.
-			// The CI script just waits for ports. It runs `lein run ...` which assumes a cluster.
-			// If the cluster isn't formed, the tests might fail.
-			// BUT, looking at the previous demo.go (if I could), it probably did the joins.
-
-			// Let's add a joiner goroutine.
-			return joinCluster(runCtx, nodes)
-		})
+		// All three nodes were started with the same raftPeers list and
+		// raftBootstrap=true above, so the etcd cluster is fully formed
+		// at startup. joinCluster (AddVoter via raftadmin against
+		// nodes[0]) is no longer needed and would actively misbehave
+		// under etcd's randomised elections — nodes[0] is not guaranteed
+		// to be leader, so the AddVoter RPC would either hit a follower
+		// and be rejected, or add duplicates to an already-complete
+		// configuration.
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -261,95 +231,6 @@ func effectiveDemoMetricsToken(token string) string {
 		return token
 	}
 	return "demo-metrics-token"
-}
-
-func joinCluster(ctx context.Context, nodes []config) error {
-	leader := nodes[0]
-	// Give servers some time to start
-	if err := waitForJoinRetry(ctx, joinWait); err != nil {
-		return joinClusterWaitError(err)
-	}
-
-	// Connect to leader
-	conn, err := grpc.NewClient(leader.address, internalutil.GRPCDialOptions()...)
-	if err != nil {
-		return fmt.Errorf("failed to dial leader: %w", err)
-	}
-	defer conn.Close()
-	client := pb.NewRaftAdminClient(conn)
-
-	for _, n := range nodes[1:] {
-		if err := joinNodeWithRetry(ctx, client, n); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func joinNodeWithRetry(ctx context.Context, client pb.RaftAdminClient, n config) error {
-	for i := range joinRetries {
-		if err := tryJoinNode(ctx, client, n); err == nil {
-			return nil
-		} else {
-			if ctx.Err() != nil {
-				// Retry loop should stop immediately once the parent context is canceled.
-				return joinRetryCancelResult(ctx)
-			}
-			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
-		}
-		if i == joinRetries-1 {
-			break
-		}
-		if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
-			return joinRetryCancelResult(ctx)
-		}
-	}
-	if ctx.Err() != nil {
-		return joinRetryCancelResult(ctx)
-	}
-	return fmt.Errorf("failed to join node %s after retries", n.raftID)
-}
-
-func joinRetryCancelResult(ctx context.Context) error {
-	if ctx == nil || ctx.Err() == nil {
-		return nil
-	}
-	return joinClusterWaitError(errors.WithStack(ctx.Err()))
-}
-
-func tryJoinNode(ctx context.Context, client pb.RaftAdminClient, n config) error {
-	slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
-	addCtx, cancelAdd := context.WithTimeout(ctx, joinRPCTimeout)
-	defer cancelAdd()
-	_, err := client.AddVoter(addCtx, &pb.RaftAdminAddVoterRequest{
-		Id:            n.raftID,
-		Address:       n.address,
-		PreviousIndex: 0,
-	})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	slog.Info("Successfully joined node", "id", n.raftID)
-	return nil
-}
-
-func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return errors.WithStack(ctx.Err())
-	case <-timer.C:
-		return nil
-	}
-}
-
-func joinClusterWaitError(err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		// Do not override the original errgroup cause with cancellation.
-		return nil
-	}
-	return err
 }
 
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
