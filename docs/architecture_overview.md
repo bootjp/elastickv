@@ -177,7 +177,7 @@ sequenceDiagram
   end
 
   Tx->>H: "Next()"
-  H-->>Tx: "ts = max(wall, ceiling)<<16 | logical++"
+  H-->>Tx: "ts = max(wall, ceiling)<<16 | logical_counter"
 ```
 
 ## 5. Notes
