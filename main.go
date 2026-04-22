@@ -202,7 +202,7 @@ func run() error {
 		return nil
 	})
 
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, runtimes)
+	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, runtimes, bootstrapServers)
 	if err != nil {
 		return err
 	}
@@ -508,15 +508,20 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 // setupAdminService is a thin wrapper around configureAdminService that also
 // binds each Raft runtime to the server and logs an operator warning when
 // running without authentication. Keeping this out of run() preserves run's
-// cyclomatic-complexity budget.
+// cyclomatic-complexity budget. Members are seeded from the bootstrap
+// configuration so GetClusterOverview advertises peer node addresses to the
+// admin binary's fan-out discovery path.
 func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,
+	bootstrapServers []raft.Server,
 ) (*adapter.AdminServer, []grpc.ServerOption, error) {
+	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	srv, opts, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: grpcAddress},
+		members,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -533,6 +538,28 @@ func setupAdminService(
 	return srv, opts, nil
 }
 
+// adminMembersFromBootstrap extracts the peer list (everyone except self) from
+// the Raft bootstrap configuration so GetClusterOverview returns a populated
+// members list. Without this the admin binary's membersFrom cache collapses to
+// only the responding seed and stops fanning out across the cluster.
+func adminMembersFromBootstrap(selfID string, servers []raft.Server) []adapter.NodeIdentity {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([]adapter.NodeIdentity, 0, len(servers))
+	for _, s := range servers {
+		id := string(s.ID)
+		if id == selfID {
+			continue
+		}
+		out = append(out, adapter.NodeIdentity{
+			NodeID:      id,
+			GRPCAddress: string(s.Address),
+		})
+	}
+	return out
+}
+
 // configureAdminService builds the node-side AdminServer plus the gRPC
 // interceptor options that enforce its bearer token, or returns (nil, nil,
 // nil) when the service is intentionally disabled. It is mutually exclusive
@@ -542,6 +569,7 @@ func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
 	self adapter.NodeIdentity,
+	members []adapter.NodeIdentity,
 ) (*adapter.AdminServer, []grpc.ServerOption, error) {
 	if tokenPath == "" && !insecureNoAuth {
 		return nil, nil, nil
@@ -557,7 +585,7 @@ func configureAdminService(
 		}
 		token = loaded
 	}
-	srv := adapter.NewAdminServer(self, nil)
+	srv := adapter.NewAdminServer(self, members)
 	unary, stream := adapter.AdminTokenAuth(token)
 	var opts []grpc.ServerOption
 	if unary != nil {

@@ -76,10 +76,13 @@ var (
 	nodeTokenFile        = flag.String("nodeTokenFile", "", "File containing the bearer token sent to nodes' Admin service")
 	nodesRefreshInterval = flag.Duration("nodesRefreshInterval", defaultNodesRefreshInterval, "Duration to cache cluster membership before re-fetching")
 	insecureNoAuth       = flag.Bool("adminInsecureNoAuth", false, "Skip bearer token authentication; development only")
-	nodeTLSCACertFile    = flag.String("nodeTLSCACertFile", "", "PEM file with CA certificates used to verify nodes' gRPC TLS; enables TLS when set")
-	nodeTLSServerName    = flag.String("nodeTLSServerName", "", "Expected TLS server name when connecting to nodes (overrides the address host)")
-	nodeTLSSkipVerify    = flag.Bool("nodeTLSInsecureSkipVerify", false, "Skip TLS certificate verification; development only")
-	nodeTLSPlaintext     = flag.Bool("nodeTLSPlaintext", false, "Skip TLS entirely and dial nodes with plaintext credentials; development only")
+	// Node gRPC is plaintext in Phase 0, so the admin binary defaults to
+	// plaintext too. TLS is opt-in: set --nodeTLSCACertFile (preferred) or
+	// --nodeTLSInsecureSkipVerify to switch to TLS. When the cluster turns
+	// on TLS, operators flip the flag without code changes.
+	nodeTLSCACertFile = flag.String("nodeTLSCACertFile", "", "PEM file with CA certificates used to verify nodes' gRPC TLS; setting this flag enables TLS dialing")
+	nodeTLSServerName = flag.String("nodeTLSServerName", "", "Expected TLS server name when connecting to nodes (overrides the address host); only honoured when TLS is enabled")
+	nodeTLSSkipVerify = flag.Bool("nodeTLSInsecureSkipVerify", false, "Dial nodes with TLS but skip certificate verification; development only. Implies TLS.")
 )
 
 func main() {
@@ -100,7 +103,7 @@ func run() error {
 		return err
 	}
 
-	creds, err := loadTransportCredentials(*nodeTLSPlaintext, *nodeTLSCACertFile, *nodeTLSServerName, *nodeTLSSkipVerify)
+	creds, err := loadTransportCredentials(*nodeTLSCACertFile, *nodeTLSServerName, *nodeTLSSkipVerify)
 	if err != nil {
 		return err
 	}
@@ -207,20 +210,24 @@ func loadToken(path string, insecureMode bool) (string, error) {
 }
 
 // loadTransportCredentials builds the gRPC TransportCredentials used to dial
-// nodes. Precedence: --nodeTLSPlaintext (dev-only plaintext) → mutually
-// exclusive with the TLS flags → otherwise TLS with the system trust roots by
-// default, optionally overridden by --nodeTLSCACertFile and
-// --nodeTLSInsecureSkipVerify.
+// nodes. Phase 0 nodes expose a plaintext gRPC server, so the default is
+// insecure credentials — if neither --nodeTLSCACertFile nor
+// --nodeTLSInsecureSkipVerify is set, the admin binary dials plaintext.
+// Passing either flag opts into TLS; --nodeTLSServerName is honoured only
+// alongside a TLS opt-in.
 func loadTransportCredentials(
-	plaintext bool,
 	caFile, serverName string,
 	skipVerify bool,
 ) (credentials.TransportCredentials, error) {
-	if plaintext {
-		if caFile != "" || serverName != "" || skipVerify {
-			return nil, errors.New("--nodeTLSPlaintext is mutually exclusive with other TLS flags")
+	tlsRequested := caFile != "" || skipVerify
+	if !tlsRequested {
+		if serverName != "" {
+			return nil, errors.New("--nodeTLSServerName requires TLS; set --nodeTLSCACertFile or --nodeTLSInsecureSkipVerify")
 		}
 		return insecure.NewCredentials(), nil
+	}
+	if caFile != "" && skipVerify {
+		return nil, errors.New("--nodeTLSCACertFile and --nodeTLSInsecureSkipVerify are mutually exclusive")
 	}
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
@@ -228,9 +235,6 @@ func loadTransportCredentials(
 		InsecureSkipVerify: skipVerify, //nolint:gosec // gated behind --nodeTLSInsecureSkipVerify; dev-only.
 	}
 	if caFile != "" {
-		if skipVerify {
-			return nil, errors.New("--nodeTLSCACertFile and --nodeTLSInsecureSkipVerify are mutually exclusive")
-		}
 		pem, err := os.ReadFile(caFile)
 		if err != nil {
 			return nil, errors.Wrap(err, "read node TLS CA file")

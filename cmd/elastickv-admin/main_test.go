@@ -97,40 +97,50 @@ func TestLoadTokenRejectsInsecureWithFile(t *testing.T) {
 	}
 }
 
-func TestLoadTransportCredentialsPrecedence(t *testing.T) {
+func TestLoadTransportCredentialsPlaintextDefault(t *testing.T) {
 	t.Parallel()
+	if _, err := loadTransportCredentials("", "", false); err != nil {
+		t.Fatalf("no-flags default should succeed: %v", err)
+	}
+	if _, err := loadTransportCredentials("", "node-1", false); err == nil {
+		t.Fatal("serverName without TLS opt-in should error")
+	}
+}
 
-	if _, err := loadTransportCredentials(true, "", "", false); err != nil {
-		t.Fatalf("plaintext alone should succeed: %v", err)
-	}
-	if _, err := loadTransportCredentials(true, "/tmp/ca.pem", "", false); err == nil {
-		t.Fatal("plaintext + CA file should error")
-	}
-	if _, err := loadTransportCredentials(true, "", "", true); err == nil {
-		t.Fatal("plaintext + skip-verify should error")
-	}
-
+func TestLoadTransportCredentialsTLS(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	ca := filepath.Join(dir, "ca.pem")
 	if err := os.WriteFile(ca, writePEMCert(t), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadTransportCredentials(false, ca, "", true); err == nil {
-		t.Fatal("CA file + skip-verify should error")
+	if _, err := loadTransportCredentials(ca, "", true); err == nil {
+		t.Fatal("CA file + skip-verify should error (mutually exclusive)")
 	}
-	creds, err := loadTransportCredentials(false, ca, "node-1", false)
+	creds, err := loadTransportCredentials(ca, "node-1", false)
 	if err != nil {
 		t.Fatalf("valid CA config failed: %v", err)
 	}
 	if creds == nil {
 		t.Fatal("expected TLS creds")
 	}
+	creds, err = loadTransportCredentials("", "", true)
+	if err != nil {
+		t.Fatalf("skip-verify alone should succeed: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("expected TLS creds for skip-verify")
+	}
+}
 
+func TestLoadTransportCredentialsRejectsBadCA(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad.pem")
 	if err := os.WriteFile(bad, []byte("not a cert"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadTransportCredentials(false, bad, "", false); err == nil {
+	if _, err := loadTransportCredentials(bad, "", false); err == nil {
 		t.Fatal("expected error for unparseable CA file")
 	}
 }
