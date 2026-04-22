@@ -194,17 +194,17 @@ func (r *RedisServer) getLuaPool() *luaStatePool {
 	return r.luaPool
 }
 
-// newLuaStatePool returns a pool whose New func builds a freshly
-// initialised, reusable *lua.LState. The state has all libs opened,
-// dangerous loaders nil-ed, and redis/cjson/cmsgpack registered with
-// closures that dispatch through luaLookupContext (not a captured
-// *luaScriptContext pointer -- that would be wrong for reuse).
+// newLuaStatePool returns a pool that lazily allocates
+// *pooledLuaState instances on demand. The pool deliberately does NOT
+// set sync.Pool.New: if it did, p.pool.Get() would auto-invoke the
+// constructor on an empty pool and we could not distinguish a fresh
+// allocation from a reused instance. Instead, get() inspects the
+// result of p.pool.Get() -- a nil return signals an empty pool and
+// drives the miss counter plus an explicit newPooledLuaState() call.
+// This keeps the hit/miss metrics honest, which is what the serial
+// reuse tests and the observability counters rely on.
 func newLuaStatePool() *luaStatePool {
-	p := &luaStatePool{}
-	p.pool.New = func() any {
-		return newPooledLuaState()
-	}
-	return p
+	return &luaStatePool{}
 }
 
 // newPooledLuaState builds a fresh pooled state: base libs, dangerous
@@ -472,15 +472,30 @@ func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValu
 // so that redis.call / redis.pcall can see it. Binding is a single
 // pointer write to the state-local ctxBinding userdata -- no lock,
 // no global map.
+//
+// Because newLuaStatePool does NOT set sync.Pool.New, p.pool.Get()
+// returns nil when the pool is empty; that is the signal for a miss
+// (fresh allocation). A non-nil return is a genuine reuse and counts
+// as a hit. The defensive type-assertion guard preserves behaviour if
+// a future refactor ever puts something unexpected into the pool.
 func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
-	pls, ok := p.pool.Get().(*pooledLuaState)
-	if !ok || pls == nil {
-		// New func never returns nil, but defend against misuse.
-		pls = newPooledLuaState()
+	v := p.pool.Get()
+	if v == nil {
 		p.misses.Add(1)
-	} else {
-		p.hits.Add(1)
+		pls := newPooledLuaState()
+		pls.ctxBinding.Value = ctx
+		return pls
 	}
+	pls, ok := v.(*pooledLuaState)
+	if !ok || pls == nil {
+		// Defence in depth: anything other than a *pooledLuaState is
+		// treated as an allocation miss rather than a silent hit.
+		p.misses.Add(1)
+		pls = newPooledLuaState()
+		pls.ctxBinding.Value = ctx
+		return pls
+	}
+	p.hits.Add(1)
 	pls.ctxBinding.Value = ctx
 	return pls
 }

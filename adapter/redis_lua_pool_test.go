@@ -160,20 +160,55 @@ func TestLua_PoolSerialAcquireReusesState(t *testing.T) {
 }
 
 // TestLua_PoolRecordsReuseVsAllocation pins down the "is the pool
-// actually doing anything?" question via the hit counter. After N
-// get/put cycles we must see at least one hit; a broken pool (e.g.
-// one that never returned to the shared pile) would show zero hits.
+// actually doing anything?" question via the hit/miss counters. The
+// test guards against the subtle regression where sync.Pool.New is
+// (re-)configured: with a New func set, p.pool.Get() on an empty
+// pool would auto-construct and never return nil, so hit/miss
+// tracking would be meaningless. Two sub-scenarios are exercised:
+//
+//  1. Miss branch: a get() on a brand-new pool has nothing to hand
+//     out. It must increment the miss counter (fresh allocation) and
+//     leave hits at zero. This is deterministic -- sync.Pool's own
+//     scheduling cannot turn an empty pool into a non-empty one.
+//  2. Hit branch: after many put/get cycles at least one acquire
+//     must actually be served from the pool. sync.Pool under -race
+//     randomises per-P caching and can drop items, so we cannot
+//     assert on a single put/get round-trip; instead we run a loop
+//     large enough that the probability of zero reuse is negligible.
+//
+// If sync.Pool.New were accidentally re-introduced, the miss branch
+// (step 1) would fail immediately: Misses would be 0, Hits would be 1.
 func TestLua_PoolRecordsReuseVsAllocation(t *testing.T) {
 	t.Parallel()
 
 	pool := newLuaStatePool()
 
-	const iters = 200
+	// Scenario 1: empty pool -> miss. Deterministic.
+	plsA := pool.get(nil)
+	require.NotNil(t, plsA, "get on empty pool must allocate a fresh state, not return nil")
+	require.Equal(t, uint64(0), pool.Hits(),
+		"empty pool must not record a hit on first acquire -- sync.Pool.New likely reintroduced")
+	require.Equal(t, uint64(1), pool.Misses(),
+		"empty pool must record exactly one miss on first acquire")
+	pool.put(plsA)
+
+	// Scenario 2: with the state now available, a loop of get/put
+	// cycles must observe at least one genuine reuse. We cannot
+	// assert on a single round-trip because sync.Pool under -race
+	// may drop the freshly-put item from the local P cache; over
+	// many iterations, however, at least one must be served.
+	const iters = 500
 	for i := 0; i < iters; i++ {
 		pool.put(pool.get(nil))
 	}
 	require.Greater(t, pool.Hits(), uint64(0),
 		"pool reported zero hits across %d cycles -- reuse not happening", iters)
+	// The total acquires must sum to Hits + Misses = iters + 1 (the
+	// initial get outside the loop). This invariant catches a bug
+	// where get() forgets to increment either counter on some path.
+	require.Equal(t, uint64(iters+1), pool.Hits()+pool.Misses(),
+		"hit+miss counters must sum to total acquires; got hits=%d misses=%d",
+		pool.Hits(), pool.Misses())
 }
 
 // TestLua_VMReuseNonStringGlobalKeysAreWiped guards against a leak
