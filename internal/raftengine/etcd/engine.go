@@ -82,8 +82,15 @@ const (
 	// 2-lane layout (heartbeat + normal) is used. Opt-in by design: the
 	// raft hot path is high blast radius and a regression here can cause
 	// cluster-wide elections.
-	dispatcherLanesEnvVar    = "ELASTICKV_RAFT_DISPATCHER_LANES"
+	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
+	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
+	// snapshot once the applied index has advanced this many entries past
+	// the last snapshot's index. etcd/raft itself uses 10_000 as a default,
+	// but with fat proposal payloads (e.g. Lua scripts) this can produce a
+	// multi-GiB WAL between snapshots. Operators can lower via
+	// ELASTICKV_RAFT_SNAPSHOT_COUNT without a rebuild.
 	defaultSnapshotEvery     = 10_000
+	snapshotEveryEnvVar      = "ELASTICKV_RAFT_SNAPSHOT_COUNT"
 	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
 	defaultMaxPendingConfigs = 64
@@ -1661,7 +1668,7 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < defaultSnapshotEvery {
+	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < snapshotEveryFromEnv() {
 		return nil
 	}
 	snapshot, err := e.fsm.Snapshot()
@@ -2066,6 +2073,10 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	snapDir := filepath.Join(e.dataDir, snapDirName)
 	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 		slog.Warn("failed to purge old snap files", "error", purgeErr)
+	}
+	walDir := filepath.Join(e.dataDir, walDirName)
+	if purgeErr := purgeOldWALFiles(walDir, maxWALFilesFromEnv()); purgeErr != nil {
+		slog.Warn("failed to purge old wal files", "error", purgeErr)
 	}
 	return nil
 }
@@ -2768,6 +2779,29 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 }
 
+// snapshotEveryFromEnv returns the FSM-snapshot trigger threshold (in applied
+// raft entries past the last snapshot). Operators can override via
+// ELASTICKV_RAFT_SNAPSHOT_COUNT; invalid or missing values fall back to
+// defaultSnapshotEvery. Values < 1 are clamped to 1 rather than rejected so a
+// misconfiguration errs on the side of MORE-frequent snapshots (smaller WAL
+// footprint) instead of disabling snapshotting entirely.
+func snapshotEveryFromEnv() uint64 {
+	v := strings.TrimSpace(os.Getenv(snapshotEveryEnvVar))
+	if v == "" {
+		return defaultSnapshotEvery
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		slog.Warn("invalid ELASTICKV_RAFT_SNAPSHOT_COUNT; using default",
+			"value", v, "default", defaultSnapshotEvery)
+		return defaultSnapshotEvery
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 // dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has
 // been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. The value
 // is parsed with strconv.ParseBool, which accepts the standard tokens
@@ -3253,6 +3287,10 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 		snapDir := filepath.Join(e.dataDir, snapDirName)
 		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 			slog.Warn("failed to purge old snap files", "error", purgeErr)
+		}
+		walDir := filepath.Join(e.dataDir, walDirName)
+		if purgeErr := purgeOldWALFiles(walDir, maxWALFilesFromEnv()); purgeErr != nil {
+			slog.Warn("failed to purge old wal files", "error", purgeErr)
 		}
 		return nil
 	case errors.Is(err, etcdraft.ErrCompacted):
