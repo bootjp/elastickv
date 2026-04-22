@@ -108,8 +108,11 @@ func TestLua_VMReuseDoesNotLeakGlobals(t *testing.T) {
 	require.NoError(t, stateB.DoString(`assert(string.upper("ok") == "OK")`))
 	pool.put(plsB)
 
-	// Pool should have registered at least one hit by now.
-	require.GreaterOrEqual(t, pool.Hits(), uint64(1), "pool never reported a hit")
+	// NOTE: we intentionally do NOT assert pool.Hits() >= 1 here.
+	// As noted at line 81, sync.Pool may evict items under GC pressure,
+	// making a single-iteration hit assertion non-deterministic.
+	// Pool effectiveness is covered by TestLua_PoolRecordsReuseVsAllocation,
+	// which uses a loop to ensure reuse occurs.
 }
 
 // TestLua_VMReuseRestoresRebindsWhitelistedGlobals guards against a
