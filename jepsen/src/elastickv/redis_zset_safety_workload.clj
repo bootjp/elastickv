@@ -124,8 +124,16 @@
 (defn- parse-withscores
   "Carmine returns a flat [member score member score ...] vector for
   ZRANGE WITHSCORES. Convert to a sorted vector of [member (double score)]
-  preserving server-returned order (score ascending, then member)."
+  preserving server-returned order (score ascending, then member).
+
+  Throws on odd-length payloads: a WITHSCORES reply with a dangling member
+  is a protocol violation and this workload is meant to surface exactly
+  that kind of anomaly, not silently drop evidence."
   [flat]
+  (when (odd? (count flat))
+    (throw (ex-info "WITHSCORES reply has odd element count"
+                    {:count (count flat)
+                     :payload flat})))
   (->> flat
        (partition 2)
        (mapv (fn [[m s]]

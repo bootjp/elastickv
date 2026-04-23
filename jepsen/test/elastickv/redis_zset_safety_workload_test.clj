@@ -751,3 +751,12 @@
             ["m-jvm"  Double/POSITIVE_INFINITY]
             ["m-num"  3.5]]
            parsed))))
+
+(deftest parse-withscores-rejects-odd-length-payload
+  ;; A WITHSCORES reply with a dangling member (odd element count) is a
+  ;; protocol violation. The checker must surface it rather than let
+  ;; `(partition 2)` silently drop evidence of the anomaly.
+  (is (thrown-with-msg?
+        clojure.lang.ExceptionInfo
+        #"odd element count"
+        (#'workload/parse-withscores ["m1" "1.0" "m2-dangling"]))))
