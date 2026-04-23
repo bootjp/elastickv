@@ -17,9 +17,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// nowFunc is a test seam for injecting a fixed clock into GetRaftGroups so
-// its timestamp output is deterministic.
-var nowFunc = time.Now
 
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
@@ -51,6 +48,12 @@ type AdminServer struct {
 	groupsMu sync.RWMutex
 	groups   map[uint64]AdminGroup
 
+	// now is the clock used for LastContactUnixMs and any other
+	// timestamping this service needs. It's a per-server field (not a
+	// package global) so `-race` tests that swap the clock on one server
+	// instance cannot contend with concurrent RPCs on another instance.
+	now func() time.Time
+
 	pb.UnimplementedAdminServer
 }
 
@@ -65,7 +68,20 @@ func NewAdminServer(self NodeIdentity, members []NodeIdentity) *AdminServer {
 		self:    self,
 		members: cloned,
 		groups:  make(map[uint64]AdminGroup),
+		now:     time.Now,
 	}
+}
+
+// SetClock overrides the clock used by GetRaftGroups, letting tests inject a
+// fixed time without mutating any package-global state. Concurrent RPCs on
+// other AdminServer instances are unaffected.
+func (s *AdminServer) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	s.groupsMu.Lock()
+	s.now = now
+	s.groupsMu.Unlock()
 }
 
 // RegisterGroup binds a Raft group ID to its engine so the Admin service can
@@ -108,7 +124,7 @@ func (s *AdminServer) GetRaftGroups(
 	defer s.groupsMu.RUnlock()
 	ids := sortedGroupIDs(s.groups)
 	out := make([]*pb.RaftGroupState, 0, len(ids))
-	now := nowFunc()
+	now := s.now()
 	for _, id := range ids {
 		st := s.groups[id].Status()
 		// Translate LastContact (duration since the last contact with the

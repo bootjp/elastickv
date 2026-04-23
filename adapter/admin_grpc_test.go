@@ -58,11 +58,11 @@ func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
 	srv.RegisterGroup(1, fakeGroupWithContact{leaderID: "n1", term: 2, commit: 99, applied: 97, lastContact: 5 * time.Second})
 
-	// Freeze nowFunc so the computed last-contact timestamp is deterministic.
-	origNow := nowFunc
+	// Freeze the per-server clock so the computed last-contact timestamp is
+	// deterministic. No package-global state is mutated, so other parallel
+	// tests cannot race through this seam.
 	fixed := time.Unix(1_000_000, 0)
-	nowFunc = func() time.Time { return fixed }
-	t.Cleanup(func() { nowFunc = origNow })
+	srv.SetClock(func() time.Time { return fixed })
 
 	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
 	if err != nil {

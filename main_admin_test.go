@@ -104,7 +104,7 @@ func TestLoadAdminTokenFileRejectsOversize(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", adminTokenMaxBytes+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadAdminTokenFile(path); err == nil || !strings.Contains(err.Error(), "maximum is") {
+	if _, err := loadAdminTokenFile(path); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected size-cap error, got %v", err)
 	}
 }

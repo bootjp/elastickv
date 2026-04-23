@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -238,18 +239,21 @@ func loadToken(path string, insecureMode bool) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "resolve token path")
 	}
-	info, err := os.Stat(abs)
+	// Read through an io.LimitReader bounded to maxTokenFileBytes+1 so a file
+	// that grows or is swapped between stat() and read() still cannot force
+	// an oversized allocation. If we can drain one byte past the cap the
+	// token is too large — reject it.
+	f, err := os.Open(abs)
 	if err != nil {
-		return "", errors.Wrap(err, "stat token file")
+		return "", errors.Wrap(err, "open token file")
 	}
-	if info.Size() > maxTokenFileBytes {
-		return "", fmt.Errorf("token file %s is %d bytes; maximum is %d — refusing to load",
-			abs, info.Size(), maxTokenFileBytes)
-	}
-	// Size is bounded above, so materializing the file is safe.
-	b, err := os.ReadFile(abs)
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
 	if err != nil {
 		return "", errors.Wrap(err, "read token file")
+	}
+	if len(b) > maxTokenFileBytes {
+		return "", fmt.Errorf("token file %s exceeds maximum of %d bytes — refusing to load", abs, maxTokenFileBytes)
 	}
 	token := strings.TrimSpace(string(b))
 	if token == "" {
@@ -302,14 +306,16 @@ type nodeClient struct {
 	conn   *grpc.ClientConn
 	client pb.AdminClient
 
-	// refcount and evicted are protected by fanout.mu. They let the cache
-	// evict entries while RPCs are in flight: eviction removes the entry
-	// from the map and marks it evicted, and the conn is closed only once
-	// the last borrower calls release. Without this the previous design
-	// could cancel healthy in-flight GetClusterOverview calls whenever the
-	// cache was saturated.
+	// refcount, evicted, and closed are protected by fanout.mu. They let the
+	// cache evict entries while RPCs are in flight: eviction removes the
+	// entry from the map and marks it evicted, and the conn is closed only
+	// once the last borrower calls release. closed guards against a second
+	// release on an already-closed client so the public contract (extra
+	// release() calls are no-ops) holds even when refcount transiently
+	// bounces back to zero.
 	refcount int
 	evicted  bool
+	closed   bool
 }
 
 type membership struct {
@@ -370,7 +376,13 @@ func (f *fanout) Close() {
 	// Shutdown is an intentional cancellation of any in-flight RPCs; close
 	// connections eagerly and let borrowers see the cancel. Borrowers that
 	// still hold leases will observe the conn as closed on their next call.
+	// Mark each client closed so the deferred release path does not attempt
+	// a double-close.
 	for _, c := range f.clients {
+		if c.closed {
+			continue
+		}
+		c.closed = true
 		if err := c.conn.Close(); err != nil {
 			log.Printf("elastickv-admin: close gRPC connection to %s: %v", c.addr, err)
 		}
@@ -412,7 +424,8 @@ func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 }
 
 // releaseFunc returns the closer used to drop a lease. On the last release
-// of an evicted client the underlying connection is finally closed.
+// of an evicted client the underlying connection is finally closed. Extra
+// release() calls after the conn is already closed are safe no-ops.
 func (f *fanout) releaseFunc(c *nodeClient) func() {
 	return func() {
 		f.mu.Lock()
@@ -420,7 +433,8 @@ func (f *fanout) releaseFunc(c *nodeClient) func() {
 		if c.refcount > 0 {
 			c.refcount--
 		}
-		if c.refcount == 0 && c.evicted {
+		if c.refcount == 0 && c.evicted && !c.closed {
+			c.closed = true
 			if err := c.conn.Close(); err != nil {
 				log.Printf("elastickv-admin: deferred close for %s: %v", c.addr, err)
 			}
@@ -458,16 +472,18 @@ func (f *fanout) evictOneLocked() {
 // retireLocked removes a client from the cache and, if no lease is currently
 // held, closes its connection. Otherwise the connection stays open until the
 // last borrower releases, so an evicted entry never cancels an in-flight
-// RPC. Caller must hold f.mu.
+// RPC. Idempotent — double-retiring or retiring after the last release is a
+// no-op. Caller must hold f.mu.
 func (f *fanout) retireLocked(addr string, c *nodeClient) {
 	delete(f.clients, addr)
 	if c.evicted {
 		return
 	}
 	c.evicted = true
-	if c.refcount > 0 {
+	if c.refcount > 0 || c.closed {
 		return
 	}
+	c.closed = true
 	if err := c.conn.Close(); err != nil {
 		log.Printf("elastickv-admin: retire %s: close: %v", addr, err)
 	}

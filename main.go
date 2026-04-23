@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -589,18 +590,21 @@ func loadAdminTokenFile(path string) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "resolve admin token path")
 	}
-	info, err := os.Stat(abs)
+	// Read through an io.LimitReader bounded to adminTokenMaxBytes+1 so a
+	// file that grows or is swapped between stat() and read() cannot force
+	// an oversized allocation; draining one byte past the cap means the
+	// file is too large and we reject it.
+	f, err := os.Open(abs)
 	if err != nil {
-		return "", errors.Wrap(err, "stat admin token file")
+		return "", errors.Wrap(err, "open admin token file")
 	}
-	if info.Size() > adminTokenMaxBytes {
-		return "", fmt.Errorf(
-			"admin token file %s is %d bytes; maximum is %d",
-			abs, info.Size(), adminTokenMaxBytes)
-	}
-	b, err := os.ReadFile(abs)
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, adminTokenMaxBytes+1))
 	if err != nil {
 		return "", errors.Wrap(err, "read admin token file")
+	}
+	if len(b) > adminTokenMaxBytes {
+		return "", fmt.Errorf("admin token file %s exceeds maximum of %d bytes", abs, adminTokenMaxBytes)
 	}
 	token := strings.TrimSpace(string(b))
 	if token == "" {

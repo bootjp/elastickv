@@ -208,7 +208,7 @@ func TestLoadTokenRejectsOversizedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := loadToken(path, false)
-	if err == nil || !strings.Contains(err.Error(), "maximum is") {
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected size-cap error, got %v", err)
 	}
 }

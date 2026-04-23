@@ -146,7 +146,7 @@ Writes are sampled exactly once by the current Raft leader before proposal. Read
 
 The hot path uses lock-free reads for route lookup and counter increments. The data structures used are:
 
-- **Current-window counters**: `routes` is an immutable `routeTable` published through `atomic.Pointer[routeTable]`. `routeTable` owns `map[RouteID]*routeSlot`; each `routeSlot` owns an `atomic.Pointer[routeCounters]`. `Observe` loads the current table, performs a plain map lookup against that immutable snapshot, loads the slot's counter pointer, and uses `atomic.AddUint64` on the counter fields. Adding a new `RouteID` or replacing split/merge mappings performs a copy-on-write table update under a non-hot-path `routesMu`, then publishes the new table with one atomic store. No `Observe` call ever runs against a Go map that can be mutated concurrently.
+- **Current-window counters**: `routes` is an immutable `routeTable` published through `atomic.Pointer[routeTable]`. `routeTable` owns `map[RouteID]*routeSlot`; each `routeSlot` owns fixed counter fields (`reads`, `writes`, `readBytes`, `writeBytes`) that are mutated with `atomic.AddUint64`. `Observe` loads the current table, performs a plain map lookup against that immutable snapshot, and increments the slot's counters directly — no counter pointer is ever swapped, so there is no retirement window where a writer could race a flush. Adding a new `RouteID` or replacing split/merge mappings performs a copy-on-write table update under a non-hot-path `routesMu`, then publishes the new table with one atomic store. No `Observe` call ever runs against a Go map that can be mutated concurrently.
 - **Flush**: the flush goroutine drains each counter in place with `atomic.SwapUint64(&counter, 0)`. The value returned by the swap is the exact count accumulated since the previous flush; subsequent `Observe` calls see the zeroed counter and add to it without contention. There is no "old pointer" for late writers to hit — the fast path only ever touches the current counter cell, so no increment can race past the flush snapshot. Split/merge reshapes (§5.4) still go through the copy-on-write `routeTable`, but the counters themselves stay in place and are harvested by `SwapUint64`. No counts are lost and no late-writer cleanup is required.
 - **Split/merge** (§5.4): the route-watch callback creates the new child slots and publishes a new immutable `routeTable` *before* the `distribution.Engine` exposes the new `RouteID` to the coordinator, so by the time `Observe` sees the new `RouteID` the counter already exists and the callback does not race with the hot path.
 
@@ -173,7 +173,7 @@ Sampler
  └─ history *ringBuffer[matrixColumn]   // one column per stepSeconds (default 60s)
 ```
 
-Every `stepSeconds` a flush goroutine swaps each route's counter pointer (§5.1) and drops a new column into the ring buffer.
+Every `stepSeconds` a flush goroutine drains each route's counters with `atomic.SwapUint64(&counter, 0)` (§5.1) and drops a new column into the ring buffer.
 
 **Route budget and memory cap.** Naïve sizing (`columns × routes × series × 8B`) does not scale: 1 M routes × 1440 columns × 4 series × 8 B = ~46 GiB. Unbounded growth is unacceptable. The sampler enforces a hard budget on tracked routes:
 
@@ -192,7 +192,7 @@ If an operator needs higher fidelity across more routes than the cap allows, the
 
 ### 5.4 Keeping up with splits and merges
 
-`distribution.Engine` already emits a watch stream on route-state transitions. The sampler subscribes and, on a split, copies the parent route's historical column values into both children so the heatmap stays visually continuous across the event. On a merge, child columns are summed into the surviving parent. Current-window updates use the immutable-table, pointer-swap scheme from §5.1: child `routeSlot`s and `routeCounters` are installed in a freshly copied `routeTable` **before** the `distribution.Engine` publishes the new `RouteID` to the coordinator, so `Observe` never dereferences a missing route. Counts that raced a transition are attributed to whichever `RouteID` the coordinator resolved — acceptable because the loss is bounded by a single step window.
+`distribution.Engine` already emits a watch stream on route-state transitions. The sampler subscribes and, on a split, copies the parent route's historical column values into both children so the heatmap stays visually continuous across the event. On a merge, child columns are summed into the surviving parent. Current-window updates use the immutable-table, copy-on-write scheme from §5.1: child `routeSlot`s (each with zeroed counter fields) are installed in a freshly copied `routeTable` **before** the `distribution.Engine` publishes the new `RouteID` to the coordinator, so `Observe` never dereferences a missing route. Counts that raced a transition are attributed to whichever `RouteID` the coordinator resolved — acceptable because the loss is bounded by a single step window.
 
 ### 5.5 Bucketing for the response
 
@@ -289,20 +289,20 @@ Because writes are recorded by Raft leaders and follower-local reads are recorde
 - For each query (`GetKeyVizMatrix`, `GetRouteDetail`, `GetAdapterSummary`), the admin binary issues parallel gRPC calls to every known node and merges results server-side before sending one combined JSON payload to the browser.
 - Merging rule for the heatmap: rows are grouped by `bucketID`/`lineageID` and time step. Read samples from multiple nodes are **summed**, because they represent distinct locally served reads. For write samples the authoritative identity is `(raftGroupID, leaderTerm)` — by Raft invariants at most one leader exists per term per group — so the admin binary collapses write samples to **one value per `(bucketID, raftGroupID, leaderTerm, windowStart)`** key. If the same logical key arrives from more than one node (e.g., an ex-leader that has not yet expired its local cache plus a correctly-responding new leader in the same term), the entries are expected to be identical and the merger keeps one; if they differ, the cell is surfaced with `conflict=true` (not silently dropped). Across distinct `leaderTerm` values for the same group and window, values are summed because each term's leader only observed its own term's writes. The admin binary never uses "later timestamp wins" to overwrite a previous leader's complete window with a new leader's partial window.
 - Degraded mode: if any node is unreachable, the admin binary returns a partial result with a per-node `{node, ok, error}` status array so the UI can surface "3 of 4 nodes responded" instead of silently hiding ranges. The heatmap hatches rows or time windows whose expected source node failed.
-- A single-node mode (`--nodes=one:50051 --no-fanout`) is retained for operators who explicitly want the partial view.
+- A single-node mode — pass one address to `--nodes` and the admin binary will fan out to just that node's view. A future `--no-fanout` flag that also suppresses the background membership-discovery RPC is deferred; for now the operator can simulate it by pointing at a single seed and accepting the one-node partial view.
 
 ## 10. Performance Considerations
 
-- Sampler fast path on a hit: `atomic.Pointer[routeTable].Load`, immutable map lookup by `RouteID`, `atomic.Pointer[routeCounters].Load`, then `atomic.AddUint64` on the four counters. No allocation per call, no mutex acquisition, no global lock.
+- Sampler fast path on a hit: `atomic.Pointer[routeTable].Load`, immutable map lookup by `RouteID`, then `atomic.AddUint64` on the slot's four counter fields. No allocation per call, no mutex acquisition, no global lock.
 - The coordinator already holds the `RouteID` at the hook site, so the sampler does not re-resolve.
-- The flush goroutine performs atomic pointer swaps per tracked route; there is no write lock covering `Observe` calls. Splits and merges publish a copied immutable route table with child counters before publishing the new `RouteID` (§5.4), so the callback does not race with the hot path.
+- The flush goroutine performs in-place `atomic.SwapUint64` per tracked counter; there is no write lock covering `Observe` calls and no retired pointers for late writers to hit. Splits and merges publish a copied immutable route table with child counters before publishing the new `RouteID` (§5.4), so the callback does not race with the hot path.
 - API endpoints cap `to − from` at 7 days and `rows` at 1024 to bound server work.
 - `LiveSummary` adds a second atomic increment alongside each existing Prometheus `Inc()`, plus one atomic increment on a fixed-bucket histogram counter. Cost is on the order of a nanosecond and well below the noise floor in §5.2.
 - Fan-out cost (§9.1) is N parallel gRPC calls; each node serves only its locally observed samples, so the response size is distributed and the aggregate wall-clock is bounded by the slowest node, not the sum.
 
 ## 11. Testing
 
-1. Unit tests for `keyviz.Sampler`: concurrent `Observe` under the `-race` detector while copy-on-write route-table updates run, flush correctness via the pointer-swap protocol, split/merge reshaping, forwarded-read "already sampled" deduplication, and the **accuracy SLO** (1000 trials of synthetic workload must satisfy ±5% relative error at 95% CI per §5.2).
+1. Unit tests for `keyviz.Sampler`: concurrent `Observe` under the `-race` detector while copy-on-write route-table updates run, flush correctness via the `atomic.SwapUint64` drain protocol (no counts lost across the flush boundary), split/merge reshaping, forwarded-read "already sampled" deduplication, and the **accuracy SLO** (1000 trials of synthetic workload must satisfy ±5% relative error at 95% CI per §5.2).
 2. Route-budget test: generate more than `--keyvizMaxTrackedRoutes` routes and assert that coarsening preserves total observed traffic, keeps hot routes un-merged, and returns `aggregate`, `bucketID`, `routeCount`, and constituent route metadata correctly.
 3. Integration test in `kv/` that drives synthetic traffic through the coordinator and asserts the matrix reflects the skew.
 4. gRPC handler tests with a fake engine and fake Raft status reader.
