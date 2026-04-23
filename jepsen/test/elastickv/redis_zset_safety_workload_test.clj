@@ -3,6 +3,7 @@
   the model-based checker's edge cases (no-op ZREM, :info ZINCRBY)."
   (:require [clojure.test :refer :all]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [elastickv.redis-zset-safety-workload :as workload]))
 
 ;; ---------------------------------------------------------------------------
@@ -569,6 +570,71 @@
 ;; ---------------------------------------------------------------------------
 ;; Infinity score parsing
 ;; ---------------------------------------------------------------------------
+
+;; ---------------------------------------------------------------------------
+;; Client setup! / invoke! robustness (gemini MEDIUM)
+;; ---------------------------------------------------------------------------
+
+(deftest setup-bang-tolerates-missing-conn-spec
+  ;; gemini MEDIUM: if open! failed to populate :conn-spec (unresolvable
+  ;; host, etc.), setup! must NOT throw. Otherwise stale data from a
+  ;; prior run stays under zset-key and produces false-positive safety
+  ;; failures. The fix logs the skip loudly but returns normally.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient {} nil)]
+    (is (= client (client/setup! client {}))
+        "setup! must return the client (not throw) when :conn-spec is nil")))
+
+(deftest setup-bang-tolerates-unreachable-redis
+  ;; gemini MEDIUM: a Redis that can't be reached must surface as a
+  ;; logged warn, not an uncaught throw that aborts the whole run. The
+  ;; fix catches Throwable in setup!.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "127.0.0.1"
+                                     :port 1   ; guaranteed unreachable
+                                     :timeout-ms 100}})]
+    (is (= client (client/setup! client {}))
+        "setup! must swallow connection errors and keep the run going")))
+
+(deftest zincrby-invoke-handles-nil-response
+  ;; gemini MEDIUM: if car/wcar for ZINCRBY returns nil (error reply
+  ;; coerced, unexpected protocol edge), the op must complete as :info
+  ;; with a structured :error, not throw NumberFormatException from
+  ;; parse-double-safe swallowing (str nil) -> "nil".
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zincrby :value ["m1" 1.0] :process 0 :index 0}]
+    (with-redefs [workload/zincrby! (fn [& _] nil)]
+      (let [result (client/invoke! client {} op)]
+        (is (= :info (:type result))
+            (str "expected :info on nil ZINCRBY reply, got: " result))
+        (is (some? (:error result))
+            (str "expected :error to be populated, got: " result))))))
+
+(deftest zincrby-invoke-handles-unexpected-response
+  ;; gemini MEDIUM: same guard, but for a non-string / non-number reply.
+  ;; Must complete :info rather than propagate a parse failure.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zincrby :value ["m1" 1.0] :process 0 :index 0}]
+    (with-redefs [workload/zincrby! (fn [& _] {:unexpected :map})]
+      (let [result (client/invoke! client {} op)]
+        (is (= :info (:type result))
+            (str "expected :info on unexpected ZINCRBY reply, got: " result))))))
+
+(deftest zincrby-invoke-accepts-numeric-response
+  ;; Sanity: some Carmine versions coerce integer scores to longs.
+  ;; Must parse cleanly to a Double and complete :ok.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zincrby :value ["m1" 1.0] :process 0 :index 0}]
+    (with-redefs [workload/zincrby! (fn [& _] 7)]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result))
+            (str "expected :ok on numeric reply, got: " result))
+        (is (= ["m1" 7.0] (:value result)))))))
 
 (deftest parse-withscores-handles-inf-strings
   ;; gemini HIGH: Redis returns "inf" / "+inf" / "-inf" for infinite

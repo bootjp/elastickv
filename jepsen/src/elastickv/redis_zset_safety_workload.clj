@@ -86,6 +86,41 @@
       :else
       (Double/parseDouble raw))))
 
+(defn- coerce-zincrby-score
+  "Carmine's ZINCRBY reply is normally a score string, but under error /
+  timeout / protocol edge cases it may be nil, a numeric value, or
+  something else entirely. Stringifying nil produces \"nil\", which
+  parse-double-safe would then hand to Double/parseDouble and throw.
+  Explicitly classify the response so the invoke! path can record
+  :unknown-response as :info instead of masking it in a catch-all.
+
+  Returns one of:
+    [:ok   (double score)]
+    [:nil]                    ; nil response
+    [:error <string>]         ; Carmine error reply
+    [:unexpected <value>]     ; anything else"
+  [response]
+  (cond
+    (nil? response)
+    [:nil]
+
+    (number? response)
+    [:ok (double response)]
+
+    (string? response)
+    (try
+      [:ok (parse-double-safe response)]
+      (catch NumberFormatException _
+        [:unexpected response]))
+
+    ;; Carmine surfaces Redis error replies as exceptions by default,
+    ;; but some codepaths wrap them in an ex-info / Throwable value.
+    (instance? Throwable response)
+    [:error (.getMessage ^Throwable response)]
+
+    :else
+    [:unexpected response]))
+
 (defn- parse-withscores
   "Carmine returns a flat [member score member score ...] vector for
   ZRANGE WITHSCORES. Convert to a sorted vector of [member (double score)]
@@ -96,6 +131,13 @@
        (mapv (fn [[m s]]
                [(if (bytes? m) (String. ^bytes m) (str m))
                 (parse-double-safe s)]))))
+
+(defn- zincrby!
+  "Executes a ZINCRBY against conn-spec and returns Carmine's raw reply
+  (normally a score string). Extracted so tests can stub the Redis call
+  without going through the `car/wcar` macro."
+  [conn-spec key delta member]
+  (car/wcar conn-spec (car/zincrby key (double delta) member)))
 
 (defrecord ElastickvRedisZSetSafetyClient [node->port conn-spec]
   client/Client
@@ -110,10 +152,20 @@
   (close! [this _test] this)
 
   (setup! [this _test]
-    (when-let [cs (:conn-spec this)]
-      (try (car/wcar cs (car/del zset-key))
-           (catch Exception e
-             (warn "ZSet safety setup DEL failed:" (.getMessage e)))))
+    (if-let [cs (:conn-spec this)]
+      (try
+        (car/wcar cs (car/del zset-key))
+        (catch Throwable t
+          ;; Do NOT swallow silently: repeated setup! failures across
+          ;; runs would leave stale data under zset-key and could
+          ;; produce false-positive safety failures. Log loudly so
+          ;; operators notice.
+          (warn "ZSet safety setup! DEL failed -- stale data may survive"
+                "into this run:" (.getMessage t))))
+      ;; open! failed to populate :conn-spec (e.g. unresolvable host);
+      ;; flag it rather than silently proceeding with a no-op setup.
+      (warn "ZSet safety setup! skipped: missing :conn-spec on client;"
+            "prior state under" zset-key "may survive into this run"))
     this)
 
   (teardown! [this _test] this)
@@ -129,9 +181,21 @@
 
           :zincrby
           (let [[member delta] (:value op)
-                new-score (car/wcar cs (car/zincrby zset-key (double delta) member))]
-            (assoc op :type :ok
-                   :value [member (parse-double-safe new-score)]))
+                new-score (zincrby! cs zset-key delta member)
+                [tag v]   (coerce-zincrby-score new-score)]
+            (case tag
+              :ok         (assoc op :type :ok :value [member v])
+              :nil        (do (warn "ZSet safety ZINCRBY returned nil for" member)
+                              (assoc op :type :info
+                                        :error :nil-response))
+              :error      (do (warn "ZSet safety ZINCRBY returned error reply:" v)
+                              (assoc op :type :info
+                                        :error {:kind :error-response
+                                                :message v}))
+              :unexpected (do (warn "ZSet safety ZINCRBY returned unexpected reply:" (pr-str v))
+                              (assoc op :type :info
+                                        :error {:kind :unexpected-response
+                                                :value (pr-str v)}))))
 
           :zrem
           (let [member (:value op)
