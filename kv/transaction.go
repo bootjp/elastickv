@@ -7,10 +7,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -60,10 +58,6 @@ func WithProposalObserver(observer ProposalObserver) TransactionOption {
 	return func(t *TransactionManager) {
 		t.proposalObserver = observer
 	}
-}
-
-func NewTransaction(raft *raft.Raft, opts ...TransactionOption) *TransactionManager {
-	return NewTransactionWithProposer(hashicorpraftengine.New(raft), opts...)
 }
 
 func NewTransactionWithProposer(proposer raftengine.Proposer, opts ...TransactionOption) *TransactionManager {

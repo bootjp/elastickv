@@ -7,7 +7,6 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,7 +34,7 @@ func (s *stubAdapterCoordinator) VerifyLeader() error {
 	return s.verifyLeaderErr
 }
 
-func (s *stubAdapterCoordinator) RaftLeader() raft.ServerAddress {
+func (s *stubAdapterCoordinator) RaftLeader() string {
 	return ""
 }
 
@@ -50,7 +49,7 @@ func (s *stubAdapterCoordinator) VerifyLeaderForKey([]byte) error {
 	return nil
 }
 
-func (s *stubAdapterCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
+func (s *stubAdapterCoordinator) RaftLeaderForKey([]byte) string {
 	return ""
 }
 

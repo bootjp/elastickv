@@ -9,7 +9,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 // LeaderRoutedStore is an MVCCStore wrapper that serves reads from the local
@@ -64,7 +63,7 @@ func (s *LeaderRoutedStore) leaderOKForKey(ctx context.Context, key []byte) bool
 	return ok
 }
 
-func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) raft.ServerAddress {
+func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) string {
 	if s.coordinator == nil {
 		return ""
 	}

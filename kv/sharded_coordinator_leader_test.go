@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +18,7 @@ func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	r, stop := newSingleRaft(t, "shard-leader", NewKvFSMWithHLC(st, NewHLC()))
 	t.Cleanup(stop)
 
-	re := hashicorpraftengine.New(r)
+	re := r
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: re, Store: st, Txn: NewLeaderProxyWithEngine(re)},
 	}

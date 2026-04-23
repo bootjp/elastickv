@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -14,20 +13,17 @@ import (
 	"strings"
 	"time"
 
-	transport "github.com/Jille/raft-grpc-transport"
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
-	"github.com/bootjp/elastickv/internal/raftstore"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
@@ -53,14 +49,14 @@ var (
 )
 
 const (
-	raftSnapshotsRetain = 2
 	kvParts             = 2
 	defaultFileMode     = 0755
-	joinRetries         = 20
-	joinWait            = 3 * time.Second
-	joinRetryInterval   = 1 * time.Second
-	joinRPCTimeout      = 3 * time.Second
 	raftObserveInterval = 5 * time.Second
+	demoTickInterval    = 10 * time.Millisecond
+	demoHeartbeatTick   = 1
+	demoElectionTick    = 10
+	demoMaxSizePerMsg   = 1 << 20
+	demoMaxInflightMsg  = 256
 )
 
 func init() {
@@ -87,6 +83,11 @@ type config struct {
 	raftRedisMap   string
 	raftS3Map      string
 	raftDynamoMap  string
+	// raftPeers, when non-empty, seeds the etcd raft factory with the
+	// full cluster membership. Demo mode populates it for every node so
+	// non-bootstrap nodes start with a known peer list instead of
+	// failing with "no persisted peers and no peer list was supplied".
+	raftPeers []raftengine.Server
 }
 
 func main() {
@@ -176,10 +177,16 @@ func main() {
 		var redisMapParts []string
 		var s3MapParts []string
 		var dynamoMapParts []string
+		peers := make([]raftengine.Server, 0, len(nodes))
 		for _, n := range nodes {
 			redisMapParts = append(redisMapParts, n.address+"="+n.redisAddress)
 			s3MapParts = append(s3MapParts, n.address+"="+n.s3Address)
 			dynamoMapParts = append(dynamoMapParts, n.address+"="+n.dynamoAddress)
+			peers = append(peers, raftengine.Server{
+				Suffrage: "voter",
+				ID:       n.raftID,
+				Address:  n.address,
+			})
 		}
 		raftRedisMapStr := strings.Join(redisMapParts, ",")
 		raftS3MapStr := strings.Join(s3MapParts, ",")
@@ -189,6 +196,12 @@ func main() {
 			n.raftRedisMap = raftRedisMapStr
 			n.raftS3Map = raftS3MapStr
 			n.raftDynamoMap = raftDynamoMapStr
+			n.raftPeers = peers
+			// etcd raft requires every member of a fresh cluster to
+			// bootstrap with the same peer list. Override the per-node
+			// raftBootstrap flag in demo mode so n2/n3 don't fail with
+			// "no persisted peers and no peer list was supplied".
+			n.raftBootstrap = true
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
 				slog.Error(err.Error())
@@ -196,39 +209,14 @@ func main() {
 			}
 		}
 
-		// Wait for n1 to be ready then join others?
-		// Actually, standard bootstrap expects a configuration.
-		// If we only bootstrap n1, we need to join n2 and n3.
-		// For simplicity in this demo, let's bootstrap n1 with just n1, and have n2/n3 join.
-		// Or better: bootstrap n1 with {n1, n2, n3}.
-		// But run() logic for bootstrap only adds *raftID to configuration.
-
-		// Let's modify bootstrapping logic in run() slightly or just rely on manual join?
-		// The original demo likely used raftadmin to join or predefined bootstrap.
-		// Since we can't easily change run() logic too much without breaking Jepsen,
-		// let's use a separate goroutine to join n2/n3 to n1 after a delay.
-
-		eg.Go(func() error {
-			// Wait a bit for n1 to start
-			// This is hacky but sufficient for a demo
-			// Better would be to wait for gRPC readiness
-			// But standard 'sleep' is unavailable here without import time
-			// We can use a simple retry loop to join.
-
-			// Actually, let's keep it simple: just start them.
-			// If n1 bootstraps as a single node cluster, n2 and n3 won't be part of it automatically.
-			// We need to issue 'add_voter' commands.
-			// Let's rely on an external script or add a helper here?
-
-			// For this specific demo restoration, we'll assume the external script might handle joins
-			// OR we check if the CI script does it.
-			// The CI script just waits for ports. It runs `lein run ...` which assumes a cluster.
-			// If the cluster isn't formed, the tests might fail.
-			// BUT, looking at the previous demo.go (if I could), it probably did the joins.
-
-			// Let's add a joiner goroutine.
-			return joinCluster(runCtx, nodes)
-		})
+		// All three nodes were started with the same raftPeers list and
+		// raftBootstrap=true above, so the etcd cluster is fully formed
+		// at startup. joinCluster (AddVoter via raftadmin against
+		// nodes[0]) is no longer needed and would actively misbehave
+		// under etcd's randomised elections — nodes[0] is not guaranteed
+		// to be leader, so the AddVoter RPC would either hit a follower
+		// and be rejected, or add duplicates to an already-complete
+		// configuration.
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -243,132 +231,6 @@ func effectiveDemoMetricsToken(token string) string {
 		return token
 	}
 	return "demo-metrics-token"
-}
-
-func joinCluster(ctx context.Context, nodes []config) error {
-	leader := nodes[0]
-	// Give servers some time to start
-	if err := waitForJoinRetry(ctx, joinWait); err != nil {
-		return joinClusterWaitError(err)
-	}
-
-	// Connect to leader
-	conn, err := grpc.NewClient(leader.address, internalutil.GRPCDialOptions()...)
-	if err != nil {
-		return fmt.Errorf("failed to dial leader: %w", err)
-	}
-	defer conn.Close()
-	client := pb.NewRaftAdminClient(conn)
-
-	for _, n := range nodes[1:] {
-		if err := joinNodeWithRetry(ctx, client, n); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func joinNodeWithRetry(ctx context.Context, client pb.RaftAdminClient, n config) error {
-	for i := range joinRetries {
-		if err := tryJoinNode(ctx, client, n); err == nil {
-			return nil
-		} else {
-			if ctx.Err() != nil {
-				// Retry loop should stop immediately once the parent context is canceled.
-				return joinRetryCancelResult(ctx)
-			}
-			slog.Warn("Failed to join node, retrying...", "id", n.raftID, "err", err)
-		}
-		if i == joinRetries-1 {
-			break
-		}
-		if err := waitForJoinRetry(ctx, joinRetryInterval); err != nil {
-			return joinRetryCancelResult(ctx)
-		}
-	}
-	if ctx.Err() != nil {
-		return joinRetryCancelResult(ctx)
-	}
-	return fmt.Errorf("failed to join node %s after retries", n.raftID)
-}
-
-func joinRetryCancelResult(ctx context.Context) error {
-	if ctx == nil || ctx.Err() == nil {
-		return nil
-	}
-	return joinClusterWaitError(errors.WithStack(ctx.Err()))
-}
-
-func tryJoinNode(ctx context.Context, client pb.RaftAdminClient, n config) error {
-	slog.Info("Attempting to join node", "id", n.raftID, "address", n.address)
-	addCtx, cancelAdd := context.WithTimeout(ctx, joinRPCTimeout)
-	defer cancelAdd()
-	_, err := client.AddVoter(addCtx, &pb.RaftAdminAddVoterRequest{
-		Id:            n.raftID,
-		Address:       n.address,
-		PreviousIndex: 0,
-	})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	slog.Info("Successfully joined node", "id", n.raftID)
-	return nil
-}
-
-func waitForJoinRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return errors.WithStack(ctx.Err())
-	case <-timer.C:
-		return nil
-	}
-}
-
-func joinClusterWaitError(err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		// Do not override the original errgroup cause with cancellation.
-		return nil
-	}
-	return err
-}
-
-func setupStorage(dir string) (raft.LogStore, raft.StableStore, raft.SnapshotStore, error) {
-	if dir == "" {
-		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), nil
-	}
-	for _, legacy := range []string{"logs.dat", "stable.dat"} {
-		if _, err := os.Stat(filepath.Join(dir, legacy)); err == nil {
-			return nil, nil, nil, errors.WithStack(errors.Newf(
-				"legacy boltdb Raft storage %q found in %s; manual migration required before using Pebble-backed storage",
-				legacy, dir,
-			))
-		}
-	}
-	raftStore, err := raftstore.NewPebbleStore(filepath.Join(dir, "raft.db"))
-	if err != nil {
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	fss, err := raft.NewFileSnapshotStore(dir, raftSnapshotsRetain, os.Stdout)
-	if err != nil {
-		_ = raftStore.Close()
-		return nil, nil, nil, errors.WithStack(err)
-	}
-	return raftStore, raftStore, fss, nil
-}
-
-// setupStores creates both the Raft log/stable/snapshot stores and the FSM MVCCStore.
-func setupStores(raftDataDir string, cleanup *internalutil.CleanupStack) (raft.LogStore, raft.StableStore, raft.SnapshotStore, store.MVCCStore, error) {
-	ldb, sdb, fss, err := setupStorage(raftDataDir)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	st, err := setupFSMStore(raftDataDir, cleanup)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	return ldb, sdb, fss, st, nil
 }
 
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
@@ -397,33 +259,35 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(ctx context.Context, r *raft.Raft, st store.MVCCStore, tm *transport.Manager, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-	trx := kv.NewTransaction(r, kv.WithProposalObserver(proposalObserver))
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
-	tm.Register(s)
+	if registerTransport != nil {
+		registerTransport(s)
+	}
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
-	pb.RegisterInternalServer(s, adapter.NewInternal(trx, r, coordinator.Clock(), relay))
+	pb.RegisterInternalServer(s, adapter.NewInternalWithEngine(trx, engine, coordinator.Clock(), relay))
 	pb.RegisterDistributionServer(s, distServer)
-	internalraftadmin.RegisterOperationalServices(ctx, s, hashicorpraftengine.New(r), []string{"RawKV"})
+	internalraftadmin.RegisterOperationalServices(ctx, s, engine, []string{"RawKV"})
 	return s, gs
 }
 
 func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker, deltaCompactor *adapter.DeltaCompactor) (*adapter.RedisServer, error) {
-	leaderRedis := make(map[raft.ServerAddress]string)
+	leaderRedis := make(map[string]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
 		for part := range parts {
 			kv := strings.Split(part, "=")
 			if len(kv) == kvParts {
-				leaderRedis[raft.ServerAddress(kv[0])] = kv[1]
+				leaderRedis[kv[0]] = kv[1]
 			}
 		}
 	}
 	// Ensure self is in map (override if present)
-	leaderRedis[raft.ServerAddress(addr)] = redisAddr
+	leaderRedis[addr] = redisAddr
 
 	l, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
@@ -455,7 +319,7 @@ func setupS3(
 	if coordinator == nil {
 		return nil, errors.New("coordinator must not be nil")
 	}
-	leaderS3 := make(map[raft.ServerAddress]string)
+	leaderS3 := make(map[string]string)
 	if raftS3MapStr != "" {
 		parts := strings.SplitSeq(raftS3MapStr, ",")
 		for part := range parts {
@@ -468,10 +332,10 @@ func setupS3(
 				slog.Warn("ignoring invalid raft-s3 map entry; expected format addr=s3addr", "entry", part)
 				continue
 			}
-			leaderS3[raft.ServerAddress(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
+			leaderS3[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 		}
 	}
-	leaderS3[raft.ServerAddress(addr)] = s3Addr
+	leaderS3[addr] = s3Addr
 
 	l, err := lc.Listen(ctx, "tcp", s3Addr)
 	if err != nil {
@@ -496,16 +360,16 @@ func setupS3(
 }
 
 func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, dynamoAddr, raftDynamoMapStr string, observer monitoring.DynamoDBRequestObserver) (*adapter.DynamoDBServer, error) {
-	leaderDynamo := make(map[raft.ServerAddress]string)
+	leaderDynamo := make(map[string]string)
 	if raftDynamoMapStr != "" {
 		for part := range strings.SplitSeq(raftDynamoMapStr, ",") {
 			pair := strings.SplitN(part, "=", kvParts)
 			if len(pair) == kvParts {
-				leaderDynamo[raft.ServerAddress(pair[0])] = pair[1]
+				leaderDynamo[pair[0]] = pair[1]
 			}
 		}
 	}
-	leaderDynamo[raft.ServerAddress(addr)] = dynamoAddr
+	leaderDynamo[addr] = dynamoAddr
 	l, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -517,12 +381,70 @@ func setupDynamo(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, c
 	), nil
 }
 
+// openRaftEngine creates the etcd-backed raft engine for a demo node. It
+// resolves the data dir (using a temp dir when cfg.raftDataDir is empty),
+// refuses to start on top of legacy hashicorp/raft state, and registers
+// cleanup callbacks for the data dir, engine and factory resources.
+func openRaftEngine(cfg config, fsm raftengine.StateMachine, cleanup *internalutil.CleanupStack) (*raftengine.FactoryResult, error) {
+	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   demoTickInterval,
+		HeartbeatTick:  demoHeartbeatTick,
+		ElectionTick:   demoElectionTick,
+		MaxSizePerMsg:  demoMaxSizePerMsg,
+		MaxInflightMsg: demoMaxInflightMsg,
+	})
+
+	raftDir := cfg.raftDataDir
+	if raftDir == "" {
+		tmp, err := os.MkdirTemp("", "elastickv-raft-*")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		cleanup.Add(func() { os.RemoveAll(tmp) })
+		raftDir = tmp
+	} else if err := os.MkdirAll(raftDir, defaultFileMode); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	// Refuse to start on top of hashicorp/raft artifacts from a previous
+	// deployment. The backend has been removed and silently overwriting
+	// its state with etcd markers could commit to an incompatible engine
+	// over committed data. Fail fast so operators have to migrate
+	// explicitly.
+	for _, legacy := range []string{"raft.db", "logs.dat", "stable.dat"} {
+		if _, err := os.Stat(filepath.Join(raftDir, legacy)); err == nil {
+			return nil, errors.WithStack(errors.Newf("legacy hashicorp/raft artifact %q found in %s; hashicorp backend has been removed, manual migration required", legacy, raftDir))
+		} else if !os.IsNotExist(err) {
+			return nil, errors.WithStack(err)
+		}
+	}
+
+	result, err := factory.Create(raftengine.FactoryConfig{
+		LocalID:      cfg.raftID,
+		LocalAddress: cfg.address,
+		DataDir:      raftDir,
+		Peers:        cfg.raftPeers,
+		Bootstrap:    cfg.raftBootstrap,
+		StateMachine: fsm,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	cleanup.Add(func() {
+		_ = result.Engine.Close()
+		if result.Close != nil {
+			_ = result.Close()
+		}
+	})
+	return result, nil
+}
+
 func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	var lc net.ListenConfig
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
-	ldb, sdb, fss, st, err := setupStores(cfg.raftDataDir, &cleanup)
+	st, err := setupFSMStore(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
 	}
@@ -531,30 +453,14 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	fsm := kv.NewKvFSMWithHLC(st, hlc)
 	readTracker := kv.NewActiveTimestampTracker()
 
-	// Config
-	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(cfg.raftID)
-	c.Logger = hclog.New(&hclog.LoggerOptions{
-		Name:       "raft-" + cfg.raftID,
-		JSONFormat: true,
-		Level:      hclog.Info,
-	})
-
-	// Transport
-	tm := transport.New(raft.ServerAddress(cfg.address), internalutil.GRPCDialOptions())
-
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
+	result, err := openRaftEngine(cfg, fsm, &cleanup)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	if err := bootstrapClusterIfNeeded(r, cfg); err != nil {
 		return err
 	}
 
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
-	engine := hashicorpraftengine.New(r)
+	engine := result.Engine
 	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
 	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	defer func() {
@@ -590,7 +496,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(ctx, r, st, tm, coordinator, distServer, relay, proposalObserver)
+	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
@@ -697,25 +603,6 @@ func setupPprofHTTPServer(ctx context.Context, lc net.ListenConfig, pprofAddress
 	}
 	ps := monitoring.NewPprofServer(pprofToken)
 	return pprofL, ps, nil
-}
-
-func bootstrapClusterIfNeeded(r *raft.Raft, cfg config) error {
-	if !cfg.raftBootstrap {
-		return nil
-	}
-	bootstrapCfg := raft.Configuration{
-		Servers: []raft.Server{
-			{
-				Suffrage: raft.Voter,
-				ID:       raft.ServerID(cfg.raftID),
-				Address:  raft.ServerAddress(cfg.address),
-			},
-		},
-	}
-	if err := r.BootstrapCluster(bootstrapCfg).Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
-		return errors.WithStack(err)
-	}
-	return nil
 }
 
 func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {

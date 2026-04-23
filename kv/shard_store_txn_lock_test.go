@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -26,8 +25,8 @@ func setupTwoShardStore(t *testing.T) (*ShardStore, map[uint64]*ShardGroup, func
 	st2 := store.NewMVCCStore()
 	r2, stop2 := newSingleRaft(t, "g2", NewKvFSMWithHLC(st2, NewHLC()))
 
-	e1 := hashicorpraftengine.New(r1)
-	e2 := hashicorpraftengine.New(r2)
+	e1 := r1
+	e2 := r2
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: st1, Txn: NewLeaderProxyWithEngine(e1)},
 		2: {Engine: e2, Store: st2, Txn: NewLeaderProxyWithEngine(e2)},
@@ -97,7 +96,7 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
-	e1 := hashicorpraftengine.New(r1)
+	e1 := r1
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: st1, Txn: NewLeaderProxyWithEngine(e1)},
 	}
@@ -234,7 +233,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
-	e1 := hashicorpraftengine.New(r1)
+	e1 := r1
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: st1, Txn: NewLeaderProxyWithEngine(e1)},
 	}
@@ -264,7 +263,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t 
 	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
-	e1 := hashicorpraftengine.New(r1)
+	e1 := r1
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: st1, Txn: NewLeaderProxyWithEngine(e1)},
 	}
@@ -294,7 +293,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *tes
 	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
 	defer stop1()
 
-	e1 := hashicorpraftengine.New(r1)
+	e1 := r1
 	groups := map[uint64]*ShardGroup{
 		1: {Engine: e1, Store: st1, Txn: NewLeaderProxyWithEngine(e1)},
 	}

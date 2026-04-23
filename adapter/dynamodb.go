@@ -26,7 +26,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -135,7 +134,7 @@ type DynamoDBServer struct {
 	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
-	leaderDynamo    map[raft.ServerAddress]string
+	leaderDynamo    map[string]string
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -154,9 +153,9 @@ func WithDynamoDBActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) Dyna
 // WithDynamoDBLeaderMap configures the Raft-address-to-DynamoDB-address mapping
 // used to forward requests from followers to the current leader.
 // The format mirrors the raftRedisMap / raftS3Map convention.
-func WithDynamoDBLeaderMap(m map[raft.ServerAddress]string) DynamoDBServerOption {
+func WithDynamoDBLeaderMap(m map[string]string) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
-		server.leaderDynamo = make(map[raft.ServerAddress]string, len(m))
+		server.leaderDynamo = make(map[string]string, len(m))
 		for k, v := range m {
 			server.leaderDynamo[k] = v
 		}

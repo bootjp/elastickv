@@ -2,16 +2,13 @@ package kv
 
 import (
 	"context"
-	"io"
 	"sync"
 	"testing"
 	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -67,7 +64,7 @@ func TestFSMApplyBatchKeepsPerRequestResults(t *testing.T) {
 	data, err := proto.Marshal(cmd)
 	require.NoError(t, err)
 
-	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	resp := fsm.Apply(data)
 	applyResp, ok := resp.(*fsmApplyResponse)
 	require.True(t, ok)
 	require.Len(t, applyResp.results, 3)
@@ -95,7 +92,7 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 	r, stop := newSingleRaft(t, "raw-batch", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
-	tm := NewTransaction(r)
+	tm := NewTransactionWithProposer(r)
 
 	req1 := []*pb.Request{{
 		IsTxn: false,
@@ -170,7 +167,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 		},
 	}}
 
-	_, _, err := applyRequests(hashicorpraftengine.New(r), reqs, observer)
+	_, _, err := applyRequests(r, reqs, observer)
 	require.Error(t, err)
 	require.Equal(t, 1, observer.FailureCount())
 }
@@ -189,71 +186,11 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 		},
 	}}
 
-	_, results, err := applyRequests(hashicorpraftengine.New(r), reqs, observer)
+	_, results, err := applyRequests(r, reqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)
 	require.Zero(t, observer.FailureCount())
-}
-
-type etcdFSMAdapter struct {
-	fsm raft.FSM
-}
-
-func (a etcdFSMAdapter) Apply(data []byte) any {
-	return a.fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
-}
-
-func (a etcdFSMAdapter) Snapshot() (etcdraftengine.Snapshot, error) {
-	snapshot, err := a.fsm.Snapshot()
-	if err != nil {
-		return nil, err
-	}
-	return hashicorpSnapshotAdapter{snapshot: snapshot}, nil
-}
-
-func (a etcdFSMAdapter) Restore(r io.Reader) error {
-	return a.fsm.Restore(io.NopCloser(r))
-}
-
-type hashicorpSnapshotAdapter struct {
-	snapshot raft.FSMSnapshot
-}
-
-func (a hashicorpSnapshotAdapter) WriteTo(w io.Writer) (int64, error) {
-	sink := &snapshotSinkAdapter{writer: w}
-	if err := a.snapshot.Persist(sink); err != nil {
-		return sink.written, err
-	}
-	return sink.written, nil
-}
-
-func (a hashicorpSnapshotAdapter) Close() error {
-	a.snapshot.Release()
-	return nil
-}
-
-type snapshotSinkAdapter struct {
-	writer  io.Writer
-	written int64
-}
-
-func (s *snapshotSinkAdapter) ID() string {
-	return "etcd-fsm-adapter"
-}
-
-func (s *snapshotSinkAdapter) Cancel() error {
-	return nil
-}
-
-func (s *snapshotSinkAdapter) Close() error {
-	return nil
-}
-
-func (s *snapshotSinkAdapter) Write(p []byte) (int, error) {
-	n, err := s.writer.Write(p)
-	s.written += int64(n)
-	return n, err
 }
 
 func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
@@ -264,7 +201,7 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 		LocalAddress: "127.0.0.1:7001",
 		DataDir:      t.TempDir(),
 		Bootstrap:    true,
-		StateMachine: etcdFSMAdapter{fsm: NewKvFSMWithHLC(st, NewHLC())},
+		StateMachine: NewKvFSMWithHLC(st, NewHLC()),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

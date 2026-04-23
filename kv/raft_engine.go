@@ -6,7 +6,6 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 func engineForGroup(g *ShardGroup) raftengine.Engine {
@@ -92,9 +91,9 @@ func leaseReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint
 	return index, nil
 }
 
-func leaderAddrFromEngine(engine raftengine.LeaderView) raft.ServerAddress {
+func leaderAddrFromEngine(engine raftengine.LeaderView) string {
 	if engine == nil {
 		return ""
 	}
-	return raft.ServerAddress(engine.Leader().Address)
+	return engine.Leader().Address
 }

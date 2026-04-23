@@ -9,7 +9,6 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -721,7 +720,7 @@ func (s *distributionCoordinatorStub) VerifyLeader() error {
 	return nil
 }
 
-func (s *distributionCoordinatorStub) RaftLeader() raft.ServerAddress {
+func (s *distributionCoordinatorStub) RaftLeader() string {
 	return ""
 }
 
@@ -736,7 +735,7 @@ func (s *distributionCoordinatorStub) VerifyLeaderForKey(_ []byte) error {
 	return nil
 }
 
-func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) raft.ServerAddress {
+func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 	return ""
 }
 
