@@ -816,6 +816,7 @@
                                  (:ssh opts))
              :remote      control/ssh
              :nemesis     (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
+             ;; Jepsen 0.3.x can't fressian-serialize some combined final gens; skip.
              :final-generator nil
              :concurrency (or (:concurrency opts) 5)
              :generator   (->> (:generator workload)
