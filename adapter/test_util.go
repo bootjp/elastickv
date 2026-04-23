@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -30,6 +32,12 @@ const (
 	testEngineElectionTick  = 10
 	testEngineMaxSizePerMsg = 1 << 20
 	testEngineMaxInflight   = 256
+
+	// leaderChurnRetryTimeout bounds how long doEventually keeps retrying a
+	// write that fails with "not leader" right after createNode returns.
+	leaderChurnRetryTimeout = 5 * time.Second
+	// leaderChurnRetryInterval is the poll interval between retries.
+	leaderChurnRetryInterval = 50 * time.Millisecond
 )
 
 func newTestFactory() raftengine.Factory {
@@ -441,4 +449,51 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 	}
 
 	return nodes, grpcAdders, redisAdders, peers
+}
+
+// isTransientNotLeaderErr reports whether err is a transient "not leader"
+// error that can happen right after createNode returns if the newly elected
+// leader briefly steps down due to a missed heartbeat quorum (common on slow
+// CI runners under -race). Callers should retry the write in that case.
+func isTransientNotLeaderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "not leader")
+}
+
+// doEventually retries do() while it returns a transient "not leader" error,
+// giving the cluster a few seconds to re-settle leadership after startup.
+// Non-"not leader" errors fail the test immediately.
+func doEventually(t *testing.T, do func() error) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		err := do()
+		if err == nil {
+			return true
+		}
+		if isTransientNotLeaderErr(err) {
+			return false
+		}
+		require.NoError(t, err)
+		return true
+	}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
+}
+
+// rpushEventually wraps RPUSH in doEventually so transient leader churn
+// immediately after createNode doesn't fail the test.
+func rpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
+	t.Helper()
+	doEventually(t, func() error {
+		return rdb.RPush(ctx, key, vals...).Err()
+	})
+}
+
+// lpushEventually wraps LPUSH in doEventually so transient leader churn
+// immediately after createNode doesn't fail the test.
+func lpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
+	t.Helper()
+	doEventually(t, func() error {
+		return rdb.LPush(ctx, key, vals...).Err()
+	})
 }
