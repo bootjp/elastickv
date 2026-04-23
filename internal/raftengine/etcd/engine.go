@@ -190,9 +190,9 @@ type OpenConfig struct {
 	HeartbeatTick int
 	StateMachine  StateMachine
 	// MaxSizePerMsg caps the byte size of a single MsgApp payload (Raft-level
-	// flow control). Default: 4 MiB. Larger values amortise more entries per
-	// MsgApp under small-entry workloads; smaller values tighten worst-case
-	// memory. Operators can override at runtime via
+	// flow control). Default: 2 MiB (see defaultMaxSizePerMsg). Larger values
+	// amortise more entries per MsgApp under small-entry workloads; smaller
+	// values tighten worst-case memory. Operators can override at runtime via
 	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG (integer byte count) without a
 	// rebuild; the env var takes precedence over the caller-supplied value.
 	MaxSizePerMsg uint64
@@ -200,10 +200,10 @@ type OpenConfig struct {
 	// per peer before waiting for an acknowledgement (Raft-level flow control).
 	// It also sets the per-peer dispatch channel capacity, so total buffered
 	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
-	// Default: 1024. Increase for deeper pipelining on high-bandwidth links;
-	// lower in memory-constrained clusters. Operators can override at
-	// runtime via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS without a rebuild; the
-	// env var takes precedence over the caller-supplied value.
+	// Default: 512 (see defaultMaxInflightMsg). Increase for deeper pipelining
+	// on high-bandwidth links; lower in memory-constrained clusters. Operators
+	// can override at runtime via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS without a
+	// rebuild; the env var takes precedence over the caller-supplied value.
 	MaxInflightMsg int
 }
 
