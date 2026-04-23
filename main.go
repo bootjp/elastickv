@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -584,33 +582,14 @@ func configureAdminService(
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
 // so a misconfigured path (for example a log file) cannot force an arbitrary
-// allocation before the bearer-token check.
+// allocation before the bearer-token check. Delegates to the shared helper in
+// internal/ so the admin binary and the node process read tokens identically.
 func loadAdminTokenFile(path string) (string, error) {
-	abs, err := filepath.Abs(path)
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
 	if err != nil {
-		return "", errors.Wrap(err, "resolve admin token path")
+		return "", errors.Wrap(err, "load admin token")
 	}
-	// Read through an io.LimitReader bounded to adminTokenMaxBytes+1 so a
-	// file that grows or is swapped between stat() and read() cannot force
-	// an oversized allocation; draining one byte past the cap means the
-	// file is too large and we reject it.
-	f, err := os.Open(abs)
-	if err != nil {
-		return "", errors.Wrap(err, "open admin token file")
-	}
-	defer func() { _ = f.Close() }()
-	b, err := io.ReadAll(io.LimitReader(f, adminTokenMaxBytes+1))
-	if err != nil {
-		return "", errors.Wrap(err, "read admin token file")
-	}
-	if len(b) > adminTokenMaxBytes {
-		return "", fmt.Errorf("admin token file %s exceeds maximum of %d bytes", abs, adminTokenMaxBytes)
-	}
-	token := strings.TrimSpace(string(b))
-	if token == "" {
-		return "", errors.New("admin token file is empty")
-	}
-	return token, nil
+	return tok, nil
 }
 
 // startMonitoringCollectors wires up the per-tick Prometheus

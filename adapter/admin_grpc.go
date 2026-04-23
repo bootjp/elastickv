@@ -17,7 +17,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
 // standing up a real Raft cluster.
@@ -130,16 +129,22 @@ func (s *AdminServer) GetRaftGroups(
 		// Translate LastContact (duration since the last contact with the
 		// leader, per raftengine.Status) into an absolute unix-ms so UI
 		// clients can diff against their own clock instead of having to
-		// reason about the server's uptime. Zero LastContact (leader on
-		// self, or no contact recorded yet) reports the current time
-		// rather than an arbitrary epoch zero.
+		// reason about the server's uptime. The etcd engine returns a
+		// sentinel negative duration when the last contact is unknown
+		// (follower/candidate has never heard from a leader); clamping
+		// negatives to zero prevents the UI from rendering a future
+		// timestamp as "freshly contacted".
+		lastContact := st.LastContact
+		if lastContact < 0 {
+			lastContact = 0
+		}
 		out = append(out, &pb.RaftGroupState{
 			RaftGroupId:       id,
 			LeaderNodeId:      st.Leader.ID,
 			LeaderTerm:        st.Term,
 			CommitIndex:       st.CommitIndex,
 			AppliedIndex:      st.AppliedIndex,
-			LastContactUnixMs: now.Add(-st.LastContact).UnixMilli(),
+			LastContactUnixMs: now.Add(-lastContact).UnixMilli(),
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil

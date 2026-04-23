@@ -81,6 +81,28 @@ func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	}
 }
 
+// TestGetRaftGroupsClampsNegativeLastContact pins the sentinel-negative
+// handling for raftengine's "unknown last contact" value (-1). Without the
+// clamp, the admin UI would show a future timestamp precisely when leader
+// contact is unknown, which reads as "freshly contacted" to operators.
+func TestGetRaftGroupsClampsNegativeLastContact(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
+	srv.RegisterGroup(1, fakeGroupWithContact{leaderID: "n1", term: 1, lastContact: -1})
+
+	fixed := time.Unix(2_000_000, 0)
+	srv.SetClock(func() time.Time { return fixed })
+
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resp.Groups[0].LastContactUnixMs
+	if got != fixed.UnixMilli() {
+		t.Fatalf("LastContactUnixMs = %d, want %d (now clamped to 0 duration)", got, fixed.UnixMilli())
+	}
+}
+
 type fakeGroupWithContact struct {
 	leaderID    string
 	term        uint64

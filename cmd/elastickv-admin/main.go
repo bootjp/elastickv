@@ -11,18 +11,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/singleflight"
@@ -235,31 +234,11 @@ func loadToken(path string, insecureMode bool) (string, error) {
 	if insecureMode {
 		return "", errors.New("--adminInsecureNoAuth and --nodeTokenFile are mutually exclusive")
 	}
-	abs, err := filepath.Abs(path)
+	tok, err := internalutil.LoadBearerTokenFile(path, maxTokenFileBytes, "admin token")
 	if err != nil {
-		return "", errors.Wrap(err, "resolve token path")
+		return "", errors.Wrap(err, "load admin token")
 	}
-	// Read through an io.LimitReader bounded to maxTokenFileBytes+1 so a file
-	// that grows or is swapped between stat() and read() still cannot force
-	// an oversized allocation. If we can drain one byte past the cap the
-	// token is too large — reject it.
-	f, err := os.Open(abs)
-	if err != nil {
-		return "", errors.Wrap(err, "open token file")
-	}
-	defer func() { _ = f.Close() }()
-	b, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
-	if err != nil {
-		return "", errors.Wrap(err, "read token file")
-	}
-	if len(b) > maxTokenFileBytes {
-		return "", fmt.Errorf("token file %s exceeds maximum of %d bytes — refusing to load", abs, maxTokenFileBytes)
-	}
-	token := strings.TrimSpace(string(b))
-	if token == "" {
-		return "", errors.New("token file is empty")
-	}
-	return token, nil
+	return tok, nil
 }
 
 // loadTransportCredentials builds the gRPC TransportCredentials used to dial
@@ -538,8 +517,14 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 	})
 	select {
 	case r := <-ch:
-		addrs, _ := r.Val.([]string)
-		return addrs
+		// refreshMembership always returns a []string today, but explicitly
+		// check the assertion so a future return-type change turns into a
+		// loud, non-panicking fallback to seeds instead of a silent crash.
+		if addrs, ok := r.Val.([]string); ok {
+			return addrs
+		}
+		log.Printf("elastickv-admin: membership refresh returned unexpected type %T; falling back to seeds", r.Val)
+		return append([]string(nil), f.seeds...)
 	case <-ctx.Done():
 		// Caller bailed. Give them whatever targets we can assemble without
 		// blocking: the last cached membership if we have one, else seeds.
