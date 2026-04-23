@@ -15,13 +15,26 @@
       }
     ]
   },
-  "description": "Pebble storage engine internals for elastickv: block cache, L0 pressure, compactions, memtables, FSM apply sync mode, and store write conflicts.",
+  "description": "Pebble storage engine internals for elastickv: block cache, LSM level state (L0 + memtables), compaction backlog, FSM apply sync mode, and store write conflicts. Each gauge-style signal is presented as a stat (current value per node) + a timeseries (trend over the selected range), so operators can read both 'what is it now' and 'where is it heading'.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "links": [],
   "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "panels": [],
+      "title": "Block Cache",
+      "type": "row"
+    },
     {
       "datasource": "$datasource",
       "description": "Block cache hit rate = hits / (hits + misses). Greater than 95% is healthy; below 80% means the working set no longer fits in the configured block cache and every read falls through to the filesystem, which usually shows up as a step change in GET p99 and disk read IOPS.",
@@ -33,9 +46,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red", "value": 0},
-              {"color": "yellow", "value": 0.80},
-              {"color": "green", "value": 0.95}
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.8
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
             ]
           },
           "min": 0,
@@ -44,13 +66,21 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
-      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
+        "orientation": "horizontal",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         }
@@ -65,7 +95,7 @@
           "instant": true
         }
       ],
-      "title": "Block Cache Hit Rate",
+      "title": "Block Cache Hit Rate (current)",
       "type": "stat"
     },
     {
@@ -73,24 +103,38 @@
       "description": "Block cache hit rate over time. Watch for sudden drops after a deploy, a compaction burst, or a workload shift: these indicate the hot set no longer fits.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "showPoints": "auto"
           },
+          "unit": "percentunit",
           "min": 0,
-          "max": 1,
-          "unit": "percentunit"
+          "max": 1
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 16, "x": 8, "y": 0},
-      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 3,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -110,7 +154,9 @@
       "description": "Current block cache size per node versus the configured capacity. If 'size' sits pegged at 'capacity' and hit rate is falling, the cache is full and evicting useful blocks; consider raising the capacity or shrinking the working set.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -121,11 +167,23 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 6},
-      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 4,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -150,10 +208,12 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Block cache hit and miss rates side-by-side. A climbing miss rate is the earliest warning that the cache is under-sized; the hit-rate panel lags it because hit rate is a ratio.",
+      "description": "Block cache hit and miss rates side-by-side. A climbing miss rate is the earliest warning that the cache is under-sized; the hit-rate panel lags it because hit rate is a ratio. Rate-of-counter only; no current-value stat companion (instantaneous rates are not meaningful as a snapshot).",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -164,11 +224,23 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 6},
-      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 5,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -192,31 +264,674 @@
       "type": "timeseries"
     },
     {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 16,
+      "panels": [
+        {
+          "datasource": "$datasource",
+          "description": "Current count of L0 sublevels per node. Pebble begins throttling writes around 20 sublevels and will hard-stall the FSM if compaction cannot keep up; sustained red here means ingest outran compaction. `max by (node_id)` coalesces the group / node_address dimensions emitted by the Pebble collector.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 10
+                  },
+                  {
+                    "color": "red",
+                    "value": 15
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 18
+          },
+          "id": 6,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "L0 Sublevels (current)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "L0 sublevels trend per node. The red threshold line at 20 marks where Pebble begins its write-stall heuristic; approaching this value is the early warning that compaction is losing the race.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto",
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 20
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 18
+          },
+          "id": 7,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "L0 Sublevels Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Current number of files in L0 per node. Use alongside the sublevel panel to distinguish 'many small files' (compaction falling behind on count) from 'many overlapping files' (write-stall risk). Thresholds tuned to deploy-size defaults: green <500, yellow 500-1000, red >=1000.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 500
+                  },
+                  {
+                    "color": "red",
+                    "value": 1000
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 26
+          },
+          "id": 8,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "L0 Num Files (current)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "L0 file count trend per node. The red threshold line at 1000 marks the practical soft limit for this deploy before L0->Lbase compaction falls terminally behind.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto",
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1000
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 26
+          },
+          "id": 9,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "L0 Num Files Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Active memtable count per node. Normally 1-2; sustained growth means flushes are not keeping up with writes, which cascades into L0 file growth and eventually a write stall. Default Pebble stall kicks in at 5 memtables.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 3
+                  },
+                  {
+                    "color": "red",
+                    "value": 5
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 34
+          },
+          "id": 10,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "Memtable Count (current)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Memtable count trend per node. The red threshold line at 5 marks Pebble's default write-stall trigger for memtable count.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto",
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 5
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 34
+          },
+          "id": 11,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Memtable Count Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Current bytes held in active memtables per node. Caps at ~MemTableSize * MaxMemtableCount; steady readings near that cap mean flush is the bottleneck. Thresholds intentionally coarse because the meaningful ceiling is deploy-specific.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 268435456
+                  },
+                  {
+                    "color": "orange",
+                    "value": 536870912
+                  }
+                ]
+              },
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 42
+          },
+          "id": 12,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "Memtable Size (current)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Memtable bytes trend per node. Pair with Memtable Count to distinguish 'few large memtables queued for flush' from 'many tiny memtables piling up'.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 42
+          },
+          "id": 13,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Memtable Size Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Current count of memtables that have been flushed but cannot yet be freed because an iterator or snapshot still references them. Non-zero for long periods indicates leaked iterators or long-lived snapshots pinning memory.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 1
+                  },
+                  {
+                    "color": "red",
+                    "value": 6
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 50
+          },
+          "id": 14,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "Memtable Zombies (current)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Memtable zombie trend per node. A rising baseline is the signature of an iterator leak: step-ups at deploys or long-running scans are normal, but the line should return to zero.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 50
+          },
+          "id": 15,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Memtable Zombies Over Time",
+          "type": "timeseries"
+        }
+      ],
+      "title": "LSM Level State",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 17,
+      "panels": [],
+      "title": "Compaction",
+      "type": "row"
+    },
+    {
       "datasource": "$datasource",
-      "description": "Number of L0 sublevels per node. Pebble begins throttling writes around 20 sublevels and will hard-stall the FSM if compaction cannot keep up; sustained red here usually means ingest outran compaction.",
+      "description": "Pebble's own estimate of outstanding compaction work per node, in bytes. Growing unboundedly means compaction is losing the race. Thresholds: green <100 MiB, yellow 100-500 MiB, red >=500 MiB. Upper bound is context-dependent so no stall-line is drawn on the trend.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "green", "value": 0},
-              {"color": "orange", "value": 10},
-              {"color": "red", "value": 20}
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 104857600
+              },
+              {
+                "color": "red",
+                "value": 524288000
+              }
             ]
           },
-          "unit": "short"
+          "unit": "bytes"
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 12},
-      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "id": 18,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
         "orientation": "horizontal",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         }
@@ -225,64 +940,23 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "max by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "refId": "A",
           "instant": true
         }
       ],
-      "title": "L0 Sublevels",
+      "title": "Compaction Estimated Debt (current)",
       "type": "stat"
     },
     {
       "datasource": "$datasource",
-      "description": "Number of files currently in L0 per node. More than ~20 files and Pebble's write-stall heuristic will start holding up new writes. Use alongside the sublevel panel to distinguish 'many small files' from 'many overlapping files'.",
+      "description": "Compaction debt trend per node. Compare against the Compaction Rate panel: healthy engines oscillate; a monotonically rising line is the ingest-vs-compaction gap.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": 0},
-              {"color": "orange", "value": 10},
-              {"color": "red", "value": 20}
-            ]
+          "color": {
+            "mode": "palette-classic"
           },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 12},
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "datasource": "$datasource",
-          "editorMode": "code",
-          "expr": "elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"}",
-          "legendFormat": "{{node_id}}",
-          "refId": "A",
-          "instant": true
-        }
-      ],
-      "title": "L0 Num Files",
-      "type": "stat"
-    },
-    {
-      "datasource": "$datasource",
-      "description": "Pebble's own estimate of outstanding compaction work, in bytes. Growing unboundedly means compaction is losing the race; compare against the compaction rate below.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -293,31 +967,106 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 12},
-      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 19,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "max by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Compaction Estimated Debt",
+      "title": "Compaction Estimated Debt Over Time",
       "type": "timeseries"
     },
     {
       "datasource": "$datasource",
-      "description": "Number of compactions currently running per node. Should move in lockstep with the configured max concurrent compactions; a flat-zero line while debt climbs indicates compactions are being blocked (e.g. by a flush pipeline stall).",
+      "description": "Current number of compactions running per node. Should sit near the configured max concurrent compactions when there is work to do; a flat-zero reading while debt climbs means compactions are being blocked (for example, by a flush pipeline stall).",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "blue",
+                "value": 1
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "id": 20,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "legendFormat": "{{node_id}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Compactions In Progress (current)",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Compactions-in-progress trend per node. Pair with the debt trend: sustained ceiling at max concurrency during rising debt is the compaction-saturation signature.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -328,31 +1077,45 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 18},
-      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "id": 21,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "max by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Compactions In Progress",
+      "title": "Compactions In Progress Over Time",
       "type": "timeseries"
     },
     {
       "datasource": "$datasource",
-      "description": "Rate of completed compactions per node. Correlate with the debt panel: a healthy engine shows debt oscillating while this rate is non-zero.",
+      "description": "Rate of completed compactions per node. Correlate with the debt panel: a healthy engine shows debt oscillating while this rate is non-zero. Rate-of-counter metric, so no current-value stat companion.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -363,11 +1126,23 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 18},
-      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 22,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -383,33 +1158,71 @@
       "type": "timeseries"
     },
     {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "id": 23,
+      "panels": [],
+      "title": "FSM Apply",
+      "type": "row"
+    },
+    {
       "datasource": "$datasource",
-      "description": "FSM apply sync mode gauge: the label `mode` is `sync` or `nosync`, and the value is 1 for the active mode. Operators care because nosync gives the fastest Raft apply but loses unflushed writes on a crash; sync pays fsync on every batch. Green = nosync in this deploy's convention. **Requires `elastickv_pebble_fsm_apply_sync_mode` (PR #592). Empty until that PR merges — this is not a scrape failure.**",
+      "description": "FSM apply sync mode gauge: the label `mode` is `sync` or `nosync`, and the value is 1 for the active mode. Operators care because nosync gives the fastest Raft apply but loses unflushed writes on a crash; sync pays fsync on every batch. Green = nosync in this deploy's convention. **Requires `elastickv_pebble_fsm_apply_sync_mode` (PR #592). Empty until that PR merges - this is not a scrape failure.**",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red", "value": 0},
-              {"color": "green", "value": 1}
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
           "mappings": [
-            {"type": "value", "options": {"0": {"text": "off"}, "1": {"text": "on"}}}
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "off"
+                },
+                "1": {
+                  "text": "on"
+                }
+              }
+            }
           ],
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 18},
-      "id": 10,
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 44
+      },
+      "id": 24,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "orientation": "horizontal",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         }
@@ -428,116 +1241,26 @@
       "type": "stat"
     },
     {
-      "datasource": "$datasource",
-      "description": "Active memtable count per node. Normally 1-2; sustained growth here means flushes are not keeping up with writes, which cascades into L0 file growth and eventually a write stall.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {
-            "axisPlacement": "auto",
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "showPoints": "auto"
-          },
-          "unit": "short"
-        },
-        "overrides": []
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 50
       },
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 24},
-      "id": 11,
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      },
-      "targets": [
-        {
-          "datasource": "$datasource",
-          "editorMode": "code",
-          "expr": "elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"}",
-          "legendFormat": "{{node_id}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Memtable Count",
-      "type": "timeseries"
+      "id": 25,
+      "panels": [],
+      "title": "Store Write Conflicts",
+      "type": "row"
     },
     {
       "datasource": "$datasource",
-      "description": "Total bytes held in active memtables per node. Caps at ~MemTableSize * MaxMemtableCount; steady readings near that cap mean flush is the bottleneck.",
+      "description": "Rate of OCC-style store write conflicts, grouped by key prefix. Hot prefixes light up here before they show up as Lua retry pressure or client timeouts; use this to find the hotspot key family. Keyed by `key_prefix` rather than `node_id`, so no per-node stat companion applies.",
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {
-            "axisPlacement": "auto",
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "showPoints": "auto"
+          "color": {
+            "mode": "palette-classic"
           },
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 24},
-      "id": 12,
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      },
-      "targets": [
-        {
-          "datasource": "$datasource",
-          "editorMode": "code",
-          "expr": "elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
-          "legendFormat": "{{node_id}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Memtable Size",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "$datasource",
-      "description": "Memtables that have been flushed but cannot yet be freed because an iterator or snapshot still references them. Climbing zombie counts indicate leaked iterators or long-lived snapshots pinning memory.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {
-            "axisPlacement": "auto",
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "showPoints": "auto"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 24},
-      "id": 13,
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      },
-      "targets": [
-        {
-          "datasource": "$datasource",
-          "editorMode": "code",
-          "expr": "elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"}",
-          "legendFormat": "{{node_id}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Memtable Zombies",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "$datasource",
-      "description": "Rate of OCC-style store write conflicts, grouped by key prefix. Hot prefixes light up here before they show up as Lua retry pressure or client timeouts; use this to find the hotspot key family.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
           "custom": {
             "axisPlacement": "auto",
             "lineInterpolation": "linear",
@@ -548,11 +1271,23 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
-      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "id": 26,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -629,5 +1364,5 @@
   "timezone": "browser",
   "title": "Elastickv Pebble Internals",
   "uid": "elastickv-pebble-internals",
-  "version": 1
+  "version": 2
 }
