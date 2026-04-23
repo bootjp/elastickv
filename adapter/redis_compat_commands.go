@@ -273,41 +273,81 @@ func (e *helloParseError) Error() string { return e.msg }
 // containing the exact wire-format string to emit via WriteError.
 // Split out of hello() so the handler's cyclomatic complexity stays
 // within the linter's budget.
+// parsedHelloOption is the pure-function result of a single option
+// token. advance is the number of input args consumed. Exactly one
+// of (advance > 0) or (err != nil) is non-zero.
+type parsedHelloOption struct {
+	name    string
+	hasName bool
+	advance int
+}
+
+const (
+	// helloAuthOptionArity is the total token count a HELLO AUTH
+	// clause consumes: keyword + username + password.
+	helloAuthOptionArity = 3
+	// helloSetNameOptionArity is keyword + name.
+	helloSetNameOptionArity = 2
+)
+
+// parseHelloOption decodes one HELLO option starting at args[0] (the
+// option keyword). Returns how many input tokens the option consumed
+// and any client-side staging it wants applied.
+func parseHelloOption(args [][]byte) (parsedHelloOption, error) {
+	opt := strings.ToUpper(string(args[0]))
+	switch opt {
+	case "AUTH":
+		if len(args) < helloAuthOptionArity {
+			return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO AUTH"}
+		}
+		// elastickv's Redis adapter has no AUTH layer. Rejecting rather
+		// than silently accepting keeps operators honest.
+		return parsedHelloOption{}, &helloParseError{msg: "NOPERM HELLO AUTH is not supported"}
+	case "SETNAME":
+		if len(args) < helloSetNameOptionArity {
+			return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO SETNAME"}
+		}
+		return parsedHelloOption{
+			name:    string(args[1]),
+			hasName: true,
+			advance: helloSetNameOptionArity,
+		}, nil
+	default:
+		return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO option '" + opt + "'"}
+	}
+}
+
 func parseHelloArgs(state *connState, args [][]byte) error {
 	if len(args) == 0 {
 		return nil
 	}
 	protover, err := strconv.Atoi(string(args[0]))
-	if err != nil {
+	if err != nil || protover != helloReplyProto {
+		// Non-numeric, RESP3 (3), or any other requested version:
+		// reject with NOPROTO so well-behaved clients fall back to
+		// RESP2.
 		return &helloParseError{msg: "NOPROTO unsupported protocol version"}
 	}
-	if protover != helloReplyProto {
-		// RESP3 (3) and any other requested version: reject.
-		// Matching real Redis's error code (NOPROTO) so
-		// well-behaved clients fall back to RESP2.
-		return &helloParseError{msg: "NOPROTO unsupported protocol version"}
-	}
+	// Buffer side effects locally so a partial parse (e.g. SETNAME
+	// followed by a bad option or AUTH) leaves connState untouched —
+	// the command must be all-or-nothing, matching real Redis.
+	var (
+		pendingName    string
+		pendingNameSet bool
+	)
 	for i := 1; i < len(args); {
-		opt := strings.ToUpper(string(args[i]))
-		switch opt {
-		case "AUTH":
-			if i+2 >= len(args) {
-				return &helloParseError{msg: "ERR Syntax error in HELLO AUTH"}
-			}
-			// elastickv's Redis adapter has no AUTH layer.
-			// Rejecting rather than silently accepting keeps
-			// operators honest: a client that thinks it has
-			// authenticated must see an explicit error.
-			return &helloParseError{msg: "NOPERM HELLO AUTH is not supported"}
-		case "SETNAME":
-			if i+1 >= len(args) {
-				return &helloParseError{msg: "ERR Syntax error in HELLO SETNAME"}
-			}
-			state.clientName = string(args[i+1])
-			i += 2
-		default:
-			return &helloParseError{msg: "ERR Syntax error in HELLO option '" + opt + "'"}
+		opt, err := parseHelloOption(args[i:])
+		if err != nil {
+			return err
 		}
+		if opt.hasName {
+			pendingName = opt.name
+			pendingNameSet = true
+		}
+		i += opt.advance
+	}
+	if pendingNameSet {
+		state.clientName = pendingName
 	}
 	return nil
 }

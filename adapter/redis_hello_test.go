@@ -314,6 +314,45 @@ func TestHello_SyntaxErrorOnDanglingSetName(t *testing.T) {
 	require.NotEmpty(t, conn.err)
 }
 
+func TestHello_SetNameNotPersistedOnLaterAuthError(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+	state := getConnState(conn)
+	state.clientName = "prev"
+
+	// SETNAME parses OK but then AUTH fails -- the clientName must
+	// NOT have been committed, so GETNAME should still return "prev".
+	r.hello(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdHello), []byte("2"),
+		[]byte("SETNAME"), []byte("newname"),
+		[]byte("AUTH"), []byte("u"), []byte("p"),
+	}})
+	require.Contains(t, conn.err, "NOPERM")
+	require.Equal(t, "prev", state.clientName,
+		"HELLO must be all-or-nothing: SETNAME side effect must not persist on later error")
+}
+
+func TestHello_SetNameNotPersistedOnLaterUnknownOption(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+	state := getConnState(conn)
+	state.clientName = "prev"
+
+	// SETNAME parses OK but a later unknown option aborts parsing.
+	// clientName must remain "prev".
+	r.hello(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdHello), []byte("2"),
+		[]byte("SETNAME"), []byte("newname"),
+		[]byte("BOGUS"),
+	}})
+	require.NotEmpty(t, conn.err)
+	require.Equal(t, "prev", state.clientName)
+}
+
 func TestHello_ConnIDIsStableWithinConnection(t *testing.T) {
 	t.Parallel()
 
