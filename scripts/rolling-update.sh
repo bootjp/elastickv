@@ -399,24 +399,13 @@ update_one_node() {
 
   copy_raftadmin_to_remote "$node_id" "$ssh_target"
 
-  # ssh joins remaining arguments into a single command string which the remote
-  # shell re-parses, so values containing whitespace or shell metacharacters
-  # must be escaped before transport. EXTRA_ENV is documented as a
-  # whitespace-separated list of KEY=VALUE pairs and therefore always needs
-  # quoting; other forwarded variables are structurally whitespace-free today
-  # but we still escape the ones most likely to evolve (path-like values) for
-  # defense in depth.
-  local extra_env_escaped s3_credentials_file_escaped
-  extra_env_escaped="$(printf '%q' "${EXTRA_ENV:-}")"
-  s3_credentials_file_escaped="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
-
   ssh "${SSH_BASE_OPTS[@]}" "$ssh_target" \
     env \
-      IMAGE="$IMAGE" \
+      IMAGE="$IMAGE_Q" \
       RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
       CONTAINER_NAME="$CONTAINER_NAME" \
-      DATA_DIR="$DATA_DIR" \
-      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
+      DATA_DIR="$DATA_DIR_Q" \
+      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT_Q" \
       RAFT_ENGINE="$RAFT_ENGINE" \
       RAFT_PORT="$RAFT_PORT" \
       REDIS_PORT="$REDIS_PORT" \
@@ -424,7 +413,7 @@ update_one_node() {
       S3_PORT="$S3_PORT" \
       ENABLE_S3="$ENABLE_S3" \
       S3_REGION="$S3_REGION" \
-      S3_CREDENTIALS_FILE="$s3_credentials_file_escaped" \
+      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
@@ -437,7 +426,7 @@ update_one_node() {
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
-      EXTRA_ENV="$extra_env_escaped" \
+      EXTRA_ENV="$EXTRA_ENV_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -852,6 +841,19 @@ fi
 
 ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
+
+# ssh joins remaining arguments into a single command string which the remote
+# shell re-parses, so values containing whitespace or shell metacharacters
+# must be escaped before transport. EXTRA_ENV is documented as a
+# whitespace-separated list of KEY=VALUE pairs and therefore always needs
+# quoting; other forwarded variables are structurally whitespace-free today
+# but we still escape the path-like ones most likely to evolve for defense
+# in depth. Escape once here since these don't change per node.
+EXTRA_ENV_Q="$(printf '%q' "${EXTRA_ENV:-}")"
+S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
+IMAGE_Q="$(printf '%q' "$IMAGE")"
+DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
+SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
