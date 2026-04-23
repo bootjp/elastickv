@@ -606,7 +606,7 @@ func (r *RedisServer) Run() error {
 			if !ok {
 				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
-				r.observeRedisError(name, time.Since(start))
+				r.observeRedisUnsupported(name, time.Since(start))
 				return
 			}
 
@@ -863,6 +863,23 @@ func (r *RedisServer) observeRedisError(command string, dur time.Duration) {
 		Command:  command,
 		IsError:  true,
 		Duration: dur,
+	})
+}
+
+// observeRedisUnsupported records a command that was rejected because
+// the adapter has no route for it. In addition to the usual error
+// counters (which bucket the name into "unknown"), this flags the
+// report so the monitoring layer can record the real command name in
+// its bounded-cardinality unsupported-commands counter.
+func (r *RedisServer) observeRedisUnsupported(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:     command,
+		IsError:     true,
+		Duration:    dur,
+		Unsupported: true,
 	})
 }
 

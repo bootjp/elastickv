@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +12,23 @@ const (
 	redisOutcomeSuccess = "success"
 	redisOutcomeError   = "error"
 	redisCommandUnknown = "unknown"
+
+	// maxUnsupportedCommandLabels caps the cardinality of the
+	// elastickv_redis_unsupported_commands_total{command} label set. Once
+	// this many distinct names have been seen, further novel names are
+	// collapsed into the "other" bucket so a hostile or buggy client
+	// cannot explode metric cardinality via protocol abuse.
+	maxUnsupportedCommandLabels = 32
+
+	// maxUnsupportedCommandLabelLen defensively caps the length of the
+	// actual command-name label value. Redis command names are short; a
+	// client sending a pathologically long first argument should not be
+	// able to pollute label values with the entire payload.
+	maxUnsupportedCommandLabelLen = 64
+
+	// redisUnsupportedCommandOther is the overflow bucket used when the
+	// observed name is novel and the distinct-name cap is full.
+	redisUnsupportedCommandOther = "other"
 )
 
 var redisCommandSet = map[string]struct{}{
@@ -106,13 +124,23 @@ type RedisRequestReport struct {
 	Command  string
 	IsError  bool
 	Duration time.Duration
+	// Unsupported indicates the command was rejected because the adapter
+	// has no route for it. When true, ObserveRedisRequest additionally
+	// records the real (bounded) command name in
+	// elastickv_redis_unsupported_commands_total alongside the existing
+	// "unknown"-bucketed counters, which are preserved unchanged.
+	Unsupported bool
 }
 
 // RedisMetrics holds all Prometheus metric vectors for the Redis adapter.
 type RedisMetrics struct {
-	requestsTotal   *prometheus.CounterVec
-	requestDuration *prometheus.HistogramVec
-	errorsTotal     *prometheus.CounterVec
+	requestsTotal       *prometheus.CounterVec
+	requestDuration     *prometheus.HistogramVec
+	errorsTotal         *prometheus.CounterVec
+	unsupportedCommands *prometheus.CounterVec
+
+	unsupportedMu    sync.Mutex
+	unsupportedNames map[string]struct{}
 }
 
 func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
@@ -139,12 +167,21 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 			},
 			[]string{"command"},
 		),
+		unsupportedCommands: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_redis_unsupported_commands_total",
+				Help: "Count of Redis commands rejected as unsupported, labelled with the actual command name (bounded cardinality).",
+			},
+			[]string{"command"},
+		),
+		unsupportedNames: make(map[string]struct{}, maxUnsupportedCommandLabels),
 	}
 
 	registerer.MustRegister(
 		m.requestsTotal,
 		m.requestDuration,
 		m.errorsTotal,
+		m.unsupportedCommands,
 	)
 
 	return m
@@ -167,6 +204,36 @@ func (m *RedisMetrics) ObserveRedisRequest(report RedisRequestReport) {
 	if report.IsError {
 		m.errorsTotal.WithLabelValues(command).Inc()
 	}
+	if report.Unsupported {
+		m.observeUnsupportedCommand(report.Command)
+	}
+}
+
+// observeUnsupportedCommand increments the bounded-cardinality
+// elastickv_redis_unsupported_commands_total counter with the real
+// command name, falling back to "other" when the distinct-name cap has
+// been reached. The input is uppercased, trimmed, and length-capped to
+// avoid pathological label values.
+func (m *RedisMetrics) observeUnsupportedCommand(raw string) {
+	name := strings.ToUpper(strings.TrimSpace(raw))
+	if name == "" {
+		name = redisCommandUnknown
+	}
+	if len(name) > maxUnsupportedCommandLabelLen {
+		name = name[:maxUnsupportedCommandLabelLen]
+	}
+
+	label := redisUnsupportedCommandOther
+	m.unsupportedMu.Lock()
+	if _, seen := m.unsupportedNames[name]; seen {
+		label = name
+	} else if len(m.unsupportedNames) < maxUnsupportedCommandLabels {
+		m.unsupportedNames[name] = struct{}{}
+		label = name
+	}
+	m.unsupportedMu.Unlock()
+
+	m.unsupportedCommands.WithLabelValues(label).Inc()
 }
 
 func normalizeRedisCommand(command string) string {
