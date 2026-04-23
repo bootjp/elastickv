@@ -139,8 +139,9 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *ra
 //nolint:unparam
 func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	const (
-		waitTimeout  = 5 * time.Second
-		waitInterval = 100 * time.Millisecond
+		waitTimeout           = 5 * time.Second
+		waitInterval          = 100 * time.Millisecond
+		leaderReadinessWindow = 10 * time.Second
 	)
 
 	t.Helper()
@@ -152,7 +153,7 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 
 	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
 	waitForConfigReplication(t, cfg, nodes, waitTimeout, waitInterval)
-	waitForRaftReadiness(t, nodes, waitTimeout, waitInterval)
+	waitForRaftReadiness(t, nodes, leaderReadinessWindow, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
@@ -218,28 +219,124 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 	}
 }
 
+// leaderStabilityWindow is the duration a node must continuously report itself
+// as leader (and peers as followers pointing at it) before we treat the cluster
+// as ready. This absorbs the "elected then immediately stepped down" race
+// observed on slow CI, where quorum-active-timeout briefly flips the leader
+// back to follower moments after it wins an election.
+const leaderStabilityWindow = 300 * time.Millisecond
+
+// defaultStabilityPoll is the sampling interval used during the stability
+// window when the caller-supplied waitInterval is unsuitable (zero or larger
+// than the window itself).
+const defaultStabilityPoll = 25 * time.Millisecond
+
+// waitForRaftReadiness blocks until the bootstrap leader (nodes[0]) has been
+// elected AND has remained leader for leaderStabilityWindow, with all other
+// nodes acknowledging it as leader. It relies on raft.LeaderCh() for the
+// initial election event rather than polling, and then verifies stability to
+// filter out transient leadership flaps during CI congestion.
+//
+// waitInterval is the polling interval used during the stability window. The
+// parameter is preserved for backwards compatibility with existing call sites.
 func waitForRaftReadiness(t *testing.T, nodes []Node, waitTimeout, waitInterval time.Duration) {
 	t.Helper()
 
-	expectedLeader := raft.ServerAddress(nodes[0].raftAddress)
-	assert.Eventually(t, func() bool {
-		for i, n := range nodes {
-			state := n.raft.State()
-			if i == 0 {
-				if state != raft.Leader {
-					return false
-				}
-			} else if state != raft.Follower {
+	if len(nodes) == 0 {
+		return
+	}
+
+	leader := nodes[0]
+	followers := nodes[1:]
+	expectedLeader := raft.ServerAddress(leader.raftAddress)
+
+	stabilityPoll := waitInterval
+	if stabilityPoll <= 0 || stabilityPoll > leaderStabilityWindow {
+		stabilityPoll = defaultStabilityPoll
+	}
+
+	deadline := time.Now().Add(waitTimeout)
+	leaderCh := leader.raft.LeaderCh()
+
+	// Drain any stale notifications so we only observe this run's transitions.
+	drainLeaderCh(leaderCh)
+
+	var lastState raft.RaftState
+	for time.Now().Before(deadline) {
+		if !awaitLeaderElected(t, leader, leaderCh, deadline, waitTimeout) {
+			// Residual `false` on the channel; loop and keep waiting.
+			continue
+		}
+		if leaderHoldsStable(leader, followers, expectedLeader, stabilityPoll, &lastState) {
+			return
+		}
+		// Flipped during the window; go back to waiting for another `true`
+		// event from LeaderCh.
+	}
+
+	t.Fatalf("leader never stabilised within %s (last state: %s)", waitTimeout, lastState)
+}
+
+// awaitLeaderElected returns true once `leader` is in raft.Leader state. If
+// the node is not yet leader it blocks on leaderCh until a `true` notification
+// arrives or the deadline expires (t.Fatalf on timeout / channel close). It
+// returns false when a stale `false` is observed, asking the caller to retry.
+func awaitLeaderElected(t *testing.T, leader Node, leaderCh <-chan bool, deadline time.Time, waitTimeout time.Duration) bool {
+	t.Helper()
+	if leader.raft.State() == raft.Leader {
+		return true
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		t.Fatalf("no leader elected within %s (last state: %s)", waitTimeout, leader.raft.State())
+	}
+	select {
+	case became, ok := <-leaderCh:
+		if !ok {
+			t.Fatalf("leader channel closed before leadership acquired")
+		}
+		return became
+	case <-time.After(remaining):
+		t.Fatalf("no leader elected within %s (last state: %s)", waitTimeout, leader.raft.State())
+	}
+	return false
+}
+
+// drainLeaderCh consumes any buffered notifications on the leader channel so
+// that subsequent receives only observe post-drain events.
+func drainLeaderCh(ch <-chan bool) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// leaderHoldsStable verifies the leader stays in raft.Leader state, and all
+// followers stay in raft.Follower pointing at expectedLeader, for the full
+// leaderStabilityWindow. Returns true on success, false if anything flips.
+func leaderHoldsStable(leader Node, followers []Node, expectedLeader raft.ServerAddress, poll time.Duration, lastState *raft.RaftState) bool {
+	stableUntil := time.Now().Add(leaderStabilityWindow)
+	for time.Now().Before(stableUntil) {
+		state := leader.raft.State()
+		*lastState = state
+		if state != raft.Leader {
+			return false
+		}
+		for _, f := range followers {
+			if f.raft.State() != raft.Follower {
 				return false
 			}
-
-			addr, _ := n.raft.LeaderWithID()
+			addr, _ := f.raft.LeaderWithID()
 			if addr != expectedLeader {
 				return false
 			}
 		}
-		return true
-	}, waitTimeout, waitInterval)
+		time.Sleep(poll)
+	}
+	return true
 }
 
 func waitForConfigReplication(t *testing.T, cfg raft.Configuration, nodes []Node, waitTimeout, waitInterval time.Duration) {
