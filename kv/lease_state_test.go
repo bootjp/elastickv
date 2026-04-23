@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
@@ -38,22 +39,22 @@ func TestIsLeadershipLossError(t *testing.T) {
 func TestLeaseState_NilReceiverIsAlwaysExpired(t *testing.T) {
 	t.Parallel()
 	var s *leaseState
-	require.False(t, s.valid(time.Now()))
-	s.extend(time.Now().Add(time.Hour), s.generation()) // must not panic
-	s.invalidate()                                      // must not panic
-	require.False(t, s.valid(time.Now()))
+	require.False(t, s.valid(monoclock.Now()))
+	s.extend(monoclock.Now().Add(time.Hour), s.generation()) // must not panic
+	s.invalidate()                                           // must not panic
+	require.False(t, s.valid(monoclock.Now()))
 }
 
 func TestLeaseState_ZeroValueIsExpired(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	require.False(t, s.valid(time.Now()))
+	require.False(t, s.valid(monoclock.Now()))
 }
 
 func TestLeaseState_ExtendAndExpire(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 	s.extend(now.Add(50*time.Millisecond), s.generation())
 
 	require.True(t, s.valid(now))
@@ -65,7 +66,7 @@ func TestLeaseState_ExtendAndExpire(t *testing.T) {
 func TestLeaseState_InvalidateClears(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 	s.extend(now.Add(time.Hour), s.generation())
 	require.True(t, s.valid(now))
 
@@ -76,15 +77,15 @@ func TestLeaseState_InvalidateClears(t *testing.T) {
 func TestLeaseState_ExtendIsMonotonic(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 
 	s.extend(now.Add(time.Hour), s.generation())
 	require.True(t, s.valid(now.Add(30*time.Minute)))
 
 	// A shorter extension must NOT regress the lease: an out-of-order
-	// writer that sampled time.Now() earlier could otherwise prematurely
-	// expire a freshly extended lease and force callers into the slow
-	// path while the leader is still confirmed.
+	// writer that sampled monoclock.Now() earlier could otherwise
+	// prematurely expire a freshly extended lease and force callers
+	// into the slow path while the leader is still confirmed.
 	s.extend(now.Add(time.Minute), s.generation())
 	require.True(t, s.valid(now.Add(30*time.Minute)))
 
@@ -96,12 +97,12 @@ func TestLeaseState_ExtendIsMonotonic(t *testing.T) {
 func TestLeaseState_InvalidateBeatsConcurrentExtend(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 	s.extend(now.Add(time.Hour), s.generation())
 
-	// invalidate stores nil unconditionally, even when the current expiry
-	// is in the future. Otherwise leadership-loss callbacks would be
-	// powerless once a lease is in place.
+	// invalidate stores the zero sentinel unconditionally, even when
+	// the current expiry is in the future. Otherwise leadership-loss
+	// callbacks would be powerless once a lease is in place.
 	s.invalidate()
 	require.False(t, s.valid(now))
 }
@@ -113,7 +114,7 @@ func TestLeaseState_InvalidateBeatsConcurrentExtend(t *testing.T) {
 func TestLeaseState_ExtendCannotResurrectAfterInvalidate(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 
 	// Caller pattern: sample generation BEFORE the quorum operation.
 	expectedGen := s.generation()
@@ -137,7 +138,7 @@ func TestLeaseState_ExtendCannotResurrectAfterInvalidate(t *testing.T) {
 func TestLeaseState_ExtendWithFreshGenSucceedsAfterInvalidate(t *testing.T) {
 	t.Parallel()
 	var s leaseState
-	now := time.Now()
+	now := monoclock.Now()
 
 	s.invalidate()
 	freshGen := s.generation()
@@ -153,7 +154,7 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 
 	// Cooperative scheduling: runtime.Gosched() between iterations keeps
 	// the workers from pegging a core while still interleaving enough
-	// extend/valid pairs under `-race` to exercise the atomic-pointer
+	// extend/valid pairs under `-race` to exercise the atomic-int64
 	// invariants.
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -163,7 +164,7 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 				return
 			default:
 				gen := s.generation()
-				s.extend(time.Now().Add(time.Second), gen)
+				s.extend(monoclock.Now().Add(time.Second), gen)
 				runtime.Gosched()
 			}
 		}
@@ -175,7 +176,7 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				_ = s.valid(time.Now())
+				_ = s.valid(monoclock.Now())
 				runtime.Gosched()
 			}
 		}

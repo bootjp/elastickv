@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -246,13 +247,15 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	//   * dispatchStart: any real quorum confirmation happens at or
 	//     after this instant, so using it as the lease-extension base
 	//     is strictly conservative (window can only be SHORTER than
-	//     the actual safety window, never longer).
+	//     the actual safety window, never longer). Sampled from the
+	//     monotonic-raw clock so NTP slew/step cannot push the lease
+	//     past its true safety window (see internal/monoclock).
 	//   * expectedGen: if a leader-loss callback fires between this
 	//     sample and the post-dispatch extend, the generation will
 	//     have advanced; extend(expectedGen) will see the mismatch
 	//     and refuse to resurrect the lease. Capturing gen INSIDE
 	//     extend would observe the post-invalidate value as current.
-	dispatchStart := time.Now()
+	dispatchStart := monoclock.Now()
 	expectedGen := c.lease.generation()
 	var resp *CoordinateResponse
 	var err error
@@ -279,7 +282,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 // every subsequent read onto the slow LinearizableRead path and defeat
 // the lease's purpose. RegisterLeaderLossCallback plus the
 // State()==StateLeader fast-path guard cover real leader loss.
-func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart time.Time, expectedGen uint64) {
+func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err error, dispatchStart monoclock.Instant, expectedGen uint64) {
 	if err != nil {
 		// Only invalidate on errors that actually signal leadership
 		// loss. Write conflicts and validation errors are business-
@@ -422,9 +425,13 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
 		// Misconfigured tick settings: lease is disabled.
 		return c.LinearizableRead(ctx)
 	}
-	// Single time.Now() sample so the primary, secondary, and
-	// extension steps all reason about the same instant.
-	now := time.Now()
+	// Single monoclock.Now() sample so the primary, secondary, and
+	// extension steps all reason about the same monotonic-raw instant.
+	// Using CLOCK_MONOTONIC_RAW (via internal/monoclock) keeps the
+	// lease-vs-safety-window comparison immune to NTP rate adjustment
+	// and wall-clock steps; a misconfigured time daemon cannot slip
+	// the lease past electionTimeout - leaseSafetyMargin.
+	now := monoclock.Now()
 	state := c.engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		c.observeLeaseRead(true)
@@ -467,11 +474,17 @@ func (c *Coordinate) observeLeaseRead(hit bool) {
 // read. Enforces the safety contract from raftengine.LeaseProvider:
 //   - local state must be Leader
 //   - ack must be non-zero (a quorum was ever observed)
-//   - ack must not be after now (clock-skew guard: LastQuorumAck is
-//     rebuilt from UnixNano with no monotonic component, so a
-//     backwards wall-clock step could otherwise let a stale ack pass)
+//   - ack must not be after now (defensive guard: the monotonic-raw
+//     clock cannot go backwards, but a zero / bogus ack reading should
+//     still fail closed)
 //   - now − ack must be strictly less than leaseDur
-func engineLeaseAckValid(state raftengine.State, ack, now time.Time, leaseDur time.Duration) bool {
+//
+// Both ack and now are monoclock.Instant readings from
+// CLOCK_MONOTONIC_RAW, so the comparison is immune to NTP rate
+// adjustment and wall-clock steps. See docs/lease_read_design.md §3.2
+// for why the raw monotonic source matters once leaseSafetyMargin is
+// tightened below ~5 ms.
+func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, leaseDur time.Duration) bool {
 	if state != raftengine.StateLeader || ack.IsZero() || ack.After(now) {
 		return false
 	}

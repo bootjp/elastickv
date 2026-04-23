@@ -2,8 +2,8 @@ package kv
 
 import (
 	"sync/atomic"
-	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -30,30 +30,36 @@ func isLeadershipLossError(err error) bool {
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
-// leaseState tracks the wall-clock expiry of a leader-local read lease.
-// All operations are lock-free via atomic.Pointer plus a generation
-// counter that prevents an in-flight extend from resurrecting a lease
-// that a concurrent invalidate has cleared.
+// leaseState tracks the monotonic-raw expiry of a leader-local read
+// lease. All operations are lock-free via atomic.Int64 (the raw
+// monoclock.Instant nanoseconds) plus a generation counter that
+// prevents an in-flight extend from resurrecting a lease that a
+// concurrent invalidate has cleared.
 //
-// A nil expiry means the lease has never been issued or has been
-// invalidated. A non-nil expiry is the wall-clock instant after which
-// the lease is considered expired; a caller comparing time.Now() against
-// the loaded value can decide whether to skip a quorum confirmation.
+// expiry == 0 means the lease has never been issued or has been
+// invalidated. A non-zero value is the monotonic-raw instant after
+// which the lease is considered expired; a caller comparing
+// monoclock.Now() against the loaded value can decide whether to skip
+// a quorum confirmation. The monotonic-raw clock is immune to NTP
+// rate adjustment and wall-clock steps (see internal/monoclock).
 type leaseState struct {
-	gen    atomic.Uint64
-	expiry atomic.Pointer[time.Time]
+	gen atomic.Uint64
+	// expiryNanos stores monoclock.Instant.Nanos(); 0 means "no lease".
+	// Stored as int64 so CAS can be expressed without an extra pointer
+	// indirection, preserving the lock-free fast-path performance.
+	expiryNanos atomic.Int64
 }
 
 // valid reports whether the lease is unexpired at now.
-func (s *leaseState) valid(now time.Time) bool {
+func (s *leaseState) valid(now monoclock.Instant) bool {
 	if s == nil {
 		return false
 	}
-	exp := s.expiry.Load()
-	if exp == nil {
+	ns := s.expiryNanos.Load()
+	if ns == 0 {
 		return false
 	}
-	return now.Before(*exp)
+	return now.Before(monoclock.FromNanos(ns))
 }
 
 // generation returns the current invalidation counter. Callers MUST
@@ -76,8 +82,14 @@ func (s *leaseState) generation() uint64 {
 // generation guard prevents a Dispatch that returned successfully
 // *just before* a leader-loss invalidate from resurrecting the
 // lease milliseconds after invalidation.
-func (s *leaseState) extend(until time.Time, expectedGen uint64) {
+func (s *leaseState) extend(until monoclock.Instant, expectedGen uint64) {
 	if s == nil {
+		return
+	}
+	target := until.Nanos()
+	if target == 0 {
+		// Refuse to store 0 — that value is the sentinel for "no
+		// lease" and would race with invalidate's zero-store.
 		return
 	}
 	for {
@@ -86,20 +98,20 @@ func (s *leaseState) extend(until time.Time, expectedGen uint64) {
 		if s.gen.Load() != expectedGen {
 			return
 		}
-		current := s.expiry.Load()
-		if current != nil && !until.After(*current) {
+		current := s.expiryNanos.Load()
+		if current != 0 && target <= current {
 			return
 		}
-		if !s.expiry.CompareAndSwap(current, &until) {
+		if !s.expiryNanos.CompareAndSwap(current, target) {
 			continue
 		}
 		// CAS landed. If invalidate raced in between the pre-CAS gate
 		// and the CAS itself, undo our write iff no later writer has
-		// replaced it. Using CAS with our own pointer means a fresh
+		// replaced it. Using CAS with our own target means a fresh
 		// extend that captured the post-invalidate generation is left
-		// intact.
+		// intact (its CAS already replaced our target with its own).
 		if s.gen.Load() != expectedGen {
-			s.expiry.CompareAndSwap(&until, nil)
+			s.expiryNanos.CompareAndSwap(target, 0)
 		}
 		return
 	}
@@ -114,5 +126,5 @@ func (s *leaseState) invalidate() {
 		return
 	}
 	s.gen.Add(1)
-	s.expiry.Store(nil)
+	s.expiryNanos.Store(0)
 }

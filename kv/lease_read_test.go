@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
@@ -21,7 +22,7 @@ type fakeLeaseEngine struct {
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
 	state                    atomic.Value // stores raftengine.State; default Leader
-	lastQuorumAckUnixNano    atomic.Int64 // 0 = no ack yet. Updated by ackNow().
+	lastQuorumAckMonoNs      atomic.Int64 // 0 = no ack yet. Updated by setQuorumAck().
 	leaderLossCallbacksMu    sync.Mutex
 	leaderLossCallbacks      []fakeLeaseEngineCb
 	registerLeaderLossCalled atomic.Int32
@@ -64,21 +65,21 @@ func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.Proposal
 func (e *fakeLeaseEngine) Close() error                 { return nil }
 func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
-func (e *fakeLeaseEngine) LastQuorumAck() time.Time {
+func (e *fakeLeaseEngine) LastQuorumAck() monoclock.Instant {
 	// Honor the raftengine.LeaseProvider contract that non-leaders
-	// return the zero time, mirroring the production etcd engine. A
-	// test that sets a fresh ack and a non-leader state MUST still
+	// return the zero Instant, mirroring the production etcd engine.
+	// A test that sets a fresh ack and a non-leader state MUST still
 	// see the slow path taken; a divergent fake would hide regressions
 	// where production code stops gating on engine.State() before
 	// consulting LastQuorumAck.
 	if e.State() != raftengine.StateLeader {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	ns := e.lastQuorumAckUnixNano.Load()
+	ns := e.lastQuorumAckMonoNs.Load()
 	if ns == 0 {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	return time.Unix(0, ns)
+	return monoclock.FromNanos(ns)
 }
 func (e *fakeLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 	e.registerLeaderLossCalled.Add(1)
@@ -158,12 +159,12 @@ func (e *nonLeaseEngine) Close() error { return nil }
 // anchor on the fake engine so tests can exercise the new PRIMARY
 // fast path (LastQuorumAck + State==Leader) independently of the
 // caller-side lease state.
-func (e *fakeLeaseEngine) setQuorumAck(t time.Time) {
-	if t.IsZero() {
-		e.lastQuorumAckUnixNano.Store(0)
+func (e *fakeLeaseEngine) setQuorumAck(i monoclock.Instant) {
+	if i.IsZero() {
+		e.lastQuorumAckMonoNs.Store(0)
 		return
 	}
-	e.lastQuorumAckUnixNano.Store(t.UnixNano())
+	e.lastQuorumAckMonoNs.Store(i.Nanos())
 }
 
 // --- Coordinate.LeaseRead -----------------------------------------------
@@ -176,10 +177,10 @@ func (e *fakeLeaseEngine) setQuorumAck(t time.Time) {
 func TestCoordinate_LeaseRead_EngineAckFastPath(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 123, leaseDur: time.Hour}
-	eng.setQuorumAck(time.Now())
+	eng.setQuorumAck(monoclock.Now())
 	c := NewCoordinatorWithEngine(nil, eng)
 
-	require.False(t, c.lease.valid(time.Now()),
+	require.False(t, c.lease.valid(monoclock.Now()),
 		"caller-side lease must start cold so the fast-path hit is attributable to the engine ack")
 
 	idx, err := c.LeaseRead(context.Background())
@@ -187,7 +188,7 @@ func TestCoordinate_LeaseRead_EngineAckFastPath(t *testing.T) {
 	require.Equal(t, uint64(123), idx)
 	require.Equal(t, int32(0), eng.linearizableCalls.Load(),
 		"engine-driven ack alone must skip LinearizableRead")
-	require.False(t, c.lease.valid(time.Now()),
+	require.False(t, c.lease.valid(monoclock.Now()),
 		"engine-driven fast path must not warm the caller-side lease")
 }
 
@@ -199,7 +200,7 @@ func TestCoordinate_LeaseRead_EngineAckStaleFallsThrough(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 7, leaseDur: 50 * time.Millisecond}
 	// Set the ack far enough in the past that time.Since(ack) > leaseDur.
-	eng.setQuorumAck(time.Now().Add(-time.Hour))
+	eng.setQuorumAck(monoclock.Now().Add(-time.Hour))
 	c := NewCoordinatorWithEngine(nil, eng)
 
 	_, err := c.LeaseRead(context.Background())
@@ -216,7 +217,7 @@ func TestCoordinate_LeaseRead_EngineAckIgnoredWhenNotLeader(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("not leader")
 	eng := &fakeLeaseEngine{applied: 7, leaseDur: time.Hour, linearizableErr: sentinel}
-	eng.setQuorumAck(time.Now())
+	eng.setQuorumAck(monoclock.Now())
 	eng.state.Store(raftengine.StateFollower)
 	c := NewCoordinatorWithEngine(nil, eng)
 
@@ -231,7 +232,7 @@ func TestCoordinate_LeaseRead_FastPathSkipsEngine(t *testing.T) {
 	eng := &fakeLeaseEngine{applied: 100, leaseDur: time.Hour}
 	c := NewCoordinatorWithEngine(nil, eng)
 
-	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
+	c.lease.extend(monoclock.Now().Add(time.Hour), c.lease.generation())
 
 	idx, err := c.LeaseRead(context.Background())
 	require.NoError(t, err)
@@ -249,7 +250,7 @@ func TestCoordinate_LeaseRead_SlowPathRefreshesLease(t *testing.T) {
 	require.Equal(t, uint64(50), idx)
 	require.Equal(t, int32(1), eng.linearizableCalls.Load())
 
-	require.True(t, c.lease.valid(time.Now()))
+	require.True(t, c.lease.valid(monoclock.Now()))
 
 	idx2, err := c.LeaseRead(context.Background())
 	require.NoError(t, err)
@@ -263,12 +264,12 @@ func TestCoordinate_LeaseRead_ErrorInvalidatesLease(t *testing.T) {
 	eng := &fakeLeaseEngine{applied: 7, leaseDur: time.Hour, linearizableErr: sentinel}
 	c := NewCoordinatorWithEngine(nil, eng)
 
-	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
+	c.lease.extend(monoclock.Now().Add(time.Hour), c.lease.generation())
 	c.lease.invalidate() // force slow path
 
 	_, err := c.LeaseRead(context.Background())
 	require.ErrorIs(t, err, sentinel)
-	require.False(t, c.lease.valid(time.Now()))
+	require.False(t, c.lease.valid(monoclock.Now()))
 	require.Equal(t, int32(1), eng.linearizableCalls.Load())
 
 	// Subsequent call also takes slow path because lease is invalidated.
@@ -289,8 +290,8 @@ func TestCoordinate_LeaseRead_FallbackWhenEngineNotLeader(t *testing.T) {
 	c := NewCoordinatorWithEngine(nil, eng)
 
 	// Warm the lease so valid() returns true.
-	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
-	require.True(t, c.lease.valid(time.Now()))
+	c.lease.extend(monoclock.Now().Add(time.Hour), c.lease.generation())
+	require.True(t, c.lease.valid(monoclock.Now()))
 
 	// Engine transitioned to follower (or unknown); async invalidate
 	// hasn't run yet.
@@ -316,7 +317,7 @@ func TestCoordinate_LeaseRead_FallbackWhenLeaseDurationZero(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), idx)
 	require.Equal(t, int32(1), eng.linearizableCalls.Load())
-	require.False(t, c.lease.valid(time.Now()),
+	require.False(t, c.lease.valid(monoclock.Now()),
 		"lease must not have been extended when LeaseDuration <= 0")
 
 	// Every subsequent call must still take the slow path.
@@ -354,10 +355,10 @@ func TestCoordinate_CloseDeregistersLeaderLossCallback(t *testing.T) {
 
 	// After Close, firing leader-loss must NOT invoke this Coordinate's
 	// invalidate (it must have been removed from the engine's slice).
-	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
-	require.True(t, c.lease.valid(time.Now()))
+	c.lease.extend(monoclock.Now().Add(time.Hour), c.lease.generation())
+	require.True(t, c.lease.valid(monoclock.Now()))
 	eng.fireLeaderLoss()
-	require.True(t, c.lease.valid(time.Now()),
+	require.True(t, c.lease.valid(monoclock.Now()),
 		"Close must remove the callback so subsequent leader-loss firings do NOT touch this Coordinate's lease")
 
 	// Close is idempotent.
@@ -370,11 +371,11 @@ func TestCoordinate_RegistersLeaderLossCallback(t *testing.T) {
 	c := NewCoordinatorWithEngine(nil, eng)
 	require.Equal(t, int32(1), eng.registerLeaderLossCalled.Load())
 
-	c.lease.extend(time.Now().Add(time.Hour), c.lease.generation())
-	require.True(t, c.lease.valid(time.Now()))
+	c.lease.extend(monoclock.Now().Add(time.Hour), c.lease.generation())
+	require.True(t, c.lease.valid(monoclock.Now()))
 
 	eng.fireLeaderLoss()
-	require.False(t, c.lease.valid(time.Now()),
+	require.False(t, c.lease.valid(monoclock.Now()),
 		"leader-loss callback must invalidate the lease")
 }
 
@@ -446,7 +447,7 @@ func TestCoordinate_LeaseRead_ObserverSeparatesHitsFromMisses(t *testing.T) {
 func TestLeaseReadEngineCtx_FastPath_SkipsLinearizableRead(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 42, leaseDur: time.Hour}
-	eng.setQuorumAck(time.Now())
+	eng.setQuorumAck(monoclock.Now())
 
 	idx, err := leaseReadEngineCtx(context.Background(), eng)
 	require.NoError(t, err)
@@ -461,7 +462,7 @@ func TestLeaseReadEngineCtx_FastPath_SkipsLinearizableRead(t *testing.T) {
 func TestLeaseReadEngineCtx_StaleAck_FallsThroughToLinearizable(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 7, leaseDur: 50 * time.Millisecond}
-	eng.setQuorumAck(time.Now().Add(-time.Hour))
+	eng.setQuorumAck(monoclock.Now().Add(-time.Hour))
 
 	idx, err := leaseReadEngineCtx(context.Background(), eng)
 	require.NoError(t, err)
@@ -476,7 +477,7 @@ func TestLeaseReadEngineCtx_StaleAck_FallsThroughToLinearizable(t *testing.T) {
 func TestLeaseReadEngineCtx_NotLeader_FallsThrough(t *testing.T) {
 	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 99, leaseDur: time.Hour}
-	eng.setQuorumAck(time.Now())
+	eng.setQuorumAck(monoclock.Now())
 	eng.state.Store(raftengine.StateFollower)
 	// On a non-leader the fake honours the LeaseProvider contract and
 	// returns zero ack, so the engineLeaseAckValid state guard also
