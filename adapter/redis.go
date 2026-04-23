@@ -606,7 +606,12 @@ func (r *RedisServer) Run() error {
 			if !ok {
 				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
-				r.observeRedisError(name, time.Since(start))
+				// Pass the RAW command bytes (not the already-uppercased `name`)
+				// so that the unsupported-command observer can detect invalid
+				// UTF-8 before strings.ToUpper silently rewrites the bytes to
+				// the U+FFFD replacement character. See observeUnsupportedCommand
+				// in monitoring/redis.go.
+				r.observeRedisUnsupported(string(cmd.Args[0]), time.Since(start))
 				return
 			}
 
@@ -863,6 +868,28 @@ func (r *RedisServer) observeRedisError(command string, dur time.Duration) {
 		Command:  command,
 		IsError:  true,
 		Duration: dur,
+	})
+}
+
+// observeRedisUnsupported records a command that was rejected because
+// the adapter has no route for it. In addition to the usual error
+// counters (which bucket the name into "unknown"), this flags the
+// report so the monitoring layer can record the real command name in
+// its bounded-cardinality unsupported-commands counter.
+//
+// IMPORTANT: `command` must be the RAW bytes the client sent (not an
+// already-uppercased value). The monitoring layer relies on seeing the
+// raw bytes to detect invalid UTF-8 before strings.ToUpper silently
+// replaces invalid bytes with the Unicode replacement character.
+func (r *RedisServer) observeRedisUnsupported(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:     command,
+		IsError:     true,
+		Duration:    dur,
+		Unsupported: true,
 	})
 }
 
