@@ -38,8 +38,15 @@ const (
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1
 	etcdElectionMinTicks  = 2
-	etcdMaxSizePerMsg     = 1 << 20
-	etcdMaxInflightMsg    = 256
+	// etcdMaxSizePerMsg caps bytes per MsgApp. 4 MiB reduces MsgApp count
+	// per committed byte under small-entry KV workloads, cutting dispatcher
+	// wake-ups on the leader and recv syscalls on the follower. Operators
+	// can override via ELASTICKV_RAFT_MAX_SIZE_PER_MSG at runtime.
+	etcdMaxSizePerMsg = 4 << 20
+	// etcdMaxInflightMsg caps in-flight MsgApps per peer. 1024 gives deeper
+	// pipelining on wide-bandwidth LAN during write bursts. Operators can
+	// override via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS at runtime.
+	etcdMaxInflightMsg = 1024
 )
 
 func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {

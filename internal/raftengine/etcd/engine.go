@@ -46,13 +46,37 @@ const (
 	// stepCh on followers filling up while their event loop was held
 	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
 	// #565 removed most of that CPU); 1024 is a 4× safety margin.
-	// Note that with the current defaultMaxSizePerMsg of 1 MiB, the
-	// true worst-case bound can be much larger (up to roughly 1 GiB
+	// Note that with the current defaultMaxSizePerMsg of 4 MiB, the
+	// true worst-case bound can be much larger (up to roughly 4 GiB
 	// per peer if every slot held a max-sized message). In practice,
 	// typical MsgApp payloads are far smaller, so expected steady-state
 	// memory remains much lower than that worst-case bound.
+	//
+	// Operators can override both knobs at runtime without a rebuild
+	// via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS and
+	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
 	defaultMaxInflightMsg = 1024
-	defaultMaxSizePerMsg  = 1 << 20
+	// defaultMaxSizePerMsg caps the byte size of a single MsgApp payload.
+	// Raised from 1 MiB → 4 MiB so each MsgApp amortises more entries
+	// under small-entry workloads (Redis-style KV, median entry ~500 B).
+	// Fewer MsgApps per committed byte means fewer dispatcher wake-ups
+	// on the leader and fewer recv syscalls on the follower; the
+	// follower's apply loop also contends less with the read path.
+	defaultMaxSizePerMsg = 4 << 20
+	// maxInflightMsgEnvVar / maxSizePerMsgEnvVar let operators tune the
+	// Raft-level flow-control knobs without a rebuild. Parsed once at
+	// Open and passed through normalizeLimitConfig; invalid values fall
+	// back to the defaults with a warning. MaxSizePerMsg is expressed
+	// as an integer byte count for consistency with the other numeric
+	// knobs in this package.
+	maxInflightMsgEnvVar = "ELASTICKV_RAFT_MAX_INFLIGHT_MSGS"
+	maxSizePerMsgEnvVar  = "ELASTICKV_RAFT_MAX_SIZE_PER_MSG"
+	// minMaxSizePerMsg is the lower bound accepted from the environment
+	// override. A payload cap below ~1 KiB makes MsgApp batching
+	// degenerate (one entry per message) which defeats the whole point
+	// of the knob; clamp to this floor rather than rejecting so that a
+	// fat-fingered operator doesn't take out the engine.
+	minMaxSizePerMsg uint64 = 1 << 10
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages
@@ -142,13 +166,21 @@ type OpenConfig struct {
 	ElectionTick  int
 	HeartbeatTick int
 	StateMachine  StateMachine
+	// MaxSizePerMsg caps the byte size of a single MsgApp payload (Raft-level
+	// flow control). Default: 4 MiB. Larger values amortise more entries per
+	// MsgApp under small-entry workloads; smaller values tighten worst-case
+	// memory. Operators can override at runtime via
+	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG (integer byte count) without a
+	// rebuild; the env var takes precedence over the caller-supplied value.
 	MaxSizePerMsg uint64
 	// MaxInflightMsg controls how many MsgApp messages Raft may have in-flight
 	// per peer before waiting for an acknowledgement (Raft-level flow control).
 	// It also sets the per-peer dispatch channel capacity, so total buffered
 	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
-	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
-	// lower in memory-constrained clusters.
+	// Default: 1024. Increase for deeper pipelining on high-bandwidth links;
+	// lower in memory-constrained clusters. Operators can override at
+	// runtime via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS without a rebuild; the
+	// env var takes precedence over the caller-supplied value.
 	MaxInflightMsg int
 }
 
@@ -2588,6 +2620,21 @@ func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 	if cfg.MaxSizePerMsg == 0 {
 		cfg.MaxSizePerMsg = defaultMaxSizePerMsg
 	}
+	// Env overrides win over caller-supplied values so that operators can
+	// retune replication flow-control without a rebuild. This mirrors the
+	// behaviour of ELASTICKV_RAFT_SNAPSHOT_COUNT and
+	// ELASTICKV_RAFT_MAX_WAL_FILES. Invalid values fall back to the
+	// compiled-in defaults with a warning.
+	if v, ok := maxInflightMsgFromEnv(); ok {
+		cfg.MaxInflightMsg = v
+	}
+	if v, ok := maxSizePerMsgFromEnv(); ok {
+		cfg.MaxSizePerMsg = v
+	}
+	slog.Info("etcd raft engine: message size limits",
+		"max_inflight_msgs", cfg.MaxInflightMsg,
+		"max_size_per_msg_bytes", cfg.MaxSizePerMsg,
+	)
 	return cfg
 }
 
@@ -2843,6 +2890,48 @@ func snapshotEveryFromEnv() uint64 {
 		return 1
 	}
 	return n
+}
+
+// maxInflightMsgFromEnv parses ELASTICKV_RAFT_MAX_INFLIGHT_MSGS. Returns
+// (value, true) when the env var is set to a valid positive integer.
+// Returns (0, false) when the var is unset so the caller can keep the
+// existing cfg.MaxInflightMsg (which normalizeLimitConfig has already
+// defaulted to defaultMaxInflightMsg). Invalid values (non-numeric,
+// negative, zero) are logged at warn level and treated as unset so the
+// engine falls back to the compiled-in default rather than an obviously
+// broken override.
+func maxInflightMsgFromEnv() (int, bool) {
+	v := strings.TrimSpace(os.Getenv(maxInflightMsgEnvVar))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		slog.Warn("invalid ELASTICKV_RAFT_MAX_INFLIGHT_MSGS; using default",
+			"value", v, "default", defaultMaxInflightMsg)
+		return 0, false
+	}
+	return n, true
+}
+
+// maxSizePerMsgFromEnv parses ELASTICKV_RAFT_MAX_SIZE_PER_MSG as a plain
+// integer byte count. Returns (value, true) when the env var is set to a
+// valid integer >= minMaxSizePerMsg (1 KiB). Returns (0, false) when the
+// var is unset so normalizeLimitConfig can keep its earlier default.
+// Invalid or too-small values fall back to the compiled-in default with
+// a warning; a sub-KiB cap would make MsgApp batching degenerate.
+func maxSizePerMsgFromEnv() (uint64, bool) {
+	v := strings.TrimSpace(os.Getenv(maxSizePerMsgEnvVar))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n < minMaxSizePerMsg {
+		slog.Warn("invalid ELASTICKV_RAFT_MAX_SIZE_PER_MSG; using default",
+			"value", v, "min", minMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
+		return 0, false
+	}
+	return n, true
 }
 
 // dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has

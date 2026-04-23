@@ -1841,3 +1841,104 @@ func TestDispatcherLanesEnabledFromEnv(t *testing.T) {
 		require.Equalf(t, c.want, dispatcherLanesEnabledFromEnv(), "env=%q", c.val)
 	}
 }
+
+// TestMaxInflightMsgFromEnv_Unset pins the "no env var => caller wins"
+// contract of maxInflightMsgFromEnv. normalizeLimitConfig relies on the
+// second return to decide whether to overwrite the caller-supplied value.
+func TestMaxInflightMsgFromEnv_Unset(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	n, ok := maxInflightMsgFromEnv()
+	require.False(t, ok)
+	require.Equal(t, 0, n)
+}
+
+// TestMaxInflightMsgFromEnv_ReadsOverride pins that a valid positive
+// integer is parsed and surfaced to the caller verbatim.
+func TestMaxInflightMsgFromEnv_ReadsOverride(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	n, ok := maxInflightMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, 2048, n)
+}
+
+// TestMaxInflightMsgFromEnv_FallsBackOnInvalid pins the safety behaviour:
+// a non-numeric, zero, or negative value is refused and the caller is
+// told to keep the compiled-in default rather than get a broken override.
+func TestMaxInflightMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
+	cases := []string{"not-a-number", "0", "-3"}
+	for _, v := range cases {
+		t.Setenv(maxInflightMsgEnvVar, v)
+		n, ok := maxInflightMsgFromEnv()
+		require.Falsef(t, ok, "env=%q", v)
+		require.Equalf(t, 0, n, "env=%q", v)
+	}
+}
+
+// TestMaxSizePerMsgFromEnv_Unset pins the "no env var => caller wins"
+// contract, symmetric with maxInflightMsgFromEnv above.
+func TestMaxSizePerMsgFromEnv_Unset(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	n, ok := maxSizePerMsgFromEnv()
+	require.False(t, ok)
+	require.Equal(t, uint64(0), n)
+}
+
+// TestMaxSizePerMsgFromEnv_ReadsOverride pins that a valid byte count
+// >= minMaxSizePerMsg is accepted and surfaced to the caller verbatim.
+func TestMaxSizePerMsgFromEnv_ReadsOverride(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, "8388608") // 8 MiB
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, uint64(8388608), n)
+}
+
+// TestMaxSizePerMsgFromEnv_FallsBackOnInvalid covers the three failure
+// modes: non-numeric, zero, and below-floor. The floor is minMaxSizePerMsg
+// (1 KiB) — a smaller cap would make MsgApp batching degenerate.
+func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
+	cases := []string{"not-a-number", "0", "512"}
+	for _, v := range cases {
+		t.Setenv(maxSizePerMsgEnvVar, v)
+		n, ok := maxSizePerMsgFromEnv()
+		require.Falsef(t, ok, "env=%q", v)
+		require.Equalf(t, uint64(0), n, "env=%q", v)
+	}
+}
+
+// TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
+// that reach raft.Config when neither the caller nor the operator has
+// overridden them: 1024 inflight msgs and 4 MiB per msg.
+func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	got := normalizeLimitConfig(OpenConfig{})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+	require.Equal(t, 1024, got.MaxInflightMsg)
+	require.Equal(t, uint64(4<<20), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_EnvOverridesCaller pins that a valid env var
+// takes precedence over any caller-supplied cfg value. This is how an
+// operator retunes a running deployment without a rebuild.
+func TestNormalizeLimitConfig_EnvOverridesCaller(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	t.Setenv(maxSizePerMsgEnvVar, "8388608")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: 256,
+		MaxSizePerMsg:  1 << 20,
+	})
+	require.Equal(t, 2048, got.MaxInflightMsg)
+	require.Equal(t, uint64(8388608), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault pins that a
+// malformed env override does NOT leak through to raft.Config; the
+// caller-supplied defaults remain in effect.
+func TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "not-a-number")
+	t.Setenv(maxSizePerMsgEnvVar, "-1")
+	got := normalizeLimitConfig(OpenConfig{})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+}
