@@ -1,0 +1,633 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Pebble storage engine internals for elastickv: block cache, L0 pressure, compactions, memtables, FSM apply sync mode, and store write conflicts.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "$datasource",
+      "description": "Block cache hit rate = hits / (hits + misses). Greater than 95% is healthy; below 80% means the working set no longer fits in the configured block cache and every read falls through to the filesystem, which usually shows up as a step change in GET p99 and disk read IOPS.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": 0},
+              {"color": "yellow", "value": 0.80},
+              {"color": "green", "value": 0.95}
+            ]
+          },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "hit rate",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Block Cache Hit Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Block cache hit rate over time. Watch for sudden drops after a deploy, a compaction burst, or a workload shift: these indicate the hot set no longer fits.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 16, "x": 8, "y": 0},
+      "id": 2,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "hit rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Block Cache Hit Rate Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Current block cache size per node versus the configured capacity. If 'size' sits pegged at 'capacity' and hit rate is falling, the cache is full and evicting useful blocks; consider raising the capacity or shrinking the working set.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 6},
+      "id": 3,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_block_cache_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "size {{node_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_block_cache_capacity_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "capacity {{node_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Block Cache Size vs Capacity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Block cache hit and miss rates side-by-side. A climbing miss rate is the earliest warning that the cache is under-sized; the hit-rate panel lags it because hit rate is a ratio.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 6},
+      "id": 4,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "legendFormat": "hits {{node_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "legendFormat": "misses {{node_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Block Cache Hits / Misses Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Number of L0 sublevels per node. Pebble begins throttling writes around 20 sublevels and will hard-stall the FSM if compaction cannot keep up; sustained red here usually means ingest outran compaction.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "orange", "value": 10},
+              {"color": "red", "value": 20}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 12},
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "L0 Sublevels",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Number of files currently in L0 per node. More than ~20 files and Pebble's write-stall heuristic will start holding up new writes. Use alongside the sublevel panel to distinguish 'many small files' from 'many overlapping files'.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "orange", "value": 10},
+              {"color": "red", "value": 20}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 12},
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "L0 Num Files",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Pebble's own estimate of outstanding compaction work, in bytes. Growing unboundedly means compaction is losing the race; compare against the compaction rate below.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 12},
+      "id": 7,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Compaction Estimated Debt",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Number of compactions currently running per node. Should move in lockstep with the configured max concurrent compactions; a flat-zero line while debt climbs indicates compactions are being blocked (e.g. by a flush pipeline stall).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 18},
+      "id": 8,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Compactions In Progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Rate of completed compactions per node. Correlate with the debt panel: a healthy engine shows debt oscillating while this rate is non-zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 18},
+      "id": 9,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "rate(elastickv_pebble_compact_count_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Compaction Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "FSM apply sync mode gauge: the label `mode` is `sync` or `nosync`, and the value is 1 for the active mode. Operators care because nosync gives the fastest Raft apply but loses unflushed writes on a crash; sync pays fsync on every batch. Green = nosync in this deploy's convention. **Requires `elastickv_pebble_fsm_apply_sync_mode` (PR #592). Empty until that PR merges — this is not a scrape failure.**",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": 0},
+              {"color": "green", "value": 1}
+            ]
+          },
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "off"}, "1": {"text": "on"}}}
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 18},
+      "id": 10,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_fsm_apply_sync_mode{job=\"elastickv\",node_id=~\"$node_id\",mode=\"nosync\"}",
+          "legendFormat": "{{node_id}} nosync",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "FSM Apply Sync Mode (nosync = 1 is desired)",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Active memtable count per node. Normally 1-2; sustained growth here means flushes are not keeping up with writes, which cascades into L0 file growth and eventually a write stall.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 24},
+      "id": 11,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memtable Count",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Total bytes held in active memtables per node. Caps at ~MemTableSize * MaxMemtableCount; steady readings near that cap mean flush is the bottleneck.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 24},
+      "id": 12,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memtable Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Memtables that have been flushed but cannot yet be freed because an iterator or snapshot still references them. Climbing zombie counts indicate leaked iterators or long-lived snapshots pinning memory.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 24},
+      "id": 13,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memtable Zombies",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Rate of OCC-style store write conflicts, grouped by key prefix. Hot prefixes light up here before they show up as Lua retry pressure or client timeouts; use this to find the hotspot key family.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
+      "id": 14,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (key_prefix) (rate(elastickv_store_write_conflict_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "legendFormat": "{{key_prefix}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Store Write Conflicts by Prefix",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": [
+    "elastickv",
+    "pebble",
+    "storage",
+    "internals"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "default",
+          "value": "default"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "$datasource",
+        "definition": "label_values(elastickv_pebble_l0_num_files{job=\"elastickv\"}, node_id)",
+        "includeAll": true,
+        "label": "Node ID",
+        "multi": true,
+        "name": "node_id",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(elastickv_pebble_l0_num_files{job=\"elastickv\"}, node_id)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Elastickv Pebble Internals",
+  "uid": "elastickv-pebble-internals",
+  "version": 1
+}

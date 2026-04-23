@@ -264,11 +264,28 @@ func (s *LeaderRoutedStore) ApplyMutations(ctx context.Context, mutations []*sto
 	return errors.WithStack(s.local.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaft forwards to the local store's raft-apply variant. See
+// store.MVCCStore for the durability contract.
+func (s *LeaderRoutedStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS))
+}
+
+// DeletePrefixAtRaft forwards to the local store's raft-apply variant.
+func (s *LeaderRoutedStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS))
 }
 
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {

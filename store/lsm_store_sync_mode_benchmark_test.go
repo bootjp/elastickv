@@ -8,22 +8,22 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-// BenchmarkApplyMutations_SyncMode measures per-op latency and
-// throughput of the FSM commit path under each
+// BenchmarkApplyMutationsRaft_SyncMode measures per-op latency and
+// throughput of the raft-apply FSM commit path under each
 // ELASTICKV_FSM_SYNC_MODE value. The benchmark is write-heavy and
-// serial: each iteration issues one ApplyMutations on a fresh (key,
+// serial: each iteration issues one ApplyMutationsRaft on a fresh (key,
 // commitTS) pair with a single Put mutation, exercising the single-
 // fsync hot path.
 //
 // Run with:
 //
-//	go test ./store -run='^$' -bench='BenchmarkApplyMutations_SyncMode' -benchtime=2s -benchmem
+//	go test ./store -run='^$' -bench='BenchmarkApplyMutationsRaft_SyncMode' -benchtime=2s -benchmem
 //
 // The sync/nosync ratio (not absolute numbers, which are disk-
 // dependent) is the signal of interest. On a laptop SSD, nosync
 // typically runs 10-50x faster per op; the exact multiplier reflects
 // how cheap the platform's fsync is on a freshly-created WAL file.
-func BenchmarkApplyMutations_SyncMode(b *testing.B) {
+func BenchmarkApplyMutationsRaft_SyncMode(b *testing.B) {
 	cases := []struct {
 		name string
 		opts *pebble.WriteOptions
@@ -67,8 +67,8 @@ func BenchmarkApplyMutations_SyncMode(b *testing.B) {
 				}
 				startTS := uint64(i) * 2
 				commitTS := startTS + 1
-				if err := s.ApplyMutations(ctx, muts, nil, startTS, commitTS); err != nil {
-					b.Fatalf("ApplyMutations: %v", err)
+				if err := s.ApplyMutationsRaft(ctx, muts, nil, startTS, commitTS); err != nil {
+					b.Fatalf("ApplyMutationsRaft: %v", err)
 				}
 			}
 		})
