@@ -457,24 +457,29 @@
                             (some #(and (= :zincrby (:f %))
                                         (:unknown-score? %))
                                   coll))
-        ;; Count concurrent/uncertain ZINCRBYs. The resulting score of a
-        ;; read relative to ZINCRBYs depends on how many of them took
-        ;; effect before the read observed state.
-        ;;   * 0 uncertain ZINCRBYs: :scores is authoritative.
-        ;;   * 1 uncertain ZINCRBY whose final score is KNOWN (:ok):
-        ;;     the read can observe either the pre-op state (already in
-        ;;     :scores from candidates) or the post-op state (its known
-        ;;     final score, also added to :scores). :scores is complete.
-        ;;   * 1 uncertain ZINCRBY with UNKNOWN score (:info/:pending):
-        ;;     the post-op score is not recoverable from the history.
-        ;;     We must relax the strict score check.
-        ;;   * >=2 uncertain ZINCRBYs: their relative serialization
-        ;;     order produces prefix-sum intermediates that are not in
-        ;;     :scores (e.g. pre + delta1 before pre + delta1 + delta2).
-        ;;     Relax the strict score check.
-        uncertain-incrs (filter #(= :zincrby (:f %)) uncertain)
-        unknown-score? (or (has-unknown-incr? uncertain)
-                           (> (count uncertain-incrs) 1))
+        ;; Classify uncertain ZINCRBYs by whether their resulting score
+        ;; is known. The resulting score of a read relative to ZINCRBYs
+        ;; depends only on which of them took effect before the read
+        ;; observed state AND whether each such ZINCRBY's return value
+        ;; is recorded.
+        ;;   * Any uncertain ZINCRBY with UNKNOWN score (:info/:pending):
+        ;;     the post-op score is not recoverable from the history, so
+        ;;     we must relax the strict score check -- any numeric score
+        ;;     is admissible.
+        ;;   * All uncertain ZINCRBYs :ok with known return values:
+        ;;     every recorded return pins the ZINCRBY's post-op state
+        ;;     and (because ZINCRBY reads-then-writes atomically) its
+        ;;     pre-op state. Any real-time consistent linearization
+        ;;     therefore ends on one of those known return values (or
+        ;;     on a candidate's score). :scores already contains all
+        ;;     of them via the add-scores reduction over `uncertain`,
+        ;;     so the strict score check is sound. Intermediate
+        ;;     "prefix-sum" values (pre + delta_i for just one of
+        ;;     several concurrent zincrbys) are NOT admissible final
+        ;;     states: the return values constrain the serialization
+        ;;     order, and no legitimate read can observe a partial sum
+        ;;     that doesn't match any recorded post-op score.
+        unknown-score? (has-unknown-incr? uncertain)
 
         any-candidate-write? (some write-op? candidates)
         any-candidate-zrem? (some #(= :zrem (:f %)) candidates)

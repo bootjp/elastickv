@@ -488,6 +488,85 @@
         "expected pre-reset intermediate (3.0) to be flagged")))
 
 ;; ---------------------------------------------------------------------------
+;; unknown-score? gate: restricted to :info ZINCRBYs only. Two concurrent
+;; :ok ZINCRBYs with known return values do NOT make the score check
+;; unknown -- their return values pin the linearization and the
+;; admissible score set is constrained by :scores (candidates + uncertain
+;; ok return values). (codex P1)
+;; ---------------------------------------------------------------------------
+
+(deftest two-ok-concurrent-zincrbys-reject-impossible-score
+  ;; codex P1: two overlapping :ok ZINCRBYs with known return values
+  ;; (3 and 6) constrain the admissible post-chain read set to {1,3,6}.
+  ;; A read of 999 is impossible under any linearization; the checker
+  ;; must flag it as :score-mismatch (no longer swallowed by the old
+  ;; "2+ uncertain zincrbys -> unknown-score?" shortcut).
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+                 ;; Two concurrent ZINCRBYs. Windows overlap the read.
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 2]    :index 2}
+                 {:type :invoke :process 2 :f :zincrby :value ["m1" 3]    :index 3}
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 3.0]  :index 4}
+                 {:type :ok     :process 2 :f :zincrby :value ["m1" 6.0]  :index 5}
+                 ;; Read observes an impossible score.
+                 {:type :invoke :process 3 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 999.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected impossible score to be flagged, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
+(deftest two-ok-concurrent-zincrbys-accept-known-chain-tail
+  ;; codex P1: same concurrent :ok ZINCRBY history, but the read
+  ;; observes one of the recorded return values. Both 3.0 (linearization
+  ;; where +3 ran first, then +2) and 6.0 (the other order) must be
+  ;; accepted as valid.
+  (let [base [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+              {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+              {:type :invoke :process 1 :f :zincrby :value ["m1" 2]    :index 2}
+              {:type :invoke :process 2 :f :zincrby :value ["m1" 3]    :index 3}
+              {:type :ok     :process 1 :f :zincrby :value ["m1" 3.0]  :index 4}
+              {:type :ok     :process 2 :f :zincrby :value ["m1" 6.0]  :index 5}]
+        read-6 (conj base
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 6.0]] :index 7})
+        read-3 (conj base
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 3.0]] :index 7})]
+    (is (:valid? (run-checker read-6))
+        "expected 6.0 (one linearization) to be accepted")
+    (is (:valid? (run-checker read-3))
+        "expected 3.0 (other linearization) to be accepted")))
+
+(deftest info-plus-ok-concurrent-zincrby-stays-unknown
+  ;; codex P1: when at least one concurrent ZINCRBY is :info (unknown
+  ;; post-op score), the strict score check must be relaxed regardless
+  ;; of how many other :ok ZINCRBYs are concurrent. Any numeric score
+  ;; must be accepted for this read.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
+                 ;; One :info ZINCRBY (unknown outcome).
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 2]    :index 2}
+                 ;; One :ok ZINCRBY with known return value.
+                 {:type :invoke :process 2 :f :zincrby :value ["m1" 3]    :index 3}
+                 {:type :ok     :process 2 :f :zincrby :value ["m1" 4.0]  :index 4}
+                 {:type :info   :process 1 :f :zincrby :value ["m1" 2]
+                  :error "conn reset" :index 5}
+                 ;; Read observes an "arbitrary" score -- admissible
+                 ;; because the :info ZINCRBY could have produced any
+                 ;; post-op state visible to the read.
+                 {:type :invoke :process 3 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 42.0]] :index 7}]]
+    (is (:valid? (run-checker history))
+        "expected any score accepted when :info ZINCRBY is concurrent")))
+
+;; ---------------------------------------------------------------------------
 ;; Infinity score parsing
 ;; ---------------------------------------------------------------------------
 
