@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -363,7 +364,9 @@ func TestRedisMetricsUnsupportedCommandTruncatesLongName(t *testing.T) {
 					continue
 				}
 				require.LessOrEqual(t, len(lbl.GetValue()), 64,
-					"label value must be length-capped")
+					"label value must be length-capped (byte count)")
+				require.True(t, utf8.ValidString(lbl.GetValue()),
+					"label value must be valid UTF-8")
 				if lbl.GetValue() == strings.Repeat("A", 64) {
 					found = true
 				}
@@ -371,6 +374,96 @@ func TestRedisMetricsUnsupportedCommandTruncatesLongName(t *testing.T) {
 		}
 	}
 	require.True(t, found, "expected truncated 64-char label value")
+}
+
+// TestRedisMetricsUnsupportedCommandTruncatesOnRuneBoundary verifies that
+// truncating a long command name that contains multibyte UTF-8 runes does
+// not split a rune, which would produce an invalid UTF-8 label and cause
+// prometheus.WithLabelValues to panic. The input is 63 ASCII 'A' bytes
+// followed by a 2-byte rune 'é' repeated enough times to exceed the 64-byte
+// cap; a byte-boundary truncate would split the first 'é'.
+func TestRedisMetricsUnsupportedCommandTruncatesOnRuneBoundary(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RedisObserver()
+
+	// 63 bytes of 'A' + a sequence of 'é' (2 bytes each, uppercases to 'É'
+	// which is also 2 bytes). Total byte length well over 64.
+	payload := strings.Repeat("A", 63) + strings.Repeat("é", 20)
+	require.Greater(t, len(payload), 64)
+
+	require.NotPanics(t, func() {
+		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:     payload,
+			IsError:     true,
+			Duration:    time.Millisecond,
+			Unsupported: true,
+		})
+	})
+
+	mf, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+
+	var checked bool
+	for _, family := range mf {
+		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() != "command" {
+					continue
+				}
+				v := lbl.GetValue()
+				require.LessOrEqual(t, len(v), 64,
+					"byte-length cap must be preserved")
+				require.True(t, utf8.ValidString(v),
+					"truncation must not split a rune (invalid UTF-8 would panic prometheus)")
+				checked = true
+			}
+		}
+	}
+	require.True(t, checked, "expected an unsupported-commands metric to be emitted")
+}
+
+// TestRedisMetricsUnsupportedCommandRejectsInvalidUTF8 verifies that an
+// ingress command name that is already invalid UTF-8 (e.g. a binary blob
+// from a misbehaving or hostile client) does not crash the observer and is
+// folded into a fixed "invalid_utf8" sentinel label.
+func TestRedisMetricsUnsupportedCommandRejectsInvalidUTF8(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RedisObserver()
+
+	// 0xff 0xfe 0xfd are never valid UTF-8 start bytes.
+	invalid := string([]byte{0xff, 0xfe, 0xfd, 0xc3, 0x28})
+	require.False(t, utf8.ValidString(invalid))
+
+	require.NotPanics(t, func() {
+		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:     invalid,
+			IsError:     true,
+			Duration:    time.Millisecond,
+			Unsupported: true,
+		})
+	})
+
+	mf, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+
+	var sentinelCount float64
+	for _, family := range mf {
+		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() == "command" && lbl.GetValue() == "invalid_utf8" {
+					sentinelCount += metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), sentinelCount,
+		"invalid-UTF-8 input must be folded into the 'invalid_utf8' sentinel")
 }
 
 func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -29,6 +30,12 @@ const (
 	// redisUnsupportedCommandOther is the overflow bucket used when the
 	// observed name is novel and the distinct-name cap is full.
 	redisUnsupportedCommandOther = "other"
+
+	// redisUnsupportedCommandInvalidUTF8 is the sentinel label applied when
+	// the raw command name contains bytes that are not valid UTF-8. Using a
+	// fixed sentinel avoids ever passing invalid UTF-8 to
+	// prometheus.WithLabelValues, which would panic.
+	redisUnsupportedCommandInvalidUTF8 = "invalid_utf8"
 )
 
 var redisCommandSet = map[string]struct{}{
@@ -215,12 +222,40 @@ func (m *RedisMetrics) ObserveRedisRequest(report RedisRequestReport) {
 // been reached. The input is uppercased, trimmed, and length-capped to
 // avoid pathological label values.
 func (m *RedisMetrics) observeUnsupportedCommand(raw string) {
-	name := strings.ToUpper(strings.TrimSpace(raw))
+	// Guard against raw inputs that are already invalid UTF-8 at ingress
+	// (e.g. a binary blob sent as a command name). Passing invalid UTF-8
+	// to prometheus.WithLabelValues would panic and crash the calling
+	// goroutine. Check the raw string before strings.ToUpper, which would
+	// otherwise silently rewrite invalid bytes to the Unicode replacement
+	// character and mask the problem.
+	var name string
+	if !utf8.ValidString(raw) {
+		name = redisUnsupportedCommandInvalidUTF8
+	} else {
+		name = strings.ToUpper(strings.TrimSpace(raw))
+	}
 	if name == "" {
 		name = redisCommandUnknown
 	}
 	if len(name) > maxUnsupportedCommandLabelLen {
-		name = name[:maxUnsupportedCommandLabelLen]
+		// Truncate by UTF-8 rune boundary, not byte boundary, so we never
+		// split a multibyte rune and produce invalid UTF-8 (which would
+		// make prometheus.WithLabelValues panic). We keep the cap as a
+		// byte limit to preserve the existing cardinality/size semantics.
+		b := 0
+		cut := len(name)
+		for i, r := range name {
+			size := utf8.RuneLen(r)
+			if size < 0 {
+				size = 1
+			}
+			if b+size > maxUnsupportedCommandLabelLen {
+				cut = i
+				break
+			}
+			b += size
+		}
+		name = name[:cut]
 	}
 
 	label := redisUnsupportedCommandOther
