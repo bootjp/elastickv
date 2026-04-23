@@ -857,13 +857,17 @@ ensure_remote_raftadmin_binaries
 # these don't change per node.
 #
 # EXTRA_ENV may legitimately span multiple lines in deploy.env; normalise
-# newlines to spaces *before* `printf %q` so the escape emits plain
-# backslash-quoting rather than ANSI-C $'...' quoting. Common remote login
-# shells (/bin/sh -> dash on Debian/Ubuntu) don't grok $'...' and would
-# pass it through as literal characters, breaking the `KEY=VALUE`
-# validator in run_container.
-EXTRA_ENV_NORMALISED="${EXTRA_ENV//$'\n'/ }"
-EXTRA_ENV_Q="$(printf '%q' "${EXTRA_ENV_NORMALISED:-}")"
+# all non-space whitespace (newline, carriage return, tab) to spaces
+# *before* `printf %q` so the escape emits plain backslash-quoting rather
+# than ANSI-C $'...' quoting. Common remote login shells (/bin/sh -> dash
+# on Debian/Ubuntu) don't grok $'...' and would pass it through as literal
+# characters, breaking the `KEY=VALUE` validator in run_container.
+# CR handling additionally covers deploy.env files edited on Windows.
+# `${EXTRA_ENV:-}` is required because `set -u` is active and EXTRA_ENV
+# may be unset (the variable is optional in deploy.env).
+EXTRA_ENV_NORMALISED="${EXTRA_ENV:-}"
+EXTRA_ENV_NORMALISED="${EXTRA_ENV_NORMALISED//[$'\t\r\n']/ }"
+EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
