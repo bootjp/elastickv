@@ -91,26 +91,39 @@ holds:
 
 ```go
 type leaseState struct {
-    gen    atomic.Uint64                // bumped by invalidate()
-    expiry atomic.Pointer[time.Time]    // nil = expired / invalidated
+    gen         atomic.Uint64 // bumped by invalidate()
+    expiryNanos atomic.Int64  // 0 = expired / invalidated; else monoclock.Instant nanos
 }
 ```
 
-- `expiry == nil` or `time.Now() >= *expiry`: lease is expired. The next
-  `LeaseRead` falls back to `LinearizableRead` and refreshes the lease on
-  success.
-- `time.Now() < *expiry`: lease is valid. `LeaseRead` returns immediately
-  without contacting the Raft layer.
-- `invalidate()` increments `gen` before clearing `expiry`. `extend()`
-  captures `gen` at entry and, after its CAS lands, undoes its own
-  write (via CAS on the pointer it stored) iff `gen` has moved. This
-  prevents a Dispatch that succeeded just before a leader-loss
-  invalidate from resurrecting the lease milliseconds after it was
-  cleared. A fresh `extend()` that captured the post-invalidate
-  generation is left intact because it stored a different pointer.
+All timestamps on the lease path come from `internal/monoclock`, which
+reads `CLOCK_MONOTONIC_RAW` via `clock_gettime(3)` on Linux and Darwin
+(falling back to Go's runtime monotonic on other platforms — FreeBSD
+included, since `golang.org/x/sys/unix` does not export
+`CLOCK_MONOTONIC_RAW` on FreeBSD).
+The raw monotonic clock is immune to NTP rate adjustment and wall-clock
+step events — TiKV's lease path makes the same choice. Go's
+`time.Now()` is not sufficient: its embedded monotonic component is
+still NTP-slewed at up to 500 ppm under POSIX, and a misconfigured or
+abused time daemon can exceed that cap. See §3.2 on why the safety
+argument should not rest on NTP behaving.
 
-The lock-free form lets readers do one atomic load + one wall-clock compare
-on the fast path.
+- `expiryNanos == 0` or `monoclock.Now() >= expiry`: lease is expired.
+  The next `LeaseRead` falls back to `LinearizableRead` and refreshes
+  the lease on success.
+- `monoclock.Now() < expiry`: lease is valid. `LeaseRead` returns
+  immediately without contacting the Raft layer.
+- `invalidate()` increments `gen` before clearing `expiryNanos`.
+  `extend()` captures `gen` at entry and, after its CAS lands, undoes
+  its own write (via CAS on the exact value it wrote) iff `gen` has
+  moved. This prevents a Dispatch that succeeded just before a
+  leader-loss invalidate from resurrecting the lease milliseconds
+  after it was cleared. A fresh `extend()` that captured the
+  post-invalidate generation is left intact because its CAS already
+  replaced the earlier target.
+
+The lock-free form lets readers do one atomic load + one monotonic-raw
+compare on the fast path.
 
 ### 3.2 Lease duration
 
@@ -134,12 +147,43 @@ config: `10ms * 100 - 300ms = 700 ms`.
 `leaseSafetyMargin` (proposed: 300 ms) absorbs:
 
 - Goroutine scheduling delay between heartbeat ack and lease refresh.
-- Wall-clock skew between leader and the partition's new leader candidate.
+- Clock skew between leader and the partition's new leader candidate.
+  (Both read `CLOCK_MONOTONIC_RAW` on their own hosts — the skew here
+  is between two independent monotonic oscillators, not NTP-adjusted
+  wall clocks. Per-host drift of quartz oscillators is ≤50 ppm, so
+  the two sides cannot diverge by more than that within an
+  electionTimeout window.)
 - GC pauses on the leader.
 
 The margin is conservative; reducing it shortens the post-write quiet window
 during which lease reads still hit local state, at the cost of a smaller
 safety buffer.
+
+#### Why CLOCK_MONOTONIC_RAW, not time.Now()
+
+Go's `time.Now()` embeds the kernel's NTP-adjusted monotonic clock
+(`CLOCK_MONOTONIC` on Linux), which is rate-slewed at up to 500 ppm
+under POSIX. Inside a 700 ms lease window that amounts to ~0.35 ms —
+comfortably smaller than the 300 ms safety margin on paper. But the
+safety case for the lease should not depend on NTP being well-behaved:
+
+1. POSIX caps slew rate at 500 ppm, but a misconfigured or malicious
+   `adjtimex` call can exceed that cap.
+2. A lease-read regression is observable only when the lease boundary
+   overshoots `electionTimeout`, i.e. under exactly the conditions
+   (partition + clock drift) where NTP is most likely to be wrong.
+3. TiKV, whose lease-read design we otherwise track, already uses
+   `CLOCK_MONOTONIC_RAW` for this reason. Matching their choice keeps
+   the door open for tightening `leaseSafetyMargin` below ~5 ms, at
+   which point NTP slew alone becomes comparable to the margin.
+
+The `internal/monoclock` package wraps `clock_gettime(CLOCK_MONOTONIC_RAW, &ts)`
+(`unix.ClockGettime` from `golang.org/x/sys/unix`) on Linux and
+Darwin. Other platforms — including FreeBSD, where `x/sys/unix` does
+not export the `CLOCK_MONOTONIC_RAW` constant — fall back to Go's
+runtime monotonic clock; on those platforms lease safety reverts to
+the NTP-slewed baseline, which is still sufficient at the current
+margin.
 
 ### 3.3 Refresh triggers
 
@@ -152,8 +196,9 @@ The lease is refreshed on:
    confirmation than ReadIndex.
 
 Both refresh base the new expiry on `preOpInstant + LeaseDuration()`,
-where `preOpInstant` is captured BEFORE the quorum operation starts, not
-after it returns. This is strictly conservative: any real quorum
+where `preOpInstant` is a `monoclock.Now()` reading
+(`CLOCK_MONOTONIC_RAW`) captured BEFORE the quorum operation starts,
+not after it returns. This is strictly conservative: any real quorum
 confirmation must happen at or after `preOpInstant`, so the lease window
 can only be shorter than the true safety window, never longer.
 Post-operation sampling would let apply-queue depth / scheduling jitter
@@ -234,11 +279,13 @@ func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
         // Misconfigured tick settings disable the lease entirely.
         return c.LinearizableRead(ctx)
     }
-    // Capture time.Now() AND lease.generation() exactly once before
-    // any quorum work. The generation guard prevents a leader-loss
-    // callback that fires during LinearizableRead from being
-    // silently overwritten by the post-op extend.
-    now := time.Now()
+    // Capture monoclock.Now() AND lease.generation() exactly once
+    // before any quorum work. The monotonic-raw sample keeps the
+    // window safe against NTP rate adjustment / wall-clock steps;
+    // the generation guard prevents a leader-loss callback that
+    // fires during LinearizableRead from being silently overwritten
+    // by the post-op extend.
+    now := monoclock.Now()
     expectedGen := c.lease.generation()
     if c.lease.valid(now) {
         return lp.AppliedIndex(), nil
@@ -357,9 +404,13 @@ write to commit. However:
   out of leader and invalidates the lease.
 - Clock skew exceeding `leaseSafetyMargin`: lease may extend beyond
   `electionTimeout`, allowing a stale read after a successor leader has
-  accepted writes. Mitigation: keep `leaseSafetyMargin` larger than the
-  documented clock-skew SLO of the deployment. Default 300 ms is consistent
-  with the HLC physical window of 3 s used elsewhere.
+  accepted writes. Because the lease path uses `CLOCK_MONOTONIC_RAW`
+  (see §3.2), this hazard is bounded by inter-host oscillator drift
+  (~50 ppm quartz-spec ceiling), not by NTP's 500 ppm slew or
+  operator-driven `settimeofday` jumps — a misconfigured time daemon
+  can no longer push the lease past its safety window. The 300 ms
+  default margin remains consistent with the HLC physical window of
+  3 s used elsewhere.
 
 ---
 
