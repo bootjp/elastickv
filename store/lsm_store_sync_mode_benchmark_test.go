@@ -50,7 +50,13 @@ func BenchmarkApplyMutations_SyncMode(b *testing.B) {
 				key := []byte(fmt.Sprintf("bench-%010d", i))
 				muts := []*KVPairMutation{{Op: OpTypePut, Key: key, Value: val}}
 				// startTS must be strictly < commitTS and distinct across
-				// iterations to avoid MVCC write-conflict.
+				// iterations to avoid MVCC write-conflict. Guard the
+				// int -> uint64 conversion to satisfy gosec G115; i is
+				// non-negative here by construction (loop from 0) but
+				// the linter cannot prove it.
+				if i < 0 {
+					b.Fatalf("unexpected negative iteration counter: %d", i)
+				}
 				startTS := uint64(i) * 2
 				commitTS := startTS + 1
 				if err := s.ApplyMutations(ctx, muts, nil, startTS, commitTS); err != nil {
