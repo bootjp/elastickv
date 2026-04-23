@@ -415,7 +415,7 @@
       ],
       "title": "Errors by Command",
       "type": "timeseries",
-      "description": "Error rate split by Redis command."
+      "description": "Error rate split by Redis command. NOTE: the `unknown` bucket aggregates every command name not in the adapter's allow-list (including unsupported commands and malformed input). For a real-name breakdown see the 'Unsupported Commands by Name' panel, which uses the PR #594 elastickv_redis_unsupported_commands_total counter."
     },
     {
       "datasource": "$datasource",
@@ -1024,7 +1024,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Number of redis.call()/pcall() invocations per Lua script execution. High count × per-call latency = total redis.call() time. If p99 count is large (e.g. >100), the script is iterating many keys and each Raft read compounds the latency.",
+      "description": "Number of redis.call()/pcall() invocations per Lua script execution. High count \u00d7 per-call latency = total redis.call() time. If p99 count is large (e.g. >100), the script is iterating many keys and each Raft read compounds the latency.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1135,6 +1135,608 @@
       ],
       "title": "Average Time per redis.call() Invocation",
       "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Rate of Redis commands rejected as unsupported, broken down by the real command name (PR #594). Cardinality is bounded: at most 32 distinct `command` label values plus an `other` overflow bucket, so this is safe to expose globally. Values like `invalid_utf8` are sentinels emitted when the wire payload was not valid UTF-8 and the command name could not be decoded. Pair this with the 'Errors by Command' panel: the `unknown` rows there are broken down by real name here. **Requires `elastickv_redis_unsupported_commands_total` (PR #594). Empty until that PR merges — this is not a scrape failure.**",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum by (command) (rate(elastickv_redis_unsupported_commands_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "legendFormat": "{{command}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Unsupported Commands by Name",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "id": 23,
+      "panels": [
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.9
+                  },
+                  {
+                    "color": "green",
+                    "value": 0.99
+                  }
+                ]
+              },
+              "min": 0,
+              "max": 1,
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 0,
+            "y": 0
+          },
+          "id": 24,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m])) / clamp_min(sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\"}[5m])), 1e-9)",
+              "legendFormat": "hit ratio",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "Lease Fast-Path Hit Ratio",
+          "type": "stat",
+          "description": "Fraction of Coordinator.LeaseRead calls served from the local AppliedIndex instead of a full LinearizableRead. Steady-state should be >= 0.99 on a hot workload; a drop indicates leader flaps, clock-skew-driven lease expiry, or a regression on the fast path. This is one of the three #560-verification panels: if #560 landed, GET traffic should flow through LeaseRead and push this toward 1.0."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.05
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.25
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 6,
+            "y": 0
+          },
+          "id": 25,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "legendFormat": "GET p99",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "GET p99 (success)",
+          "type": "stat",
+          "description": "Current p99 latency for successful GET commands over the last 5 minutes. One of the three #560-verification panels: the fast path halved pebble seek count, so this should be FLAT or DOWN across the rollout, never up."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 10
+                  },
+                  {
+                    "color": "red",
+                    "value": 100
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 12,
+            "y": 0
+          },
+          "id": 26,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
+              "legendFormat": "lease misses/s",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "LinearizableRead Rate (lease miss)",
+          "type": "stat",
+          "description": "Rate of Coordinator.LeaseRead calls that FELL BACK to LinearizableRead. Every miss corresponds to one slow-path raft ReadIndex round-trip, the exact behaviour #560 eliminates for GETs on steady leaders. This is the third #560-verification panel: watch it collapse as the rollout reaches each node."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.001
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.01
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 18,
+            "y": 0
+          },
+          "id": 27,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum(rate(elastickv_redis_errors_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\"}[5m])) / clamp_min(sum(rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\"}[5m])), 1e-9)",
+              "legendFormat": "GET error ratio",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "title": "GET Error Ratio",
+          "type": "stat",
+          "description": "Fraction of GET requests returning an error. Paired with the GET p99 stat so operators can tell latency wins from quietly-shed traffic: a fast-path bug that mis-classifies a key could turn latency wins into NIL responses, which would light up this tile but not the latency one."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 4
+          },
+          "id": 28,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "legendFormat": "p50",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "legendFormat": "p95",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "legendFormat": "p99",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "GET Latency (p50 / p95 / p99)",
+          "type": "timeseries",
+          "description": "Per-quantile GET latency taken from elastickv_redis_request_duration_seconds. #560 reduces string-GET pebble SeekGE calls from ~17 to 1-2, so the p50 should barely move (it was already fast) while p95 and especially p99 tighten on the head of the distribution. Overlay with the deploy annotation to see the step change."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 4
+          },
+          "id": 29,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m]))",
+              "legendFormat": "{{node_id}} success",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"error\"}[5m]))",
+              "legendFormat": "{{node_id}} error",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "GET Throughput and Errors (per node)",
+          "type": "timeseries",
+          "description": "Per-node GET request rate split by outcome. Shows whether the rollout affects traffic distribution: if one node's GET rate collapses post-deploy without a matching rise elsewhere, clients are likely disconnecting instead of fast-pathing, which invalidates the latency-win interpretation."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "fillOpacity": 10,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 12
+          },
+          "id": 30,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m]))",
+              "legendFormat": "hits",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
+              "legendFormat": "misses (= LinearizableRead)",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Lease Hit vs LinearizableRead Rate Over Time",
+          "type": "timeseries",
+          "description": "Hit and miss rates as time series so operators can correlate miss spikes with leader elections (see the Raft dashboard's leader_changes counter) or lease clock-skew events. The miss series IS the raft engine's slow-path read rate; a clean #560 rollout should show this line fall sharply while hits rise."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 12
+          },
+          "id": 31,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (group) (rate(elastickv_raft_step_queue_full_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "legendFormat": "stepCh full (group {{group}})",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (group) (rate(elastickv_raft_dispatch_dropped_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "legendFormat": "dispatch dropped (group {{group}})",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (group) (rate(elastickv_raft_dispatch_errors_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "legendFormat": "dispatch errors (group {{group}})",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Raft Queue Saturation (stepCh full / outbound drops / errors)",
+          "type": "timeseries",
+          "description": "Counter rates from the etcd raft engine. stepCh-full means inbound messages from remote peers were dropped because the local raft loop was too slow to consume them (the 'etcd raft inbound step queue is full' log line). dispatch-dropped means outbound messages were discarded before transport because the per-peer channel was full. dispatch-errors means transport delivery failed. The pre-#560 seek storm caused all three to spike together; watch for them to fall after the rollout and stay flat."
+        },
+        {
+          "datasource": "$datasource",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 20
+          },
+          "id": 32,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (command) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=~\"GET|SET|TYPE|EXISTS\"}[5m]))",
+              "legendFormat": "{{command}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "GET vs SET vs TYPE vs EXISTS Rate",
+          "type": "timeseries",
+          "description": "Proxy for seek amplification: before #560, every GET internally issued a TYPE probe, so the ratio of TYPE-like rawKeyTypeAt work to GETs was ~1:1. We do not currently export pebble SeekGE directly; this panel lets operators sanity-check that GET's external rate hasn't shifted relative to SET/TYPE/EXISTS in a way that would explain latency changes. If pebble SeekGE telemetry is exposed later, a dedicated panel should be added here."
+        }
+      ],
+      "title": "Hot Path (legacy PR #560)",
+      "type": "row"
     }
   ],
   "refresh": "10s",
@@ -1163,6 +1765,27 @@
         "refresh": 1,
         "regex": "",
         "type": "datasource"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "elastickv",
+          "value": "elastickv"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Job",
+        "multi": false,
+        "name": "job",
+        "options": [
+          {
+            "selected": true,
+            "text": "elastickv",
+            "value": "elastickv"
+          }
+        ],
+        "query": "elastickv",
+        "type": "custom"
       },
       {
         "allValue": ".*",
@@ -1220,7 +1843,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Elastickv Redis Request Health",
+  "title": "Elastickv Redis",
   "uid": "elastickv-redis-summary",
   "version": 1
 }

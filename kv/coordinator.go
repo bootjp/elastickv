@@ -60,7 +60,7 @@ type LeaseReadObserver interface {
 // WithLeaseReadObserver wires a LeaseReadObserver onto a Coordinate.
 // This is the mechanism monitoring uses to surface the lease-hit ratio
 // panel on the Redis hot-path dashboard (see
-// monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+// the "Hot Path" row in monitoring/grafana/dashboards/elastickv-redis-summary.json).
 //
 // Typed-nil guard: a caller passing a typed-nil pointer
 // (e.g. `var o *myObserver; WithLeaseReadObserver(o)`) produces an
