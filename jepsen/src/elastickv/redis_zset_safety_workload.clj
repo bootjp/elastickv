@@ -152,7 +152,19 @@
   (close! [this _test] this)
 
   (setup! [this _test]
-    (if-let [cs (:conn-spec this)]
+    ;; Hard-fail when :conn-spec is missing after open!. Silently (or
+    ;; even loudly) proceeding would leave stale data from a previous
+    ;; run under zset-key and risk false-positive checker results from
+    ;; that dirty state. Better to abort the run and surface the
+    ;; configuration problem.
+    (let [cs (or (:conn-spec this)
+                 (throw (ex-info
+                          (str "ZSet safety setup! cannot clear prior state:"
+                               " :conn-spec is missing on client (open! did"
+                               " not populate it). Aborting to avoid running"
+                               " against stale data under " zset-key ".")
+                          {:type ::missing-conn-spec
+                           :zset-key zset-key})))]
       (try
         (car/wcar cs (car/del zset-key))
         (catch Throwable t
@@ -161,11 +173,7 @@
           ;; produce false-positive safety failures. Log loudly so
           ;; operators notice. clojure.tools.logging/warn expects
           ;; (warn msg) or (warn throwable msg) -- NOT multiple strings.
-          (warn t "ZSet safety setup! DEL failed -- stale data may survive into this run")))
-      ;; open! failed to populate :conn-spec (e.g. unresolvable host);
-      ;; flag it rather than silently proceeding with a no-op setup.
-      (warn (str "ZSet safety setup! skipped: missing :conn-spec on client;"
-                 " prior state under " zset-key " may survive into this run")))
+          (warn t "ZSet safety setup! DEL failed -- stale data may survive into this run"))))
     this)
 
   (teardown! [this _test] this)

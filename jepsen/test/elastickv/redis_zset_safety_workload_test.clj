@@ -599,14 +599,17 @@
 ;; Client setup! / invoke! robustness (gemini MEDIUM)
 ;; ---------------------------------------------------------------------------
 
-(deftest setup-bang-tolerates-missing-conn-spec
-  ;; gemini MEDIUM: if open! failed to populate :conn-spec (unresolvable
-  ;; host, etc.), setup! must NOT throw. Otherwise stale data from a
-  ;; prior run stays under zset-key and produces false-positive safety
-  ;; failures. The fix logs the skip loudly but returns normally.
+(deftest setup-bang-hard-fails-when-conn-spec-missing
+  ;; gemini HIGH: if open! failed to populate :conn-spec (unresolvable
+  ;; host, etc.), setup! MUST throw rather than silently proceed.
+  ;; Continuing with a no-op setup would leave stale data from a prior
+  ;; run under zset-key and risk false-positive checker verdicts from
+  ;; that dirty state. We want Jepsen to surface the failure.
   (let [client (workload/->ElastickvRedisZSetSafetyClient {} nil)]
-    (is (= client (client/setup! client {}))
-        "setup! must return the client (not throw) when :conn-spec is nil")))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #":conn-spec is missing"
+                          (client/setup! client {}))
+        "setup! must throw ex-info when :conn-spec is nil")))
 
 (deftest setup-bang-tolerates-unreachable-redis
   ;; gemini MEDIUM: a Redis that can't be reached must surface as a
