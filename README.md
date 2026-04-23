@@ -52,16 +52,20 @@ Provisioned monitoring assets live under:
 
 - `monitoring/prometheus/prometheus.yml`
 - `monitoring/grafana/dashboards/elastickv-cluster-overview.json`
-- `monitoring/grafana/dashboards/elastickv-cluster-summary.json`
+- `monitoring/grafana/dashboards/elastickv-dynamodb.json`
 - `monitoring/grafana/dashboards/elastickv-raft-status.json`
+- `monitoring/grafana/dashboards/elastickv-redis-summary.json`
+- `monitoring/grafana/dashboards/elastickv-pebble-internals.json`
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
 
 The provisioned dashboards are organized by operator task:
 
-- `Elastickv Cluster Overview` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health
-- `Elastickv Request Health` is the DynamoDB/API drilldown for slow operations, noisy nodes, and hot/erroring tables
+- `Elastickv Cluster` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health
+- `Elastickv DynamoDB` is the DynamoDB-compatible API drilldown for slow operations, noisy nodes, and hot/erroring tables
 - `Elastickv Raft Status` is the control-plane drilldown for membership, leader changes, failed proposals, node state, index drift, backlog, and leader contact
+- `Elastickv Redis` is the Redis-compatible API drilldown for per-command throughput/latency/errors, with a collapsible `Hot Path` row for GET fast-path (PR #560) verification
+- `Elastickv Pebble Internals` is the storage-engine drilldown for block cache, L0 pressure, compactions, memtables, and store write conflicts
 
 If you bind `--metricsAddress` to a non-loopback address, `--metricsToken` is required. Prometheus must send the same bearer token, for example:
 
