@@ -346,6 +346,56 @@
     (is (contains? kinds :missing-member-range)
         (str "expected :missing-member-range, got kinds=" kinds))))
 
+(deftest missing-member-range-error-reports-full-allowed-score-set
+  ;; When a member is missing from ZRANGEBYSCORE and multiple
+  ;; concurrent writers make several scores admissible, the error map
+  ;; must surface the FULL admissible set under :allowed (matching
+  ;; :score-mismatch-range convention) rather than pick an arbitrary
+  ;; single :expected-score.
+  (let [history [;; Two concurrent ZADDs for m1, both committed before
+                 ;; the read. Either score (5 or 6) is admissible, both
+                 ;; fall inside [0, 10].
+                 {:type :invoke :process 0 :f :zadd :value ["m1" 5] :index 0}
+                 {:type :invoke :process 1 :f :zadd :value ["m1" 6] :index 1}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 5] :index 2}
+                 {:type :ok     :process 1 :f :zadd :value ["m1" 6] :index 3}
+                 ;; Read sees nothing -- m1 must appear under any
+                 ;; admissible linearization, so :missing-member-range
+                 ;; fires.
+                 {:type :invoke :process 2 :f :zrangebyscore :value [0.0 10.0] :index 4}
+                 {:type :ok     :process 2 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0] :members []} :index 5}]
+        result  (run-checker history)
+        miss    (first (filter #(= :missing-member-range (:kind %))
+                               (:first-errors result)))]
+    (is (not (:valid? result)))
+    (is (some? miss)
+        (str "expected a :missing-member-range error, got: " (:first-errors result)))
+    (is (contains? miss :allowed)
+        (str "error map must include :allowed, got: " miss))
+    (is (= #{5.0 6.0} (set (:allowed miss)))
+        (str "expected :allowed to contain both admissible scores, got: " miss))
+    ;; :expected-score is retained for backcompat but MUST be nil when
+    ;; there is more than one admissible score, to avoid misleading
+    ;; consumers that read it.
+    (is (nil? (:expected-score miss))
+        (str "expected :expected-score nil for multi-score set, got: " miss))))
+
+(deftest missing-member-range-error-keeps-expected-score-when-single
+  ;; Backcompat: when the admissible set has exactly one score,
+  ;; :expected-score matches it.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 5] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 5] :index 1}
+                 {:type :invoke :process 0 :f :zrangebyscore :value [0.0 10.0] :index 2}
+                 {:type :ok     :process 0 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0] :members []} :index 3}]
+        result  (run-checker history)
+        miss    (first (filter #(= :missing-member-range (:kind %))
+                               (:first-errors result)))]
+    (is (some? miss))
+    (is (= #{5.0} (set (:allowed miss))))
+    (is (= 5.0 (:expected-score miss)))))
+
 (deftest zrange-completeness-still-detects-truly-missing-member
   ;; Sanity: no uncertainty, member committed-present. Absence flagged.
   (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 5] :index 0}

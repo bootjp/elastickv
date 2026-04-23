@@ -782,11 +782,22 @@
           (when (and must-be-present?
                      (score-definitely-in-range? scores unknown-score? lo hi)
                      (not (contains? observed-members member)))
+            ;; Report the full set of admissible scores (:allowed), not
+            ;; just an arbitrary first element -- picking `(first
+            ;; scores)` on a multi-element set is misleading when
+            ;; concurrent writers leave several linearizations valid.
+            ;; :allowed matches the convention used by the sibling
+            ;; :score-mismatch-range error above. :expected-score is
+            ;; retained (as `(first scores)` for a single-element set,
+            ;; nil otherwise) for backward compatibility with any
+            ;; out-of-tree consumers.
             (swap! errors conj {:kind :missing-member-range
                                 :index cmp-idx
                                 :bounds bounds
                                 :member member
-                                :expected-score (first scores)})))))
+                                :allowed scores
+                                :expected-score (when (= 1 (count scores))
+                                                  (first scores))})))))
     @errors))
 
 (defn zset-safety-checker
