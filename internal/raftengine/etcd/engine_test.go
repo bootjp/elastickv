@@ -1912,8 +1912,8 @@ func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
 
 // TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
 // that reach raft.Config when neither the caller nor the operator has
-// overridden them: 512 inflight msgs and 4 MiB per msg. The combination
-// bounds worst-case per-peer buffered Raft traffic at 2 GiB (512 × 4 MiB);
+// overridden them: 512 inflight msgs and 2 MiB per msg. The combination
+// bounds worst-case per-peer buffered Raft traffic at 1 GiB (512 × 2 MiB);
 // see defaultMaxInflightMsg for the memory-footprint rationale.
 func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "")
@@ -1922,7 +1922,7 @@ func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
 	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
 	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
 	require.Equal(t, 512, got.MaxInflightMsg)
-	require.Equal(t, uint64(4<<20), got.MaxSizePerMsg)
+	require.Equal(t, uint64(2<<20), got.MaxSizePerMsg)
 }
 
 // TestNormalizeLimitConfig_EnvOverridesCaller pins that a valid env var

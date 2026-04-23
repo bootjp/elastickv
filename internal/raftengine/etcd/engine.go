@@ -47,16 +47,20 @@ const (
 	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
 	// #565 removed most of that CPU); 512 is a 2× safety margin.
 	//
-	// We intentionally do NOT raise this in lock-step with the 4 MiB
-	// defaultMaxSizePerMsg bump: the two knobs multiply, and 1024 ×
-	// 4 MiB is a 4 GiB per-peer worst-case product that a bursty
-	// multi-peer deployment can plausibly realise under TCP backpressure
-	// loss. 512 × 4 MiB halves that to 2 GiB per peer while preserving
-	// the MsgApp-batching win that motivates the 4 MiB cap on small-entry
-	// workloads. Operators who need deeper pipelines (large clusters with
-	// plenty of RAM) can raise this via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS
-	// without a rebuild; operators who need a smaller memory ceiling can
-	// lower MaxSizePerMsg via ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
+	// We intentionally do NOT raise this in lock-step with the 2 MiB
+	// defaultMaxSizePerMsg: the two knobs multiply, and 1024 × 2 MiB
+	// is a 2 GiB per-peer worst-case product that a bursty multi-peer
+	// deployment can plausibly realise under TCP backpressure loss.
+	// 512 × 2 MiB halves that to 1 GiB per peer (4 GiB on a 5-node
+	// leader with 4 followers), which fits comfortably inside the
+	// 4–16 GiB RAM envelope of typical elastickv nodes while still
+	// preserving the MsgApp-batching win that motivates raising the
+	// byte cap above etcd/raft's 1 MiB upstream default on small-entry
+	// workloads. Operators who need deeper pipelines (large clusters
+	// with plenty of RAM) can raise this via
+	// ELASTICKV_RAFT_MAX_INFLIGHT_MSGS without a rebuild; operators
+	// who need a smaller memory ceiling can lower MaxSizePerMsg via
+	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
 	defaultMaxInflightMsg = 512
 	// minInboundChannelCap is the floor applied when sizing the engine's
 	// inbound stepCh / dispatchReportCh from the resolved MaxInflightMsg.
@@ -66,12 +70,22 @@ const (
 	// pre-#529 compiled-in default that was known to be survivable.
 	minInboundChannelCap = 256
 	// defaultMaxSizePerMsg caps the byte size of a single MsgApp payload.
-	// Raised from 1 MiB → 4 MiB so each MsgApp amortises more entries
-	// under small-entry workloads (Redis-style KV, median entry ~500 B).
+	// Set to 2 MiB — double etcd/raft's 1 MiB upstream default — so each
+	// MsgApp amortises more entries under small-entry workloads
+	// (Redis-style KV, median entry ~500 B; 2 MiB / 500 B ≈ 4000 entries
+	// per MsgApp already saturates the per-RPC batching benefit).
 	// Fewer MsgApps per committed byte means fewer dispatcher wake-ups
 	// on the leader and fewer recv syscalls on the follower; the
 	// follower's apply loop also contends less with the read path.
-	defaultMaxSizePerMsg = 4 << 20
+	//
+	// Lowered from 4 MiB → 2 MiB in tandem with defaultMaxInflightMsg=512
+	// to cap per-peer worst-case buffered Raft traffic at 1 GiB
+	// (512 × 2 MiB), i.e. 4 GiB on a 5-node leader with 4 followers.
+	// The previous 4 MiB cap produced a 2 GiB/peer, 8 GiB/leader
+	// worst case that was too tight for the 4–16 GiB RAM envelope
+	// typical elastickv nodes operate in; the batching win of 4 MiB
+	// over 2 MiB is marginal on small-entry workloads.
+	defaultMaxSizePerMsg = 2 << 20
 	// maxInflightMsgEnvVar / maxSizePerMsgEnvVar let operators tune the
 	// Raft-level flow-control knobs without a rebuild. Parsed once at
 	// Open and passed through normalizeLimitConfig; invalid values fall

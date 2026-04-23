@@ -38,19 +38,24 @@ const (
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1
 	etcdElectionMinTicks  = 2
-	// etcdMaxSizePerMsg caps bytes per MsgApp. 4 MiB reduces MsgApp count
-	// per committed byte under small-entry KV workloads, cutting dispatcher
-	// wake-ups on the leader and recv syscalls on the follower. Operators
-	// can override via ELASTICKV_RAFT_MAX_SIZE_PER_MSG at runtime.
-	etcdMaxSizePerMsg = 4 << 20
+	// etcdMaxSizePerMsg caps bytes per MsgApp. 2 MiB (double etcd/raft's
+	// 1 MiB upstream default) reduces MsgApp count per committed byte
+	// under small-entry KV workloads, cutting dispatcher wake-ups on the
+	// leader and recv syscalls on the follower, while keeping the
+	// per-peer worst-case buffered memory (MaxInflightMsg × MaxSizePerMsg
+	// = 512 × 2 MiB = 1 GiB) inside the RAM envelope of typical
+	// elastickv nodes (4–16 GiB). Operators can override via
+	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG at runtime.
+	etcdMaxSizePerMsg = 2 << 20
 	// etcdMaxInflightMsg caps in-flight MsgApps per peer. 512 gives a 2x
 	// safety margin over the pre-#529 default of 256 to absorb short CPU
 	// bursts, without letting the per-peer worst-case buffered memory
-	// (MaxInflightMsg × MaxSizePerMsg) grow beyond 2 GiB on the current
-	// 4 MiB MaxSizePerMsg. Operators with wide-bandwidth LAN clusters and
-	// headroom can raise this via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS at
-	// runtime; operators with tighter memory budgets can lower the byte
-	// cap via ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
+	// (MaxInflightMsg × MaxSizePerMsg) grow beyond 1 GiB on the current
+	// 2 MiB MaxSizePerMsg — i.e. 4 GiB on a 5-node leader with 4
+	// followers. Operators with wide-bandwidth LAN clusters and headroom
+	// can raise this via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS at runtime;
+	// operators with tighter memory budgets can lower the byte cap via
+	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
 	etcdMaxInflightMsg = 512
 )
 
