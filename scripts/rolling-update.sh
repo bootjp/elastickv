@@ -665,12 +665,29 @@ run_container() {
     )
   fi
 
+  # Pass through additional container environment variables from EXTRA_ENV.
+  # Accepts a whitespace-separated list of KEY=VALUE pairs, e.g.:
+  #   EXTRA_ENV="ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512"
+  # Each pair is forwarded as a single `-e KEY=VALUE` flag so VALUE may contain
+  # characters that bash would otherwise interpret; pairs themselves must not
+  # contain whitespace.
+  local extra_env_flags=()
+  if [[ -n "${EXTRA_ENV:-}" ]]; then
+    # shellcheck disable=SC2206
+    local -a extra_env_pairs=( ${EXTRA_ENV} )
+    local pair
+    for pair in "${extra_env_pairs[@]}"; do
+      extra_env_flags+=(-e "$pair")
+    done
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
