@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
@@ -55,7 +56,13 @@ func TestGetClusterOverviewReturnsSelfAndLeaders(t *testing.T) {
 func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	t.Parallel()
 	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
-	srv.RegisterGroup(1, fakeGroup{leaderID: "n1", term: 2, commit: 99, applied: 97})
+	srv.RegisterGroup(1, fakeGroupWithContact{leaderID: "n1", term: 2, commit: 99, applied: 97, lastContact: 5 * time.Second})
+
+	// Freeze nowFunc so the computed last-contact timestamp is deterministic.
+	origNow := nowFunc
+	fixed := time.Unix(1_000_000, 0)
+	nowFunc = func() time.Time { return fixed }
+	t.Cleanup(func() { nowFunc = origNow })
 
 	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
 	if err != nil {
@@ -67,6 +74,28 @@ func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	g := resp.Groups[0]
 	if g.CommitIndex != 99 || g.AppliedIndex != 97 || g.LeaderTerm != 2 {
 		t.Fatalf("unexpected state %+v", g)
+	}
+	wantLastContact := fixed.Add(-5 * time.Second).UnixMilli()
+	if g.LastContactUnixMs != wantLastContact {
+		t.Fatalf("LastContactUnixMs = %d, want %d", g.LastContactUnixMs, wantLastContact)
+	}
+}
+
+type fakeGroupWithContact struct {
+	leaderID    string
+	term        uint64
+	commit      uint64
+	applied     uint64
+	lastContact time.Duration
+}
+
+func (f fakeGroupWithContact) Status() raftengine.Status {
+	return raftengine.Status{
+		Leader:       raftengine.LeaderInfo{ID: f.leaderID},
+		Term:         f.term,
+		CommitIndex:  f.commit,
+		AppliedIndex: f.applied,
+		LastContact:  f.lastContact,
 	}
 }
 

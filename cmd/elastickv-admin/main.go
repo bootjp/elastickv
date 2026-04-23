@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,6 +84,7 @@ var (
 	nodeTLSCACertFile = flag.String("nodeTLSCACertFile", "", "PEM file with CA certificates used to verify nodes' gRPC TLS; setting this flag enables TLS dialing")
 	nodeTLSServerName = flag.String("nodeTLSServerName", "", "Expected TLS server name when connecting to nodes (overrides the address host); only honoured when TLS is enabled")
 	nodeTLSSkipVerify = flag.Bool("nodeTLSInsecureSkipVerify", false, "Dial nodes with TLS but skip certificate verification; development only. Implies TLS.")
+	allowRemoteBind   = flag.Bool("allowRemoteBind", false, "Allow --bindAddr to listen on a non-loopback interface. The admin UI has no browser-facing auth; set this only when the UI is fronted by an authenticating reverse proxy.")
 )
 
 func main() {
@@ -92,25 +94,36 @@ func main() {
 	}
 }
 
-func run() error {
+type runConfig struct {
+	seeds []string
+	fan   *fanout
+}
+
+// initRun consolidates flag parsing and fanout construction so run() stays
+// under the project's cyclop budget.
+func initRun() (runConfig, error) {
 	seeds := splitNodes(*nodes)
 	if len(seeds) == 0 {
-		return errors.New("--nodes is required (comma-separated gRPC addresses)")
+		return runConfig{}, errors.New("--nodes is required (comma-separated gRPC addresses)")
 	}
-
 	token, err := loadToken(*nodeTokenFile, *insecureNoAuth)
 	if err != nil {
-		return err
+		return runConfig{}, err
 	}
-
+	if err := validateBindAddr(*bindAddr, *allowRemoteBind); err != nil {
+		return runConfig{}, err
+	}
 	creds, err := loadTransportCredentials(*nodeTLSCACertFile, *nodeTLSServerName, *nodeTLSSkipVerify)
 	if err != nil {
-		return err
+		return runConfig{}, err
 	}
-
 	fan := newFanout(seeds, token, *nodesRefreshInterval, creds)
-	defer fan.Close()
+	return runConfig{seeds: seeds, fan: fan}, nil
+}
 
+// buildMux wires the Phase 0 HTTP surface. Lives outside run() both for
+// testability and to keep run() under the cyclop budget.
+func buildMux(fan *fanout) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -127,10 +140,19 @@ func run() error {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("elastickv-admin: phase 0 — SPA not yet embedded\n"))
 	})
+	return mux
+}
+
+func run() error {
+	cfg, err := initRun()
+	if err != nil {
+		return err
+	}
+	defer cfg.fan.Close()
 
 	srv := &http.Server{
 		Addr:              *bindAddr,
-		Handler:           mux,
+		Handler:           buildMux(cfg.fan),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -142,7 +164,7 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("elastickv-admin listening on %s (seeds=%v)", *bindAddr, seeds)
+		log.Printf("elastickv-admin listening on %s (seeds=%v)", *bindAddr, cfg.seeds)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
@@ -161,6 +183,33 @@ func run() error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// validateBindAddr rejects a non-loopback bind unless the operator has
+// explicitly opted into --allowRemoteBind. The admin binary performs no
+// browser-side authentication in Phase 0 while holding a privileged node
+// admin token, so a misconfigured 0.0.0.0:8080 would expose that token-gated
+// cluster view to anyone on the network.
+func validateBindAddr(addr string, allow bool) error {
+	if allow {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return errors.Wrapf(err, "invalid --bindAddr %q", addr)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("--bindAddr %q has an empty host; pass an explicit loopback host like 127.0.0.1 or set --allowRemoteBind when fronted by an auth proxy", addr)
+	}
+	ip := net.ParseIP(host)
+	switch {
+	case host == "localhost":
+		return nil
+	case ip != nil && ip.IsLoopback():
+		return nil
+	}
+	return fmt.Errorf("--bindAddr %q is not loopback; set --allowRemoteBind to expose the admin UI remotely (the UI has no browser-side auth — do so only behind an auth proxy)", addr)
 }
 
 func splitNodes(raw string) []string {
@@ -252,6 +301,15 @@ type nodeClient struct {
 	addr   string
 	conn   *grpc.ClientConn
 	client pb.AdminClient
+
+	// refcount and evicted are protected by fanout.mu. They let the cache
+	// evict entries while RPCs are in flight: eviction removes the entry
+	// from the map and marks it evicted, and the conn is closed only once
+	// the last borrower calls release. Without this the previous design
+	// could cancel healthy in-flight GetClusterOverview calls whenever the
+	// cache was saturated.
+	refcount int
+	evicted  bool
 }
 
 type membership struct {
@@ -309,6 +367,9 @@ func (f *fanout) Close() {
 		return
 	}
 	f.closed = true
+	// Shutdown is an intentional cancellation of any in-flight RPCs; close
+	// connections eagerly and let borrowers see the cancel. Borrowers that
+	// still hold leases will observe the conn as closed on their next call.
 	for _, c := range f.clients {
 		if err := c.conn.Close(); err != nil {
 			log.Printf("elastickv-admin: close gRPC connection to %s: %v", c.addr, err)
@@ -320,37 +381,58 @@ func (f *fanout) Close() {
 	f.clients = map[string]*nodeClient{}
 }
 
-func (f *fanout) clientFor(addr string) (*nodeClient, error) {
+// clientFor returns a leased nodeClient that callers must release once they
+// finish the RPC (release is the second return value, always non-nil and safe
+// to call). The cache is bounded by maxCachedClients; if the cache is full,
+// one entry is evicted — prefer non-seed victims, fall back to any entry when
+// the cache is saturated with seeds. Evicted entries stop accepting new leases
+// but their underlying *grpc.ClientConn is kept alive until every outstanding
+// borrower has released; this prevents an eviction from canceling a healthy
+// concurrent GetClusterOverview.
+func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
-		return nil, errFanoutClosed
+		return nil, func() {}, errFanoutClosed
 	}
 	if c, ok := f.clients[addr]; ok {
-		return c, nil
+		c.refcount++
+		return c, f.releaseFunc(c), nil
 	}
-	// Bound the cache so a high-churn cluster or a stream of hostile
-	// discovery responses cannot leak file descriptors. Prefer evicting a
-	// non-seed entry — those are easiest to re-dial on demand — but when the
-	// cache is already saturated with seeds (operator passed >=maxCachedClients
-	// addresses to --nodes), fall back to evicting any entry. Without that
-	// fallback the cap is vacuous in the seed-heavy configuration Codex
-	// flagged, so the cache could grow without bound.
 	if len(f.clients) >= maxCachedClients {
 		f.evictOneLocked()
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(f.creds))
 	if err != nil {
-		return nil, errors.Wrapf(err, "dial %s", addr)
+		return nil, func() {}, errors.Wrapf(err, "dial %s", addr)
 	}
-	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn)}
+	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn), refcount: 1}
 	f.clients[addr] = c
-	return c, nil
+	return c, f.releaseFunc(c), nil
 }
 
-// evictOneLocked removes exactly one entry from f.clients and closes its
-// connection. Prefers non-seed entries; falls back to any entry if none exist
-// (for example when len(seeds) >= maxCachedClients). Caller must hold f.mu.
+// releaseFunc returns the closer used to drop a lease. On the last release
+// of an evicted client the underlying connection is finally closed.
+func (f *fanout) releaseFunc(c *nodeClient) func() {
+	return func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if c.refcount > 0 {
+			c.refcount--
+		}
+		if c.refcount == 0 && c.evicted {
+			if err := c.conn.Close(); err != nil {
+				log.Printf("elastickv-admin: deferred close for %s: %v", c.addr, err)
+			}
+		}
+	}
+}
+
+// evictOneLocked removes exactly one entry from f.clients. Prefers non-seed
+// entries; falls back to any entry if none are eligible (for example when
+// len(seeds) >= maxCachedClients). The underlying connection is closed only
+// if no borrowers still hold a lease; otherwise closing is deferred to the
+// last release (see releaseFunc). Caller must hold f.mu.
 func (f *fanout) evictOneLocked() {
 	seeds := make(map[string]struct{}, len(f.seeds))
 	for _, s := range f.seeds {
@@ -365,37 +447,45 @@ func (f *fanout) evictOneLocked() {
 		if _, keep := seeds[victim]; keep {
 			continue
 		}
-		delete(f.clients, victim)
-		if err := vc.conn.Close(); err != nil {
-			log.Printf("elastickv-admin: evict %s: close: %v", victim, err)
-		}
+		f.retireLocked(victim, vc)
 		return
 	}
-	if fallbackClient == nil {
+	if fallbackClient != nil {
+		f.retireLocked(fallback, fallbackClient)
+	}
+}
+
+// retireLocked removes a client from the cache and, if no lease is currently
+// held, closes its connection. Otherwise the connection stays open until the
+// last borrower releases, so an evicted entry never cancels an in-flight
+// RPC. Caller must hold f.mu.
+func (f *fanout) retireLocked(addr string, c *nodeClient) {
+	delete(f.clients, addr)
+	if c.evicted {
 		return
 	}
-	delete(f.clients, fallback)
-	if err := fallbackClient.conn.Close(); err != nil {
-		log.Printf("elastickv-admin: evict %s (seed-fallback): close: %v", fallback, err)
+	c.evicted = true
+	if c.refcount > 0 {
+		return
+	}
+	if err := c.conn.Close(); err != nil {
+		log.Printf("elastickv-admin: retire %s: close: %v", addr, err)
 	}
 }
 
 // invalidateClient drops a cached connection — used when a peer returns
-// Unavailable so the next request re-dials or skips the removed node.
+// Unavailable so the next request re-dials or skips the removed node. The
+// connection stays open until the last borrower releases, so invalidating
+// does not cancel other goroutines' in-flight RPCs.
 func (f *fanout) invalidateClient(addr string) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
-		f.mu.Unlock()
 		return
 	}
-	c, ok := f.clients[addr]
-	delete(f.clients, addr)
 	f.members = nil
-	f.mu.Unlock()
-	if ok {
-		if err := c.conn.Close(); err != nil {
-			log.Printf("elastickv-admin: close gRPC connection to %s: %v", addr, err)
-		}
+	if c, ok := f.clients[addr]; ok {
+		f.retireLocked(addr, c)
 	}
 }
 
@@ -453,7 +543,7 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 // discoveryRPCTimeout so a slow first seed does not stall the whole request.
 func (f *fanout) refreshMembership(ctx context.Context) []string {
 	for _, seed := range f.seeds {
-		cli, err := f.clientFor(seed)
+		cli, release, err := f.clientFor(seed)
 		if err != nil {
 			log.Printf("elastickv-admin: dial seed %s: %v", seed, err)
 			continue
@@ -461,6 +551,7 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 		rpcCtx, cancel := context.WithTimeout(ctx, discoveryRPCTimeout)
 		resp, err := cli.client.GetClusterOverview(f.outgoingCtx(rpcCtx), &pb.GetClusterOverviewRequest{})
 		cancel()
+		release()
 		if err != nil {
 			if status.Code(err) == codes.Unavailable {
 				f.invalidateClient(seed)
@@ -562,12 +653,13 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 		go func(i int, addr string) {
 			defer wg.Done()
 			entry := perNodeResult{Node: addr}
-			cli, err := f.clientFor(addr)
+			cli, release, err := f.clientFor(addr)
 			if err != nil {
 				entry.Error = err.Error()
 				results[i] = entry
 				return
 			}
+			defer release()
 			resp, err := cli.client.GetClusterOverview(f.outgoingCtx(ctx), &pb.GetClusterOverviewRequest{})
 			if err != nil {
 				if status.Code(err) == codes.Unavailable {

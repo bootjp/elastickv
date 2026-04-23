@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/adapter"
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 )
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
@@ -69,7 +69,7 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 
 func TestAdminMembersFromBootstrapExcludesSelf(t *testing.T) {
 	t.Parallel()
-	servers := []raft.Server{
+	servers := []raftengine.Server{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 		{ID: "n3", Address: "10.0.0.13:50051"},
@@ -91,7 +91,7 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 	if got := adminMembersFromBootstrap("n1", nil); got != nil {
 		t.Fatalf("empty bootstrap should produce nil, got %v", got)
 	}
-	single := []raft.Server{{ID: "n1", Address: "a:1"}}
+	single := []raftengine.Server{{ID: "n1", Address: "a:1"}}
 	if got := adminMembersFromBootstrap("n1", single); len(got) != 0 {
 		t.Fatalf("single-node bootstrap should yield no members, got %v", got)
 	}

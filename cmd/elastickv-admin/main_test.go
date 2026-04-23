@@ -28,6 +28,38 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestValidateBindAddr(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		addr    string
+		allow   bool
+		wantErr bool
+	}{
+		{"loopback ipv4", "127.0.0.1:8080", false, false},
+		{"loopback ipv6", "[::1]:8080", false, false},
+		{"localhost", "localhost:8080", false, false},
+		{"remote bind default rejected", "0.0.0.0:8080", false, true},
+		{"specific ip default rejected", "10.0.0.5:8080", false, true},
+		{"empty host rejected", ":8080", false, true},
+		{"allow opt-in permits remote", "0.0.0.0:8080", true, false},
+		{"malformed addr", "not-an-addr", false, true},
+	}
+	for _, tc := range cases {
+
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateBindAddr(tc.addr, tc.allow)
+			if tc.wantErr && err == nil {
+				t.Fatalf("want error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestSplitNodesTrimsAndDrops(t *testing.T) {
 	t.Parallel()
 	got := splitNodes(" host-a:50051 ,,host-b:50051 ,")
@@ -225,8 +257,10 @@ func TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds(t *testing.T) {
 	defer f.Close()
 
 	for _, s := range seeds {
-		if _, err := f.clientFor(s); err != nil {
+		if _, release, err := f.clientFor(s); err != nil {
 			t.Fatalf("clientFor(%s): %v", s, err)
+		} else {
+			release()
 		}
 	}
 	f.mu.Lock()
@@ -245,9 +279,11 @@ func TestFanoutClientCacheEvictsWhenFull(t *testing.T) {
 	// Fill the cache past the cap. New dials should not error out and the
 	// map must stay bounded.
 	for i := 0; i < maxCachedClients+5; i++ {
-		if _, err := f.clientFor("node-" + strconvItoa(i) + ":1"); err != nil {
+		_, release, err := f.clientFor("node-" + strconvItoa(i) + ":1")
+		if err != nil {
 			t.Fatalf("clientFor[%d]: %v", i, err)
 		}
+		release()
 	}
 	f.mu.Lock()
 	size := len(f.clients)
@@ -471,6 +507,39 @@ func TestWriteJSONSuccessPath(t *testing.T) {
 	}
 }
 
+// TestFanoutEvictionDoesNotCloseInFlightConn asserts that evicting a cached
+// entry while a borrower still holds the lease does NOT close the underlying
+// gRPC connection — the close is deferred to the last release(), so in-flight
+// RPCs on the evicted client complete successfully.
+func TestFanoutEvictionDoesNotCloseInFlightConn(t *testing.T) {
+	t.Parallel()
+
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	addr := startFakeAdmin(t, peer)
+
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	// Borrower 1 leases the client.
+	cli, release, err := f.clientFor(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force eviction while the lease is held. invalidateClient marks
+	// the entry retired+refcount>0, so the conn must stay open.
+	f.invalidateClient(addr)
+
+	// The lease should still be usable — conn.Close() has been deferred.
+	if _, callErr := cli.client.GetClusterOverview(
+		context.Background(), &pb.GetClusterOverviewRequest{},
+	); callErr != nil {
+		t.Fatalf("in-flight RPC on retired client failed (eviction raced): %v", callErr)
+	}
+	release() // last release closes the conn; verify no panic / double-close.
+	release() // extra release must be a no-op (refcount already zero).
+}
+
 // TestFanoutClientForAfterCloseIsSafe asserts that clientFor and
 // invalidateClient do not panic when invoked concurrently with Close — a
 // shutdown-time race that otherwise hits a nil-map write in clientFor.
@@ -479,7 +548,7 @@ func TestFanoutClientForAfterCloseIsSafe(t *testing.T) {
 	f := newFanout([]string{"127.0.0.1:1"}, "", time.Second, insecure.NewCredentials())
 	f.Close()
 
-	if _, err := f.clientFor("127.0.0.1:2"); err == nil {
+	if _, _, err := f.clientFor("127.0.0.1:2"); err == nil {
 		t.Fatal("expected error after Close, got nil")
 	}
 	f.invalidateClient("127.0.0.1:2") // must be a no-op, not panic

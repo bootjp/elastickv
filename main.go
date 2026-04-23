@@ -499,7 +499,7 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,
-	bootstrapServers []raft.Server,
+	bootstrapServers []raftengine.Server,
 ) (*adapter.AdminServer, []grpc.ServerOption, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	srv, opts, err := configureAdminService(
@@ -527,19 +527,18 @@ func setupAdminService(
 // the Raft bootstrap configuration so GetClusterOverview returns a populated
 // members list. Without this the admin binary's membersFrom cache collapses to
 // only the responding seed and stops fanning out across the cluster.
-func adminMembersFromBootstrap(selfID string, servers []raft.Server) []adapter.NodeIdentity {
+func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []adapter.NodeIdentity {
 	if len(servers) == 0 {
 		return nil
 	}
 	out := make([]adapter.NodeIdentity, 0, len(servers))
 	for _, s := range servers {
-		id := string(s.ID)
-		if id == selfID {
+		if s.ID == selfID {
 			continue
 		}
 		out = append(out, adapter.NodeIdentity{
-			NodeID:      id,
-			GRPCAddress: string(s.Address),
+			NodeID:      s.ID,
+			GRPCAddress: s.Address,
 		})
 	}
 	return out

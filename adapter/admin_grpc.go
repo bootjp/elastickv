@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
@@ -15,6 +16,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// nowFunc is a test seam for injecting a fixed clock into GetRaftGroups so
+// its timestamp output is deterministic.
+var nowFunc = time.Now
 
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
@@ -103,14 +108,22 @@ func (s *AdminServer) GetRaftGroups(
 	defer s.groupsMu.RUnlock()
 	ids := sortedGroupIDs(s.groups)
 	out := make([]*pb.RaftGroupState, 0, len(ids))
+	now := nowFunc()
 	for _, id := range ids {
 		st := s.groups[id].Status()
+		// Translate LastContact (duration since the last contact with the
+		// leader, per raftengine.Status) into an absolute unix-ms so UI
+		// clients can diff against their own clock instead of having to
+		// reason about the server's uptime. Zero LastContact (leader on
+		// self, or no contact recorded yet) reports the current time
+		// rather than an arbitrary epoch zero.
 		out = append(out, &pb.RaftGroupState{
-			RaftGroupId:  id,
-			LeaderNodeId: st.Leader.ID,
-			LeaderTerm:   st.Term,
-			CommitIndex:  st.CommitIndex,
-			AppliedIndex: st.AppliedIndex,
+			RaftGroupId:       id,
+			LeaderNodeId:      st.Leader.ID,
+			LeaderTerm:        st.Term,
+			CommitIndex:       st.CommitIndex,
+			AppliedIndex:      st.AppliedIndex,
+			LastContactUnixMs: now.Add(-st.LastContact).UnixMilli(),
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil
