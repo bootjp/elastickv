@@ -97,8 +97,10 @@ type leaseState struct {
 ```
 
 All timestamps on the lease path come from `internal/monoclock`, which
-reads `CLOCK_MONOTONIC_RAW` via `clock_gettime(3)` on Linux / Darwin /
-FreeBSD (falling back to Go's runtime monotonic on other platforms).
+reads `CLOCK_MONOTONIC_RAW` via `clock_gettime(3)` on Linux and Darwin
+(falling back to Go's runtime monotonic on other platforms — FreeBSD
+included, since `golang.org/x/sys/unix` does not export
+`CLOCK_MONOTONIC_RAW` on FreeBSD).
 The raw monotonic clock is immune to NTP rate adjustment and wall-clock
 step events — TiKV's lease path makes the same choice. Go's
 `time.Now()` is not sufficient: its embedded monotonic component is
@@ -176,10 +178,12 @@ safety case for the lease should not depend on NTP being well-behaved:
    which point NTP slew alone becomes comparable to the margin.
 
 The `internal/monoclock` package wraps `clock_gettime(CLOCK_MONOTONIC_RAW, &ts)`
-(`unix.ClockGettime` from `golang.org/x/sys/unix`) on Linux, Darwin,
-and FreeBSD. Other platforms fall back to Go's runtime monotonic
-clock; on those platforms lease safety reverts to the NTP-slewed
-baseline, which is still sufficient at the current margin.
+(`unix.ClockGettime` from `golang.org/x/sys/unix`) on Linux and
+Darwin. Other platforms — including FreeBSD, where `x/sys/unix` does
+not export the `CLOCK_MONOTONIC_RAW` constant — fall back to Go's
+runtime monotonic clock; on those platforms lease safety reverts to
+the NTP-slewed baseline, which is still sufficient at the current
+margin.
 
 ### 3.3 Refresh triggers
 

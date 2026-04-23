@@ -1,13 +1,14 @@
-//go:build linux || darwin || freebsd
+//go:build linux || darwin
 
 package monoclock
 
 import "golang.org/x/sys/unix"
 
-// nowNanos reads CLOCK_MONOTONIC_RAW via clock_gettime(3). Linux and
-// Darwin both expose this clock; FreeBSD labels the equivalent clock
-// CLOCK_MONOTONIC_RAW as well. Windows and Plan 9 use the portable
-// fallback (monoclock_fallback.go).
+// nowNanos reads CLOCK_MONOTONIC_RAW via clock_gettime(3). Only Linux
+// and Darwin export this constant in golang.org/x/sys/unix; FreeBSD
+// lacks the binding (its kernel exposes CLOCK_MONOTONIC_PRECISE, a
+// different clock) and all other platforms use the portable fallback
+// in monoclock_fallback.go.
 //
 // A non-nil error from ClockGettime should be essentially impossible
 // on supported platforms (the syscall fails only on invalid clock IDs
