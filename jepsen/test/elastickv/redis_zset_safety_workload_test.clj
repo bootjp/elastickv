@@ -663,6 +663,34 @@
             (str "expected :ok on numeric reply, got: " result))
         (is (= ["m1" 7.0] (:value result)))))))
 
+(deftest zrem-invoke-handles-nil-response
+  ;; gemini MEDIUM: if car/wcar for ZREM returns nil (protocol edge,
+  ;; closed connection, etc.), `(long nil)` would throw NPE and the
+  ;; op would be logged as a generic failure via the general Exception
+  ;; handler. Guard with `(or removed 0)` so the op resolves cleanly
+  ;; as :ok [member false].
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "ghost" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] nil)]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result))
+            (str "expected :ok on nil ZREM reply, got: " result))
+        (is (= ["ghost" false] (:value result))
+            (str "expected removed? false on nil reply, got: " result))))))
+
+(deftest zrem-invoke-handles-numeric-response
+  ;; Sanity: ZREM's normal reply is an integer count.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "m1" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] 1)]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result)))
+        (is (= ["m1" true] (:value result)))))))
+
 (deftest parse-withscores-handles-inf-strings
   ;; gemini HIGH: Redis returns "inf" / "+inf" / "-inf" for infinite
   ;; ZSET scores. Double/parseDouble expects "Infinity"; the workload's

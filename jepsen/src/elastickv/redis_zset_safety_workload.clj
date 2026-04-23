@@ -139,6 +139,13 @@
   [conn-spec key delta member]
   (car/wcar conn-spec (car/zincrby key (double delta) member)))
 
+(defn- zrem!
+  "Executes a ZREM against conn-spec and returns Carmine's raw reply
+  (normally an integer count of removed members). Extracted so tests
+  can stub the Redis call without going through the `car/wcar` macro."
+  [conn-spec key member]
+  (car/wcar conn-spec (car/zrem key member)))
+
 (defrecord ElastickvRedisZSetSafetyClient [node->port conn-spec]
   client/Client
 
@@ -207,8 +214,14 @@
 
           :zrem
           (let [member (:value op)
-                removed (car/wcar cs (car/zrem zset-key member))]
-            (assoc op :type :ok :value [member (pos? (long removed))]))
+                ;; Carmine normally returns an integer count. Guard
+                ;; against nil / missing reply (protocol edge, closed
+                ;; connection, etc.) so `(long removed)` doesn't throw
+                ;; NPE -- that would otherwise fall through to the
+                ;; general Exception handler and be logged as a generic
+                ;; op failure, obscuring the actual signal.
+                removed (zrem! cs zset-key member)]
+            (assoc op :type :ok :value [member (pos? (long (or removed 0)))]))
 
           :zrange-all
           (let [flat (car/wcar cs (car/zrange zset-key 0 -1 "WITHSCORES"))]
