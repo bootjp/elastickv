@@ -56,6 +56,13 @@ const (
 	// via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS and
 	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
 	defaultMaxInflightMsg = 1024
+	// minInboundChannelCap is the floor applied when sizing the engine's
+	// inbound stepCh / dispatchReportCh from the resolved MaxInflightMsg.
+	// Even if a (misconfigured) caller drops MaxInflightMsg below this,
+	// we keep at least this much buffering so that a single tick burst
+	// doesn't trip errStepQueueFull on the inbound side. 256 matches the
+	// pre-#529 compiled-in default that was known to be survivable.
+	minInboundChannelCap = 256
 	// defaultMaxSizePerMsg caps the byte size of a single MsgApp payload.
 	// Raised from 1 MiB → 4 MiB so each MsgApp amortises more entries
 	// under small-entry workloads (Redis-style KV, median entry ~500 B).
@@ -451,24 +458,33 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
-		nodeID:           prepared.cfg.NodeID,
-		localID:          prepared.cfg.LocalID,
-		localAddress:     prepared.cfg.LocalAddress,
-		dataDir:          prepared.cfg.DataDir,
-		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
-		tickInterval:     prepared.cfg.TickInterval,
-		electionTick:     prepared.cfg.ElectionTick,
-		storage:          prepared.disk.Storage,
-		rawNode:          rawNode,
-		persist:          prepared.disk.Persist,
-		fsm:              prepared.cfg.StateMachine,
-		peers:            peerMap,
-		transport:        prepared.cfg.Transport,
-		proposeCh:        make(chan proposalRequest),
-		readCh:           make(chan readRequest),
-		adminCh:          make(chan adminRequest),
-		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
-		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
+		nodeID:       prepared.cfg.NodeID,
+		localID:      prepared.cfg.LocalID,
+		localAddress: prepared.cfg.LocalAddress,
+		dataDir:      prepared.cfg.DataDir,
+		fsmSnapDir:   filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
+		tickInterval: prepared.cfg.TickInterval,
+		electionTick: prepared.cfg.ElectionTick,
+		storage:      prepared.disk.Storage,
+		rawNode:      rawNode,
+		persist:      prepared.disk.Persist,
+		fsm:          prepared.cfg.StateMachine,
+		peers:        peerMap,
+		transport:    prepared.cfg.Transport,
+		proposeCh:    make(chan proposalRequest),
+		readCh:       make(chan readRequest),
+		adminCh:      make(chan adminRequest),
+		// Size the inbound step / dispatch-report channels from the
+		// resolved MaxInflightMsg (post-normalizeLimitConfig, which has
+		// already applied the env override and compiled-in default) so
+		// that operators raising ELASTICKV_RAFT_MAX_INFLIGHT_MSGS above
+		// the default actually get the extra buffering they asked for.
+		// Using defaultMaxInflightMsg here would silently cap the
+		// channel at 1024 even when the Raft layer has been told to
+		// keep 2048 in flight, re-triggering errStepQueueFull under
+		// the exact bursty conditions this knob is meant to absorb.
+		stepCh:           make(chan raftpb.Message, inboundChannelCap(prepared.cfg.MaxInflightMsg)),
+		dispatchReportCh: make(chan dispatchReport, inboundChannelCap(prepared.cfg.MaxInflightMsg)),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -2611,6 +2627,19 @@ func normalizeTimingConfig(cfg OpenConfig) OpenConfig {
 		cfg.ElectionTick = defaultElectionTick
 	}
 	return cfg
+}
+
+// inboundChannelCap returns the capacity to use when allocating the
+// engine's inbound stepCh and dispatchReportCh. It mirrors the resolved
+// MaxInflightMsg but clamps to minInboundChannelCap so that a caller
+// passing a tiny value doesn't shrink the buffers below a survivable
+// floor. maxInflight is expected to be the post-normalizeLimitConfig
+// value (compiled default or env override applied).
+func inboundChannelCap(maxInflight int) int {
+	if maxInflight < minInboundChannelCap {
+		return minInboundChannelCap
+	}
+	return maxInflight
 }
 
 func normalizeLimitConfig(cfg OpenConfig) OpenConfig {

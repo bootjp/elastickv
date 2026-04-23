@@ -1965,3 +1965,65 @@ func TestNormalizeLimitConfig_InvalidEnvOverridesCaller(t *testing.T) {
 	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
 	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
 }
+
+// TestInboundChannelCap verifies the floor/passthrough behaviour of the
+// stepCh / dispatchReportCh sizing helper: the resolved MaxInflightMsg
+// drives capacity, but never below minInboundChannelCap.
+func TestInboundChannelCap(t *testing.T) {
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(0))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(1))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(minInboundChannelCap-1))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(minInboundChannelCap))
+	require.Equal(t, 1024, inboundChannelCap(1024))
+	require.Equal(t, 2048, inboundChannelCap(2048))
+}
+
+// TestOpen_InboundChannelsHonourMaxInflightEnv pins the codex P1 fix:
+// when ELASTICKV_RAFT_MAX_INFLIGHT_MSGS is raised above the compiled-in
+// default, the engine's inbound stepCh and dispatchReportCh must be
+// sized from the override, not the default. Previously these were hard-
+// wired to defaultMaxInflightMsg (1024), so a 2048 override would still
+// hit errStepQueueFull at 1024 inbound messages, silently defeating the
+// whole tuning knob.
+func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+	require.Equal(t, 2048, cap(engine.stepCh),
+		"stepCh capacity must reflect the env-overridden MaxInflightMsg")
+	require.Equal(t, 2048, cap(engine.dispatchReportCh),
+		"dispatchReportCh capacity must reflect the env-overridden MaxInflightMsg")
+}
+
+// TestOpen_InboundChannelsDefaultCap pins that with no env override the
+// inbound channels are sized from the compiled-in default (1024), the
+// current production value.
+func TestOpen_InboundChannelsDefaultCap(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+	require.Equal(t, defaultMaxInflightMsg, cap(engine.stepCh))
+	require.Equal(t, defaultMaxInflightMsg, cap(engine.dispatchReportCh))
+}
