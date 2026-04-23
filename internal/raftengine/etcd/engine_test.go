@@ -1912,14 +1912,16 @@ func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
 
 // TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
 // that reach raft.Config when neither the caller nor the operator has
-// overridden them: 1024 inflight msgs and 4 MiB per msg.
+// overridden them: 512 inflight msgs and 4 MiB per msg. The combination
+// bounds worst-case per-peer buffered Raft traffic at 2 GiB (512 × 4 MiB);
+// see defaultMaxInflightMsg for the memory-footprint rationale.
 func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "")
 	t.Setenv(maxSizePerMsgEnvVar, "")
 	got := normalizeLimitConfig(OpenConfig{})
 	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
 	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
-	require.Equal(t, 1024, got.MaxInflightMsg)
+	require.Equal(t, 512, got.MaxInflightMsg)
 	require.Equal(t, uint64(4<<20), got.MaxSizePerMsg)
 }
 
@@ -1982,9 +1984,9 @@ func TestInboundChannelCap(t *testing.T) {
 // when ELASTICKV_RAFT_MAX_INFLIGHT_MSGS is raised above the compiled-in
 // default, the engine's inbound stepCh and dispatchReportCh must be
 // sized from the override, not the default. Previously these were hard-
-// wired to defaultMaxInflightMsg (1024), so a 2048 override would still
-// hit errStepQueueFull at 1024 inbound messages, silently defeating the
-// whole tuning knob.
+// wired to defaultMaxInflightMsg, so a larger override would still hit
+// errStepQueueFull at the compiled-in cap, silently defeating the whole
+// tuning knob.
 func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "2048")
 	fsm := &testStateMachine{}
@@ -2007,7 +2009,7 @@ func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
 }
 
 // TestOpen_InboundChannelsDefaultCap pins that with no env override the
-// inbound channels are sized from the compiled-in default (1024), the
+// inbound channels are sized from the compiled-in default (512), the
 // current production value.
 func TestOpen_InboundChannelsDefaultCap(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "")

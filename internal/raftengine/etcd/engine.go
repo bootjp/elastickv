@@ -40,22 +40,24 @@ const (
 	// queue. Total buffered memory is bounded by
 	// O(numPeers × MaxInflightMsg × avgMsgSize).
 	//
-	// Raised from 256 → 1024 to absorb short CPU bursts without forcing
+	// Raised from 256 → 512 to absorb short CPU bursts without forcing
 	// peers to reject with "etcd raft inbound step queue is full".
 	// Under production congestion we observed the 256-slot inbound
 	// stepCh on followers filling up while their event loop was held
 	// up by adapter-side pebble seek storms (PRs #560, #562, #563,
-	// #565 removed most of that CPU); 1024 is a 4× safety margin.
-	// Note that with the current defaultMaxSizePerMsg of 4 MiB, the
-	// true worst-case bound can be much larger (up to roughly 4 GiB
-	// per peer if every slot held a max-sized message). In practice,
-	// typical MsgApp payloads are far smaller, so expected steady-state
-	// memory remains much lower than that worst-case bound.
+	// #565 removed most of that CPU); 512 is a 2× safety margin.
 	//
-	// Operators can override both knobs at runtime without a rebuild
-	// via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS and
-	// ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
-	defaultMaxInflightMsg = 1024
+	// We intentionally do NOT raise this in lock-step with the 4 MiB
+	// defaultMaxSizePerMsg bump: the two knobs multiply, and 1024 ×
+	// 4 MiB is a 4 GiB per-peer worst-case product that a bursty
+	// multi-peer deployment can plausibly realise under TCP backpressure
+	// loss. 512 × 4 MiB halves that to 2 GiB per peer while preserving
+	// the MsgApp-batching win that motivates the 4 MiB cap on small-entry
+	// workloads. Operators who need deeper pipelines (large clusters with
+	// plenty of RAM) can raise this via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS
+	// without a rebuild; operators who need a smaller memory ceiling can
+	// lower MaxSizePerMsg via ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
+	defaultMaxInflightMsg = 512
 	// minInboundChannelCap is the floor applied when sizing the engine's
 	// inbound stepCh / dispatchReportCh from the resolved MaxInflightMsg.
 	// Even if a (misconfigured) caller drops MaxInflightMsg below this,

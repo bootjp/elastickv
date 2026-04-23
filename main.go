@@ -43,10 +43,15 @@ const (
 	// wake-ups on the leader and recv syscalls on the follower. Operators
 	// can override via ELASTICKV_RAFT_MAX_SIZE_PER_MSG at runtime.
 	etcdMaxSizePerMsg = 4 << 20
-	// etcdMaxInflightMsg caps in-flight MsgApps per peer. 1024 gives deeper
-	// pipelining on wide-bandwidth LAN during write bursts. Operators can
-	// override via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS at runtime.
-	etcdMaxInflightMsg = 1024
+	// etcdMaxInflightMsg caps in-flight MsgApps per peer. 512 gives a 2x
+	// safety margin over the pre-#529 default of 256 to absorb short CPU
+	// bursts, without letting the per-peer worst-case buffered memory
+	// (MaxInflightMsg × MaxSizePerMsg) grow beyond 2 GiB on the current
+	// 4 MiB MaxSizePerMsg. Operators with wide-bandwidth LAN clusters and
+	// headroom can raise this via ELASTICKV_RAFT_MAX_INFLIGHT_MSGS at
+	// runtime; operators with tighter memory budgets can lower the byte
+	// cap via ELASTICKV_RAFT_MAX_SIZE_PER_MSG.
+	etcdMaxInflightMsg = 512
 )
 
 func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {
