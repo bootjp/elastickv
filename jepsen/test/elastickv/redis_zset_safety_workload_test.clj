@@ -663,6 +663,47 @@
             (str "expected :ok on numeric reply, got: " result))
         (is (= ["m1" 7.0] (:value result)))))))
 
+;; ---------------------------------------------------------------------------
+;; Vacuous-pass guard (codex P1)
+;; ---------------------------------------------------------------------------
+
+(deftest empty-history-is-unknown-not-valid
+  ;; codex P1: an empty history (e.g. Redis unreachable, all ops
+  ;; downgraded to :info) produces zero successful reads. The checker
+  ;; MUST NOT return :valid? true in that case -- that would be a
+  ;; false-green. Expect :valid? :unknown plus a diagnostic :reason.
+  (let [result (run-checker [])]
+    (is (= :unknown (:valid? result))
+        (str "expected :unknown on empty history, got: " result))
+    (is (string? (:reason result))
+        (str "expected :reason to be populated, got: " result))
+    (is (zero? (:reads result)))))
+
+(deftest all-info-history-is-unknown-not-valid
+  ;; codex P1: a run where every operation was downgraded to :info
+  ;; (Redis unreachable / every read timed out) still has read-pairs
+  ;; filtered down to zero :ok reads. Must surface as :valid? :unknown.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :info   :process 0 :f :zadd       :value ["m1" 1] :index 1
+                  :error "conn refused"}
+                 {:type :invoke :process 0 :f :zrange-all                 :index 2}
+                 {:type :info   :process 0 :f :zrange-all                 :index 3
+                  :error "conn refused"}]
+        result  (run-checker history)]
+    (is (= :unknown (:valid? result))
+        (str "expected :unknown when all ops are :info, got: " result))
+    (is (string? (:reason result)))))
+
+(deftest one-successful-read-is-enough-to-validate
+  ;; Sanity: the vacuous-pass guard must only kick in when there are
+  ;; ZERO successful reads. A single :ok read with no errors is a
+  ;; legitimate :valid? true.
+  (let [history [{:type :invoke :process 0 :f :zrange-all :index 0}
+                 {:type :ok     :process 0 :f :zrange-all :value [] :index 1}]
+        result  (run-checker history)]
+    (is (true? (:valid? result))
+        (str "expected :valid? true with one :ok read, got: " result))))
+
 (deftest zrem-invoke-handles-nil-response
   ;; gemini MEDIUM: if car/wcar for ZREM returns nil (protocol edge,
   ;; closed connection, etc.), `(long nil)` would throw NPE and the

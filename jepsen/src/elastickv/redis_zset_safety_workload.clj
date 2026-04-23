@@ -760,13 +760,33 @@
                                    :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
                          []
                          read-pairs)
-            by-kind (group-by :kind all-errors)]
-        {:valid? (empty? all-errors)
-         :reads  (count read-pairs)
-         :mutations (count mutations)
-         :error-count (count all-errors)
-         :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
-         :first-errors (take 20 all-errors)}))))
+            by-kind (group-by :kind all-errors)
+            ;; Vacuous-pass guard (codex P1): if the run produced zero
+            ;; successful reads, we have no evidence that the system
+            ;; under test actually satisfies ZSet safety -- every op
+            ;; may have been downgraded to :info because Redis was
+            ;; unreachable or every read timed out. Returning
+            ;; `:valid? true` in that case would be a false-green.
+            ;; Emit `:valid? :unknown` with a diagnostic reason; the
+            ;; cli's `fail-on-invalid!` treats anything other than
+            ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
+            no-successful-reads? (zero? (count read-pairs))
+            valid? (cond
+                     (seq all-errors)      false
+                     no-successful-reads?  :unknown
+                     :else                 true)]
+        (cond-> {:valid? valid?
+                 :reads  (count read-pairs)
+                 :mutations (count mutations)
+                 :error-count (count all-errors)
+                 :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
+                 :first-errors (take 20 all-errors)}
+          no-successful-reads?
+          (assoc :reason
+                 (str "No successful :zrange-all / :zrangebyscore reads"
+                      " completed -- cannot assert ZSet safety. Likely"
+                      " Redis was unreachable or every read timed out;"
+                      " re-run against a healthy cluster.")))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload
