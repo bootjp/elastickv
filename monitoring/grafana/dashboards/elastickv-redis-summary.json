@@ -1138,7 +1138,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Rate of Redis commands rejected as unsupported, broken down by the real command name (PR #594). Cardinality is bounded: at most 32 distinct `command` label values plus an `other` overflow bucket, so this is safe to expose globally. Values like `invalid_utf8` are sentinels emitted when the wire payload was not valid UTF-8 and the command name could not be decoded. Pair this with the 'Errors by Command' panel: the `unknown` rows there are broken down by real name here.",
+      "description": "Rate of Redis commands rejected as unsupported, broken down by the real command name (PR #594). Cardinality is bounded: at most 32 distinct `command` label values plus an `other` overflow bucket, so this is safe to expose globally. Values like `invalid_utf8` are sentinels emitted when the wire payload was not valid UTF-8 and the command name could not be decoded. Pair this with the 'Errors by Command' panel: the `unknown` rows there are broken down by real name here. **Requires `elastickv_redis_unsupported_commands_total` (PR #594). Empty until that PR merges — this is not a scrape failure.**",
       "fieldConfig": {
         "defaults": {
           "color": {

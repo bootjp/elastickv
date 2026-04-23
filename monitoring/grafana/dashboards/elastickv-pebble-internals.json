@@ -384,7 +384,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "FSM apply sync mode gauge: the label `mode` is `sync` or `nosync`, and the value is 1 for the active mode. Operators care because nosync gives the fastest Raft apply but loses unflushed writes on a crash; sync pays fsync on every batch. Green = nosync in this deploy's convention.",
+      "description": "FSM apply sync mode gauge: the label `mode` is `sync` or `nosync`, and the value is 1 for the active mode. Operators care because nosync gives the fastest Raft apply but loses unflushed writes on a crash; sync pays fsync on every batch. Green = nosync in this deploy's convention. **Requires `elastickv_pebble_fsm_apply_sync_mode` (PR #592). Empty until that PR merges — this is not a scrape failure.**",
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "thresholds"},
