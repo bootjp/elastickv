@@ -22,7 +22,7 @@ import (
 // array-header) is the only way to distinguish `proto` (integer 2)
 // from `version` (bulk "7.0.0") or `modules` (empty array header).
 type helloReplyElement struct {
-	kind string // "bulk" | "int" | "arrayHeader"
+	kind string // "bulk" | "string" | "int" | "arrayHeader" | "null"
 	str  string
 	num  int64
 }
@@ -46,7 +46,10 @@ func (c *helloRecordingConn) Close() error          { return nil }
 func (c *helloRecordingConn) WriteError(msg string) { c.err = msg }
 func (c *helloRecordingConn) WriteString(s string) {
 	c.str = s
-	c.writes = append(c.writes, helloReplyElement{kind: "bulk", str: s})
+	// Recorded as a distinct "string" kind so a future regression that
+	// swaps WriteBulkString for WriteString (or vice versa) fails the
+	// wire-shape assertions instead of passing silently.
+	c.writes = append(c.writes, helloReplyElement{kind: "string", str: s})
 }
 func (c *helloRecordingConn) WriteBulk(bulk []byte) {
 	c.writes = append(c.writes, helloReplyElement{kind: "bulk", str: string(bulk)})
@@ -418,4 +421,69 @@ elastickv_redis_requests_total{command="HELLO",node_address="10.0.0.1:50051",nod
 		"elastickv_redis_requests_total",
 	)
 	require.NoError(t, err)
+}
+
+func TestClient_SetName_RejectsWrongArity(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+	state := getConnState(conn)
+	state.clientName = "prev"
+
+	// CLIENT SETNAME with no value (2 args total).
+	r.client(conn, redcon.Command{Args: [][]byte{
+		[]byte("CLIENT"), []byte("SETNAME"),
+	}})
+	require.Contains(t, conn.err, "wrong number of arguments")
+	require.Equal(t, "prev", state.clientName, "malformed SETNAME must not clobber clientName")
+
+	// CLIENT SETNAME foo bar (4 args total) — also rejected.
+	conn2 := &helloRecordingConn{}
+	state2 := getConnState(conn2)
+	state2.clientName = "prev"
+	r.client(conn2, redcon.Command{Args: [][]byte{
+		[]byte("CLIENT"), []byte("SETNAME"), []byte("foo"), []byte("bar"),
+	}})
+	require.Contains(t, conn2.err, "wrong number of arguments")
+	require.Equal(t, "prev", state2.clientName)
+}
+
+func TestClient_GetName_RejectsWrongArity(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+
+	// CLIENT GETNAME extra (3 args total) — GETNAME takes no operand.
+	r.client(conn, redcon.Command{Args: [][]byte{
+		[]byte("CLIENT"), []byte("GETNAME"), []byte("extra"),
+	}})
+	require.Contains(t, conn.err, "wrong number of arguments")
+}
+
+func TestClient_ID_RejectsWrongArity(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+
+	// CLIENT ID junk (3 args total) — ID takes no operand.
+	r.client(conn, redcon.Command{Args: [][]byte{
+		[]byte("CLIENT"), []byte("ID"), []byte("junk"),
+	}})
+	require.Contains(t, conn.err, "wrong number of arguments")
+}
+
+func TestClient_Info_RejectsWrongArity(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+	conn := &helloRecordingConn{}
+
+	// CLIENT INFO extra (3 args total) — INFO takes no operand.
+	r.client(conn, redcon.Command{Args: [][]byte{
+		[]byte("CLIENT"), []byte("INFO"), []byte("extra"),
+	}})
+	require.Contains(t, conn.err, "wrong number of arguments")
 }
