@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "DynamoDB-compatible request health for elastickv: throughput, latency, errors, tables, and noisy nodes.",
+  "description": "DynamoDB-compatible API health for elastickv: per-operation throughput and latency, per-table request/error breakdown, and item-volume panels.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -918,7 +918,7 @@
     "elastickv",
     "dynamodb",
     "requests",
-    "summary"
+    "api"
   ],
   "templating": {
     "list": [
@@ -1019,7 +1019,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Elastickv Request Health",
-  "uid": "elastickv-cluster-summary",
+  "title": "Elastickv DynamoDB",
+  "uid": "elastickv-dynamodb",
   "version": 2
 }
