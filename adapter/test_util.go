@@ -455,29 +455,32 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 // error that can happen right after createNode returns if the newly elected
 // leader briefly steps down due to a missed heartbeat quorum (common on slow
 // CI runners under -race). Callers should retry the write in that case.
+//
+// The match is case-insensitive because Redis protocol error bodies and
+// other layers may capitalise the phrase differently (e.g. "ERR Not Leader").
 func isTransientNotLeaderErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "not leader")
+	return strings.Contains(strings.ToLower(err.Error()), "not leader")
 }
 
 // doEventually retries do() while it returns a transient "not leader" error,
 // giving the cluster a few seconds to re-settle leadership after startup.
 // Non-"not leader" errors fail the test immediately.
+//
+// Note: we use assert.Eventually (not require.Eventually) so we can capture
+// the last observed error in lastErr and surface it via require.NoError after
+// the loop. Otherwise a timeout would only report "condition never met in 5s"
+// and swallow the underlying error.
 func doEventually(t *testing.T, do func() error) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		err := do()
-		if err == nil {
-			return true
-		}
-		if isTransientNotLeaderErr(err) {
-			return false
-		}
-		require.NoError(t, err)
-		return true
+	var lastErr error
+	_ = assert.Eventually(t, func() bool {
+		lastErr = do()
+		return lastErr == nil || !isTransientNotLeaderErr(lastErr)
 	}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
+	require.NoError(t, lastErr)
 }
 
 // rpushEventually wraps RPUSH in doEventually so transient leader churn
