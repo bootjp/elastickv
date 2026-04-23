@@ -473,6 +473,9 @@ func (c *Coordinate) observeLeaseRead(hit bool) {
 // published via LastQuorumAck is fresh enough to serve a leader-local
 // read. Enforces the safety contract from raftengine.LeaseProvider:
 //   - local state must be Leader
+//   - now must be a real reading; a zero now signals that the
+//     caller's monoclock.Now() read failed (e.g. clock_gettime denied
+//     under seccomp) and the lease fast path must fail closed
 //   - ack must be non-zero (a quorum was ever observed)
 //   - ack must not be after now (defensive guard: the monotonic-raw
 //     clock cannot go backwards, but a zero / bogus ack reading should
@@ -485,7 +488,7 @@ func (c *Coordinate) observeLeaseRead(hit bool) {
 // for why the raw monotonic source matters once leaseSafetyMargin is
 // tightened below ~5 ms.
 func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, leaseDur time.Duration) bool {
-	if state != raftengine.StateLeader || ack.IsZero() || ack.After(now) {
+	if state != raftengine.StateLeader || now.IsZero() || ack.IsZero() || ack.After(now) {
 		return false
 	}
 	return now.Sub(ack) < leaseDur

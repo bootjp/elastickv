@@ -511,3 +511,19 @@ func TestLeaseReadEngineCtx_NilEngine(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrLeaderNotFound)
 }
+
+// TestEngineLeaseAckValid_ZeroNowFailsClosed pins the clock-failure
+// fail-closed behaviour on the engine-ack path: when monoclock.Now()
+// returns the zero Instant (clock_gettime denied under seccomp or
+// similar), the fast path must NOT certify the lease even against a
+// fresh ack. Without the now.IsZero guard, a persistent clock
+// failure would let ack.After(zero) still hold only accidentally
+// (depends on ack.Nanos > 0); an explicit zero-check keeps the
+// invariant independent of ack-value internals.
+func TestEngineLeaseAckValid_ZeroNowFailsClosed(t *testing.T) {
+	t.Parallel()
+	ack := monoclock.Now() // fresh ack
+	require.False(t,
+		engineLeaseAckValid(raftengine.StateLeader, ack, monoclock.Zero, time.Hour),
+		"zero now must force the slow path")
+}

@@ -51,6 +51,21 @@ func TestLeaseState_ZeroValueIsExpired(t *testing.T) {
 	require.False(t, s.valid(monoclock.Now()))
 }
 
+// TestLeaseState_ZeroNowFailsClosed pins the "clock unavailable"
+// invariant: if the caller's monoclock.Now() read failed (e.g.
+// clock_gettime denied under seccomp) and surfaced monoclock.Zero,
+// valid() MUST return false even for a freshly warmed lease.
+// Otherwise a persistent clock failure would keep the node serving
+// fast-path reads off a stale lease indefinitely.
+func TestLeaseState_ZeroNowFailsClosed(t *testing.T) {
+	t.Parallel()
+	var s leaseState
+	s.extend(monoclock.Now().Add(time.Hour), s.generation())
+	require.True(t, s.valid(monoclock.Now()), "sanity: warmed lease is valid for a real now")
+	require.False(t, s.valid(monoclock.Zero),
+		"a zero now signals clock failure; lease must fail closed")
+}
+
 func TestLeaseState_ExtendAndExpire(t *testing.T) {
 	t.Parallel()
 	var s leaseState

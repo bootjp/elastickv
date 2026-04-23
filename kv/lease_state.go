@@ -51,8 +51,15 @@ type leaseState struct {
 }
 
 // valid reports whether the lease is unexpired at now.
+//
+// A zero-valued now indicates that the caller's monotonic-raw clock
+// read failed (e.g. clock_gettime denied under seccomp) and is treated
+// as "no lease evidence available" -- fail closed onto the slow path.
+// Without this guard, a warmed lease (non-zero expiry) would stay
+// forever valid for any caller sampling monoclock.Zero, since
+// zero.Before(positive) holds.
 func (s *leaseState) valid(now monoclock.Instant) bool {
-	if s == nil {
+	if s == nil || now.IsZero() {
 		return false
 	}
 	ns := s.expiryNanos.Load()

@@ -11,11 +11,13 @@ import "golang.org/x/sys/unix"
 // in monoclock_fallback.go.
 //
 // A non-nil error from ClockGettime should be essentially impossible
-// on supported platforms (the syscall fails only on invalid clock IDs
-// or EFAULT on the timespec pointer, neither of which applies here),
-// but returning zero instead of panicking keeps the lease path live
-// under bizarre sandboxes; the existing engineLeaseAckValid guards
-// (ack.IsZero, ack.After(now)) still hold.
+// on supported platforms — the syscall fails only on invalid clock
+// IDs (compile-time constant here) or EFAULT on the timespec pointer
+// (stack-allocated here). The realistic failure mode is a
+// seccomp/sandbox profile that denies clock_gettime. We return 0 in
+// that case: callers (leaseState.valid, engineLeaseAckValid) treat a
+// zero Instant as "clock unavailable" and force the slow path, so a
+// persistent syscall failure cannot leave a warmed lease valid.
 func nowNanos() int64 {
 	var ts unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &ts); err != nil {
