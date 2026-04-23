@@ -857,8 +857,11 @@
                                  (:ssh opts))
              :remote      control/ssh
              :nemesis     (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
-             ;; Jepsen 0.3.x can't fressian-serialize some combined final gens; skip.
-             :final-generator nil
+             ;; The inner workload's :final-generator is the trivially-
+             ;; serializable (gen/once {:f :zrange-all}) -- a single
+             ;; Limit defrecord wrapping a plain map. It round-trips
+             ;; through Jepsen 0.3.x's Fressian store cleanly
+             ;; (verified at 86 bytes), so we don't override it here.
              :concurrency (or (:concurrency opts) 5)
              :generator   (->> (:generator workload)
                                (gen/nemesis nemesis-gen)
