@@ -499,19 +499,19 @@ func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
-) (*adapter.AdminServer, []grpc.ServerOption, error) {
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
-	srv, opts, err := configureAdminService(
+	srv, icept, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: grpcAddress},
 		members,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, adminGRPCInterceptors{}, err
 	}
 	if srv == nil {
-		return nil, nil, nil
+		return nil, adminGRPCInterceptors{}, nil
 	}
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
@@ -519,7 +519,7 @@ func setupAdminService(
 	if *adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
 	}
-	return srv, opts, nil
+	return srv, icept, nil
 }
 
 // adminMembersFromBootstrap extracts the peer list (everyone except self) from
@@ -543,41 +543,56 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 	return out
 }
 
-// configureAdminService builds the node-side AdminServer plus the gRPC
-// interceptor options that enforce its bearer token, or returns (nil, nil,
-// nil) when the service is intentionally disabled. It is mutually exclusive
-// with --adminInsecureNoAuth so operators have to opt into the unauthenticated
+// adminGRPCInterceptors bundles the unary+stream interceptors that enforce the
+// Admin bearer token. Returning the raw interceptor functions (rather than
+// pre-wrapped grpc.ServerOption values via grpc.ChainUnaryInterceptor) lets
+// the registration site combine them with any other interceptors in a single
+// ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
+// silent overwrites (gRPC-Go: last option of the same type wins).
+type adminGRPCInterceptors struct {
+	unary  []grpc.UnaryServerInterceptor
+	stream []grpc.StreamServerInterceptor
+}
+
+func (a adminGRPCInterceptors) empty() bool {
+	return len(a.unary) == 0 && len(a.stream) == 0
+}
+
+// configureAdminService builds the node-side AdminServer plus the interceptor
+// set that enforces its bearer token, or returns (nil, {}, nil) when the
+// service is intentionally disabled. It is mutually exclusive with
+// --adminInsecureNoAuth so operators have to opt into the unauthenticated
 // mode explicitly.
 func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
-) (*adapter.AdminServer, []grpc.ServerOption, error) {
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	if tokenPath == "" && !insecureNoAuth {
-		return nil, nil, nil
+		return nil, adminGRPCInterceptors{}, nil
 	}
 	if tokenPath != "" && insecureNoAuth {
-		return nil, nil, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
+		return nil, adminGRPCInterceptors{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
 	}
 	token := ""
 	if tokenPath != "" {
 		loaded, err := loadAdminTokenFile(tokenPath)
 		if err != nil {
-			return nil, nil, err
+			return nil, adminGRPCInterceptors{}, err
 		}
 		token = loaded
 	}
 	srv := adapter.NewAdminServer(self, members)
 	unary, stream := adapter.AdminTokenAuth(token)
-	var opts []grpc.ServerOption
+	var icept adminGRPCInterceptors
 	if unary != nil {
-		opts = append(opts, grpc.ChainUnaryInterceptor(unary))
+		icept.unary = append(icept.unary, unary)
 	}
 	if stream != nil {
-		opts = append(opts, grpc.ChainStreamInterceptor(stream))
+		icept.stream = append(icept.stream, stream)
 	}
-	return srv, opts, nil
+	return srv, icept, nil
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
@@ -661,11 +676,21 @@ func startRaftServers(
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
-	adminGRPCOpts []grpc.ServerOption,
+	adminGRPCOpts adminGRPCInterceptors,
 ) error {
 	for _, rt := range runtimes {
 		opts := append([]grpc.ServerOption(nil), internalutil.GRPCServerOptions()...)
-		opts = append(opts, adminGRPCOpts...)
+		// Collapse all interceptors into a single ChainUnaryInterceptor /
+		// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
+		// (single-interceptor) option added anywhere in this chain cannot
+		// silently overwrite the admin auth gate — gRPC-Go keeps only the
+		// last option of the same type.
+		if len(adminGRPCOpts.unary) > 0 {
+			opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
+		}
+		if len(adminGRPCOpts.stream) > 0 {
+			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+		}
 		gs := grpc.NewServer(opts...)
 		trx := kv.NewTransactionWithProposer(rt.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
@@ -897,7 +922,7 @@ type runtimeServerRunner struct {
 	coordinate      kv.Coordinator
 	distServer      *adapter.DistributionServer
 	adminServer     *adapter.AdminServer
-	adminGRPCOpts   []grpc.ServerOption
+	adminGRPCOpts   adminGRPCInterceptors
 	redisAddress    string
 	leaderRedis     map[string]string
 	pubsubRelay     *adapter.RedisPubSubRelay

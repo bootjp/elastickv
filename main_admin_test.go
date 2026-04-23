@@ -12,12 +12,12 @@ import (
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, opts, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
-	if srv != nil || opts != nil {
-		t.Fatalf("disabled service should return nil, nil; got %v %v", srv, opts)
+	if srv != nil || !icept.empty() {
+		t.Fatalf("disabled service should return nil server and empty interceptors; got %v %+v", srv, icept)
 	}
 }
 
@@ -40,30 +40,30 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, opts, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	// Expect a unary + stream interceptor for the admin-token gate.
-	if len(opts) != 2 {
-		t.Fatalf("expected 2 grpc.ServerOption (unary + stream), got %d", len(opts))
+	// Expect one unary + one stream interceptor for the admin-token gate.
+	if len(icept.unary) != 1 || len(icept.stream) != 1 {
+		t.Fatalf("expected 1 unary + 1 stream interceptor, got %d + %d", len(icept.unary), len(icept.stream))
 	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, opts, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected AdminServer in insecure mode")
 	}
-	if len(opts) != 0 {
-		t.Fatalf("insecure mode should not attach interceptors, got %d", len(opts))
+	if !icept.empty() {
+		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
 	}
 }
 
