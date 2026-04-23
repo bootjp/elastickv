@@ -211,6 +211,32 @@ func strconvItoa(i int) string {
 	return string(digits)
 }
 
+// TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds asserts that when
+// operators configure more seeds than maxCachedClients the cache still honors
+// its cap — without the seed-fallback, the eviction loop would skip every
+// entry and the cache would grow past the documented bound.
+func TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds(t *testing.T) {
+	t.Parallel()
+	seeds := make([]string, 0, maxCachedClients+3)
+	for i := 0; i < maxCachedClients+3; i++ {
+		seeds = append(seeds, "seed-"+strconvItoa(i)+":1")
+	}
+	f := newFanout(seeds, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	for _, s := range seeds {
+		if _, err := f.clientFor(s); err != nil {
+			t.Fatalf("clientFor(%s): %v", s, err)
+		}
+	}
+	f.mu.Lock()
+	size := len(f.clients)
+	f.mu.Unlock()
+	if size > maxCachedClients {
+		t.Fatalf("cache size = %d, exceeds cap %d (seed-only path)", size, maxCachedClients)
+	}
+}
+
 func TestFanoutClientCacheEvictsWhenFull(t *testing.T) {
 	t.Parallel()
 	f := newFanout([]string{"seed:1"}, "", time.Second, insecure.NewCredentials())

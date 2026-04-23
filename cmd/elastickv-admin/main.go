@@ -330,25 +330,14 @@ func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 		return c, nil
 	}
 	// Bound the cache so a high-churn cluster or a stream of hostile
-	// discovery responses cannot leak file descriptors. Evict any one entry
-	// (map iteration is randomized) to make room; the evicted target will be
-	// re-dialed on demand if it comes back. Never evict an address that is in
-	// the active seeds list.
+	// discovery responses cannot leak file descriptors. Prefer evicting a
+	// non-seed entry — those are easiest to re-dial on demand — but when the
+	// cache is already saturated with seeds (operator passed >=maxCachedClients
+	// addresses to --nodes), fall back to evicting any entry. Without that
+	// fallback the cap is vacuous in the seed-heavy configuration Codex
+	// flagged, so the cache could grow without bound.
 	if len(f.clients) >= maxCachedClients {
-		seeds := map[string]struct{}{}
-		for _, s := range f.seeds {
-			seeds[s] = struct{}{}
-		}
-		for victim, vc := range f.clients {
-			if _, keep := seeds[victim]; keep {
-				continue
-			}
-			delete(f.clients, victim)
-			if err := vc.conn.Close(); err != nil {
-				log.Printf("elastickv-admin: evict %s: close: %v", victim, err)
-			}
-			break
-		}
+		f.evictOneLocked()
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(f.creds))
 	if err != nil {
@@ -357,6 +346,38 @@ func (f *fanout) clientFor(addr string) (*nodeClient, error) {
 	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn)}
 	f.clients[addr] = c
 	return c, nil
+}
+
+// evictOneLocked removes exactly one entry from f.clients and closes its
+// connection. Prefers non-seed entries; falls back to any entry if none exist
+// (for example when len(seeds) >= maxCachedClients). Caller must hold f.mu.
+func (f *fanout) evictOneLocked() {
+	seeds := make(map[string]struct{}, len(f.seeds))
+	for _, s := range f.seeds {
+		seeds[s] = struct{}{}
+	}
+	var fallback string
+	var fallbackClient *nodeClient
+	for victim, vc := range f.clients {
+		if fallback == "" {
+			fallback, fallbackClient = victim, vc
+		}
+		if _, keep := seeds[victim]; keep {
+			continue
+		}
+		delete(f.clients, victim)
+		if err := vc.conn.Close(); err != nil {
+			log.Printf("elastickv-admin: evict %s: close: %v", victim, err)
+		}
+		return
+	}
+	if fallbackClient == nil {
+		return
+	}
+	delete(f.clients, fallback)
+	if err := fallbackClient.conn.Close(); err != nil {
+		log.Printf("elastickv-admin: evict %s (seed-fallback): close: %v", fallback, err)
+	}
 }
 
 // invalidateClient drops a cached connection — used when a peer returns
