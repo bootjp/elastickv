@@ -402,8 +402,8 @@ update_one_node() {
   ssh "${SSH_BASE_OPTS[@]}" "$ssh_target" \
     env \
       IMAGE="$IMAGE_Q" \
-      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
-      CONTAINER_NAME="$CONTAINER_NAME" \
+      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN_Q" \
+      CONTAINER_NAME="$CONTAINER_NAME_Q" \
       DATA_DIR="$DATA_DIR_Q" \
       SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT_Q" \
       RAFT_ENGINE="$RAFT_ENGINE" \
@@ -681,9 +681,14 @@ run_container() {
   # contain whitespace.
   local extra_env_flags=()
   if [[ -n "${EXTRA_ENV:-}" ]]; then
-    # Split on whitespace without triggering filename globbing.
+    # Split on whitespace without triggering filename globbing. Normalise
+    # newlines to spaces first so multi-line EXTRA_ENV values (common in
+    # long deploy.env overrides) are fully parsed — a here-string consumes
+    # only up to the first newline, so without this step subsequent lines
+    # would be silently dropped.
     local -a extra_env_pairs=()
-    read -r -a extra_env_pairs <<< "${EXTRA_ENV}"
+    local extra_env_normalised="${EXTRA_ENV//$'\n'/ }"
+    read -r -a extra_env_pairs <<< "${extra_env_normalised}"
     local pair
     for pair in "${extra_env_pairs[@]}"; do
       if [[ "$pair" != *=* || "$pair" == =* ]]; then
@@ -854,6 +859,8 @@ S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
+RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
+CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
