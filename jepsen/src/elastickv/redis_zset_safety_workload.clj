@@ -172,15 +172,23 @@
                                " against stale data under " zset-key ".")
                           {:type ::missing-conn-spec
                            :zset-key zset-key})))]
+      ;; The cleanup DEL MUST succeed. If it fails (connection refused,
+      ;; Redis error reply, timeout, whatever), stale data from a prior
+      ;; run survives under zset-key and can produce false-positive
+      ;; safety verdicts in the checker. Log loudly AND re-throw so
+      ;; Jepsen aborts the run instead of silently running against
+      ;; dirty state. (gemini MEDIUM)
       (try
         (car/wcar cs (car/del zset-key))
         (catch Throwable t
-          ;; Do NOT swallow silently: repeated setup! failures across
-          ;; runs would leave stale data under zset-key and could
-          ;; produce false-positive safety failures. Log loudly so
-          ;; operators notice. clojure.tools.logging/warn expects
-          ;; (warn msg) or (warn throwable msg) -- NOT multiple strings.
-          (warn t "ZSet safety setup! DEL failed -- stale data may survive into this run"))))
+          (warn t "ZSet safety setup! DEL failed -- aborting to avoid stale data")
+          (throw (ex-info
+                   (str "ZSet safety setup! failed to clear prior state at "
+                        zset-key ": " (.getMessage t)
+                        ". Refusing to run against potentially stale data.")
+                   {:type ::cleanup-failed
+                    :zset-key zset-key}
+                   t)))))
     this)
 
   (teardown! [this _test] this)

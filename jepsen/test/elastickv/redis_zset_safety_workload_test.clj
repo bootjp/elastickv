@@ -611,16 +611,19 @@
                           (client/setup! client {}))
         "setup! must throw ex-info when :conn-spec is nil")))
 
-(deftest setup-bang-tolerates-unreachable-redis
-  ;; gemini MEDIUM: a Redis that can't be reached must surface as a
-  ;; logged warn, not an uncaught throw that aborts the whole run. The
-  ;; fix catches Throwable in setup!.
+(deftest setup-bang-hard-fails-when-cleanup-del-errors
+  ;; gemini MEDIUM: even when :conn-spec is populated, if the actual
+  ;; cleanup (DEL zset-key) fails or errors, setup! must NOT silently
+  ;; proceed. Stale data surviving from a prior run under zset-key
+  ;; would cause false-positive safety verdicts. Propagate the
+  ;; exception so Jepsen aborts the run.
   (let [client (workload/->ElastickvRedisZSetSafetyClient
                  {} {:pool {} :spec {:host "127.0.0.1"
                                      :port 1   ; guaranteed unreachable
                                      :timeout-ms 100}})]
-    (is (= client (client/setup! client {}))
-        "setup! must swallow connection errors and keep the run going")))
+    (is (thrown? Throwable
+                 (client/setup! client {}))
+        "setup! must propagate cleanup failures, not swallow them")))
 
 (deftest zincrby-invoke-handles-nil-response
   ;; gemini MEDIUM: if car/wcar for ZINCRBY returns nil (error reply
