@@ -41,6 +41,10 @@ message RaftGroupState {
   uint64 leader_term = 3;
   uint64 commit_index = 4;
   uint64 applied_index = 5;
+  // last_contact_unix_ms is the unix-ms timestamp of the most recent leader
+  // contact observed on this node. Zero means "unknown" (for example, the
+  // engine is a follower that has never heard from a leader); UIs should
+  // render that case as "unknown" rather than "contacted at epoch".
   int64 last_contact_unix_ms = 6;
 }
 

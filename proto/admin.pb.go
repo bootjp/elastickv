@@ -345,13 +345,17 @@ func (x *GetClusterOverviewResponse) GetAggregateQps() uint64 {
 }
 
 type RaftGroupState struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	RaftGroupId       uint64                 `protobuf:"varint,1,opt,name=raft_group_id,json=raftGroupId,proto3" json:"raft_group_id,omitempty"`
-	LeaderNodeId      string                 `protobuf:"bytes,2,opt,name=leader_node_id,json=leaderNodeId,proto3" json:"leader_node_id,omitempty"`
-	LeaderTerm        uint64                 `protobuf:"varint,3,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
-	CommitIndex       uint64                 `protobuf:"varint,4,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
-	AppliedIndex      uint64                 `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	LastContactUnixMs int64                  `protobuf:"varint,6,opt,name=last_contact_unix_ms,json=lastContactUnixMs,proto3" json:"last_contact_unix_ms,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RaftGroupId  uint64                 `protobuf:"varint,1,opt,name=raft_group_id,json=raftGroupId,proto3" json:"raft_group_id,omitempty"`
+	LeaderNodeId string                 `protobuf:"bytes,2,opt,name=leader_node_id,json=leaderNodeId,proto3" json:"leader_node_id,omitempty"`
+	LeaderTerm   uint64                 `protobuf:"varint,3,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	CommitIndex  uint64                 `protobuf:"varint,4,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	AppliedIndex uint64                 `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	// last_contact_unix_ms is the unix-ms timestamp of the most recent leader
+	// contact observed on this node. Zero means "unknown" (for example, the
+	// engine is a follower that has never heard from a leader); UIs should
+	// render that case as "unknown" rather than "contacted at epoch".
+	LastContactUnixMs int64 `protobuf:"varint,6,opt,name=last_contact_unix_ms,json=lastContactUnixMs,proto3" json:"last_contact_unix_ms,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }

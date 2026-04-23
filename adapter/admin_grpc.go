@@ -19,9 +19,12 @@ import (
 
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
-// standing up a real Raft cluster.
+// standing up a real Raft cluster. Configuration is polled on each
+// GetClusterOverview to pick up scale-out / scale-in events without the
+// operator having to restart the admin binary.
 type AdminGroup interface {
 	Status() raftengine.Status
+	Configuration(ctx context.Context) (raftengine.Configuration, error)
 }
 
 // NodeIdentity is the value form of the protobuf NodeIdentity message used for
@@ -94,23 +97,69 @@ func (s *AdminServer) RegisterGroup(groupID uint64, g AdminGroup) {
 	s.groupsMu.Unlock()
 }
 
-// GetClusterOverview returns the local node identity, the configured member
+// GetClusterOverview returns the local node identity, the current member
 // list, and per-group leader identity collected from the engines registered
-// via RegisterGroup.
+// via RegisterGroup. The member list is the union of (a) the bootstrap seed
+// supplied to NewAdminServer and (b) the live Configuration of every
+// registered Raft group — the latter picks up scale-out nodes added after
+// startup so the admin binary's fan-out discovery does not miss them.
 func (s *AdminServer) GetClusterOverview(
-	_ context.Context,
+	ctx context.Context,
 	_ *pb.GetClusterOverviewRequest,
 ) (*pb.GetClusterOverviewResponse, error) {
 	leaders := s.snapshotLeaders()
-	members := make([]*pb.NodeIdentity, 0, len(s.members))
-	for _, m := range s.members {
-		members = append(members, m.toProto())
-	}
+	members := s.snapshotMembers(ctx)
 	return &pb.GetClusterOverviewResponse{
 		Self:         s.self.toProto(),
 		Members:      members,
 		GroupLeaders: leaders,
 	}, nil
+}
+
+// snapshotMembers unions the seed members with the live Configuration of each
+// registered group (deduplicating by NodeID). Configuration errors are logged
+// via the returned error in the per-member accumulator; they never fail the
+// overall RPC because the seed list is always available as a fallback.
+func (s *AdminServer) snapshotMembers(ctx context.Context) []*pb.NodeIdentity {
+	seen := make(map[string]struct{})
+	out := make([]*pb.NodeIdentity, 0, len(s.members))
+	add := func(id, addr string) {
+		if id == "" || id == s.self.NodeID {
+			return
+		}
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, &pb.NodeIdentity{NodeId: id, GrpcAddress: addr})
+	}
+
+	// Seed members first — stable order when a group Configuration call
+	// errors or returns an empty list.
+	for _, m := range s.members {
+		add(m.NodeID, m.GRPCAddress)
+	}
+
+	s.groupsMu.RLock()
+	groups := make([]AdminGroup, 0, len(s.groups))
+	for _, g := range s.groups {
+		groups = append(groups, g)
+	}
+	s.groupsMu.RUnlock()
+
+	for _, g := range groups {
+		cfg, err := g.Configuration(ctx)
+		if err != nil {
+			// A single group failing to report its ConfState does not fail
+			// the RPC; the seed list and other groups still produce useful
+			// output.
+			continue
+		}
+		for _, srv := range cfg.Servers {
+			add(srv.ID, srv.Address)
+		}
+	}
+	return out
 }
 
 // GetRaftGroups returns per-group state snapshots. Phase 0 wires commit/applied
@@ -130,13 +179,14 @@ func (s *AdminServer) GetRaftGroups(
 		// leader, per raftengine.Status) into an absolute unix-ms so UI
 		// clients can diff against their own clock instead of having to
 		// reason about the server's uptime. The etcd engine returns a
-		// sentinel negative duration when the last contact is unknown
-		// (follower/candidate has never heard from a leader); clamping
-		// negatives to zero prevents the UI from rendering a future
-		// timestamp as "freshly contacted".
-		lastContact := st.LastContact
-		if lastContact < 0 {
-			lastContact = 0
+		// sentinel negative duration when contact is unknown (e.g., a
+		// follower that has never heard from a leader). Report that case
+		// as `LastContactUnixMs=0` (epoch) so the UI can render "unknown"
+		// / "never contacted" rather than treating it as "freshly
+		// contacted just now".
+		var lastContactUnixMs int64
+		if st.LastContact >= 0 {
+			lastContactUnixMs = now.Add(-st.LastContact).UnixMilli()
 		}
 		out = append(out, &pb.RaftGroupState{
 			RaftGroupId:       id,
@@ -144,7 +194,7 @@ func (s *AdminServer) GetRaftGroups(
 			LeaderTerm:        st.Term,
 			CommitIndex:       st.CommitIndex,
 			AppliedIndex:      st.AppliedIndex,
-			LastContactUnixMs: now.Add(-lastContact).UnixMilli(),
+			LastContactUnixMs: lastContactUnixMs,
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil

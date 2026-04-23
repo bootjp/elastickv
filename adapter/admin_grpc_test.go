@@ -18,6 +18,8 @@ type fakeGroup struct {
 	term     uint64
 	commit   uint64
 	applied  uint64
+	servers  []raftengine.Server
+	cfgErr   error
 }
 
 func (f fakeGroup) Status() raftengine.Status {
@@ -27,6 +29,13 @@ func (f fakeGroup) Status() raftengine.Status {
 		CommitIndex:  f.commit,
 		AppliedIndex: f.applied,
 	}
+}
+
+func (f fakeGroup) Configuration(context.Context) (raftengine.Configuration, error) {
+	if f.cfgErr != nil {
+		return raftengine.Configuration{}, f.cfgErr
+	}
+	return raftengine.Configuration{Servers: append([]raftengine.Server(nil), f.servers...)}, nil
 }
 
 func TestGetClusterOverviewReturnsSelfAndLeaders(t *testing.T) {
@@ -81,11 +90,68 @@ func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	}
 }
 
-// TestGetRaftGroupsClampsNegativeLastContact pins the sentinel-negative
-// handling for raftengine's "unknown last contact" value (-1). Without the
-// clamp, the admin UI would show a future timestamp precisely when leader
-// contact is unknown, which reads as "freshly contacted" to operators.
-func TestGetRaftGroupsClampsNegativeLastContact(t *testing.T) {
+// TestGetClusterOverviewUnionsSeedsAndLiveConfig asserts that
+// GetClusterOverview picks up a node that was added to a Raft group after the
+// admin server was constructed (scale-out). Without Configuration polling,
+// the static seed list would miss it entirely.
+func TestGetClusterOverviewUnionsSeedsAndLiveConfig(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		[]NodeIdentity{{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"}},
+	)
+	// Group reports a member (n3) that is NOT in the bootstrap seed list.
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.12:50051"},
+			{ID: "n3", Address: "10.0.0.13:50051"},
+		},
+	})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]string)
+	for _, m := range resp.Members {
+		ids[m.NodeId] = m.GrpcAddress
+	}
+	// Self (n1) is excluded; both seed (n2) and live-config (n3) must appear.
+	if len(ids) != 2 {
+		t.Fatalf("members = %v, want {n2, n3}", ids)
+	}
+	if ids["n2"] != "10.0.0.12:50051" || ids["n3"] != "10.0.0.13:50051" {
+		t.Fatalf("unexpected members %v", ids)
+	}
+}
+
+// TestGetClusterOverviewSurvivesConfigurationError asserts that a group that
+// errors on Configuration() does NOT fail the RPC — seed members are still
+// returned.
+func TestGetClusterOverviewSurvivesConfigurationError(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1"},
+		[]NodeIdentity{{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"}},
+	)
+	srv.RegisterGroup(1, fakeGroup{leaderID: "n1", cfgErr: context.DeadlineExceeded})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("overview should not fail on group config error: %v", err)
+	}
+	if len(resp.Members) != 1 || resp.Members[0].NodeId != "n2" {
+		t.Fatalf("unexpected members %v", resp.Members)
+	}
+}
+
+// TestGetRaftGroupsMapsUnknownLastContactToZero pins the sentinel-negative
+// handling for raftengine's "unknown last contact" value (-1). The RPC
+// reports 0 (epoch) in that case so the UI renders "unknown" rather than
+// "contacted just now".
+func TestGetRaftGroupsMapsUnknownLastContactToZero(t *testing.T) {
 	t.Parallel()
 	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
 	srv.RegisterGroup(1, fakeGroupWithContact{leaderID: "n1", term: 1, lastContact: -1})
@@ -97,9 +163,8 @@ func TestGetRaftGroupsClampsNegativeLastContact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := resp.Groups[0].LastContactUnixMs
-	if got != fixed.UnixMilli() {
-		t.Fatalf("LastContactUnixMs = %d, want %d (now clamped to 0 duration)", got, fixed.UnixMilli())
+	if got := resp.Groups[0].LastContactUnixMs; got != 0 {
+		t.Fatalf("LastContactUnixMs = %d, want 0 (unknown sentinel)", got)
 	}
 }
 
@@ -119,6 +184,10 @@ func (f fakeGroupWithContact) Status() raftengine.Status {
 		AppliedIndex: f.applied,
 		LastContact:  f.lastContact,
 	}
+}
+
+func (f fakeGroupWithContact) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
 }
 
 // TestGroupOrderingIsStable locks in deterministic ascending-by-RaftGroupId
