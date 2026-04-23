@@ -688,7 +688,10 @@ run_container() {
     # would be silently dropped.
     local -a extra_env_pairs=()
     local extra_env_normalised="${EXTRA_ENV//$'\n'/ }"
-    read -r -a extra_env_pairs <<< "${extra_env_normalised}"
+    # Explicit IFS so splitting is immune to any earlier mutation. Default
+    # whitespace is already space/tab/newline; pinning it here makes the
+    # behaviour self-documenting.
+    IFS=$' \t\n' read -r -a extra_env_pairs <<< "${extra_env_normalised}"
     local pair
     for pair in "${extra_env_pairs[@]}"; do
       if [[ "$pair" != *=* || "$pair" == =* ]]; then
