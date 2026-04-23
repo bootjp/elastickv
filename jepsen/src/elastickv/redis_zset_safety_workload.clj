@@ -177,7 +177,7 @@
       ;; run survives under zset-key and can produce false-positive
       ;; safety verdicts in the checker. Log loudly AND re-throw so
       ;; Jepsen aborts the run instead of silently running against
-      ;; dirty state. (gemini MEDIUM)
+      ;; dirty state.
       (try
         (car/wcar cs (car/del zset-key))
         (catch Throwable t
@@ -769,7 +769,7 @@
                          []
                          read-pairs)
             by-kind (group-by :kind all-errors)
-            ;; Vacuous-pass guard (codex P1): if the run produced zero
+            ;; Vacuous-pass guard: if the run produced zero
             ;; successful reads, we have no evidence that the system
             ;; under test actually satisfies ZSet safety -- every op
             ;; may have been downgraded to :info because Redis was

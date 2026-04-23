@@ -77,12 +77,12 @@
     (is (not (:valid? result)) (str "expected mismatch, got: " result))))
 
 (deftest single-ok-concurrent-zincrby-still-validates-scores
-  ;; Codex P1: :unknown-score? must NOT be set when exactly one
-  ;; concurrent ZINCRBY is :ok (and therefore has a known resulting
-  ;; score). The read may observe either the pre-op score or the
-  ;; post-op score, both of which are in :scores. An arbitrary
-  ;; impossible score (e.g. 999.0) must still be flagged as a
-  ;; :score-mismatch, not waved through by `:unknown-score?`.
+  ;; :unknown-score? must NOT be set when exactly one concurrent
+  ;; ZINCRBY is :ok (and therefore has a known resulting score). The
+  ;; read may observe either the pre-op score or the post-op score,
+  ;; both of which are in :scores. An arbitrary impossible score
+  ;; (e.g. 999.0) must still be flagged as a :score-mismatch, not
+  ;; waved through by `:unknown-score?`.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 1}
                  {:type :invoke :process 1 :f :zincrby :value ["m1" 5]   :index 2}
@@ -130,7 +130,7 @@
     (is (:valid? result) (str "expected valid, got: " result))))
 
 (deftest duplicate-members-are-flagged
-  ;; CodeRabbit finding: ZRANGE must not return the same member twice.
+  ;; ZRANGE must not return the same member twice.
   ;; With a hypothetical committed + concurrent score for the same
   ;; member, a duplicate could sneak past sort + score-membership
   ;; checks. Enforce distinctness explicitly.
@@ -143,7 +143,7 @@
     (is (not (:valid? result)) (str "expected duplicate-members error, got: " result))))
 
 (deftest overlapping-committed-zadds-allow-either-score
-  ;; CodeRabbit finding: two :ok ZADDs for the same member whose
+  ;; Two :ok ZADDs for the same member whose
   ;; invoke/complete windows overlap have ambiguous serialization
   ;; order. Either's resulting score is a valid post-state; the checker
   ;; must not pin to the higher :complete-idx value only.
@@ -163,7 +163,7 @@
         (str "expected valid under overlapping-writes relaxation, got: " result))))
 
 (deftest info-before-read-is-considered-uncertain
-  ;; CodeRabbit finding: an :info mutation that completed before a
+  ;; An :info mutation that completed before a
   ;; later read may have taken effect. It must be considered a possible
   ;; source of state for that read, rather than being ignored by both
   ;; model-before and the concurrent window.
@@ -183,11 +183,11 @@
         (str "expected :info-before-read to skip strict score check, got: " result))))
 
 ;; ---------------------------------------------------------------------------
-;; Stale-read / phantom / superseded-committed checks (gemini HIGH)
+;; Stale-read / phantom / superseded-committed checks
 ;; ---------------------------------------------------------------------------
 
 (deftest phantom-member-is-flagged
-  ;; gemini HIGH: a read that observes a member which was never added
+  ;; A read that observes a member which was never added
   ;; (no ZADD/ZINCRBY/true-ZREM anywhere) must be rejected.
   (let [history [{:type :invoke :process 0 :f :zrange-all :index 0}
                  {:type :ok     :process 0 :f :zrange-all
@@ -199,7 +199,7 @@
         (str "expected :unexpected-presence, got kinds=" kinds))))
 
 (deftest phantom-from-info-zrem-still-flagged
-  ;; gemini HIGH (round 2): an :info ZREM is the ONLY history contact
+  ;; An :info ZREM is the ONLY history contact
   ;; with a member (no ZADD/ZINCRBY ever). Because completed-mutation-
   ;; window defaults :removed? to true on :info ZREMs (for uncertainty
   ;; accounting), the checker must NOT treat ZREM as proof the member
@@ -224,7 +224,7 @@
         (str "expected :unexpected-presence, got kinds=" kinds))))
 
 (deftest stale-read-after-committed-zrem-is-flagged
-  ;; gemini HIGH: once a ZADD and a subsequent real (:removed? true) ZREM
+  ;; Once a ZADD and a subsequent real (:removed? true) ZREM
   ;; have BOTH committed (with no concurrent re-add), a later read that
   ;; still sees the member must be rejected as a stale read.
   (let [history [;; Add then remove m1 — both committed before any read.
@@ -243,7 +243,7 @@
         (str "expected :unexpected-presence, got kinds=" kinds))))
 
 (deftest superseded-committed-score-is-not-allowed
-  ;; gemini HIGH: a ZADD committed BEFORE another ZADD for the same
+  ;; A ZADD committed BEFORE another ZADD for the same
   ;; member whose invoke strictly followed it should not be treated as
   ;; a valid post-state score. Only the latest committed score (plus
   ;; concurrent in-flight) may be observed.
@@ -267,11 +267,11 @@
 ;; ---------------------------------------------------------------------------
 
 ;; ---------------------------------------------------------------------------
-;; Linearization of concurrent ops / uncertain mutations (gemini HIGH batch 2)
+;; Linearization of concurrent ops / uncertain mutations
 ;; ---------------------------------------------------------------------------
 
 (deftest concurrent-zadd-zrem-both-completed-accepts-either-outcome
-  ;; gemini HIGH: ZADD and ZREM for the same member whose invoke/complete
+  ;; ZADD and ZREM for the same member whose invoke/complete
   ;; windows overlap (both commit before the read) have ambiguous
   ;; linearization. A linearizable store may serialize either one last,
   ;; so the read legitimately observes EITHER [["m1" 1.0]] OR [].
@@ -294,7 +294,7 @@
         "expected read observing ZREM's outcome (absent) to be accepted")))
 
 (deftest info-zrem-concurrent-with-read-allows-missing-member
-  ;; gemini HIGH: an :info ZREM that might have applied before a read
+  ;; An :info ZREM that might have applied before a read
   ;; leaves the member's presence uncertain. A ZRANGE that omits the
   ;; member must NOT be flagged as a completeness failure.
   (let [history [;; ZADD m1 committed before the read.
@@ -312,7 +312,7 @@
         (str "expected :info ZREM to make absence acceptable, got: " result))))
 
 (deftest info-zincrby-does-not-flag-zrangebyscore-completeness
-  ;; gemini HIGH: a pre-read :info / concurrent ZINCRBY leaves the
+  ;; A pre-read :info / concurrent ZINCRBY leaves the
   ;; resulting score unknown. ZRANGEBYSCORE filtering on a specific
   ;; range must not flag the member as missing, because its score may
   ;; have moved outside [lo, hi].
@@ -359,11 +359,11 @@
         (str "expected :missing-member, got kinds=" kinds))))
 
 ;; ---------------------------------------------------------------------------
-;; Failed-concurrent mutations must not contribute to uncertainty (codex P1)
+;; Failed-concurrent mutations must not contribute to uncertainty
 ;; ---------------------------------------------------------------------------
 
 (deftest failed-concurrent-zrem-does-not-relax-must-be-present
-  ;; codex P1: a concurrent ZREM that completes with :fail did NOT take
+  ;; A concurrent ZREM that completes with :fail did NOT take
   ;; effect. Its window must NOT make the member's presence uncertain,
   ;; so a read that omits the member (which was ZADDed and committed
   ;; beforehand) must be flagged as :missing-member.
@@ -386,7 +386,7 @@
         (str "expected :missing-member, got kinds=" kinds))))
 
 (deftest failed-concurrent-zadd-does-not-contribute-allowed-score
-  ;; codex P1: a concurrent ZADD that completes with :fail did NOT take
+  ;; A concurrent ZADD that completes with :fail did NOT take
   ;; effect. Its score must NOT be added to the allowed set. A read
   ;; observing that score must be flagged as :score-mismatch rather than
   ;; being waved through by the failed ZADD's ghost contribution.
@@ -410,11 +410,11 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Chained committed ZINCRBYs: only the linearization-chain tail is a
-;; valid final score. Earlier intermediate return values are stale. (codex P1)
+;; valid final score. Earlier intermediate return values are stale.
 ;; ---------------------------------------------------------------------------
 
 (deftest chained-committed-zincrby-rejects-stale-intermediate
-  ;; codex P1: sequential committed ZINCRBYs form a forced linearization
+  ;; Sequential committed ZINCRBYs form a forced linearization
   ;; chain. The first ZINCRBY's return value is an intermediate that no
   ;; post-chain read may observe. Expect :score-mismatch on the stale
   ;; intermediate.
@@ -442,7 +442,7 @@
         (str "expected :score-mismatch, got kinds=" kinds))))
 
 (deftest chained-committed-zincrby-accepts-latest
-  ;; codex P1: same history but the read observes the LATEST chain tail
+  ;; Same history but the read observes the LATEST chain tail
   ;; (6.0) -- accept as valid.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
@@ -458,7 +458,7 @@
         (str "expected chain-tail score to be accepted, got: " result))))
 
 (deftest concurrent-zincrby-both-admissible
-  ;; codex P1: two overlapping-in-real-time ZINCRBYs whose returned
+  ;; Two overlapping-in-real-time ZINCRBYs whose returned
   ;; scores are BOTH candidate final states under some linearization.
   ;; Read observing either value must be accepted.
   ;; Overlap: A=[inv=2, cmp=5], B=[inv=3, cmp=4].
@@ -484,7 +484,7 @@
         "expected A's return value (6.0) admissible under overlap")))
 
 (deftest zadd-resets-zincrby-chain
-  ;; codex P1: a committed ZADD between ZINCRBYs resets the chain --
+  ;; A committed ZADD between ZINCRBYs resets the chain --
   ;; subsequent ZINCRBYs operate on the new ZADD'd value. The pre-reset
   ;; ZINCRBY score is NOT a valid read after the chain completes.
   (let [base [;; ZADD m1 1
@@ -517,11 +517,11 @@
 ;; :ok ZINCRBYs with known return values do NOT make the score check
 ;; unknown -- their return values pin the linearization and the
 ;; admissible score set is constrained by :scores (candidates + uncertain
-;; ok return values). (codex P1)
+;; ok return values).
 ;; ---------------------------------------------------------------------------
 
 (deftest two-ok-concurrent-zincrbys-reject-impossible-score
-  ;; codex P1: two overlapping :ok ZINCRBYs with known return values
+  ;; Two overlapping :ok ZINCRBYs with known return values
   ;; (3 and 6) constrain the admissible post-chain read set to {1,3,6}.
   ;; A read of 999 is impossible under any linearization; the checker
   ;; must flag it as :score-mismatch (no longer swallowed by the old
@@ -545,7 +545,7 @@
         (str "expected :score-mismatch, got kinds=" kinds))))
 
 (deftest two-ok-concurrent-zincrbys-accept-known-chain-tail
-  ;; codex P1: same concurrent :ok ZINCRBY history, but the read
+  ;; Same concurrent :ok ZINCRBY history, but the read
   ;; observes one of the recorded return values. Both 3.0 (linearization
   ;; where +3 ran first, then +2) and 6.0 (the other order) must be
   ;; accepted as valid.
@@ -569,7 +569,7 @@
         "expected 3.0 (other linearization) to be accepted")))
 
 (deftest info-plus-ok-concurrent-zincrby-stays-unknown
-  ;; codex P1: when at least one concurrent ZINCRBY is :info (unknown
+  ;; When at least one concurrent ZINCRBY is :info (unknown
   ;; post-op score), the strict score check must be relaxed regardless
   ;; of how many other :ok ZINCRBYs are concurrent. Any numeric score
   ;; must be accepted for this read.
@@ -596,11 +596,11 @@
 ;; ---------------------------------------------------------------------------
 
 ;; ---------------------------------------------------------------------------
-;; Client setup! / invoke! robustness (gemini MEDIUM)
+;; Client setup! / invoke! robustness
 ;; ---------------------------------------------------------------------------
 
 (deftest setup-bang-hard-fails-when-conn-spec-missing
-  ;; gemini HIGH: if open! failed to populate :conn-spec (unresolvable
+  ;; If open! failed to populate :conn-spec (unresolvable
   ;; host, etc.), setup! MUST throw rather than silently proceed.
   ;; Continuing with a no-op setup would leave stale data from a prior
   ;; run under zset-key and risk false-positive checker verdicts from
@@ -612,7 +612,7 @@
         "setup! must throw ex-info when :conn-spec is nil")))
 
 (deftest setup-bang-hard-fails-when-cleanup-del-errors
-  ;; gemini MEDIUM: even when :conn-spec is populated, if the actual
+  ;; Even when :conn-spec is populated, if the actual
   ;; cleanup (DEL zset-key) fails or errors, setup! must NOT silently
   ;; proceed. Stale data surviving from a prior run under zset-key
   ;; would cause false-positive safety verdicts. Propagate the
@@ -626,7 +626,7 @@
         "setup! must propagate cleanup failures, not swallow them")))
 
 (deftest zincrby-invoke-handles-nil-response
-  ;; gemini MEDIUM: if car/wcar for ZINCRBY returns nil (error reply
+  ;; If car/wcar for ZINCRBY returns nil (error reply
   ;; coerced, unexpected protocol edge), the op must complete as :info
   ;; with a structured :error, not throw NumberFormatException from
   ;; parse-double-safe swallowing (str nil) -> "nil".
@@ -642,7 +642,7 @@
             (str "expected :error to be populated, got: " result))))))
 
 (deftest zincrby-invoke-handles-unexpected-response
-  ;; gemini MEDIUM: same guard, but for a non-string / non-number reply.
+  ;; Same guard, but for a non-string / non-number reply.
   ;; Must complete :info rather than propagate a parse failure.
   (let [client (workload/->ElastickvRedisZSetSafetyClient
                  {} {:pool {} :spec {:host "localhost" :port 6379
@@ -667,11 +667,11 @@
         (is (= ["m1" 7.0] (:value result)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Vacuous-pass guard (codex P1)
+;; Vacuous-pass guard
 ;; ---------------------------------------------------------------------------
 
 (deftest empty-history-is-unknown-not-valid
-  ;; codex P1: an empty history (e.g. Redis unreachable, all ops
+  ;; An empty history (e.g. Redis unreachable, all ops
   ;; downgraded to :info) produces zero successful reads. The checker
   ;; MUST NOT return :valid? true in that case -- that would be a
   ;; false-green. Expect :valid? :unknown plus a diagnostic :reason.
@@ -683,7 +683,7 @@
     (is (zero? (:reads result)))))
 
 (deftest all-info-history-is-unknown-not-valid
-  ;; codex P1: a run where every operation was downgraded to :info
+  ;; A run where every operation was downgraded to :info
   ;; (Redis unreachable / every read timed out) still has read-pairs
   ;; filtered down to zero :ok reads. Must surface as :valid? :unknown.
   (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
@@ -708,7 +708,7 @@
         (str "expected :valid? true with one :ok read, got: " result))))
 
 (deftest zrem-invoke-handles-nil-response
-  ;; gemini MEDIUM: if car/wcar for ZREM returns nil (protocol edge,
+  ;; If car/wcar for ZREM returns nil (protocol edge,
   ;; closed connection, etc.), `(long nil)` would throw NPE and the
   ;; op would be logged as a generic failure via the general Exception
   ;; handler. Guard with `(or removed 0)` so the op resolves cleanly
@@ -736,7 +736,7 @@
         (is (= ["m1" true] (:value result)))))))
 
 (deftest parse-withscores-handles-inf-strings
-  ;; gemini HIGH: Redis returns "inf" / "+inf" / "-inf" for infinite
+  ;; Redis returns "inf" / "+inf" / "-inf" for infinite
   ;; ZSET scores. Double/parseDouble expects "Infinity"; the workload's
   ;; parser must normalize both encodings instead of throwing.
   (let [flat ["m-pos"  "inf"
