@@ -148,6 +148,16 @@ func (r *Registry) PebbleCollector() *PebbleCollector {
 	return newPebbleCollector(r.pebble)
 }
 
+// SetFSMApplySyncMode forwards the resolved ELASTICKV_FSM_SYNC_MODE
+// label to the PebbleMetrics gauge so operators can observe the active
+// durability posture on this node. Safe to call with a nil registry.
+func (r *Registry) SetFSMApplySyncMode(activeLabel string) {
+	if r == nil || r.pebble == nil {
+		return
+	}
+	r.pebble.SetFSMApplySyncMode(activeLabel)
+}
+
 // WriteConflictCollector returns a collector that polls each MVCC
 // store's per-(kind, key_prefix) OCC conflict counters and mirrors
 // them into the elastickv_store_write_conflict_total Prometheus
