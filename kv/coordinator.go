@@ -183,7 +183,7 @@ type Coordinator interface {
 
 // LeaseReadableCoordinator is the optional capability implemented by
 // coordinators that participate in the leader-local lease read path
-// (see docs/lease_read_design.md). Callers that want lease reads
+// (see docs/design/2026_04_20_implemented_lease_read.md). Callers that want lease reads
 // should type-assert to this interface and fall back to
 // LinearizableRead when the assertion fails, following the same
 // pattern as raftengine.LeaseProvider. Keeping the lease methods OFF

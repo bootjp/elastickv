@@ -1148,7 +1148,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// ~17 pebble seeks (list meta + list delta + 3×wide-column probes
 	// each doing 3 seeks + hash/set/zset/stream/HLL/str/bare); that
 	// overhead dominated every GET on a hot cluster (see
-	// docs/lease_read_design.md). A live string key resolves in 1-2
+	// docs/design/2026_04_20_implemented_lease_read.md). A live string key resolves in 1-2
 	// seeks here, and we only fall back to keyTypeAt when the string
 	// path returns ErrKeyNotFound (meaning either missing, expired,
 	// or a non-string type is present under this user-key).
