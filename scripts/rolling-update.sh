@@ -848,13 +848,22 @@ ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
 
 # ssh joins remaining arguments into a single command string which the remote
-# shell re-parses, so values containing whitespace or shell metacharacters
-# must be escaped before transport. EXTRA_ENV is documented as a
-# whitespace-separated list of KEY=VALUE pairs and therefore always needs
-# quoting; other forwarded variables are structurally whitespace-free today
-# but we still escape the path-like ones most likely to evolve for defense
-# in depth. Escape once here since these don't change per node.
-EXTRA_ENV_Q="$(printf '%q' "${EXTRA_ENV:-}")"
+# login shell re-parses before `bash -s` is exec'd, so values containing
+# whitespace or shell metacharacters must be escaped before transport.
+# EXTRA_ENV is documented as a whitespace-separated list of KEY=VALUE pairs
+# and therefore always needs quoting; other forwarded variables are
+# structurally whitespace-free today but we still escape the path-like
+# ones most likely to evolve for defense in depth. Escape once here since
+# these don't change per node.
+#
+# EXTRA_ENV may legitimately span multiple lines in deploy.env; normalise
+# newlines to spaces *before* `printf %q` so the escape emits plain
+# backslash-quoting rather than ANSI-C $'...' quoting. Common remote login
+# shells (/bin/sh -> dash on Debian/Ubuntu) don't grok $'...' and would
+# pass it through as literal characters, breaking the `KEY=VALUE`
+# validator in run_container.
+EXTRA_ENV_NORMALISED="${EXTRA_ENV//$'\n'/ }"
+EXTRA_ENV_Q="$(printf '%q' "${EXTRA_ENV_NORMALISED:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
