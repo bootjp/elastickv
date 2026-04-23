@@ -116,7 +116,7 @@
     ;; Carmine surfaces Redis error replies as exceptions by default,
     ;; but some codepaths wrap them in an ex-info / Throwable value.
     (instance? Throwable response)
-    [:error (.getMessage ^Throwable response)]
+    [:error (or (.getMessage ^Throwable response) (str response))]
 
     :else
     [:unexpected response]))
@@ -184,7 +184,7 @@
           (warn t "ZSet safety setup! DEL failed -- aborting to avoid stale data")
           (throw (ex-info
                    (str "ZSet safety setup! failed to clear prior state at "
-                        zset-key ": " (.getMessage t)
+                        zset-key ": " (or (.getMessage t) (str t))
                         ". Refusing to run against potentially stale data.")
                    {:type ::cleanup-failed
                     :zset-key zset-key}
@@ -245,7 +245,7 @@
                                         :members (parse-withscores flat)})))
         (catch Exception e
           (warn e (str "ZSet safety op failed: " (:f op)))
-          (assoc op :type :info :error (.getMessage e)))))))
+          (assoc op :type :info :error (or (.getMessage e) (str e))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Generator
