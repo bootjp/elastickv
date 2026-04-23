@@ -119,7 +119,7 @@ The adapter sits beside Redis, DynamoDB, and S3 and reuses the same `store.MVCCS
 
 ### 4.1 Leader proxy reuse
 
-The DynamoDB adapter already has the right proxy shape (`adapter/dynamodb.go:proxyToLeader`): small request bodies, JSON envelope, re-emit response. SQS message payloads cap at 256 KiB, so the existing proxy pattern is sufficient and the streaming HTTP proxy that S3 needed (`docs/s3_compatible_adapter_design.md §4.1`) is **not** required here. The SQS adapter should fork the DynamoDB proxy helper rather than reuse the S3 streaming proxy.
+The DynamoDB adapter already has the right proxy shape (`adapter/dynamodb.go:proxyToLeader`): small request bodies, JSON envelope, re-emit response. SQS message payloads cap at 256 KiB, so the existing proxy pattern is sufficient and the streaming HTTP proxy that S3 needed (`docs/design/2026_03_22_implemented_s3_compatible_adapter.md §4.1`) is **not** required here. The SQS adapter should fork the DynamoDB proxy helper rather than reuse the S3 streaming proxy.
 
 ## 5. Data Model
 
@@ -159,7 +159,7 @@ Message state is split across three key families so that the hot path (`ReceiveM
 3. `!sqs|msg|dedup|<queue-esc><gen-u64><dedup-id-esc>` → FIFO deduplication record, with expiry stored in the value. Populated only for FIFO or `SendMessageBatch` idempotent entries.
 4. `!sqs|msg|group|<queue-esc><gen-u64><group-esc>` → FIFO group in-flight lock. Present only when the group currently has an unacknowledged delivered message. Value references the locking `message_id` and `visible_at`.
 
-Key encoding reuses the DynamoDB adapter's byte-ordered segment encoder (`encodeDynamoKeySegment` in `adapter/dynamodb.go`). Strings are self-delimited with the `0x00 0xFF` / `0x00 0x01` escape-and-terminator scheme; integers are fixed-width big-endian `uint64`. This matches the S3 adapter key layout (`docs/s3_compatible_adapter_design.md §5.2`) so the three adapters agree on ordering and parsing.
+Key encoding reuses the DynamoDB adapter's byte-ordered segment encoder (`encodeDynamoKeySegment` in `adapter/dynamodb.go`). Strings are self-delimited with the `0x00 0xFF` / `0x00 0x01` escape-and-terminator scheme; integers are fixed-width big-endian `uint64`. This matches the S3 adapter key layout (`docs/design/2026_03_22_implemented_s3_compatible_adapter.md §5.2`) so the three adapters agree on ordering and parsing.
 
 ### 5.3 Message record
 
@@ -236,7 +236,7 @@ Every internal prefix must normalize to this route:
 
 ### 6.2 Required core changes
 
-1. `routeKey(...)` (same function touched by the S3 design, see `docs/s3_compatible_adapter_design.md §6.2`) gains an `!sqs|...` branch that trims to the queue route prefix.
+1. `routeKey(...)` (same function touched by the S3 design, see `docs/design/2026_03_22_implemented_s3_compatible_adapter.md §6.2`) gains an `!sqs|...` branch that trims to the queue route prefix.
 2. `kv/ShardStore.routesForScan` gains an SQS-aware internal scan mapping so `ReceiveMessage`'s visibility-index scan lands on the correct shard.
 3. The queue catalog (`!sqs|queue|meta|...`, `!sqs|queue|gen|...`) routes to a fixed control-plane group like the DynamoDB table catalog.
 
@@ -517,7 +517,7 @@ The design choices are:
 
 The two repository-level prerequisites are:
 
-1. SQS-aware internal-key routing and scan routing in `kv/`, matching the changes that `docs/s3_compatible_adapter_design.md §6.2` already proposes for S3.
+1. SQS-aware internal-key routing and scan routing in `kv/`, matching the changes that `docs/design/2026_03_22_implemented_s3_compatible_adapter.md §6.2` already proposes for S3.
 2. A leader-local long-poll notifier subscribed to the FSM commit stream.
 
 With those in place, SQS compatibility can be added without changing the underlying storage, consensus, or HLC design.
