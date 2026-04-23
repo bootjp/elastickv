@@ -287,9 +287,9 @@
                                                      "WITHSCORES"))]
             (assoc op :type :ok :value {:bounds [lo hi]
                                         :members (parse-withscores flat)})))
-        (catch Exception e
-          (warn e (str "ZSet safety op failed: " (:f op)))
-          (assoc op :type :info :error (or (.getMessage e) (str e))))))))
+        (catch Throwable t
+          (warn t (str "ZSet safety op failed: " (:f op)))
+          (assoc op :type :info :error (or (.getMessage ^Throwable t) (str t))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Generator
