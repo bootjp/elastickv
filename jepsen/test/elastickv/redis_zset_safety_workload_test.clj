@@ -121,8 +121,7 @@
   ;; CI-observed false positive: a member whose only prior ops are no-op
   ;; ZREMs was classified as :score-mismatch with :allowed #{} instead
   ;; of treated as never-existed (:phantom candidate, empty read -> OK).
-  ;; After the existence-evidence? fix, a read that observes NO such
-  ;; member must be accepted as valid.
+  ;; A read that observes NO such member must be accepted as valid.
   (let [history [{:type :invoke :process 0 :f :zrem :value "never-added" :index 0}
                  {:type :invoke :process 1 :f :zrange-all :index 1}
                  {:type :ok     :process 1 :f :zrange-all :value [] :index 2}
@@ -196,6 +195,31 @@
         result  (run-checker history)
         kinds   (set (map :kind (:first-errors result)))]
     (is (not (:valid? result)) (str "expected phantom error, got: " result))
+    (is (contains? kinds :unexpected-presence)
+        (str "expected :unexpected-presence, got kinds=" kinds))))
+
+(deftest phantom-from-info-zrem-still-flagged
+  ;; gemini HIGH (round 2): an :info ZREM is the ONLY history contact
+  ;; with a member (no ZADD/ZINCRBY ever). Because completed-mutation-
+  ;; window defaults :removed? to true on :info ZREMs (for uncertainty
+  ;; accounting), the checker must NOT treat ZREM as proof the member
+  ;; ever existed. A read observing the member present must be flagged
+  ;; as :unexpected-presence. Since setup! clears the key at test
+  ;; start, every observed member must trace back to a successful (or
+  ;; in-flight) ZADD/ZINCRBY -- never to a ZREM.
+  (let [history [;; ZREM of a member that was never added. Invoked
+                 ;; concurrently with the read, response eventually
+                 ;; lost (:info). No ZADD/ZINCRBY anywhere in history.
+                 {:type :invoke :process 0 :f :zrem  :value "phantom" :index 0}
+                 {:type :invoke :process 1 :f :zrange-all :index 1}
+                 ;; Read observes the phantom present at some score.
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["phantom" 7.0]] :index 2}
+                 {:type :info   :process 0 :f :zrem  :value "phantom" :index 3}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected :unexpected-presence for phantom, got: " result))
     (is (contains? kinds :unexpected-presence)
         (str "expected :unexpected-presence, got kinds=" kinds))))
 

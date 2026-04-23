@@ -421,16 +421,6 @@
   [m]
   (#{:zadd :zincrby} (:f m)))
 
-(defn- existence-evidence?
-  "A mutation proves that the member existed at some point iff it is a
-  write-op, or a ZREM whose :removed? flag is true. No-op ZREMs
-  (:removed? false) do NOT prove existence."
-  [m]
-  (case (:f m)
-    (:zadd :zincrby) true
-    :zrem            (boolean (:removed? m))
-    false))
-
 (defn- allowed-scores-for-member
   "Compute the set of scores considered valid for `member` by a read
   whose window is [read-inv-idx, read-cmp-idx], based on committed state
@@ -561,13 +551,16 @@
 
         ;; can-be-present?: at least one admissible linearization
         ;; (candidates + uncertain) ends with the member present.
-        ;; An uncertain write (or an uncertain :zrem combined with
-        ;; existence evidence) can flip an otherwise-absent candidate
-        ;; outcome to present by reordering after a write.
+        ;; Presence REQUIRES a write-op (ZADD / ZINCRBY) somewhere in
+        ;; the admissible set -- either a candidate committed write or
+        ;; an uncertain concurrent/pre-read :info write. ZREM never
+        ;; contributes existence evidence: since `setup!` clears the
+        ;; key at test start, an observed member that never had a ZADD
+        ;; or ZINCRBY touch it must be a phantom regardless of any
+        ;; ZREM's :removed? flag (which may be defaulted to true on
+        ;; :info for uncertainty accounting only).
         can-be-present? (or candidate-can-be-present?
-                            any-uncertain-write?
-                            (and any-uncertain-zrem?
-                                 (some existence-evidence? uncertain)))
+                            any-uncertain-write?)
 
         ;; must-be-present?: EVERY admissible linearization ends with
         ;; the member present. Requires the candidate outcome to be
