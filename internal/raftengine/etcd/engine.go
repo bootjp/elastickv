@@ -2897,9 +2897,10 @@ func snapshotEveryFromEnv() uint64 {
 // Returns (0, false) when the var is unset so the caller can keep the
 // existing cfg.MaxInflightMsg (which normalizeLimitConfig has already
 // defaulted to defaultMaxInflightMsg). Invalid values (non-numeric,
-// negative, zero) are logged at warn level and treated as unset so the
-// engine falls back to the compiled-in default rather than an obviously
-// broken override.
+// negative, zero) are logged at warn level and return
+// (defaultMaxInflightMsg, true) so the engine actually applies the
+// compiled-in default the log message promises — otherwise a malformed
+// env var would silently let an unrelated caller-supplied value win.
 func maxInflightMsgFromEnv() (int, bool) {
 	v := strings.TrimSpace(os.Getenv(maxInflightMsgEnvVar))
 	if v == "" {
@@ -2909,7 +2910,7 @@ func maxInflightMsgFromEnv() (int, bool) {
 	if err != nil || n < 1 {
 		slog.Warn("invalid ELASTICKV_RAFT_MAX_INFLIGHT_MSGS; using default",
 			"value", v, "default", defaultMaxInflightMsg)
-		return 0, false
+		return defaultMaxInflightMsg, true
 	}
 	return n, true
 }
@@ -2919,7 +2920,9 @@ func maxInflightMsgFromEnv() (int, bool) {
 // valid integer >= minMaxSizePerMsg (1 KiB). Returns (0, false) when the
 // var is unset so normalizeLimitConfig can keep its earlier default.
 // Invalid or too-small values fall back to the compiled-in default with
-// a warning; a sub-KiB cap would make MsgApp batching degenerate.
+// a warning and return (defaultMaxSizePerMsg, true) so the override
+// actually applies the default the warning promises; a sub-KiB cap
+// would make MsgApp batching degenerate.
 func maxSizePerMsgFromEnv() (uint64, bool) {
 	v := strings.TrimSpace(os.Getenv(maxSizePerMsgEnvVar))
 	if v == "" {
@@ -2929,7 +2932,7 @@ func maxSizePerMsgFromEnv() (uint64, bool) {
 	if err != nil || n < minMaxSizePerMsg {
 		slog.Warn("invalid ELASTICKV_RAFT_MAX_SIZE_PER_MSG; using default",
 			"value", v, "min", minMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
-		return 0, false
+		return uint64(defaultMaxSizePerMsg), true
 	}
 	return n, true
 }

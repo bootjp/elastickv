@@ -1862,15 +1862,17 @@ func TestMaxInflightMsgFromEnv_ReadsOverride(t *testing.T) {
 }
 
 // TestMaxInflightMsgFromEnv_FallsBackOnInvalid pins the safety behaviour:
-// a non-numeric, zero, or negative value is refused and the caller is
-// told to keep the compiled-in default rather than get a broken override.
+// a non-numeric, zero, or negative value is refused and the compiled-in
+// default is surfaced (ok=true) so that normalizeLimitConfig actually
+// applies the default the warning log promises, instead of letting a
+// caller-supplied value silently win.
 func TestMaxInflightMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
 	cases := []string{"not-a-number", "0", "-3"}
 	for _, v := range cases {
 		t.Setenv(maxInflightMsgEnvVar, v)
 		n, ok := maxInflightMsgFromEnv()
-		require.Falsef(t, ok, "env=%q", v)
-		require.Equalf(t, 0, n, "env=%q", v)
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, defaultMaxInflightMsg, n, "env=%q", v)
 	}
 }
 
@@ -1894,14 +1896,17 @@ func TestMaxSizePerMsgFromEnv_ReadsOverride(t *testing.T) {
 
 // TestMaxSizePerMsgFromEnv_FallsBackOnInvalid covers the three failure
 // modes: non-numeric, zero, and below-floor. The floor is minMaxSizePerMsg
-// (1 KiB) — a smaller cap would make MsgApp batching degenerate.
+// (1 KiB) — a smaller cap would make MsgApp batching degenerate. On
+// failure the helper returns (defaultMaxSizePerMsg, true) so the caller
+// actually applies the compiled-in default the log line promises, rather
+// than silently letting a caller-supplied value win.
 func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
 	cases := []string{"not-a-number", "0", "512"}
 	for _, v := range cases {
 		t.Setenv(maxSizePerMsgEnvVar, v)
 		n, ok := maxSizePerMsgFromEnv()
-		require.Falsef(t, ok, "env=%q", v)
-		require.Equalf(t, uint64(0), n, "env=%q", v)
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, uint64(defaultMaxSizePerMsg), n, "env=%q", v)
 	}
 }
 
@@ -1934,11 +1939,29 @@ func TestNormalizeLimitConfig_EnvOverridesCaller(t *testing.T) {
 
 // TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault pins that a
 // malformed env override does NOT leak through to raft.Config; the
-// caller-supplied defaults remain in effect.
+// compiled-in defaults are applied (even when the caller supplied a
+// different value) so the operator-visible warning log matches reality.
 func TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "not-a-number")
 	t.Setenv(maxSizePerMsgEnvVar, "-1")
 	got := normalizeLimitConfig(OpenConfig{})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_InvalidEnvOverridesCaller pins the fix for
+// the "log message is a lie" gemini reviewer finding: when the env var
+// is malformed, the helper warns "using default" — so the default MUST
+// actually win, even if the caller supplied a non-default value. Prior
+// to the fix the caller's 256 would silently survive, contradicting the
+// log line.
+func TestNormalizeLimitConfig_InvalidEnvOverridesCaller(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "garbage")
+	t.Setenv(maxSizePerMsgEnvVar, "also-garbage")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: 256,
+		MaxSizePerMsg:  1 << 20,
+	})
 	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
 	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
 }
