@@ -107,16 +107,25 @@ type LeaseProvider interface {
 	// Safety: callers must verify the lease against a single
 	// `now := monoclock.Now()` sample:
 	//   state == raftengine.StateLeader &&
-	//   !ack.IsZero() && !ack.After(now) && now.Sub(ack) < LeaseDuration()
+	//   !now.IsZero() && !ack.IsZero() && !ack.After(now) &&
+	//   now.Sub(ack) < LeaseDuration()
 	//
-	// The monotonic-raw clock (CLOCK_MONOTONIC_RAW on Linux / Darwin /
-	// FreeBSD; see internal/monoclock) is immune to NTP rate adjustment
-	// and wall-clock step events, so this comparison stays safe even if
-	// the system's time daemon slews or steps the wall clock. The
-	// !ack.After(now) guard remains as a defensive fail-closed for a
-	// zero / bogus ack reading. LeaseDuration is bounded by
-	// electionTimeout - safety_margin, guaranteeing no successor leader
-	// has accepted writes within that window.
+	// The !now.IsZero() guard fails closed when the caller's
+	// clock_gettime read errored (e.g. seccomp denies it) and
+	// monoclock.Now() returned the zero Instant; without it, a
+	// persistent clock failure could keep a once-warmed lease valid
+	// forever. See kv.engineLeaseAckValid.
+	//
+	// The monotonic-raw clock (CLOCK_MONOTONIC_RAW on Linux / Darwin;
+	// runtime-monotonic fallback on FreeBSD / Windows / others, see
+	// internal/monoclock) is immune to NTP rate adjustment and
+	// wall-clock step events on the raw-clock platforms, so the
+	// comparison stays safe even if the system's time daemon slews
+	// or steps the wall clock. The !ack.After(now) guard remains as
+	// a defensive fail-closed for a zero / bogus ack reading.
+	// LeaseDuration is bounded by electionTimeout - safety_margin,
+	// guaranteeing no successor leader has accepted writes within
+	// that window.
 	//
 	// Returns the zero Instant when no quorum has been confirmed yet
 	// or when the local node is not the leader. Single-node LEADERS
