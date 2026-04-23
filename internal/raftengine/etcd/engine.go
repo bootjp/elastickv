@@ -81,7 +81,7 @@ const (
 	// minMaxSizePerMsg is the lower bound accepted from the environment
 	// override. A payload cap below ~1 KiB makes MsgApp batching
 	// degenerate (one entry per message) which defeats the whole point
-	// of the knob; clamp to this floor rather than rejecting so that a
+	// of the knob; fall back to the default rather than rejecting so that a
 	// fat-fingered operator doesn't take out the engine.
 	minMaxSizePerMsg uint64 = 1 << 10
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
