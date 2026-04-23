@@ -30,6 +30,7 @@ import (
 const (
 	cmdBZPopMin         = "BZPOPMIN"
 	cmdClient           = "CLIENT"
+	cmdCommand          = "COMMAND"
 	cmdDBSize           = "DBSIZE"
 	cmdDel              = "DEL"
 	cmdDiscard          = "DISCARD"
@@ -167,6 +168,7 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 var argsLen = map[string]int{
 	cmdBZPopMin:         -3,
 	cmdClient:           -2,
+	cmdCommand:          -1,
 	cmdDBSize:           1,
 	cmdDel:              -2,
 	cmdDiscard:          1,
@@ -417,6 +419,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
 		cmdBZPopMin:         r.bzpopmin,
 		cmdClient:           r.client,
+		cmdCommand:          r.command,
 		cmdDBSize:           r.dbsize,
 		cmdDel:              r.del,
 		cmdDiscard:          r.discard,

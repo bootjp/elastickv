@@ -220,6 +220,172 @@ func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 	}
 }
 
+// command implements the Redis `COMMAND` family used by clients for
+// capability probing at connect time (go-redis, redis-py, ioredis, …).
+// Subcommand matrix:
+//
+//	COMMAND                    -> array of per-command info
+//	COMMAND COUNT              -> integer
+//	COMMAND LIST               -> array of names (FILTERBY rejected)
+//	COMMAND INFO [name ...]    -> array of per-command info (nil per unknown)
+//	COMMAND DOCS [name ...]    -> minimal map-shaped doc entries
+//	COMMAND GETKEYS cmd args   -> array of extracted keys
+//	COMMAND GETKEYSANDFLAGS    -> ERR unsupported
+func (r *RedisServer) command(conn redcon.Conn, cmd redcon.Command) {
+	if len(cmd.Args) == 1 {
+		r.writeCommandInfoAll(conn)
+		return
+	}
+	sub := strings.ToUpper(string(cmd.Args[1]))
+	switch sub {
+	case "COUNT":
+		// COUNT must match the cardinality of COMMAND / COMMAND LIST —
+		// which iterate argsLen (= routed set). The table has the same
+		// size by invariant, but driving COUNT off argsLen keeps the
+		// three subcommands wire-consistent even during the brief
+		// window when a new route has been added but the table row is
+		// still pending.
+		conn.WriteInt(len(argsLen))
+	case "LIST":
+		// `COMMAND LIST` takes no args (bare list) or `FILTERBY …` which we
+		// reject below. Anything past the subcommand slot is a filter.
+		const commandListArgFixed = 2
+		if len(cmd.Args) > commandListArgFixed {
+			// We explicitly do not support FILTERBY MODULE|ACLCAT|PATTERN
+			// — elastickv has no modules and no ACL categories. Rejecting
+			// here is consistent with how real Redis would behave when a
+			// filter resolves to an empty universe; clients that see this
+			// fall back to COMMAND (no args), which we support.
+			conn.WriteError("ERR unsupported COMMAND LIST filter")
+			return
+		}
+		r.writeCommandList(conn)
+	case "INFO":
+		r.writeCommandInfo(conn, cmd.Args[2:])
+	case "DOCS":
+		r.writeCommandDocs(conn, cmd.Args[2:])
+	case "GETKEYS":
+		r.writeCommandGetKeys(conn, cmd.Args[2:])
+	case "GETKEYSANDFLAGS":
+		conn.WriteError("ERR unsupported COMMAND subcommand 'GETKEYSANDFLAGS'")
+	default:
+		conn.WriteError("ERR Unknown COMMAND subcommand '" + sub + "'")
+	}
+}
+
+// writeCommandInfoEntry emits the 6-element per-command info array for a
+// single command. Redis 7 extends this to 10 elements; we deliberately
+// stop at 6 because every client we care about parses the first 6 fields
+// and ignores trailing elements.
+func writeCommandInfoEntry(conn redcon.Conn, meta redisCommandMeta) {
+	const infoArity = 6
+	conn.WriteArray(infoArity)
+	conn.WriteBulkString(meta.Name)
+	conn.WriteInt(meta.Arity)
+	conn.WriteArray(len(meta.Flags))
+	for _, f := range meta.Flags {
+		conn.WriteBulkString(f)
+	}
+	conn.WriteInt(meta.FirstKey)
+	conn.WriteInt(meta.LastKey)
+	conn.WriteInt(meta.Step)
+}
+
+func (r *RedisServer) writeCommandInfoAll(conn redcon.Conn) {
+	metas := routedRedisCommandMetas()
+	conn.WriteArray(len(metas))
+	for _, meta := range metas {
+		writeCommandInfoEntry(conn, meta)
+	}
+}
+
+func (r *RedisServer) writeCommandList(conn redcon.Conn) {
+	metas := routedRedisCommandMetas()
+	conn.WriteArray(len(metas))
+	for _, meta := range metas {
+		conn.WriteBulkString(meta.Name)
+	}
+}
+
+func (r *RedisServer) writeCommandInfo(conn redcon.Conn, requested [][]byte) {
+	// `COMMAND INFO` with no names is equivalent to `COMMAND` (no args):
+	// return info for every known command. This is what real Redis does
+	// and what go-redis relies on when it issues bare `COMMAND INFO`.
+	if len(requested) == 0 {
+		r.writeCommandInfoAll(conn)
+		return
+	}
+	conn.WriteArray(len(requested))
+	for _, raw := range requested {
+		meta, ok := redisCommandTable[strings.ToUpper(string(raw))]
+		if !ok {
+			conn.WriteNull()
+			continue
+		}
+		writeCommandInfoEntry(conn, meta)
+	}
+}
+
+// writeCommandDocs emits the minimum shape real clients check for:
+// a 4-element map-shaped array per requested command with "summary" and
+// "arguments" keys. We do not maintain per-command docs, so the summary
+// is empty and the arguments array is empty. Unknown commands produce a
+// nil entry, matching Redis semantics.
+func (r *RedisServer) writeCommandDocs(conn redcon.Conn, requested [][]byte) {
+	const docEntryLen = 4
+	conn.WriteArray(len(requested))
+	for _, raw := range requested {
+		if _, ok := redisCommandTable[strings.ToUpper(string(raw))]; !ok {
+			conn.WriteNull()
+			continue
+		}
+		conn.WriteArray(docEntryLen)
+		conn.WriteBulkString("summary")
+		conn.WriteBulkString("")
+		conn.WriteBulkString("arguments")
+		conn.WriteArray(0)
+	}
+}
+
+// writeCommandGetKeys dispatches COMMAND GETKEYS for a given subcommand
+// plus its arguments. Real Redis requires at least one arg after GETKEYS
+// (the command name itself); we enforce that here rather than lean on
+// argsLen which only validates the outer COMMAND call.
+func (r *RedisServer) writeCommandGetKeys(conn redcon.Conn, argv [][]byte) {
+	if len(argv) == 0 {
+		conn.WriteError("ERR wrong number of arguments for 'command|getkeys' command")
+		return
+	}
+	meta, ok := redisCommandTable[strings.ToUpper(string(argv[0]))]
+	if !ok {
+		conn.WriteError("ERR Invalid command specified")
+		return
+	}
+	// validate arity of the nested command so we match Redis behaviour of
+	// refusing to compute keys for obviously malformed commands (a common
+	// source of confusion in client test suites).
+	switch {
+	case meta.Arity > 0 && len(argv) != meta.Arity:
+		conn.WriteError("ERR Invalid arguments specified for populating the array of keys")
+		return
+	case meta.Arity < 0 && len(argv) < -meta.Arity:
+		conn.WriteError("ERR Invalid arguments specified for populating the array of keys")
+		return
+	}
+	keys := redisCommandGetKeys(meta, argv)
+	if len(keys) == 0 {
+		// `The command has no key arguments` — real Redis returns an error
+		// in this case rather than an empty array, and go-redis's test
+		// suite expects the error form.
+		conn.WriteError("ERR The command has no key arguments")
+		return
+	}
+	conn.WriteArray(len(keys))
+	for _, k := range keys {
+		conn.WriteBulk(k)
+	}
+}
+
 func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
 	if _, err := strconv.Atoi(string(cmd.Args[1])); err != nil {
 		conn.WriteError("ERR invalid DB index")
