@@ -55,6 +55,13 @@ Optional environment:
   RAFTADMIN_RPC_TIMEOUT_SECONDS
   RAFTADMIN_ALLOW_INSECURE
 
+  EXTRA_ENV
+    Whitespace-separated list of additional container environment variables to
+    forward to the remote docker run as `-e KEY=VALUE` flags. Format:
+    "KEY=VALUE [KEY=VALUE ...]" (e.g. "ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512").
+    Each pair must be KEY=VALUE with a non-empty KEY; pairs themselves must not
+    contain whitespace.
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
@@ -394,11 +401,11 @@ update_one_node() {
 
   ssh "${SSH_BASE_OPTS[@]}" "$ssh_target" \
     env \
-      IMAGE="$IMAGE" \
-      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
-      CONTAINER_NAME="$CONTAINER_NAME" \
-      DATA_DIR="$DATA_DIR" \
-      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
+      IMAGE="$IMAGE_Q" \
+      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN_Q" \
+      CONTAINER_NAME="$CONTAINER_NAME_Q" \
+      DATA_DIR="$DATA_DIR_Q" \
+      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT_Q" \
       RAFT_ENGINE="$RAFT_ENGINE" \
       RAFT_PORT="$RAFT_PORT" \
       REDIS_PORT="$REDIS_PORT" \
@@ -406,7 +413,7 @@ update_one_node() {
       S3_PORT="$S3_PORT" \
       ENABLE_S3="$ENABLE_S3" \
       S3_REGION="$S3_REGION" \
-      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE" \
+      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
@@ -417,8 +424,9 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
-      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
-      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
+      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
+      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
+      EXTRA_ENV="$EXTRA_ENV_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -665,12 +673,47 @@ run_container() {
     )
   fi
 
+  # Pass through additional container environment variables from EXTRA_ENV.
+  # Accepts a whitespace-separated list of KEY=VALUE pairs, e.g.:
+  #   EXTRA_ENV="ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512"
+  # Each pair is forwarded as a single `-e KEY=VALUE` flag so VALUE may contain
+  # characters that bash would otherwise interpret; pairs themselves must not
+  # contain whitespace.
+  local extra_env_flags=()
+  if [[ -n "${EXTRA_ENV:-}" ]]; then
+    # Split on whitespace without triggering filename globbing. Normalise
+    # newlines to spaces first so multi-line EXTRA_ENV values (common in
+    # long deploy.env overrides) are fully parsed — a here-string consumes
+    # only up to the first newline, so without this step subsequent lines
+    # would be silently dropped.
+    local -a extra_env_pairs=()
+    local extra_env_normalised="${EXTRA_ENV//$'\n'/ }"
+    # Explicit IFS so splitting is immune to any earlier mutation. Default
+    # whitespace is already space/tab/newline; pinning it here makes the
+    # behaviour self-documenting.
+    IFS=$' \t\n' read -r -a extra_env_pairs <<< "${extra_env_normalised}"
+    local pair
+    for pair in "${extra_env_pairs[@]}"; do
+      if [[ "$pair" != *=* || "$pair" == =* ]]; then
+        echo "invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
+        exit 1
+      fi
+      local key="${pair%%=*}"
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "invalid EXTRA_ENV key '$key' in entry '$pair'; key must match [A-Za-z_][A-Za-z0-9_]*" >&2
+        exit 1
+      fi
+      extra_env_flags+=(-e "$pair")
+    done
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
@@ -806,6 +849,36 @@ fi
 
 ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
+
+# ssh joins remaining arguments into a single command string which the remote
+# login shell re-parses before `bash -s` is exec'd, so values containing
+# whitespace or shell metacharacters must be escaped before transport.
+# EXTRA_ENV is documented as a whitespace-separated list of KEY=VALUE pairs
+# and therefore always needs quoting; other forwarded variables are
+# structurally whitespace-free today but we still escape the path-like
+# ones most likely to evolve for defense in depth. Escape once here since
+# these don't change per node.
+#
+# EXTRA_ENV may legitimately span multiple lines in deploy.env; normalise
+# all non-space whitespace (newline, carriage return, tab) to spaces
+# *before* `printf %q` so the escape emits plain backslash-quoting rather
+# than ANSI-C $'...' quoting. Common remote login shells (/bin/sh -> dash
+# on Debian/Ubuntu) don't grok $'...' and would pass it through as literal
+# characters, breaking the `KEY=VALUE` validator in run_container.
+# CR handling additionally covers deploy.env files edited on Windows.
+# `${EXTRA_ENV:-}` is required because `set -u` is active and EXTRA_ENV
+# may be unset (the variable is optional in deploy.env).
+EXTRA_ENV_NORMALISED="${EXTRA_ENV:-}"
+EXTRA_ENV_NORMALISED="${EXTRA_ENV_NORMALISED//[$'\t\r\n']/ }"
+EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
+S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
+IMAGE_Q="$(printf '%q' "$IMAGE")"
+DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
+SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
+RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
+CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
+RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
