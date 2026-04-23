@@ -162,8 +162,15 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, engin
 //nolint:unparam
 func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	const (
-		waitTimeout  = 5 * time.Second
-		waitInterval = 100 * time.Millisecond
+		// listenerWaitTimeout bounds the per-socket Dial loop; a few seconds
+		// is plenty since the listeners are already Listen()ing by the time
+		// we poll.
+		listenerWaitTimeout = 5 * time.Second
+		waitInterval        = 100 * time.Millisecond
+		// raftReadyTimeout is the overall budget for leader election +
+		// 300ms stability window. 10s gives room for re-elections on
+		// slow CI runners under -race.
+		raftReadyTimeout = 10 * time.Second
 	)
 
 	t.Helper()
@@ -173,8 +180,8 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	ports := assignPorts(n)
 	nodes, grpcAdders, redisAdders, peers := setupNodes(t, ctx, n, ports)
 
-	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
-	waitForRaftReadiness(t, nodes, peers, waitTimeout, waitInterval)
+	waitForNodeListeners(t, ctx, nodes, listenerWaitTimeout, waitInterval)
+	waitForRaftReadiness(t, nodes, peers, raftReadyTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
@@ -250,27 +257,88 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// Nudge leadership onto node 0 if a different node won.
 	ensureNodeZeroIsLeader(t, nodes, peers, waitTimeout, waitInterval)
 
-	require.Eventually(t, func() bool {
-		var leaderAddr string
-		for _, n := range nodes {
-			leader := n.engine.Leader().Address
-			if leader == "" {
-				return false
-			}
-			if leaderAddr == "" {
-				leaderAddr = leader
-			} else if leader != leaderAddr {
-				return false
-			}
+	// Require the leader to remain stable for a short window before we
+	// declare the cluster ready. etcd/raft can briefly publish a leader
+	// and then step down if the freshly-elected leader fails its first
+	// heartbeat quorum check — callers that issue writes immediately
+	// after this helper returns would race into that window and see
+	// transient "not leader" errors. A stability window catches the
+	// flip and loops until the leader actually holds.
+	waitForStableLeader(t, nodes, peers, waitTimeout)
+}
+
+// waitForStableLeader polls the cluster until nodes[0] has been the leader
+// (and all other nodes agree on it as the leader address) for a continuous
+// stability window. If leadership flips during the window, the loop restarts.
+//
+// Design notes:
+//   - The etcd/raft engine exposes no "leader gained" event channel;
+//     raftengine.LeaseProvider offers only RegisterLeaderLossCallback
+//     (leader -> non-leader), which is the wrong direction for a readiness
+//     check. So this helper uses pure polling: a tight inner sample loop
+//     checks that every node reports leader == peers[0].Address for 12
+//     consecutive samples (25ms × 12 = 300ms). Any miss restarts the
+//     outer loop.
+//   - The overall deadline is the caller-supplied waitTimeout (10s at the
+//     current createNode call site), which bounds how long we re-try
+//     re-elections.
+func waitForStableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout time.Duration) {
+	t.Helper()
+
+	const (
+		stabilityWindow = 300 * time.Millisecond
+		pollInterval    = 25 * time.Millisecond
+	)
+
+	if len(nodes) == 0 || len(peers) == 0 {
+		return
+	}
+	targetAddr := peers[0].Address
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !leaderLooksReady(nodes, targetAddr) {
+			time.Sleep(pollInterval)
+			continue
 		}
-		// Confirm the leader address belongs to the configured peers.
-		for _, p := range peers {
-			if p.Address == leaderAddr {
-				return true
-			}
+		if leaderStableFor(nodes, targetAddr, stabilityWindow, pollInterval) {
+			return
 		}
+		// Leader flipped during the window — fall through and retry.
+	}
+	t.Fatalf("leader never stabilised on %s within %s", targetAddr, timeout)
+}
+
+// leaderLooksReady returns true when nodes[0] reports itself as leader and
+// every node's Leader().Address matches the expected target. This is the
+// single-sample precondition used by waitForStableLeader; the stability
+// window then requires this to stay true for N consecutive samples.
+func leaderLooksReady(nodes []Node, targetAddr string) bool {
+	if nodes[0].engine.State() != raftengine.StateLeader {
 		return false
-	}, waitTimeout, waitInterval)
+	}
+	for _, n := range nodes {
+		if n.engine.Leader().Address != targetAddr {
+			return false
+		}
+	}
+	return true
+}
+
+// leaderStableFor samples leaderLooksReady every pollInterval for the full
+// window and returns true iff every sample reports ready. A single negative
+// sample returns false immediately so the outer loop can re-check.
+func leaderStableFor(nodes []Node, targetAddr string, window, pollInterval time.Duration) bool {
+	end := time.Now().Add(window)
+	for {
+		if !leaderLooksReady(nodes, targetAddr) {
+			return false
+		}
+		if !time.Now().Before(end) {
+			return true
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // ensureNodeZeroIsLeader waits for any node to become leader, then (if
