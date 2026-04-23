@@ -701,6 +701,11 @@ run_container() {
         echo "invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
         exit 1
       fi
+      local key="${pair%%=*}"
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "invalid EXTRA_ENV key '$key' in entry '$pair'; key must match [A-Za-z_][A-Za-z0-9_]*" >&2
+        exit 1
+      fi
       extra_env_flags+=(-e "$pair")
     done
   fi
