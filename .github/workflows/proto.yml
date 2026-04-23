@@ -48,6 +48,10 @@ jobs:
         run: buf generate
       - name: Fail on regenerated diff
         run: |
+          # intent-to-add surfaces newly generated .pb.go that would
+          # otherwise be invisible to `git diff` (adding a .proto without
+          # committing its generated .pb.go must fail this gate).
+          git add -N proto/
           if ! git diff --exit-code -- proto/; then
             echo "::error::Generated proto files differ from committed output. Run 'make -C proto gen' and commit the result."
             exit 1

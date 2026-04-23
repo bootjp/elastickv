@@ -3,7 +3,8 @@ PROTOC_GEN_GO_VERSION := 1.36.11
 PROTOC_GEN_GO_GRPC_VERSION := 1.6.1
 
 BUF ?= buf
-BREAKING_AGAINST ?= ../.git#subdir=proto,branch=main
+# BREAKING_AGAINST lets callers override the auto-detected baseline.
+BREAKING_AGAINST ?=
 
 .PHONY: all gen check-tools breaking
 
@@ -45,11 +46,18 @@ check-tools:
 	fi
 
 breaking: check-tools
-	@if git -C .. rev-parse --verify main >/dev/null 2>&1; then \
-		$(BUF) breaking --against '$(BREAKING_AGAINST)'; \
+	@baseline=''; \
+	if git -C .. rev-parse --verify main >/dev/null 2>&1; then \
+		baseline='../.git#subdir=proto,branch=main'; \
+	elif git -C .. rev-parse --verify origin/main >/dev/null 2>&1; then \
+		baseline='../.git#subdir=proto,ref=refs/remotes/origin/main'; \
 	else \
-		echo "skip breaking check: main branch not found"; \
-	fi
+		echo "no breaking baseline found: neither 'main' nor 'origin/main' is reachable"; \
+		echo "fetch main first (git fetch origin main) or override with BREAKING_AGAINST=..."; \
+		exit 1; \
+	fi; \
+	if [ -n "$(BREAKING_AGAINST)" ]; then baseline='$(BREAKING_AGAINST)'; fi; \
+	$(BUF) breaking --against "$$baseline"
 
 gen: check-tools breaking
 	$(BUF) generate
