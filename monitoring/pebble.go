@@ -174,22 +174,28 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 }
 
 // SetFSMApplySyncMode records which ELASTICKV_FSM_SYNC_MODE is active.
-// activeLabel is expected to be "sync" or "nosync"; any other value is
-// still accepted (operator observability trumps enum strictness) and
-// leaves the previously-recorded mode labels untouched at 0.
+// activeLabel must be "sync" or "nosync"; any other value is coerced to
+// "sync" to match the store resolver's fallback behaviour for unknown
+// ELASTICKV_FSM_SYNC_MODE values (see store.resolveFSMApplyWriteOpts).
+// This keeps the gauge's two-row shape stable: exactly one of
+// {"sync","nosync"} is 1 at any time and the other is 0.
 //
 // Call this once at startup after the store package has resolved the
 // env var. Invoking again is safe and idempotent: the new label goes to
-// 1 and all previously-set labels go to 0.
+// 1 and the other known label goes to 0.
 func (m *PebbleMetrics) SetFSMApplySyncMode(activeLabel string) {
 	if m == nil || m.fsmApplySyncMode == nil {
 		return
 	}
+	// Coerce unknown labels to "sync" so the gauge never leaks a third
+	// row and so a prior stale label cannot stay pinned at 1. This
+	// mirrors store.resolveFSMApplyWriteOpts, which also falls back to
+	// sync on unrecognised input.
+	if activeLabel != "sync" && activeLabel != "nosync" {
+		activeLabel = "sync"
+	}
 	// Zero both known labels before setting the active one so the gauge
-	// has a stable two-row shape regardless of call ordering. Unknown
-	// labels received via an earlier SetFSMApplySyncMode call remain in
-	// place at their prior value; they are not part of the documented
-	// mode set and exist only as an escape hatch for future modes.
+	// has a stable two-row shape regardless of call ordering.
 	m.fsmApplySyncMode.WithLabelValues("sync").Set(0)
 	m.fsmApplySyncMode.WithLabelValues("nosync").Set(0)
 	m.fsmApplySyncMode.WithLabelValues(activeLabel).Set(1)

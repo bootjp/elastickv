@@ -306,3 +306,35 @@ func TestSetFSMApplySyncMode_NilRegistryIsSafe(t *testing.T) {
 	var r *Registry
 	require.NotPanics(t, func() { r.SetFSMApplySyncMode("sync") })
 }
+
+// TestSetFSMApplySyncMode_UnknownLabelCoercesToSync verifies that an
+// unrecognised label is coerced to "sync" rather than pinning a third
+// row on the gauge. This mirrors store.resolveFSMApplyWriteOpts, which
+// also falls back to sync on unknown input; the two paths must agree
+// or the gauge will disagree with the actual WriteOptions the store
+// uses.
+func TestSetFSMApplySyncMode_UnknownLabelCoercesToSync(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+
+	// Prime the gauge with a legitimate nosync posture so we can prove
+	// the follow-up unknown-label call flips sync to 1 (not leaves it
+	// at its prior value).
+	registry.SetFSMApplySyncMode("nosync")
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+
+	registry.SetFSMApplySyncMode("batch") // never implemented, treated as sync
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+}
