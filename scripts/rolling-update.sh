@@ -674,10 +674,15 @@ run_container() {
   # contain whitespace.
   local extra_env_flags=()
   if [[ -n "${EXTRA_ENV:-}" ]]; then
-    # shellcheck disable=SC2206
-    local -a extra_env_pairs=( ${EXTRA_ENV} )
+    # Split on whitespace without triggering filename globbing.
+    local -a extra_env_pairs=()
+    read -r -a extra_env_pairs <<< "${EXTRA_ENV}"
     local pair
     for pair in "${extra_env_pairs[@]}"; do
+      if [[ "$pair" != *=* || "$pair" == =* ]]; then
+        echo "invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
+        exit 1
+      fi
       extra_env_flags+=(-e "$pair")
     done
   fi
