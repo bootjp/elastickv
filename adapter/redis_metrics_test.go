@@ -506,6 +506,51 @@ func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {
 	require.Equal(t, float64(workers*perWorks), total)
 }
 
+// TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes covers the
+// regression this commit fixes: the adapter's Run() loop must pass RAW
+// command bytes (not strings.ToUpper'd bytes) to the unsupported-command
+// observer. ToUpper silently rewrites invalid UTF-8 into the U+FFFD
+// replacement character, so if the raw path is not preserved the
+// invalid_utf8 sentinel is never reached and a hostile client can burn
+// through the distinct-name slots with replacement-char garbage. Feeding
+// the observer directly with three invalid bytes must produce the
+// sentinel, not a synthetic "valid UTF-8" label.
+func TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RedisObserver()
+
+	raw := string([]byte{0xff, 0xff, 0xff})
+	require.False(t, utf8.ValidString(raw), "precondition: bytes must be invalid UTF-8")
+
+	require.NotPanics(t, func() {
+		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:     raw,
+			IsError:     true,
+			Duration:    time.Millisecond,
+			Unsupported: true,
+		})
+	})
+
+	mf, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+
+	var sentinel float64
+	for _, family := range mf {
+		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() == "command" && lbl.GetValue() == "invalid_utf8" {
+					sentinel += metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), sentinel,
+		"raw invalid-UTF-8 bytes must land in the 'invalid_utf8' sentinel")
+}
+
 // stubRedisConn is a minimal redcon.Conn implementation for unit tests.
 type stubRedisConn struct {
 	lastError  string

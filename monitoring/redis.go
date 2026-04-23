@@ -221,6 +221,13 @@ func (m *RedisMetrics) ObserveRedisRequest(report RedisRequestReport) {
 // command name, falling back to "other" when the distinct-name cap has
 // been reached. The input is uppercased, trimmed, and length-capped to
 // avoid pathological label values.
+//
+// `raw` MUST be the raw bytes received from the client (NOT already
+// uppercased). strings.ToUpper silently rewrites invalid UTF-8 bytes
+// into the U+FFFD replacement character, which would mask the invalid-
+// UTF-8 sentinel path and let a hostile client consume real label slots
+// with synthetic "valid" garbage. Keep ToUpper/TrimSpace inside this
+// function, AFTER the UTF-8 validity check.
 func (m *RedisMetrics) observeUnsupportedCommand(raw string) {
 	// Guard against raw inputs that are already invalid UTF-8 at ingress
 	// (e.g. a binary blob sent as a command name). Passing invalid UTF-8
