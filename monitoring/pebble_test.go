@@ -31,6 +31,19 @@ func (f *fakePebbleSource) Metrics() *pebble.Metrics {
 	return f.metrics
 }
 
+// fakePebbleCapacitySource additionally implements PebbleCacheCapacitySource
+// so the collector emits elastickv_pebble_block_cache_capacity_bytes.
+type fakePebbleCapacitySource struct {
+	fakePebbleSource
+	capacity int64
+}
+
+func (f *fakePebbleCapacitySource) BlockCacheCapacityBytes() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.capacity
+}
+
 // newFakeMetrics builds a *pebble.Metrics populated only with the
 // fields the collector reads. Other fields stay at their zero value.
 func newFakeMetrics(l0Sub int32, l0Files int64, debt uint64, inProg int64, compactCount int64,
@@ -188,6 +201,58 @@ func TestPebbleCollectorSkipsNilSnapshot(t *testing.T) {
 	// No gauges or counters should exist yet.
 	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.l0Sublevels))
 	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.compactCountTotal))
+}
+
+func TestPebbleCollectorEmitsBlockCacheCapacity(t *testing.T) {
+	// When the source implements PebbleCacheCapacitySource, the
+	// collector mirrors the configured capacity into
+	// elastickv_pebble_block_cache_capacity_bytes alongside the current
+	// usage gauge. This lets operators see a low hit rate and
+	// immediately tell whether the cache is undersized vs simply cold.
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.PebbleCollector()
+	require.NotNil(t, collector)
+
+	src := &fakePebbleCapacitySource{capacity: 256 << 20}
+	src.set(newFakeMetrics(
+		0, 0, 0, 0, 0,
+		0, 0, 0,
+		4096, 0, 0,
+	))
+	sources := []PebbleSource{{GroupID: 3, GroupIDStr: "3", Source: src}}
+	collector.ObserveOnce(sources)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_pebble_block_cache_capacity_bytes Configured maximum size of Pebble's block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.
+# TYPE elastickv_pebble_block_cache_capacity_bytes gauge
+elastickv_pebble_block_cache_capacity_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 2.68435456e+08
+# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by Pebble's block cache.
+# TYPE elastickv_pebble_block_cache_size_bytes gauge
+elastickv_pebble_block_cache_size_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 4096
+`),
+		"elastickv_pebble_block_cache_capacity_bytes",
+		"elastickv_pebble_block_cache_size_bytes",
+	)
+	require.NoError(t, err)
+}
+
+func TestPebbleCollectorSkipsCapacityWhenUnsupported(t *testing.T) {
+	// A PebbleMetricsSource that does NOT additionally implement
+	// PebbleCacheCapacitySource must not cause the capacity gauge to be
+	// populated for its group. This preserves backward compatibility
+	// with sources that pre-date the capacity interface.
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.PebbleCollector()
+	require.NotNil(t, collector)
+
+	src := &fakePebbleSource{}
+	src.set(newFakeMetrics(0, 0, 0, 0, 0, 0, 0, 0, 1024, 0, 0))
+	collector.ObserveOnce([]PebbleSource{{GroupID: 4, GroupIDStr: "4", Source: src}})
+
+	// The capacity vector should remain empty (no label sets observed).
+	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.blockCacheCapacityBytes))
 }
 
 func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
