@@ -129,7 +129,7 @@
   (->> flat
        (partition 2)
        (mapv (fn [[m s]]
-               [(if (bytes? m) (String. ^bytes m) (str m))
+               [(if (bytes? m) (String. ^bytes m "UTF-8") (str m))
                 (parse-double-safe s)]))))
 
 (defn- zincrby!
