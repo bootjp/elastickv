@@ -26,7 +26,7 @@ The design goal is S3 compatibility, not full AWS parity. The adapter should be 
 ### 2.2 Non-goals
 
 1. Full AWS S3 feature parity.
-2. IAM, STS, bucket policies, or cross-account authorization. (Bucket-level canned ACLs `private`/`public-read` are supported — see `docs/s3_public_bucket_design.md`.)
+2. IAM, STS, bucket policies, or cross-account authorization. (Bucket-level canned ACLs `private`/`public-read` are supported — see `docs/design/2026_04_01_implemented_s3_public_bucket.md`.)
 3. Public S3 object versioning APIs in the first milestone.
 4. Lifecycle rules, replication, object lock, event notifications, website hosting, or SSE-KMS.
 5. Zero-copy `CopyObject` in the first milestone.
@@ -361,7 +361,7 @@ Milestone 1 should support a narrow, explicit security model:
 1. AWS Signature Version 4 request signing
 2. Static access-key and secret-key pairs from local configuration
 3. Optional fixed region from server configuration
-4. Bucket-level canned ACLs (`private`, `public-read`) via `PutBucketAcl` / `GetBucketAcl` and `x-amz-acl` header on `CreateBucket`. Public buckets allow anonymous read access (GetObject, HeadObject, ListObjectsV2) while write operations always require authentication. See `docs/s3_public_bucket_design.md` for details.
+4. Bucket-level canned ACLs (`private`, `public-read`) via `PutBucketAcl` / `GetBucketAcl` and `x-amz-acl` header on `CreateBucket`. Public buckets allow anonymous read access (GetObject, HeadObject, ListObjectsV2) while write operations always require authentication. See `docs/design/2026_04_01_implemented_s3_public_bucket.md` for details.
 
 Not in scope for Milestone 1:
 

@@ -37,7 +37,7 @@ Deployment/runbook documents:
 
 Design documents:
 
-- `docs/s3_compatible_adapter_design.md` (S3-compatible object storage adapter design, data model, routing, and rollout plan)
+- `docs/design/2026_03_22_implemented_s3_compatible_adapter.md` (S3-compatible object storage adapter design, data model, routing, and rollout plan)
 
 ## Metrics and Grafana
 
@@ -237,7 +237,7 @@ aws --endpoint-url http://localhost:9000 s3api put-bucket-acl \
 
 Public buckets allow unauthenticated `GetObject`, `HeadObject`, `HeadBucket`, and `ListObjectsV2`. Write operations (`PutObject`, `DeleteObject`, multipart uploads) always require authentication. `ListBuckets` and ACL management also always require authentication.
 
-See `docs/s3_compatible_adapter_design.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan. See `docs/s3_public_bucket_design.md` for the public bucket ACL design.
+See `docs/design/2026_03_22_implemented_s3_compatible_adapter.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan. See `docs/design/2026_04_01_implemented_s3_public_bucket.md` for the public bucket ACL design.
 
 ### Connecting to a Follower Node
 To connect to a follower node:

@@ -33,7 +33,7 @@ import (
 // network delay plus scheduling slop. leaseSafetyMargin is sized to
 // cover that overshoot, so leaseDuration = electionTimeout -
 // leaseSafetyMargin keeps the lease strictly inside the no-new-leader
-// window. See docs/lease_read_design.md for the full argument.
+// window. See docs/design/2026_04_20_implemented_lease_read.md for the full argument.
 type quorumAckTracker struct {
 	mu       sync.Mutex
 	peerAcks map[uint64]int64 // peer ID → last ack monoclock ns observed on leader

@@ -33,7 +33,7 @@ const (
 	// duration of a leader-local read lease. It absorbs goroutine scheduling
 	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
 	// and bounded wall-clock skew between the leader and a partition's new
-	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	// leader candidate. See docs/design/2026_04_20_implemented_lease_read.md for the safety argument.
 	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK. It also sizes the inbound
