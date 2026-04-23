@@ -121,6 +121,39 @@
     :else
     [:unexpected response]))
 
+(defn- coerce-zrem-count
+  "Carmine's ZREM reply is normally a Long (count of removed members),
+  but under protocol edge cases / Carmine versions / RESP2 vs RESP3
+  differences it can also arrive as a numeric string (\"1\") or raw
+  bytes. Blindly calling `(long reply)` on those forms throws
+  ClassCastException, which would fall through to the general exception
+  handler and mask the real signal.
+
+  Returns a non-negative long count. Unparseable or unexpected values
+  are treated as 0 (i.e. \"nothing removed\") so the op still resolves
+  as :ok -- matching the existing nil-guard behaviour.
+  "
+  [response]
+  (cond
+    (nil? response)
+    0
+
+    (number? response)
+    (long response)
+
+    (string? response)
+    (try
+      (Long/parseLong ^String response)
+      (catch NumberFormatException _ 0))
+
+    (bytes? response)
+    (try
+      (Long/parseLong (String. ^bytes response "UTF-8"))
+      (catch NumberFormatException _ 0))
+
+    :else
+    0))
+
 (defn- parse-withscores
   "Carmine returns a flat [member score member score ...] vector for
   ZRANGE WITHSCORES. Convert to a sorted vector of [member (double score)]
@@ -232,12 +265,15 @@
           (let [member (:value op)
                 ;; Carmine normally returns an integer count. Guard
                 ;; against nil / missing reply (protocol edge, closed
-                ;; connection, etc.) so `(long removed)` doesn't throw
-                ;; NPE -- that would otherwise fall through to the
-                ;; general Exception handler and be logged as a generic
-                ;; op failure, obscuring the actual signal.
-                removed (zrem! cs zset-key member)]
-            (assoc op :type :ok :value [member (pos? (long (or removed 0)))]))
+                ;; connection, etc.) AND against non-numeric shapes
+                ;; (string "1", raw bytes) that some Carmine versions
+                ;; or RESP3 codepaths surface. A naked `(long reply)`
+                ;; would NPE on nil and ClassCastException on
+                ;; string/bytes, falling through to the general
+                ;; Exception handler and masking the real signal.
+                removed (zrem! cs zset-key member)
+                n       (coerce-zrem-count removed)]
+            (assoc op :type :ok :value [member (pos? n)]))
 
           :zrange-all
           (let [flat (car/wcar cs (car/zrange zset-key 0 -1 "WITHSCORES"))]

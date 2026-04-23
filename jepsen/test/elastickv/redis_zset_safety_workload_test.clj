@@ -735,6 +735,58 @@
         (is (= :ok (:type result)))
         (is (= ["m1" true] (:value result)))))))
 
+(deftest zrem-invoke-handles-string-response
+  ;; Some Carmine versions / RESP3 codepaths surface ZREM's count as a
+  ;; numeric string rather than a Long. `(long \"1\")` would throw
+  ;; ClassCastException; the coerce-zrem-count helper must parse the
+  ;; string and the op must still resolve as :ok with removed? true.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "m1" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] "1")]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result))
+            (str "expected :ok on string ZREM reply, got: " result))
+        (is (= ["m1" true] (:value result))
+            (str "expected removed? true on string \"1\", got: " result))))))
+
+(deftest zrem-invoke-handles-string-zero-response
+  ;; String "0" must be parsed as removed? false (not truthy because it
+  ;; is a non-empty string).
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "ghost" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] "0")]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result)))
+        (is (= ["ghost" false] (:value result)))))))
+
+(deftest zrem-invoke-handles-bytes-response
+  ;; Raw-bytes numeric reply (RESP binary-safe path) must be decoded as
+  ;; UTF-8 and parsed. "1" => removed? true.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "m1" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] (.getBytes "1" "UTF-8"))]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result)))
+        (is (= ["m1" true] (:value result)))))))
+
+(deftest zrem-invoke-handles-unparseable-response
+  ;; Totally unexpected reply shape: treat as 0 (nothing removed) rather
+  ;; than throw. Keeps the op :ok and records removed? false.
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zrem :value "ghost" :process 0 :index 0}]
+    (with-redefs [workload/zrem! (fn [& _] :weird)]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result)))
+        (is (= ["ghost" false] (:value result)))))))
+
 (deftest parse-withscores-handles-inf-strings
   ;; Redis returns "inf" / "+inf" / "-inf" for infinite
   ;; ZSET scores. Double/parseDouble expects "Infinity"; the workload's
