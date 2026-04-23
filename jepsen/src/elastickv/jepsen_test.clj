@@ -47,11 +47,21 @@
                                        [f tail]
                                        [elastickv-test args])
         ;; jepsen.cli/run! requires a subcommand ("test" or "analyze")
-        ;; as the first arg. Insert "test" if absent so users don't
-        ;; have to type it twice.
+        ;; as the first arg. Insert "test" only when the user clearly
+        ;; did NOT supply a subcommand:
+        ;;   - remaining-args is empty, OR
+        ;;   - the first token is an option (starts with "-")
+        ;; If the first token looks like a subcommand (any non-option
+        ;; word, e.g. "test", "analyze", "serve", or a future jepsen.cli
+        ;; subcommand we don't hard-code), leave it alone and let
+        ;; jepsen.cli/run! handle it (including producing a better
+        ;; error message for unknown subcommands than we could here).
         [next-head & _] remaining-args
-        final-args (if (#{"test" "analyze"} next-head)
-                     remaining-args
-                     (cons "test" remaining-args))]
+        prepend-test? (or (empty? remaining-args)
+                          (and (string? next-head)
+                               (.startsWith ^String next-head "-")))
+        final-args (if prepend-test?
+                     (cons "test" remaining-args)
+                     remaining-args)]
     (cli/run! (cli/single-test-cmd {:test-fn selected-fn})
               final-args)))
