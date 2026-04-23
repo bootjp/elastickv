@@ -63,6 +63,7 @@ var redisCommandSet = map[string]struct{}{
 	"GET":              {},
 	"GETDEL":           {},
 	"HDEL":             {},
+	"HELLO":            {},
 	"HEXISTS":          {},
 	"HGET":             {},
 	"HGETALL":          {},
