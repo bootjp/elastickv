@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -18,7 +17,7 @@ type stubLeaderCoordinator struct {
 	verify            error
 	linearizableErr   error
 	linearizableCalls int
-	leader            raft.ServerAddress
+	leader            string
 	clock             *HLC
 }
 
@@ -34,7 +33,7 @@ func (s *stubLeaderCoordinator) VerifyLeader() error {
 	return s.verify
 }
 
-func (s *stubLeaderCoordinator) RaftLeader() raft.ServerAddress {
+func (s *stubLeaderCoordinator) RaftLeader() string {
 	return s.leader
 }
 
@@ -46,7 +45,7 @@ func (s *stubLeaderCoordinator) VerifyLeaderForKey([]byte) error {
 	return s.verify
 }
 
-func (s *stubLeaderCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
+func (s *stubLeaderCoordinator) RaftLeaderForKey([]byte) string {
 	return s.leader
 }
 
@@ -121,7 +120,7 @@ func (f *fakeRawKVServer) RawLatestCommitTS(context.Context, *pb.RawLatestCommit
 	return &pb.RawLatestCommitTSResponse{}, nil
 }
 
-func startRawKVServer(t *testing.T, svc pb.RawKVServer) (raft.ServerAddress, func()) {
+func startRawKVServer(t *testing.T, svc pb.RawKVServer) (string, func()) {
 	t.Helper()
 
 	var lc net.ListenConfig
@@ -138,7 +137,7 @@ func startRawKVServer(t *testing.T, svc pb.RawKVServer) (raft.ServerAddress, fun
 		grpcServer.Stop()
 		_ = lis.Close()
 	}
-	return raft.ServerAddress(lis.Addr().String()), stop
+	return lis.Addr().String(), stop
 }
 
 func TestLeaderRoutedStore_UsesLocalStoreWhenLeaderVerified(t *testing.T) {

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -34,6 +34,33 @@ func (f *fakeInternal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.F
 	return &pb.ForwardResponse{Success: true, CommitIndex: 0}, nil
 }
 
+// stubFollowerEngine is a minimal raftengine.Engine stub that reports the
+// local node as a follower and returns a configured leader address. It is
+// used by TestLeaderProxy_ForwardsWhenFollower to exercise the forwarding
+// code path without running a real two-node raft cluster.
+type stubFollowerEngine struct {
+	leaderAddr string
+}
+
+func (s *stubFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, raftengine.ErrNotLeader
+}
+func (s *stubFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
+func (s *stubFollowerEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "leader", Address: s.leaderAddr}
+}
+func (s *stubFollowerEngine) VerifyLeader(context.Context) error { return raftengine.ErrNotLeader }
+func (s *stubFollowerEngine) LinearizableRead(context.Context) (uint64, error) {
+	return 0, raftengine.ErrNotLeader
+}
+func (s *stubFollowerEngine) Status() raftengine.Status {
+	return raftengine.Status{State: raftengine.StateFollower, Leader: s.Leader()}
+}
+func (s *stubFollowerEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+func (s *stubFollowerEngine) Close() error { return nil }
+
 func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	t.Parallel()
 
@@ -41,7 +68,7 @@ func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	r, stop := newSingleRaft(t, "lp-local", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
 
-	p := NewLeaderProxy(r)
+	p := NewLeaderProxyWithEngine(r)
 
 	reqs := []*pb.Request{
 		{
@@ -79,60 +106,21 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		_ = lis.Close()
 	})
 
-	leaderAddr, leaderTrans := raft.NewInmemTransport(raft.ServerAddress(lis.Addr().String()))
-	followerAddr, followerTrans := raft.NewInmemTransport("follower")
-	leaderTrans.Connect(followerAddr, followerTrans)
-	followerTrans.Connect(leaderAddr, leaderTrans)
-
-	raftCfg := raft.Configuration{
-		Servers: []raft.Server{
-			{Suffrage: raft.Voter, ID: "leader", Address: leaderAddr},
-			{Suffrage: raft.Voter, ID: "follower", Address: followerAddr},
-		},
-	}
-
-	leader := func() *raft.Raft {
-		c := raft.DefaultConfig()
-		c.LocalID = "leader"
-		c.HeartbeatTimeout = 50 * time.Millisecond
-		c.ElectionTimeout = 100 * time.Millisecond
-		c.LeaderLeaseTimeout = 50 * time.Millisecond
-
-		ldb := raft.NewInmemStore()
-		sdb := raft.NewInmemStore()
-		fss := raft.NewInmemSnapshotStore()
-		r, err := raft.NewRaft(c, NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()), ldb, sdb, fss, leaderTrans)
-		require.NoError(t, err)
-		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
-		t.Cleanup(func() { _ = r.Shutdown().Error() })
-		return r
-	}()
-
-	follower := func() *raft.Raft {
-		c := raft.DefaultConfig()
-		c.LocalID = "follower"
-		c.HeartbeatTimeout = 250 * time.Millisecond
-		c.ElectionTimeout = 500 * time.Millisecond
-		c.LeaderLeaseTimeout = 250 * time.Millisecond
-
-		ldb := raft.NewInmemStore()
-		sdb := raft.NewInmemStore()
-		fss := raft.NewInmemSnapshotStore()
-		r, err := raft.NewRaft(c, NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()), ldb, sdb, fss, followerTrans)
-		require.NoError(t, err)
-		require.NoError(t, r.BootstrapCluster(raftCfg).Error())
-		t.Cleanup(func() { _ = r.Shutdown().Error() })
-		return r
-	}()
-
-	require.Eventually(t, func() bool { return leader.State() == raft.Leader }, 5*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool { return follower.State() == raft.Follower }, 5*time.Second, 10*time.Millisecond)
+	// Wait briefly so the gRPC server is ready to serve.
+	dialer := &net.Dialer{Timeout: 100 * time.Millisecond}
 	require.Eventually(t, func() bool {
-		addr, _ := follower.LeaderWithID()
-		return addr == leaderAddr
-	}, 5*time.Second, 10*time.Millisecond)
+		dialCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		c, err := dialer.DialContext(dialCtx, "tcp", lis.Addr().String())
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	}, 2*time.Second, 10*time.Millisecond)
 
-	p := NewLeaderProxy(follower)
+	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	p := NewLeaderProxyWithEngine(follower)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
 	reqs := []*pb.Request{

@@ -28,7 +28,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -73,7 +72,7 @@ type S3Server struct {
 	region      string
 	store       store.MVCCStore
 	coordinator kv.Coordinator
-	leaderS3    map[raft.ServerAddress]string
+	leaderS3    map[string]string
 	staticCreds map[string]string
 	readTracker *kv.ActiveTimestampTracker
 	httpServer  *http.Server
@@ -282,7 +281,7 @@ type s3ListPartEntry struct {
 	Size         int64  `xml:"Size"`
 }
 
-func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[raft.ServerAddress]string, opts ...S3ServerOption) *S3Server {
+func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[string]string, opts ...S3ServerOption) *S3Server {
 	s := &S3Server{
 		listen:      listen,
 		s3Addr:      s3Addr,
@@ -299,7 +298,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	}
 	if s.s3Addr != "" {
 		if s.leaderS3 == nil {
-			s.leaderS3 = map[raft.ServerAddress]string{}
+			s.leaderS3 = map[string]string{}
 		}
 		if leader := s.coordinatorLeaderAddress(); leader != "" {
 			if _, exists := s.leaderS3[leader]; !exists {
@@ -2241,7 +2240,7 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	if err != nil {
 		return false
 	}
-	var leader raft.ServerAddress
+	var leader string
 	if len(key) > 0 {
 		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(key) == nil {
 			return false
@@ -2303,7 +2302,7 @@ func (s *S3Server) clock() *kv.HLC {
 	return s.coordinator.Clock()
 }
 
-func (s *S3Server) coordinatorLeaderAddress() raft.ServerAddress {
+func (s *S3Server) coordinatorLeaderAddress() string {
 	if s == nil || s.coordinator == nil {
 		return ""
 	}
@@ -2964,11 +2963,11 @@ func validateS3PutPreconditions(r *http.Request, previous *s3ObjectManifest) err
 	return nil
 }
 
-func cloneLeaderAddrMap(src map[raft.ServerAddress]string) map[raft.ServerAddress]string {
+func cloneLeaderAddrMap(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make(map[raft.ServerAddress]string, len(src))
+	out := make(map[string]string, len(src))
 	for key, value := range src {
 		out[key] = value
 	}

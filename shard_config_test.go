@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,7 +95,7 @@ func TestParseShardRanges(t *testing.T) {
 func TestParseRaftRedisMap(t *testing.T) {
 	m, err := parseRaftRedisMap("a=b, c=d")
 	require.NoError(t, err)
-	require.Equal(t, map[raft.ServerAddress]string{
+	require.Equal(t, map[string]string{
 		"a": "b",
 		"c": "d",
 	}, m)
@@ -103,7 +103,7 @@ func TestParseRaftRedisMap(t *testing.T) {
 	t.Run("trims whitespace", func(t *testing.T) {
 		m, err := parseRaftRedisMap(" a = b , c = d ")
 		require.NoError(t, err)
-		require.Equal(t, map[raft.ServerAddress]string{
+		require.Equal(t, map[string]string{
 			"a": "b",
 			"c": "d",
 		}, m)
@@ -118,7 +118,7 @@ func TestParseRaftRedisMap(t *testing.T) {
 func TestParseRaftS3Map(t *testing.T) {
 	m, err := parseRaftS3Map("a=b, c=d")
 	require.NoError(t, err)
-	require.Equal(t, map[raft.ServerAddress]string{
+	require.Equal(t, map[string]string{
 		"a": "b",
 		"c": "d",
 	}, m)
@@ -126,7 +126,7 @@ func TestParseRaftS3Map(t *testing.T) {
 	t.Run("trims whitespace", func(t *testing.T) {
 		m, err := parseRaftS3Map(" a = b , c = d ")
 		require.NoError(t, err)
-		require.Equal(t, map[raft.ServerAddress]string{
+		require.Equal(t, map[string]string{
 			"a": "b",
 			"c": "d",
 		}, m)
@@ -142,9 +142,9 @@ func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
 		require.NoError(t, err)
-		require.Equal(t, []raft.Server{
-			{Suffrage: raft.Voter, ID: raft.ServerID("n1"), Address: raft.ServerAddress("10.0.0.11:50051")},
-			{Suffrage: raft.Voter, ID: raft.ServerID("n2"), Address: raft.ServerAddress("10.0.0.12:50051")},
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+			{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
 		}, members)
 	})
 

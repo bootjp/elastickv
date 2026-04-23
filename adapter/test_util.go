@@ -10,21 +10,37 @@ import (
 	"testing"
 	"time"
 
-	transport "github.com/Jille/raft-grpc-transport"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 )
+
+const (
+	testEngineTickInterval  = 10 * time.Millisecond
+	testEngineHeartbeatTick = 1
+	testEngineElectionTick  = 10
+	testEngineMaxSizePerMsg = 1 << 20
+	testEngineMaxInflight   = 256
+)
+
+func newTestFactory() raftengine.Factory {
+	return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
+		TickInterval:   testEngineTickInterval,
+		HeartbeatTick:  testEngineHeartbeatTick,
+		ElectionTick:   testEngineElectionTick,
+		MaxSizePerMsg:  testEngineMaxSizePerMsg,
+		MaxInflightMsg: testEngineMaxInflight,
+	})
+}
 
 func shutdown(nodes []Node) {
 	for _, n := range nodes {
@@ -41,12 +57,14 @@ func shutdown(nodes []Node) {
 		if n.dynamoServer != nil {
 			n.dynamoServer.Stop()
 		}
-		if n.raft != nil {
-			n.raft.Shutdown()
+		if n.engine != nil {
+			if err := n.engine.Close(); err != nil {
+				log.Printf("engine close: %v", err)
+			}
 		}
-		if n.tm != nil {
-			if err := n.tm.Close(); err != nil {
-				log.Printf("transport close: %v", err)
+		if n.closeFactory != nil {
+			if err := n.closeFactory(); err != nil {
+				log.Printf("factory close: %v", err)
 			}
 		}
 	}
@@ -69,9 +87,6 @@ const (
 	raftPort   = 50000
 	redisPort  = 63790
 	dynamoPort = 28000
-
-	// followers wait longer before starting elections to give the leader time to bootstrap and share config.
-	followerElectionTimeout = 10 * time.Second
 )
 
 var mu sync.Mutex
@@ -116,11 +131,11 @@ type Node struct {
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
 	opsCancel     context.CancelFunc
-	raft          *raft.Raft
-	tm            *transport.Manager
+	engine        raftengine.Engine
+	closeFactory  func() error
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *raft.Raft, tm *transport.Manager, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, opsCancel context.CancelFunc) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, engine raftengine.Engine, closeFactory func() error, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, opsCancel context.CancelFunc) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
@@ -131,8 +146,8 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, r *ra
 		redisServer:   rd,
 		dynamoServer:  ds,
 		opsCancel:     opsCancel,
-		raft:          r,
-		tm:            tm,
+		engine:        engine,
+		closeFactory:  closeFactory,
 	}
 }
 
@@ -148,11 +163,10 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	ctx := context.Background()
 
 	ports := assignPorts(n)
-	nodes, grpcAdders, redisAdders, cfg := setupNodes(t, ctx, n, ports)
+	nodes, grpcAdders, redisAdders, peers := setupNodes(t, ctx, n, ports)
 
 	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
-	waitForConfigReplication(t, cfg, nodes, waitTimeout, waitInterval)
-	waitForRaftReadiness(t, nodes, waitTimeout, waitInterval)
+	waitForRaftReadiness(t, nodes, peers, waitTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
@@ -202,7 +216,7 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 	t.Helper()
 	d := &net.Dialer{Timeout: time.Second}
 	for _, n := range nodes {
-		assert.Eventually(t, func() bool {
+		require.Eventually(t, func() bool {
 			conn, err := d.DialContext(ctx, "tcp", n.grpcAddress)
 			if err != nil {
 				return false
@@ -218,62 +232,83 @@ func waitForNodeListeners(t *testing.T, ctx context.Context, nodes []Node, waitT
 	}
 }
 
-func waitForRaftReadiness(t *testing.T, nodes []Node, waitTimeout, waitInterval time.Duration) {
+func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server, waitTimeout, waitInterval time.Duration) {
 	t.Helper()
 
-	expectedLeader := raft.ServerAddress(nodes[0].raftAddress)
-	assert.Eventually(t, func() bool {
-		for i, n := range nodes {
-			state := n.raft.State()
-			if i == 0 {
-				if state != raft.Leader {
-					return false
-				}
-			} else if state != raft.Follower {
-				return false
-			}
+	// Existing tests assume hosts[0] (node 0) is the cluster leader — the
+	// previous hashicorp setup ensured this by giving node 0 an immediate
+	// election timeout while others waited 10s. etcd/raft elections are
+	// randomised, so whoever wins the first election is effectively random.
+	// Nudge leadership onto node 0 if a different node won.
+	ensureNodeZeroIsLeader(t, nodes, peers, waitTimeout, waitInterval)
 
-			addr, _ := n.raft.LeaderWithID()
-			if addr != expectedLeader {
-				return false
-			}
-		}
-		return true
-	}, waitTimeout, waitInterval)
-}
-
-func waitForConfigReplication(t *testing.T, cfg raft.Configuration, nodes []Node, waitTimeout, waitInterval time.Duration) {
-	t.Helper()
-
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
+		var leaderAddr string
 		for _, n := range nodes {
-			future := n.raft.GetConfiguration()
-			if future.Error() != nil {
+			leader := n.engine.Leader().Address
+			if leader == "" {
 				return false
 			}
-
-			current := future.Configuration().Servers
-			if len(current) != len(cfg.Servers) {
+			if leaderAddr == "" {
+				leaderAddr = leader
+			} else if leader != leaderAddr {
 				return false
-			}
-
-			for _, expected := range cfg.Servers {
-				if !containsServer(current, expected) {
-					return false
-				}
 			}
 		}
-		return true
+		// Confirm the leader address belongs to the configured peers.
+		for _, p := range peers {
+			if p.Address == leaderAddr {
+				return true
+			}
+		}
+		return false
 	}, waitTimeout, waitInterval)
 }
 
-func containsServer(servers []raft.Server, expected raft.Server) bool {
-	for _, s := range servers {
-		if s.ID == expected.ID && s.Address == expected.Address && s.Suffrage == expected.Suffrage {
+// ensureNodeZeroIsLeader waits for any node to become leader, then (if
+// necessary) triggers a leadership transfer to node 0 so downstream
+// tests that assume hosts[0] is authoritative keep working.
+func ensureNodeZeroIsLeader(t *testing.T, nodes []Node, peers []raftengine.Server, waitTimeout, waitInterval time.Duration) {
+	t.Helper()
+
+	if len(nodes) == 0 || len(peers) == 0 {
+		return
+	}
+	targetAddr := peers[0].Address
+
+	// Step 1: wait until some node is leader so we know the cluster is live.
+	require.Eventually(t, func() bool {
+		for _, n := range nodes {
+			if n.engine.State() == raftengine.StateLeader {
+				return true
+			}
+		}
+		return false
+	}, waitTimeout, waitInterval, "no node became leader")
+
+	// Step 2: if node 0 isn't already leader, ask the current leader to
+	// transfer leadership to it. This is best-effort — a transfer can
+	// race with another election, in which case the Eventually below
+	// will retry.
+	require.Eventually(t, func() bool {
+		if nodes[0].engine.State() == raftengine.StateLeader {
 			return true
 		}
-	}
-	return false
+		for _, n := range nodes {
+			if n.engine.State() != raftengine.StateLeader {
+				continue
+			}
+			admin, ok := n.engine.(raftengine.Admin)
+			if !ok {
+				return false
+			}
+			transferCtx, cancel := context.WithTimeout(context.Background(), waitInterval)
+			_ = admin.TransferLeadershipToServer(transferCtx, peers[0].ID, targetAddr)
+			cancel()
+			break
+		}
+		return false
+	}, waitTimeout, waitInterval, "node 0 did not become leader")
 }
 
 func assignPorts(n int) []portsAdress {
@@ -284,27 +319,19 @@ func assignPorts(n int) []portsAdress {
 	return ports
 }
 
-func buildRaftConfig(n int, ports []portsAdress) raft.Configuration {
-	cfg := raft.Configuration{}
+func buildTestPeers(n int, ports []portsAdress) []raftengine.Server {
+	peers := make([]raftengine.Server, 0, n)
 	for i := range n {
-		suffrage := raft.Nonvoter
-		if i == 0 {
-			suffrage = raft.Voter
-		}
-
-		cfg.Servers = append(cfg.Servers, raft.Server{
-			Suffrage: suffrage,
-			ID:       raft.ServerID(strconv.Itoa(i)),
-			Address:  raft.ServerAddress(ports[i].raftAddress),
+		peers = append(peers, raftengine.Server{
+			Suffrage: "voter",
+			ID:       strconv.Itoa(i),
+			Address:  ports[i].raftAddress,
 		})
 	}
-
-	return cfg
+	return peers
 }
 
-const leaderElectionTimeout = 0 * time.Second
-
-func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) ([]Node, []string, []string, raft.Configuration) {
+func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) ([]Node, []string, []string, []raftengine.Server) {
 	t.Helper()
 	var grpcAdders []string
 	var redisAdders []string
@@ -331,11 +358,13 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		}
 	}
 
-	cfg := buildRaftConfig(n, ports)
-	leaderRedisMap := make(map[raft.ServerAddress]string, len(ports))
+	peers := buildTestPeers(n, ports)
+	leaderRedisMap := make(map[string]string, len(ports))
 	for _, p := range ports {
-		leaderRedisMap[raft.ServerAddress(p.raftAddress)] = p.redisAddress
+		leaderRedisMap[p.raftAddress] = p.redisAddress
 	}
+
+	factory := newTestFactory()
 
 	for i := range n {
 		st := store.NewMVCCStore()
@@ -350,28 +379,31 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		redisSock := lis[i].redis
 		dynamoSock := lis[i].dynamo
 
-		// リーダーが先に投票を開始させる
-		electionTimeout := leaderElectionTimeout
-		if i != 0 {
-			electionTimeout = followerElectionTimeout
-		}
-
-		r, tm, err := newRaft(strconv.Itoa(i), port.raftAddress, fsm, i == 0, cfg, electionTimeout)
-		assert.NoError(t, err)
+		result, err := factory.Create(raftengine.FactoryConfig{
+			LocalID:      strconv.Itoa(i),
+			LocalAddress: port.raftAddress,
+			DataDir:      t.TempDir(),
+			Peers:        peers,
+			Bootstrap:    true,
+			StateMachine: fsm,
+		})
+		require.NoError(t, err)
 
 		s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-		trx := kv.NewTransaction(r)
-		coordinator := kv.NewCoordinator(trx, r, kv.WithHLC(hlc))
+		trx := kv.NewTransactionWithProposer(result.Engine)
+		coordinator := kv.NewCoordinatorWithEngine(trx, result.Engine, kv.WithHLC(hlc))
 		relay := NewRedisPubSubRelay()
 		routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 		gs := NewGRPCServer(routedStore, coordinator, WithCloseStore())
 		opsCtx, opsCancel := context.WithCancel(ctx)
 		go coordinator.RunHLCLeaseRenewal(opsCtx)
-		tm.Register(s)
+		if result.RegisterTransport != nil {
+			result.RegisterTransport(s)
+		}
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, NewInternal(trx, r, coordinator.Clock(), relay))
-		internalraftadmin.RegisterOperationalServices(opsCtx, s, hashicorpraftengine.New(r), []string{"Example"})
+		pb.RegisterInternalServer(s, NewInternalWithEngine(trx, result.Engine, coordinator.Clock(), relay))
+		internalraftadmin.RegisterOperationalServices(opsCtx, s, result.Engine, []string{"Example"})
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)
 		redisAdders = append(redisAdders, port.redisAddress)
@@ -398,8 +430,8 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			port.raftAddress,
 			port.redisAddress,
 			port.dynamoAddress,
-			r,
-			tm,
+			result.Engine,
+			result.Close,
 			s,
 			gs,
 			rd,
@@ -408,41 +440,5 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		))
 	}
 
-	return nodes, grpcAdders, redisAdders, cfg
-}
-
-func newRaft(myID string, myAddress string, fsm raft.FSM, bootstrap bool, cfg raft.Configuration, electionTimeout time.Duration) (*raft.Raft, *transport.Manager, error) {
-	c := raft.DefaultConfig()
-	c.LocalID = raft.ServerID(myID)
-	c.CommitTimeout = 1 * time.Millisecond
-
-	if electionTimeout > 0 {
-		c.ElectionTimeout = electionTimeout
-	}
-
-	// this config is for development
-	ldb := raft.NewInmemStore()
-	sdb := raft.NewInmemStore()
-	fss := raft.NewInmemSnapshotStore()
-
-	c.Logger = hclog.New(&hclog.LoggerOptions{
-		Name:  "raft-" + myID,
-		Level: hclog.LevelFromString("WARN"),
-	})
-
-	tm := transport.New(raft.ServerAddress(myAddress), internalutil.GRPCDialOptions())
-
-	r, err := raft.NewRaft(c, fsm, ldb, sdb, fss, tm.Transport())
-	if err != nil {
-		return nil, nil, errors.WithStack(err)
-	}
-
-	if bootstrap {
-		f := r.BootstrapCluster(cfg)
-		if err := f.Error(); err != nil {
-			return nil, nil, errors.WithStack(err)
-		}
-	}
-
-	return r, tm, nil
+	return nodes, grpcAdders, redisAdders, peers
 }

@@ -11,7 +11,6 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -31,7 +30,7 @@ func startS3Server(
 	s3Addr string,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
-	leaderS3 map[raft.ServerAddress]string,
+	leaderS3 map[string]string,
 	region string,
 	credentialsFile string,
 	pathStyleOnly bool,

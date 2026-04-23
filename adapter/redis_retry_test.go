@@ -10,7 +10,6 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
 )
@@ -61,7 +60,7 @@ func (c *retryOnceCoordinator) VerifyLeader() error {
 	return nil
 }
 
-func (c *retryOnceCoordinator) RaftLeader() raft.ServerAddress {
+func (c *retryOnceCoordinator) RaftLeader() string {
 	return ""
 }
 
@@ -73,7 +72,7 @@ func (c *retryOnceCoordinator) VerifyLeaderForKey([]byte) error {
 	return nil
 }
 
-func (c *retryOnceCoordinator) RaftLeaderForKey([]byte) raft.ServerAddress {
+func (c *retryOnceCoordinator) RaftLeaderForKey([]byte) string {
 	return ""
 }
 

@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
-	cockroachdberrors "github.com/cockroachdb/errors"
-	hashicorpraft "github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,26 +25,6 @@ func TestIsLeadershipLossError(t *testing.T) {
 		{"raftengine ErrNotLeader direct", raftengine.ErrNotLeader, true},
 		{"raftengine ErrLeadershipLost direct", raftengine.ErrLeadershipLost, true},
 		{"raftengine ErrLeadershipTransferInProgress direct", raftengine.ErrLeadershipTransferInProgress, true},
-		{
-			"hashicorp ErrNotLeader marked with raftengine sentinel",
-			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrNotLeader, raftengine.ErrNotLeader)),
-			true,
-		},
-		{
-			"hashicorp ErrLeadershipLost marked with raftengine sentinel",
-			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrLeadershipLost, raftengine.ErrLeadershipLost)),
-			true,
-		},
-		{
-			"hashicorp ErrLeadershipTransferInProgress marked with raftengine sentinel",
-			cockroachdberrors.WithStack(cockroachdberrors.Mark(hashicorpraft.ErrLeadershipTransferInProgress, raftengine.ErrLeadershipTransferInProgress)),
-			true,
-		},
-		{
-			"bare hashicorp ErrNotLeader (no raftengine mark) is NOT detected",
-			hashicorpraft.ErrNotLeader,
-			false,
-		},
 	}
 
 	for _, tc := range cases {

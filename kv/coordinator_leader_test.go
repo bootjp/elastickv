@@ -14,7 +14,7 @@ func TestCoordinateVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	r, stop := newSingleRaft(t, "coord-leader", NewKvFSMWithHLC(st, NewHLC()))
 	t.Cleanup(stop)
 
-	c := NewCoordinator(&stubTransactional{}, r)
+	c := NewCoordinatorWithEngine(&stubTransactional{}, r)
 	require.NoError(t, c.VerifyLeader())
 }
 

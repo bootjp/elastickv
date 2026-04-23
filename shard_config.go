@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 type groupSpec struct {
@@ -116,20 +116,20 @@ func parseShardRanges(raw string, defaultGroup uint64) ([]rangeSpec, error) {
 	return ranges, nil
 }
 
-func parseRaftRedisMap(raw string) (map[raft.ServerAddress]string, error) {
+func parseRaftRedisMap(raw string) (map[string]string, error) {
 	return parseRaftAddressMap(raw, ErrInvalidRaftRedisMapEntry)
 }
 
-func parseRaftS3Map(raw string) (map[raft.ServerAddress]string, error) {
+func parseRaftS3Map(raw string) (map[string]string, error) {
 	return parseRaftAddressMap(raw, ErrInvalidRaftS3MapEntry)
 }
 
-func parseRaftDynamoMap(raw string) (map[raft.ServerAddress]string, error) {
+func parseRaftDynamoMap(raw string) (map[string]string, error) {
 	return parseRaftAddressMap(raw, ErrInvalidRaftDynamoMapEntry)
 }
 
-func parseRaftAddressMap(raw string, invalidEntry error) (map[raft.ServerAddress]string, error) {
-	out := make(map[raft.ServerAddress]string)
+func parseRaftAddressMap(raw string, invalidEntry error) (map[string]string, error) {
+	out := make(map[string]string)
 	if raw == "" {
 		return out, nil
 	}
@@ -148,17 +148,17 @@ func parseRaftAddressMap(raw string, invalidEntry error) (map[raft.ServerAddress
 		if k == "" || v == "" {
 			return nil, errors.Wrapf(invalidEntry, "%q", part)
 		}
-		out[raft.ServerAddress(k)] = v
+		out[k] = v
 	}
 	return out, nil
 }
 
-func parseRaftBootstrapMembers(raw string) ([]raft.Server, error) {
-	servers := make([]raft.Server, 0)
+func parseRaftBootstrapMembers(raw string) ([]raftengine.Server, error) {
+	servers := make([]raftengine.Server, 0)
 	if raw == "" {
 		return servers, nil
 	}
-	seen := make(map[raft.ServerID]struct{})
+	seen := make(map[string]struct{})
 	parts := strings.SplitSeq(raw, ",")
 	for part := range parts {
 		part = strings.TrimSpace(part)
@@ -174,15 +174,14 @@ func parseRaftBootstrapMembers(raw string) ([]raft.Server, error) {
 		if id == "" || addr == "" {
 			return nil, errors.Wrapf(ErrInvalidRaftBootstrapMembersEntry, "%q", part)
 		}
-		sid := raft.ServerID(id)
-		if _, exists := seen[sid]; exists {
+		if _, exists := seen[id]; exists {
 			return nil, errors.Wrapf(ErrInvalidRaftBootstrapMembersEntry, "duplicate id %q", id)
 		}
-		seen[sid] = struct{}{}
-		servers = append(servers, raft.Server{
-			Suffrage: raft.Voter,
-			ID:       sid,
-			Address:  raft.ServerAddress(addr),
+		seen[id] = struct{}{}
+		servers = append(servers, raftengine.Server{
+			Suffrage: "voter",
+			ID:       id,
+			Address:  addr,
 		})
 	}
 	return servers, nil

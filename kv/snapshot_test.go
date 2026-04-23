@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	store3 "github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -33,13 +32,7 @@ func TestSnapshot(t *testing.T) {
 	b, err := proto.Marshal(&mutation)
 	assert.NoError(t, err)
 
-	fsm.Apply(&raft.Log{
-		Type: raft.LogCommand,
-		Data: b,
-	})
-	fsm.Apply(&raft.Log{
-		Type: raft.LogBarrier,
-	})
+	fsm.Apply(b)
 
 	ctx := context.Background()
 	v, err := store.GetAt(ctx, []byte("hoge"), ^uint64(0))
@@ -57,9 +50,9 @@ func TestSnapshot(t *testing.T) {
 	assert.NoError(t, err)
 
 	var buf bytes.Buffer
-	_, err = kvFSMSnap.snapshot.WriteTo(&buf)
+	_, err = kvFSMSnap.WriteTo(&buf)
 	assert.NoError(t, err)
-	kvFSMSnap.Release()
+	assert.NoError(t, kvFSMSnap.Close())
 	err = fsm2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes())))
 	assert.NoError(t, err)
 
@@ -93,15 +86,16 @@ func TestFSMSnapshotPreservesCeiling(t *testing.T) {
 	}
 	b, err := proto.Marshal(req)
 	require.NoError(t, err)
-	fsm1.Apply(&raft.Log{Type: raft.LogCommand, Data: b})
+	fsm1.Apply(b)
 
-	// Take snapshot and persist it via Persist (the real code path).
+	// Take snapshot and write it out.
 	snap, err := fsm1.Snapshot()
 	require.NoError(t, err)
 
 	var buf bytes.Buffer
-	sink := &snapshotSinkAdapter{writer: &buf}
-	require.NoError(t, snap.Persist(sink))
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
 
 	// Restore into a fresh FSM with its own HLC starting at zero.
 	hlc2 := NewHLC()
@@ -172,7 +166,7 @@ func TestFSMSnapshotRestoreOldFormat(t *testing.T) {
 	}
 	b, err := proto.Marshal(req)
 	require.NoError(t, err)
-	fsm1.Apply(&raft.Log{Type: raft.LogCommand, Data: b})
+	fsm1.Apply(b)
 
 	// Grab the raw store snapshot bytes (bypasses the new header).
 	storeSnap, err := st1.Snapshot()

@@ -15,7 +15,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 type ShardGroup struct {
@@ -686,7 +685,7 @@ func (c *ShardedCoordinator) VerifyLeader() error {
 	return verifyLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
+func (c *ShardedCoordinator) RaftLeader() string {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok {
 		return ""
@@ -718,7 +717,7 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
 	return verifyLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {
+func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return ""

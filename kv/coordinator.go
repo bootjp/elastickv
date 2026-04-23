@@ -9,10 +9,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 const redirectForwardTimeout = 5 * time.Second
@@ -91,10 +89,6 @@ func normalizeLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
 		}
 	}
 	return observer
-}
-
-func NewCoordinator(txm Transactional, r *raft.Raft, opts ...CoordinatorOption) *Coordinate {
-	return NewCoordinatorWithEngine(txm, hashicorpraftengine.New(r), opts...)
 }
 
 func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts ...CoordinatorOption) *Coordinate {
@@ -180,10 +174,10 @@ type Coordinator interface {
 	IsLeader() bool
 	VerifyLeader() error
 	LinearizableRead(ctx context.Context) (uint64, error)
-	RaftLeader() raft.ServerAddress
+	RaftLeader() string
 	IsLeaderForKey(key []byte) bool
 	VerifyLeaderForKey(key []byte) error
-	RaftLeaderForKey(key []byte) raft.ServerAddress
+	RaftLeaderForKey(key []byte) string
 	Clock() *HLC
 }
 
@@ -325,7 +319,7 @@ func (c *Coordinate) VerifyLeader() error {
 }
 
 // RaftLeader returns the current leader's address as known by this node.
-func (c *Coordinate) RaftLeader() raft.ServerAddress {
+func (c *Coordinate) RaftLeader() string {
 	return leaderAddrFromEngine(c.engine)
 }
 
@@ -384,7 +378,7 @@ func (c *Coordinate) VerifyLeaderForKey(_ []byte) error {
 	return c.VerifyLeader()
 }
 
-func (c *Coordinate) RaftLeaderForKey(_ []byte) raft.ServerAddress {
+func (c *Coordinate) RaftLeaderForKey(_ []byte) string {
 	return c.RaftLeader()
 }
 
