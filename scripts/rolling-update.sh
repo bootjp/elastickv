@@ -55,6 +55,13 @@ Optional environment:
   RAFTADMIN_RPC_TIMEOUT_SECONDS
   RAFTADMIN_ALLOW_INSECURE
 
+  EXTRA_ENV
+    Whitespace-separated list of additional container environment variables to
+    forward to the remote docker run as `-e KEY=VALUE` flags. Format:
+    "KEY=VALUE [KEY=VALUE ...]" (e.g. "ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512").
+    Each pair must be KEY=VALUE with a non-empty KEY; pairs themselves must not
+    contain whitespace.
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
