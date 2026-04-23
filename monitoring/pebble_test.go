@@ -265,3 +265,44 @@ func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
 	collector := registry.PebbleCollector()
 	require.NotPanics(t, func() { collector.ObserveOnce(nil) })
 }
+
+// TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive verifies that
+// calling SetFSMApplySyncMode("nosync") drives the sync label to 0
+// and the nosync label to 1 (and vice versa). Operators rely on this
+// gauge to alert on unexpected durability posture changes, so the
+// two-row shape must stay stable across successive calls.
+func TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+
+	registry.SetFSMApplySyncMode("sync")
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+
+	registry.SetFSMApplySyncMode("nosync")
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+}
+
+// TestSetFSMApplySyncMode_NilRegistryIsSafe matches the pattern of
+// other monitoring helpers: bootstrap paths that construct an engine
+// without a registry (tests, the redis-proxy binary) must not panic.
+func TestSetFSMApplySyncMode_NilRegistryIsSafe(t *testing.T) {
+	var r *Registry
+	require.NotPanics(t, func() { r.SetFSMApplySyncMode("sync") })
+}

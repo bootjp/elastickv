@@ -117,6 +117,10 @@ func run() error {
 	var lc net.ListenConfig
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
+	// Record the active FSM apply sync mode so operators can see on the
+	// /metrics endpoint which durability posture this node is running in.
+	// See store.FSMApplySyncModeLabel for the underlying env resolution.
+	metricsRegistry.SetFSMApplySyncMode(store.FSMApplySyncModeLabel())
 
 	// Create the shared HLC before building shard groups so every FSM can update
 	// physicalCeiling when HLC lease entries are applied to the Raft log.
