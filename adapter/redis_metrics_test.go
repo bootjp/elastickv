@@ -506,15 +506,15 @@ func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {
 	require.Equal(t, float64(workers*perWorks), total)
 }
 
-// TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes covers the
-// regression this commit fixes: the adapter's Run() loop must pass RAW
-// command bytes (not strings.ToUpper'd bytes) to the unsupported-command
-// observer. ToUpper silently rewrites invalid UTF-8 into the U+FFFD
-// replacement character, so if the raw path is not preserved the
-// invalid_utf8 sentinel is never reached and a hostile client can burn
-// through the distinct-name slots with replacement-char garbage. Feeding
-// the observer directly with three invalid bytes must produce the
-// sentinel, not a synthetic "valid UTF-8" label.
+// TestRedisMetricsUnsupportedCommandRawInvalidUTF8FromAdapterPath covers
+// the regression fixed alongside this commit: the adapter's Run() loop
+// must pass RAW command bytes (not strings.ToUpper'd bytes) to the
+// unsupported-command observer. ToUpper silently rewrites invalid UTF-8
+// into the U+FFFD replacement character, so if the raw path is not
+// preserved the invalid_utf8 sentinel is never reached and a hostile
+// client can burn through the distinct-name slots with replacement-char
+// garbage. Feeding the observer directly with three invalid bytes must
+// produce the sentinel, not a synthetic "valid UTF-8" label.
 func TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes(t *testing.T) {
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
@@ -549,6 +549,119 @@ func TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes(t *testing.T) {
 	}
 	require.Equal(t, float64(1), sentinel,
 		"raw invalid-UTF-8 bytes must land in the 'invalid_utf8' sentinel")
+}
+
+// TestRedisMetricsUnsupportedCommandRejectsPathologicalLength defends
+// against CPU-exhaustion input: a hostile client sending a multi-megabyte
+// first argument must not cause strings.ToUpper / utf8.ValidString /
+// []rune iteration to process the full payload. The observer caps the raw
+// input length before any O(n) string operation runs; this test just
+// asserts the call returns quickly and does not panic under the default
+// `go test -timeout` budget.
+func TestRedisMetricsUnsupportedCommandRejectsPathologicalLength(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RedisObserver()
+
+	// 1 MiB of 'A'. Well above any reasonable Redis command name.
+	huge := strings.Repeat("A", 1<<20)
+
+	require.NotPanics(t, func() {
+		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:     huge,
+			IsError:     true,
+			Duration:    time.Millisecond,
+			Unsupported: true,
+		})
+	})
+
+	mf, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+
+	var checked bool
+	for _, family := range mf {
+		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() != "command" {
+					continue
+				}
+				require.LessOrEqual(t, len(lbl.GetValue()), 64,
+					"even pathologically long inputs must respect the 64-byte label cap")
+				require.True(t, utf8.ValidString(lbl.GetValue()),
+					"label value must remain valid UTF-8")
+				checked = true
+			}
+		}
+	}
+	require.True(t, checked, "expected a metric to be emitted for the huge input")
+}
+
+// TestRedisMetricsUnsupportedCommandRWMutexFastPath exercises the
+// read-locked fast path in observeUnsupportedCommand under concurrent
+// observers hitting a mix of already-admitted names (fast path) and brand
+// new names (slow path). It is designed to run under `go test -race`.
+func TestRedisMetricsUnsupportedCommandRWMutexFastPath(t *testing.T) {
+	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
+	observer := registry.RedisObserver()
+
+	// Pre-seed a handful of names so the vast majority of concurrent
+	// observations take the read-only fast path.
+	seeds := []string{"ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"}
+	for _, s := range seeds {
+		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+			Command:     s,
+			IsError:     true,
+			Duration:    time.Microsecond,
+			Unsupported: true,
+		})
+	}
+
+	const (
+		workers = 32
+		iters   = 500
+	)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				var cmd string
+				// ~80% fast path, ~20% slow path (new names) to stress
+				// both RLock and Lock branches concurrently.
+				if i%5 == 0 {
+					cmd = fmt.Sprintf("NEW_W%03d_I%03d", w, i)
+				} else {
+					cmd = seeds[i%len(seeds)]
+				}
+				observer.ObserveRedisRequest(monitoring.RedisRequestReport{
+					Command:     cmd,
+					IsError:     true,
+					Duration:    time.Microsecond,
+					Unsupported: true,
+				})
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Sanity: the total across all label buckets must equal the total
+	// number of observations performed (including seeds).
+	mf, err := registry.Gatherer().Gather()
+	require.NoError(t, err)
+
+	var total float64
+	for _, family := range mf {
+		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			total += metric.GetCounter().GetValue()
+		}
+	}
+	require.Equal(t, float64(len(seeds)+workers*iters), total)
 }
 
 // stubRedisConn is a minimal redcon.Conn implementation for unit tests.

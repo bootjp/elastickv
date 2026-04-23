@@ -36,6 +36,15 @@ const (
 	// fixed sentinel avoids ever passing invalid UTF-8 to
 	// prometheus.WithLabelValues, which would panic.
 	redisUnsupportedCommandInvalidUTF8 = "invalid_utf8"
+
+	// maxUnsupportedCommandRawLen defensively caps the raw input length
+	// before any O(n) string operations (strings.ToUpper, utf8.ValidString,
+	// rune iteration) run. Redis command names are always short, so a
+	// multi-megabyte first argument is abusive input; processing the full
+	// payload would let a hostile client burn CPU. The cap is loose enough
+	// to cover any plausible command name plus a margin of whitespace; the
+	// later rune-aware truncation produces the final label.
+	maxUnsupportedCommandRawLen = 256
 )
 
 var redisCommandSet = map[string]struct{}{
@@ -146,7 +155,7 @@ type RedisMetrics struct {
 	errorsTotal         *prometheus.CounterVec
 	unsupportedCommands *prometheus.CounterVec
 
-	unsupportedMu    sync.Mutex
+	unsupportedMu    sync.RWMutex
 	unsupportedNames map[string]struct{}
 }
 
@@ -229,10 +238,20 @@ func (m *RedisMetrics) ObserveRedisRequest(report RedisRequestReport) {
 // with synthetic "valid" garbage. Keep ToUpper/TrimSpace inside this
 // function, AFTER the UTF-8 validity check.
 func (m *RedisMetrics) observeUnsupportedCommand(raw string) {
+	// Defensive cap on raw input length BEFORE any O(n) string operations
+	// (utf8.ValidString, strings.ToUpper, rune iteration). A hostile
+	// client sending a multi-megabyte first argument would otherwise burn
+	// CPU on every call. Cutting mid-rune is acceptable here because the
+	// UTF-8 validity check below rejects the result or the rune-aware
+	// truncation further down trims to a clean boundary.
+	if len(raw) > maxUnsupportedCommandRawLen {
+		raw = raw[:maxUnsupportedCommandRawLen]
+	}
+
 	// Guard against raw inputs that are already invalid UTF-8 at ingress
 	// (e.g. a binary blob sent as a command name). Passing invalid UTF-8
 	// to prometheus.WithLabelValues would panic and crash the calling
-	// goroutine. Check the raw string before strings.ToUpper, which would
+	// goroutine. Check the raw string BEFORE strings.ToUpper, which would
 	// otherwise silently rewrite invalid bytes to the Unicode replacement
 	// character and mask the problem.
 	var name string
@@ -247,33 +266,41 @@ func (m *RedisMetrics) observeUnsupportedCommand(raw string) {
 	if len(name) > maxUnsupportedCommandLabelLen {
 		// Truncate by UTF-8 rune boundary, not byte boundary, so we never
 		// split a multibyte rune and produce invalid UTF-8 (which would
-		// make prometheus.WithLabelValues panic). We keep the cap as a
-		// byte limit to preserve the existing cardinality/size semantics.
-		b := 0
+		// make prometheus.WithLabelValues panic). The range-loop index `i`
+		// is itself the byte offset of rune `r`; because the upstream
+		// UTF-8 validity check guarantees `name` is valid UTF-8 here,
+		// utf8.RuneLen(r) is always positive.
 		cut := len(name)
 		for i, r := range name {
-			size := utf8.RuneLen(r)
-			if size < 0 {
-				size = 1
-			}
-			if b+size > maxUnsupportedCommandLabelLen {
+			if i+utf8.RuneLen(r) > maxUnsupportedCommandLabelLen {
 				cut = i
 				break
 			}
-			b += size
 		}
 		name = name[:cut]
 	}
 
+	// Fast path: if the name has already been admitted, only a read lock
+	// is needed so concurrent observers do not serialise on the same
+	// mutex.
 	label := redisUnsupportedCommandOther
-	m.unsupportedMu.Lock()
-	if _, seen := m.unsupportedNames[name]; seen {
+	m.unsupportedMu.RLock()
+	_, seen := m.unsupportedNames[name]
+	m.unsupportedMu.RUnlock()
+	if seen {
 		label = name
-	} else if len(m.unsupportedNames) < maxUnsupportedCommandLabels {
-		m.unsupportedNames[name] = struct{}{}
-		label = name
+	} else {
+		m.unsupportedMu.Lock()
+		// Double-check under the write lock: another goroutine may have
+		// admitted this name between our RUnlock and Lock.
+		if _, seen := m.unsupportedNames[name]; seen {
+			label = name
+		} else if len(m.unsupportedNames) < maxUnsupportedCommandLabels {
+			m.unsupportedNames[name] = struct{}{}
+			label = name
+		}
+		m.unsupportedMu.Unlock()
 	}
-	m.unsupportedMu.Unlock()
 
 	m.unsupportedCommands.WithLabelValues(label).Inc()
 }
