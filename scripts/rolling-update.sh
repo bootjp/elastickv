@@ -424,8 +424,8 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
-      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
-      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
+      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
+      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
@@ -874,6 +874,8 @@ DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
+RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
