@@ -100,30 +100,8 @@ const (
 // NewPebbleStore's signature and is deferred to a follow-up PR.
 var pebbleCacheBytes = defaultPebbleCacheBytes
 
-// fsmApplyWriteOpts is the Pebble WriteOptions value applied on the FSM
-// commit path. Resolved once from ELASTICKV_FSM_SYNC_MODE at init() and
-// then treated as read-only. Exposed as a package variable so tests can
-// swap it via setFSMApplyWriteOptsForTest; production code must not
-// mutate it after init().
-//
-// The zero (unset) state is `pebble.Sync`, preserving legacy behaviour.
-var fsmApplyWriteOpts = pebble.Sync
-
-// fsmApplySyncModeLabel is the human-readable label corresponding to the
-// resolved fsmApplyWriteOpts. Kept alongside the write-options pointer so
-// monitoring (elastickv_fsm_apply_sync_mode) and log lines stay in sync.
-var fsmApplySyncModeLabel = fsmSyncModeSync
-
 func init() {
 	pebbleCacheBytes = resolvePebbleCacheBytes(os.Getenv(pebbleCacheMBEnv))
-	fsmApplyWriteOpts, fsmApplySyncModeLabel = resolveFSMApplyWriteOpts(os.Getenv(fsmSyncModeEnv))
-}
-
-// FSMApplySyncModeLabel returns the resolved FSM sync-mode label
-// ("sync" or "nosync"). Consumed by monitoring to surface the current
-// durability posture as a gauge with a mode label.
-func FSMApplySyncModeLabel() string {
-	return fsmApplySyncModeLabel
 }
 
 // resolveFSMApplyWriteOpts parses an ELASTICKV_FSM_SYNC_MODE value and
@@ -192,6 +170,18 @@ type pebbleStore struct {
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
 	writeConflicts *writeConflictCounter
+	// fsmApplyWriteOpts is the Pebble WriteOptions value applied on the
+	// FSM commit path (ApplyMutations, DeletePrefixAt). Resolved once
+	// from ELASTICKV_FSM_SYNC_MODE in NewPebbleStore and then treated
+	// as read-only for the store's lifetime. The default is pebble.Sync;
+	// operators may opt into pebble.NoSync when the raft WAL's
+	// durability is considered sufficient.
+	fsmApplyWriteOpts *pebble.WriteOptions
+	// fsmApplySyncModeLabel is the human-readable label corresponding
+	// to fsmApplyWriteOpts ("sync" or "nosync"). Kept alongside the
+	// write-options pointer so monitoring (elastickv_fsm_apply_sync_mode)
+	// and log lines stay in sync with the resolved mode.
+	fsmApplySyncModeLabel string
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
@@ -238,12 +228,15 @@ func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
 
 // NewPebbleStore creates a new Pebble-backed MVCC store.
 func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
+	fsmOpts, fsmLabel := resolveFSMApplyWriteOpts(os.Getenv(fsmSyncModeEnv))
 	s := &pebbleStore{
 		dir: dir,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		writeConflicts: newWriteConflictCounter(),
+		writeConflicts:        newWriteConflictCounter(),
+		fsmApplyWriteOpts:     fsmOpts,
+		fsmApplySyncModeLabel: fsmLabel,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -487,6 +480,15 @@ func (s *pebbleStore) LastCommitTS() uint64 {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return s.lastCommitTS
+}
+
+// FSMApplySyncModeLabel returns the resolved FSM sync-mode label
+// ("sync" or "nosync") for this store. Consumed by monitoring to
+// surface the current durability posture as a gauge with a mode label.
+// The value is fixed for the store's lifetime (resolved once from
+// ELASTICKV_FSM_SYNC_MODE in NewPebbleStore) so no locking is needed.
+func (s *pebbleStore) FSMApplySyncModeLabel() string {
+	return s.fsmApplySyncModeLabel
 }
 
 func (s *pebbleStore) MinRetainedTS() uint64 {
@@ -1118,11 +1120,11 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		s.mtx.Unlock()
 		return err
 	}
-	// fsmApplyWriteOpts is Sync by default. Operators may opt in to NoSync
+	// s.fsmApplyWriteOpts is Sync by default. Operators may opt in to NoSync
 	// via ELASTICKV_FSM_SYNC_MODE=nosync when the raft WAL's durability is
 	// considered sufficient (raft-log replay from the last FSM snapshot
 	// re-applies any entries lost from Pebble after a crash).
-	if err := b.Commit(fsmApplyWriteOpts); err != nil {
+	if err := b.Commit(s.fsmApplyWriteOpts); err != nil {
 		s.mtx.Unlock()
 		return errors.WithStack(err)
 	}
@@ -1175,8 +1177,8 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 		return err
 	}
 	// See ApplyMutations for the durability argument behind
-	// fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE).
-	if err := batch.Commit(fsmApplyWriteOpts); err != nil {
+	// s.fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE).
+	if err := batch.Commit(s.fsmApplyWriteOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	s.updateLastCommitTS(newLastTS)

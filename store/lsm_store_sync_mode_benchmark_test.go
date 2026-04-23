@@ -33,14 +33,22 @@ func BenchmarkApplyMutations_SyncMode(b *testing.B) {
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
-			setBenchFSMApplyWriteOpts(b, tc.opts)
-
 			dir := b.TempDir()
 			s, err := NewPebbleStore(dir)
 			if err != nil {
 				b.Fatalf("NewPebbleStore: %v", err)
 			}
 			defer s.Close()
+			ps, ok := s.(*pebbleStore)
+			if !ok {
+				b.Fatalf("NewPebbleStore returned non-*pebbleStore type: %T", s)
+			}
+			ps.fsmApplyWriteOpts = tc.opts
+			if tc.opts == pebble.NoSync {
+				ps.fsmApplySyncModeLabel = fsmSyncModeNoSync
+			} else {
+				ps.fsmApplySyncModeLabel = fsmSyncModeSync
+			}
 
 			ctx := context.Background()
 			val := make([]byte, 64)
@@ -65,16 +73,4 @@ func BenchmarkApplyMutations_SyncMode(b *testing.B) {
 			}
 		})
 	}
-}
-
-// setBenchFSMApplyWriteOpts is the benchmark counterpart to
-// setFSMApplyWriteOptsForTest. It accepts *testing.B (which does not
-// satisfy the testing.TB-only t.Helper() pattern used by the test
-// helper) so the benchmark can swap the package-level write options
-// around each sub-run.
-func setBenchFSMApplyWriteOpts(b *testing.B, opts *pebble.WriteOptions) {
-	b.Helper()
-	prev := fsmApplyWriteOpts
-	fsmApplyWriteOpts = opts
-	b.Cleanup(func() { fsmApplyWriteOpts = prev })
 }

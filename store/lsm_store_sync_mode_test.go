@@ -24,11 +24,8 @@ import (
 // verify that switching write options does not change the visible
 // store state.
 func TestApplyMutations_NoSyncFunctionalEquivalence(t *testing.T) {
-	setFSMApplyWriteOptsForTest(t, pebble.NoSync, fsmSyncModeNoSync)
-
 	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
+	s := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 	defer s.Close()
 
 	ctx := context.Background()
@@ -63,11 +60,8 @@ func TestApplyMutations_NoSyncFunctionalEquivalence(t *testing.T) {
 // custom VFS shim that is not currently wired into Pebble at this
 // layer.
 func TestApplyMutations_NoSyncReopenVisibility(t *testing.T) {
-	setFSMApplyWriteOptsForTest(t, pebble.NoSync, fsmSyncModeNoSync)
-
 	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
+	s := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 
 	ctx := context.Background()
 	mutations := []*KVPairMutation{
@@ -76,8 +70,7 @@ func TestApplyMutations_NoSyncReopenVisibility(t *testing.T) {
 	require.NoError(t, s.ApplyMutations(ctx, mutations, nil, 0, 10))
 	require.NoError(t, s.Close())
 
-	reopened, err := NewPebbleStore(dir)
-	require.NoError(t, err)
+	reopened := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 	defer reopened.Close()
 
 	val, err := reopened.GetAt(ctx, []byte("keep"), 10)

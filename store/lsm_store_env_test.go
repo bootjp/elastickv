@@ -90,25 +90,31 @@ func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
 	cache.Unref()
 }
 
-// setFSMApplyWriteOptsForTest swaps the package-level fsmApplyWriteOpts
-// and fsmApplySyncModeLabel for the duration of a single test and restores
-// both during t.Cleanup. Tests use this instead of mutating os.Environ so
-// parallel binaries remain isolated.
-func setFSMApplyWriteOptsForTest(t *testing.T, opts *pebble.WriteOptions, label string) {
+// newPebbleStoreWithFSMApplyWriteOptsForTest constructs a pebbleStore
+// (not the MVCCStore interface) with an explicit *pebble.WriteOptions
+// and sync-mode label for the FSM commit path, bypassing the
+// ELASTICKV_FSM_SYNC_MODE env resolution. Tests use this to exercise
+// both sync and nosync modes deterministically without mutating
+// os.Environ (which would leak into parallel test binaries).
+//
+// The store is created via NewPebbleStore and then the relevant
+// fields are overridden; this keeps the full init path (cache,
+// metadata scans, etc.) identical to production while only swapping
+// the write-options that govern commit-time durability.
+func newPebbleStoreWithFSMApplyWriteOptsForTest(t *testing.T, dir string, opts *pebble.WriteOptions, label string) *pebbleStore {
 	t.Helper()
-	prevOpts := fsmApplyWriteOpts
-	prevLabel := fsmApplySyncModeLabel
-	fsmApplyWriteOpts = opts
-	fsmApplySyncModeLabel = label
-	t.Cleanup(func() {
-		fsmApplyWriteOpts = prevOpts
-		fsmApplySyncModeLabel = prevLabel
-	})
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok, "NewPebbleStore returned non-*pebbleStore type")
+	ps.fsmApplyWriteOpts = opts
+	ps.fsmApplySyncModeLabel = label
+	return ps
 }
 
 // TestFSMApplySyncModeEnvOverride covers the ELASTICKV_FSM_SYNC_MODE
 // parsing contract directly against resolveFSMApplyWriteOpts, which is
-// what init() calls. Mirrors the approach taken for
+// what NewPebbleStore calls. Mirrors the approach taken for
 // ELASTICKV_PEBBLE_CACHE_MB to avoid mutating os.Environ at runtime.
 func TestFSMApplySyncModeEnvOverride(t *testing.T) {
 	t.Run("empty string uses sync default", func(t *testing.T) {
@@ -157,15 +163,19 @@ func TestFSMApplySyncModeEnvOverride(t *testing.T) {
 	})
 }
 
-// TestFSMApplySyncModeLabelAccessor verifies the read-only public
-// accessor returns the current label (so monitoring never reads the
-// package var directly) and tracks the test helper.
+// TestFSMApplySyncModeLabelAccessor verifies that a constructed
+// pebbleStore exposes its resolved sync-mode label via the per-instance
+// accessor, so monitoring can read the mode off a concrete store
+// instead of a package global.
 func TestFSMApplySyncModeLabelAccessor(t *testing.T) {
-	before := FSMApplySyncModeLabel()
 	t.Run("nosync", func(t *testing.T) {
-		setFSMApplyWriteOptsForTest(t, pebble.NoSync, fsmSyncModeNoSync)
-		require.Equal(t, fsmSyncModeNoSync, FSMApplySyncModeLabel())
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
+		defer ps.Close()
+		require.Equal(t, fsmSyncModeNoSync, ps.FSMApplySyncModeLabel())
 	})
-	// Cleanup via t.Cleanup should restore the prior label.
-	require.Equal(t, before, FSMApplySyncModeLabel())
+	t.Run("sync", func(t *testing.T) {
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.Sync, fsmSyncModeSync)
+		defer ps.Close()
+		require.Equal(t, fsmSyncModeSync, ps.FSMApplySyncModeLabel())
+	})
 }

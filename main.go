@@ -117,10 +117,6 @@ func run() error {
 	var lc net.ListenConfig
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
-	// Record the active FSM apply sync mode so operators can see on the
-	// /metrics endpoint which durability posture this node is running in.
-	// See store.FSMApplySyncModeLabel for the underlying env resolution.
-	metricsRegistry.SetFSMApplySyncMode(store.FSMApplySyncModeLabel())
 
 	// Create the shared HLC before building shard groups so every FSM can update
 	// physicalCeiling when HLC lease entries are applied to the Raft log.
@@ -141,6 +137,15 @@ func run() error {
 	)
 	if err != nil {
 		return err
+	}
+
+	// Record the active FSM apply sync mode so operators can see on the
+	// /metrics endpoint which durability posture this node is running in.
+	// The label is resolved per-pebbleStore from ELASTICKV_FSM_SYNC_MODE
+	// in NewPebbleStore; read it off the first constructed store (all
+	// shards share the same env and therefore the same label).
+	if label := fsmApplySyncModeLabelFromRuntimes(runtimes); label != "" {
+		metricsRegistry.SetFSMApplySyncMode(label)
 	}
 
 	cleanup := internalutil.CleanupStack{}
@@ -432,6 +437,35 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 		})
 	}
 	return out
+}
+
+// fsmApplySyncModeLabeler narrows an MVCCStore to those implementations
+// that can report the resolved ELASTICKV_FSM_SYNC_MODE label. The
+// pebble-backed store satisfies this today; alternate backends (none
+// yet) would either implement it or be skipped.
+type fsmApplySyncModeLabeler interface {
+	FSMApplySyncModeLabel() string
+}
+
+// fsmApplySyncModeLabelFromRuntimes returns the FSM apply sync-mode
+// label resolved by the first shard store that exposes it. All shards
+// on a node read the same ELASTICKV_FSM_SYNC_MODE env var at
+// construction time so the label is uniform across the runtimes;
+// returning the first one suffices. Returns "" when no runtime
+// exposes the accessor, in which case the caller skips emitting the
+// gauge to avoid publishing a misleading default.
+func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(fsmApplySyncModeLabeler)
+		if !ok {
+			continue
+		}
+		return src.FSMApplySyncModeLabel()
+	}
+	return ""
 }
 
 // pebbleMonitorSources extracts the MVCC stores that expose
