@@ -159,13 +159,13 @@
           ;; Do NOT swallow silently: repeated setup! failures across
           ;; runs would leave stale data under zset-key and could
           ;; produce false-positive safety failures. Log loudly so
-          ;; operators notice.
-          (warn "ZSet safety setup! DEL failed -- stale data may survive"
-                "into this run:" (.getMessage t))))
+          ;; operators notice. clojure.tools.logging/warn expects
+          ;; (warn msg) or (warn throwable msg) -- NOT multiple strings.
+          (warn t "ZSet safety setup! DEL failed -- stale data may survive into this run")))
       ;; open! failed to populate :conn-spec (e.g. unresolvable host);
       ;; flag it rather than silently proceeding with a no-op setup.
-      (warn "ZSet safety setup! skipped: missing :conn-spec on client;"
-            "prior state under" zset-key "may survive into this run"))
+      (warn (str "ZSet safety setup! skipped: missing :conn-spec on client;"
+                 " prior state under " zset-key " may survive into this run")))
     this)
 
   (teardown! [this _test] this)
@@ -185,14 +185,14 @@
                 [tag v]   (coerce-zincrby-score new-score)]
             (case tag
               :ok         (assoc op :type :ok :value [member v])
-              :nil        (do (warn "ZSet safety ZINCRBY returned nil for" member)
+              :nil        (do (warn (str "ZSet safety ZINCRBY returned nil for " member))
                               (assoc op :type :info
                                         :error :nil-response))
-              :error      (do (warn "ZSet safety ZINCRBY returned error reply:" v)
+              :error      (do (warn (str "ZSet safety ZINCRBY returned error reply: " v))
                               (assoc op :type :info
                                         :error {:kind :error-response
                                                 :message v}))
-              :unexpected (do (warn "ZSet safety ZINCRBY returned unexpected reply:" (pr-str v))
+              :unexpected (do (warn (str "ZSet safety ZINCRBY returned unexpected reply: " (pr-str v)))
                               (assoc op :type :info
                                         :error {:kind :unexpected-response
                                                 :value (pr-str v)}))))
@@ -215,7 +215,7 @@
             (assoc op :type :ok :value {:bounds [lo hi]
                                         :members (parse-withscores flat)})))
         (catch Exception e
-          (warn "ZSet safety op failed:" (:f op) (.getMessage e))
+          (warn e (str "ZSet safety op failed: " (:f op)))
           (assoc op :type :info :error (.getMessage e)))))))
 
 ;; ---------------------------------------------------------------------------
