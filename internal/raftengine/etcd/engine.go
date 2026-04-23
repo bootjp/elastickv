@@ -750,7 +750,7 @@ func (e *Engine) LastQuorumAck() time.Time {
 // heartbeat channel was full. Monotonic across the life of the engine.
 // Surfaced to Prometheus via the monitoring package so the hot-path
 // dashboard can graph stepCh saturation alongside LinearizableRead
-// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+// rate (see the "Hot Path" row in monitoring/grafana/dashboards/elastickv-redis-summary.json).
 func (e *Engine) DispatchDropCount() uint64 {
 	if e == nil {
 		return 0

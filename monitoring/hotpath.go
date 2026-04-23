@@ -9,8 +9,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Hot-path metrics support the "Redis Hot Path" dashboard
-// (monitoring/grafana/dashboards/elastickv-redis-hotpath.json). They
+// Hot-path metrics support the "Hot Path (legacy PR #560)" collapsed
+// row inside monitoring/grafana/dashboards/elastickv-redis-summary.json.
+// They
 // were added to confirm PR #560 (GET fast-path) landed in production:
 // the LinearizableRead call rate should drop sharply on a
 // string-dominated workload while GET p99 stays flat or improves, and
