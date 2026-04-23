@@ -419,6 +419,7 @@ update_one_node() {
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
+      EXTRA_ENV="${EXTRA_ENV:-}" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
