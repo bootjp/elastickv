@@ -94,6 +94,18 @@ command byte" simplicity, and a bounded `ZRANGE 0 10` contributes at
 most one unmarshal per request (cheap). Dynamic (observed-cost)
 classification is a follow-up; v1 bias is a boring, reviewable list.
 
+**Blocking `XREAD BLOCK ms` is a special case** — it may hold a
+worker slot for up to `ms` milliseconds while doing no work, which
+can trivially exhaust the pool if even a handful of long-polling
+consumers are active. v1 resolution: **blocking variants (`XREAD
+BLOCK`, `BLPOP`, `BRPOP`, `BZPOPMIN`/`MAX`) bypass the heavy-command
+pool and are handled on their own goroutine**. They are I/O-bound
+waiting, not CPU-bound; their CPU cost lands on wake-up, when the
+dispatcher can re-evaluate whether to gate the follow-up work. The
+gating decision is made in `dispatchCommand` when it sees the command
+name plus the `BLOCK`/`B*` prefix — the simplest arg inspection we
+allow, limited to "is this command blocking?".
+
 ### Tradeoffs
 
 - Adds an enqueue → pickup hop for gated commands. Pool-has-capacity
@@ -121,6 +133,17 @@ outer Lua waiting for an inner call that can never start. Two options:
 (A) preserves "one client request = one slot." Ship must pick one
 explicitly; do not discover this at test time.
 
+**Implementation note for (A): context propagation.** `Submit`
+identifies "inside a pool slot" by attaching a sentinel value to
+`context.Context` (`ctxKeyInPoolSlot`). The Lua adapter threads that
+`ctx` into every `redis.call` it makes; the dispatcher's pool-gate
+check returns immediately when `ctx.Value(ctxKeyInPoolSlot) != nil`
+instead of attempting another `Submit`. This is the only mechanism
+that reliably distinguishes "new client request" from "inner call"
+without tagging every goroutine or holding a pool-wide set of
+goroutine IDs. The sentinel must be package-private so external
+callers cannot fake it.
+
 ### Recommended v1 shape
 
 Package-level pool in `adapter/` with a `Submit(command, fn)` entry
@@ -129,15 +152,18 @@ commands in `dispatchCommand` call `Submit`; ungated stay
 synchronous. Static list lives next to `dispatchCommand`. Pool-full →
 `-BUSY server overloaded`. Lua follows option (A).
 
-**Container-aware sizing.** `runtime.GOMAXPROCS(0)` on Linux returns
-the host CPU count, not the container's cgroup quota (unless
-`GOMAXPROCS` is set explicitly or something has configured it).
-Operators running under Kubernetes/Docker with a CPU limit should
-either (a) set `GOMAXPROCS` in the deploy environment to match the
-cgroup quota (the project's rolling-update script is the natural
-place), or (b) wire `go.uber.org/automaxprocs` into `main.go` so the
-correction happens at startup. v1 prefers (a) for auditability;
-(b) is acceptable as a follow-up if operators want it automatic.
+**Container-aware sizing.** Go 1.25+ (which this repo uses) derives
+the default `GOMAXPROCS` from the cgroup v2 CPU quota on Linux
+automatically, so in most cases `runtime.GOMAXPROCS(0)` already
+reflects the container's share. Two caveats remain: (a) Go runtimes
+older than 1.25 do not, and (b) explicitly setting `GOMAXPROCS`
+disables the runtime's periodic quota-change detection, so an
+operator who hard-codes the value in the deploy environment loses
+auto-updates if the quota changes at runtime. v1 leaves the runtime
+default in place and documents the two caveats; a `GOMAXPROCS` env
+override is still honoured for operators who want explicit control.
+`go.uber.org/automaxprocs` remains an option for pre-1.25 toolchains
+but is not needed for this repo.
 
 **Single pool vs per-class sub-pools.** v1 uses a single global pool.
 The risk: a burst of `KEYS *` or `SCAN` from a management client can
@@ -285,6 +311,18 @@ network failure. Per-client in-flight semaphore is deferred: it
 requires threading client identity through every dispatch, which is
 a bigger change than 2026-04-24 justifies.
 
+**Avoiding a reject-storm feedback loop.** A client with an
+aggressive reconnect pool can answer each `-ERR max connections`
+with an immediate new `connect()` — the server spends CPU on the
+accept/write/close cycle and the client makes no progress. Two
+mitigations: (a) **rate-limit the reject itself**: once a peer IP
+has been rejected `R` times in the last second, the next rejects
+are answered with `RST` (cheap kernel-level reset) instead of an
+accept + write + close; (b) document operator-side client
+configuration (e.g., for redis-rb: `reconnect_attempts=3` plus an
+exponential backoff). (a) ships in v1 behind a compile-time
+constant; (b) belongs in the ops runbook.
+
 ### Where in the code
 
 - `adapter/redis.go:631` — `Run`, where `redcon.Serve` is called.
@@ -338,34 +376,55 @@ new entries. O(new), matching the XREAD spec.
 ### Migration path
 
 Streams persist across restarts and can be large, so no flag-day
-rewrite. Dual-format read:
+rewrite.
 
-1. On XREAD/XRANGE/XLEN/XREVRANGE, try the new per-entry layout first.
-2. If empty AND the legacy single-blob key exists, fall back to the
-   legacy path.
-3. On the next write (`XADD`/`XDEL`/...), rewrite to per-entry and
-   delete the legacy blob in the same commit.
+**Two migration modes** — simple (PR #620, v1 stream PR) and chunked
+(stacked follow-up). The dual-read rule differs between them; the
+distinction matters for correctness.
 
-Remove the legacy fallback later once
-`elastickv_stream_legacy_format_reads_total` has sat at zero across
-all nodes for a soak window.
+**Mode A — simple migration (PR #620 ships this):** the first write
+rewrites the entire legacy blob and deletes it in one Raft commit.
+At any given instant a stream is either entirely legacy or entirely
+per-entry; there is no mixed state. Read rule:
 
-**Chunked migration for large legacy streams.** A single `XADD` on a
-100k-entry legacy stream would rewrite every entry in one Raft
-transaction — regressing into the same CPU and commit-time spike the
-design is supposed to prevent. The migration write therefore caps how
-many entries it rewrites per transaction (`STREAM_MIGRATION_CHUNK`,
-default 1 024). When the legacy stream exceeds the chunk, the first
-write migrates the oldest `CHUNK` entries and the remaining legacy
-tail stays in a legacy-*suffix* key (the blob minus the entries
-already promoted). Subsequent writes drain another chunk each, until
-the legacy tail is empty and can be deleted. A background "migrator"
-goroutine driven by the same `legacy_format_reads_total` metric is a
-follow-up if operator-driven migration proves too slow.
+1. On XREAD/XRANGE/XLEN/XREVRANGE, read the per-entry layout.
+2. If the per-entry meta key is absent AND the legacy blob key
+   exists, fall back to the legacy path.
+3. On the next write, rewrite to per-entry and delete the legacy blob
+   in the same commit.
 
-The existing stream PR (#620) ships the simpler "rewrite all in one
-txn" version; chunked migration is a stacked follow-up once we see
-legacy stream sizes in production.
+**Mode B — chunked migration (follow-up):** each write drains at
+most `STREAM_MIGRATION_CHUNK` (default 1 024) entries from the legacy
+blob into per-entry keys, and leaves the rest in a *legacy-suffix*
+key until a subsequent write drains more. During this window the
+stream exists in BOTH layouts simultaneously: the oldest N entries
+are per-entry, the newer M entries are still in the suffix blob.
+
+Read rule for Mode B — **always merge both layouts**, do not
+fall-through on "new layout empty":
+
+1. Read `meta` if present; read all per-entry keys that match the
+   requested ID range.
+2. Read the legacy-suffix blob if present; decode only entries
+   falling in the ID range.
+3. Merge by ID order, deduplicate (the migrator is responsible for
+   never writing the same ID in both layouts in a single commit), and
+   return.
+
+The v1 dual-read (Mode A) is safe because there is no mixed state.
+Extending it verbatim to Mode B would return incomplete results
+during chunked migration — entries still in the legacy suffix would
+be invisible to readers until the suffix was fully drained. Mode B
+must ship together with the "always merge" read rule.
+
+`elastickv_stream_legacy_format_reads_total` counts reads that
+touched a legacy-format key in either mode. Remove the legacy
+fallback only after it has sat at zero across all nodes for a soak
+window.
+
+The existing stream PR (#620) ships **Mode A only**. Chunked
+migration (Mode B) is explicitly deferred and must not be enabled
+before the merged-read rule lands alongside it.
 
 ### Other one-blob-per-key collections
 
@@ -427,8 +486,17 @@ Recommended order of implementation:
    workload.
 2. **Layer 1 second.** Generic defense for the next unknown
    hotspot. Static command list is small, reviewable, and composes
-   with Layer 4 — streams become a cheap command once Layer 4 ships,
-   but the pool still catches Lua, KEYS, and HGETALL.
+   with Layer 4. **Once Layer 4 ships, XREAD's per-call cost is
+   O(new) so in steady state it is cheap**, but we deliberately
+   keep it gated in Layer 1 v1 for three reasons: (i) a client can
+   still request a huge ID range via XRANGE / a massive `COUNT` on
+   XREAD that the adapter must scan; (ii) the legacy fallback path
+   is still reachable during the migration soak window and that
+   path is still O(n); (iii) revisiting the classification after
+   Layer 4 + Layer 6 metric is a reviewable data-driven decision,
+   not a v1 speculation. The `elastickv_heavy_command_pool_submit_total{cmd="XREAD"}`
+   metric added in Layer 1 is the signal that tells us when XREAD
+   can graduate to ungated.
 3. **Layer 3 third.** Per-client fairness. Coordinate with the
    resilience roadmap item-6 work so we don't ship two overlapping
    admission-control mechanisms. If item 6 ships first, Layer 3 is
