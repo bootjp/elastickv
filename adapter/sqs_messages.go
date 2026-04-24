@@ -520,12 +520,16 @@ func (s *SQSServer) tryDeliverCandidate(
 		return nil, false
 	}
 	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
-	// ReadKeys include the visibility entry and the data record so a
-	// concurrent ReceiveMessage that rotated the same message commits a
-	// newer version and forces our Dispatch to return ErrWriteConflict.
-	// Skipping the candidate on conflict prevents duplicate delivery.
+	// StartTS pins the OCC read snapshot to the timestamp we actually
+	// loaded the record at. Without it, the coordinator assigns a newer
+	// StartTS at dispatch, so a concurrent rotation that committed
+	// AFTER our read but BEFORE the assigned StartTS would slip through
+	// ReadKeys validation and let this transaction double-deliver.
+	// ReadKeys cover both the visibility entry and the data record so
+	// any concurrent commit on either produces ErrWriteConflict.
 	req := &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
+		StartTS:  readTS,
 		ReadKeys: [][]byte{cand.visKey, dataKey},
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: cand.visKey},
@@ -585,7 +589,7 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		rec, dataKey, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
+		rec, dataKey, readTS, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
 		if err != nil {
 			return err
 		}
@@ -596,8 +600,12 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 			// fall through to commit below
 		}
 		visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		// StartTS pins OCC to the snapshot we loaded the record at, so a
+		// concurrent rotation that commits after our load but before a
+		// coordinator-assigned StartTS cannot slip past ReadKeys.
 		req := &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
+			StartTS:  readTS,
 			ReadKeys: [][]byte{dataKey, visKey},
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: dataKey},
@@ -631,25 +639,27 @@ const (
 // outcome for AWS-compatible DeleteMessage semantics: structural errors
 // propagate; missing records and token mismatches return
 // sqsDeleteNoOp; matching tokens return sqsDeleteProceed with the
-// loaded record.
-func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, sqsDeleteOutcome, error) {
+// loaded record. The readTS it took the snapshot at is returned so the
+// caller can pass it as StartTS on the OCC dispatch, pinning the
+// read-write conflict detection window.
+func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, sqsDeleteNoOp, nil
+			return nil, nil, readTS, sqsDeleteNoOp, nil
 		}
-		return nil, nil, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return nil, nil, sqsDeleteNoOp, nil
+		return nil, nil, readTS, sqsDeleteNoOp, nil
 	}
-	return rec, dataKey, sqsDeleteProceed, nil
+	return rec, dataKey, readTS, sqsDeleteProceed, nil
 }
 
 func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Request) {
@@ -682,7 +692,7 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		rec, dataKey, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
+		rec, dataKey, readTS, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
 		if apiErr != nil {
 			return apiErr
 		}
@@ -697,8 +707,13 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 			return errors.WithStack(err)
 		}
 		newVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		// StartTS pins OCC to the snapshot; without it the coordinator
+		// would auto-assign a newer StartTS and a concurrent receive /
+		// delete that commits between our load and dispatch could slip
+		// past the ReadKeys validation.
 		req := &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
+			StartTS:  readTS,
 			ReadKeys: [][]byte{dataKey, oldVisKey},
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: oldVisKey},
@@ -735,25 +750,27 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 
 // loadAndVerifyMessage reads the data record for the given handle and
 // verifies that the receipt token matches the current one on record.
-// Returns the record, its key, or a typed SQS error.
-func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, error) {
+// Returns the record, its key, the snapshot timestamp the read ran at,
+// or a typed SQS error. Callers use the snapshot as StartTS on the
+// OCC dispatch so concurrent commits cannot slip past ReadKeys.
+func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
+			return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
 		}
-		return nil, nil, errors.WithStack(err)
+		return nil, nil, readTS, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return nil, nil, readTS, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
+		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
 	}
-	return rec, dataKey, nil
+	return rec, dataKey, readTS, nil
 }
 
 // ------------------------ small helpers ------------------------
