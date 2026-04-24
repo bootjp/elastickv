@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -11,11 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -106,12 +110,94 @@ var (
 	adminFullAccessKeys            = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 )
 
+// memoryPressureExit is set to true by the memwatch OnExceed callback to
+// signal that the subsequent graceful shutdown was triggered by user-space
+// OOM avoidance rather than an ordinary SIGTERM. The process exits with a
+// distinct non-zero code (exitCodeMemoryPressure) so operators reading
+// logs can distinguish this case from a crash or an ordinary stop.
+var memoryPressureExit atomic.Bool
+
+// exitCodeMemoryPressure is reported by main when memwatch triggered the
+// shutdown. It is non-zero so supervisors see a non-success exit, but
+// distinct from log.Fatalf's 1 and from os.Exit(1) in the other binaries
+// so log scraping can tell them apart.
+const exitCodeMemoryPressure = 2
+
+// memoryShutdownThresholdEnvVar configures the heap-inuse ceiling at
+// which memwatch triggers a graceful shutdown. Empty or "0" disables the
+// watchdog (the default; existing operators see no behaviour change).
+const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
+
+// memoryShutdownPollIntervalEnvVar overrides memwatch's default poll
+// cadence. Accepts any time.ParseDuration string. Invalid values log a
+// warning and fall through to the default.
+const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
+
+const bytesPerMiB = 1024 * 1024
+
 func main() {
 	flag.Parse()
 
-	if err := run(); err != nil {
+	err := run()
+	if memoryPressureExit.Load() {
+		// memwatch fired: surface exit code 2 regardless of whether run()
+		// returned a nil or an error (cancel() can cause in-flight
+		// listeners to return spurious errors during shutdown). Still
+		// log any residual error so a secondary failure during the
+		// graceful shutdown is visible in logs rather than swallowed.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("shutdown error after memory pressure", "error", err)
+		}
+		os.Exit(exitCodeMemoryPressure)
+	}
+	if err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+// memwatchConfigFromEnv resolves the memwatch Config from environment
+// variables. It returns (cfg, true) when the watcher should run, or
+// (_, false) when the operator has not opted in (the default). Errors in
+// the optional poll-interval override are logged and ignored so a typo
+// cannot take the process down.
+func memwatchConfigFromEnv() (memwatch.Config, bool) {
+	raw := strings.TrimSpace(os.Getenv(memoryShutdownThresholdEnvVar))
+	if raw == "" {
+		return memwatch.Config{}, false
+	}
+	mb, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		slog.Warn("invalid "+memoryShutdownThresholdEnvVar+"; watcher disabled",
+			"value", raw, "error", err)
+		return memwatch.Config{}, false
+	}
+	if mb == 0 {
+		return memwatch.Config{}, false
+	}
+	// Guard against mb * bytesPerMiB wrapping past math.MaxUint64. The
+	// value has no real use above this ceiling (the host does not have
+	// exabytes of RAM), and a wrapped value would set an absurdly low
+	// threshold that fires immediately.
+	if mb > math.MaxUint64/bytesPerMiB {
+		slog.Warn("value for "+memoryShutdownThresholdEnvVar+" would overflow uint64; watcher disabled",
+			"value_mb", mb)
+		return memwatch.Config{}, false
+	}
+
+	cfg := memwatch.Config{
+		ThresholdBytes: mb * bytesPerMiB,
+	}
+	cfg.PollInterval = memwatch.DefaultPollInterval
+	if rawInterval := strings.TrimSpace(os.Getenv(memoryShutdownPollIntervalEnvVar)); rawInterval != "" {
+		d, err := time.ParseDuration(rawInterval)
+		if err != nil || d <= 0 {
+			slog.Warn("invalid "+memoryShutdownPollIntervalEnvVar+"; using default",
+				"value", rawInterval, "error", err)
+		} else {
+			cfg.PollInterval = d
+		}
+	}
+	return cfg, true
 }
 
 func run() error {
@@ -184,6 +270,7 @@ func run() error {
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
+	startMemoryWatchdog(runCtx, eg, cancel)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
@@ -529,6 +616,33 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 		})
 	}
 	return out
+}
+
+// startMemoryWatchdog optionally starts the memwatch goroutine. The
+// watcher is off by default; it is enabled only when the operator sets
+// ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
+// callback flips the memoryPressureExit sentinel and cancels the root
+// context, routing through the exact same shutdown path SIGTERM would
+// use (errgroup unwinds, CleanupStack runs, WAL is synced). We do NOT
+// send a signal, call os.Exit, or touch the raft engine directly here.
+func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context.CancelFunc) {
+	cfg, enabled := memwatchConfigFromEnv()
+	if !enabled {
+		return
+	}
+	cfg.OnExceed = func() {
+		memoryPressureExit.Store(true)
+		cancel()
+	}
+	w := memwatch.New(cfg)
+	slog.Info("memory watchdog enabled",
+		"threshold_bytes", cfg.ThresholdBytes,
+		"poll_interval", cfg.PollInterval,
+	)
+	eg.Go(func() error {
+		w.Start(ctx)
+		return nil
+	})
 }
 
 // startMonitoringCollectors wires up the per-tick Prometheus
