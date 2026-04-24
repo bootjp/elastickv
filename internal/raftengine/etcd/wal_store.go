@@ -125,7 +125,11 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if !wal.Repair(logger, walDir) {
 		return nil, errors.Wrap(err, "WAL unrepairable")
 	}
-	return tryLoadWalState(logger, walDir, snapDir, fsmSnapDir, fsm)
+	ds, err = tryLoadWalState(logger, walDir, snapDir, fsmSnapDir, fsm)
+	if err != nil {
+		return nil, errors.Wrap(err, "WAL unrepairable after repair")
+	}
+	return ds, nil
 }
 
 func tryLoadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine) (*diskState, error) {
