@@ -514,26 +514,27 @@ O(total_entries_in_cluster), not O(legacy_blobs). In a deployment
 with many large migrated streams this is the exact cost profile
 Layer 4 was introduced to eliminate.
 
-Two implementable options, pick whichever is cheaper in the target
-backend:
+**The implementable option is a sidecar index.** On every write that
+creates a legacy blob record the logical stream name in a dedicated
+`!redis|stream_legacy_index|<key>` tombstone-style marker. The
+migration write that rewrites the stream deletes that marker in the
+same commit. The counter becomes `SCAN !redis|stream_legacy_index|`,
+bounded by the number of legacy blobs, not total entries.
 
-1. **Bloom-filter / sidecar index.** On every write that creates a
-   legacy blob record the logical stream name in a dedicated
-   `!redis|stream_legacy_index|<key>` tombstone-style marker. The
-   migration write that rewrites the stream deletes that marker in
-   the same commit. The counter becomes `SCAN !redis|stream_legacy_index|`,
-   bounded by the number of legacy blobs, not total entries.
-2. **Layout-walk.** Iterate `!redis|stream|<key>|meta` keys and, for
-   each stream, probe `!redis|stream|<key>` (the legacy blob key has
-   no suffix). Scan cost is O(num_streams), not O(num_entries).
-   Equivalent answer; avoids the sidecar index.
+A "walk `|meta` keys" alternative was considered and **rejected**:
+untouched legacy streams never acquire a `|meta` key (Mode A's read
+rule explicitly expects `|meta` to be absent and falls back to the
+legacy blob). Iterating `|meta` would miss exactly the cold
+legacy streams that this counter exists to surface, reintroducing
+the same blind spot the paired counter is closing.
 
-Both pass the key-pattern sanity check: legacy keys live at
-`!redis|stream|<logical>` with no further suffix, per-entry keys at
+Key-pattern sanity check: legacy keys live at `!redis|stream|<logical>`
+with no further suffix, per-entry keys at
 `!redis|stream|<logical>|entry|<id>`, meta at
-`!redis|stream|<logical>|meta`. The "prefix scan on `!redis|stream|`"
-wording in earlier drafts was wrong and has been retracted; the
-layout above is authoritative.
+`!redis|stream|<logical>|meta`, and the sidecar index at
+`!redis|stream_legacy_index|<logical>`. The "prefix scan on
+`!redis|stream|`" wording in earlier drafts was wrong and has been
+retracted; the layout above is authoritative.
 
 The fallback is safe to remove only when **both** counters are zero
 across every node. The index/walk runs at the same cadence as
