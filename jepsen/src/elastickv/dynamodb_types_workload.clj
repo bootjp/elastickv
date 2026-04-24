@@ -345,14 +345,20 @@
                           write-capacity
                           nil)]
     {:client    client
+     ;; Per-key generator: emits exactly `max-writes` distinct writes (one
+     ;; per index 0..max-writes-1) interleaved with up to `max-writes`
+     ;; reads.  Both sub-gens are finite, so gen/mix terminates when both
+     ;; are drained.  We bound *writes* specifically rather than total ops
+     ;; so --max-writes-per-key is honest: a read-heavy random mix can no
+     ;; longer starve the run of the writes that drive the register
+     ;; signal.
      :generator (independent/concurrent-generator
                   threads-per-key
                   (range key-count)
                   (fn [_k]
-                    (->> (gen/mix [(map (fn [i] {:f :write :value (gen-fn i)})
-                                        (range))
-                                   (gen/repeat {:f :read})])
-                         (gen/limit max-writes))))
+                    (gen/mix [(map (fn [i] {:f :write :value (gen-fn i)})
+                                   (range max-writes))
+                              (repeat max-writes {:f :read})])))
      ;; :competition runs Knossos's graph-search (:linear) and tree-search
      ;; (:wgl) algorithms in parallel and returns whichever proves a verdict
      ;; first.  :linear alone times out on dense Jepsen histories and yields
