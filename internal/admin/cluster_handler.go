@@ -92,5 +92,12 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(info)
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		// The 200 header is already on the wire, so we cannot
+		// change the status — but a truncated JSON body is hard
+		// to diagnose without a breadcrumb.
+		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin cluster response encode failed",
+			slog.String("error", err.Error()),
+		)
+	}
 }

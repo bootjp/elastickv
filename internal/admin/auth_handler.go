@@ -234,8 +234,9 @@ func readLoginRequest(w http.ResponseWriter, r *http.Request) (loginRequest, boo
 // expensive KDF would add latency to every login attempt without
 // changing the threat model.
 var (
-	secretCompareKey     []byte
-	secretCompareKeyOnce sync.Once
+	secretCompareKey      []byte
+	secretCompareKeyOnce  sync.Once
+	unknownKeyPlaceholder []byte
 )
 
 func initSecretCompareKey() {
@@ -246,6 +247,12 @@ func initSecretCompareKey() {
 		// cannot authenticate anyone anyway.
 		panic("admin: crypto/rand failure while initialising secret compare key: " + err.Error())
 	}
+	// Materialise the unknown-key-placeholder digest exactly once so
+	// the login failure hot path does not re-run HMAC on every try;
+	// the value is deterministic given secretCompareKey.
+	mac := hmac.New(sha256.New, secretCompareKey)
+	mac.Write([]byte("admin-auth-unknown-key-placeholder"))
+	unknownKeyPlaceholder = mac.Sum(nil)
 }
 
 // digestForCompare returns HMAC-SHA256(secretCompareKey, s). Used only
@@ -257,22 +264,11 @@ func digestForCompare(s string) []byte {
 	return mac.Sum(nil)
 }
 
-// unknownKeyPlaceholder is a sentinel digest we compare against when the
-// caller-supplied access key is not in the credential store. Using a
-// deterministic value here keeps the work done by the authenticate path
-// roughly equivalent between "unknown key" and "known key, wrong
-// secret", so the two branches are not distinguishable by timing.
-var unknownKeyPlaceholder = func() []byte {
-	secretCompareKeyOnce.Do(initSecretCompareKey)
-	mac := hmac.New(sha256.New, secretCompareKey)
-	mac.Write([]byte("admin-auth-unknown-key-placeholder"))
-	return mac.Sum(nil)
-}
-
 func (s *AuthService) authenticate(w http.ResponseWriter, req loginRequest) (AuthPrincipal, bool) {
+	secretCompareKeyOnce.Do(initSecretCompareKey)
 	providedHash := digestForCompare(req.SecretKey)
 	expected, known := s.creds.LookupSecret(req.AccessKey)
-	expectedHash := unknownKeyPlaceholder()
+	expectedHash := unknownKeyPlaceholder
 	if known {
 		expectedHash = digestForCompare(expected)
 	}

@@ -186,7 +186,14 @@ func (v *Verifier) validateClaims(claims jwtClaims) (AuthPrincipal, error) {
 	if claims.EXP == 0 || now >= claims.EXP {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "token expired")
 	}
-	if claims.IAT != 0 && now+clockSkewToleranceSeconds < claims.IAT {
+	// A missing iat is treated the same as a missing exp: the admin
+	// Signer always sets iat, so a token without one is either
+	// malformed, produced by a foreign signer that happens to share
+	// the HS256 key, or a future-version token we do not recognise.
+	if claims.IAT == 0 {
+		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "missing iat")
+	}
+	if now+clockSkewToleranceSeconds < claims.IAT {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "token issued in the future")
 	}
 	if claims.Sub == "" {

@@ -178,7 +178,10 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
 	require.NoError(t, err)
 
-	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // self-signed in test
+	transport := &http.Transport{TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // self-signed certificate in test; server identity is not what we assert here.
+		MinVersion:         tls.VersionTLS12,
+	}}
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
 	deadline := time.Now().Add(3 * time.Second)
 	var resp *http.Response

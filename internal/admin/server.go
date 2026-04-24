@@ -1,12 +1,10 @@
 package admin
 
 import (
-	"context"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"reflect"
-	"strings"
 )
 
 // ServerDeps bundles the collaborators the admin HTTP surface needs. All
@@ -158,30 +156,25 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 		return BodyLimit(defaultBodyLimit)(next)
 	}
 
+	// Build each route's middleware stack exactly once at startup
+	// rather than rebuilding 4–5 closures per inbound request.
+	loginChain := publicAuth(loginHandler)
+	logoutChain := protect(logoutHandler)
+	clusterChain := protect(clusterHandler)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/admin/api/v1/auth/login":
-			publicAuth(loginHandler).ServeHTTP(w, r)
+			loginChain.ServeHTTP(w, r)
 		case "/admin/api/v1/auth/logout":
-			protect(logoutHandler).ServeHTTP(w, r)
+			logoutChain.ServeHTTP(w, r)
 		case "/admin/api/v1/cluster":
-			protect(clusterHandler).ServeHTTP(w, r)
+			clusterChain.ServeHTTP(w, r)
 		default:
 			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 				"no admin API handler is registered for this path")
 		}
 	})
-}
-
-// ctxClosed is a small helper for shutdown signalling; kept here so
-// tests do not need to import context directly.
-func ctxClosed(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	default:
-		return false
-	}
 }
 
 func errMissing(field string) error {
@@ -226,10 +219,4 @@ var nilableKinds = map[reflect.Kind]struct{}{
 func isNilableKind(k reflect.Kind) bool {
 	_, ok := nilableKinds[k]
 	return ok
-}
-
-// endpointMatches is a small helper kept here for readability in table
-// driven path-routing tests.
-func endpointMatches(path, want string) bool {
-	return strings.EqualFold(path, want)
 }

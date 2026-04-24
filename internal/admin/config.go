@@ -103,6 +103,9 @@ func (c *Config) validateTLS() error {
 	if tlsConfigured || !addressRequiresTLS(strings.TrimSpace(c.Listen)) || c.AllowPlaintextNonLoopback {
 		return nil
 	}
+	// errors.Newf already carries a stack; errors.WithStack here is
+	// for the project's wrapcheck linter, which requires every
+	// cockroachdb/errors return at a package boundary to be wrapped.
 	return errors.WithStack(errors.Newf(
 		"-adminListen %q is not loopback but TLS is not configured;"+
 			" set -adminTLSCertFile + -adminTLSKeyFile, or explicitly pass"+
@@ -130,21 +133,32 @@ func (c *Config) validateSigningKeys() error {
 
 // DecodedSigningKeys returns the raw HS256 keys in verification order: the
 // primary signing key first, followed by an optional previous key. Validate
-// must be called first.
+// must be called first; this method also asserts that contract defensively
+// so a missing key cannot quietly produce a `[][]byte{nil}` result and feed
+// a nil HMAC key into the verifier.
 func (c *Config) DecodedSigningKeys() ([][]byte, error) {
+	if c == nil || !c.Enabled {
+		return nil, errors.New("DecodedSigningKeys called on a disabled admin config")
+	}
 	primary, err := decodeSigningKey("-adminSessionSigningKey", c.SessionSigningKey)
 	if err != nil {
 		return nil, err
 	}
-	keys := [][]byte{primary}
-	if strings.TrimSpace(c.SessionSigningKeyPrevious) != "" {
-		prev, err := decodeSigningKey("-adminSessionSigningKeyPrevious", c.SessionSigningKeyPrevious)
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, prev)
+	if len(primary) == 0 {
+		return nil, errors.New("-adminSessionSigningKey is empty; call Validate first")
 	}
-	return keys, nil
+	keys := [][]byte{primary}
+	if strings.TrimSpace(c.SessionSigningKeyPrevious) == "" {
+		return keys, nil
+	}
+	prev, err := decodeSigningKey("-adminSessionSigningKeyPrevious", c.SessionSigningKeyPrevious)
+	if err != nil {
+		return nil, err
+	}
+	if len(prev) == 0 {
+		return nil, errors.New("-adminSessionSigningKeyPrevious is set but decoded to zero bytes")
+	}
+	return append(keys, prev), nil
 }
 
 // RoleIndex returns a map from access key to Role after Validate has
@@ -175,12 +189,28 @@ func decodeSigningKey(field, encoded string) ([]byte, error) {
 	if trim == "" {
 		return nil, nil
 	}
-	raw, err := base64.StdEncoding.DecodeString(trim)
-	if err != nil {
-		raw, err = base64.RawStdEncoding.DecodeString(trim)
-		if err != nil {
-			return nil, errors.Wrapf(err, "%s is not valid base64", field)
+	// Operators routinely copy keys out of Kubernetes Secrets or
+	// similar tooling that may emit either standard or URL-safe
+	// base64, with or without padding. Try each alphabet in turn so
+	// a correct key is never rejected over a formatting mismatch.
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	var (
+		raw    []byte
+		decErr error
+	)
+	for _, dec := range decoders {
+		raw, decErr = dec.DecodeString(trim)
+		if decErr == nil {
+			break
 		}
+	}
+	if decErr != nil {
+		return nil, errors.Wrapf(decErr, "%s is not valid base64", field)
 	}
 	if len(raw) != sessionSigningKeyLen {
 		return nil, errors.WithStack(errors.Newf(

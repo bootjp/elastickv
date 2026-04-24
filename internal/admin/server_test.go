@@ -166,14 +166,3 @@ func TestServer_WriteRejectsMissingCSRF(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, req)
 	require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed}, rec.Code)
 }
-
-// Smoke-test that ctxClosed and endpointMatches compile & work; these
-// are small internal helpers that would otherwise skew coverage.
-func TestInternalHelpers(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	require.False(t, ctxClosed(ctx))
-	cancel()
-	require.True(t, ctxClosed(ctx))
-	require.True(t, endpointMatches("/a", "/A"))
-	require.False(t, endpointMatches("/a", "/b"))
-}

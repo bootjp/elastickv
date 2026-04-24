@@ -34,16 +34,26 @@ func TestServer_RejectsTypedNilCredentialStore(t *testing.T) {
 }
 
 func TestIsNilCredentialStore(t *testing.T) {
-	require.True(t, isNilCredentialStore(nil))
-	require.True(t, isNilCredentialStore(MapCredentialStore(nil)))
-
 	var noMap MapCredentialStore
-	require.True(t, isNilCredentialStore(noMap))
-
-	require.False(t, isNilCredentialStore(MapCredentialStore{"AKIA": "x"}))
-	// An empty (but non-nil) map is not considered nil — it is a valid
-	// "no credentials configured, reject all logins" posture; the
-	// wiring layer (main_admin.go) is responsible for refusing that
-	// shape when admin is enabled.
-	require.False(t, isNilCredentialStore(MapCredentialStore{}))
+	cases := []struct {
+		name  string
+		store CredentialStore
+		want  bool
+	}{
+		{"untyped nil", nil, true},
+		{"typed nil map literal", MapCredentialStore(nil), true},
+		{"zero-value MapCredentialStore variable", noMap, true},
+		{"non-empty map", MapCredentialStore{"AKIA": "x"}, false},
+		// An empty (but non-nil) map is not considered nil — it
+		// is a valid "no credentials configured, reject all
+		// logins" posture; the wiring layer (main_admin.go) is
+		// responsible for refusing that shape when admin is
+		// enabled.
+		{"empty non-nil map", MapCredentialStore{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isNilCredentialStore(tc.store))
+		})
+	}
 }

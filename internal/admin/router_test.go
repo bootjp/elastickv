@@ -91,9 +91,11 @@ func TestRouter_StaticTraversalRejected(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	// Requested path cleaned by net/http before reaching us is still
-	// under /admin/ — defence in depth: we reject any ".." segment.
-	require.NotEqual(t, http.StatusOK, rec.Code)
+	// A ".." path segment must resolve to the exact JSON 404 — any
+	// other response (302/400/500) would hide a regression in the
+	// validation path (e.g. the file opening and returning a 500).
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
 }
 
 // Filenames containing ".." as a substring (but not as a path segment)

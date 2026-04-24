@@ -2,6 +2,7 @@ package admin
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"path"
@@ -196,10 +197,7 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 		rt.notFind.ServeHTTP(w, r)
 		return
 	}
-	readSeeker, ok := f.(interface {
-		Read(p []byte) (int, error)
-		Seek(offset int64, whence int) (int64, error)
-	})
+	readSeeker, ok := f.(io.ReadSeeker)
 	if !ok {
 		// embed.FS files implement ReadSeeker, but be defensive.
 		writeJSONError(w, http.StatusInternalServerError, "internal", "asset is not seekable")
@@ -209,12 +207,17 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *Router) serveSPA(w http.ResponseWriter, r *http.Request) {
-	if rt.static == nil {
-		rt.notFind.ServeHTTP(w, r)
-		return
-	}
+	// Reject non-GET/HEAD methods before inspecting rt.static so the
+	// response is uniform across admin binaries whether or not the
+	// SPA bundle happens to be configured. Without this, a POST to
+	// /admin/something returned a JSON 404 with a nil static and a
+	// JSON 405 with a populated static — same URL, different answer.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		return
+	}
+	if rt.static == nil {
+		rt.notFind.ServeHTTP(w, r)
 		return
 	}
 	f, err := rt.static.Open(pathIndexHTML)
@@ -228,10 +231,7 @@ func (rt *Router) serveSPA(w http.ResponseWriter, r *http.Request) {
 		rt.notFind.ServeHTTP(w, r)
 		return
 	}
-	readSeeker, ok := f.(interface {
-		Read(p []byte) (int, error)
-		Seek(offset int64, whence int) (int64, error)
-	})
+	readSeeker, ok := f.(io.ReadSeeker)
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "index.html is not seekable")
 		return

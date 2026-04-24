@@ -6,12 +6,21 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
+)
+
+// Environment variables that the admin listener consults before
+// falling back to the command-line flag values. Exposing secrets via
+// env vars / file paths keeps them out of /proc/<pid>/cmdline.
+const (
+	envAdminSessionSigningKey         = "ELASTICKV_ADMIN_SESSION_SIGNING_KEY"
+	envAdminSessionSigningKeyPrevious = "ELASTICKV_ADMIN_SESSION_SIGNING_KEY_PREVIOUS"
 )
 
 const (
@@ -75,6 +84,14 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		return errors.New("admin listener is enabled but no static credentials are configured;" +
 			" set -s3CredentialsFile to a file with at least one entry,")
 	}
+	primaryKey, err := resolveSigningKey(*adminSessionSigningKey, *adminSessionSigningKeyFile, envAdminSessionSigningKey)
+	if err != nil {
+		return errors.Wrap(err, "resolve -adminSessionSigningKey")
+	}
+	previousKey, err := resolveSigningKey(*adminSessionSigningKeyPrevious, *adminSessionSigningKeyPreviousFile, envAdminSessionSigningKeyPrevious)
+	if err != nil {
+		return errors.Wrap(err, "resolve -adminSessionSigningKeyPrevious")
+	}
 	cfg := adminListenerConfig{
 		enabled:                   *adminEnabled,
 		listen:                    *adminListen,
@@ -82,8 +99,8 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		tlsKeyFile:                *adminTLSKeyFile,
 		allowPlaintextNonLoopback: *adminAllowPlaintextNonLoopback,
 		allowInsecureDevCookie:    *adminAllowInsecureDevCookie,
-		sessionSigningKey:         *adminSessionSigningKey,
-		sessionSigningKeyPrevious: *adminSessionSigningKeyPrevious,
+		sessionSigningKey:         primaryKey,
+		sessionSigningKeyPrevious: previousKey,
 		readOnlyAccessKeys:        parseCSV(*adminReadOnlyAccessKeys),
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
@@ -137,7 +154,7 @@ func startAdminServer(
 	if err != nil {
 		return "", err
 	}
-	httpSrv := newAdminHTTPServer(server, &adminCfg)
+	httpSrv := newAdminHTTPServer(server)
 	listener, err := lc.Listen(ctx, "tcp", adminCfg.Listen)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to listen on admin address %s", adminCfg.Listen)
@@ -204,8 +221,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 	return server, nil
 }
 
-func newAdminHTTPServer(server *admin.Server, adminCfg *admin.Config) *http.Server {
-	_ = adminCfg // reserved for future use (e.g. per-listener TLS overrides)
+func newAdminHTTPServer(server *admin.Server) *http.Server {
 	return &http.Server{
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: adminReadHeaderTimeout,
@@ -290,6 +306,26 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 			Groups:  groups,
 		}, nil
 	})
+}
+
+// resolveSigningKey picks the effective admin signing key from, in
+// priority order: the --*File flag (file contents), the env var, and
+// finally the --*Flag argv value. Preferring the file/env paths keeps
+// the raw base64 out of /proc/<pid>/cmdline on Linux. Returns the empty
+// string when every source is unset — callers that require a value
+// (validated elsewhere) must handle that case themselves.
+func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
+	if strings.TrimSpace(filePath) != "" {
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			return "", errors.Wrapf(err, "read admin signing key file %q", filePath)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
+		return v, nil
+	}
+	return strings.TrimSpace(flagValue), nil
 }
 
 // parseCSV splits a flag value like "a,b,c" into a slice with empty and
