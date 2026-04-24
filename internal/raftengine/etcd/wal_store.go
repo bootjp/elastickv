@@ -117,7 +117,8 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	// different failure mode (the FSM snapshotter has its own
 	// on-disk CRC footer) and wal.Repair does not address it;
 	// running repair in that case would dirty a perfectly-good WAL.
-	snapshot, err := loadPersistedSnapshotWithRepair(logger, walDir, snapDir)
+	snapshotter := snap.New(logger, snapDir)
+	snapshot, err := loadPersistedSnapshotWithRepair(logger, walDir, snapshotter)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +130,6 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if err != nil {
 		return nil, err
 	}
-	snapshotter := snap.New(logger, snapDir)
 
 	storage, err := newMemoryStorage(persistedState{
 		HardState: hardState,
@@ -154,9 +154,10 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 }
 
 // loadPersistedSnapshotWithRepair wraps loadPersistedSnapshot with one
-// wal.Repair attempt on io.ErrUnexpectedEOF.
-func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir, snapDir string) (raftpb.Snapshot, error) {
-	snapshotter := snap.New(logger, snapDir)
+// wal.Repair attempt on io.ErrUnexpectedEOF. The caller passes in a
+// shared snapshotter so loadWalState does not instantiate snap.New
+// twice per open.
+func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
 	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
 	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
 		return snapshot, err
