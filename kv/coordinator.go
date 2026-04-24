@@ -268,10 +268,32 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	// explicit drain.
 	timer := time.NewTimer(dispatchLeaderRetryInterval)
 	defer timer.Stop()
+	// boundedCtx caps every dispatchOnce call by the retry deadline so
+	// that a forward RPC inside redirect (which itself uses
+	// context.WithTimeout(ctx, redirectForwardTimeout)) can never run
+	// past the advertised dispatchLeaderRetryBudget. Without this bound,
+	// a near-expiry iteration could legitimately enter dispatchOnce and
+	// then sit in cli.Forward for the full 5s redirectForwardTimeout —
+	// the wall-clock check between iterations would trip on the next
+	// pass, but the offending call has already exceeded the budget.
+	// context.WithDeadline picks the earlier of the caller's deadline
+	// and ours, so callers with a tighter deadline still get their
+	// own cancellation semantics.
+	boundedCtx, cancelBounded := context.WithDeadline(ctx, deadline)
+	defer cancelBounded()
 	var lastResp *CoordinateResponse
 	var lastErr error
 	for {
-		lastResp, lastErr = c.dispatchOnce(ctx, reqs)
+		lastResp, lastErr = c.dispatchOnce(boundedCtx, reqs)
+		// Caller-supplied ctx cancellation/deadline takes precedence
+		// over any error dispatchOnce returned (which may itself wrap
+		// context.Canceled / context.DeadlineExceeded propagated
+		// through boundedCtx). gRPC clients rely on the wrapped
+		// ctx.Err() to distinguish "I gave up" from "system was
+		// unavailable".
+		if err := ctx.Err(); err != nil {
+			return lastResp, errors.WithStack(err)
+		}
 		if !shouldRetryDispatch(lastErr) {
 			return lastResp, lastErr
 		}
@@ -292,11 +314,11 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			return lastResp, err
 		}
 		// Re-check the deadline AFTER the back-off sleep. If the budget
-		// expired while we slept, do not start another dispatchOnce:
-		// redirect()'s gRPC forward carries a 5s per-call timeout, so a
-		// fresh attempt post-budget could push the total call far past
-		// the advertised dispatchLeaderRetryBudget and break the
-		// bounded-failure contract gRPC clients rely on.
+		// expired while we slept, do not start another dispatchOnce —
+		// boundedCtx would just cancel it immediately, but exiting here
+		// keeps the surfaced error as the last transient leader signal
+		// instead of a context-deadline error from inside the gRPC
+		// stack.
 		if !time.Now().Before(deadline) {
 			return lastResp, lastErr
 		}
