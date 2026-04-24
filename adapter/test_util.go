@@ -27,14 +27,29 @@ import (
 )
 
 const (
-	testEngineTickInterval  = 10 * time.Millisecond
-	testEngineHeartbeatTick = 1
-	testEngineElectionTick  = 10
+	testEngineTickInterval = 10 * time.Millisecond
+	// testEngineHeartbeatTick / testEngineElectionTick preserve etcd/raft's
+	// recommended 10x ratio (ElectionTick = 10 × HeartbeatTick). Previous
+	// values (1 / 10 → 100 ms election timeout) were too tight for `-race`
+	// on CI: CheckQuorum only holds ~100 ms of heartbeat-response history,
+	// so any scheduler pause on a loaded runner drops the leader's view of
+	// quorum, and it steps down with "quorum is not active", bouncing
+	// writes to "etcd raft engine is not leader" / "leader not found" in
+	// the middle of tests like Test_consistency_satisfy_write_after_read_sequence.
+	// 5 / 50 gives a 500 ms election timeout (500-1000 ms randomised) and
+	// a 50 ms heartbeat, absorbing goroutine-scheduler jitter while still
+	// keeping tests fast. Combined with leaseSafetyMargin = 300 ms, this
+	// also yields a non-zero 200 ms LeaseDuration so the lease-read fast
+	// path gets exercised instead of always falling through to ReadIndex.
+	testEngineHeartbeatTick = 5
+	testEngineElectionTick  = 50
 	testEngineMaxSizePerMsg = 1 << 20
 	testEngineMaxInflight   = 256
 
 	// leaderChurnRetryTimeout bounds how long doEventually keeps retrying a
-	// write that fails with "not leader" right after createNode returns.
+	// write that fails with a transient leader-unavailable error. It covers
+	// both startup churn right after createNode returns and mid-test churn
+	// when the leader briefly steps down under CI load.
 	leaderChurnRetryTimeout = 5 * time.Second
 	// leaderChurnRetryInterval is the poll interval between retries.
 	leaderChurnRetryInterval = 50 * time.Millisecond
@@ -519,18 +534,23 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 	return nodes, grpcAdders, redisAdders, peers
 }
 
-// isTransientNotLeaderErr reports whether err is a transient "not leader"
-// error that can happen right after createNode returns if the newly elected
-// leader briefly steps down due to a missed heartbeat quorum (common on slow
-// CI runners under -race). Callers should retry the write in that case.
+// isTransientNotLeaderErr reports whether err is a transient
+// leader-unavailable error that can happen right after createNode returns
+// (freshly-elected leader briefly steps down due to a missed heartbeat
+// quorum) or in the middle of a long-running test when CI load causes the
+// leader to miss quorum momentarily.
 //
-// The match is case-insensitive because Redis protocol error bodies and
-// other layers may capitalise the phrase differently (e.g. "ERR Not Leader").
+// Both "not leader" (ErrNotLeader, etcd/raft step errors) and
+// "leader not found" (ErrLeaderNotFound, emitted while the cluster is
+// re-electing) are treated as retryable. The match is case-insensitive
+// because Redis protocol error bodies and other layers may capitalise the
+// phrase differently (e.g. "ERR Not Leader").
 func isTransientNotLeaderErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "not leader")
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not leader") || strings.Contains(s, "leader not found")
 }
 
 // doEventually retries do() while it returns a transient "not leader" error,
@@ -566,5 +586,66 @@ func lpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key s
 	t.Helper()
 	doEventually(t, func() error {
 		return rdb.LPush(ctx, key, vals...).Err()
+	})
+}
+
+// rawPutEventually wraps RawKV.RawPut in doEventually so transient leader
+// churn (either at startup or in the middle of a long-running loop) does
+// not fail the test with "not leader" / "leader not found".
+func rawPutEventually(t *testing.T, ctx context.Context, c pb.RawKVClient, req *pb.RawPutRequest) {
+	t.Helper()
+	doEventually(t, func() error {
+		_, err := c.RawPut(ctx, req)
+		return err
+	})
+}
+
+// rawGetEventually wraps RawKV.RawGet in doEventually and returns the
+// response only after a successful (non-"not leader") call.
+func rawGetEventually(t *testing.T, ctx context.Context, c pb.RawKVClient, req *pb.RawGetRequest) *pb.RawGetResponse {
+	t.Helper()
+	var resp *pb.RawGetResponse
+	doEventually(t, func() error {
+		r, err := c.RawGet(ctx, req)
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	return resp
+}
+
+// txnPutEventually wraps TransactionalKV.Put in doEventually.
+func txnPutEventually(t *testing.T, ctx context.Context, c pb.TransactionalKVClient, req *pb.PutRequest) {
+	t.Helper()
+	doEventually(t, func() error {
+		_, err := c.Put(ctx, req)
+		return err
+	})
+}
+
+// txnGetEventually wraps TransactionalKV.Get in doEventually and returns the
+// response only after a successful (non-"not leader") call.
+func txnGetEventually(t *testing.T, ctx context.Context, c pb.TransactionalKVClient, req *pb.GetRequest) *pb.GetResponse {
+	t.Helper()
+	var resp *pb.GetResponse
+	doEventually(t, func() error {
+		r, err := c.Get(ctx, req)
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	return resp
+}
+
+// txnDeleteEventually wraps TransactionalKV.Delete in doEventually.
+func txnDeleteEventually(t *testing.T, ctx context.Context, c pb.TransactionalKVClient, req *pb.DeleteRequest) {
+	t.Helper()
+	doEventually(t, func() error {
+		_, err := c.Delete(ctx, req)
+		return err
 	})
 }
