@@ -46,10 +46,10 @@ func TestRedisMetrics_MissingKeyNotCountedAsError(t *testing.T) {
 	t.Run("missing-key commands report outcome=success", func(t *testing.T) {
 		// Warm the client so that any connection-setup traffic
 		// go-redis issues (HELLO, CLIENT ID, CLIENT SETINFO, ...)
-		// lands BEFORE the baseline snapshot below. elastickv answers
-		// some of those with an ERR reply (HELLO is unimplemented,
-		// CLIENT ID is unsupported), and those errors are unrelated
-		// to the missing-key semantics being exercised here.
+		// lands BEFORE the baseline snapshot below. Even though HELLO
+		// and CLIENT ID / SETINFO are now supported and reply
+		// successfully, any stray observations must still not
+		// contaminate the missing-key-specific counters below.
 		require.NoError(t, rdb.Ping(ctx).Err())
 
 		errorsBefore := countErrorMetrics(t, registry)

@@ -2,8 +2,8 @@ package kv
 
 import (
 	"context"
-	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -71,14 +71,14 @@ func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView
 // Safety mirrors Coordinator.LeaseRead (see engineLeaseAckValid):
 // the returned AppliedIndex is only served when the local node is
 // Leader AND LastQuorumAck is within LeaseDuration of a single
-// time.Now() sample.
+// monoclock.Now() sample (CLOCK_MONOTONIC_RAW).
 func leaseReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {
 	if engine == nil {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
 		if leaseDur := lp.LeaseDuration(); leaseDur > 0 {
-			now := time.Now()
+			now := monoclock.Now()
 			if engineLeaseAckValid(engine.State(), lp.LastQuorumAck(), now, leaseDur) {
 				return lp.AppliedIndex(), nil
 			}

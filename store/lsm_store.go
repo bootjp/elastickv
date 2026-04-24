@@ -63,8 +63,10 @@ const (
 	// avoid a magic-number lint violation on the shift amount.
 	mebibyteShift = 20
 
-	// fsmSyncModeEnv selects the Pebble WriteOptions used on the FSM
-	// commit path (ApplyMutations, DeletePrefixAt). Values:
+	// fsmSyncModeEnv selects the Pebble WriteOptions used on the
+	// raft-apply FSM commit path (ApplyMutationsRaft / DeletePrefixAtRaft).
+	// Direct (non-raft) callers of ApplyMutations / DeletePrefixAt are
+	// unaffected by this knob and always use pebble.Sync. Values:
 	//
 	//   "sync"    (default) — b.Commit(pebble.Sync); every committed raft
 	//                         entry triggers an fsync on the Pebble WAL.
@@ -171,11 +173,13 @@ type pebbleStore struct {
 	// WriteConflictCollector; not part of the authoritative OCC path.
 	writeConflicts *writeConflictCounter
 	// fsmApplyWriteOpts is the Pebble WriteOptions value applied on the
-	// FSM commit path (ApplyMutations, DeletePrefixAt). Resolved once
-	// from ELASTICKV_FSM_SYNC_MODE in NewPebbleStore and then treated
-	// as read-only for the store's lifetime. The default is pebble.Sync;
-	// operators may opt into pebble.NoSync when the raft WAL's
-	// durability is considered sufficient.
+	// raft-apply FSM commit path (ApplyMutationsRaft / DeletePrefixAtRaft).
+	// Resolved once from ELASTICKV_FSM_SYNC_MODE in NewPebbleStore and
+	// then treated as read-only for the store's lifetime. The default is
+	// pebble.Sync; operators may opt into pebble.NoSync when the raft
+	// WAL's durability is considered sufficient. Direct (non-raft)
+	// callers of ApplyMutations / DeletePrefixAt use pebble.Sync
+	// unconditionally and are never affected by this field.
 	fsmApplyWriteOpts *pebble.WriteOptions
 	// fsmApplySyncModeLabel is the human-readable label corresponding
 	// to fsmApplyWriteOpts ("sync" or "nosync"). Kept alongside the
@@ -1084,7 +1088,46 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 	return nil
 }
 
+// directApplyWriteOpts returns the Pebble WriteOptions used by the
+// direct (non-raft) commit path. Always pebble.Sync: direct callers do
+// not have raft-log replay as a durability backstop, so they must not
+// be affected by ELASTICKV_FSM_SYNC_MODE=nosync.
+//
+// Exposed so tests can assert the non-raft path is always Sync even
+// when the FSM-apply path has been reconfigured to NoSync.
+func (s *pebbleStore) directApplyWriteOpts() *pebble.WriteOptions {
+	return pebble.Sync
+}
+
+// raftApplyWriteOpts returns the Pebble WriteOptions used by the
+// raft-apply commit path, as configured by ELASTICKV_FSM_SYNC_MODE.
+func (s *pebbleStore) raftApplyWriteOpts() *pebble.WriteOptions {
+	return s.fsmApplyWriteOpts
+}
+
+// ApplyMutations is the direct (non-raft) commit path. It unconditionally
+// uses pebble.Sync so that callers without raft-log replay as a durability
+// backstop (catalog bootstrap, admin snapshots, migrations, tests) are never
+// affected by ELASTICKV_FSM_SYNC_MODE=nosync.
 func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts())
+}
+
+// ApplyMutationsRaft is the raft-apply commit path. Durability is governed
+// by ELASTICKV_FSM_SYNC_MODE (s.fsmApplyWriteOpts, default pebble.Sync):
+// operators may opt into pebble.NoSync when the raft WAL's fsync is
+// considered the authoritative durability boundary. On crash, raft-log
+// replay from the last FSM snapshot re-applies any entries lost from
+// Pebble's un-fsynced WAL tail.
+//
+// Must only be called from inside the FSM apply loop. All other call sites
+// must use ApplyMutations so a nosync opt-in cannot silently drop
+// acknowledged writes that have no raft backstop.
+func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts())
+}
+
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1120,11 +1163,7 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 		s.mtx.Unlock()
 		return err
 	}
-	// s.fsmApplyWriteOpts is Sync by default. Operators may opt in to NoSync
-	// via ELASTICKV_FSM_SYNC_MODE=nosync when the raft WAL's durability is
-	// considered sufficient (raft-log replay from the last FSM snapshot
-	// re-applies any entries lost from Pebble after a crash).
-	if err := b.Commit(s.fsmApplyWriteOpts); err != nil {
+	if err := b.Commit(writeOpts); err != nil {
 		s.mtx.Unlock()
 		return errors.WithStack(err)
 	}
@@ -1138,7 +1177,23 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 // tombstone versions at commitTS. An empty prefix deletes all keys. Keys
 // matching excludePrefix are preserved. Uses an iterator-based approach that
 // avoids loading values into caller memory.
+//
+// Like ApplyMutations, this direct-commit entry point unconditionally uses
+// pebble.Sync so non-raft callers are never affected by
+// ELASTICKV_FSM_SYNC_MODE=nosync. Raft-apply callers must use
+// DeletePrefixAtRaft instead.
 func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts())
+}
+
+// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt. Durability
+// is governed by s.fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE). See
+// ApplyMutationsRaft for the full durability argument.
+func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts())
+}
+
+func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1176,9 +1231,7 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 	if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
 		return err
 	}
-	// See ApplyMutations for the durability argument behind
-	// s.fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE).
-	if err := batch.Commit(s.fsmApplyWriteOpts); err != nil {
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	s.updateLastCommitTS(newLastTS)
