@@ -97,6 +97,33 @@ func TestRouter_StaticTraversalRejected(t *testing.T) {
 	require.NotEqual(t, http.StatusOK, rec.Code)
 }
 
+// Filenames containing ".." as a substring (but not as a path segment)
+// are legitimate — the guard must not reject `app..js`.
+func TestRouter_StaticSubstringDotDotAllowed(t *testing.T) {
+	fs := fstest.MapFS{
+		"index.html":     {Data: []byte("<!doctype html>")},
+		"assets/app..js": {Data: []byte("console.log('double-dot');")},
+	}
+	r := NewRouter(nil, fs)
+	req := httptest.NewRequest(http.MethodGet, "/admin/assets/app..js", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "double-dot")
+}
+
+// A client-supplied double slash must resolve to a JSON 404, not a 500.
+func TestRouter_StaticDoubleSlashReturnsJSON404(t *testing.T) {
+	r := NewRouter(nil, newTestStatic())
+	req := httptest.NewRequest(http.MethodGet, "/admin/assets//app.js", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+}
+
 func TestRouter_SPAFallbackServesIndex(t *testing.T) {
 	r := NewRouter(nil, newTestStatic())
 	for _, p := range []string{"/admin", "/admin/", "/admin/dynamo", "/admin/s3/bucket-42"} {

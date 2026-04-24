@@ -122,7 +122,14 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	// Drop /admin/assets/ prefix → relative path under pathRootAssetsDir.
 	rel := strings.TrimPrefix(r.URL.Path, pathPrefixAssets)
-	if rel == "" || strings.Contains(rel, "..") {
+	// Defence against traversal and malformed paths: require the
+	// already-normalised form that fs.ValidPath enforces (no
+	// ".." segments, no "//" segments, no leading "/"). Anything
+	// that does not pass validation resolves to a 404 JSON rather
+	// than risking a 500 from the underlying fs.FS — legitimate
+	// filenames containing ".." as a substring (e.g. "app..js")
+	// still pass because ValidPath checks segments, not substrings.
+	if rel == "" || !fs.ValidPath(rel) {
 		rt.notFind.ServeHTTP(w, r)
 		return
 	}

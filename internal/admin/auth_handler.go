@@ -301,9 +301,15 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to mint csrf token")
 		return
 	}
-	// Use the same clock the signer used so the response's
-	// expires_at cannot drift from the JWT's exp claim; injected
-	// test clocks therefore produce deterministic outputs too.
+	// Compute the response expiry from the AuthService clock plus
+	// the configured session TTL. Injected test clocks therefore
+	// produce deterministic values, and in practice callers (main
+	// and NewServer) pass the same clock to both the Signer and
+	// the AuthService, so the response's expires_at matches the
+	// JWT exp claim. We do not cross-check against the signer's
+	// clock here because Signer does not expose it; if a future
+	// caller wires them independently, expires_at may drift by up
+	// to the delta between the two clocks.
 	expires := s.clock().UTC().Add(s.sessionTTL)
 	http.SetCookie(w, s.buildCookie(sessionCookieName, token, true))
 	http.SetCookie(w, s.buildCookie(csrfCookieName, csrf, false))

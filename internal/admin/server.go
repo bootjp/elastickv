@@ -68,6 +68,13 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	if deps.Credentials == nil {
 		return nil, errMissing("Credentials")
 	}
+	if deps.Roles == nil {
+		// A nil role index would silently 403 every login. Treat it
+		// as a wiring bug rather than a valid "admin is locked down"
+		// state: operators who really want zero admin access can
+		// set admin.enabled=false or pass an empty (non-nil) map.
+		return nil, errMissing("Roles")
+	}
 	if deps.ClusterInfo == nil {
 		return nil, errMissing("ClusterInfo")
 	}
@@ -122,12 +129,18 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
-	// The protected chain: body limit → session auth → CSRF → audit.
+	// The protected chain: body limit → session auth → audit → CSRF.
+	// Audit is deliberately placed before CSRF so that CSRF-rejected
+	// protected requests are still written to the audit log — the
+	// actor is already known at that point because SessionAuth ran.
+	// If CSRF were wrapped inside Audit, every csrf_missing /
+	// csrf_mismatch rejection would silently escape auditing, which
+	// is exactly the attack trace operators want to see.
 	protect := func(next http.Handler) http.Handler {
 		return BodyLimit(defaultBodyLimit)(
 			SessionAuth(verifier)(
-				CSRFDoubleSubmit()(
-					Audit(logger)(next),
+				Audit(logger)(
+					CSRFDoubleSubmit()(next),
 				),
 			),
 		)
