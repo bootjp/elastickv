@@ -451,6 +451,91 @@ func TestSQSServer_LongPollTimesOutOnEmptyQueue(t *testing.T) {
 	}
 }
 
+func TestSQSServer_SendFIFOValidation(t *testing.T) {
+	t.Parallel()
+	// FIFO queues require MessageGroupId, and without
+	// ContentBasedDeduplication they also require
+	// MessageDeduplicationId. Standard queues must reject both fields.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	// FIFO queue, ContentBasedDeduplication=false (default).
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "fifo-send.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	fifoURL, _ := out["QueueUrl"].(string)
+
+	// Missing MessageGroupId must fail.
+	status, body := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":    fifoURL,
+		"MessageBody": "x",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("FIFO send without group: got %d want 400 (%v)", status, body)
+	}
+	if body["__type"] != sqsErrMissingParameter {
+		t.Fatalf("error type: %q want %q", body["__type"], sqsErrMissingParameter)
+	}
+
+	// MessageGroupId but no dedup id (and no content-based dedup)
+	// must also fail.
+	status, body = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":       fifoURL,
+		"MessageBody":    "x",
+		"MessageGroupId": "g1",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("FIFO send without dedup: got %d (%v)", status, body)
+	}
+
+	// Both fields present → success.
+	status, body = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":               fifoURL,
+		"MessageBody":            "x",
+		"MessageGroupId":         "g1",
+		"MessageDeduplicationId": "d1",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("valid FIFO send: got %d (%v)", status, body)
+	}
+
+	// Standard queue rejects FIFO-only fields.
+	stdURL := createSQSQueueForTest(t, node, "std-send")
+	status, body = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":       stdURL,
+		"MessageBody":    "x",
+		"MessageGroupId": "g1",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("Standard send with MessageGroupId: got %d (%v)", status, body)
+	}
+	if body["__type"] != sqsErrInvalidAttributeValue {
+		t.Fatalf("error type: %q want %q", body["__type"], sqsErrInvalidAttributeValue)
+	}
+}
+
+func TestSQSServer_CreateQueueRequiresExplicitFifoFlag(t *testing.T) {
+	t.Parallel()
+	// AWS requires FifoQueue=true to be explicitly set to create a
+	// FIFO queue. A .fifo-suffixed name without the attribute must
+	// fail, not silently create a FIFO queue.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "implicit-fifo.fifo",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf(".fifo name without FifoQueue=true: got %d (%v)", status, out)
+	}
+	if out["__type"] != sqsErrValidation {
+		t.Fatalf("error type: %q want %q", out["__type"], sqsErrValidation)
+	}
+}
+
 func TestSQSServer_ReceiptHandleCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

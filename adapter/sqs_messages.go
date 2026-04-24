@@ -67,18 +67,20 @@ const (
 // (VisibleAtMillis, CurrentReceiptToken, ReceiveCount) lives here rather
 // than in a side-record so a single OCC transaction can rotate it.
 type sqsMessageRecord struct {
-	MessageID           string            `json:"message_id"`
-	Body                []byte            `json:"body"`
-	MD5OfBody           string            `json:"md5_of_body"`
-	MessageAttributes   map[string]string `json:"message_attributes,omitempty"`
-	SenderID            string            `json:"sender_id,omitempty"`
-	SendTimestampMillis int64             `json:"send_timestamp_millis"`
-	AvailableAtMillis   int64             `json:"available_at_millis"`
-	VisibleAtMillis     int64             `json:"visible_at_millis"`
-	ReceiveCount        int64             `json:"receive_count"`
-	FirstReceiveMillis  int64             `json:"first_receive_millis,omitempty"`
-	CurrentReceiptToken []byte            `json:"current_receipt_token"`
-	QueueGeneration     uint64            `json:"queue_generation"`
+	MessageID              string            `json:"message_id"`
+	Body                   []byte            `json:"body"`
+	MD5OfBody              string            `json:"md5_of_body"`
+	MessageAttributes      map[string]string `json:"message_attributes,omitempty"`
+	SenderID               string            `json:"sender_id,omitempty"`
+	SendTimestampMillis    int64             `json:"send_timestamp_millis"`
+	AvailableAtMillis      int64             `json:"available_at_millis"`
+	VisibleAtMillis        int64             `json:"visible_at_millis"`
+	ReceiveCount           int64             `json:"receive_count"`
+	FirstReceiveMillis     int64             `json:"first_receive_millis,omitempty"`
+	CurrentReceiptToken    []byte            `json:"current_receipt_token"`
+	QueueGeneration        uint64            `json:"queue_generation"`
+	MessageGroupId         string            `json:"message_group_id,omitempty"`
+	MessageDeduplicationId string            `json:"message_deduplication_id,omitempty"`
 }
 
 var storedSQSMsgPrefix = []byte{0x00, 'S', 'M', 0x01}
@@ -241,10 +243,12 @@ func decodeReceiptHandle(raw string) (*decodedReceiptHandle, error) {
 // ------------------------ input decoding ------------------------
 
 type sqsSendMessageInput struct {
-	QueueUrl          string            `json:"QueueUrl"`
-	MessageBody       string            `json:"MessageBody"`
-	DelaySeconds      *int64            `json:"DelaySeconds,omitempty"`
-	MessageAttributes map[string]string `json:"MessageAttributes,omitempty"`
+	QueueUrl               string            `json:"QueueUrl"`
+	MessageBody            string            `json:"MessageBody"`
+	DelaySeconds           *int64            `json:"DelaySeconds,omitempty"`
+	MessageAttributes      map[string]string `json:"MessageAttributes,omitempty"`
+	MessageGroupId         string            `json:"MessageGroupId,omitempty"`
+	MessageDeduplicationId string            `json:"MessageDeduplicationId,omitempty"`
 }
 
 type sqsReceiveMessageInput struct {
@@ -280,6 +284,10 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	meta, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
+		writeSQSErrorFromErr(w, apiErr)
+		return
+	}
+	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
 		return
 	}
@@ -330,6 +338,47 @@ func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, 
 	return meta, nil
 }
 
+// validateSendFIFOParams enforces the AWS-compatible rules around
+// MessageGroupId and MessageDeduplicationId:
+//
+//   - FIFO queues REQUIRE MessageGroupId on every send.
+//   - FIFO queues without ContentBasedDeduplication REQUIRE
+//     MessageDeduplicationId as well.
+//   - Standard queues REJECT both fields — accepting them silently
+//     would let misbehaving clients think they are getting FIFO
+//     semantics.
+//   - FIFO queues REJECT per-message DelaySeconds (already handled in
+//     resolveSendDelay below, but we also short-circuit it here so the
+//     error ordering matches AWS).
+//
+// Note: Milestone 1 does not yet enforce the per-group ordering /
+// dedup invariants — the queue type gate is still useful so clients
+// get the right AWS error shape, and the persisted MessageGroupId /
+// MessageDeduplicationId fields are there for Milestone 2's group-
+// lock implementation.
+func validateSendFIFOParams(meta *sqsQueueMeta, in sqsSendMessageInput) error {
+	if meta.IsFIFO {
+		if in.MessageGroupId == "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "FIFO queue requires MessageGroupId")
+		}
+		if !meta.ContentBasedDedup && in.MessageDeduplicationId == "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "FIFO queue without ContentBasedDeduplication requires MessageDeduplicationId")
+		}
+		if in.DelaySeconds != nil {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "FIFO queue does not accept per-message DelaySeconds")
+		}
+		return nil
+	}
+	// Standard queue: both FIFO-only fields must be empty.
+	if in.MessageGroupId != "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "MessageGroupId is only valid on FIFO queues")
+	}
+	if in.MessageDeduplicationId != "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "MessageDeduplicationId is only valid on FIFO queues")
+	}
+	return nil
+}
+
 func resolveSendDelay(meta *sqsQueueMeta, requested *int64) (int64, error) {
 	delay := meta.DelaySeconds
 	if requested == nil {
@@ -354,15 +403,17 @@ func buildSendRecord(meta *sqsQueueMeta, in sqsSendMessageInput, delay int64) (*
 	availableAt := now + delay*sqsMillisPerSecond
 	body := []byte(in.MessageBody)
 	rec := &sqsMessageRecord{
-		MessageID:           messageID,
-		Body:                body,
-		MD5OfBody:           sqsMD5Hex(body),
-		MessageAttributes:   in.MessageAttributes,
-		SendTimestampMillis: now,
-		AvailableAtMillis:   availableAt,
-		VisibleAtMillis:     availableAt,
-		CurrentReceiptToken: token,
-		QueueGeneration:     meta.Generation,
+		MessageID:              messageID,
+		Body:                   body,
+		MD5OfBody:              sqsMD5Hex(body),
+		MessageAttributes:      in.MessageAttributes,
+		SendTimestampMillis:    now,
+		AvailableAtMillis:      availableAt,
+		VisibleAtMillis:        availableAt,
+		CurrentReceiptToken:    token,
+		QueueGeneration:        meta.Generation,
+		MessageGroupId:         in.MessageGroupId,
+		MessageDeduplicationId: in.MessageDeduplicationId,
 	}
 	recordBytes, err := encodeSQSMessageRecord(rec)
 	if err != nil {
@@ -415,7 +466,11 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	waitSeconds := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
 
-	delivered := s.longPollReceive(ctx, queueName, meta.Generation, max, visibilityTimeout, waitSeconds)
+	delivered, err := s.longPollReceive(ctx, queueName, meta.Generation, max, visibilityTimeout, waitSeconds)
+	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
 }
 
@@ -446,10 +501,17 @@ func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) int64 {
 // than the commit-stream notifier described in §7.3 of the design; the
 // poll interval is short enough (200 ms) to mask the difference for
 // typical client-side WaitTimeSeconds values.
-func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout, waitSeconds int64) []map[string]any {
-	delivered := s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+//
+// Scan errors are propagated to the caller so a backend / routing
+// failure surfaces as an actionable 5xx instead of a silent empty 200
+// that would stall consumers.
+func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout, waitSeconds int64) ([]map[string]any, error) {
+	delivered, err := s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+	if err != nil {
+		return nil, err
+	}
 	if len(delivered) > 0 || waitSeconds <= 0 {
-		return delivered
+		return delivered, nil
 	}
 	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
 	ticker := time.NewTicker(sqsLongPollInterval)
@@ -457,29 +519,34 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen u
 	for {
 		select {
 		case <-ctx.Done():
-			return delivered
+			return delivered, nil
 		case <-ticker.C:
 		}
 		if time.Now().After(deadline) {
-			return delivered
+			return delivered, nil
 		}
-		delivered = s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+		delivered, err = s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+		if err != nil {
+			return nil, err
+		}
 		if len(delivered) > 0 {
-			return delivered
+			return delivered, nil
 		}
 	}
 }
 
 // scanAndDeliverOnce is the single-pass scan+rotate the long-poll loop
 // re-runs. Each pass takes its own snapshot so the OCC StartTS tracks
-// the most recent visible_at for the candidates it picked.
-func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout int64) []map[string]any {
+// the most recent visible_at for the candidates it picked. Scan errors
+// are returned so the caller can fail the receive with an actionable
+// status code instead of serializing them as empty success.
+func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout int64) ([]map[string]any, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, gen, max*sqsReceiveScanOverfetchFactor, readTS)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS)
+	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS), nil
 }
 
 func clampReceiveMaxMessages(requested int) int {
