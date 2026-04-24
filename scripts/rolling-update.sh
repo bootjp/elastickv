@@ -916,7 +916,13 @@ merge_extra_env() {
   local -a default_pairs=()
   local pair key seen=" " merged=""
 
-  read -r -a user_pairs <<< "$user"
+  # Guard the here-strings: on Bash 3.2 (macOS default) `read` on an
+  # empty here-string returns non-zero, which trips `set -e`. Skip the
+  # read when the source string is empty — the empty array is the
+  # intended result either way.
+  if [[ -n "$user" ]]; then
+    read -r -a user_pairs <<< "$user"
+  fi
   for pair in "${user_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
     [[ "$pair" == *=* ]] || continue
@@ -924,7 +930,9 @@ merge_extra_env() {
     seen+="${key} "
   done
 
-  read -r -a default_pairs <<< "$defaults"
+  if [[ -n "$defaults" ]]; then
+    read -r -a default_pairs <<< "$defaults"
+  fi
   for pair in "${default_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
     [[ "$pair" == *=* ]] || continue
