@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -115,15 +116,9 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		return nil, err
 	}
 
-	w, err := wal.Open(logger, walDir, walSnapshotFor(snapshot))
+	w, hardState, entries, err := openAndReadWAL(logger, walDir, walSnapshotFor(snapshot))
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	_, hardState, entries, err := w.ReadAll()
-	if err != nil {
-		_ = w.Close()
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
 	storage, err := newMemoryStorage(persistedState{
@@ -141,6 +136,40 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		Persist:   etcdstorage.NewStorage(logger, w, snapshotter),
 		LocalSnap: snapshot,
 	}, nil
+}
+
+// openAndReadWAL opens the WAL at walDir and returns its hard state and
+// entries. On io.ErrUnexpectedEOF from ReadAll — which happens when the
+// kernel OOM-killer SIGKILLs the process mid-WAL-write, leaving the last
+// preallocated segment with a partial trailing record — it invokes
+// wal.Repair to truncate the partial record and retries the open once.
+// This is the same recovery path etcd's own server uses on boot. CRC
+// mismatches and other errors propagate unchanged: those are real
+// corruption, not in-flight-write truncation.
+func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	repaired := false
+	for {
+		w, err := wal.Open(logger, walDir, walSnap)
+		if err != nil {
+			return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+		}
+		_, hardState, entries, err := w.ReadAll()
+		if err == nil {
+			return w, hardState, entries, nil
+		}
+		_ = w.Close()
+		if repaired || !errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+		}
+		logger.Warn("WAL tail truncated, repairing",
+			zap.String("dir", walDir),
+			zap.Error(err),
+		)
+		if !wal.Repair(logger, walDir) {
+			return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable")
+		}
+		repaired = true
+	}
 }
 
 func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {

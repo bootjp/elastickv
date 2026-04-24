@@ -1,6 +1,10 @@
 package etcd
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -127,4 +131,143 @@ func TestRestoreSnapshotStateTokenFileNotFound(t *testing.T) {
 	err := restoreSnapshotState(fsm, snap, dir)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 	require.Nil(t, fsm.restored)
+}
+
+// --- openAndReadWAL / WAL auto-repair tests ---
+//
+// These tests cover the OOM-SIGKILL → partial-trailing-record scenario:
+// the kernel kills the process mid-WAL-write, leaving the last
+// preallocated WAL segment with a torn trailing record. On restart,
+// wal.ReadAll returns io.ErrUnexpectedEOF. openAndReadWAL should invoke
+// wal.Repair to truncate the partial record and retry once. CRC
+// mismatches (real corruption, not torn writes) must propagate.
+
+// seedWAL bootstraps a fresh raft WAL with a few proposals, closes it
+// cleanly, and returns the data dir.
+func seedWAL(t *testing.T, proposals [][]byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:0",
+		DataDir:      dir,
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	for _, p := range proposals {
+		_, err := engine.Propose(context.Background(), p)
+		require.NoError(t, err)
+	}
+	require.NoError(t, engine.Close())
+	return dir
+}
+
+// lastWALFile returns the path of the lexicographically-last .wal in dir.
+// etcd WAL filenames are seq-index padded, so lexicographic order matches
+// sequence order.
+func lastWALFile(t *testing.T, walDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(walDir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".wal" {
+			names = append(names, e.Name())
+		}
+	}
+	require.NotEmpty(t, names, "no .wal files in %s", walDir)
+	sort.Strings(names)
+	return filepath.Join(walDir, names[len(names)-1])
+}
+
+func TestLoadWalStateRepairsTruncatedTail(t *testing.T) {
+	// Simulates the 2026-04-24 incident: OOM-SIGKILL mid-WAL-write left
+	// the last segment with a torn trailing record. Before this fix the
+	// process could not restart; now openAndReadWAL invokes wal.Repair
+	// to truncate the partial record and continues.
+	dir := seedWAL(t, [][]byte{[]byte("one"), []byte("two"), []byte("three")})
+
+	// Chop bytes off the tail to simulate a mid-record SIGKILL. etcd
+	// preallocates 64MiB per WAL with zero padding; truncating inside
+	// the padded tail still leaves valid earlier records intact. We
+	// truncate past the zero padding and into actual framing so
+	// ReadAll surfaces io.ErrUnexpectedEOF rather than silently
+	// stopping at the zero frame.
+	walPath := lastWALFile(t, filepath.Join(dir, walDirName))
+	info, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.NoError(t, os.Truncate(walPath, info.Size()-(64*1024+16)))
+
+	// Re-open: loadWalState → openAndReadWAL → repair → succeed.
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:0",
+		DataDir:      dir,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+	// Entries committed before the torn write must survive.
+	require.GreaterOrEqual(t, len(fsm.Applied()), 1,
+		"repair should preserve entries committed before the torn write")
+}
+
+func TestLoadWalStateUnrepairableCRCMismatchReturnsError(t *testing.T) {
+	// wal.Repair only fixes io.ErrUnexpectedEOF (torn trailing record).
+	// A flipped byte inside a persisted record surfaces as a CRC
+	// mismatch, which is genuine corruption — repair cannot help and
+	// the error must propagate rather than silently masking it.
+	dir := seedWAL(t, [][]byte{[]byte("one"), []byte("two"), []byte("three")})
+
+	walPath := lastWALFile(t, filepath.Join(dir, walDirName))
+	f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	// Flip a byte ~200 bytes in — past the file header but inside a
+	// real record. etcd WAL preallocates zeroes, so we need to land
+	// in content not padding.
+	var one [1]byte
+	_, err = f.ReadAt(one[:], 200)
+	require.NoError(t, err)
+	one[0] ^= 0xff
+	_, err = f.WriteAt(one[:], 200)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	fsm := &testStateMachine{}
+	_, err = Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:0",
+		DataDir:      dir,
+		StateMachine: fsm,
+	})
+	require.Error(t, err, "CRC mismatch is not repairable; error must surface")
+}
+
+func TestOpenAndReadWALSucceedsWithoutRepair(t *testing.T) {
+	// Happy-path sanity check: a pristine WAL opens and ReadAll returns
+	// the expected entries, no repair invoked.
+	dir := seedWAL(t, [][]byte{[]byte("one"), []byte("two")})
+
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:0",
+		DataDir:      dir,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+	require.Equal(t,
+		[][]byte{[]byte("one"), []byte("two")},
+		fsm.Applied(),
+	)
 }
