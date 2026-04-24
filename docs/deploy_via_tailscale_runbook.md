@@ -70,10 +70,23 @@ Copy the client ID and secret; they go into GitHub in the next step.
 Repo → Settings → Environments → New environment: `production`.
 
 ### Required reviewers
-Configure "Required reviewers" on the environment. Non-dry-run deploys will
-pause until one of the reviewers approves. Configure "Deployment protection
-rules" to auto-approve if the workflow input `dry_run == true` (optional; cuts
-friction for previews).
+Configure "Required reviewers" on the environment. **Every run that targets
+this environment pauses for approval** — including dry-runs, because
+GitHub's native environment-protection rules cannot be made conditional on
+workflow inputs. Three ways to handle the dry-run-approval friction:
+
+1. **Accept the prompt for dry-runs too.** A dry-run requires one approver
+   click before it proceeds; still cheap and keeps the policy simple.
+2. **Add a second environment `production-dry-run` without required
+   reviewers** and change the workflow to pick the environment via
+   `environment: ${{ inputs.dry_run && 'production-dry-run' || 'production' }}`.
+   Cleanest but doubles the secrets/vars you must keep in sync.
+3. **Install a deployment-protection-rule GitHub App** (custom or
+   marketplace) that approves runs whose inputs show `dry_run == true`.
+   Most flexible; most setup.
+
+v1 ships with approach 1 (single environment, prompt on every run).
+Approach 2 is the recommended upgrade once the friction becomes annoying.
 
 ### Environment secrets
 
@@ -93,8 +106,8 @@ Regenerate on operator rotation.
 |------|-------|---------|
 | `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
-| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). The workflow renders this into the script's `NODES` env var. | `n1=kv01,n2=kv02,n3=kv03,n4=kv04,n5=kv05` |
-| `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow renders this into the script's `NODES` env var. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
+| `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 
 **Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
 in the `production` environment to keep the GitHub-side names
@@ -128,6 +141,32 @@ Recommended first-run sequence:
 
 Re-run the workflow with `image_tag` set to the previous-known-good sha. The
 `nodes` input can target specific nodes if only some carry the bad image.
+
+### If a running workflow is cancelled mid-rollout
+
+GitHub cancelling the job between node steps is the one operational
+hazard that needs manual cleanup.
+
+1. **Look at the last log line from the `Roll cluster` step.** The script
+   logs `[rolling-update] rolling n<id>: docker stop/rm/run ...` before
+   each node recreate. Whatever `n<id>` appears last is the one in
+   flight when the cancel signal landed.
+2. **SSH into that node** over Tailscale and run `docker ps`. If the
+   container is absent or `Exited`, finish the recreate by hand with the
+   docker run arguments the script emitted (which you can see in the
+   workflow log, step `Roll cluster`).
+3. **Confirm the new leader via `raftadmin` or metrics** before re-running
+   the workflow with `nodes:` scoped to the remaining untouched IDs. Do
+   NOT re-run the full rollout if the partial one is still in flight —
+   it will stop the same node you are trying to recover.
+4. **File a ticket** with the log excerpt so we can eventually teach the
+   workflow to set a start-marker on each node and fast-skip completed
+   nodes on re-run.
+
+The script is idempotent for the "container exists and is up" case, so
+re-running the workflow with the same `ref` after confirming the
+interrupted node is healthy is safe — the script will stop+recreate
+each node in turn regardless of whether it was touched before.
 
 ## 7. What the workflow does NOT do (yet)
 

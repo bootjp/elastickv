@@ -111,15 +111,37 @@ jobs:
           fi
           if [[ -n "$NODES_FILTER" ]]; then
             # Filter NODES_RAFT_MAP and SSH_TARGETS_MAP to the requested subset.
+            # Reject any filter ID that does not appear in the map: silently
+            # dropping unknown IDs would let a typo like "n1,n9" proceed as
+            # a one-node rollout of n1 alone, which is a staged-deploy
+            # footgun.
+            IFS=',' read -r -a wanted <<< "$NODES_FILTER"
+            IFS=',' read -r -a entries <<< "$NODES_RAFT_MAP"
+            declare -a known_ids=()
+            for e in "${entries[@]}"; do
+              known_ids+=("${e%%=*}")
+            done
+            unknown=""
+            for w in "${wanted[@]}"; do
+              found=0
+              for k in "${known_ids[@]}"; do
+                if [[ "$k" == "$w" ]]; then found=1; break; fi
+              done
+              if [[ $found -eq 0 ]]; then unknown+="${unknown:+, }$w"; fi
+            done
+            if [[ -n "$unknown" ]]; then
+              echo "::error::nodes filter '$NODES_FILTER' references unknown raft IDs: $unknown. Known IDs: ${known_ids[*]}"
+              exit 1
+            fi
             filter_csv() {
               local all="$1"
               local filter="$2"
               local out=""
-              IFS=',' read -r -a entries <<< "$all"
-              IFS=',' read -r -a wanted <<< "$filter"
-              for e in "${entries[@]}"; do
+              IFS=',' read -r -a list_entries <<< "$all"
+              IFS=',' read -r -a list_wanted <<< "$filter"
+              for e in "${list_entries[@]}"; do
                 key="${e%%=*}"
-                for w in "${wanted[@]}"; do
+                for w in "${list_wanted[@]}"; do
                   if [[ "$key" == "$w" ]]; then
                     out+="${e},"
                     break
