@@ -890,7 +890,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Pebble's own estimate of outstanding compaction work per node, in bytes. Growing unboundedly means compaction is losing the race. Thresholds: green <100 MiB, yellow 100-500 MiB, red >=500 MiB. Upper bound is context-dependent so no stall-line is drawn on the trend.",
+      "description": "Pebble estimate of outstanding compaction work per node, summed across all raft groups on that node, in bytes. `sum by (node_id)` — not `max` — because each group keeps its own compaction queue and real node-level backlog is the sum; `max` would drop all but the busiest group and under-report compaction pressure on nodes hosting more than one group. Growing unboundedly means compaction is losing the race. Thresholds: green <100 MiB, yellow 100-500 MiB, red >=500 MiB. Upper bound is context-dependent so no stall-line is drawn on the trend.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -940,7 +940,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "refId": "A",
           "instant": true
@@ -951,7 +951,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Compaction debt trend per node. Compare against the Compaction Rate panel: healthy engines oscillate; a monotonically rising line is the ingest-vs-compaction gap.",
+      "description": "Compaction debt trend per node, summed across all raft groups (matching the paired stat panel). Compare against the Compaction Rate panel: healthy engines oscillate; a monotonically rising line is the ingest-vs-compaction gap.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -989,7 +989,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1000,7 +1000,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Current number of compactions running per node. Should sit near the configured max concurrent compactions when there is work to do; a flat-zero reading while debt climbs means compactions are being blocked (for example, by a flush pipeline stall).",
+      "description": "Current number of compactions running per node, summed across all raft groups on that node. `sum by (node_id)` — not `max` — because compaction concurrency is per-group, so two groups each running two compactions is four concurrent compactions on the node; `max` would report only two and hide node-level compaction saturation. Should sit near the (per-group max × group-count) ceiling when there is work to do; a flat-zero reading while debt climbs means compactions are being blocked (for example, by a flush pipeline stall).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1050,7 +1050,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "refId": "A",
           "instant": true
@@ -1061,7 +1061,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Compactions-in-progress trend per node. Pair with the debt trend: sustained ceiling at max concurrency during rising debt is the compaction-saturation signature.",
+      "description": "Compactions-in-progress trend per node, summed across all raft groups (matching the paired stat panel). Pair with the debt trend: sustained ceiling at (per-group max × group-count) during rising debt is the compaction-saturation signature.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1099,7 +1099,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
