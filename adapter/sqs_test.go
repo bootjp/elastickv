@@ -124,19 +124,15 @@ func TestSQSServer_KnownTargetsReturnNotImplemented(t *testing.T) {
 	t.Parallel()
 	base := startTestSQSServer(t)
 
-	// Targets that still return NotImplemented. The catalog targets
-	// (CreateQueue/DeleteQueue/ListQueues/GetQueueUrl/GetQueueAttributes/
-	// SetQueueAttributes) are covered by TestSQSServer_Catalog* against a
-	// real single-node cluster because they require a coordinator to
-	// dispatch transactions.
+	// Targets that still return NotImplemented. The catalog and core
+	// message operations (Create/Delete/List/Get/SetQueue*, SendMessage,
+	// ReceiveMessage, DeleteMessage, ChangeMessageVisibility) have real
+	// handlers; they are exercised against a single-node cluster by
+	// TestSQSServer_Catalog* and TestSQSServer_Send*.
 	targets := []string{
 		sqsPurgeQueueTarget,
-		sqsSendMessageTarget,
 		sqsSendMessageBatchTarget,
-		sqsReceiveMessageTarget,
-		sqsDeleteMessageTarget,
 		sqsDeleteMessageBatchTarget,
-		sqsChangeMessageVisibilityTarget,
 		sqsChangeMessageVisibilityBatchTgt,
 		sqsTagQueueTarget,
 		sqsUntagQueueTarget,
