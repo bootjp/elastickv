@@ -298,3 +298,40 @@ func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
 		})
 	}
 }
+
+// TestFinalDispatchErr_PrefersTransientOnBudgetExpiry pins the
+// Codex-P2 fix: when Dispatch's bounded retry budget fires
+// mid-attempt, dispatchOnce returns a context.DeadlineExceeded
+// propagated from boundedCtx rather than a genuine failure. The
+// gRPC caller should see the last transient leader error collected
+// during the retry window, not the internal deadline leak — that
+// describes the true failure mode ("leader unavailable") whereas
+// the deadline is just how the retry loop noticed it ran out.
+func TestFinalDispatchErr_PrefersTransientOnBudgetExpiry(t *testing.T) {
+	t.Parallel()
+
+	transient := cerrors.WithStack(raftengine.ErrNotLeader)
+	ctxDeadline := cerrors.WithStack(context.DeadlineExceeded)
+
+	// Past deadline, transient error accumulated: surface the
+	// transient leader error, not the deadline marker.
+	past := time.Now().Add(-time.Millisecond)
+	require.ErrorIs(t, finalDispatchErr(ctxDeadline, transient, past), raftengine.ErrNotLeader)
+
+	// Past deadline but no transient ever seen (very first attempt
+	// returned a non-retryable failure that happens to straddle the
+	// deadline): surface lastErr unchanged so callers see the real
+	// reason, not a misleading nil.
+	require.ErrorIs(t, finalDispatchErr(ctxDeadline, nil, past), context.DeadlineExceeded)
+
+	// Still within budget, non-transient error: surface lastErr.
+	// This is the healthy-path case where a write conflict / validation
+	// failure must reach the caller unclobbered.
+	future := time.Now().Add(5 * time.Second)
+	businessErr := errors.New("write conflict")
+	require.ErrorIs(t, finalDispatchErr(businessErr, transient, future), businessErr)
+
+	// Within budget with no prior transient — same as above but
+	// exercises the nil-guard on lastTransientErr.
+	require.ErrorIs(t, finalDispatchErr(businessErr, nil, future), businessErr)
+}

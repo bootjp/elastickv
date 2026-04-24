@@ -282,7 +282,13 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	boundedCtx, cancelBounded := context.WithDeadline(ctx, deadline)
 	defer cancelBounded()
 	var lastResp *CoordinateResponse
-	var lastErr error
+	// lastErr tracks the most recent dispatchOnce result. lastTransientErr
+	// separately retains the most recent TRANSIENT leader error we
+	// actually observed from a leader-routing failure, distinct from a
+	// context.DeadlineExceeded that boundedCtx propagates when our
+	// retry budget fires mid-attempt. The distinction matters for the
+	// final surfaced error: see finalDispatchErr.
+	var lastErr, lastTransientErr error
 	for {
 		lastResp, lastErr = c.dispatchOnce(boundedCtx, reqs)
 		// A successful dispatch means the commit already happened on
@@ -305,8 +311,9 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			return lastResp, errors.WithStack(err)
 		}
 		if !shouldRetryDispatch(lastErr) {
-			return lastResp, lastErr
+			return lastResp, finalDispatchErr(lastErr, lastTransientErr, deadline)
 		}
+		lastTransientErr = lastErr
 		if !time.Now().Before(deadline) {
 			return lastResp, lastErr
 		}
@@ -345,6 +352,32 @@ func shouldRetryDispatch(err error) bool {
 		return false
 	}
 	return isTransientLeaderError(err)
+}
+
+// finalDispatchErr picks the error Dispatch surfaces when the retry
+// loop terminates via shouldRetryDispatch == false. There are two
+// cases:
+//
+//   - The attempt returned a genuine non-transient error (write
+//     conflict, validation failure, etc.) while the budget was still
+//     healthy. Return lastErr unchanged; the caller needs the real
+//     failure reason, not a stale leader signal.
+//   - Our bounded retry budget fired mid-attempt, so dispatchOnce
+//     propagates a context.DeadlineExceeded from boundedCtx rather
+//     than a genuine failure. That deadline is just how the retry
+//     loop noticed it ran out; the *actual* failure mode is the
+//     transient leader churn we saw during the window. Return
+//     lastTransientErr so clients see "leader unavailable" instead
+//     of an internal gRPC timeout after bounded retries.
+//
+// The time.Now() check distinguishes the two: if now ≥ deadline, the
+// budget is exhausted and the most recent non-transient lastErr is
+// the deadline marker, not a real business error.
+func finalDispatchErr(lastErr, lastTransientErr error, deadline time.Time) error {
+	if lastTransientErr != nil && !time.Now().Before(deadline) {
+		return lastTransientErr
+	}
+	return lastErr
 }
 
 // waitForDispatchRetry sleeps for interval on timer or until ctx fires,
