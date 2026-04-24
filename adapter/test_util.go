@@ -67,28 +67,35 @@ func newTestFactory() raftengine.Factory {
 
 func shutdown(nodes []Node) {
 	for _, n := range nodes {
-		if n.opsCancel != nil {
-			n.opsCancel()
+		shutdownNode(n)
+	}
+}
+
+func shutdownNode(n Node) {
+	if n.opsCancel != nil {
+		n.opsCancel()
+	}
+	n.grpcServer.Stop()
+	if n.grpcService != nil {
+		if err := n.grpcService.Close(); err != nil {
+			log.Printf("grpc service close: %v", err)
 		}
-		n.grpcServer.Stop()
-		if n.grpcService != nil {
-			if err := n.grpcService.Close(); err != nil {
-				log.Printf("grpc service close: %v", err)
-			}
+	}
+	n.redisServer.Stop()
+	if n.dynamoServer != nil {
+		n.dynamoServer.Stop()
+	}
+	if n.sqsServer != nil {
+		n.sqsServer.Stop()
+	}
+	if n.engine != nil {
+		if err := n.engine.Close(); err != nil {
+			log.Printf("engine close: %v", err)
 		}
-		n.redisServer.Stop()
-		if n.dynamoServer != nil {
-			n.dynamoServer.Stop()
-		}
-		if n.engine != nil {
-			if err := n.engine.Close(); err != nil {
-				log.Printf("engine close: %v", err)
-			}
-		}
-		if n.closeFactory != nil {
-			if err := n.closeFactory(); err != nil {
-				log.Printf("factory close: %v", err)
-			}
+	}
+	if n.closeFactory != nil {
+		if err := n.closeFactory(); err != nil {
+			log.Printf("factory close: %v", err)
 		}
 	}
 }
@@ -98,10 +105,12 @@ type portsAdress struct {
 	raft          int
 	redis         int
 	dynamo        int
+	sqs           int
 	grpcAddress   string
 	raftAddress   string
 	redisAddress  string
 	dynamoAddress string
+	sqsAddress    string
 }
 
 const (
@@ -110,6 +119,7 @@ const (
 	raftPort   = 50000
 	redisPort  = 63790
 	dynamoPort = 28000
+	sqsPort    = 29000
 )
 
 var mu sync.Mutex
@@ -117,12 +127,14 @@ var portGrpc atomic.Int32
 var portRaft atomic.Int32
 var portRedis atomic.Int32
 var portDynamo atomic.Int32
+var portSQS atomic.Int32
 
 func init() {
 	portGrpc.Store(raftPort)
 	portRaft.Store(grpcPort)
 	portRedis.Store(redisPort)
 	portDynamo.Store(dynamoPort)
+	portSQS.Store(sqsPort)
 }
 
 func portAssigner() portsAdress {
@@ -132,15 +144,18 @@ func portAssigner() portsAdress {
 	rp := portRaft.Add(1)
 	rd := portRedis.Add(1)
 	dn := portDynamo.Add(1)
+	sq := portSQS.Add(1)
 	return portsAdress{
 		grpc:          int(gp),
 		raft:          int(rp),
 		redis:         int(rd),
 		dynamo:        int(dn),
+		sqs:           int(sq),
 		grpcAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
 		raftAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
 		redisAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(rd))),
 		dynamoAddress: net.JoinHostPort("localhost", strconv.Itoa(int(dn))),
+		sqsAddress:    net.JoinHostPort("localhost", strconv.Itoa(int(sq))),
 	}
 }
 
@@ -149,25 +164,29 @@ type Node struct {
 	raftAddress   string
 	redisAddress  string
 	dynamoAddress string
+	sqsAddress    string
 	grpcServer    *grpc.Server
 	grpcService   *GRPCServer
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
+	sqsServer     *SQSServer
 	opsCancel     context.CancelFunc
 	engine        raftengine.Engine
 	closeFactory  func() error
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, engine raftengine.Engine, closeFactory func() error, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, opsCancel context.CancelFunc) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress, sqsAddress string, engine raftengine.Engine, closeFactory func() error, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, sq *SQSServer, opsCancel context.CancelFunc) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
 		redisAddress:  redisAddress,
 		dynamoAddress: dynamoAddress,
+		sqsAddress:    sqsAddress,
 		grpcServer:    grpcs,
 		grpcService:   grpcService,
 		redisServer:   rd,
 		dynamoServer:  ds,
+		sqsServer:     sq,
 		opsCancel:     opsCancel,
 		engine:        engine,
 		closeFactory:  closeFactory,
@@ -205,6 +224,7 @@ type listeners struct {
 	grpc   net.Listener
 	redis  net.Listener
 	dynamo net.Listener
+	sqs    net.Listener
 }
 
 func bindListeners(ctx context.Context, lc *net.ListenConfig, port portsAdress) (portsAdress, listeners, bool, error) {
@@ -235,10 +255,22 @@ func bindListeners(ctx context.Context, lc *net.ListenConfig, port portsAdress) 
 		return port, listeners{}, false, errors.WithStack(err)
 	}
 
+	sqsSock, err := lc.Listen(ctx, "tcp", port.sqsAddress)
+	if err != nil {
+		_ = grpcSock.Close()
+		_ = redisSock.Close()
+		_ = dynamoSock.Close()
+		if errors.Is(err, unix.EADDRINUSE) {
+			return port, listeners{}, true, nil
+		}
+		return port, listeners{}, false, errors.WithStack(err)
+	}
+
 	return port, listeners{
 		grpc:   grpcSock,
 		redis:  redisSock,
 		dynamo: dynamoSock,
+		sqs:    sqsSock,
 	}, false, nil
 }
 
@@ -469,6 +501,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		grpcSock := lis[i].grpc
 		redisSock := lis[i].redis
 		dynamoSock := lis[i].dynamo
+		sqsSock := lis[i].sqs
 
 		result, err := factory.Create(raftengine.FactoryConfig{
 			LocalID:      strconv.Itoa(i),
@@ -516,17 +549,24 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, ds.Run())
 		}()
 
+		sq := NewSQSServer(sqsSock, routedStore, coordinator)
+		go func() {
+			assert.NoError(t, sq.Run())
+		}()
+
 		nodes = append(nodes, newNode(
 			port.grpcAddress,
 			port.raftAddress,
 			port.redisAddress,
 			port.dynamoAddress,
+			port.sqsAddress,
 			result.Engine,
 			result.Close,
 			s,
 			gs,
 			rd,
 			ds,
+			sq,
 			opsCancel,
 		))
 	}
