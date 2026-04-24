@@ -117,6 +117,20 @@ func TestRouter_SPAWithoutStaticReturns404(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+func TestRouter_BareAPIRootReturnsJSON404NotHTML(t *testing.T) {
+	r := NewRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), newTestStatic())
+	for _, p := range []string{"/admin/api/v1", "/admin/assets"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusNotFound, rec.Code, "path %s", p)
+		require.Containsf(t, rec.Header().Get("Content-Type"), "application/json", "path %s", p)
+		require.NotContainsf(t, rec.Body.String(), "<html", "path %s must not serve SPA HTML", p)
+	}
+}
+
 func TestRouter_NonAdminPathReturns404JSON(t *testing.T) {
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/other", nil)

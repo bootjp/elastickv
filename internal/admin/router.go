@@ -13,11 +13,18 @@ import (
 // Constants for the admin URL namespace. Centralised here so the router,
 // handlers, and tests all agree on the paths. The admin listener only
 // serves URLs under /admin/*; anything else yields a 404.
+//
+// The "root" variants (without a trailing slash) are treated as the
+// directory itself so that requests like `/admin/api/v1` or
+// `/admin/assets` resolve to a JSON 404 rather than falling through to
+// the SPA fallback and being answered with index.html.
 const (
 	pathPrefixAdmin   = "/admin"
-	pathPrefixAPIv1   = "/admin/api/v1/"
+	pathAPIv1Root     = "/admin/api/v1"
+	pathPrefixAPIv1   = pathAPIv1Root + "/"
 	pathHealthz       = "/admin/healthz"
-	pathPrefixAssets  = "/admin/assets/"
+	pathAssetsRoot    = "/admin/assets"
+	pathPrefixAssets  = pathAssetsRoot + "/"
 	pathRootAssetsDir = "assets"
 	pathIndexHTML     = "index.html"
 )
@@ -64,6 +71,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 
 	switch {
+	case p == pathAPIv1Root:
+		// Bare /admin/api/v1 is an API root, not an SPA page: answer
+		// with a JSON 404 so clients never get HTML back on an API
+		// path.
+		rt.notFind.ServeHTTP(w, r)
+		return
 	case strings.HasPrefix(p, pathPrefixAPIv1):
 		if rt.api == nil {
 			rt.notFind.ServeHTTP(w, r)
@@ -73,6 +86,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case p == pathHealthz:
 		rt.serveHealth(w, r)
+		return
+	case p == pathAssetsRoot:
+		// Same reasoning as /admin/api/v1: the bare assets root is
+		// a directory, not an SPA route.
+		rt.notFind.ServeHTTP(w, r)
 		return
 	case strings.HasPrefix(p, pathPrefixAssets):
 		rt.serveAsset(w, r)

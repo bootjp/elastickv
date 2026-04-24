@@ -80,10 +80,10 @@ func (c *Config) Validate() error {
 func (c *Config) validateListen() error {
 	listen := strings.TrimSpace(c.Listen)
 	if listen == "" {
-		return errors.New("admin.listen must not be empty when admin.enabled=true")
+		return errors.New("-adminListen must not be empty when -adminEnabled=true")
 	}
 	if _, _, err := net.SplitHostPort(listen); err != nil {
-		return errors.Wrapf(err, "admin.listen %q is not host:port", c.Listen)
+		return errors.Wrapf(err, "-adminListen %q is not host:port", c.Listen)
 	}
 	return nil
 }
@@ -96,7 +96,7 @@ func (c *Config) validateTLS() error {
 		// treating it as "TLS off" would downgrade transport
 		// security while the operator thinks TLS is enabled; fail
 		// fast so the misconfiguration is visible at startup.
-		return errors.New("admin.tls.cert_file and admin.tls.key_file must be set together;" +
+		return errors.New("-adminTLSCertFile and -adminTLSKeyFile must be set together;" +
 			" partial TLS configuration is not allowed")
 	}
 	tlsConfigured := certSet && keySet
@@ -104,25 +104,25 @@ func (c *Config) validateTLS() error {
 		return nil
 	}
 	return errors.WithStack(errors.Newf(
-		"admin.listen %q is not loopback but TLS is not configured;"+
-			" set admin.tls.cert_file + admin.tls.key_file, or explicitly pass"+
+		"-adminListen %q is not loopback but TLS is not configured;"+
+			" set -adminTLSCertFile + -adminTLSKeyFile, or explicitly pass"+
 			" -adminAllowPlaintextNonLoopback (strongly discouraged)",
 		c.Listen,
 	))
 }
 
 func (c *Config) validateSigningKeys() error {
-	primary, err := decodeSigningKey("admin.session_signing_key", c.SessionSigningKey)
+	primary, err := decodeSigningKey("-adminSessionSigningKey", c.SessionSigningKey)
 	if err != nil {
 		return err
 	}
 	if len(primary) == 0 {
-		return errors.New("admin.session_signing_key is required when admin.enabled=true")
+		return errors.New("-adminSessionSigningKey is required when -adminEnabled=true")
 	}
 	if strings.TrimSpace(c.SessionSigningKeyPrevious) == "" {
 		return nil
 	}
-	if _, err := decodeSigningKey("admin.session_signing_key_previous", c.SessionSigningKeyPrevious); err != nil {
+	if _, err := decodeSigningKey("-adminSessionSigningKeyPrevious", c.SessionSigningKeyPrevious); err != nil {
 		return err
 	}
 	return nil
@@ -132,13 +132,13 @@ func (c *Config) validateSigningKeys() error {
 // primary signing key first, followed by an optional previous key. Validate
 // must be called first.
 func (c *Config) DecodedSigningKeys() ([][]byte, error) {
-	primary, err := decodeSigningKey("admin.session_signing_key", c.SessionSigningKey)
+	primary, err := decodeSigningKey("-adminSessionSigningKey", c.SessionSigningKey)
 	if err != nil {
 		return nil, err
 	}
 	keys := [][]byte{primary}
 	if strings.TrimSpace(c.SessionSigningKeyPrevious) != "" {
-		prev, err := decodeSigningKey("admin.session_signing_key_previous", c.SessionSigningKeyPrevious)
+		prev, err := decodeSigningKey("-adminSessionSigningKeyPrevious", c.SessionSigningKeyPrevious)
 		if err != nil {
 			return nil, err
 		}
@@ -207,7 +207,7 @@ func validateAccessKeyRoles(readOnly, full []string) error {
 		}
 		if _, dup := fullSet[trim]; dup {
 			return errors.WithStack(errors.Newf(
-				"access key %q is listed in both admin.read_only_access_keys and admin.full_access_keys;"+
+				"access key %q is listed in both -adminReadOnlyAccessKeys and -adminFullAccessKeys;"+
 					" this would silently grant write access depending on lookup order, so it is rejected at startup",
 				trim,
 			))

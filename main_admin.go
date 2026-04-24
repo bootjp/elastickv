@@ -230,18 +230,31 @@ func registerAdminLifecycle(
 // newClusterInfoSource builds a ClusterInfoSource that reads from the
 // runtime raftGroupRuntime slice. It lives here (rather than
 // internal/admin) so the admin package stays free of main-package types.
+//
+// Membership is fetched via engine.Configuration(ctx); the call is
+// best-effort — if it fails (for instance because the engine is in the
+// middle of a leadership transition) we leave Members empty rather
+// than fail the whole cluster snapshot.
 func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) admin.ClusterInfoSource {
-	return admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
+	return admin.ClusterInfoFunc(func(ctx context.Context) (admin.ClusterInfo, error) {
 		groups := make([]admin.GroupInfo, 0, len(runtimes))
 		for _, rt := range runtimes {
 			if rt == nil || rt.engine == nil {
 				continue
 			}
 			status := rt.engine.Status()
+			var members []string
+			if cfg, err := rt.engine.Configuration(ctx); err == nil {
+				members = make([]string, 0, len(cfg.Servers))
+				for _, srv := range cfg.Servers {
+					members = append(members, srv.ID)
+				}
+			}
 			groups = append(groups, admin.GroupInfo{
 				GroupID:  rt.spec.id,
 				LeaderID: status.Leader.ID,
 				IsLeader: strings.EqualFold(string(status.State), "leader"),
+				Members:  members,
 			})
 		}
 		return admin.ClusterInfo{

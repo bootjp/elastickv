@@ -28,7 +28,7 @@ func TestConfigValidate_RequiresListen(t *testing.T) {
 	}
 	err := c.Validate()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "admin.listen must not be empty")
+	require.Contains(t, err.Error(), "-adminListen must not be empty")
 }
 
 func TestConfigValidate_RequiresSigningKey(t *testing.T) {
@@ -38,7 +38,7 @@ func TestConfigValidate_RequiresSigningKey(t *testing.T) {
 	}
 	err := c.Validate()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "session_signing_key is required")
+	require.Contains(t, err.Error(), "adminSessionSigningKey is required")
 }
 
 func TestConfigValidate_SigningKeyWrongLength(t *testing.T) {
@@ -169,7 +169,7 @@ func TestConfigValidate_PreviousSigningKeyValidated(t *testing.T) {
 	}
 	err := c.Validate()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "session_signing_key_previous")
+	require.Contains(t, err.Error(), "adminSessionSigningKeyPrevious")
 }
 
 func TestConfigDecodedSigningKeys_Order(t *testing.T) {
@@ -221,5 +221,5 @@ func TestConfigValidate_PreservesContext(t *testing.T) {
 	}
 	err := c.Validate()
 	require.Error(t, err)
-	require.True(t, strings.Contains(err.Error(), "admin.listen"))
+	require.True(t, strings.Contains(err.Error(), "-adminListen"))
 }
