@@ -908,17 +908,20 @@ EXTRA_ENV_DEFAULT_NORMALISED="${EXTRA_ENV_DEFAULT_NORMALISED//[$'\t\r\n']/ }"
 merge_extra_env() {
   local defaults="$1"
   local user="$2"
-  local -A seen=()
+  # Portable across Bash 3.2 (macOS default) which lacks associative
+  # arrays: concatenate user KEYs into a space-padded string and match
+  # with " KEY " to test set membership. The EXTRA_ENV list is typically
+  # a handful of entries, so the linear check is negligible.
   local -a user_pairs=()
   local -a default_pairs=()
-  local pair key merged=""
+  local pair key seen=" " merged=""
 
   read -r -a user_pairs <<< "$user"
   for pair in "${user_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
     [[ "$pair" == *=* ]] || continue
     key="${pair%%=*}"
-    seen["$key"]=1
+    seen+="${key} "
   done
 
   read -r -a default_pairs <<< "$defaults"
@@ -926,7 +929,7 @@ merge_extra_env() {
     [[ -n "$pair" ]] || continue
     [[ "$pair" == *=* ]] || continue
     key="${pair%%=*}"
-    if [[ -z "${seen[$key]:-}" ]]; then
+    if [[ "$seen" != *" ${key} "* ]]; then
       merged+="${merged:+ }$pair"
     fi
   done
