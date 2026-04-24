@@ -161,6 +161,49 @@ func TestRedis_StreamXTrimMaxLen(t *testing.T) {
 	}
 }
 
+// TestRedis_StreamXAddMaxLenZero verifies that XADD ... MAXLEN 0 advances
+// LastMs/LastSeq for auto-ID monotonicity but leaves the stream empty
+// (Length==0 and no live entry keys). The previous implementation wrote the
+// entry and set Length=0 without deleting it, creating a committed-state
+// inconsistency.
+func TestRedis_StreamXAddMaxLenZero(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed two entries so there is something to trim.
+	for i := range 2 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: "stream-maxlen0",
+			ID:     fmt.Sprintf("%d-0", 1000+i),
+			Values: []string{"k", "v"},
+		}).Result()
+		require.NoError(t, err)
+	}
+	require.Equal(t, int64(2), rdb.XLen(ctx, "stream-maxlen0").Val())
+
+	// XADD with MAXLEN 0: should trim everything including the new entry.
+	id, err := rdb.Do(ctx, "XADD", "stream-maxlen0", "MAXLEN", "0", "*", "k", "v").Text()
+	require.NoError(t, err)
+	require.NotEmpty(t, id, "returned ID must still be valid")
+
+	xlen := rdb.XLen(ctx, "stream-maxlen0").Val()
+	require.Equal(t, int64(0), xlen, "XLEN must be 0 after MAXLEN 0")
+
+	entries, err := rdb.XRange(ctx, "stream-maxlen0", "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 0, "XRANGE must return no entries after MAXLEN 0")
+
+	// Auto-ID must still be monotonic (LastMs/LastSeq was advanced).
+	id2, err := rdb.Do(ctx, "XADD", "stream-maxlen0", "MAXLEN", "0", "*", "k", "v2").Text()
+	require.NoError(t, err)
+	require.Greater(t, id2, id, "subsequent XADD * must produce a strictly greater ID")
+}
+
 func TestRedis_StreamXRangeBounds(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
@@ -208,10 +251,9 @@ func TestRedis_StreamXRangeBounds(t *testing.T) {
 	// `XRANGE k 0 +` and `XRANGE k 1001 1002` must work without
 	// returning "ERR Invalid stream ID"; the legacy blob path accepted
 	// shorthand via string-compare fallback, so migrating streams must
-	// keep that contract. parseStreamBoundID expands "ms" to ms-0
-	// (lower inclusive / upper exclusive) or ms-MaxUint64 (lower
-	// exclusive / upper inclusive) so the half-open scan covers the
-	// whole ms row.
+	// keep that contract. parseStreamBoundID expands shorthand to ms-0
+	// for lower/exclusive-upper, or ms-MaxUint64 for inclusive-upper,
+	// so the half-open scan covers the correct ms row.
 	shortAll, err := rdb.XRange(ctx, "stream-range", "0", "+").Result()
 	require.NoError(t, err, "XRANGE with shorthand lower bound 0 must succeed after migration")
 	require.Len(t, shortAll, 4)
@@ -225,6 +267,11 @@ func TestRedis_StreamXRangeBounds(t *testing.T) {
 	shortExclusiveUpper, err := rdb.Do(ctx, "XRANGE", "stream-range", "-", "(1002").Slice()
 	require.NoError(t, err, "XRANGE with shorthand exclusive upper bound must succeed")
 	require.Len(t, shortExclusiveUpper, 2, "(1002 shorthand excludes all ms=1002 entries")
+
+	// Exclusive lower shorthand: (1000 means "after 1000-0", so 1001-0 onward.
+	shortExclusiveLower, err := rdb.Do(ctx, "XRANGE", "stream-range", "(1000", "+").Slice()
+	require.NoError(t, err, "XRANGE with shorthand exclusive lower bound must succeed")
+	require.Len(t, shortExclusiveLower, 3, "(1000 shorthand excludes 1000-0, keeps 1001..1003")
 }
 
 func TestRedis_StreamMigrationFromLegacyBlob(t *testing.T) {

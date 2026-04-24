@@ -3739,6 +3739,18 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	}
 	elems = append(elems, trim...)
 
+	// MAXLEN 0: the trim above deleted all pre-existing entries (scanned at
+	// readTS), but cannot see the just-appended entry because it was written
+	// above the read snapshot. Emit a follow-up Del so the entry doesn't
+	// survive while meta says Length=0. The coordinator applies elems in
+	// order, so this Del tombstones the preceding Put at the same commitTS.
+	if req.maxLen == 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:  kv.Del,
+			Key: store.StreamEntryKey(key, parsedID.ms, parsedID.seq),
+		})
+	}
+
 	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
 		Length:  nextLen,
 		LastMs:  parsedID.ms,
@@ -4733,16 +4745,16 @@ func streamBoundHigh(prefix []byte, raw string) ([]byte, error) {
 
 // parseStreamBoundID accepts both the strict ms-seq form and the shorthand
 // "ms" form that Redis XRANGE/XREVRANGE allow. Redis interprets a shorthand
-// ID as a half-open range over every entry with matching ms:
+// ID differently depending on position and exclusivity:
 //
-//	XRANGE key 5 5      == every entry with ms == 5
-//	XRANGE key (5 5     == every entry with ms == 5 except ms-0
+//   - Lower bound inclusive ("5"): expand to 5-0; scan starts at 5-0.
+//   - Lower bound exclusive ("(5"): expand to 5-0; caller shifts +1 → 5-1.
+//   - Upper bound inclusive ("5"): expand to 5-MaxUint64; caller shifts +1 → 6-0 (exclusive upper).
+//   - Upper bound exclusive ("(5"): expand to 5-0; scan stops at 5-0 (excludes all ms=5 entries).
 //
-// To make the existing ±1 exclusive-shift logic work uniformly, we expand
-// the shorthand to the ms-seq that would reproduce the same scan after that
-// shift: seq=MaxUint64 when matching-all-ms is on the same side of the
-// comparison as the shift ((upper && !exclusive) or (lower && exclusive));
-// seq=0 otherwise. Full ms-seq IDs pass through unchanged.
+// The rule is: seq = MaxUint64 when upper && !exclusive (need to include the
+// full ms row before the caller's inclusive→exclusive shift), seq = 0
+// otherwise. Full ms-seq IDs pass through unchanged.
 func parseStreamBoundID(raw string, upper, exclusive bool) (uint64, uint64, bool) {
 	if strings.IndexByte(raw, '-') >= 0 {
 		parsed, ok := tryParseRedisStreamID(raw)
@@ -4755,9 +4767,11 @@ func parseStreamBoundID(raw string, upper, exclusive bool) (uint64, uint64, bool
 	if err != nil {
 		return 0, 0, false
 	}
-	// XOR: exactly one of "upper" and "exclusive" puts us in the
-	// "match all entries with this ms" side.
-	if upper != exclusive {
+	// Upper inclusive bounds need seq=MaxUint64 so the caller's +1 shift
+	// produces (ms+1)-0, covering the entire ms row. All other
+	// combinations use seq=0: lower bounds start at ms-0, and upper
+	// exclusive bounds stop before ms-0 (excluding the whole ms).
+	if upper && !exclusive {
 		return ms, ^uint64(0), true
 	}
 	return ms, 0, true

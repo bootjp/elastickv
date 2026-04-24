@@ -157,7 +157,7 @@ func ExtractStreamUserKeyFromMeta(key []byte) []byte {
 
 // ExtractStreamUserKeyFromEntry extracts the logical user key from a stream entry key.
 func ExtractStreamUserKeyFromEntry(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(StreamEntryPrefix))
+	trimmed := bytes.TrimPrefix(key, streamEntryPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize+StreamIDBytes {
 		return nil
 	}
