@@ -3841,10 +3841,25 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 		return nil, nil, store.StreamMeta{}, false, err
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(val.Entries)+1)
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
+	// Capture LastMs/LastSeq from the original final entry before any
+	// truncation so XADD * stays monotonic even when the blob is capped.
 	var lastMs, lastSeq uint64
-	for _, entry := range val.Entries {
+	if len(val.Entries) > 0 {
+		if lastParsed, ok := tryParseRedisStreamID(val.Entries[len(val.Entries)-1].ID); ok {
+			lastMs, lastSeq = lastParsed.ms, lastParsed.seq
+		}
+	}
+	// Cap migration to maxWideColumnItems entries to bound the transaction
+	// size. Legacy streams exceeding the cap are implicitly trimmed to their
+	// most-recent maxWideColumnItems entries, consistent with the write-path
+	// guard in xaddEnforceMaxWideColumn.
+	entriesToMigrate := val.Entries
+	if len(entriesToMigrate) > maxWideColumnItems {
+		entriesToMigrate = entriesToMigrate[len(entriesToMigrate)-maxWideColumnItems:]
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(entriesToMigrate)+1)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
+	for _, entry := range entriesToMigrate {
 		parsed, ok := tryParseRedisStreamID(entry.ID)
 		if !ok {
 			return nil, nil, store.StreamMeta{}, false, cockerrors.WithStack(cockerrors.Newf("invalid legacy stream ID %q", entry.ID))
@@ -3858,14 +3873,13 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 			Key:   store.StreamEntryKey(key, parsed.ms, parsed.seq),
 			Value: value,
 		})
-		lastMs, lastSeq = parsed.ms, parsed.seq
 	}
 	migratedMeta := store.StreamMeta{
-		Length:  int64(len(val.Entries)),
+		Length:  int64(len(entriesToMigrate)),
 		LastMs:  lastMs,
 		LastSeq: lastSeq,
 	}
-	return elems, val.Entries, migratedMeta, true, nil
+	return elems, entriesToMigrate, migratedMeta, true, nil
 }
 
 // resolveXAddID resolves the requested ID (possibly '*') against the current
