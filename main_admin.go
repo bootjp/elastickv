@@ -77,7 +77,8 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
-	return startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, buildVersion())
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, buildVersion())
+	return err
 }
 
 // buildAdminConfig translates flag values into an admin.Config.
@@ -101,6 +102,12 @@ func buildAdminConfig(in adminListenerConfig) admin.Config {
 // listener is disabled. Errors at this point are hard startup failures:
 // the design doc mandates ハードエラーで起動失敗 for every invalid
 // configuration, and we honour that uniformly.
+//
+// The returned address is the actual host:port the listener bound to; it
+// differs from adminCfg.Listen only when the caller passed a port of 0,
+// but tests rely on this to avoid the bind-close-rebind race that a
+// pre-allocated free-port helper would otherwise introduce. When admin
+// is disabled the returned address is empty.
 func startAdminServer(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -109,27 +116,32 @@ func startAdminServer(
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
 	version string,
-) error {
+) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
 	enabled, err := checkAdminConfig(&adminCfg, cluster)
 	if err != nil || !enabled {
-		return err
+		return "", err
 	}
 	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster)
 	if err != nil {
-		return err
+		return "", err
 	}
 	httpSrv := newAdminHTTPServer(server, &adminCfg)
 	listener, err := lc.Listen(ctx, "tcp", adminCfg.Listen)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on admin address %s", adminCfg.Listen)
+		return "", errors.Wrapf(err, "failed to listen on admin address %s", adminCfg.Listen)
 	}
 	tlsEnabled := strings.TrimSpace(adminCfg.TLSCertFile) != "" && strings.TrimSpace(adminCfg.TLSKeyFile) != ""
 	if tlsEnabled {
 		httpSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
-	registerAdminLifecycle(ctx, eg, httpSrv, listener, &adminCfg, tlsEnabled, version)
-	return nil
+	actualAddr := listener.Addr().String()
+	// Use the real bound address in log lines and in the lifecycle
+	// task so the shutdown banner matches startup.
+	boundCfg := adminCfg
+	boundCfg.Listen = actualAddr
+	registerAdminLifecycle(ctx, eg, httpSrv, listener, &boundCfg, tlsEnabled, version)
+	return actualAddr, nil
 }
 
 // checkAdminConfig validates adminCfg; returns (enabled=false, nil) when

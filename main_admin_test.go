@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +69,7 @@ func TestStartAdminServer_DisabledNoOp(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
-	err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, "")
 	require.NoError(t, err)
 }
 
@@ -83,7 +82,7 @@ func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
 		listen:  "127.0.0.1:0",
 		// missing signing key
 	}
-	err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
 	require.Error(t, err)
 }
 
@@ -96,7 +95,7 @@ func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
 		listen:            "0.0.0.0:0",
 		sessionSigningKey: freshKey(),
 	}
-	err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS")
 }
@@ -110,7 +109,7 @@ func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
 		listen:            "127.0.0.1:0",
 		sessionSigningKey: freshKey(),
 	}
-	err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cluster info source")
 }
@@ -123,27 +122,25 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 		_ = eg.Wait()
 	}()
 
-	port := freePort(t)
-	listen := "127.0.0.1:" + port
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:                true,
-		listen:                 listen,
+		listen:                 "127.0.0.1:0",
 		sessionSigningKey:      freshKey(),
 		allowInsecureDevCookie: true,
 	}
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n1", Version: "test"}, nil
 	})
-	require.NoError(t, startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test"))
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	require.NoError(t, err)
 
 	// Poll /admin/healthz until success or the test deadline.
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(3 * time.Second)
 	var resp *http.Response
-	var err error
 	for time.Now().Before(deadline) {
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+"/admin/healthz", nil)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/admin/healthz", nil)
 		require.NoError(t, reqErr)
 		resp, err = client.Do(req)
 		if err == nil {
@@ -167,12 +164,10 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 		_ = eg.Wait()
 	}()
 
-	port := freePort(t)
-	listen := "127.0.0.1:" + port
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:           true,
-		listen:            listen,
+		listen:            "127.0.0.1:0",
 		tlsCertFile:       certFile,
 		tlsKeyFile:        keyFile,
 		sessionSigningKey: freshKey(),
@@ -180,15 +175,15 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n-tls", Version: "test"}, nil
 	})
-	require.NoError(t, startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test"))
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	require.NoError(t, err)
 
 	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // self-signed in test
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
 	deadline := time.Now().Add(3 * time.Second)
 	var resp *http.Response
-	var err error
 	for time.Now().Before(deadline) {
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+listen+"/admin/healthz", nil)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/admin/healthz", nil)
 		require.NoError(t, reqErr)
 		resp, err = client.Do(req)
 		if err == nil {
@@ -199,25 +194,6 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_ = resp.Body.Close()
-}
-
-func freePort(t *testing.T) string {
-	t.Helper()
-	var lc net.ListenConfig
-	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr, ok := l.Addr().(*net.TCPAddr)
-	require.True(t, ok, "listener did not produce a *net.TCPAddr")
-	_ = l.Close()
-	return strings.TrimSpace(filepathBase(addr.String()))
-}
-
-func filepathBase(hostPort string) string {
-	i := strings.LastIndex(hostPort, ":")
-	if i < 0 {
-		return hostPort
-	}
-	return hostPort[i+1:]
 }
 
 // writeSelfSignedCert writes a short-lived self-signed certificate to a

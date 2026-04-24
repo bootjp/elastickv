@@ -122,9 +122,10 @@ type loginRequest struct {
 }
 
 // loginResponse is the JSON body the login endpoint returns on success.
-// The CSRF token is also readable from the admin_csrf cookie; we include
-// it here as a convenience for clients that want to avoid parsing the
-// Set-Cookie header themselves.
+// The CSRF token is delivered exclusively via the admin_csrf cookie (see
+// the Set-Cookie headers the handler sets on the same response); we do
+// not echo it in the JSON body to avoid encouraging clients to cache or
+// log the token out of band.
 type loginResponse struct {
 	Role      Role      `json:"role"`
 	ExpiresAt time.Time `json:"expires_at"`

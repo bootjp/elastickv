@@ -3,8 +3,6 @@ package admin
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -179,9 +177,3 @@ func TestInternalHelpers(t *testing.T) {
 	require.True(t, endpointMatches("/a", "/A"))
 	require.False(t, endpointMatches("/a", "/b"))
 }
-
-// Keep io, fmt imported to avoid drift if the test evolves.
-var (
-	_ = io.Discard
-	_ = fmt.Sprint
-)
