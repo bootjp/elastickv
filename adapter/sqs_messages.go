@@ -504,7 +504,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	delivered, err := s.longPollReceive(ctx, queueName, meta.Generation, max, visibilityTimeout, waitSeconds)
+	delivered, err := s.longPollReceive(ctx, queueName, max, visibilityTimeout, waitSeconds)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -540,9 +540,12 @@ func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) (int64, err
 //
 // Scan errors are propagated to the caller so a backend / routing
 // failure surfaces as an actionable 5xx instead of a silent empty 200
-// that would stall consumers.
-func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout, waitSeconds int64) ([]map[string]any, error) {
-	delivered, err := s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+// that would stall consumers. Each pass re-resolves queue metadata so
+// a DeleteQueue / PurgeQueue that commits during a long wait is
+// observed on the very next scan — otherwise we'd keep scanning
+// orphan keys under the old generation.
+func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, max int, visibilityTimeout, waitSeconds int64) ([]map[string]any, error) {
+	delivered, err := s.scanAndDeliverOnce(ctx, queueName, max, visibilityTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -561,7 +564,7 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen u
 		if time.Now().After(deadline) {
 			return delivered, nil
 		}
-		delivered, err = s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+		delivered, err = s.scanAndDeliverOnce(ctx, queueName, max, visibilityTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -573,16 +576,25 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen u
 
 // scanAndDeliverOnce is the single-pass scan+rotate the long-poll loop
 // re-runs. Each pass takes its own snapshot so the OCC StartTS tracks
-// the most recent visible_at for the candidates it picked. Scan errors
-// are returned so the caller can fail the receive with an actionable
-// status code instead of serializing them as empty success.
-func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout int64) ([]map[string]any, error) {
+// the most recent visible_at for the candidates it picked, AND each
+// pass re-reads queue metadata so a concurrent DeleteQueue /
+// PurgeQueue that bumps the generation is observed immediately. If
+// the queue has been deleted the method returns QueueDoesNotExist;
+// scan errors and other non-retryable failures propagate.
+func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, max int, visibilityTimeout int64) ([]map[string]any, error) {
 	readTS := s.nextTxnReadTS(ctx)
-	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, gen, max*sqsReceiveScanOverfetchFactor, readTS)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, meta.Generation, max*sqsReceiveScanOverfetchFactor, readTS)
 	if err != nil {
 		return nil, err
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS)
+	return s.rotateMessagesForDelivery(ctx, queueName, meta.Generation, candidates, visibilityTimeout, max, readTS)
 }
 
 // resolveReceiveMaxMessages validates MaxNumberOfMessages against the
@@ -812,10 +824,14 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 		// StartTS pins OCC to the snapshot we loaded the record at, so a
 		// concurrent rotation that commits after our load but before a
 		// coordinator-assigned StartTS cannot slip past ReadKeys.
+		// ReadKeys also include the queue meta + generation keys so a
+		// concurrent DeleteQueue (which only touches those two keys)
+		// forces this delete to abort with ErrWriteConflict rather
+		// than committing against an orphan record.
 		req := &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  readTS,
-			ReadKeys: [][]byte{dataKey, visKey},
+			ReadKeys: [][]byte{dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: dataKey},
 				{Op: kv.Del, Key: visKey},
@@ -944,11 +960,13 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 		// StartTS pins OCC to the snapshot; without it the coordinator
 		// would auto-assign a newer StartTS and a concurrent receive /
 		// delete that commits between our load and dispatch could slip
-		// past the ReadKeys validation.
+		// past the ReadKeys validation. Meta + generation keys are
+		// included so a DeleteQueue race (which only mutates those
+		// two keys) also forces this visibility change to abort.
 		req := &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  readTS,
-			ReadKeys: [][]byte{dataKey, oldVisKey},
+			ReadKeys: [][]byte{dataKey, oldVisKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: oldVisKey},
 				{Op: kv.Put, Key: newVisKey, Value: []byte(rec.MessageID)},
