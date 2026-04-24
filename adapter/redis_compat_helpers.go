@@ -949,6 +949,16 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 // deleteStreamWideColumnElems returns delete operations for all stream
 // wide-column keys: the meta key (if it exists) and every entry under the
 // entry scan prefix.
+//
+// Unlike scanAllDeltaElems (shared with lists/zset), this path does NOT cap
+// at maxWideColumnItems. The legacy blob form let users create streams of
+// arbitrary size and DEL always worked on them; a migrated stream with more
+// than maxWideColumnItems entries would otherwise become undeletable
+// (DEL / EXPIRE 0 / MULTI-EXEC DEL would return ErrCollectionTooLarge and
+// leave the keys stranded in storage). Paginated scan via
+// scanStreamEntryKeysForDelete enumerates every entry key instead of
+// buffering them in one scan; memory is still bounded because callers
+// append Del elems and dispatch them in batches downstream.
 func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	var elems []*kv.Elem[kv.OP]
 	metaKey := store.StreamMetaKey(key)
@@ -957,11 +967,34 @@ func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byt
 	} else if exists {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
 	}
-	entryElems, err := r.scanAllDeltaElems(ctx, store.StreamEntryScanPrefix(key), readTS)
+	entryElems, err := r.scanStreamEntryKeysForDelete(ctx, store.StreamEntryScanPrefix(key), readTS)
 	if err != nil {
 		return nil, err
 	}
 	return append(elems, entryElems...), nil
+}
+
+// scanStreamEntryKeysForDelete paginates through entry keys under prefix
+// and returns Del elems for each. Intentionally uncapped for stream delete
+// — see deleteStreamWideColumnElems for the rationale.
+func (r *RedisServer) scanStreamEntryKeysForDelete(ctx context.Context, prefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	const cursorAdv = byte(0x00)
+	var elems []*kv.Elem[kv.OP]
+	end := store.PrefixScanEnd(prefix)
+	cursor := prefix
+	for {
+		kvs, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		for _, pair := range kvs {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		}
+		if len(kvs) < store.MaxDeltaScanLimit {
+			return elems, nil
+		}
+		cursor = append(bytes.Clone(kvs[len(kvs)-1].Key), cursorAdv)
+	}
 }
 
 // deleteZSetWideColumnElems returns delete operations for all ZSet wide-column keys:
