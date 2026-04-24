@@ -93,6 +93,17 @@ var (
 	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
+
+	adminEnabled                   = flag.Bool("adminEnabled", false, "Enable the admin HTTP listener")
+	adminListen                    = flag.String("adminListen", "127.0.0.1:8080", "host:port for the admin HTTP listener (loopback by default)")
+	adminTLSCertFile               = flag.String("adminTLSCertFile", "", "PEM-encoded TLS certificate for the admin listener")
+	adminTLSKeyFile                = flag.String("adminTLSKeyFile", "", "PEM-encoded TLS private key for the admin listener")
+	adminAllowPlaintextNonLoopback = flag.Bool("adminAllowPlaintextNonLoopback", false, "Allow the admin listener to bind a non-loopback address without TLS (strongly discouraged)")
+	adminAllowInsecureDevCookie    = flag.Bool("adminAllowInsecureDevCookie", false, "Mint admin cookies without the Secure attribute (local plaintext dev only)")
+	adminSessionSigningKey         = flag.String("adminSessionSigningKey", "", "Cluster-shared base64 HS256 key (64 bytes decoded) that signs admin session tokens")
+	adminSessionSigningKeyPrevious = flag.String("adminSessionSigningKeyPrevious", "", "Optional previous admin HS256 key accepted only for verification during rotation")
+	adminReadOnlyAccessKeys        = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
+	adminFullAccessKeys            = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 )
 
 func main() {
@@ -220,6 +231,10 @@ func run() error {
 	}
 	if err := runner.start(); err != nil {
 		return err
+	}
+
+	if err := startAdminFromFlags(runCtx, &lc, eg, runtimes); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 
 	if err := eg.Wait(); err != nil {
