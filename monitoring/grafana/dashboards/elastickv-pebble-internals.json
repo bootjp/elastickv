@@ -653,7 +653,7 @@
         },
         {
           "datasource": "$datasource",
-          "description": "Current bytes held in active memtables per node. Caps at ~MemTableSize * MaxMemtableCount; steady readings near that cap mean flush is the bottleneck. Thresholds intentionally coarse because the meaningful ceiling is deploy-specific.",
+          "description": "Current bytes held in active memtables per node, summed across all raft groups on that node. `sum by (node_id)` — not `max` — because each group owns its own Pebble instance and real per-node memtable memory is the sum of every group's memtables; `max by (node_id)` would pick only the largest group and under-report pressure on nodes hosting more than one group. Thresholds intentionally coarse because the meaningful ceiling is deploy-specific.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -703,7 +703,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -714,7 +714,7 @@
         },
         {
           "datasource": "$datasource",
-          "description": "Memtable bytes trend per node. Pair with Memtable Count to distinguish 'few large memtables queued for flush' from 'many tiny memtables piling up'.",
+          "description": "Memtable bytes trend per node (summed across all raft groups on that node, matching the paired stat panel). Pair with Memtable Count to distinguish 'few large memtables queued for flush' from 'many tiny memtables piling up'.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -752,7 +752,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
