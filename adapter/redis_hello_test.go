@@ -433,7 +433,7 @@ func TestClient_SetName_RejectsWrongArity(t *testing.T) {
 
 	// CLIENT SETNAME with no value (2 args total).
 	r.client(conn, redcon.Command{Args: [][]byte{
-		[]byte("CLIENT"), []byte("SETNAME"),
+		[]byte(cmdClient), []byte("SETNAME"),
 	}})
 	require.Contains(t, conn.err, "wrong number of arguments")
 	require.Equal(t, "prev", state.clientName, "malformed SETNAME must not clobber clientName")
@@ -443,7 +443,7 @@ func TestClient_SetName_RejectsWrongArity(t *testing.T) {
 	state2 := getConnState(conn2)
 	state2.clientName = "prev"
 	r.client(conn2, redcon.Command{Args: [][]byte{
-		[]byte("CLIENT"), []byte("SETNAME"), []byte("foo"), []byte("bar"),
+		[]byte(cmdClient), []byte("SETNAME"), []byte("foo"), []byte("bar"),
 	}})
 	require.Contains(t, conn2.err, "wrong number of arguments")
 	require.Equal(t, "prev", state2.clientName)
@@ -457,7 +457,7 @@ func TestClient_GetName_RejectsWrongArity(t *testing.T) {
 
 	// CLIENT GETNAME extra (3 args total) — GETNAME takes no operand.
 	r.client(conn, redcon.Command{Args: [][]byte{
-		[]byte("CLIENT"), []byte("GETNAME"), []byte("extra"),
+		[]byte(cmdClient), []byte("GETNAME"), []byte("extra"),
 	}})
 	require.Contains(t, conn.err, "wrong number of arguments")
 }
@@ -470,7 +470,7 @@ func TestClient_ID_RejectsWrongArity(t *testing.T) {
 
 	// CLIENT ID junk (3 args total) — ID takes no operand.
 	r.client(conn, redcon.Command{Args: [][]byte{
-		[]byte("CLIENT"), []byte("ID"), []byte("junk"),
+		[]byte(cmdClient), []byte("ID"), []byte("junk"),
 	}})
 	require.Contains(t, conn.err, "wrong number of arguments")
 }
@@ -483,7 +483,49 @@ func TestClient_Info_RejectsWrongArity(t *testing.T) {
 
 	// CLIENT INFO extra (3 args total) — INFO takes no operand.
 	r.client(conn, redcon.Command{Args: [][]byte{
-		[]byte("CLIENT"), []byte("INFO"), []byte("extra"),
+		[]byte(cmdClient), []byte("INFO"), []byte("extra"),
 	}})
 	require.Contains(t, conn.err, "wrong number of arguments")
+}
+
+// CLIENT SETINFO must enforce exact arity too; the prior implementation
+// returned OK for any arity including zero operands, which silently
+// hid client bugs that real Redis would reject as wrong-arity. Pin the
+// "missing operands" and "extra operand" cases so a regression cannot
+// re-introduce the silent-success behaviour.
+func TestClient_SetInfo_RejectsWrongArity(t *testing.T) {
+	t.Parallel()
+
+	r := newHelloTestServer(t, true)
+
+	// CLIENT SETINFO with no operands (2 args total).
+	conn := &helloRecordingConn{}
+	r.client(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdClient), []byte("SETINFO"),
+	}})
+	require.Contains(t, conn.err, "wrong number of arguments")
+	require.NotEqual(t, "OK", conn.str,
+		"missing-operand SETINFO must not silently return OK")
+
+	// CLIENT SETINFO attr (3 args total) — missing value.
+	conn2 := &helloRecordingConn{}
+	r.client(conn2, redcon.Command{Args: [][]byte{
+		[]byte(cmdClient), []byte("SETINFO"), []byte("lib-name"),
+	}})
+	require.Contains(t, conn2.err, "wrong number of arguments")
+
+	// CLIENT SETINFO attr value extra (5 args total) — extra operand.
+	conn3 := &helloRecordingConn{}
+	r.client(conn3, redcon.Command{Args: [][]byte{
+		[]byte(cmdClient), []byte("SETINFO"), []byte("lib-name"), []byte("redis-go"), []byte("extra"),
+	}})
+	require.Contains(t, conn3.err, "wrong number of arguments")
+
+	// CLIENT SETINFO attr value (4 args total) — accepted shape.
+	conn4 := &helloRecordingConn{}
+	r.client(conn4, redcon.Command{Args: [][]byte{
+		[]byte(cmdClient), []byte("SETINFO"), []byte("lib-name"), []byte("redis-go"),
+	}})
+	require.Empty(t, conn4.err, "well-formed SETINFO must not produce an error")
+	require.Equal(t, "OK", conn4.str, "well-formed SETINFO replies OK")
 }

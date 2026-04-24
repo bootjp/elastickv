@@ -228,7 +228,7 @@ func checkClientArity(conn redcon.Conn, cmd redcon.Command, sub string, want int
 // CLIENT GETNAME gets the right answer without having to re-issue
 // CLIENT SETNAME.
 func clientSetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
-	if checkClientArity(conn, cmd, "SETNAME", clientSetNameMinArgs) {
+	if checkClientArity(conn, cmd, "SETNAME", clientSetNameArgCount) {
 		return
 	}
 	state.clientName = string(cmd.Args[2])
@@ -261,12 +261,24 @@ func (r *RedisServer) clientInfo(conn redcon.Conn, cmd redcon.Command, state *co
 	conn.WriteBulkString(fmt.Sprintf("id=%d addr=%s name=%s", id, conn.RemoteAddr(), state.clientName))
 }
 
+// clientSetInfo handles CLIENT SETINFO <attr> <value>. elastickv does
+// not persist the advertised attributes (lib-name / lib-ver, etc.), but
+// it MUST still enforce exact arity — otherwise `CLIENT SETINFO` with
+// no operands returns OK and masks a client bug that real Redis would
+// have surfaced as a wrong-arity error.
+func clientSetInfo(conn redcon.Conn, cmd redcon.Command) {
+	if checkClientArity(conn, cmd, "SETINFO", clientSetInfoArgCount) {
+		return
+	}
+	conn.WriteString("OK")
+}
+
 func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 	sub := strings.ToUpper(string(cmd.Args[1]))
 	state := getConnState(conn)
 	switch sub {
 	case "SETINFO":
-		conn.WriteString("OK")
+		clientSetInfo(conn, cmd)
 	case "SETNAME":
 		clientSetName(conn, cmd, state)
 	case "GETNAME":
@@ -298,9 +310,20 @@ const (
 	// helloReplyArrayLen is the number of elements in the flat
 	// alternating key/value reply: 7 pairs = 14 elements.
 	helloReplyArrayLen = 14
-	// clientSetNameMinArgs is the arg count at which CLIENT SETNAME
-	// has its <name> operand (CLIENT + SETNAME + name = 3).
-	clientSetNameMinArgs = 3
+	// clientSetNameArgCount is the EXACT cmd.Args length for CLIENT
+	// SETNAME (CLIENT + SETNAME + name = 3). Kept as an exact-arity
+	// constant — not a minimum — because checkClientArity compares
+	// `len(cmd.Args) == want`; renaming it to *MinArgs would invite a
+	// future refactor that "just" swaps the helper for a >= check and
+	// silently re-introduces the wrong-arity silent-OK bug.
+	clientSetNameArgCount = 3
+	// clientSetInfoArgCount is the EXACT cmd.Args length for CLIENT
+	// SETINFO (CLIENT + SETINFO + attr + value = 4). Real Redis
+	// rejects any other arity for `client|setinfo`; without this
+	// check we would keep returning OK for `CLIENT SETINFO` with no
+	// operands, matching exactly the silent-success behaviour this
+	// PR is supposed to eliminate for every CLIENT subcommand.
+	clientSetInfoArgCount = 4
 )
 
 // helloParseError is the internal signal used by parseHelloArgs to
