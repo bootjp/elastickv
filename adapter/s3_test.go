@@ -874,7 +874,7 @@ func newSignedS3Request(
 		signingTime,
 	)
 	require.NoError(t, err)
-	expectedAuth, err := buildS3AuthorizationHeader(req, testS3AccessKey, testS3SecretKey, testS3Region, signingTime, payloadHash)
+	expectedAuth, err := buildSigV4AuthorizationHeader(req, testS3AccessKey, testS3SecretKey, "s3", testS3Region, signingTime, payloadHash)
 	require.NoError(t, err)
 	require.Equal(t, strings.TrimSpace(req.Header.Get("Authorization")), expectedAuth)
 	return req

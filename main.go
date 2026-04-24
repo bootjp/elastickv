@@ -80,6 +80,8 @@ var (
 	s3CredsFile          = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyleOnly      = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	sqsAddr              = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsRegion            = flag.String("sqsRegion", "us-east-1", "SQS signing region")
+	sqsCredsFile         = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
 	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
 	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddr            = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
@@ -216,6 +218,8 @@ func run() error {
 		s3PathStyleOnly: *s3PathStyleOnly,
 		sqsAddress:      *sqsAddr,
 		leaderSQS:       cfg.leaderSQS,
+		sqsRegion:       *sqsRegion,
+		sqsCredsFile:    *sqsCredsFile,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
 		pprofAddress:    *pprofAddr,
@@ -840,6 +844,8 @@ type runtimeServerRunner struct {
 	s3PathStyleOnly bool
 	sqsAddress      string
 	leaderSQS       map[string]string
+	sqsRegion       string
+	sqsCredsFile    string
 	metricsAddress  string
 	metricsToken    string
 	pprofAddress    string
@@ -872,7 +878,7 @@ func (r runtimeServerRunner) start() error {
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS); err != nil {
+	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {

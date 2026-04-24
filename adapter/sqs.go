@@ -67,6 +67,8 @@ type SQSServer struct {
 	httpServer     *http.Server
 	targetHandlers map[string]func(http.ResponseWriter, *http.Request)
 	leaderSQS      map[string]string
+	region         string
+	staticCreds    map[string]string
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
@@ -141,6 +143,11 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeSQSError(w, http.StatusMethodNotAllowed, sqsErrMalformedRequest, "SQS JSON protocol requires POST")
+		return
+	}
+
+	if authErr := s.authorizeSQSRequest(r); authErr != nil {
+		writeSQSError(w, authErr.Status, authErr.Code, authErr.Message)
 		return
 	}
 

@@ -19,6 +19,8 @@ func startSQSServer(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	leaderSQS map[string]string,
+	region string,
+	credentialsFile string,
 ) error {
 	sqsAddr = strings.TrimSpace(sqsAddr)
 	if sqsAddr == "" {
@@ -28,11 +30,18 @@ func startSQSServer(
 	if err != nil {
 		return errors.Wrapf(err, "failed to listen on %s", sqsAddr)
 	}
+	staticCreds, err := loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
+	if err != nil {
+		_ = sqsL.Close()
+		return err
+	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
 		shardStore,
 		coordinate,
 		adapter.WithSQSLeaderMap(leaderSQS),
+		adapter.WithSQSRegion(region),
+		adapter.WithSQSStaticCredentials(staticCreds),
 	)
 	// Two-goroutine shutdown pattern mirrors startS3Server: one goroutine waits
 	// on either ctx.Done() or Run completion to call Stop, the other runs the
