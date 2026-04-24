@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -165,6 +166,28 @@ func seedWAL(t *testing.T, proposals [][]byte) string {
 	return dir
 }
 
+// truncateInsideLastRecord scans walPath for the end of written record
+// data (the first 8-byte aligned block of zeros in the preallocated tail)
+// and truncates a few bytes before that boundary so the truncation lands
+// inside framing rather than in the zero padding.
+func truncateInsideLastRecord(t *testing.T, walPath string) {
+	t.Helper()
+	data, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	end := len(data)
+	// Walk backwards 8 bytes at a time, skipping zeros, until we hit a
+	// block that isn't all zeros — that's where real record framing ends.
+	zeros := make([]byte, 8)
+	for end >= 8 && bytes.Equal(data[end-8:end], zeros) {
+		end -= 8
+	}
+	require.Greater(t, end, 16, "WAL has no non-zero content; seedWAL likely didn't propose anything")
+	// Lop off the final 5 bytes of real framing — enough to corrupt the
+	// trailing record's length prefix or payload so wal.ReadAll surfaces
+	// io.ErrUnexpectedEOF instead of a clean EOF.
+	require.NoError(t, os.Truncate(walPath, int64(end-5)))
+}
+
 // lastWALFile returns the path of the lexicographically-last .wal in dir.
 // etcd WAL filenames are seq-index padded, so lexicographic order matches
 // sequence order.
@@ -191,15 +214,14 @@ func TestLoadWalStateRepairsTruncatedTail(t *testing.T) {
 	dir := seedWAL(t, [][]byte{[]byte("one"), []byte("two"), []byte("three")})
 
 	// Chop bytes off the tail to simulate a mid-record SIGKILL. etcd
-	// preallocates 64MiB per WAL with zero padding; truncating inside
-	// the padded tail still leaves valid earlier records intact. We
-	// truncate past the zero padding and into actual framing so
-	// ReadAll surfaces io.ErrUnexpectedEOF rather than silently
-	// stopping at the zero frame.
+	// preallocates 64MiB per WAL with zero padding, so we must find the
+	// actual end of written records and truncate *inside* framing;
+	// truncating in the zero-padded region leaves valid records intact
+	// and the decoder stops cleanly at the zero length header (no
+	// ErrUnexpectedEOF → repair wouldn't trigger, test would pass for
+	// the wrong reason).
 	walPath := lastWALFile(t, filepath.Join(dir, walDirName))
-	info, err := os.Stat(walPath)
-	require.NoError(t, err)
-	require.NoError(t, os.Truncate(walPath, info.Size()-(64*1024+16)))
+	truncateInsideLastRecord(t, walPath)
 
 	// Re-open: loadWalState → openAndReadWAL → repair → succeed.
 	fsm := &testStateMachine{}
