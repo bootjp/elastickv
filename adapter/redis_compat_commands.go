@@ -4769,8 +4769,9 @@ func parseStreamBoundID(raw string, upper, exclusive bool) (uint64, uint64, bool
 	}
 	// Upper inclusive bounds need seq=MaxUint64 so the caller's +1 shift
 	// produces (ms+1)-0, covering the entire ms row. All other
-	// combinations use seq=0: lower bounds start at ms-0, and upper
-	// exclusive bounds stop before ms-0 (excluding the whole ms).
+	// combinations use seq=0: lower inclusive starts at ms-0, lower
+	// exclusive starts at ms-0 then the caller shifts to ms-1, and upper
+	// exclusive stops before ms-0 (excluding the whole ms).
 	if upper && !exclusive {
 		return ms, ^uint64(0), true
 	}
