@@ -59,6 +59,8 @@ type xreadResult struct {
 }
 
 type xaddRequest struct {
+	// maxLen is -1 when no MAXLEN clause was given, 0 for explicit MAXLEN 0,
+	// or a positive value for MAXLEN <n>.
 	maxLen int
 	id     string
 	fields []string
@@ -3562,7 +3564,7 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 func parseXAddMaxLen(args [][]byte) (int, int, error) {
 	argIndex := redisPairWidth
 	if len(args) < 5 || !strings.EqualFold(string(args[argIndex]), "MAXLEN") {
-		return 0, argIndex, nil
+		return -1, argIndex, nil
 	}
 
 	argIndex++
@@ -3621,6 +3623,11 @@ func nextXAddID(hasLast bool, lastMs, lastSeq uint64, requested string) (string,
 		requestedID, requestedValid := tryParseRedisStreamID(requested)
 		if !requestedValid {
 			return "", errors.New("ERR Invalid stream ID specified as stream command argument")
+		}
+		// Redis rejects IDs <= 0-0 unconditionally; a stream entry with
+		// ID "0-0" is unreachable via XREAD ... 0 (which means "after 0-0").
+		if requestedID.ms == 0 && requestedID.seq == 0 {
+			return "", errors.New("ERR The ID specified in XADD must be greater than 0-0")
 		}
 		if hasLast && compareStreamIDs(requestedID.ms, requestedID.seq, lastMs, lastSeq) <= 0 {
 			return "", errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
@@ -3746,11 +3753,11 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 }
 
 // xaddEnforceMaxWideColumn rejects an XADD that would push the stream past
-// maxWideColumnItems when no MAXLEN clause could rescue it. A MAXLEN <= the
-// cap keeps the committed length bounded even when meta.Length is already
-// at the ceiling, so we only reject on the ungated path.
+// maxWideColumnItems when no MAXLEN clause could rescue it. A MAXLEN >= 0
+// and <= the cap keeps the committed length bounded even when meta.Length is
+// already at the ceiling, so we only reject on the ungated path.
 func xaddEnforceMaxWideColumn(key []byte, currentLength int64, maxLen int) error {
-	if maxLen > 0 && maxLen <= maxWideColumnItems {
+	if maxLen >= 0 && maxLen <= maxWideColumnItems {
 		return nil
 	}
 	if currentLength < int64(maxWideColumnItems) {
@@ -3766,7 +3773,7 @@ func xaddEnforceMaxWideColumn(key []byte, currentLength int64, maxLen int) error
 // it. Used only as a capacity hint for the elems slice; the actual trim
 // list is computed by xaddTrimIfNeeded.
 func estimateXAddTrimCount(maxLen int, currentLength int64) int {
-	if maxLen <= 0 {
+	if maxLen < 0 {
 		return 0
 	}
 	nextLen := currentLength + 1
@@ -3776,10 +3783,11 @@ func estimateXAddTrimCount(maxLen int, currentLength int64) int {
 	return int(nextLen) - maxLen
 }
 
-// When maxLen == 0 or the new length fits under it, no trim is emitted and
-// trimElems is nil; otherwise Del operations for the oldest entries are
-// returned and finalLength equals maxLen. All scans use the caller's ctx
-// and readTS so the trim happens at the same MVCC snapshot as the write.
+// When maxLen < 0 (unset) or the new length fits under it, no trim is
+// emitted and trimElems is nil; otherwise Del operations for the oldest
+// entries are returned and finalLength equals maxLen. All scans use the
+// caller's ctx and readTS so the trim happens at the same MVCC snapshot
+// as the write.
 func (r *RedisServer) xaddTrimIfNeeded(
 	ctx context.Context,
 	key []byte,
@@ -3789,7 +3797,7 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	migrationActive bool,
 	existingEntries []redisStreamEntry,
 ) (int64, []*kv.Elem[kv.OP], error) {
-	if maxLen <= 0 || candidateLen <= int64(maxLen) {
+	if maxLen < 0 || candidateLen <= int64(maxLen) {
 		return candidateLen, nil, nil
 	}
 	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, migrationActive, existingEntries, int(candidateLen)-maxLen)

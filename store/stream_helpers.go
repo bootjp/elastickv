@@ -26,6 +26,13 @@ const (
 	streamMetaLengthSignBit = 63
 )
 
+// Pre-computed byte-slice prefixes to avoid per-call []byte(string)
+// allocations in hot-path predicates (IsStreamMetaKey, IsStreamEntryKey, etc.).
+var (
+	streamMetaPrefixBytes  = []byte(StreamMetaPrefix)
+	streamEntryPrefixBytes = []byte(StreamEntryPrefix)
+)
+
 // StreamMeta is the per-stream metadata. Length is authoritative for XLEN;
 // LastMs/LastSeq track the highest ID ever appended so XADD '*' stays
 // strictly monotonic even after XTRIM removes the current tail.
@@ -127,17 +134,17 @@ func ExtractStreamEntryID(entryKey, userKey []byte) (ms, seq uint64, ok bool) {
 
 // IsStreamMetaKey reports whether the key is a stream metadata key.
 func IsStreamMetaKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(StreamMetaPrefix))
+	return bytes.HasPrefix(key, streamMetaPrefixBytes)
 }
 
 // IsStreamEntryKey reports whether the key is a stream entry key.
 func IsStreamEntryKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(StreamEntryPrefix))
+	return bytes.HasPrefix(key, streamEntryPrefixBytes)
 }
 
 // ExtractStreamUserKeyFromMeta extracts the logical user key from a stream meta key.
 func ExtractStreamUserKeyFromMeta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(StreamMetaPrefix))
+	trimmed := bytes.TrimPrefix(key, streamMetaPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize {
 		return nil
 	}

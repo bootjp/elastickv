@@ -488,10 +488,11 @@ func TestXAddEnforceMaxWideColumn(t *testing.T) {
 		maxLen   int
 		wantFail bool
 	}{
-		{"below-cap-no-maxlen", ceiling - 1, 0, false},
-		{"at-cap-no-maxlen", ceiling, 0, true},
-		{"above-cap-no-maxlen", ceiling + 5, 0, true},
+		{"below-cap-no-maxlen", ceiling - 1, -1, false},
+		{"at-cap-no-maxlen", ceiling, -1, true},
+		{"above-cap-no-maxlen", ceiling + 5, -1, true},
 		{"at-cap-bounded-maxlen", ceiling, 10, false},
+		{"at-cap-maxlen-zero", ceiling, 0, false},
 		{"above-cap-bounded-maxlen", ceiling + 5, maxWideColumnItems, false},
 		{"at-cap-maxlen-too-large", ceiling, maxWideColumnItems + 1, true},
 	}

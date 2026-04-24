@@ -1508,8 +1508,8 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 		// !stream|meta| keys are length-prefixed (see store.StreamMetaKey):
 		// a pattern-bound scan over the raw prefix would mask out every
 		// migrated stream because the user-key bytes do not start at
-		// prefix[len(prefix):]. Delegate to the wide-column scan below
-		// which uses StreamMetaScanPrefix(start) to place the user-key
+		// prefix[len(prefix):]. Delegate to the wide-column scan below,
+		// which uses streamMetaScanStart(start) to place the user-key
 		// lower bound past the length field.
 		if prefix == store.StreamMetaPrefix {
 			continue
