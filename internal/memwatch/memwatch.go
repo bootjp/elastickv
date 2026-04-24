@@ -171,6 +171,14 @@ func (w *Watcher) Start(ctx context.Context) {
 		return
 	}
 
+	// Sample once before the first tick: if the process is already above
+	// the threshold at Start (crashloop-restart after OOM, large startup
+	// allocations, etc.), waiting for the first ticker cycle can let the
+	// kernel OOM-kill the process we were supposed to protect.
+	if w.checkAndMaybeFire() {
+		return
+	}
+
 	ticker := time.NewTicker(w.cfg.PollInterval)
 	defer ticker.Stop()
 
