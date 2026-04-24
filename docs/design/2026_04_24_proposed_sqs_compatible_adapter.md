@@ -309,7 +309,7 @@ Details:
 1. Fence the snapshot scan with `coordinator.LeaseReadForKey(ctx, queueRoute)`. While the lease is valid (≤ `electionTimeout − leaseSafetyMargin`, currently 700 ms per `docs/design/2026_04_20_implemented_lease_read.md §3.2`) this returns immediately with no ReadIndex round-trip. Under sustained receive load this amortizes quorum confirmation across every receive in the lease window instead of paying one ReadIndex per call.
 2. Snapshot-scan the visibility index for keys with `visible_at ≤ now`. Standard queues read in page-sized chunks (page limit 1024) and stop once either `MaxNumberOfMessages` candidates survive the filter or the scan is exhausted; a small `2 * k` page is fine because Standard has no filter that can hide an unbounded prefix. FIFO queues **cannot** cap the scan at `2 * k` because an entire page can legitimately belong to groups whose locks are already held, hiding deliverable messages that sit further along in the index. FIFO receive instead continues paging forward (resuming from the last key returned) until `MaxNumberOfMessages` candidates survive the group-lock and dedup filters, or the end-of-range sentinel `visible_at = now+1` is reached. A soft wall-clock budget (e.g., 100 ms) on the overall scan caps latency when the queue is pathologically group-skewed, in which case the receive returns whatever it has accumulated.
 3. Filter FIFO candidates: skip any message whose group lock is held by another message; acquire the group lock on delivery. Candidates rejected by this filter must not consume the `MaxNumberOfMessages` budget.
-4. Run one OCC transaction per batch: for each candidate, verify the visibility entry still matches, rotate receipt token, set `visible_at_hlc = now + effective_timeout`, insert the new visibility entry, bump `receive_count` and `approximate_first_receive_timestamp`, acquire FIFO group lock if applicable. A successful `Propose` also refreshes the lease (per `§3.3` of the lease-read doc), so a busy queue keeps its fast path warm without any extra work.
+4. Run one OCC transaction per batch: for each candidate, verify the visibility entry still matches, rotate receipt token, set `visible_at_hlc = now + effective_timeout`, insert the new visibility entry, bump `receive_count`, **set `approximate_first_receive_timestamp` only on the first delivery** (subsequent redeliveries must preserve the original value — it is defined as the time the message was first received), and acquire FIFO group lock if applicable. A successful `Propose` also refreshes the lease (per `§3.3` of the lease-read doc), so a busy queue keeps its fast path warm without any extra work.
 5. If the batch is empty and `WaitTimeSeconds > 0`, register a waiter on the queue's in-process condition variable and re-run step 1 on wake or timeout. Do not poll in a tight loop. On re-scan, the `LeaseRead` fence from step 1 stays local for the whole long-poll window — empty long polls cost O(1) quorum operations, not O(ticks).
 6. If `receive_count > redrive_policy.maxReceiveCount`, move the message to the DLQ (see §7.6) atomically within the receive transaction and do not return it to the caller.
 
@@ -330,18 +330,28 @@ The notifier subscribes to the local FSM commit stream, not the RPC path, so tha
 
 ### 7.4 `DeleteMessage`
 
-1. Parse receipt handle → `(queue_gen, message_id, receipt_token)`.
-2. OCC transaction:
-   - Load `!sqs|msg|data|<queue><gen><message_id>`. Missing → `ReceiptHandleIsInvalid`.
-   - Compare `current_receipt_token`. Mismatch → `InvalidReceiptHandle`.
-   - Delete the data record, the current visibility index entry, and (FIFO) release the group lock.
-3. `DeleteMessageBatch` aggregates entries into one multi-row OCC transaction and returns per-entry success/failure.
+AWS SQS `DeleteMessage` is **idempotent against stale receipt handles**: a caller that retries a delete after the visibility timeout expired (and a new consumer has since received the same message under a rotated token) is not an error case — SQS returns 200 success without deleting the now-in-flight record. Batch workers and SDK retry paths rely on this to avoid double-delivery failures, so this adapter preserves that behavior.
+
+1. Parse the receipt handle → `(queue_gen, message_id, receipt_token)`.
+   - If the handle is structurally malformed (bad base64, wrong length, wrong version byte) return `ReceiptHandleIsInvalid`. This is the only error case.
+2. Load `!sqs|msg|data|<queue><gen><message_id>` at a snapshot timestamp.
+   - **Missing record**: return 200 success. The message has already been deleted (either by us on a prior retry or by another consumer); the delete is a no-op.
+   - **Token mismatch**: return 200 success **without deleting**. The caller is holding a stale handle after a rotation; the current in-flight consumer keeps its message.
+   - **Token matches**: continue.
+3. OCC transaction (with `ReadKeys` covering the data key and the current visibility entry) deletes the data record, the current visibility index entry, and (FIFO) releases the group lock. On `ErrWriteConflict` the whole pass — including step 2's token check — is retried so that a concurrent rotation that landed between our load and our commit is handled as a stale-handle no-op rather than a spurious delete.
+4. `DeleteMessageBatch` aggregates entries into one multi-row OCC transaction and returns per-entry success/failure, applying the same stale-handle-is-success rule per entry.
 
 ### 7.5 `ChangeMessageVisibility`
 
-1. Validate receipt handle and token as in `DeleteMessage`.
+Unlike `DeleteMessage`, `ChangeMessageVisibility` requires an in-flight record and a matching token — AWS returns errors on stale handles because the caller is trying to reach into a specific delivery. The adapter follows suit.
+
+1. Parse the receipt handle. Malformed → `ReceiptHandleIsInvalid`.
 2. Reject if `VisibilityTimeout > 12 hours` or negative.
-3. OCC: delete old visibility entry, update `visible_at_hlc`, insert new visibility entry. Receipt token is **not** rotated (AWS does not rotate it for `ChangeMessageVisibility`).
+3. Load the data record.
+   - Missing record → `ReceiptHandleIsInvalid` (SQS `MessageNotInflight` on the record, but we reuse the structural code).
+   - Token mismatch → `InvalidReceiptHandle`.
+   - `visible_at_hlc <= now` (already expired back to visible) → `MessageNotInflight`.
+4. OCC (with `ReadKeys` on data + old vis entry): delete old visibility entry, update `visible_at_hlc`, insert new visibility entry. The receipt token is **not** rotated (AWS does not rotate it for `ChangeMessageVisibility`).
 
 ### 7.6 DLQ redrive
 
