@@ -552,8 +552,11 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 //
 // User-bounded scans (XREAD/XRANGE/XREVRANGE) use
 // scanStreamEntriesAfter / rangeStreamNewLayout. For the
-// materialise-everything path, expectedLen <= 0 intentionally yields an
-// empty result; otherwise we cap the scan at meta.Length plus slack,
+// materialise-everything path, expectedLen <= 0 represents an empty or
+// uninitialized stream (meta.Length == 0) and intentionally yields an
+// empty slice — this is the correct state for a newly-created or empty
+// stream; callers need not distinguish it from a missing stream.
+// When expectedLen > 0 we cap the scan at meta.Length plus slack,
 // matching existing store ScanAt semantics for non-positive limits.
 func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
@@ -948,7 +951,10 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 // entry scan prefix. Total results are capped at maxWideColumnItems to
 // prevent unbounded memory growth; DEL/EXPIRE 0/MULTI-EXEC DEL on a stream
 // that exceeds the cap returns ErrCollectionTooLarge, consistent with other
-// wide-column types.
+// wide-column types (Hash, Set, ZSet). Streams are also capped at
+// maxWideColumnItems via xaddEnforceMaxWideColumn in XADD, so a stream that
+// migrated from a legacy blob larger than the cap will require a XTRIM before
+// it can be deleted.
 func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	var elems []*kv.Elem[kv.OP]
 	metaKey := store.StreamMetaKey(key)
