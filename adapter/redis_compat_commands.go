@@ -4259,11 +4259,11 @@ func selectXReadEntries(entries []redisStreamEntry, afterID string, count int) [
 	return entries[start:end]
 }
 
-func (r *RedisServer) xreadOnce(req xreadRequest) ([]xreadResult, error) {
+func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			return nil, err
 		}
@@ -4274,7 +4274,7 @@ func (r *RedisServer) xreadOnce(req xreadRequest) ([]xreadResult, error) {
 			return nil, wrongTypeError()
 		}
 
-		entries, err := r.readStreamAfter(context.Background(), key, readTS, req.afterIDs[i], req.count)
+		entries, err := r.readStreamAfter(ctx, key, readTS, req.afterIDs[i], req.count)
 		if err != nil {
 			return nil, err
 		}
@@ -4450,7 +4450,17 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	for {
-		results, err := r.xreadOnce(req)
+		// Derive a per-iteration context from the BLOCK deadline so
+		// ScanAt/ReverseScanAt respect the remaining BLOCK window.
+		// Each iteration also caps at redisDispatchTimeout to avoid
+		// holding storage resources longer than a single dispatch.
+		iterTimeout := time.Until(deadline)
+		if iterTimeout > redisDispatchTimeout {
+			iterTimeout = redisDispatchTimeout
+		}
+		iterCtx, iterCancel := context.WithTimeout(context.Background(), iterTimeout)
+		results, err := r.xreadOnce(iterCtx, req)
+		iterCancel()
 		if err != nil {
 			conn.WriteError(err.Error())
 			return

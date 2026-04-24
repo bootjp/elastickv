@@ -268,14 +268,18 @@ func extractRedisInternalUserKey(key []byte) []byte {
 			return bytes.TrimPrefix(key, prefix)
 		}
 	}
-	// Post-migration streams: the meta record reverse-maps to the logical
-	// key, while entry rows are internal-only so KEYS never emits one line
-	// per entry. redisTTLPrefix is also internal-only.
+	// Post-migration streams: both meta and entry keys reverse-map to the
+	// logical user key so coordinator routing (doGetAt) and retryable-error
+	// normalization (normalizeRetryableRedisTxnKey) resolve to the correct
+	// stream. KEYS/SCAN visibility is separately gated by
+	// streamWideColumnVisibleUserKey which returns (nil, true) for entry
+	// keys, so this path is never reached from the key-enumeration code.
+	// redisTTLPrefix is internal-only.
 	switch {
 	case store.IsStreamMetaKey(key):
 		return store.ExtractStreamUserKeyFromMeta(key)
 	case store.IsStreamEntryKey(key):
-		return nil
+		return store.ExtractStreamUserKeyFromEntry(key)
 	case bytes.HasPrefix(key, redisTTLPrefixBytes):
 		return nil
 	default:
