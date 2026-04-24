@@ -502,11 +502,22 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
+	metaKey := sqsQueueMetaKey(requested.Name)
+	genKey := sqsQueueGenKey(requested.Name)
+	// StartTS pins OCC to the snapshot we took the existence + generation
+	// read at, and ReadKeys cover both the meta and generation records so
+	// a concurrent CreateQueue that committed between our read and our
+	// dispatch causes ErrWriteConflict and the retry loop re-reads.
+	// Without this, two races could both decide "queue missing" and both
+	// write their own generation, leaving the later write on top of a
+	// record the loser never observed.
 	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{metaKey, genKey},
 		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: sqsQueueMetaKey(requested.Name), Value: metaBytes},
-			{Op: kv.Put, Key: sqsQueueGenKey(requested.Name), Value: []byte(strconv.FormatUint(requested.Generation, 10))},
+			{Op: kv.Put, Key: metaKey, Value: metaBytes},
+			{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(requested.Generation, 10))},
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
@@ -554,11 +565,17 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		metaKey := sqsQueueMetaKey(queueName)
+		genKey := sqsQueueGenKey(queueName)
+		// StartTS + ReadKeys fence against a concurrent CreateQueue /
+		// SetQueueAttributes landing between our load and dispatch.
 		req := &kv.OperationGroup[kv.OP]{
-			IsTxn: true,
+			IsTxn:    true,
+			StartTS:  readTS,
+			ReadKeys: [][]byte{metaKey, genKey},
 			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: sqsQueueMetaKey(queueName)},
-				{Op: kv.Put, Key: sqsQueueGenKey(queueName), Value: []byte(strconv.FormatUint(lastGen+1, 10))},
+				{Op: kv.Del, Key: metaKey},
+				{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(lastGen+1, 10))},
 			},
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
@@ -812,10 +829,16 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		metaKey := sqsQueueMetaKey(queueName)
+		// StartTS + ReadKeys prevent two concurrent SetQueueAttributes
+		// from both reading the same old meta and the later dispatch
+		// clobbering the earlier commit's changes.
 		req := &kv.OperationGroup[kv.OP]{
-			IsTxn: true,
+			IsTxn:    true,
+			StartTS:  readTS,
+			ReadKeys: [][]byte{metaKey},
 			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Put, Key: sqsQueueMetaKey(queueName), Value: metaBytes},
+				{Op: kv.Put, Key: metaKey, Value: metaBytes},
 			},
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
