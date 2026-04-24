@@ -326,19 +326,53 @@ func (r *RedisServer) writeCommandInfo(conn redcon.Conn, requested [][]byte) {
 	}
 }
 
-// writeCommandDocs emits the minimum shape real clients check for:
-// a 4-element map-shaped array per requested command with "summary" and
-// "arguments" keys. We do not maintain per-command docs, so the summary
-// is empty and the arguments array is empty. Unknown commands produce a
-// nil entry, matching Redis semantics.
+// writeCommandDocs emits the RESP2 flat-map form of COMMAND DOCS:
+// alternating command-name keys and 4-element doc-maps with "summary"
+// and "arguments" fields. Two compliance-critical behaviours:
+//
+//  1. Bare `COMMAND DOCS` (no names) returns docs for ALL routed
+//     commands, identical to how `COMMAND INFO` and bare `COMMAND`
+//     behave. Clients/tools like redis-cli --docs rely on this.
+//  2. Every requested entry writes BOTH the command-name key AND the
+//     doc map value. Clients decode the top-level array as a map of
+//     name -> docs, so skipping the name key makes the reply
+//     unparseable. Unknown commands emit the requested name followed
+//     by nil (Redis semantics).
+//
+// We do not maintain per-command docs, so summary is "" and arguments
+// is empty. The wire-shape is what clients care about at connect time.
 func (r *RedisServer) writeCommandDocs(conn redcon.Conn, requested [][]byte) {
 	const docEntryLen = 4
-	conn.WriteArray(len(requested))
+	// Bare DOCS (no command names): iterate the routed set so the
+	// reply mirrors `COMMAND` / `COMMAND INFO` / `COMMAND LIST`.
+	if len(requested) == 0 {
+		metas := routedRedisCommandMetas()
+		// Two wire slots per command (name + doc map).
+		conn.WriteArray(len(metas) * 2) //nolint:mnd // 2 = (name, docs) pair
+		for _, meta := range metas {
+			conn.WriteBulkString(meta.Name)
+			conn.WriteArray(docEntryLen)
+			conn.WriteBulkString("summary")
+			conn.WriteBulkString("")
+			conn.WriteBulkString("arguments")
+			conn.WriteArray(0)
+		}
+		return
+	}
+	// Explicit names: preserve the caller-supplied order so a client
+	// that expects its own request ordering back (e.g. for building a
+	// lookup table) is not surprised. Each pair is (name, docs) or
+	// (name, nil) for unknowns.
+	conn.WriteArray(len(requested) * 2) //nolint:mnd // 2 = (name, docs) pair
 	for _, raw := range requested {
-		if _, ok := redisCommandTable[strings.ToUpper(string(raw))]; !ok {
+		name := string(raw)
+		meta, ok := redisCommandTable[strings.ToUpper(name)]
+		if !ok {
+			conn.WriteBulkString(name)
 			conn.WriteNull()
 			continue
 		}
+		conn.WriteBulkString(meta.Name)
 		conn.WriteArray(docEntryLen)
 		conn.WriteBulkString("summary")
 		conn.WriteBulkString("")

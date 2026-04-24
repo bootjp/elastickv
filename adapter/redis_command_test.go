@@ -311,16 +311,57 @@ func TestCommandList_RejectsFilterBy(t *testing.T) {
 func TestCommandDocs_Get(t *testing.T) {
 	t.Parallel()
 	conn := runCommand(t, "COMMAND", "DOCS", "GET")
-	// outer array of 1, then 4-element map-shaped array.
+	// RESP2 flat-map shape: outer array of 2 (name + doc-map pair),
+	// then a name bulk string, then a 4-element map-shaped doc-map.
 	require.Equal(t, "array", conn.writes[0].op)
-	require.Equal(t, 1, conn.writes[0].n)
-	require.Equal(t, "array", conn.writes[1].op)
-	require.Equal(t, 4, conn.writes[1].n)
-	require.Equal(t, "summary", conn.writes[2].s)
-	require.Equal(t, "", conn.writes[3].s)
-	require.Equal(t, "arguments", conn.writes[4].s)
-	require.Equal(t, "array", conn.writes[5].op)
-	require.Equal(t, 0, conn.writes[5].n)
+	require.Equal(t, 2, conn.writes[0].n, "outer array must be (name, docs) pair")
+	require.Equal(t, "bulk", conn.writes[1].op)
+	require.Equal(t, "get", conn.writes[1].s)
+	require.Equal(t, "array", conn.writes[2].op)
+	require.Equal(t, 4, conn.writes[2].n)
+	require.Equal(t, "summary", conn.writes[3].s)
+	require.Equal(t, "", conn.writes[4].s)
+	require.Equal(t, "arguments", conn.writes[5].s)
+	require.Equal(t, "array", conn.writes[6].op)
+	require.Equal(t, 0, conn.writes[6].n)
+}
+
+// TestCommandDocs_BareReturnsAllDocs pins that bare COMMAND DOCS
+// (no command names) returns docs for every routed command, matching
+// real Redis semantics. Previously bare DOCS returned an empty
+// array, which broke redis-cli --docs and any client that relied on
+// the default full-docs behaviour.
+func TestCommandDocs_BareReturnsAllDocs(t *testing.T) {
+	t.Parallel()
+	conn := runCommand(t, "COMMAND", "DOCS")
+	require.Equal(t, "array", conn.writes[0].op)
+	// Outer array is 2 × routed-command-count (each command contributes
+	// a name key and a doc-map value slot).
+	wantOuterLen := len(routedRedisCommandMetas()) * 2
+	require.Equal(t, wantOuterLen, conn.writes[0].n,
+		"bare COMMAND DOCS must emit (name, docs) for every routed command")
+	// First pair: name bulk, then 4-element doc map.
+	require.Equal(t, "bulk", conn.writes[1].op)
+	require.NotEmpty(t, conn.writes[1].s)
+	require.Equal(t, "array", conn.writes[2].op)
+	require.Equal(t, 4, conn.writes[2].n)
+	require.Equal(t, "summary", conn.writes[3].s)
+}
+
+// TestCommandDocs_UnknownReturnsNamedNil pins the Redis "unknown
+// command" shape for DOCS: the requested name key is still written
+// (preserving the flat-map layout) but its value is nil. A client
+// decoding the response as a map then sees `"FOO" -> nil`, which is
+// the canonical "we acknowledged your question, we just have no
+// entry" reply.
+func TestCommandDocs_UnknownReturnsNamedNil(t *testing.T) {
+	t.Parallel()
+	conn := runCommand(t, "COMMAND", "DOCS", "NOSUCH")
+	require.Equal(t, "array", conn.writes[0].op)
+	require.Equal(t, 2, conn.writes[0].n)
+	require.Equal(t, "bulk", conn.writes[1].op)
+	require.Equal(t, "NOSUCH", conn.writes[1].s)
+	require.Equal(t, "null", conn.writes[2].op)
 }
 
 func TestCommand_UnknownSubcommand(t *testing.T) {
