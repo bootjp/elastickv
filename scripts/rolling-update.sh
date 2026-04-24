@@ -62,6 +62,18 @@ Optional environment:
     Each pair must be KEY=VALUE with a non-empty KEY; pairs themselves must not
     contain whitespace.
 
+    DEFAULT_EXTRA_ENV defaults to "GOMEMLIMIT=1800MiB" (Go runtime soft memory
+    ceiling; GC works harder before approaching the hard --memory limit so the
+    kernel OOM killer is not triggered). Merged with EXTRA_ENV before forwarding;
+    if a user-supplied EXTRA_ENV entry sets the same KEY, the user value wins.
+    Set DEFAULT_EXTRA_ENV="" to disable the default.
+
+  CONTAINER_MEMORY_LIMIT
+    docker run --memory value (default: 2500m). Hard container-scoped memory
+    ceiling; any OOM kill is contained to the elastickv container rather than
+    cascading to host processes (e.g. qemu-guest-agent, systemd). Paired with
+    GOMEMLIMIT=1800MiB so Go GC preempts the kill. Set to "" to disable.
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
@@ -113,6 +125,9 @@ SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+# Container OOM defenses. See usage() for rationale. Empty string disables.
+DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
+CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -427,6 +442,7 @@ update_one_node() {
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
+      CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -707,10 +723,20 @@ run_container() {
     done
   fi
 
+  # Optional hard container-scoped memory limit. Keeps any OOM kill contained
+  # to the elastickv container rather than cascading to host processes
+  # (e.g. qemu-guest-agent, systemd). Pair with GOMEMLIMIT via EXTRA_ENV so
+  # the Go runtime GCs before the kernel kills the container.
+  local memory_flags=()
+  if [[ -n "${CONTAINER_MEMORY_LIMIT:-}" ]]; then
+    memory_flags=(--memory "$CONTAINER_MEMORY_LIMIT")
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
+    "${memory_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
     "${extra_env_flags[@]}" \
@@ -868,9 +894,52 @@ ensure_remote_raftadmin_binaries
 # CR handling additionally covers deploy.env files edited on Windows.
 # `${EXTRA_ENV:-}` is required because `set -u` is active and EXTRA_ENV
 # may be unset (the variable is optional in deploy.env).
-EXTRA_ENV_NORMALISED="${EXTRA_ENV:-}"
-EXTRA_ENV_NORMALISED="${EXTRA_ENV_NORMALISED//[$'\t\r\n']/ }"
+# Merge DEFAULT_EXTRA_ENV (operator-safety defaults like GOMEMLIMIT) with any
+# user-supplied EXTRA_ENV. User-supplied KEYs win over defaults for the same
+# KEY; the remote parser forwards pairs via `-e KEY=VALUE` so docker evaluates
+# the last occurrence, which means pre-pending defaults is correct: later user
+# entries override earlier defaults. We still de-duplicate here so the printed
+# command line stays clean.
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV:-}"
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV_USER_NORMALISED//[$'\t\r\n']/ }"
+EXTRA_ENV_DEFAULT_NORMALISED="${DEFAULT_EXTRA_ENV:-}"
+EXTRA_ENV_DEFAULT_NORMALISED="${EXTRA_ENV_DEFAULT_NORMALISED//[$'\t\r\n']/ }"
+
+merge_extra_env() {
+  local defaults="$1"
+  local user="$2"
+  local -A seen=()
+  local -a user_pairs=()
+  local -a default_pairs=()
+  local pair key merged=""
+
+  read -r -a user_pairs <<< "$user"
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    seen["$key"]=1
+  done
+
+  read -r -a default_pairs <<< "$defaults"
+  for pair in "${default_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    if [[ -z "${seen[$key]:-}" ]]; then
+      merged+="${merged:+ }$pair"
+    fi
+  done
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    merged+="${merged:+ }$pair"
+  done
+  printf '%s' "$merged"
+}
+
+EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
+CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
