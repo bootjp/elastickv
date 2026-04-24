@@ -31,6 +31,7 @@ The goal is SQS compatibility for standard AWS SDK/CLI workflows against a self-
 4. Provide durable, Raft-replicated storage of queues and in-flight messages so that leader failover preserves every committed send, receive, and delete.
 5. Support long polling (`WaitTimeSeconds` up to 20 seconds) without busy-waiting.
 6. Reuse the DynamoDB/S3 adapter conventions for SigV4 auth, leader detection, leader proxying, and metrics.
+7. Ship an operator-facing web console (§13) for browsing queues, peeking messages, and running administrative actions, on its own listener with token-based auth distinct from SigV4.
 
 ### 2.2 Non-goals
 
@@ -418,6 +419,9 @@ New server flags (parallel to `--s3*` and DynamoDB flags):
 4. `--sqsCredentialsFile`
 5. `--sqsEndpointBase` — base URL for emitted `QueueUrl` values (defaults to request `Host`).
 6. `--sqsMaxMessageBytes` — cluster-wide ceiling; defaults to 262144.
+7. `--consoleAddress` — listener for the operator web console; empty disables. See §13.
+8. `--consoleToken` — bearer token required on the console listener when it is not loopback-only.
+9. `--consoleReadOnly` — when true, the console listener refuses mutating actions (Send / Purge / Delete / Create).
 
 New metrics (prefixed `sqs_`):
 
@@ -478,7 +482,153 @@ Structured log fields match the rest of the project: `queue`, `message_id`, `rec
 
 Under `jepsen/sqs/`, add `standard` and `fifo` test variants mirroring the existing Redis/DynamoDB harnesses, with `partition`, `kill`, and `clock-skew` nemeses. Treat duplicate delivery inside the visibility window or within the FIFO dedup window as a failure.
 
-## 13. Rollout Plan
+## 13. Console UI
+
+A browser-based management console is bundled with the adapter so operators can inspect queues, send test messages, and run administrative actions (purge, delete) without reaching for a CLI. It is a first-class feature of the SQS surface, not a follow-up tool.
+
+### 13.1 Goals and non-goals
+
+Goals:
+
+1. Read-only queue browsing from any node (uses the same `LeaseRead` fast path as §7.8).
+2. Send, peek, purge, and delete against any queue, with visible leader routing so writes never quietly land on a follower.
+3. Zero external build toolchain — shipped as a `go:embed` static bundle.
+4. Operator-friendly auth that is distinct from the SigV4 credentials used by AWS SDK clients, so a human does not need to install `aws sigv4 curl` to load the console.
+
+Non-goals:
+
+1. Multi-tenant RBAC. Milestone 1 treats the console as single-role: whoever has the admin token can do anything.
+2. Graphical metrics. Grafana already owns that surface; the console links out to the existing dashboards rather than duplicating them.
+3. Message editing after send. SQS semantics do not support edit-in-place and neither does this console.
+
+### 13.2 Serving model
+
+The console runs on its own listener, controlled by a new `--consoleAddress` flag, exactly like `--metricsAddress` and `--pprofAddress`. Rationale:
+
+1. Operators usually restrict console access to an internal VLAN or SSH tunnel. A separate port lets them firewall the console without touching the SQS API port.
+2. The SQS API port is SigV4-only; the console port uses bearer tokens. Mixing the two authenticators on one port is error-prone.
+3. Running the console on loopback by default makes the zero-config development posture safe.
+
+```
+--consoleAddress "localhost:8090"          # TCP host+port; empty disables
+--consoleToken   ""                        # bearer token; required for non-loopback
+--consoleReadOnly false                    # if true, the console refuses mutating actions
+```
+
+`monitoring.AddressRequiresToken(addr)` already enforces "non-loopback requires a token" for metrics/pprof; the console reuses that helper.
+
+### 13.3 Architecture
+
+```mermaid
+flowchart LR
+  Browser["Operator browser"]
+  subgraph Node["Elastickv node"]
+    Static["Static bundle (go:embed)"]
+    API["Console REST API\n/console/api/*"]
+    Auth["Bearer-token middleware"]
+    Proxy["Leader proxy (shared helper)"]
+    Internal["Internal queue ops\n(reuse SQSServer methods)"]
+    Store["MVCC Store"]
+    Raft["Raft"]
+  end
+  Browser -->|GET /console/| Static
+  Browser -->|JSON fetch| Auth
+  Auth --> API
+  API -->|writes| Proxy
+  Proxy --> Internal
+  API -->|reads| Internal
+  Internal --> Store
+  Internal --> Raft
+```
+
+Key pieces:
+
+1. `adapter/console.go` holds `ConsoleServer`, which embeds `*SQSServer` for access to the existing handler methods. It shares the queue catalog and message keyspace; no duplicate storage paths.
+2. Static assets live under `adapter/console_ui/` (HTML + a single minimal JS file, both committed) and are served via `go:embed`. No npm/webpack pipeline.
+3. The REST API uses JSON with plain status codes — it is **not** AWS-compatible. AWS SDKs do not talk to this endpoint.
+4. Writes go through `proxyHTTPRequestToLeader` so a console tab pointed at a follower transparently hits the leader. Reads use `LeaseReadThrough` + local MVCC scans.
+
+### 13.4 REST API surface
+
+All paths are rooted at `/console/api/`. Requests carry `Authorization: Bearer <consoleToken>` when the token is configured.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET`  | `/queues` | list queues with attributes + approximate in-flight counts |
+| `GET`  | `/queues/{name}` | one queue's attributes + live counters |
+| `PUT`  | `/queues/{name}` | create queue; body is the same Attributes map as `CreateQueue` |
+| `DELETE` | `/queues/{name}` | delete queue (same semantics as `DeleteQueue`) |
+| `POST` | `/queues/{name}/purge` | purge queue (bumps generation, same as `PurgeQueue`) |
+| `POST` | `/queues/{name}/messages` | send a message; body `{ body, delaySeconds?, attributes? }` |
+| `GET`  | `/queues/{name}/messages?limit=N` | **admin peek**; non-destructive scan of up to N visible messages |
+| `GET`  | `/queues/{name}/inflight?limit=N` | scan currently-invisible (in-flight) messages for debugging |
+| `GET`  | `/health` | returns `{ leader: bool, node: "..." }` for the dashboard banner |
+
+"Admin peek" is the one read path that bypasses the normal SQS surface: it scans `!sqs|msg|vis|` and `!sqs|msg|data|` at a snapshot read and returns body + attributes **without** rotating the receipt token or bumping visibility. This is intentional — the console is for observing state, not competing with workers. Clients that need at-least-once delivery must continue to use `ReceiveMessage`.
+
+The peek endpoint rejects requests larger than `limit=100` and caps total response bytes so a bad operator click cannot DoS the node.
+
+Error envelope follows Go idiom, not AWS:
+
+```json
+{ "error": "queue_does_not_exist", "message": "queue \"orders\" not found" }
+```
+
+### 13.5 Front-end
+
+The bundled UI is a single-page HTML document plus one JS file. It is deliberately small so operators can read the source, and so it works over a slow SSH tunnel:
+
+1. Top bar shows the node id, Raft leadership (green "leader" / grey "follower"), and lease state — the `/console/api/health` fields.
+2. Left pane lists queues with a name filter, refreshing on a user-controlled interval (default 5s, can be paused).
+3. Right pane shows the selected queue's attributes, approximate in-flight count, and three tabs:
+   - **Peek** — paginated, non-destructive list of visible messages with body + attributes.
+   - **In-flight** — currently-invisible messages and the wall-clock time until they reappear.
+   - **Send** — a small form (body + optional delay) for posting a test message.
+4. Destructive actions (Purge, Delete) are behind a confirm prompt that types the queue name to proceed, mirroring how the AWS console gates the same actions.
+5. When `--consoleReadOnly` is set, the Send / Purge / Delete / PUT endpoints return `403 ReadOnly` and the UI greys out the corresponding buttons.
+
+No framework, no bundler: the JS file is hand-written, runs in modern browsers (ES2020+), and uses the `fetch` API. This is in the same spirit as the redis-proxy runbook's small internal UIs.
+
+### 13.6 Authentication
+
+1. Loopback + no token configured: the console is open. This is the "one-liner dev" case.
+2. Non-loopback or token configured: every `/console/*` request must carry `Authorization: Bearer <token>`. Missing or wrong token returns `401 Unauthorized`. No cookie / session; the token is supplied by the operator (typed into a small login screen and stored in `sessionStorage`).
+3. The token is compared with `subtle.ConstantTimeCompare`, same pattern as `metricsToken` / `pprofToken`.
+4. The console never sees or proxies SigV4 credentials; it uses the coordinator directly via `SQSServer` methods that already run on the authenticated-as-the-server path.
+
+### 13.7 Failure and safety behaviors
+
+1. **Lost leader during a mutating call**: the leader proxy returns `503 ServiceUnavailable`; the UI shows a toast with "leader unavailable — retrying…" and a manual retry button.
+2. **Peek under leader loss on the local node**: `LeaseReadThrough` falls back to `LinearizableRead`; if that also fails, the API returns `503` and the UI marks the right pane as "read paused".
+3. **Purge + Delete confirmations** require the exact queue name typed in a confirmation box. The server additionally rejects Purge when it was issued less than 60 s after the previous Purge, matching AWS's own rate limit.
+4. **Large peek requests** are clamped server-side (`limit`, total body bytes). The client additionally enforces `limit<=100` so a URL-bar typo cannot hurt the node.
+
+### 13.8 Observability
+
+New metrics (prefixed `sqs_console_`) mirror the SQS API metrics:
+
+1. `sqs_console_request_total{route, method, status}`
+2. `sqs_console_request_duration_seconds{route, method}`
+3. `sqs_console_peek_messages_total{queue}`
+4. `sqs_console_write_total{queue, action, status}`
+5. `sqs_console_auth_failure_total{reason}`
+
+Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_prefix` (first 8 hex of SHA-256 — enough to identify a token in logs without leaking it).
+
+### 13.9 Testing
+
+1. Unit: REST-handler table tests using `httptest.NewRecorder` for auth / validation.
+2. Integration: single-node cluster via `createNode(t, 1)`, drive the console API through `http.Client`, assert queue create → peek → purge → delete round-trip.
+3. UI smoke: a `testdata/console_ui_smoke_test.go` compiles the static bundle through `httptest.NewServer` and runs a handful of headless HTTP GETs to confirm the assets actually ship. (No Chromium; too heavy for CI.)
+4. Auth: token match, token mismatch, loopback-no-token, non-loopback-no-token (rejected at startup).
+
+### 13.10 Out of scope for Milestone 1
+
+1. SSO / OIDC / SAML. A bearer token is enough for the self-hosted operator use case this adapter targets.
+2. Per-queue ACLs. Whoever holds the token can touch every queue.
+3. Scheduled reports or message export. Observers run against metrics, not the console.
+
+## 14. Rollout Plan
 
 ### Phase 1
 
@@ -488,6 +638,7 @@ Under `jepsen/sqs/`, add `standard` and `fifo` test variants mirroring the exist
 4. Leader proxy.
 5. Metrics and structured logs.
 6. Unit + integration test coverage.
+7. Console UI read-only views (queues list, queue detail, peek, health).
 
 ### Phase 2
 
@@ -496,6 +647,7 @@ Under `jepsen/sqs/`, add `standard` and `fifo` test variants mirroring the exist
 3. DLQ redrive.
 4. Jepsen standard + FIFO workloads.
 5. Tag APIs.
+6. Console UI mutating actions (send, purge, delete, create), with the `--consoleReadOnly` gate.
 
 ### Phase 3
 
@@ -503,8 +655,9 @@ Under `jepsen/sqs/`, add `standard` and `fifo` test variants mirroring the exist
 2. `ApproximateNumberOfMessagesDelayed` / `NotVisible` accuracy.
 3. Per-queue throttling and fairness across tenants.
 4. Split-queue FIFO for very hot queues.
+5. Console UI polish: in-flight tab with per-message countdown, filtering, dark mode.
 
-## 14. Summary
+## 15. Summary
 
 The design choices are:
 
@@ -514,6 +667,7 @@ The design choices are:
 4. **All mutating operations (including ReceiveMessage) go through the leader** keeps the consistency story identical to the DynamoDB adapter.
 5. **Reuse of the DynamoDB adapter's proxy and key-encoding helpers** keeps the adapter small; the streaming S3 proxy path is not needed because SQS payloads are bounded.
 6. **Lease-read fast path for read-only APIs and the `ReceiveMessage` scan fence** amortizes ReadIndex across bursts and lets followers serve `GetQueueAttributes` / `ListQueues` without a leader round-trip, reusing the mechanism already merged in `docs/design/2026_04_20_implemented_lease_read.md`.
+7. **Embedded operator console on its own listener** (§13) gives read-only visibility from any node and a clearly-gated administrative path, without borrowing the AWS API surface or requiring SigV4 for humans.
 
 The two repository-level prerequisites are:
 
