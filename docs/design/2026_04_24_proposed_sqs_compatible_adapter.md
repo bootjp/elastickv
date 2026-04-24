@@ -194,13 +194,13 @@ Fields:
 3. **ChangeMessageVisibility:** same delete+insert swap as receive, validated against the supplied receipt handle.
 4. **Delete:** remove both the data record and the visibility index entry.
 
-Because `visible_at` leads the key, the next candidate message is always the first key `>= now` in the prefix. Invisible messages (`visible_at > now`) are naturally skipped without a sweeper.
+Because `visible_at` leads the key, the next candidate messages are the first N keys in the prefix whose `visible_at ≤ now` — concretely, a scan over `[prefix|0, prefix|now+1)`. Invisible messages (`visible_at > now`) live past the upper bound of that range and are naturally skipped without a sweeper.
 
 ### 5.5 Receipt handles
 
 Receipt handles must be opaque to the client, cheap to validate, and impossible to forge:
 
-```
+```text
 receipt_handle = base64url(
   queue_gen_u64 | message_id_16 | receipt_token_16
 )
@@ -224,7 +224,7 @@ All message keys for a given queue must hash to the same Raft group, so that `Re
 
 Logical route:
 
-```
+```text
 !sqsroute|<queue-esc><gen-u64>
 ```
 
@@ -299,7 +299,7 @@ sequenceDiagram
       S-->>C: 200 with batch
     else empty
       S->>N: Wait(queue, remaining)
-      N-->>S: wake on SendMessage commit or timeout
+      N-->>S: wake on send / delay / visibility transition / timer
     end
   end
 ```
@@ -307,8 +307,8 @@ sequenceDiagram
 Details:
 
 1. Fence the snapshot scan with `coordinator.LeaseReadForKey(ctx, queueRoute)`. While the lease is valid (≤ `electionTimeout − leaseSafetyMargin`, currently 700 ms per `docs/design/2026_04_20_implemented_lease_read.md §3.2`) this returns immediately with no ReadIndex round-trip. Under sustained receive load this amortizes quorum confirmation across every receive in the lease window instead of paying one ReadIndex per call.
-2. Snapshot-scan the visibility index for the first `k` keys with `visible_at ≤ now`, up to `MaxNumberOfMessages` (≤ 10). Use a bounded scan limit (e.g., `2 * k`) to tolerate races.
-3. Filter FIFO candidates: skip any message whose group lock is held by another message; acquire the group lock on delivery.
+2. Snapshot-scan the visibility index for keys with `visible_at ≤ now`. Standard queues read in page-sized chunks (page limit 1024) and stop once either `MaxNumberOfMessages` candidates survive the filter or the scan is exhausted; a small `2 * k` page is fine because Standard has no filter that can hide an unbounded prefix. FIFO queues **cannot** cap the scan at `2 * k` because an entire page can legitimately belong to groups whose locks are already held, hiding deliverable messages that sit further along in the index. FIFO receive instead continues paging forward (resuming from the last key returned) until `MaxNumberOfMessages` candidates survive the group-lock and dedup filters, or the end-of-range sentinel `visible_at = now+1` is reached. A soft wall-clock budget (e.g., 100 ms) on the overall scan caps latency when the queue is pathologically group-skewed, in which case the receive returns whatever it has accumulated.
+3. Filter FIFO candidates: skip any message whose group lock is held by another message; acquire the group lock on delivery. Candidates rejected by this filter must not consume the `MaxNumberOfMessages` budget.
 4. Run one OCC transaction per batch: for each candidate, verify the visibility entry still matches, rotate receipt token, set `visible_at_hlc = now + effective_timeout`, insert the new visibility entry, bump `receive_count` and `approximate_first_receive_timestamp`, acquire FIFO group lock if applicable. A successful `Propose` also refreshes the lease (per `§3.3` of the lease-read doc), so a busy queue keeps its fast path warm without any extra work.
 5. If the batch is empty and `WaitTimeSeconds > 0`, register a waiter on the queue's in-process condition variable and re-run step 1 on wake or timeout. Do not poll in a tight loop. On re-scan, the `LeaseRead` fence from step 1 stays local for the whole long-poll window — empty long polls cost O(1) quorum operations, not O(ticks).
 6. If `receive_count > redrive_policy.maxReceiveCount`, move the message to the DLQ (see §7.6) atomically within the receive transaction and do not return it to the caller.
@@ -317,9 +317,16 @@ Lease invalidation handling: if the leader loses quorum during a long poll, `Reg
 
 ### 7.3 Long-poll notifier
 
-Long polling is local to the leader: every node keeps a `map[queueRoute]*cond` and wakes waiters when a `SendMessage` commits on that queue. The notifier lives in the leader process; on failover, waiters on the old leader get `AbortedError` from the coordinator and clients retry against the new leader. AWS SDKs already retry receive on connection errors, so this is acceptable.
+Long polling is local to the leader: every node keeps a `map[queueRoute]*cond` and wakes waiters whenever the set of deliverable messages on the queue may have grown. That includes any of these commit-time transitions:
 
-The notifier must subscribe to the local FSM commit stream, not the RPC path, so that a `SendMessage` that committed via another adapter node still wakes local waiters once the Raft log reaches this leader.
+1. A `SendMessage` (or `SendMessageBatch` entry) commits — the obvious case.
+2. A `SendMessage` whose `DelaySeconds` has now elapsed — the notifier schedules a one-shot timer keyed off `available_at` when the delayed message commits, and the timer wakes the queue's waiters when it fires.
+3. A `ChangeMessageVisibility` commits a `VisibilityTimeout` that moves the record's `visible_at` backward (including the AWS-permitted value of zero) — the message becomes immediately deliverable even though no send happened.
+4. A message's visibility timeout naturally expires. Because each message has a known `visible_at`, the notifier tracks the smallest `visible_at` in-flight per queue and wakes waiters at that deadline (same timer wheel as the delay case).
+
+Waking on (1) alone would leave long-polling receivers blocked while deliverable messages already sit in the visibility index — a correctness-adjacent bug, because clients would see latency spikes at exactly the moments they want prompt delivery. The timer-wheel approach keeps this O(in-flight messages on this leader), not O(wall-clock ticks).
+
+The notifier subscribes to the local FSM commit stream, not the RPC path, so that a mutation committed via another adapter node still wakes local waiters once the Raft log reaches this leader. On failover, waiters on the old leader get `AbortedError` from the coordinator and clients retry against the new leader; AWS SDKs already retry receive on connection errors, so this is acceptable.
 
 ### 7.4 `DeleteMessage`
 
@@ -356,10 +363,10 @@ Read-only APIs never mutate queue or message state, so they do not need the lead
 
 | API | Fenced key | Read scope |
 |---|---|---|
-| `GetQueueUrl` | queue catalog route | `!sqs|queue|meta|<queue>` |
-| `GetQueueAttributes` | queue catalog route | `!sqs|queue|meta|...` and derived counters |
-| `ListQueues` | queue catalog route | prefix scan `!sqs|queue|meta|` |
-| `ListQueueTags` | queue catalog route | `!sqs|queue|meta|<queue>.tags` |
+| `GetQueueUrl` | queue catalog route | `!sqs\|queue\|meta\|<queue>` |
+| `GetQueueAttributes` | queue catalog route | `!sqs\|queue\|meta\|...` and derived counters |
+| `ListQueues` | queue catalog route | prefix scan `!sqs\|queue\|meta\|` |
+| `ListQueueTags` | queue catalog route | `!sqs\|queue\|meta\|<queue>.tags` |
 
 The fast path:
 
@@ -509,7 +516,7 @@ The console runs on its own listener, controlled by a new `--consoleAddress` fla
 2. The SQS API port is SigV4-only; the console port uses bearer tokens. Mixing the two authenticators on one port is error-prone.
 3. Running the console on loopback by default makes the zero-config development posture safe.
 
-```
+```text
 --consoleAddress "localhost:8090"          # TCP host+port; empty disables
 --consoleToken   ""                        # bearer token; required for non-loopback
 --consoleReadOnly false                    # if true, the console refuses mutating actions

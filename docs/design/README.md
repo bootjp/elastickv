@@ -4,7 +4,7 @@ Forward-looking design proposals and implementation plans for elastickv live in 
 
 ## Filename convention
 
-```
+```text
 YYYY_MM_DD_<status>_<name>.md
 ```
 
@@ -30,7 +30,7 @@ YYYY_MM_DD_<status>_<name>.md
 
 ### Examples
 
-```
+```text
 2026_04_20_implemented_lease_read.md
 2026_04_18_proposed_raft_grpc_streaming_transport.md
 2026_02_18_partial_hotspot_shard_split.md
