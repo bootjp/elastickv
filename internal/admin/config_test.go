@@ -87,6 +87,28 @@ func TestConfigValidate_NonLoopbackRequiresTLS(t *testing.T) {
 	require.Contains(t, err.Error(), "allow-plaintext-non-loopback")
 }
 
+func TestConfigValidate_PartialTLSRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, cert, key string
+	}{
+		{"only cert", "cert.pem", ""},
+		{"only key", "", "key.pem"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{
+				Enabled:           true,
+				Listen:            "127.0.0.1:8080",
+				TLSCertFile:       tc.cert,
+				TLSKeyFile:        tc.key,
+				SessionSigningKey: makeKey(10),
+			}
+			err := c.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "partial TLS configuration")
+		})
+	}
+}
+
 func TestConfigValidate_NonLoopbackWithTLSOK(t *testing.T) {
 	c := &Config{
 		Enabled:           true,

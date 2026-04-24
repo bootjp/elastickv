@@ -89,7 +89,17 @@ func (c *Config) validateListen() error {
 }
 
 func (c *Config) validateTLS() error {
-	tlsConfigured := strings.TrimSpace(c.TLSCertFile) != "" && strings.TrimSpace(c.TLSKeyFile) != ""
+	certSet := strings.TrimSpace(c.TLSCertFile) != ""
+	keySet := strings.TrimSpace(c.TLSKeyFile) != ""
+	if certSet != keySet {
+		// A lone cert or key almost always means a typo. Silently
+		// treating it as "TLS off" would downgrade transport
+		// security while the operator thinks TLS is enabled; fail
+		// fast so the misconfiguration is visible at startup.
+		return errors.New("admin.tls.cert_file and admin.tls.key_file must be set together;" +
+			" partial TLS configuration is not allowed")
+	}
+	tlsConfigured := certSet && keySet
 	if tlsConfigured || !addressRequiresTLS(strings.TrimSpace(c.Listen)) || c.AllowPlaintextNonLoopback {
 		return nil
 	}
