@@ -938,10 +938,19 @@ merge_extra_env() {
     # is baked into deploy.env — a malformed token there means a
     # safeguard we installed deliberately is silently ignored. Fail
     # loudly instead of dropping it.
+    # Three failure modes to catch early:
+    #   - no `=` at all (e.g. GOMEMLIMIT)           -> malformed
+    #   - empty key before `=` (e.g. =1800MiB)     -> malformed
+    #     (the `*=*` pattern match alone accepts this)
+    #   - empty pair (covered by the continue above)
     for pair in "${default_pairs[@]}"; do
       [[ -n "$pair" ]] || continue
       if [[ "$pair" != *=* ]]; then
         echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+        return 1
+      fi
+      if [[ "${pair%%=*}" == "" ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (empty key)" >&2
         return 1
       fi
     done
