@@ -782,24 +782,45 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{"Attributes": attrs})
 }
 
-// selectedAttributeNames returns a set of attribute names to include in the
-// response. An empty selection, or any entry equal to "All", expands to
-// every supported attribute.
-func selectedAttributeNames(req []string) map[string]bool {
-	selection := map[string]bool{}
+// sqsAttributeSelection is a tri-state result from selectedAttributeNames:
+// expandAll = AWS "All" (or any entry equals "All"); a non-nil map lists
+// the specific attribute names the caller asked for; and an empty
+// selection (no AttributeNames supplied at all) maps to "return no
+// attributes" per AWS semantics — which is the opposite of treating
+// omission as "All", and matters because real clients that omit
+// AttributeNames specifically do NOT want the server to echo every
+// piece of queue metadata back.
+type sqsAttributeSelection struct {
+	expandAll bool
+	names     map[string]bool
+}
+
+// selectedAttributeNames parses the AttributeNames array according to
+// AWS GetQueueAttributes semantics:
+//   - missing / empty array: return NO attributes (empty result).
+//   - any element equal to "All": return every supported attribute.
+//   - otherwise: return only the listed names.
+func selectedAttributeNames(req []string) sqsAttributeSelection {
 	if len(req) == 0 {
-		return nil
+		return sqsAttributeSelection{}
 	}
+	selection := map[string]bool{}
 	for _, n := range req {
 		if n == "All" {
-			return nil
+			return sqsAttributeSelection{expandAll: true}
 		}
 		selection[n] = true
 	}
-	return selection
+	return sqsAttributeSelection{names: selection}
 }
 
-func queueMetaToAttributes(meta *sqsQueueMeta, selection map[string]bool) map[string]string {
+func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection) map[string]string {
+	// No AttributeNames supplied and no "All" → AWS returns nothing.
+	// The handler still emits "Attributes" as an empty map so the
+	// response shape is stable.
+	if !selection.expandAll && len(selection.names) == 0 {
+		return map[string]string{}
+	}
 	all := map[string]string{
 		"VisibilityTimeout":             strconv.FormatInt(meta.VisibilityTimeoutSeconds, 10),
 		"MessageRetentionPeriod":        strconv.FormatInt(meta.MessageRetentionSeconds, 10),
@@ -812,11 +833,11 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection map[string]bool) map[st
 	if meta.RedrivePolicy != "" {
 		all["RedrivePolicy"] = meta.RedrivePolicy
 	}
-	if selection == nil {
+	if selection.expandAll {
 		return all
 	}
-	out := make(map[string]string, len(selection))
-	for k := range selection {
+	out := make(map[string]string, len(selection.names))
+	for k := range selection.names {
 		if v, ok := all[k]; ok {
 			out[k] = v
 		}
@@ -833,6 +854,14 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	name, err := queueNameFromURL(in.QueueUrl)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
+		return
+	}
+	// AWS marks Attributes as a required parameter on SetQueueAttributes.
+	// Without this check, a client that forgets (or mis-serializes) the
+	// field gets a 200 success and no change — a silent failure that hides
+	// automation bugs. Reject omission with MissingParameter.
+	if len(in.Attributes) == 0 {
+		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Attributes is required")
 		return
 	}
 	if err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes); err != nil {

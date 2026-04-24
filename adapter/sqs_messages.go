@@ -253,7 +253,7 @@ type sqsSendMessageInput struct {
 
 type sqsReceiveMessageInput struct {
 	QueueUrl            string `json:"QueueUrl"`
-	MaxNumberOfMessages int    `json:"MaxNumberOfMessages,omitempty"`
+	MaxNumberOfMessages *int   `json:"MaxNumberOfMessages,omitempty"`
 	VisibilityTimeout   *int64 `json:"VisibilityTimeout,omitempty"`
 	WaitTimeSeconds     *int64 `json:"WaitTimeSeconds,omitempty"`
 }
@@ -485,7 +485,11 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 		return
 	}
-	max := clampReceiveMaxMessages(in.MaxNumberOfMessages)
+	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)
+	if maxErr != nil {
+		writeSQSErrorFromErr(w, maxErr)
+		return
+	}
 	visibilityTimeout := meta.VisibilityTimeoutSeconds
 	if in.VisibilityTimeout != nil {
 		if *in.VisibilityTimeout < 0 || *in.VisibilityTimeout > sqsChangeVisibilityMaxSeconds {
@@ -581,14 +585,21 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, ge
 	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS), nil
 }
 
-func clampReceiveMaxMessages(requested int) int {
-	if requested <= 0 {
-		return sqsReceiveDefaultMaxMessages
+// resolveReceiveMaxMessages validates MaxNumberOfMessages against the
+// AWS-documented range [1, 10]. An omitted value defaults to 1.
+// Anything explicitly outside the range is an InvalidParameterValue
+// — silently clamping would let a caller bug (e.g. passing 0 or a
+// negative value) change to active polling behavior without surfacing
+// the error, matching the same policy we apply to WaitTimeSeconds.
+func resolveReceiveMaxMessages(requested *int) (int, error) {
+	if requested == nil {
+		return sqsReceiveDefaultMaxMessages, nil
 	}
-	if requested > sqsReceiveHardMaxMessages {
-		return sqsReceiveHardMaxMessages
+	v := *requested
+	if v < 1 || v > sqsReceiveHardMaxMessages {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "MaxNumberOfMessages must be between 1 and 10")
 	}
-	return requested
+	return v, nil
 }
 
 // scanVisibleMessageCandidates returns vis-index entries with

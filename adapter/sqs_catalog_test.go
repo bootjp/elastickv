@@ -292,3 +292,106 @@ func TestSQSServer_CatalogKeyEncoding(t *testing.T) {
 		t.Fatal("queueNameFromMetaKey should reject non-catalog keys")
 	}
 }
+
+func TestSQSServer_GetQueueAttributesOmittedReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	// AWS semantics: an omitted AttributeNames list returns NO
+	// attributes, not every attribute. Callers that want "everything"
+	// must pass ["All"] explicitly. Over-returning metadata on
+	// omission (our previous behavior) would hand operators data
+	// they did not ask for and differ from real SQS.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "attrs-empty-select")
+
+	// No AttributeNames → empty Attributes map.
+	status, out := callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl": url,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("getAttrs omitted: %d %v", status, out)
+	}
+	attrs, _ := out["Attributes"].(map[string]any)
+	if len(attrs) != 0 {
+		t.Fatalf("omitted AttributeNames should return empty map; got %v", attrs)
+	}
+
+	// Explicit All → every attribute.
+	status, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"All"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("getAttrs All: %d %v", status, out)
+	}
+	attrs, _ = out["Attributes"].(map[string]any)
+	if attrs["VisibilityTimeout"] == nil {
+		t.Fatalf("All should include VisibilityTimeout; got %v", attrs)
+	}
+}
+
+func TestSQSServer_SetQueueAttributesRequiresAttributes(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "setattrs-required")
+
+	status, out := callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
+		"QueueUrl": url,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("setAttrs without Attributes: got %d want 400 (%v)", status, out)
+	}
+	if got, _ := out["__type"].(string); got != sqsErrMissingParameter {
+		t.Fatalf("error type: %q want %q", got, sqsErrMissingParameter)
+	}
+
+	// Empty Attributes map is also treated as omitted.
+	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
+		"QueueUrl":   url,
+		"Attributes": map[string]string{},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("setAttrs empty Attributes: got %d want 400 (%v)", status, out)
+	}
+}
+
+func TestSQSServer_ReceiveMessageRejectsOutOfRangeMax(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "max-range")
+
+	for _, bad := range []int{0, -1, 11, 100} {
+		status, out := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+			"QueueUrl":            url,
+			"MaxNumberOfMessages": bad,
+		})
+		if status != http.StatusBadRequest {
+			t.Fatalf("MaxNumberOfMessages=%d: got %d want 400 (%v)", bad, status, out)
+		}
+		if got, _ := out["__type"].(string); got != sqsErrInvalidAttributeValue {
+			t.Fatalf("MaxNumberOfMessages=%d error type: %q want %q", bad, got, sqsErrInvalidAttributeValue)
+		}
+	}
+
+	// Omitted → defaults to 1, succeeds (empty queue returns 0 messages).
+	status, out := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl": url,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("omitted MaxNumberOfMessages: %d %v", status, out)
+	}
+
+	// In-range → succeeds.
+	status, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            url,
+		"MaxNumberOfMessages": 10,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("MaxNumberOfMessages=10: %d %v", status, out)
+	}
+}
