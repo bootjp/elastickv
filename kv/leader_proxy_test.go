@@ -255,6 +255,9 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 
 func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 	t.Parallel()
+	if testing.Short() {
+		t.Skip("exhausts the full leaderProxyRetryBudget (5s); skipped in -short mode")
+	}
 
 	// No gRPC server, no address ever published → every forward()
 	// returns ErrLeaderNotFound immediately. forwardWithRetry must loop

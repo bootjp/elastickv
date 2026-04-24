@@ -285,8 +285,18 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	var lastErr error
 	for {
 		lastResp, lastErr = c.dispatchOnce(boundedCtx, reqs)
+		// A successful dispatch means the commit already happened on
+		// the raft FSM. Do NOT let a racing caller cancellation
+		// convert that success into a reported failure: returning
+		// ctx.Err() now would mask the commit, and a client that
+		// retries a non-idempotent write could observe duplicate
+		// effects. This ordering MUST run before the ctx.Err() check
+		// below.
+		if lastErr == nil {
+			return lastResp, nil
+		}
 		// Caller-supplied ctx cancellation/deadline takes precedence
-		// over any error dispatchOnce returned (which may itself wrap
+		// over the error dispatchOnce returned (which may itself wrap
 		// context.Canceled / context.DeadlineExceeded propagated
 		// through boundedCtx). gRPC clients rely on the wrapped
 		// ctx.Err() to distinguish "I gave up" from "system was

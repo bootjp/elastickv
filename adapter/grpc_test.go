@@ -150,6 +150,7 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
+	defer shutdown(nodes)
 
 	wg := sync.WaitGroup{}
 	const workers = 1000
@@ -179,7 +180,6 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	shutdown(nodes)
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
@@ -196,18 +196,22 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			context.Background(),
 			&pb.RawPutRequest{Key: key, Value: want},
 		)
+		// Stop at the first RPC failure instead of continuing: a
+		// genuine regression would otherwise cascade into 9998 more
+		// iterations, each reporting the same broken invariant, and
+		// drown the real cause in test-output noise.
 		if !assert.NoError(t, err, "Put RPC failed") {
-			continue
+			break
 		}
 
 		_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
 		if !assert.NoError(t, err, "Put RPC failed") {
-			continue
+			break
 		}
 
 		resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
 		if !assert.NoError(t, err, "Get RPC failed") {
-			continue
+			break
 		}
 
 		assert.Equal(t, want, resp.Value, "consistency check failed")
@@ -228,23 +232,26 @@ func Test_grpc_transaction(t *testing.T) {
 			context.Background(),
 			&pb.PutRequest{Key: key, Value: want},
 		)
+		// See Test_consistency_satisfy_write_after_read_sequence:
+		// break on first RPC failure so a single broken invariant
+		// does not amplify into thousands of assertion lines.
 		if !assert.NoError(t, err, "Put RPC failed") {
-			continue
+			break
 		}
 		resp, err := c.Get(context.Background(), &pb.GetRequest{Key: key})
 		if !assert.NoError(t, err, "Get RPC failed") {
-			continue
+			break
 		}
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 
 		_, err = c.Delete(context.Background(), &pb.DeleteRequest{Key: key})
 		if !assert.NoError(t, err, "Delete RPC failed") {
-			continue
+			break
 		}
 
 		resp, err = c.Get(context.Background(), &pb.GetRequest{Key: key})
 		if !assert.NoError(t, err, "Get RPC failed") {
-			continue
+			break
 		}
 		assert.Nil(t, resp.Value, "consistency check failed")
 	}

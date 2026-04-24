@@ -216,3 +216,67 @@ func TestCoordinateDispatch_CtxCancelDuringRetrySurfaces(t *testing.T) {
 	})
 	require.ErrorIs(t, err, context.Canceled)
 }
+
+func TestCoordinateDispatch_SuccessBeatsConcurrentCancel(t *testing.T) {
+	t.Parallel()
+
+	// Inverse race of TestCoordinateDispatch_CtxCancelDuringRetrySurfaces:
+	// dispatchOnce returns SUCCESS on the same attempt where the caller
+	// cancels ctx. The commit already landed in the FSM, so the loop
+	// MUST report success rather than converting it into a
+	// context.Canceled error — doing so would make a retrying client
+	// re-issue the same write and risk duplicate effects for
+	// non-idempotent operations. Pins the fix for the CodeRabbit-major
+	// ordering bug in the retry loop (commit + cancel ordering).
+	ctx, cancel := context.WithCancel(context.Background())
+	tx := &scriptedTransactional{
+		onCommit: func(int64) {
+			// Cancel inside Commit, BEFORE Commit returns. Dispatch
+			// will then observe a successful Commit but a cancelled
+			// ctx on its first check.
+			cancel()
+		},
+	}
+	c := newRetryCoordinate(tx)
+
+	resp, err := c.Dispatch(ctx, &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Greater(t, resp.CommitIndex, uint64(0))
+}
+
+// TestIsTransientLeaderError_PinsRealSentinels asserts that the real
+// .Error() texts of the upstream sentinels we classify as transient
+// still pass through isTransientLeaderError. If a future rename of
+// these messages drifts them out of leaderErrorPhrases' closed list,
+// this test catches it at CI time rather than during a production
+// re-election window. Pinning kv.ErrLeaderNotFound covers the
+// wire-level phrase "leader not found"; raftengine.ErrNotLeader
+// covers both the errors.Is sentinel path AND the string-fallback
+// path ("not leader" substring).
+//
+// adapter.ErrNotLeader is not pinned here because adapter imports kv,
+// which would create a test-time import cycle. A symmetric pin lives
+// in the adapter test package alongside that sentinel.
+func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"kv.ErrLeaderNotFound", ErrLeaderNotFound},
+		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader},
+		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.True(t, isTransientLeaderError(tc.err),
+				"sentinel %q (%q) no longer classified as transient — update leaderErrorPhrases or the classifier",
+				tc.name, tc.err.Error())
+		})
+	}
+}

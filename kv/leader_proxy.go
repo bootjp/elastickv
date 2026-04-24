@@ -120,6 +120,16 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 				break
 			}
 		}
+		// Defensive: if the inner loop exited on the deadline guard
+		// before ever calling forward() (e.g. a future refactor
+		// shortens the budget, or the clock jumps forward between the
+		// outer deadline computation and the inner check), lastErr
+		// stays nil and errors.Wrapf(nil, ...) would silently yield
+		// nil — handing callers a (nil, nil) "success" that never
+		// happened. Surface a real error instead.
+		if lastErr == nil {
+			return nil, errors.WithStack(ErrLeaderNotFound)
+		}
 		if !isTransientLeaderError(lastErr) {
 			return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries)
 		}
