@@ -88,6 +88,29 @@ so the dispatcher can gate on the command byte without allocating):
 - **Ungated:** `GET`, `SET`, `DEL`, `EXISTS`, `INCR`, `EXPIRE`, `TTL`,
   `HGET`, `HSET`, `LPUSH`/`RPUSH`, `XADD`, single-key fast paths.
 
+**XADD during the Mode A migration window is a latent starvation
+risk.** Mode A rewrites the entire legacy blob in the first XADD that
+touches a migrated stream (see Layer 4, line 414). On a 100k-entry
+stream that single "ungated" XADD does O(N) unmarshal + re-marshal +
+per-entry Put, which is exactly the CPU profile Layer 1 is trying to
+bound. v1 mitigations, ordered by preference:
+
+1. Ship Layer 4 Mode A and Layer 1 together. The very first migration
+   XADD is expensive, but it happens once per stream; subsequent XADDs
+   are O(1) and genuinely ungated.
+2. If Mode A lands ahead of Layer 1, XADD is promoted to gated **only
+   while the periodic scan still reports legacy keys present** (see
+   Layer 4 removal criterion). Once the legacy-keys-total counter
+   reaches zero cluster-wide, XADD demotes back to ungated. This is
+   dynamic classification for exactly one command for exactly the
+   migration window; worth the complexity because the alternative is
+   a repeat of the 2026-04-24 incident triggered by a single large
+   stream's first write.
+
+Either ordering is acceptable; (1) is simpler and preferred. The
+doc does not pick an ordering — the implementer of whichever PR lands
+second owns the promotion/demotion logic.
+
 The entire `ZRANGE` family is gated, not only "full-range" variants —
 arg inspection (e.g., detecting `LIMIT 0 N`) breaks the "classify by
 command byte" simplicity, and a bounded `ZRANGE 0 10` contributes at
@@ -345,12 +368,17 @@ aggressive reconnect pool can answer each `-ERR max connections`
 with an immediate new `connect()` — the server spends CPU on the
 accept/write/close cycle and the client makes no progress. Two
 mitigations: (a) **rate-limit the reject itself**: once a peer IP
-has been rejected `R` times in the last second, the next rejects
-are answered with `RST` (cheap kernel-level reset) instead of an
-accept + write + close; (b) document operator-side client
-configuration (e.g., for redis-rb: `reconnect_attempts=3` plus an
-exponential backoff). (a) ships in v1 behind a compile-time
-constant; (b) belongs in the ops runbook.
+has been rejected `R` times in the last second, *skip the RESP
+write* for subsequent rejects and close the fd with `SetLinger(0)`.
+Pure Go `net` cannot emit a true kernel-level `RST` without
+`Accept()`; the connection is already accepted by the time we know
+to reject it, so "cheap" here means "fewer syscalls per reject
+(accept + close)," not "no accept." A true `RST`-before-accept
+requires dropping to a raw listener (`syscall.Accept4` + direct
+`SO_LINGER` setup or an eBPF filter), deferred to v2. (b) document
+operator-side client configuration (e.g., for redis-rb:
+`reconnect_attempts=3` plus an exponential backoff). (a) ships in
+v1 behind a compile-time constant; (b) belongs in the ops runbook.
 
 ### Where in the code
 
@@ -434,11 +462,19 @@ fall-through on "new layout empty":
 
 1. Read `meta` if present; read all per-entry keys that match the
    requested ID range.
-2. Read the legacy-suffix blob if present; decode only entries
-   falling in the ID range.
+2. Read the legacy-suffix blob if present; **protobuf cannot decode a
+   repeated field partially**, so the blob is fully unmarshaled and
+   then filtered to the requested ID range in memory. There is no
+   cheap "decode only the range" path without custom wire-format
+   parsing, which is out of scope for v1.
 3. Merge by ID order, deduplicate (the migrator is responsible for
    never writing the same ID in both layouts in a single commit), and
    return.
+
+Because step 2 is a full unmarshal, the suffix-blob cost is O(N_suffix)
+per read regardless of how narrow the requested ID range is. This
+matches the Mode B cost model below and is the reason Mode B ships
+together with the read-driven drain.
 
 The v1 dual-read (Mode A) is safe because there is no mixed state.
 Extending it verbatim to Mode B would return incomplete results
@@ -469,13 +505,40 @@ migration instead.
 a cold legacy-format stream that is neither read nor written for
 the soak window would keep the counter at zero while still needing
 the fallback. Add a paired counter
-`elastickv_stream_legacy_format_keys_total` populated from a
-periodic prefix scan (`!redis|stream|<...>` with no matching
-`!stream|meta|<...>`). The fallback is safe to remove only when
-**both** counters are zero across every node. The periodic scan
-runs at the same cadence as snapshot cleanup; its cost is bounded
-by the number of legacy keys remaining, which decays as migration
-progresses.
+`elastickv_stream_legacy_format_keys_total`.
+
+Naive implementation would scan `!redis|stream|<...>` prefix, but
+**that prefix is shared by every per-entry key**
+(`!redis|stream|<key>|entry|<id>`), so a scan over it is
+O(total_entries_in_cluster), not O(legacy_blobs). In a deployment
+with many large migrated streams this is the exact cost profile
+Layer 4 was introduced to eliminate.
+
+Two implementable options, pick whichever is cheaper in the target
+backend:
+
+1. **Bloom-filter / sidecar index.** On every write that creates a
+   legacy blob record the logical stream name in a dedicated
+   `!redis|stream_legacy_index|<key>` tombstone-style marker. The
+   migration write that rewrites the stream deletes that marker in
+   the same commit. The counter becomes `SCAN !redis|stream_legacy_index|`,
+   bounded by the number of legacy blobs, not total entries.
+2. **Layout-walk.** Iterate `!redis|stream|<key>|meta` keys and, for
+   each stream, probe `!redis|stream|<key>` (the legacy blob key has
+   no suffix). Scan cost is O(num_streams), not O(num_entries).
+   Equivalent answer; avoids the sidecar index.
+
+Both pass the key-pattern sanity check: legacy keys live at
+`!redis|stream|<logical>` with no further suffix, per-entry keys at
+`!redis|stream|<logical>|entry|<id>`, meta at
+`!redis|stream|<logical>|meta`. The "prefix scan on `!redis|stream|`"
+wording in earlier drafts was wrong and has been retracted; the
+layout above is authoritative.
+
+The fallback is safe to remove only when **both** counters are zero
+across every node. The index/walk runs at the same cadence as
+snapshot cleanup; its cost is bounded by the chosen option as
+described.
 
 The existing stream PR (#620) ships **Mode A only**. Chunked
 migration (Mode B) is explicitly deferred and must not be enabled
@@ -592,10 +655,12 @@ Recommended order of implementation:
    (mTLS or PROXY protocol identity) is unsurprising.
 
 5. **Layer 4 — migration window.** When can the dual-read
-   compatibility code go away? Proposed:
-   `elastickv_stream_legacy_format_reads_total` = 0 for 30 days
-   across all nodes → remove in a follow-up PR. 30 days is arbitrary;
-   revisit.
+   compatibility code go away? Proposed: **both**
+   `elastickv_stream_legacy_format_reads_total` = 0 **and**
+   `elastickv_stream_legacy_format_keys_total` = 0 for 30 days across
+   all nodes → remove in a follow-up PR. `reads_total` alone would
+   miss cold streams (see Layer 4 removal criterion); the paired
+   counter closes that gap. 30 days is arbitrary; revisit.
 
 6. **Interaction with memwatch (PR #612).** memwatch fires graceful
    shutdown on hard-threshold crossing. Admission (Layer 3 / roadmap
