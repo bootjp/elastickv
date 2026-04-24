@@ -112,14 +112,19 @@ func deleteMessageOK(t *testing.T, node Node, queueURL, receipt string) {
 	}
 }
 
-func TestSQSServer_DeleteWithWrongReceiptRejected(t *testing.T) {
+func TestSQSServer_DeleteWithStaleReceiptIsIdempotentNoOp(t *testing.T) {
 	t.Parallel()
+	// AWS SQS semantics: DeleteMessage with a stale receipt handle (token
+	// rotated under our feet, or record already gone) must return 200
+	// success without deleting. SDK retry paths and batch workers rely on
+	// this so a retry after a visibility-expiry re-delivery does not fail
+	// loudly. Structurally malformed handles are still an error;
+	// token-only mismatches are not.
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
-	queueURL := createSQSQueueForTest(t, node, "wrong-receipt")
+	queueURL := createSQSQueueForTest(t, node, "stale-receipt")
 
-	// Send + receive once to get a real message on the queue.
 	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
 		"QueueUrl":    queueURL,
 		"MessageBody": "x",
@@ -138,26 +143,47 @@ func TestSQSServer_DeleteWithWrongReceiptRejected(t *testing.T) {
 	}
 	goodHandle, _ := msgs[0].(map[string]any)["ReceiptHandle"].(string)
 
-	// Tamper the receipt token portion of the handle and expect
-	// InvalidReceiptHandle.
+	// Flip a byte of the token so the stored token != handle token.
 	decoded, err := decodeReceiptHandle(goodHandle)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	decoded.ReceiptToken[0] ^= 0xff
-	badHandle, err := encodeReceiptHandle(decoded.QueueGeneration, decoded.MessageIDHex, decoded.ReceiptToken)
+	staleHandle, err := encodeReceiptHandle(decoded.QueueGeneration, decoded.MessageIDHex, decoded.ReceiptToken)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
+
+	// Delete with the stale handle must succeed (no-op) per AWS.
 	status, out = callSQS(t, node, sqsDeleteMessageTarget, map[string]any{
 		"QueueUrl":      queueURL,
-		"ReceiptHandle": badHandle,
+		"ReceiptHandle": staleHandle,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("delete with stale receipt: status=%d body=%v", status, out)
+	}
+
+	// The real handle must still work — the stale delete must not have
+	// removed the in-flight message out from under the original consumer.
+	status, out = callSQS(t, node, sqsDeleteMessageTarget, map[string]any{
+		"QueueUrl":      queueURL,
+		"ReceiptHandle": goodHandle,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("delete with good receipt after stale no-op: %d %v", status, out)
+	}
+
+	// A structurally malformed handle still errors out — only token
+	// mismatches are the idempotent no-op case.
+	status, out = callSQS(t, node, sqsDeleteMessageTarget, map[string]any{
+		"QueueUrl":      queueURL,
+		"ReceiptHandle": "not-base64-!!!",
 	})
 	if status != http.StatusBadRequest {
-		t.Fatalf("delete with bad receipt: status=%d body=%v", status, out)
+		t.Fatalf("malformed handle: status=%d body=%v", status, out)
 	}
-	if out["__type"] != sqsErrInvalidReceiptHandle {
-		t.Fatalf("error type: %q want %q", out["__type"], sqsErrInvalidReceiptHandle)
+	if out["__type"] != sqsErrReceiptHandleInvalid {
+		t.Fatalf("error type for malformed handle: %q want %q", out["__type"], sqsErrReceiptHandleInvalid)
 	}
 }
 

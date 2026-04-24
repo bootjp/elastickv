@@ -572,19 +572,28 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{})
 }
 
-// deleteMessageWithRetry runs the receipt-token check and the delete
-// transaction under one OCC budget. A concurrent ReceiveMessage /
-// ChangeMessageVisibility that rotates the token between validate and
-// commit produces ErrWriteConflict; we retry by re-validating the
-// current token against the handle. If the token has actually been
-// rotated under us, the next pass returns InvalidReceiptHandle.
+// deleteMessageWithRetry runs the load-check-commit flow under one OCC
+// budget. AWS SQS semantics: a stale receipt handle (message already
+// gone, or token rotated by another consumer) is a 200 no-op, NOT an
+// error. The only error cases are structural (malformed handle, caught
+// before this function) and infrastructure (retry budget exhausted).
+// ErrWriteConflict on the delete Dispatch means a concurrent rotation
+// / delete landed between our read and our commit; we retry so the
+// next pass either sees the rotated token (no-op success) or the
+// missing record (no-op success).
 func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string, handle *decodedReceiptHandle) error {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		rec, dataKey, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
-		if apiErr != nil {
-			return apiErr
+		rec, dataKey, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
+		if err != nil {
+			return err
+		}
+		switch outcome {
+		case sqsDeleteNoOp:
+			return nil
+		case sqsDeleteProceed:
+			// fall through to commit below
 		}
 		visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
 		req := &kv.OperationGroup[kv.OP]{
@@ -606,6 +615,41 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "delete message retry attempts exhausted")
+}
+
+// sqsDeleteOutcome is a ternary tag returned by loadMessageForDelete so
+// the caller can cleanly distinguish the AWS-idempotent no-op case from
+// the proceed-to-commit case without conflating them with errors.
+type sqsDeleteOutcome int
+
+const (
+	sqsDeleteProceed sqsDeleteOutcome = iota
+	sqsDeleteNoOp
+)
+
+// loadMessageForDelete reads the message record and classifies the
+// outcome for AWS-compatible DeleteMessage semantics: structural errors
+// propagate; missing records and token mismatches return
+// sqsDeleteNoOp; matching tokens return sqsDeleteProceed with the
+// loaded record.
+func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, sqsDeleteOutcome, error) {
+	readTS := s.nextTxnReadTS(ctx)
+	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
+	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, nil, sqsDeleteNoOp, nil
+		}
+		return nil, nil, sqsDeleteProceed, errors.WithStack(err)
+	}
+	rec, err := decodeSQSMessageRecord(raw)
+	if err != nil {
+		return nil, nil, sqsDeleteProceed, errors.WithStack(err)
+	}
+	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
+		return nil, nil, sqsDeleteNoOp, nil
+	}
+	return rec, dataKey, sqsDeleteProceed, nil
 }
 
 func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Request) {
