@@ -146,8 +146,14 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 			),
 		)
 	}
-	// Login / logout: body limit only. Audit is handled inside the
-	// AuthService so the actor field is populated correctly.
+	// Login is the only endpoint that runs without a pre-existing
+	// session — every other write must go through session + CSRF so
+	// a cross-site page cannot force a user to perform any state
+	// change against their will. Notably, /auth/logout goes through
+	// the protected chain to prevent logout-CSRF: a hostile site that
+	// POSTed to /auth/logout would otherwise be able to force-clear a
+	// victim's cookies even with SameSite=Strict sessions, because
+	// HandleLogout always emits expired Set-Cookie headers.
 	publicAuth := func(next http.Handler) http.Handler {
 		return BodyLimit(defaultBodyLimit)(next)
 	}
@@ -157,7 +163,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 		case "/admin/api/v1/auth/login":
 			publicAuth(loginHandler).ServeHTTP(w, r)
 		case "/admin/api/v1/auth/logout":
-			publicAuth(logoutHandler).ServeHTTP(w, r)
+			protect(logoutHandler).ServeHTTP(w, r)
 		case "/admin/api/v1/cluster":
 			protect(clusterHandler).ServeHTTP(w, r)
 		default:
