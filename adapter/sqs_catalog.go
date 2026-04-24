@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -124,7 +125,14 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 		writeSQSError(w, apiErr.status, apiErr.errorType, apiErr.message)
 		return
 	}
-	writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure, err.Error())
+	// Internal errors can wrap Pebble file names, Raft peer ids, stack
+	// frames from errors.WithStack, etc. Never echo the raw error text
+	// to the client — an authenticated-but-untrusted caller could use
+	// it to fingerprint the deployment. Log the detail server-side
+	// (the request metrics / log pipeline already captures the full
+	// chain) and return a generic 500 body.
+	slog.Error("sqs adapter internal error", "err", err)
+	writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure, "internal error")
 }
 
 func writeSQSJSON(w http.ResponseWriter, payload any) {
@@ -261,23 +269,40 @@ func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMet
 	if err := applyAttributes(meta, attrs); err != nil {
 		return nil, err
 	}
-	nameHasFIFOSuffix := strings.HasSuffix(name, sqsFIFOQueueNameSuffix)
-	if v, ok := attrs["FifoQueue"]; ok {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "FifoQueue must be a boolean")
-		}
-		if b && !nameHasFIFOSuffix {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name must end in .fifo")
-		}
-		if !b && nameHasFIFOSuffix {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "Queue name ends in .fifo but FifoQueue=false")
-		}
-		meta.IsFIFO = b
-	} else if nameHasFIFOSuffix {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name requires FifoQueue=true attribute")
+	if err := resolveFifoQueueFlag(meta, name, attrs); err != nil {
+		return nil, err
+	}
+	if meta.ContentBasedDedup && !meta.IsFIFO {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
 	return meta, nil
+}
+
+// resolveFifoQueueFlag reconciles the FifoQueue attribute with the
+// queue name's .fifo suffix. AWS requires both to match, and the
+// attribute must be explicitly true for a FIFO queue — the name suffix
+// alone is not enough.
+func resolveFifoQueueFlag(meta *sqsQueueMeta, name string, attrs map[string]string) error {
+	nameHasFIFOSuffix := strings.HasSuffix(name, sqsFIFOQueueNameSuffix)
+	v, ok := attrs["FifoQueue"]
+	if !ok {
+		if nameHasFIFOSuffix {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name requires FifoQueue=true attribute")
+		}
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "FifoQueue must be a boolean")
+	}
+	if b && !nameHasFIFOSuffix {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name must end in .fifo")
+	}
+	if !b && nameHasFIFOSuffix {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "Queue name ends in .fifo but FifoQueue=false")
+	}
+	meta.IsFIFO = b
+	return nil
 }
 
 // attributeApplier writes one attribute into meta. Keeping one applier per
@@ -821,37 +846,12 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := s.nextTxnReadTS(ctx)
-		meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !exists {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		}
-		if err := applyAttributes(meta, attrs); err != nil {
-			return err
-		}
-		metaBytes, err := encodeSQSQueueMeta(meta)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		metaKey := sqsQueueMetaKey(queueName)
-		// StartTS + ReadKeys prevent two concurrent SetQueueAttributes
-		// from both reading the same old meta and the later dispatch
-		// clobbering the earlier commit's changes.
-		req := &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			StartTS:  readTS,
-			ReadKeys: [][]byte{metaKey},
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Put, Key: metaKey, Value: metaBytes},
-			},
-		}
-		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+		done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
+		if err == nil && done {
 			return nil
-		} else if !isRetryableTransactWriteError(err) {
-			return errors.WithStack(err)
+		}
+		if err != nil && !isRetryableTransactWriteError(err) {
+			return err
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
 			return errors.WithStack(err)
@@ -859,4 +859,48 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
+}
+
+// trySetQueueAttributesOnce is one read-validate-commit pass. The first
+// return reports whether the caller should stop retrying (the attrs
+// are now committed); an error means either a non-retryable failure
+// (propagate) or a retryable write conflict (retry after backoff).
+func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, error) {
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if !exists {
+		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if err := applyAttributes(meta, attrs); err != nil {
+		return false, err
+	}
+	// ContentBasedDeduplication is FIFO-only; a Standard queue
+	// silently accepting it would advertise unsupported behavior to
+	// clients. Same rule enforced on CreateQueue.
+	if meta.ContentBasedDedup && !meta.IsFIFO {
+		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
+	}
+	metaBytes, err := encodeSQSQueueMeta(meta)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	metaKey := sqsQueueMetaKey(queueName)
+	// StartTS + ReadKeys prevent two concurrent SetQueueAttributes from
+	// both reading the same old meta and the later dispatch clobbering
+	// the earlier commit's changes.
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{metaKey},
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: metaKey, Value: metaBytes},
+		},
+	}
+	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+		return false, errors.WithStack(err)
+	}
+	return true, nil
 }

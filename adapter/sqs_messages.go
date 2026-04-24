@@ -266,7 +266,7 @@ type sqsDeleteMessageInput struct {
 type sqsChangeVisibilityInput struct {
 	QueueUrl          string `json:"QueueUrl"`
 	ReceiptHandle     string `json:"ReceiptHandle"`
-	VisibilityTimeout int64  `json:"VisibilityTimeout"`
+	VisibilityTimeout *int64 `json:"VisibilityTimeout"`
 }
 
 // ------------------------ handlers ------------------------
@@ -285,6 +285,19 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	meta, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
+		return
+	}
+	// AWS SDKs verify MD5OfMessageAttributes against the canonical
+	// binary encoding (sorted, length-prefixed, with transport type
+	// byte). The Milestone-1 adapter does not yet implement that
+	// canonical hash, and a non-matching value would make every SDK
+	// SendMessage call fail with MessageAttributeMD5Mismatch. Until
+	// Milestone 2 ships the canonical encoder, reject sends that
+	// actually carry MessageAttributes so clients fail clearly at
+	// the caller instead of mysteriously in the SDK.
+	if len(in.MessageAttributes) > 0 {
+		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"MessageAttributes are not yet supported; omit the field until canonical MD5 lands")
 		return
 	}
 	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
@@ -464,7 +477,11 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		visibilityTimeout = *in.VisibilityTimeout
 	}
-	waitSeconds := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
+	waitSeconds, waitErr := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
+	if waitErr != nil {
+		writeSQSErrorFromErr(w, waitErr)
+		return
+	}
 
 	delivered, err := s.longPollReceive(ctx, queueName, meta.Generation, max, visibilityTimeout, waitSeconds)
 	if err != nil {
@@ -476,22 +493,20 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 
 // resolveReceiveWaitSeconds picks the effective long-poll duration: the
 // per-request WaitTimeSeconds if provided, else the queue default. AWS
-// permits 0..20; values outside the range are clamped so a malformed
-// client request does not stall the server.
-func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) int64 {
-	var w int64
-	if requested != nil {
-		w = *requested
-	} else {
-		w = queueDefault
+// permits 0..20 and rejects anything outside with
+// InvalidParameterValue; silently clamping a bad client value would
+// mask bugs and change behavior (negative becomes immediate polling,
+// oversized becomes long polls). The queue default is trusted — it was
+// validated at SetQueueAttributes time.
+func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) (int64, error) {
+	if requested == nil {
+		return queueDefault, nil
 	}
-	if w < 0 {
-		w = 0
+	v := *requested
+	if v < 0 || v > sqsMaxReceiveMessageWaitSeconds {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "WaitTimeSeconds must be between 0 and 20")
 	}
-	if w > sqsMaxReceiveMessageWaitSeconds {
-		w = sqsMaxReceiveMessageWaitSeconds
-	}
-	return w
+	return v, nil
 }
 
 // longPollReceive performs one scan+rotate attempt; if it returned 0
@@ -769,13 +784,30 @@ const (
 
 // loadMessageForDelete reads the message record and classifies the
 // outcome for AWS-compatible DeleteMessage semantics: structural errors
-// propagate; missing records and token mismatches return
-// sqsDeleteNoOp; matching tokens return sqsDeleteProceed with the
-// loaded record. The readTS it took the snapshot at is returned so the
-// caller can pass it as StartTS on the OCC dispatch, pinning the
-// read-write conflict detection window.
+// propagate; missing records and token mismatches on an otherwise-valid
+// queue return sqsDeleteNoOp; matching tokens return sqsDeleteProceed
+// with the loaded record. The readTS it took the snapshot at is
+// returned so the caller can pass it as StartTS on the OCC dispatch,
+// pinning the read-write conflict detection window.
+//
+// The caller-supplied QueueUrl is cross-checked against the handle's
+// embedded queue_generation: if the queue does not exist or its current
+// generation does not match the handle's generation, the handle refers
+// to a different (or recreated) queue and we reject it as a structural
+// error — silently succeeding would let misrouted deletes ack messages
+// that cannot possibly be deleted on this queue.
 func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
 	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if meta.Generation != handle.QueueGeneration {
+		return nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+	}
 	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
@@ -800,7 +832,15 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if in.VisibilityTimeout < 0 || in.VisibilityTimeout > sqsChangeVisibilityMaxSeconds {
+	// AWS requires VisibilityTimeout on ChangeMessageVisibility —
+	// omitting it returns MissingParameter, not an implicit 0 (which
+	// would unconditionally make the message visible).
+	if in.VisibilityTimeout == nil {
+		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "VisibilityTimeout is required")
+		return
+	}
+	timeout := *in.VisibilityTimeout
+	if timeout < 0 || timeout > sqsChangeVisibilityMaxSeconds {
 		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAttributeValue, "VisibilityTimeout out of range")
 		return
 	}
@@ -809,7 +849,7 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if err := s.changeVisibilityWithRetry(r.Context(), queueName, handle, in.VisibilityTimeout); err != nil {
+	if err := s.changeVisibilityWithRetry(r.Context(), queueName, handle, timeout); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}

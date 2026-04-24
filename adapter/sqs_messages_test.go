@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -387,14 +388,27 @@ func TestSQSServer_LongPollWaitsForArrival(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 	queueURL := createSQSQueueForTest(t, node, "longpoll-arrival")
 
-	// Schedule a send mid-wait.
+	// Schedule a send mid-wait. We track the timer goroutine with a
+	// WaitGroup so the test does not return while callSQS is still
+	// running — otherwise t.Fatalf inside callSQS could fire on a
+	// finished *testing.T (go test flags that as a misuse).
+	var sendWG sync.WaitGroup
+	sendWG.Add(1)
 	sendAt := time.AfterFunc(400*time.Millisecond, func() {
+		defer sendWG.Done()
 		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
 			"QueueUrl":    queueURL,
 			"MessageBody": "late",
 		})
 	})
-	defer sendAt.Stop()
+	defer func() {
+		if sendAt.Stop() {
+			// Timer stopped before firing — func won't run, so balance
+			// the Add with a manual Done.
+			sendWG.Done()
+		}
+		sendWG.Wait()
+	}()
 
 	start := time.Now()
 	status, out := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
