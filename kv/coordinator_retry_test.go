@@ -39,13 +39,16 @@ func (stubLeaderEngine) Configuration(context.Context) (raftengine.Configuration
 }
 func (stubLeaderEngine) Close() error { return nil }
 
-// scriptedTransactional returns the first len(errs) entries from errs on
-// successive Commit calls, then succeeds. It records every observed
-// request so tests can assert on per-attempt StartTS values. Commit is
-// called serially from the Dispatch retry loop, so a plain slice index
-// (guarded by atomic.Int64 for race-detector friendliness) is enough.
+// scriptedTransactional returns the error registered in errs for the
+// 0-indexed call that triggered Commit; calls without a registered
+// entry succeed. Using a map keyed by uint64 rather than a []error
+// keeps the whole counter path unsigned end-to-end — no gosec G115
+// conversions between int (for a slice length) and uint64 (the atomic
+// counter), and no //nolint suppression required. Commit is called
+// serially from the Dispatch retry loop, so atomic.Uint64 is only
+// race-detector ceremony.
 type scriptedTransactional struct {
-	errs     []error
+	errs     map[uint64]error
 	commits  atomic.Uint64
 	reqs     [][]*pb.Request
 	onCommit func(call uint64) // optional hook invoked inside Commit
@@ -57,8 +60,8 @@ func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse
 	if s.onCommit != nil {
 		s.onCommit(idx)
 	}
-	if int(idx) < len(s.errs) && s.errs[idx] != nil {
-		return nil, s.errs[idx]
+	if err := s.errs[idx]; err != nil {
+		return nil, err
 	}
 	return &TransactionResponse{CommitIndex: idx + 1}, nil
 }
@@ -130,9 +133,9 @@ func TestCoordinateDispatch_RetriesTransientLeaderError(t *testing.T) {
 	// gRPC would transport); the third succeeds. Dispatch must absorb
 	// both and return success without leaking the transient error.
 	tx := &scriptedTransactional{
-		errs: []error{
-			cerrors.WithStack(raftengine.ErrNotLeader),
-			errors.New("leader not found"),
+		errs: map[uint64]error{
+			0: cerrors.WithStack(raftengine.ErrNotLeader),
+			1: errors.New("leader not found"),
 		},
 	}
 	c := newRetryCoordinate(tx)
@@ -154,7 +157,7 @@ func TestCoordinateDispatch_NonTransientErrorSurfacesImmediately(t *testing.T) {
 	t.Parallel()
 
 	business := errors.New("write conflict")
-	tx := &scriptedTransactional{errs: []error{business}}
+	tx := &scriptedTransactional{errs: map[uint64]error{0: business}}
 	c := newRetryCoordinate(tx)
 
 	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{
@@ -170,7 +173,7 @@ func TestCoordinateDispatch_RefreshesStartTSOnRetry(t *testing.T) {
 	t.Parallel()
 
 	tx := &scriptedTransactional{
-		errs: []error{cerrors.WithStack(raftengine.ErrNotLeader)},
+		errs: map[uint64]error{0: cerrors.WithStack(raftengine.ErrNotLeader)},
 	}
 	c := newRetryCoordinate(tx)
 
@@ -205,10 +208,10 @@ func TestCoordinateDispatch_CtxCancelDuringRetrySurfaces(t *testing.T) {
 	// on this to tell "I gave up" from "cluster unavailable".
 	ctx, cancel := context.WithCancel(context.Background())
 	tx := &scriptedTransactional{
-		errs: []error{
-			cerrors.WithStack(raftengine.ErrNotLeader),
-			cerrors.WithStack(raftengine.ErrNotLeader),
-			cerrors.WithStack(raftengine.ErrNotLeader),
+		errs: map[uint64]error{
+			0: cerrors.WithStack(raftengine.ErrNotLeader),
+			1: cerrors.WithStack(raftengine.ErrNotLeader),
+			2: cerrors.WithStack(raftengine.ErrNotLeader),
 		},
 		onCommit: func(call uint64) {
 			// Cancel after the first failed attempt so the next
