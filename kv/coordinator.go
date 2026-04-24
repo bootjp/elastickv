@@ -256,16 +256,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	// during a re-election is neither, so we wait briefly for the cluster
 	// to re-stabilise. Non-leader errors that exceed the retry budget are
 	// surfaced unchanged for callers to observe.
-	//
-	// leaderAssignsTS captures whether the caller asked the coordinator to
-	// mint timestamps (reqs.StartTS == 0 on entry for a txn). If so, each
-	// retry MUST reset StartTS/CommitTS back to zero so dispatchOnce
-	// re-issues against the post-churn leader's HLC. Re-using a stale
-	// StartTS from a failed attempt would race the OCC conflict check in
-	// fsm.validateConflicts (LatestCommitTS > startTS) against writes
-	// that committed during the election window, surfacing as a
-	// write-conflict error the retry was meant to absorb.
-	leaderAssignsTS := reqs.IsTxn && reqs.StartTS == 0
+	leaderAssignsTS := coordinatorAssignsTimestamps(reqs)
 	deadline := time.Now().Add(dispatchLeaderRetryBudget)
 	// Reuse a single Timer across retries. time.After would allocate a
 	// fresh timer per iteration whose Go runtime entry lingers until the
@@ -280,7 +271,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	var lastErr error
 	for {
 		lastResp, lastErr = c.dispatchOnce(ctx, reqs)
-		if lastErr == nil || !isTransientLeaderError(lastErr) {
+		if !shouldRetryDispatch(lastErr) {
 			return lastResp, lastErr
 		}
 		if !time.Now().Before(deadline) {
@@ -289,23 +280,52 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if leaderAssignsTS {
 			// Force dispatchOnce to mint a fresh StartTS on the next
 			// attempt; keep CommitTS tied to StartTS by clearing it too
-			// (the same invariant dispatchOnce enforces).
+			// (the same invariant dispatchOnce enforces). Re-using a
+			// stale StartTS would race the OCC conflict check in
+			// fsm.validateConflicts (LatestCommitTS > startTS) against
+			// writes that committed during the election window.
 			reqs.StartTS = 0
 			reqs.CommitTS = 0
 		}
-		timer.Reset(dispatchLeaderRetryInterval)
-		select {
-		case <-ctx.Done():
-			// Caller deadline / cancellation takes precedence over the
-			// transient leader error: gRPC clients rely on
-			// context.Canceled / context.DeadlineExceeded to distinguish
-			// "I gave up waiting" from "cluster is unavailable", and a
-			// short-deadline caller against a leaderless cluster must not
-			// be told "not leader" when the real cause is their own
-			// cancellation.
-			return lastResp, errors.WithStack(ctx.Err())
-		case <-timer.C:
+		if err := waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval); err != nil {
+			return lastResp, err
 		}
+	}
+}
+
+// coordinatorAssignsTimestamps reports whether the caller expects the
+// coordinator to mint StartTS/CommitTS on this dispatch. When true, each
+// retry MUST reset the timestamps back to zero so dispatchOnce re-issues
+// against the post-churn leader's HLC.
+func coordinatorAssignsTimestamps(reqs *OperationGroup[OP]) bool {
+	if !reqs.IsTxn {
+		return false
+	}
+	return reqs.StartTS == 0
+}
+
+// shouldRetryDispatch reports whether Dispatch should loop again on the
+// error returned by dispatchOnce. Only transient leader-unavailable
+// signals qualify; a nil error and every other non-retryable error
+// (write conflict, validation, etc.) must surface unchanged.
+func shouldRetryDispatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isTransientLeaderError(err)
+}
+
+// waitForDispatchRetry sleeps for interval on timer or until ctx fires,
+// whichever comes first. A ctx cancellation returns a wrapped ctx.Err()
+// so gRPC clients can distinguish "I gave up waiting" from "cluster is
+// unavailable"; timer expiry returns nil and the caller loops again.
+func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.Duration) error {
+	timer.Reset(interval)
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
 	}
 }
 
