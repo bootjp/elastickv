@@ -257,6 +257,15 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	// to re-stabilise. Non-leader errors that exceed the retry budget are
 	// surfaced unchanged for callers to observe.
 	deadline := time.Now().Add(dispatchLeaderRetryBudget)
+	// Reuse a single Timer across retries. time.After would allocate a
+	// fresh timer per iteration whose Go runtime entry lingers until the
+	// interval elapses, producing a short-term leak proportional to the
+	// retry rate. Under heavy mid-dispatch leader churn this is a hot
+	// loop, so we Reset the timer in place instead. Go 1.23+ timer
+	// semantics make Reset on an unfired/expired Timer safe without an
+	// explicit drain.
+	timer := time.NewTimer(dispatchLeaderRetryInterval)
+	defer timer.Stop()
 	var lastResp *CoordinateResponse
 	var lastErr error
 	for {
@@ -267,10 +276,11 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if !time.Now().Before(deadline) {
 			return lastResp, lastErr
 		}
+		timer.Reset(dispatchLeaderRetryInterval)
 		select {
 		case <-ctx.Done():
 			return lastResp, lastErr
-		case <-time.After(dispatchLeaderRetryInterval):
+		case <-timer.C:
 		}
 	}
 }

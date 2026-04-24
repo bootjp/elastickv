@@ -152,9 +152,11 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	c := rawKVClient(t, adders)
 
 	wg := sync.WaitGroup{}
-	wg.Add(1000)
-	for i := range 1000 {
+	const workers = 1000
+	wg.Add(workers)
+	for i := range workers {
 		go func(i int) {
+			defer wg.Done()
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
 			want := []byte(strconv.Itoa(i))
 			_, err := c.RawPut(
@@ -162,13 +164,12 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 				&pb.RawPutRequest{Key: key, Value: want},
 			)
 			assert.NoError(t, err, "Put RPC failed")
-			_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
+			_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
 			assert.NoError(t, err, "Put RPC failed")
 
-			resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
+			resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
 			assert.NoError(t, err, "Get RPC failed")
 			assert.Equal(t, want, resp.Value, "consistency check failed")
-			wg.Done()
 		}(i)
 	}
 	wg.Wait()
