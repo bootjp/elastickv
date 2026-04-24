@@ -282,7 +282,7 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	meta, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
+	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
 		return
@@ -317,8 +317,20 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 	dataKey := sqsMsgDataKey(queueName, meta.Generation, rec.MessageID)
 	visKey := sqsMsgVisKey(queueName, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	metaKey := sqsQueueMetaKey(queueName)
+	genKey := sqsQueueGenKey(queueName)
+	// StartTS + ReadKeys fence against a concurrent DeleteQueue /
+	// PurgeQueue / SetQueueAttributes that commits between our meta
+	// read and this dispatch. Without the fence, a DeleteQueue that
+	// bumps the generation would land first, and this send would then
+	// commit under the old generation — silently storing a message
+	// that is no longer reachable via routing (acknowledged loss).
+	// ErrWriteConflict surfaces via writeSQSErrorFromErr so clients
+	// retry against the current queue state.
 	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{metaKey, genKey},
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: dataKey, Value: recordBytes},
 			{Op: kv.Put, Key: visKey, Value: []byte(rec.MessageID)},
@@ -336,19 +348,24 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, body []byte) (*sqsQueueMeta, error) {
+// loadQueueMetaForSend reads the queue metadata and body-size-gates the
+// send. Returns the snapshot read timestamp alongside the metadata so
+// the caller can pin its OCC dispatch to it; without that fence a
+// concurrent DeleteQueue / PurgeQueue could slip in between our read
+// and the write, storing a message under a dead generation.
+func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, body []byte) (*sqsQueueMeta, uint64, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, readTS, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	if int64(len(body)) > meta.MaximumMessageSize {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
+		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
 	}
-	return meta, nil
+	return meta, readTS, nil
 }
 
 // validateSendFIFOParams enforces the AWS-compatible rules around
@@ -925,8 +942,25 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 // Returns the record, its key, the snapshot timestamp the read ran at,
 // or a typed SQS error. Callers use the snapshot as StartTS on the
 // OCC dispatch so concurrent commits cannot slip past ReadKeys.
+//
+// The caller-supplied QueueUrl is cross-checked against the handle's
+// embedded queue_generation, mirroring loadMessageForDelete: an
+// existing DeleteQueue leaves orphan message keys until retention
+// cleans them up, so a handle from a deleted / recreated queue must
+// be rejected with ReceiptHandleIsInvalid instead of silently
+// mutating the orphan record.
 func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, error) {
 	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, nil, readTS, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if meta.Generation != handle.QueueGeneration {
+		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+	}
 	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
