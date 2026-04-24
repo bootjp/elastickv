@@ -148,7 +148,19 @@ func TestRouter_BareAPIRootReturnsJSON404NotHTML(t *testing.T) {
 	r := NewRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}), newTestStatic())
-	for _, p := range []string{"/admin/api/v1", "/admin/assets"} {
+	// /admin/api, /admin/api/v1 (bare), /admin/api/v2 (unimplemented),
+	// /admin/api/v2/foo (deeper under unknown version), and the bare
+	// /admin/assets directory must all resolve to a JSON 404 — never
+	// the SPA HTML fallback — so API clients and probes get a
+	// machine-readable answer.
+	paths := []string{
+		"/admin/api",
+		"/admin/api/v1",
+		"/admin/api/v2",
+		"/admin/api/v2/tables",
+		"/admin/assets",
+	}
+	for _, p := range paths {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)

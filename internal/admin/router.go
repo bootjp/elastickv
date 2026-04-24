@@ -18,8 +18,15 @@ import (
 // directory itself so that requests like `/admin/api/v1` or
 // `/admin/assets` resolve to a JSON 404 rather than falling through to
 // the SPA fallback and being answered with index.html.
+//
+// pathAPIRoot / pathPrefixAPI guard the whole `/admin/api*` namespace —
+// not just v1 — so that requests to currently-unimplemented API
+// versions (`/admin/api`, `/admin/api/v2`, ...) return a JSON 404
+// instead of being silently answered with the SPA HTML.
 const (
 	pathPrefixAdmin   = "/admin"
+	pathAPIRoot       = "/admin/api"
+	pathPrefixAPI     = pathAPIRoot + "/"
 	pathAPIv1Root     = "/admin/api/v1"
 	pathPrefixAPIv1   = pathAPIv1Root + "/"
 	pathHealthz       = "/admin/healthz"
@@ -68,38 +75,78 @@ func NewRouter(api http.Handler, static fs.FS) *Router {
 //  4. /admin/* → index.html (SPA fallback)
 //  5. anything else → 404 JSON
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := r.URL.Path
+	rt.dispatch(rt.classify(r.URL.Path)).ServeHTTP(w, r)
+}
 
-	switch {
-	case p == pathAPIv1Root:
-		// Bare /admin/api/v1 is an API root, not an SPA page: answer
-		// with a JSON 404 so clients never get HTML back on an API
-		// path.
-		rt.notFind.ServeHTTP(w, r)
-		return
-	case strings.HasPrefix(p, pathPrefixAPIv1):
-		if rt.api == nil {
-			rt.notFind.ServeHTTP(w, r)
-			return
-		}
-		rt.api.ServeHTTP(w, r)
-		return
-	case p == pathHealthz:
-		rt.serveHealth(w, r)
-		return
-	case p == pathAssetsRoot:
-		// Same reasoning as /admin/api/v1: the bare assets root is
-		// a directory, not an SPA route.
-		rt.notFind.ServeHTTP(w, r)
-		return
-	case strings.HasPrefix(p, pathPrefixAssets):
-		rt.serveAsset(w, r)
-		return
-	case p == pathPrefixAdmin || strings.HasPrefix(p, pathPrefixAdmin+"/"):
-		rt.serveSPA(w, r)
-		return
+// routeKind enumerates the admin URL classes the router distinguishes.
+// Splitting classify/dispatch keeps ServeHTTP under the cyclomatic
+// complexity ceiling while preserving the strict evaluation order that
+// API-before-SPA routing depends on.
+type routeKind int
+
+const (
+	routeAPIv1 routeKind = iota
+	routeAPIOther
+	routeHealthz
+	routeAssetsRoot
+	routeAsset
+	routeSPA
+	routeUnknown
+)
+
+func (rt *Router) classify(p string) routeKind {
+	if k, ok := classifyAPI(p); ok {
+		return k
 	}
-	rt.notFind.ServeHTTP(w, r)
+	if k, ok := classifyAssets(p); ok {
+		return k
+	}
+	if p == pathHealthz {
+		return routeHealthz
+	}
+	if p == pathPrefixAdmin || strings.HasPrefix(p, pathPrefixAdmin+"/") {
+		return routeSPA
+	}
+	return routeUnknown
+}
+
+func classifyAPI(p string) (routeKind, bool) {
+	switch {
+	case strings.HasPrefix(p, pathPrefixAPIv1):
+		return routeAPIv1, true
+	case p == pathAPIRoot, p == pathAPIv1Root, strings.HasPrefix(p, pathPrefixAPI):
+		return routeAPIOther, true
+	}
+	return 0, false
+}
+
+func classifyAssets(p string) (routeKind, bool) {
+	switch {
+	case p == pathAssetsRoot:
+		return routeAssetsRoot, true
+	case strings.HasPrefix(p, pathPrefixAssets):
+		return routeAsset, true
+	}
+	return 0, false
+}
+
+func (rt *Router) dispatch(k routeKind) http.Handler {
+	switch k {
+	case routeAPIv1:
+		if rt.api == nil {
+			return rt.notFind
+		}
+		return rt.api
+	case routeHealthz:
+		return http.HandlerFunc(rt.serveHealth)
+	case routeAsset:
+		return http.HandlerFunc(rt.serveAsset)
+	case routeSPA:
+		return http.HandlerFunc(rt.serveSPA)
+	case routeAPIOther, routeAssetsRoot, routeUnknown:
+		return rt.notFind
+	}
+	return rt.notFind
 }
 
 func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {

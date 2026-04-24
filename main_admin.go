@@ -266,7 +266,11 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 				continue
 			}
 			status := rt.engine.Status()
-			var members []string
+			// Seed as an empty-but-non-nil slice so a
+			// Configuration() failure still JSON-encodes as `[]`
+			// rather than `null`; API consumers that treat
+			// members as an always-array field rely on this.
+			members := []string{}
 			if cfg, err := rt.engine.Configuration(ctx); err == nil {
 				members = make([]string, 0, len(cfg.Servers))
 				for _, srv := range cfg.Servers {
