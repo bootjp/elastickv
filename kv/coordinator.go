@@ -16,6 +16,23 @@ import (
 
 const redirectForwardTimeout = 5 * time.Second
 
+// dispatchLeaderRetryBudget bounds how long Dispatch keeps absorbing
+// transient leader-unavailable errors (no leader resolvable yet, local
+// node just stepped down, forwarded RPC bounced off a stale leader).
+// gRPC callers expect linearizable semantics — i.e. an operation either
+// commits atomically or fails definitively — so the coordinator hides
+// raft-internal leader churn behind a bounded retry instead of leaking
+// "not leader" / "leader not found" errors out through the API.
+//
+// The budget is large enough to cover one or two complete re-elections
+// even on a slow runner (etcd/raft randomised election timeout up to
+// ~1s), and small enough that a permanent loss of quorum still surfaces
+// to the caller in bounded time.
+const dispatchLeaderRetryBudget = 5 * time.Second
+
+// dispatchLeaderRetryInterval is the poll interval between retries.
+const dispatchLeaderRetryInterval = 25 * time.Millisecond
+
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
 // physical ceiling extends ahead of the current wall clock. Modelled after
 // TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
@@ -225,10 +242,48 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	// Validate the request before any use to avoid panics on malformed input.
+	// Validation errors are not retryable, so do this once outside the loop.
 	if err := validateOperationGroup(reqs); err != nil {
 		return nil, err
 	}
 
+	// Wrap the actual dispatch in a bounded retry loop so that transient
+	// leader-unavailable errors (no leader resolvable yet, local node just
+	// stepped down, forwarded RPC bounced off a stale leader) are absorbed
+	// inside the coordinator instead of leaking out through the gRPC API.
+	// The gRPC contract is linearizable: a single client call either
+	// commits atomically or returns a definitive error. "Leader not found"
+	// during a re-election is neither, so we wait briefly for the cluster
+	// to re-stabilise. Non-leader errors that exceed the retry budget are
+	// surfaced unchanged for callers to observe.
+	deadline := time.Now().Add(dispatchLeaderRetryBudget)
+	var lastResp *CoordinateResponse
+	var lastErr error
+	for {
+		lastResp, lastErr = c.dispatchOnce(ctx, reqs)
+		if lastErr == nil || !isTransientLeaderError(lastErr) {
+			return lastResp, lastErr
+		}
+		if !time.Now().Before(deadline) {
+			return lastResp, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return lastResp, lastErr
+		case <-time.After(dispatchLeaderRetryInterval):
+		}
+	}
+}
+
+// dispatchOnce runs a single Dispatch attempt without retry. It is the
+// transactional unit retried by Dispatch on transient leader errors.
+//
+// StartTS issuance is intentionally inside the per-attempt path: if a
+// previous attempt was rejected by a stale leader, the new leader's
+// HLC must mint a fresh StartTS so it floors above any committed
+// physical-ceiling lease. Re-using the previous StartTS could violate
+// monotonicity across the leader transition.
+func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
 		return c.redirect(ctx, reqs)
 	}
@@ -266,6 +321,33 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
+}
+
+// isTransientLeaderError reports whether err is a transient
+// leader-unavailable signal worth retrying inside Dispatch.
+//
+// Two distinct conditions qualify:
+//   - ErrLeaderNotFound — no leader address resolvable on this node yet
+//     (election in progress, or the previous leader stepped down and the
+//     successor has not propagated). Recoverable as soon as a new leader
+//     publishes its identity.
+//   - isLeadershipLossError — the etcd/raft engine rejected a Propose
+//     because it just lost leadership (ErrNotLeader / ErrLeadershipLost
+//     / ErrLeadershipTransferInProgress). Recoverable by re-routing
+//     through the new leader (redirect path).
+//
+// Business-logic failures (write conflict, validation, etc.) are NOT
+// covered here — those must surface to the caller unchanged so client
+// retry logic can distinguish "system was unavailable" from "your write
+// was rejected on its merits".
+func isTransientLeaderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrLeaderNotFound) {
+		return true
+	}
+	return isLeadershipLossError(err)
 }
 
 // refreshLeaseAfterDispatch extends the lease only when the dispatch
