@@ -377,6 +377,80 @@ func TestSQSServer_ChangeMessageVisibility(t *testing.T) {
 	}
 }
 
+func TestSQSServer_LongPollWaitsForArrival(t *testing.T) {
+	t.Parallel()
+	// WaitTimeSeconds > 0 on an empty queue must block on the server up
+	// to the requested duration. If a message lands mid-wait, the
+	// receive returns it promptly instead of after the full wait.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "longpoll-arrival")
+
+	// Schedule a send mid-wait.
+	sendAt := time.AfterFunc(400*time.Millisecond, func() {
+		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":    queueURL,
+			"MessageBody": "late",
+		})
+	})
+	defer sendAt.Stop()
+
+	start := time.Now()
+	status, out := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            queueURL,
+		"MaxNumberOfMessages": 1,
+		"WaitTimeSeconds":     5,
+	})
+	elapsed := time.Since(start)
+	if status != http.StatusOK {
+		t.Fatalf("receive: %d %v", status, out)
+	}
+	msgs, _ := out["Messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1 (elapsed %v)", len(msgs), elapsed)
+	}
+	// Must have actually waited (the send was scheduled 400ms out) but
+	// must not have waited the full 5 s — the long-poll loop must
+	// return soon after the message arrives.
+	if elapsed < 300*time.Millisecond {
+		t.Fatalf("returned too quickly (%v); long poll should have waited for the send", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("returned too slowly (%v); long poll should have returned soon after arrival", elapsed)
+	}
+}
+
+func TestSQSServer_LongPollTimesOutOnEmptyQueue(t *testing.T) {
+	t.Parallel()
+	// WaitTimeSeconds on an empty queue with no arrival must return
+	// empty after approximately the requested duration.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "longpoll-empty")
+
+	start := time.Now()
+	status, out := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            queueURL,
+		"MaxNumberOfMessages": 1,
+		"WaitTimeSeconds":     1,
+	})
+	elapsed := time.Since(start)
+	if status != http.StatusOK {
+		t.Fatalf("receive: %d %v", status, out)
+	}
+	if msgs, _ := out["Messages"].([]any); len(msgs) != 0 {
+		t.Fatalf("expected 0 messages on empty poll, got %d", len(msgs))
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("returned before WaitTimeSeconds elapsed (%v)", elapsed)
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("returned long after WaitTimeSeconds elapsed (%v)", elapsed)
+	}
+}
+
 func TestSQSServer_ReceiptHandleCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

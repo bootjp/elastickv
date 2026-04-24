@@ -242,9 +242,16 @@ func validateQueueName(name string) error {
 // ------------------------ attribute parsing ------------------------
 
 func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMeta, error) {
+	// AWS SQS requires FifoQueue=true to be explicitly set to create a
+	// FIFO queue; the .fifo suffix alone is not enough. IsFIFO therefore
+	// defaults to false and is only flipped on when the attribute is
+	// present and true. A .fifo-suffixed name without the attribute is
+	// an error (InvalidAttributeValue), because silently creating a
+	// Standard queue with a .fifo suffix would later break real FIFO
+	// clients that address the queue.
 	meta := &sqsQueueMeta{
 		Name:                      name,
-		IsFIFO:                    strings.HasSuffix(name, sqsFIFOQueueNameSuffix),
+		IsFIFO:                    false,
 		VisibilityTimeoutSeconds:  sqsDefaultVisibilityTimeoutSeconds,
 		MessageRetentionSeconds:   sqsDefaultRetentionSeconds,
 		DelaySeconds:              sqsDefaultDelaySeconds,
@@ -254,21 +261,21 @@ func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMet
 	if err := applyAttributes(meta, attrs); err != nil {
 		return nil, err
 	}
-	// FifoQueue attribute is authoritative if explicitly set; otherwise the
-	// .fifo suffix implies true and callers without the suffix get a
-	// standard queue.
+	nameHasFIFOSuffix := strings.HasSuffix(name, sqsFIFOQueueNameSuffix)
 	if v, ok := attrs["FifoQueue"]; ok {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
 			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "FifoQueue must be a boolean")
 		}
-		if b && !strings.HasSuffix(name, sqsFIFOQueueNameSuffix) {
+		if b && !nameHasFIFOSuffix {
 			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name must end in .fifo")
 		}
-		if !b && strings.HasSuffix(name, sqsFIFOQueueNameSuffix) {
+		if !b && nameHasFIFOSuffix {
 			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "Queue name ends in .fifo but FifoQueue=false")
 		}
 		meta.IsFIFO = b
+	} else if nameHasFIFOSuffix {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "FIFO queue name requires FifoQueue=true attribute")
 	}
 	return meta, nil
 }

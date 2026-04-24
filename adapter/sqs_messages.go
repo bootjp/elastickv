@@ -37,6 +37,12 @@ const (
 	sqsReceiveScanOverfetchFactor = 2
 	sqsChangeVisibilityMaxSeconds = sqsMaxVisibilityTimeoutSeconds
 	sqsVisScanPageLimit           = 1024
+	// sqsLongPollInterval is how often the poll loop re-scans the
+	// visibility index when no messages were deliverable on the first
+	// scan. 200 ms is small enough that a ~20 s WaitTimeSeconds still
+	// has <1% tail-latency overhead, large enough that an empty queue
+	// does not spin.
+	sqsLongPollInterval = 200 * time.Millisecond
 	// Version byte prefixed to encoded receipt handles. Bumped when the
 	// on-wire handle format changes so old handles fail to decode loudly.
 	sqsReceiptHandleVersion = byte(0x01)
@@ -407,14 +413,73 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		visibilityTimeout = *in.VisibilityTimeout
 	}
+	waitSeconds := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
 
-	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, meta.Generation, max*sqsReceiveScanOverfetchFactor, readTS)
-	if err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	delivered := s.rotateMessagesForDelivery(ctx, queueName, meta.Generation, candidates, visibilityTimeout, max, readTS)
+	delivered := s.longPollReceive(ctx, queueName, meta.Generation, max, visibilityTimeout, waitSeconds)
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
+}
+
+// resolveReceiveWaitSeconds picks the effective long-poll duration: the
+// per-request WaitTimeSeconds if provided, else the queue default. AWS
+// permits 0..20; values outside the range are clamped so a malformed
+// client request does not stall the server.
+func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) int64 {
+	var w int64
+	if requested != nil {
+		w = *requested
+	} else {
+		w = queueDefault
+	}
+	if w < 0 {
+		w = 0
+	}
+	if w > sqsMaxReceiveMessageWaitSeconds {
+		w = sqsMaxReceiveMessageWaitSeconds
+	}
+	return w
+}
+
+// longPollReceive performs one scan+rotate attempt; if it returned 0
+// messages and the caller asked to wait, it polls the visibility index
+// on a fixed interval until a message arrives, WaitTimeSeconds elapses,
+// or the request context is canceled. Milestone 1 uses polling rather
+// than the commit-stream notifier described in §7.3 of the design; the
+// poll interval is short enough (200 ms) to mask the difference for
+// typical client-side WaitTimeSeconds values.
+func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout, waitSeconds int64) []map[string]any {
+	delivered := s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+	if len(delivered) > 0 || waitSeconds <= 0 {
+		return delivered
+	}
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	ticker := time.NewTicker(sqsLongPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return delivered
+		case <-ticker.C:
+		}
+		if time.Now().After(deadline) {
+			return delivered
+		}
+		delivered = s.scanAndDeliverOnce(ctx, queueName, gen, max, visibilityTimeout)
+		if len(delivered) > 0 {
+			return delivered
+		}
+	}
+}
+
+// scanAndDeliverOnce is the single-pass scan+rotate the long-poll loop
+// re-runs. Each pass takes its own snapshot so the OCC StartTS tracks
+// the most recent visible_at for the candidates it picked.
+func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, gen uint64, max int, visibilityTimeout int64) []map[string]any {
+	readTS := s.nextTxnReadTS(ctx)
+	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, gen, max*sqsReceiveScanOverfetchFactor, readTS)
+	if err != nil {
+		return nil
+	}
+	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS)
 }
 
 func clampReceiveMaxMessages(requested int) int {
