@@ -251,25 +251,24 @@ var argsLen = map[string]int{
 }
 
 type RedisServer struct {
-	listen                   net.Listener
-	store                    store.MVCCStore
-	coordinator              kv.Coordinator
-	readTracker              *kv.ActiveTimestampTracker
-	redisTranscoder          *redisTranscoder
-	pubsub                   *redisPubSub
-	scriptMu                 sync.RWMutex
-	scriptCache              map[string]string
-	luaPool                  *luaStatePool
-	luaPoolOnce              sync.Once
-	traceCommands            bool
-	traceSeq                 atomic.Uint64
-	redisAddr                string
-	relay                    *RedisPubSubRelay
-	relayConnCache           kv.GRPCConnCache
-	requestObserver          monitoring.RedisRequestObserver
-	luaObserver              monitoring.LuaScriptObserver
-	luaFastPathObserver      monitoring.LuaFastPathObserver
-	streamLegacyReadObserver monitoring.StreamLegacyFormatReadObserver
+	listen              net.Listener
+	store               store.MVCCStore
+	coordinator         kv.Coordinator
+	readTracker         *kv.ActiveTimestampTracker
+	redisTranscoder     *redisTranscoder
+	pubsub              *redisPubSub
+	scriptMu            sync.RWMutex
+	scriptCache         map[string]string
+	luaPool             *luaStatePool
+	luaPoolOnce         sync.Once
+	traceCommands       bool
+	traceSeq            atomic.Uint64
+	redisAddr           string
+	relay               *RedisPubSubRelay
+	relayConnCache      kv.GRPCConnCache
+	requestObserver     monitoring.RedisRequestObserver
+	luaObserver         monitoring.LuaScriptObserver
+	luaFastPathObserver monitoring.LuaFastPathObserver
 	// luaFastPathZRange is the pre-resolved counter bundle for the
 	// ZRANGEBYSCORE / ZREVRANGEBYSCORE Lua fast path. Resolved once in
 	// WithLuaFastPathObserver so the hot path does not pay for
@@ -326,14 +325,6 @@ func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.requestObserver = observer
-	}
-}
-
-// WithStreamLegacyFormatReadObserver wires the counter that tracks Redis
-// stream reads served by the legacy single-blob format.
-func WithStreamLegacyFormatReadObserver(observer monitoring.StreamLegacyFormatReadObserver) RedisServerOption {
-	return func(r *RedisServer) {
-		r.streamLegacyReadObserver = observer
 	}
 }
 

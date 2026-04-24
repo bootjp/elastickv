@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -497,35 +498,25 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
-// loadStreamAt reads the entire stream as a redisStreamValue. New writes use
-// the entry-per-key layout; older streams may still live as a single blob
-// under redisStreamKey. Try the new layout first via the meta key, and only
-// fall through to the legacy blob (and increment the legacy-read counter)
-// when the new meta is absent. The counter tells operators when it is safe
-// to delete the fallback path; a non-zero value means the migration code is
-// still exercised.
+// loadStreamAt reads the entire stream as a redisStreamValue from the
+// entry-per-key layout. Per the PR #620 operator directive, any legacy
+// single-blob data is explicitly discarded: if the new meta key is absent
+// we return an empty stream, even when a legacy blob still exists on disk.
+// The legacy blob is actively deleted by the next write (see
+// streamWriteBase) and by any DEL via deleteStreamWideColumnElems.
 func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, error) {
 	meta, metaFound, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return redisStreamValue{}, err
 	}
-	if metaFound {
-		entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
-		if err != nil {
-			return redisStreamValue{}, err
-		}
-		return redisStreamValue{Entries: entries}, nil
+	if !metaFound {
+		return redisStreamValue{}, nil
 	}
-	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisStreamValue{}, nil
-		}
-		return redisStreamValue{}, errors.WithStack(err)
+		return redisStreamValue{}, err
 	}
-	r.observeLegacyStreamRead()
-	val, err := unmarshalStreamValue(raw)
-	return val, err
+	return redisStreamValue{Entries: entries}, nil
 }
 
 // loadStreamMetaAt returns the current StreamMeta for key, or (_, false, nil)
@@ -561,15 +552,10 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	const concurrentWriteSlack = 64
-	if expectedLen <= 0 {
+	limit := scanStreamEntriesLimit(expectedLen)
+	if limit == 0 && expectedLen <= 0 {
 		return []redisStreamEntry{}, nil
 	}
-	// Size to meta.Length + slack so we don't round-trip every entry
-	// through a paging loop, but also don't silently truncate if
-	// concurrent writes grew the stream between the meta read and the
-	// scan.
-	limit := int(expectedLen) + concurrentWriteSlack
 	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -585,13 +571,28 @@ func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readT
 	return entries, nil
 }
 
-// observeLegacyStreamRead records that this read fell through to the legacy
-// single-blob format. Safe when no observer is wired (tests).
-func (r *RedisServer) observeLegacyStreamRead() {
-	if r == nil || r.streamLegacyReadObserver == nil {
-		return
+// scanStreamEntriesLimit derives the ScanAt limit for scanStreamEntriesAt.
+// Arithmetic is performed in int64 and the result is clamped to math.MaxInt
+// before narrowing; this keeps the helper correct on 32-bit targets and
+// when expectedLen is corrupted into a value that would otherwise overflow
+// int on addition with the slack. A negative or zero expectedLen falls
+// through to the ScanAt "limit==0 means no limit" convention.
+func scanStreamEntriesLimit(expectedLen int64) int {
+	const concurrentWriteSlack = int64(64)
+	if expectedLen <= 0 {
+		return 0
 	}
-	r.streamLegacyReadObserver.ObserveStreamLegacyFormatRead()
+	want := expectedLen + concurrentWriteSlack
+	// Overflow guard: expectedLen is a corrupted meta away from anything;
+	// if the sum wraps, fall back to "no limit" (ScanAt stores its own
+	// hard caps downstream) rather than pass a negative value.
+	if want < expectedLen {
+		return 0
+	}
+	if want > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(want)
 }
 
 func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uint64, elems []*kv.Elem[kv.OP]) error {
@@ -957,6 +958,15 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 // it can be deleted.
 func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	var elems []*kv.Elem[kv.OP]
+	// Delete any legacy single-blob remnant in the same commit so DEL
+	// leaves no stale data on disk even when the stream was never
+	// migrated. ExistsAt is cheap; the Del is a no-op on the storage
+	// side when the key is already absent.
+	legacyCleanup, err := r.legacyStreamCleanupElems(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	elems = append(elems, legacyCleanup...)
 	metaKey := store.StreamMetaKey(key)
 	if exists, err := r.store.ExistsAt(ctx, metaKey, readTS); err != nil {
 		return nil, errors.WithStack(err)

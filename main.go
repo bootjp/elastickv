@@ -775,7 +775,6 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
-		adapter.WithStreamLegacyFormatReadObserver(metricsRegistry.StreamLegacyFormatReadObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
 	)
 	eg.Go(func() error {

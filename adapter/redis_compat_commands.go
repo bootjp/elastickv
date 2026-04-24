@@ -3693,12 +3693,12 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", wrongTypeError()
 	}
 
-	migrationElems, existingEntries, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
+	legacyCleanup, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
 
-	id, parsedID, err := resolveXAddID(meta, metaFound, existingEntries, req.id)
+	id, parsedID, err := resolveXAddID(meta, metaFound, req.id)
 	if err != nil {
 		return "", err
 	}
@@ -3712,44 +3712,26 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", err
 	}
 
-	// NOTE: when migrationElems is non-empty, its Put(StreamEntryKey) operations
-	// and the trim-path Del(StreamEntryKey) operations below may target the same
-	// entry key. The coordinator applies operations sequentially in insertion
-	// order at a single commitTS, so the later Del tombstones the earlier Put
-	// and the end state is correct. TestRedis_StreamMigrationWithMaxLenTrim
-	// guards this apply-order contract.
-	//
-	// Capacity hint covers: migrationElems + one entry Put + one meta Put +
-	// the trim Dels that will follow. estimateTrim... avoids a cyclop
-	// bump on xaddTxn by keeping the maxLen arithmetic out of the main
-	// function body.
+	// Capacity hint covers: optional legacy-cleanup Del + one entry Put +
+	// one meta Put + the trim Dels. legacyCleanup is at most one element,
+	// and only non-empty on the very first write against a stream whose
+	// pre-migration blob is still on disk.
 	const xaddFixedElemCount = 2
 	elems := make([]*kv.Elem[kv.OP], 0,
-		len(migrationElems)+xaddFixedElemCount+estimateXAddTrimCount(req.maxLen, meta.Length))
-	elems = append(elems, migrationElems...)
+		len(legacyCleanup)+xaddFixedElemCount+estimateXAddTrimCount(req.maxLen, meta.Length))
+	elems = append(elems, legacyCleanup...)
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.StreamEntryKey(key, parsedID.ms, parsedID.seq),
 		Value: entryValue,
 	})
 
-	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1, migrationElems != nil, existingEntries)
+	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1)
 	if err != nil {
 		return "", err
 	}
 	elems = append(elems, trim...)
-
-	// MAXLEN 0: the trim above deleted all pre-existing entries (scanned at
-	// readTS), but cannot see the just-appended entry because it was written
-	// above the read snapshot. Emit a follow-up Del so the entry doesn't
-	// survive while meta says Length=0. The coordinator applies elems in
-	// order, so this Del tombstones the preceding Put at the same commitTS.
-	if req.maxLen == 0 {
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:  kv.Del,
-			Key: store.StreamEntryKey(key, parsedID.ms, parsedID.seq),
-		})
-	}
+	elems = appendMaxLenZeroSelfDel(elems, req.maxLen, key, parsedID)
 
 	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
 		Length:  nextLen,
@@ -3762,6 +3744,21 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
 	return id, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+// appendMaxLenZeroSelfDel handles the MAXLEN 0 edge case. The trim loop
+// runs scans at readTS and therefore cannot see the entry we just queued,
+// so without this follow-up Del the freshly-added entry would survive
+// while meta.Length said 0. The coordinator applies elems in order at a
+// single commitTS, so appending Del after the Put tombstones it cleanly.
+func appendMaxLenZeroSelfDel(elems []*kv.Elem[kv.OP], maxLen int, key []byte, parsedID redisStreamID) []*kv.Elem[kv.OP] {
+	if maxLen != 0 {
+		return elems
+	}
+	return append(elems, &kv.Elem[kv.OP]{
+		Op:  kv.Del,
+		Key: store.StreamEntryKey(key, parsedID.ms, parsedID.seq),
+	})
 }
 
 // xaddEnforceMaxWideColumn rejects an XADD that would push the stream past
@@ -3806,128 +3803,68 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	readTS uint64,
 	maxLen int,
 	candidateLen int64,
-	migrationActive bool,
-	existingEntries []redisStreamEntry,
 ) (int64, []*kv.Elem[kv.OP], error) {
 	if maxLen < 0 || candidateLen <= int64(maxLen) {
 		return candidateLen, nil, nil
 	}
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, migrationActive, existingEntries, int(candidateLen)-maxLen)
+	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, int(candidateLen)-maxLen)
 	if err != nil {
 		return 0, nil, err
 	}
 	return int64(maxLen), trim, nil
 }
 
-// streamWriteBase prepares a write to a stream.
-//
-// Fast path (no legacy blob, stream already in the new layout or absent):
-// only the meta key is read. migrationElems and existingEntries are nil.
-// XADD / XTRIM against a fully-migrated stream issue a bounded meta-only
-// read here, keeping append cost O(1) in the stream size.
-//
-// Migration path (legacy single-blob stream still present): load every
-// legacy entry, return Puts that re-emit them under the entry-per-key
-// layout plus a Del for the legacy blob, and return the materialized
-// entry list so the caller can derive MAXLEN trims from it at the same
-// snapshot. The legacy blob must never coexist with the new layout in a
-// committed state — violating that would double-count XLEN — so the Del
-// and the new-format Puts go out in a single transaction.
-//
-// All reads use the caller-supplied ctx and readTS, so the scan happens
-// at the exact same MVCC snapshot as the outer transaction and honours
-// request cancellation.
-func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], []redisStreamEntry, store.StreamMeta, bool, error) {
+// streamWriteBase prepares a write to a stream. Returns the loaded meta
+// (zero value when the stream has never been written) and, when a legacy
+// single-blob key is still present on disk, a Del elem that the caller
+// must include in the write transaction. No migration is performed:
+// legacy entries are discarded, not re-materialised into the new layout.
+// This matches the PR #620 operator directive that pre-migration data is
+// expendable and is cleared explicitly rather than saved.
+func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], store.StreamMeta, bool, error) {
 	meta, metaFound, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
-		return nil, nil, store.StreamMeta{}, false, err
+		return nil, store.StreamMeta{}, false, err
 	}
 	if metaFound {
-		// Already migrated: meta carries Length/LastMs/LastSeq which is all
-		// XADD/XTRIM need. Entries stay on disk — the caller uses a bounded
-		// range scan only when MAXLEN trimming is requested.
-		return nil, nil, meta, true, nil
+		return nil, meta, true, nil
 	}
-
-	legacy, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
+	legacyCleanup, err := r.legacyStreamCleanupElems(ctx, key, readTS)
 	if err != nil {
-		if cockerrors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, store.StreamMeta{}, false, nil
-		}
-		return nil, nil, store.StreamMeta{}, false, cockerrors.WithStack(err)
+		return nil, store.StreamMeta{}, false, err
 	}
-	val, err := unmarshalStreamValue(legacy)
-	if err != nil {
-		return nil, nil, store.StreamMeta{}, false, err
-	}
+	return legacyCleanup, store.StreamMeta{}, false, nil
+}
 
-	// Capture LastMs/LastSeq from the original final entry before any
-	// truncation so XADD * stays monotonic even when the blob is capped.
-	var lastMs, lastSeq uint64
-	if len(val.Entries) > 0 {
-		if lastParsed, ok := tryParseRedisStreamID(val.Entries[len(val.Entries)-1].ID); ok {
-			lastMs, lastSeq = lastParsed.ms, lastParsed.seq
-		}
+// legacyStreamCleanupElems returns a Del elem for the legacy single-blob
+// key if one is still present on disk, or nil otherwise. Called by
+// streamWriteBase and deleteStreamWideColumnElems so every write or delete
+// that touches a stream also evicts any stale legacy data.
+func (r *RedisServer) legacyStreamCleanupElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	legacyKey := redisStreamKey(key)
+	exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
 	}
-	// Reject migration when the legacy blob exceeds maxWideColumnItems.
-	// Silently truncating would cause data loss on commands that the client
-	// expects to be no-ops (e.g., XTRIM MAXLEN > stream length). The client
-	// must XTRIM the stream to ≤ maxWideColumnItems entries first so the
-	// migration can proceed without dropping data.
-	entriesToMigrate := val.Entries
-	if len(entriesToMigrate) > maxWideColumnItems {
-		return nil, nil, store.StreamMeta{}, false,
-			cockerrors.Wrapf(ErrCollectionTooLarge,
-				"legacy stream %q has %d entries, exceeding migration cap %d; XTRIM to ≤ %d entries before writing",
-				key, len(entriesToMigrate), maxWideColumnItems, maxWideColumnItems)
+	if !exists {
+		return nil, nil
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(entriesToMigrate)+1)
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
-	for _, entry := range entriesToMigrate {
-		parsed, ok := tryParseRedisStreamID(entry.ID)
-		if !ok {
-			return nil, nil, store.StreamMeta{}, false, cockerrors.WithStack(cockerrors.Newf("invalid legacy stream ID %q", entry.ID))
-		}
-		value, merr := marshalStreamEntry(entry)
-		if merr != nil {
-			return nil, nil, store.StreamMeta{}, false, merr
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.StreamEntryKey(key, parsed.ms, parsed.seq),
-			Value: value,
-		})
-	}
-	migratedMeta := store.StreamMeta{
-		Length:  int64(len(entriesToMigrate)),
-		LastMs:  lastMs,
-		LastSeq: lastSeq,
-	}
-	return elems, entriesToMigrate, migratedMeta, true, nil
+	return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: legacyKey}}, nil
 }
 
 // resolveXAddID resolves the requested ID (possibly '*') against the current
-// stream state and returns the assigned string ID plus its parsed form.
-// existingEntries is only consulted when the caller has no meta yet.
-func resolveXAddID(meta store.StreamMeta, hasMeta bool, existingEntries []redisStreamEntry, requested string) (string, redisStreamID, error) {
+// stream meta and returns the assigned string ID plus its parsed form.
+func resolveXAddID(meta store.StreamMeta, hasMeta bool, requested string) (string, redisStreamID, error) {
 	var (
 		hasLast         bool
 		lastMs, lastSeq uint64
 	)
-	switch {
-	case hasMeta && meta.Length > 0:
-		hasLast = true
+	if hasMeta {
+		// LastMs/LastSeq carry the highest ID ever assigned even when the
+		// stream was trimmed to empty, so auto-ID generation stays
+		// monotonic across MAXLEN=0 / XDEL-all cycles.
+		hasLast = meta.Length > 0 || meta.LastMs != 0 || meta.LastSeq != 0
 		lastMs, lastSeq = meta.LastMs, meta.LastSeq
-	case hasMeta:
-		// length==0 but the stream existed; LastMs/LastSeq still carry the
-		// highest ID ever assigned so auto-ID generation remains monotonic.
-		hasLast = meta.LastMs != 0 || meta.LastSeq != 0
-		lastMs, lastSeq = meta.LastMs, meta.LastSeq
-	case len(existingEntries) > 0:
-		last := existingEntries[len(existingEntries)-1]
-		if parsed, ok := tryParseRedisStreamID(last.ID); ok {
-			hasLast, lastMs, lastSeq = true, parsed.ms, parsed.seq
-		}
 	}
 	id, err := nextXAddID(hasLast, lastMs, lastSeq, requested)
 	if err != nil {
@@ -3940,42 +3877,26 @@ func resolveXAddID(meta store.StreamMeta, hasMeta bool, existingEntries []redisS
 	return id, parsed, nil
 }
 
-// buildXTrimHeadElems emits Del operations for the oldest `count` entries.
-// When migrationActive is true the caller has already scheduled Puts for
-// every legacy entry in existingEntries; those Puts must be paired with
-// Dels to keep the trim invariant without issuing a redundant scan.
-// Otherwise the Dels target live-layout entry keys fetched via a bounded
-// range scan at the caller's MVCC snapshot (ctx, readTS) — mixing a later
-// timestamp here would let us tombstone keys the caller's view never saw.
+// buildXTrimHeadElems emits Del operations for the oldest `count` entries
+// in the entry-per-key layout via a bounded range scan at the caller's
+// MVCC snapshot (ctx, readTS). Mixing a later timestamp here would let us
+// tombstone keys the caller's view never saw.
 func (r *RedisServer) buildXTrimHeadElems(
 	ctx context.Context,
 	key []byte,
 	readTS uint64,
-	migrationActive bool,
-	existingEntries []redisStreamEntry,
 	count int,
 ) ([]*kv.Elem[kv.OP], error) {
 	if count <= 0 {
 		return nil, nil
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, count)
-	if migrationActive {
-		for i := 0; i < count && i < len(existingEntries); i++ {
-			parsed, ok := tryParseRedisStreamID(existingEntries[i].ID)
-			if !ok {
-				return nil, cockerrors.WithStack(cockerrors.Newf("invalid legacy stream ID %q", existingEntries[i].ID))
-			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.StreamEntryKey(key, parsed.ms, parsed.seq)})
-		}
-		return elems, nil
-	}
-	// Live layout: fetch the oldest `count` entry keys via a bounded range scan.
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	kvs, err := r.store.ScanAt(ctx, prefix, end, count, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
 	for _, pair := range kvs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: append([]byte(nil), pair.Key...)})
 	}
@@ -4039,21 +3960,24 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 		return 0, wrongTypeError()
 	}
 
-	migrationElems, existingEntries, meta, _, err := r.streamWriteBase(ctx, key, readTS)
+	legacyCleanup, meta, _, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
 
 	if meta.Length <= int64(maxLen) {
-		if migrationElems != nil {
-			// Still have to flush the migration even when the trim is a no-op,
-			// otherwise the legacy blob stays and later writes will re-migrate.
+		if len(legacyCleanup) > 0 {
+			// Flush the legacy-blob deletion even when the trim is a no-op,
+			// otherwise a subsequent read would still find the stale blob.
+			// The pre-existing meta may be the zero value (fresh stream with
+			// legacy data on disk); persist it so the next XADD doesn't
+			// re-discover the blob and rewrite this Del.
 			metaBytes, metaErr := store.MarshalStreamMeta(meta)
 			if metaErr != nil {
 				return 0, cockerrors.WithStack(metaErr)
 			}
-			elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+1)
-			elems = append(elems, migrationElems...)
+			elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+1)
+			elems = append(elems, legacyCleanup...)
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 			return 0, r.dispatchElems(ctx, true, readTS, elems)
 		}
@@ -4061,13 +3985,13 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 	}
 
 	removed := int(meta.Length) - maxLen
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, migrationElems != nil, existingEntries, removed)
+	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, removed)
 	if err != nil {
 		return 0, err
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(trim)+1)
-	elems = append(elems, migrationElems...)
+	elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+len(trim)+1)
+	elems = append(elems, legacyCleanup...)
 	elems = append(elems, trim...)
 	meta.Length -= int64(removed)
 	metaBytes, err := store.MarshalStreamMeta(meta)
