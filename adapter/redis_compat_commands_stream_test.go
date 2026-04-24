@@ -203,6 +203,28 @@ func TestRedis_StreamXRangeBounds(t *testing.T) {
 	require.Len(t, rev, 4)
 	require.Equal(t, "1003-0", rev[0].ID)
 	require.Equal(t, "1000-0", rev[3].ID)
+
+	// Shorthand ms-only bounds (Codex P2 regression guard).
+	// `XRANGE k 0 +` and `XRANGE k 1001 1002` must work without
+	// returning "ERR Invalid stream ID"; the legacy blob path accepted
+	// shorthand via string-compare fallback, so migrating streams must
+	// keep that contract. parseStreamBoundID expands "ms" to ms-0
+	// (lower inclusive / upper exclusive) or ms-MaxUint64 (lower
+	// exclusive / upper inclusive) so the half-open scan covers the
+	// whole ms row.
+	shortAll, err := rdb.XRange(ctx, "stream-range", "0", "+").Result()
+	require.NoError(t, err, "XRANGE with shorthand lower bound 0 must succeed after migration")
+	require.Len(t, shortAll, 4)
+
+	shortRow, err := rdb.XRange(ctx, "stream-range", "1001", "1002").Result()
+	require.NoError(t, err, "XRANGE with shorthand bounds ms-only must succeed")
+	require.Len(t, shortRow, 2)
+	require.Equal(t, "1001-0", shortRow[0].ID)
+	require.Equal(t, "1002-0", shortRow[1].ID)
+
+	shortExclusiveUpper, err := rdb.Do(ctx, "XRANGE", "stream-range", "-", "(1002").Slice()
+	require.NoError(t, err, "XRANGE with shorthand exclusive upper bound must succeed")
+	require.Len(t, shortExclusiveUpper, 2, "(1002 shorthand excludes all ms=1002 entries")
 }
 
 func TestRedis_StreamMigrationFromLegacyBlob(t *testing.T) {
@@ -449,4 +471,40 @@ func gatherLegacyReads(t *testing.T, registry *monitoring.Registry) int64 {
 		return int64(total)
 	}
 	return 0
+}
+
+// TestXAddEnforceMaxWideColumn is a pure-function regression guard: the
+// maxWideColumnItems cap must reject unbounded XADDs on a stream that is
+// already at the ceiling, but must NOT reject when the caller supplied a
+// MAXLEN clause that keeps the committed length bounded.
+func TestXAddEnforceMaxWideColumn(t *testing.T) {
+	t.Parallel()
+	key := []byte("s")
+	ceiling := int64(maxWideColumnItems)
+
+	cases := []struct {
+		name     string
+		length   int64
+		maxLen   int
+		wantFail bool
+	}{
+		{"below-cap-no-maxlen", ceiling - 1, 0, false},
+		{"at-cap-no-maxlen", ceiling, 0, true},
+		{"above-cap-no-maxlen", ceiling + 5, 0, true},
+		{"at-cap-bounded-maxlen", ceiling, 10, false},
+		{"above-cap-bounded-maxlen", ceiling + 5, maxWideColumnItems, false},
+		{"at-cap-maxlen-too-large", ceiling, maxWideColumnItems + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := xaddEnforceMaxWideColumn(key, tc.length, tc.maxLen)
+			if tc.wantFail {
+				require.Error(t, err)
+				require.ErrorIs(t, err, ErrCollectionTooLarge)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

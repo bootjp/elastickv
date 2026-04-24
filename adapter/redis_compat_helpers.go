@@ -546,21 +546,33 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 }
 
 // scanStreamEntriesAt returns all entries for key in ascending ID order.
-// expectedLen is currently unused; it is kept on the signature so callers
-// that already know the stream length can later request an exact scan
-// limit without another API change. Until that optimisation lands the
-// scan is always capped at maxWideScanLimit.
+// This path exists to reconstruct the full stream for callers — the Lua
+// stream bridge (streamState) and the legacy compatibility surface — that
+// previously loaded the entire stream as a single blob. The legacy blob
+// had no size cap, so capping this scan at maxWideColumnItems would be a
+// behaviour regression for migrated large streams ("XLEN > 100k" legal
+// before the PR, fatal after). Size the scan from expectedLen (meta.Length
+// at the caller's snapshot) plus a small slack for writes that committed
+// between the meta read and the entry scan.
+//
+// User-bounded scans (XREAD/XRANGE/XREVRANGE) do keep the cap via
+// scanStreamEntriesAfter / rangeStreamNewLayout; only the
+// materialise-everything path omits it, matching legacy blob semantics.
 func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
-	_ = expectedLen
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	limit := maxWideScanLimit
+	const concurrentWriteSlack = 64
+	limit := 0 // unbounded; ScanAt treats 0 as no limit
+	if expectedLen > 0 {
+		// Size to meta.Length + slack so we don't round-trip every entry
+		// through a paging loop, but also don't silently truncate if
+		// concurrent writes grew the stream between the meta read and the
+		// scan.
+		limit = int(expectedLen) + concurrentWriteSlack
+	}
 	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
-	}
-	if len(kvs) > maxWideColumnItems {
-		return nil, errors.Wrapf(ErrCollectionTooLarge, "stream %q exceeds %d entries", key, maxWideColumnItems)
 	}
 	entries := make([]redisStreamEntry, 0, len(kvs))
 	for _, pair := range kvs {

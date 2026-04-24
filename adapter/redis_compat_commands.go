@@ -4634,11 +4634,10 @@ func streamBoundLow(prefix []byte, raw string) ([]byte, error) {
 	if exclusive {
 		raw = raw[1:]
 	}
-	parsed, ok := tryParseRedisStreamID(raw)
+	ms, seq, ok := parseStreamBoundID(raw, false, exclusive)
 	if !ok {
 		return nil, errors.New("ERR Invalid stream ID specified as stream command argument")
 	}
-	ms, seq := parsed.ms, parsed.seq
 	if exclusive {
 		switch {
 		case seq < ^uint64(0):
@@ -4662,11 +4661,10 @@ func streamBoundHigh(prefix []byte, raw string) ([]byte, error) {
 	if exclusive {
 		raw = raw[1:]
 	}
-	parsed, ok := tryParseRedisStreamID(raw)
+	ms, seq, ok := parseStreamBoundID(raw, true, exclusive)
 	if !ok {
 		return nil, errors.New("ERR Invalid stream ID specified as stream command argument")
 	}
-	ms, seq := parsed.ms, parsed.seq
 	if !exclusive {
 		switch {
 		case seq < ^uint64(0):
@@ -4679,6 +4677,38 @@ func streamBoundHigh(prefix []byte, raw string) ([]byte, error) {
 		}
 	}
 	return appendStreamKey(prefix, ms, seq), nil
+}
+
+// parseStreamBoundID accepts both the strict ms-seq form and the shorthand
+// "ms" form that Redis XRANGE/XREVRANGE allow. Redis interprets a shorthand
+// ID as a half-open range over every entry with matching ms:
+//
+//	XRANGE key 5 5      == every entry with ms == 5
+//	XRANGE key (5 5     == every entry with ms == 5 except ms-0
+//
+// To make the existing ±1 exclusive-shift logic work uniformly, we expand
+// the shorthand to the ms-seq that would reproduce the same scan after that
+// shift: seq=MaxUint64 when matching-all-ms is on the same side of the
+// comparison as the shift ((upper && !exclusive) or (lower && exclusive));
+// seq=0 otherwise. Full ms-seq IDs pass through unchanged.
+func parseStreamBoundID(raw string, upper, exclusive bool) (uint64, uint64, bool) {
+	if strings.IndexByte(raw, '-') >= 0 {
+		parsed, ok := tryParseRedisStreamID(raw)
+		if !ok {
+			return 0, 0, false
+		}
+		return parsed.ms, parsed.seq, true
+	}
+	ms, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	// XOR: exactly one of "upper" and "exclusive" puts us in the
+	// "match all entries with this ms" side.
+	if upper != exclusive {
+		return ms, ^uint64(0), true
+	}
+	return ms, 0, true
 }
 
 func appendStreamKey(prefix []byte, ms, seq uint64) []byte {
