@@ -95,6 +95,19 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.dynamodb-workload --local --time-limit 5 --rate 5 --concurrency 5 --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+      - name: Run DynamoDB per-type Jepsen workloads against elastickv
+        working-directory: jepsen
+        timeout-minutes: 10
+        run: |
+          set -e
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            echo "::group::value-type=${t}"
+            timeout 120 ~/lein run -m elastickv.dynamodb-types-workload --local \
+              --time-limit 5 --rate 5 --concurrency 4 \
+              --value-type "${t}" \
+              --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+            echo "::endgroup::"
+          done
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3
