@@ -11,11 +11,11 @@
 // path lets the node sync the WAL and stop raft cleanly, avoiding the
 // election storms and lease loss that follow crash-restarts.
 //
-// The watcher polls runtime.ReadMemStats at a fixed cadence. When
-// HeapInuse crosses the configured threshold it invokes OnExceed once
-// and exits. The watcher never calls os.Exit or sends signals itself;
-// callers wire OnExceed to the existing shutdown path (typically a
-// root context.CancelFunc).
+// The watcher samples runtime/metrics at a fixed cadence. When the live
+// heap-in-use byte count crosses the configured threshold it invokes
+// OnExceed once and exits. The watcher never calls os.Exit or sends
+// signals itself; callers wire OnExceed to the existing shutdown path
+// (typically a root context.CancelFunc).
 //
 // Wiring in elastickv (see main.go):
 //
@@ -33,20 +33,30 @@
 //
 // # Metric choice
 //
-// We read runtime.MemStats.HeapInuse. It is the closest Go-runtime-visible
-// proxy for "how close are we to OOM" without a syscall per poll. RSS from
+// We sample `runtime/metrics` (Go 1.16+) rather than `runtime.ReadMemStats`.
+// ReadMemStats triggers a stop-the-world pause proportional to the number of
+// goroutines and heap size; at 1 s cadence that's typically negligible, but
+// at a tighter MinPollInterval (10 ms) it begins to register. runtime/metrics
+// readers are lock-free for the counters we need and do not stop the world.
+//
+// The threshold is compared against
+//
+//	/memory/classes/heap/objects:bytes + /memory/classes/heap/unused:bytes
+//
+// which is the runtime/metrics equivalent of MemStats.HeapInuse: bytes held
+// in heap spans that are currently allocated from the OS, including span
+// overhead, but excluding pages the runtime has released back. RSS from
 // /proc/self/status is more accurate but requires a read syscall on every
-// poll; at the 1s cadence this watchdog runs that accuracy isn't worth the
-// cost. We deliberately do NOT use MemStats.Sys, NumGC or Alloc: Sys and
-// NumGC include memory the runtime has already released back to the OS (or
-// are monotonic counters) and Alloc counts only currently-live heap objects,
-// missing the span-level overhead that the OOM-killer actually sees.
+// poll and is not what the Go allocator itself tracks. We deliberately do
+// NOT compare against "total heap classes" (which includes released memory
+// already returned to the OS) or "heap/objects" alone (which misses span
+// fragmentation that the OOM-killer sees).
 package memwatch
 
 import (
 	"context"
 	"log/slog"
-	"runtime"
+	"runtime/metrics"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,30 +64,27 @@ import (
 
 // DefaultPollInterval is the polling cadence used when Config.PollInterval
 // is zero. One second is frequent enough to catch fast-growing memtables
-// before the kernel kills the process, but infrequent enough that
-// runtime.ReadMemStats (which stops the world briefly) doesn't become a
-// meaningful source of latency on its own.
+// before the kernel kills the process, and infrequent enough that even
+// aggressive log rollups don't observe the watcher as a hot sampler.
 const DefaultPollInterval = time.Second
 
-// MinPollInterval is the floor enforced by New. ReadMemStats is a STW
-// operation (~tens of microseconds on modern Go); polling faster than
-// 10ms risks accumulating noticeable pause time on its own, and no
-// memory-growth pattern we care about needs sub-10ms detection latency.
-// Values below this floor (including zero from an unset Config) are
-// clamped to DefaultPollInterval; an explicit operator override below
-// MinPollInterval is clamped up to it.
+// MinPollInterval is the floor enforced by New. runtime/metrics reads are
+// cheap but a sub-10ms cadence produces no detection benefit over 10ms
+// (memory pressure does not move that fast on these VMs) and would churn
+// the ticker for no gain.
 const MinPollInterval = 10 * time.Millisecond
 
 // Config configures a Watcher.
 type Config struct {
-	// ThresholdBytes is the HeapInuse threshold in bytes. When
-	// runtime.MemStats.HeapInuse exceeds this value the watcher invokes
-	// OnExceed exactly once and returns. A zero value disables the
-	// watcher entirely (Start returns immediately).
+	// ThresholdBytes is the heap-in-use threshold in bytes. When the
+	// sampled heap-in-use crosses this value the watcher invokes OnExceed
+	// exactly once and returns. A zero value disables the watcher entirely
+	// (Start returns immediately).
 	ThresholdBytes uint64
 
-	// PollInterval is how often ReadMemStats is called. Defaults to
-	// DefaultPollInterval when zero.
+	// PollInterval is how often the metrics are sampled. Defaults to
+	// DefaultPollInterval when zero; values below MinPollInterval are
+	// clamped up to MinPollInterval.
 	PollInterval time.Duration
 
 	// OnExceed is called at most once, from the watcher's own goroutine,
@@ -92,7 +99,24 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Watcher polls process memory and fires OnExceed once, when HeapInuse
+// Metric sample indices — kept stable so samples[] can be reused across
+// polls without reallocating or re-resolving names.
+const (
+	sampleHeapObjects = iota
+	sampleHeapUnused
+	sampleHeapReleased
+	sampleGCGoal
+	sampleCount
+)
+
+var metricNames = [sampleCount]string{
+	sampleHeapObjects:  "/memory/classes/heap/objects:bytes",
+	sampleHeapUnused:   "/memory/classes/heap/unused:bytes",
+	sampleHeapReleased: "/memory/classes/heap/released:bytes",
+	sampleGCGoal:       "/gc/heap/goal:bytes",
+}
+
+// Watcher polls process memory and fires OnExceed once, when heap-in-use
 // crosses the configured threshold. Callers get a single-shot notification
 // and are expected to initiate graceful shutdown; Watcher does not call
 // os.Exit or send signals itself.
@@ -102,6 +126,9 @@ type Watcher struct {
 	started   atomic.Bool
 	doneCh    chan struct{}
 	closeOnce sync.Once
+	// samples is reused across polls; metric-name resolution happens once
+	// in New so the hot path only walks a fixed []Sample.
+	samples []metrics.Sample
 }
 
 // New constructs a Watcher from the given Config. The Watcher does not
@@ -116,9 +143,14 @@ func New(cfg Config) *Watcher {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	samples := make([]metrics.Sample, sampleCount)
+	for i, name := range metricNames {
+		samples[i].Name = name
+	}
 	return &Watcher{
-		cfg:    cfg,
-		doneCh: make(chan struct{}),
+		cfg:     cfg,
+		doneCh:  make(chan struct{}),
+		samples: samples,
 	}
 }
 
@@ -168,14 +200,32 @@ func (w *Watcher) closeDoneOnce() {
 	w.closeOnce.Do(func() { close(w.doneCh) })
 }
 
-// checkAndMaybeFire reads MemStats once, and if HeapInuse is at or above
-// the threshold and OnExceed has not already fired, invokes OnExceed and
-// returns true to signal the loop to exit.
-func (w *Watcher) checkAndMaybeFire() bool {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
+// sampleUint64 reads a named Uint64 sample from w.samples after metrics.Read
+// has populated them. Returns 0 if the metric is not supported by the
+// current Go runtime (runtime/metrics guarantees no panic, just
+// KindBad). The watcher treats missing metrics as "no pressure detected";
+// the primary metrics used by the threshold check have been present since
+// Go 1.16, so this only matters for defensive correctness.
+func (w *Watcher) sampleUint64(idx int) uint64 {
+	if w.samples[idx].Value.Kind() != metrics.KindUint64 {
+		return 0
+	}
+	return w.samples[idx].Value.Uint64()
+}
 
-	if ms.HeapInuse < w.cfg.ThresholdBytes {
+// checkAndMaybeFire samples runtime/metrics once, computes heap-in-use, and
+// if it is at or above the threshold and OnExceed has not already fired,
+// invokes OnExceed and returns true to signal the loop to exit.
+func (w *Watcher) checkAndMaybeFire() bool {
+	metrics.Read(w.samples)
+
+	objects := w.sampleUint64(sampleHeapObjects)
+	unused := w.sampleUint64(sampleHeapUnused)
+	// heap-in-use = allocated heap spans (live objects plus reusable free
+	// slots the runtime still owns), matching MemStats.HeapInuse.
+	heapInuse := objects + unused
+
+	if heapInuse < w.cfg.ThresholdBytes {
 		return false
 	}
 
@@ -186,12 +236,15 @@ func (w *Watcher) checkAndMaybeFire() bool {
 		return true
 	}
 
+	released := w.sampleUint64(sampleHeapReleased)
+	gcGoal := w.sampleUint64(sampleGCGoal)
+
 	w.cfg.Logger.Warn("memory pressure shutdown",
-		"heap_inuse_bytes", ms.HeapInuse,
+		"heap_inuse_bytes", heapInuse,
+		"heap_objects_bytes", objects,
+		"heap_released_bytes", released,
 		"threshold_bytes", w.cfg.ThresholdBytes,
-		"heap_alloc_bytes", ms.HeapAlloc,
-		"heap_sys_bytes", ms.HeapSys,
-		"next_gc_bytes", ms.NextGC,
+		"next_gc_bytes", gcGoal,
 	)
 
 	if w.cfg.OnExceed != nil {
