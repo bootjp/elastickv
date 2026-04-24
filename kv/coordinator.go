@@ -310,7 +310,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if !time.Now().Before(deadline) {
 			return lastResp, lastErr
 		}
-		if err := prepareDispatchRetry(ctx, reqs, leaderAssignsTS, timer); err != nil {
+		if err := prepareDispatchRetry(ctx, reqs, leaderAssignsTS, timer, deadline); err != nil {
 			return lastResp, err
 		}
 		// Re-check the deadline AFTER the back-off sleep. If the budget
@@ -351,8 +351,20 @@ func shouldRetryDispatch(err error) bool {
 // whichever comes first. A ctx cancellation returns a wrapped ctx.Err()
 // so gRPC clients can distinguish "I gave up waiting" from "cluster is
 // unavailable"; timer expiry returns nil and the caller loops again.
-func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.Duration) error {
-	timer.Reset(interval)
+//
+// The sleep is additionally capped at time.Until(deadline). Without
+// that cap, a caller that hits the retry budget with <interval left
+// would sleep the full interval — pushing total Dispatch latency up
+// to one dispatchLeaderRetryInterval past the advertised
+// dispatchLeaderRetryBudget. Capping keeps the budget strictly
+// bounded: on return the caller's next time.Now().Before(deadline)
+// check trips and the loop exits with the last transient error.
+func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.Duration, deadline time.Time) error {
+	sleep := interval
+	if until := time.Until(deadline); until > 0 && until < sleep {
+		sleep = until
+	}
+	timer.Reset(sleep)
 	select {
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())
@@ -369,12 +381,12 @@ func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.
 // return ctx.Err() wrapped if the caller cancels during the sleep.
 // Factored out of Dispatch to keep that function's cyclomatic
 // complexity under the cyclop threshold without shuffling semantics.
-func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderAssignsTS bool, timer *time.Timer) error {
+func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderAssignsTS bool, timer *time.Timer, deadline time.Time) error {
 	if leaderAssignsTS {
 		reqs.StartTS = 0
 		reqs.CommitTS = 0
 	}
-	return waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval)
+	return waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval, deadline)
 }
 
 // dispatchOnce runs a single Dispatch attempt without retry. It is the

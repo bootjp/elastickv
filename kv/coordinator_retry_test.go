@@ -46,9 +46,9 @@ func (stubLeaderEngine) Close() error { return nil }
 // (guarded by atomic.Int64 for race-detector friendliness) is enough.
 type scriptedTransactional struct {
 	errs     []error
-	commits  atomic.Int64
+	commits  atomic.Uint64
 	reqs     [][]*pb.Request
-	onCommit func(call int64) // optional hook invoked inside Commit
+	onCommit func(call uint64) // optional hook invoked inside Commit
 }
 
 func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
@@ -60,11 +60,7 @@ func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse
 	if int(idx) < len(s.errs) && s.errs[idx] != nil {
 		return nil, s.errs[idx]
 	}
-	// idx is strictly non-negative (atomic.Add on an int64 that starts
-	// at 0 and only ever increments), so the conversion to uint64 for
-	// CommitIndex is safe. gosec G115 can't see that invariant, so
-	// silence it inline.
-	return &TransactionResponse{CommitIndex: uint64(idx + 1)}, nil //nolint:gosec
+	return &TransactionResponse{CommitIndex: idx + 1}, nil
 }
 
 func (s *scriptedTransactional) Abort([]*pb.Request) (*TransactionResponse, error) {
@@ -214,7 +210,7 @@ func TestCoordinateDispatch_CtxCancelDuringRetrySurfaces(t *testing.T) {
 			cerrors.WithStack(raftengine.ErrNotLeader),
 			cerrors.WithStack(raftengine.ErrNotLeader),
 		},
-		onCommit: func(call int64) {
+		onCommit: func(call uint64) {
 			// Cancel after the first failed attempt so the next
 			// back-off select sees ctx.Done().
 			if call == 0 {
@@ -247,7 +243,7 @@ func TestCoordinateDispatch_SuccessBeatsConcurrentCancel(t *testing.T) {
 	// ordering bug in the retry loop (commit + cancel ordering).
 	ctx, cancel := context.WithCancel(context.Background())
 	tx := &scriptedTransactional{
-		onCommit: func(int64) {
+		onCommit: func(uint64) {
 			// Cancel inside Commit, BEFORE Commit returns. Dispatch
 			// will then observe a successful Commit but a cancelled
 			// ctx on its first check.

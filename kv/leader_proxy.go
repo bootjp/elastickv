@@ -123,7 +123,23 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 		if !time.Now().Before(deadline) {
 			return nil, lastErr
 		}
-		time.Sleep(leaderProxyRetryInterval)
+		// Bounded, interruptible back-off. time.Sleep would both
+		// exceed the budget by up to one interval (if time.Until <
+		// interval remains) and ignore parentCtx — so a cancelled
+		// budget would wait out the full 25ms instead of tearing
+		// down immediately. Cap at min(interval, remaining) and
+		// wake on parentCtx.Done so the back-off tracks the
+		// deadline exactly.
+		sleep := leaderProxyRetryInterval
+		if until := time.Until(deadline); until > 0 && until < sleep {
+			sleep = until
+		}
+		timer := time.NewTimer(sleep)
+		select {
+		case <-parentCtx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
 		// Re-check the deadline AFTER the back-off: if the budget is
 		// exhausted, do not enter another maxForwardRetries cycle
 		// (which could issue up to three more RPCs, each bounded by
