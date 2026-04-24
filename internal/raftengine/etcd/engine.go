@@ -100,6 +100,29 @@ const (
 	// of the knob; fall back to the default rather than rejecting so that a
 	// fat-fingered operator doesn't take out the engine.
 	minMaxSizePerMsg uint64 = 1 << 10
+	// maxMaxInflightMsg caps the environment override for
+	// MaxInflightMsg. Open() uses the resolved value to allocate
+	// stepCh, dispatchReportCh, and every per-peer dispatch queue, so
+	// a fat-fingered ELASTICKV_RAFT_MAX_INFLIGHT_MSGS=1e8 triggers
+	// multi-GB channel allocations and crashes the process before the
+	// node even becomes healthy. 8192 is ~16× the compiled-in default
+	// (512) — plenty of headroom for pipelining experiments, and well
+	// below the point where channel allocation alone would OOM a
+	// 32 GiB runner. Values above this clamp back to the default with
+	// a warning (same policy as sub-1 values) so a misconfigured
+	// operator never hard-breaks startup.
+	maxMaxInflightMsg = 8192
+	// maxMaxSizePerMsg caps the environment override for
+	// MaxSizePerMsg at the Raft transport's per-message budget. The
+	// server- and dial-side gRPC options (see internal.GRPCMaxMessageBytes)
+	// reject frames larger than 64 MiB, so a MaxSizePerMsg above that
+	// makes Raft emit MsgApp payloads the transport physically cannot
+	// carry, producing repeated send failures / unreachable reports
+	// under large batches. Keeping this equal to GRPCMaxMessageBytes
+	// makes the transport budget the single source of truth — raise
+	// BOTH together, never this one alone. Values above this clamp
+	// back to the default with a warning.
+	maxMaxSizePerMsg uint64 = 64 << 20
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages
@@ -496,9 +519,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		// that operators raising ELASTICKV_RAFT_MAX_INFLIGHT_MSGS above
 		// the default actually get the extra buffering they asked for.
 		// Using defaultMaxInflightMsg here would silently cap the
-		// channel at 1024 even when the Raft layer has been told to
-		// keep 2048 in flight, re-triggering errStepQueueFull under
-		// the exact bursty conditions this knob is meant to absorb.
+		// channel at 512 (the current compiled-in default) even when
+		// the Raft layer has been told to keep 2048 in flight,
+		// re-triggering errStepQueueFull under the exact bursty
+		// conditions this knob is meant to absorb.
 		stepCh:           make(chan raftpb.Message, inboundChannelCap(prepared.cfg.MaxInflightMsg)),
 		dispatchReportCh: make(chan dispatchReport, inboundChannelCap(prepared.cfg.MaxInflightMsg)),
 		closeCh:          make(chan struct{}),
@@ -2938,14 +2962,21 @@ func snapshotEveryFromEnv() uint64 {
 }
 
 // maxInflightMsgFromEnv parses ELASTICKV_RAFT_MAX_INFLIGHT_MSGS. Returns
-// (value, true) when the env var is set to a valid positive integer.
-// Returns (0, false) when the var is unset so the caller can keep the
-// existing cfg.MaxInflightMsg (which normalizeLimitConfig has already
-// defaulted to defaultMaxInflightMsg). Invalid values (non-numeric,
-// negative, zero) are logged at warn level and return
+// (value, true) when the env var is set to a valid integer in
+// [1, maxMaxInflightMsg]. Returns (0, false) when the var is unset so
+// the caller can keep the existing cfg.MaxInflightMsg (which
+// normalizeLimitConfig has already defaulted to defaultMaxInflightMsg).
+// Invalid values (non-numeric, negative, zero, or above
+// maxMaxInflightMsg) are logged at warn level and return
 // (defaultMaxInflightMsg, true) so the engine actually applies the
 // compiled-in default the log message promises — otherwise a malformed
 // env var would silently let an unrelated caller-supplied value win.
+// The upper cap is load-bearing: Open() allocates stepCh,
+// dispatchReportCh, and every per-peer dispatch queue from this
+// value, so a fat-fingered `ELASTICKV_RAFT_MAX_INFLIGHT_MSGS=100000000`
+// would try to allocate multi-GB of channel memory before the node
+// becomes healthy. Clamping to the default preserves operator intent
+// ("I asked for a larger pipeline") far better than crashing startup.
 func maxInflightMsgFromEnv() (int, bool) {
 	v := strings.TrimSpace(os.Getenv(maxInflightMsgEnvVar))
 	if v == "" {
@@ -2957,17 +2988,26 @@ func maxInflightMsgFromEnv() (int, bool) {
 			"value", v, "default", defaultMaxInflightMsg)
 		return defaultMaxInflightMsg, true
 	}
+	if n > maxMaxInflightMsg {
+		slog.Warn("ELASTICKV_RAFT_MAX_INFLIGHT_MSGS exceeds safe cap; using default",
+			"value", v, "max", maxMaxInflightMsg, "default", defaultMaxInflightMsg)
+		return defaultMaxInflightMsg, true
+	}
 	return n, true
 }
 
 // maxSizePerMsgFromEnv parses ELASTICKV_RAFT_MAX_SIZE_PER_MSG as a plain
 // integer byte count. Returns (value, true) when the env var is set to a
-// valid integer >= minMaxSizePerMsg (1 KiB). Returns (0, false) when the
-// var is unset so normalizeLimitConfig can keep its earlier default.
-// Invalid or too-small values fall back to the compiled-in default with
-// a warning and return (defaultMaxSizePerMsg, true) so the override
+// valid integer in [minMaxSizePerMsg, maxMaxSizePerMsg]
+// (1 KiB .. 64 MiB). Returns (0, false) when the var is unset so
+// normalizeLimitConfig can keep its earlier default. Invalid, too-small,
+// or too-large values fall back to the compiled-in default with a
+// warning and return (defaultMaxSizePerMsg, true) so the override
 // actually applies the default the warning promises; a sub-KiB cap
-// would make MsgApp batching degenerate.
+// would make MsgApp batching degenerate, and a value above the gRPC
+// transport's GRPCMaxMessageBytes budget would make Raft emit payloads
+// the transport cannot carry, causing repeated send failures under
+// large batches.
 func maxSizePerMsgFromEnv() (uint64, bool) {
 	v := strings.TrimSpace(os.Getenv(maxSizePerMsgEnvVar))
 	if v == "" {
@@ -2977,6 +3017,11 @@ func maxSizePerMsgFromEnv() (uint64, bool) {
 	if err != nil || n < minMaxSizePerMsg {
 		slog.Warn("invalid ELASTICKV_RAFT_MAX_SIZE_PER_MSG; using default",
 			"value", v, "min", minMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
+		return uint64(defaultMaxSizePerMsg), true
+	}
+	if n > maxMaxSizePerMsg {
+		slog.Warn("ELASTICKV_RAFT_MAX_SIZE_PER_MSG exceeds transport budget; using default",
+			"value", v, "max", maxMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
 		return uint64(defaultMaxSizePerMsg), true
 	}
 	return n, true

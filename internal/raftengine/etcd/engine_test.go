@@ -1910,6 +1910,67 @@ func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
 	}
 }
 
+// TestMaxInflightMsgFromEnv_ClampsAboveCap pins the upper-bound safety
+// behaviour: a value above maxMaxInflightMsg is refused (it would
+// trigger multi-GB channel allocations at Open() and crash the process
+// before the node becomes healthy) and the compiled-in default is
+// surfaced with ok=true so normalizeLimitConfig actually applies it.
+func TestMaxInflightMsgFromEnv_ClampsAboveCap(t *testing.T) {
+	cases := []string{
+		strconv.Itoa(maxMaxInflightMsg + 1),
+		"100000000", // fat-fingered value from the Codex P2 report
+	}
+	for _, v := range cases {
+		t.Setenv(maxInflightMsgEnvVar, v)
+		n, ok := maxInflightMsgFromEnv()
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, defaultMaxInflightMsg, n, "env=%q", v)
+	}
+}
+
+// TestMaxInflightMsgFromEnv_AcceptsAtCap pins the boundary: exactly
+// maxMaxInflightMsg must parse through unchanged. Catches an off-by-one
+// regression that would silently clamp an operator-tuned value.
+func TestMaxInflightMsgFromEnv_AcceptsAtCap(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, strconv.Itoa(maxMaxInflightMsg))
+	n, ok := maxInflightMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, maxMaxInflightMsg, n)
+}
+
+// TestMaxSizePerMsgFromEnv_ClampsAboveTransportBudget pins that a
+// MaxSizePerMsg above the gRPC transport's message-size budget
+// (GRPCMaxMessageBytes) is refused. Without this clamp the override
+// would make Raft emit MsgApp frames the transport physically cannot
+// carry, producing repeated send failures under large batches.
+func TestMaxSizePerMsgFromEnv_ClampsAboveTransportBudget(t *testing.T) {
+	over := strconv.FormatUint(maxMaxSizePerMsg+1, 10)
+	t.Setenv(maxSizePerMsgEnvVar, over)
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), n)
+}
+
+// TestMaxSizePerMsgFromEnv_AcceptsAtCap covers the boundary symmetrically
+// with the inflight test above.
+func TestMaxSizePerMsgFromEnv_AcceptsAtCap(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, strconv.FormatUint(maxMaxSizePerMsg, 10))
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, maxMaxSizePerMsg, n)
+}
+
+// TestMaxMaxSizePerMsg_MatchesTransportBudget pins the invariant that
+// the MaxSizePerMsg upper cap equals GRPCMaxMessageBytes. If someone
+// raises the transport budget without updating the Raft cap (or vice
+// versa), MaxSizePerMsg overrides would silently allow values that
+// cannot traverse the wire. Changing this constant MUST be a
+// deliberate, paired action.
+func TestMaxMaxSizePerMsg_MatchesTransportBudget(t *testing.T) {
+	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes), maxMaxSizePerMsg,
+		"maxMaxSizePerMsg must track internal.GRPCMaxMessageBytes — raise both together")
+}
+
 // TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
 // that reach raft.Config when neither the caller nor the operator has
 // overridden them: 512 inflight msgs and 2 MiB per msg. The combination
@@ -1989,6 +2050,12 @@ func TestInboundChannelCap(t *testing.T) {
 // tuning knob.
 func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "2048")
+	// Open() normalizes BOTH raft limit env vars; leaving the size var
+	// unset here would let an ambient ELASTICKV_RAFT_MAX_SIZE_PER_MSG
+	// in the shell the test runs in influence config resolution and
+	// confuse an unrelated failure diagnosis. Pin it to "" so the size
+	// path always falls through to the caller's OpenConfig value.
+	t.Setenv(maxSizePerMsgEnvVar, "")
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
@@ -2013,6 +2080,9 @@ func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
 // current production value.
 func TestOpen_InboundChannelsDefaultCap(t *testing.T) {
 	t.Setenv(maxInflightMsgEnvVar, "")
+	// See TestOpen_InboundChannelsHonourMaxInflightEnv for why the size
+	// env var is cleared here too.
+	t.Setenv(maxSizePerMsgEnvVar, "")
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
