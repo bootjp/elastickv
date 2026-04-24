@@ -40,7 +40,7 @@ or later version — breaking the atomicity guarantee that MVCC provides.
 
 Because TTL is a separate writable key, concurrent `EXPIRE` calls on the same
 key produce write conflicts in `IsTxn=true` Raft transactions.  The TTL buffer
-(`docs/design/ttl-memory-buffer.md`) is a workaround for this symptom; it does
+(`docs/design/2026_04_17_implemented_ttl_memory_buffer.md`) is a workaround for this symptom; it does
 not fix the root cause.
 
 ### Root cause
@@ -281,7 +281,7 @@ operations on distinct keys have no interaction.
 
 ## 6. Impact on existing write-conflict fix
 
-The TTL buffer (see `docs/design/ttl-memory-buffer.md`) was introduced to
+The TTL buffer (see `docs/design/2026_04_17_implemented_ttl_memory_buffer.md`) was introduced to
 remove TTL from `IsTxn=true` transactions and thereby eliminate write conflicts
 on `!redis|ttl|<key>` for concurrent Lua scripts (`INCR` + `EXPIRE`).
 

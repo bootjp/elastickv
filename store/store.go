@@ -150,12 +150,25 @@ type MVCCStore interface {
 	//   read barrier followed by LatestCommitTS outside the FSM lock. A
 	//   small TOCTOU window exists between the barrier and the check.
 	ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
+	// ApplyMutationsRaft is the raft-apply variant of ApplyMutations. It
+	// carries identical MVCC semantics but is governed by the FSM-commit
+	// sync-mode knob (ELASTICKV_FSM_SYNC_MODE). Callers MUST only use this
+	// when the write is part of a raft-log apply — the raft WAL is the
+	// durability backstop that makes an un-fsynced Pebble write safe.
+	//
+	// Direct (non-raft) callers (catalog bootstrap, admin snapshots,
+	// migrations, tests) must use ApplyMutations, which is always
+	// pebble.Sync and therefore safe without raft-log replay.
+	ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.
 	// No conflict checking is performed; this is intended for bulk operations
 	// such as FLUSHALL where the caller knows no conflict check is needed.
 	DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
+	// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt with
+	// the same durability contract as ApplyMutationsRaft.
+	DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC

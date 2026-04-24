@@ -243,7 +243,7 @@ Milestone 1 implementation status (current):
 2. `SplitRange` currently supports same-group split only (no cross-group migration).
 3. Not implemented yet: `ReportAccess`, `WatchRoutes`, `GetSplitJob`.
 
-For operator examples, see the [Manual Route Split API section in the README](../README.md#manual-route-split-api-milestone-1).
+For operator examples, see the [Manual Route Split API section in the README](../../README.md#manual-route-split-api-milestone-1).
 
 ### 10.2 `proto/internal.proto`
 

@@ -227,7 +227,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	}
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
-	return errors.WithStack(f.store.ApplyMutations(ctx, muts, nil, commitTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, muts, nil, commitTS, commitTS))
 }
 
 // extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
@@ -244,7 +244,7 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	return errors.WithStack(f.store.DeletePrefixAt(ctx, prefix, txnCommonPrefix, commitTS))
+	return errors.WithStack(f.store.DeletePrefixAtRaft(ctx, prefix, txnCommonPrefix, commitTS))
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -378,7 +378,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	}
 
-	if err := f.store.ApplyMutations(ctx, storeMuts, r.ReadKeys, startTS, startTS); err != nil {
+	if err := f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, startTS); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -415,7 +415,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
@@ -500,7 +500,7 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 // The secondary-shard LatestCommitTS scan is intentionally deferred to the
 // write-conflict path so the hot (first-time) commit path pays no extra cost.
 func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
-	err := f.store.ApplyMutations(ctx, storeMuts, nil, applyStartTS, commitTS)
+	err := f.store.ApplyMutationsRaft(ctx, storeMuts, nil, applyStartTS, commitTS)
 	if err == nil {
 		return nil
 	}
@@ -517,7 +517,7 @@ func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMut
 			return errors.WithStack(lErr)
 		}
 		if exists && latestTS >= commitTS {
-			return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, nil, commitTS, commitTS))
+			return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, nil, commitTS, commitTS))
 		}
 	}
 	return errors.WithStack(err)
@@ -568,7 +568,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutations(ctx, storeMuts, nil, startTS, abortTS))
+	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, nil, startTS, abortTS))
 }
 
 func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

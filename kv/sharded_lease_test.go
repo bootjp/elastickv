@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/monoclock"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +59,7 @@ func TestShardedCoordinator_LeaseReadForKey_PerShardIsolation(t *testing.T) {
 
 	// Pre-extend shard 1's lease only.
 	g1 := coord.groups[1]
-	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
+	g1.lease.extend(monoclock.Now().Add(time.Hour), g1.lease.generation())
 
 	idx, err := coord.LeaseReadForKey(context.Background(), []byte("apple"))
 	require.NoError(t, err)
@@ -88,15 +89,15 @@ func TestShardedCoordinator_LeaseReadForKey_ErrorOnlyInvalidatesShard(t *testing
 
 	g1 := coord.groups[1]
 	g2 := coord.groups[2]
-	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
-	g2.lease.extend(time.Now().Add(time.Hour), g2.lease.generation())
+	g1.lease.extend(monoclock.Now().Add(time.Hour), g1.lease.generation())
+	g2.lease.extend(monoclock.Now().Add(time.Hour), g2.lease.generation())
 	g2.lease.invalidate() // force shard 2 onto slow path
 
 	_, err := coord.LeaseReadForKey(context.Background(), []byte("zebra"))
 	require.ErrorIs(t, err, sentinel)
-	require.False(t, g2.lease.valid(time.Now()),
+	require.False(t, g2.lease.valid(monoclock.Now()),
 		"shard 2 lease must be invalidated after error")
-	require.True(t, g1.lease.valid(time.Now()),
+	require.True(t, g1.lease.valid(monoclock.Now()),
 		"shard 1 lease must NOT be touched by shard 2's failure")
 }
 
@@ -115,25 +116,25 @@ func TestShardedCoordinator_LeaseRefreshingTxn_SkipsWhenCommitIndexZero(t *testi
 	require.True(t, ok, "NewShardedCoordinator wraps Txn in leaseRefreshingTxn")
 	txn.inner = &fixedTransactional{response: noRaftResp}
 
-	require.False(t, g1.lease.valid(time.Now()))
+	require.False(t, g1.lease.valid(monoclock.Now()))
 
 	// Commit with empty input returns success with CommitIndex=0.
 	_, err := g1.Txn.Commit(nil)
 	require.NoError(t, err)
-	require.False(t, g1.lease.valid(time.Now()),
+	require.False(t, g1.lease.valid(monoclock.Now()),
 		"lease must NOT be refreshed when no Raft commit happened")
 
 	// Same for Abort.
 	_, err = g1.Txn.Abort(nil)
 	require.NoError(t, err)
-	require.False(t, g1.lease.valid(time.Now()))
+	require.False(t, g1.lease.valid(monoclock.Now()))
 
 	// A response with CommitIndex > 0 refreshes the lease.
 	realResp := &TransactionResponse{CommitIndex: 42}
 	txn.inner = &fixedTransactional{response: realResp}
 	_, err = g1.Txn.Commit(nil)
 	require.NoError(t, err)
-	require.True(t, g1.lease.valid(time.Now()),
+	require.True(t, g1.lease.valid(monoclock.Now()),
 		"lease must be refreshed after a real Raft commit")
 }
 
@@ -205,12 +206,12 @@ func TestShardedCoordinator_RegistersPerShardLeaderLossCallback(t *testing.T) {
 
 	g1 := coord.groups[1]
 	g2 := coord.groups[2]
-	g1.lease.extend(time.Now().Add(time.Hour), g1.lease.generation())
-	g2.lease.extend(time.Now().Add(time.Hour), g2.lease.generation())
+	g1.lease.extend(monoclock.Now().Add(time.Hour), g1.lease.generation())
+	g2.lease.extend(monoclock.Now().Add(time.Hour), g2.lease.generation())
 
 	eng1.fireLeaderLoss()
-	require.False(t, g1.lease.valid(time.Now()),
+	require.False(t, g1.lease.valid(monoclock.Now()),
 		"shard 1 leader-loss callback must invalidate shard 1's lease")
-	require.True(t, g2.lease.valid(time.Now()),
+	require.True(t, g2.lease.valid(monoclock.Now()),
 		"shard 2 lease must remain valid; only its own engine's callback affects it")
 }
