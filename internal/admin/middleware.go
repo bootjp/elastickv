@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -41,10 +42,15 @@ func PrincipalFromContext(ctx context.Context) (AuthPrincipal, bool) {
 	return v, ok
 }
 
-// BodyLimit wraps the request body with http.MaxBytesReader and responds
-// 413 when the client exceeds the cap. It also sets
-// http.MaxBytesError-aware error translation so the handler does not need
-// to distinguish ordinary IO failures from overflow.
+// BodyLimit caps each request body at `limit` bytes via
+// http.MaxBytesReader. Handlers that read the body are responsible for
+// detecting overflow (via IsMaxBytesError / errors.As on
+// *http.MaxBytesError) and calling WriteMaxBytesError to respond 413.
+// We intentionally do not centralise that translation in the middleware
+// chain: different handlers parse bodies with different decoders (json,
+// form, multipart) and each already has a natural error path, so a
+// wrapper ResponseWriter would either double-write or mask subsequent
+// errors.
 func BodyLimit(limit int64) func(http.Handler) http.Handler {
 	if limit <= 0 {
 		limit = defaultBodyLimit
@@ -54,24 +60,15 @@ func BodyLimit(limit int64) func(http.Handler) http.Handler {
 			if r.Body != nil {
 				r.Body = http.MaxBytesReader(w, r.Body, limit)
 			}
-			next.ServeHTTP(bodyLimitResponseWriter{ResponseWriter: w}, r)
+			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// bodyLimitResponseWriter is a minor adapter that lets a handler translate
-// its own MaxBytesError into a consistent 413 without duplicating the
-// plumbing. At the time of writing, each write handler can call
-// r.ParseForm / json.Decode and on error call
-// `if errors.As(err, &http.MaxBytesError{}) { ... }` manually; this
-// wrapper just forces the header once per request.
-type bodyLimitResponseWriter struct {
-	http.ResponseWriter
-}
-
-// WriteMaxBytesError is called by handlers that detected a MaxBytesError.
-// It is a package-level helper rather than a method so the router error
-// path keeps the same JSON shape as the rest.
+// WriteMaxBytesError is the canonical 413 response body for admin
+// handlers that detected an http.MaxBytesError while reading a request
+// body. It keeps the JSON error shape consistent with the rest of the
+// admin surface.
 func WriteMaxBytesError(w http.ResponseWriter) {
 	writeJSONError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
 		"request body exceeds the 64 KiB admin limit")
@@ -155,26 +152,21 @@ func CSRFDoubleSubmit() func(http.Handler) http.Handler {
 					"X-Admin-CSRF header is required for write operations")
 				return
 			}
-			// Constant-time comparison: the values are user-supplied
-			// and we do not want to leak length differences.
-			if !constantTimeEq(cookie.Value, header) {
+			// Constant-time comparison on the byte contents once we
+			// know the lengths match. A length mismatch is itself not
+			// secret (the server mints both tokens with a fixed 32-byte
+			// width, so any divergence means an attacker forged or
+			// corrupted the value — the response is 403 in every case
+			// anyway), so short-circuiting there does not leak anything
+			// useful to a timing attacker.
+			if len(cookie.Value) != len(header) ||
+				subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(header)) != 1 {
 				writeJSONError(w, http.StatusForbidden, "csrf_mismatch", "CSRF token mismatch")
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-func constantTimeEq(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := 0; i < len(a); i++ {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }
 
 // auditRecorder is the ResponseWriter wrapper the Audit middleware uses

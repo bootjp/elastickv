@@ -229,10 +229,3 @@ func TestAudit_SkipsReads(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Empty(t, buf.String())
 }
-
-func TestConstantTimeEq(t *testing.T) {
-	require.True(t, constantTimeEq("abc", "abc"))
-	require.False(t, constantTimeEq("abc", "abd"))
-	require.False(t, constantTimeEq("abc", "abcd"))
-	require.True(t, constantTimeEq("", ""))
-}

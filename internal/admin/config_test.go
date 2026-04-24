@@ -84,7 +84,7 @@ func TestConfigValidate_NonLoopbackRequiresTLS(t *testing.T) {
 	err := c.Validate()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS is not configured")
-	require.Contains(t, err.Error(), "allow-plaintext-non-loopback")
+	require.Contains(t, err.Error(), "adminAllowPlaintextNonLoopback")
 }
 
 func TestConfigValidate_PartialTLSRejected(t *testing.T) {

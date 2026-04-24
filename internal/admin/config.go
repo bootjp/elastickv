@@ -106,7 +106,7 @@ func (c *Config) validateTLS() error {
 	return errors.WithStack(errors.Newf(
 		"admin.listen %q is not loopback but TLS is not configured;"+
 			" set admin.tls.cert_file + admin.tls.key_file, or explicitly pass"+
-			" --admin-allow-plaintext-non-loopback (strongly discouraged)",
+			" -adminAllowPlaintextNonLoopback (strongly discouraged)",
 		c.Listen,
 	))
 }

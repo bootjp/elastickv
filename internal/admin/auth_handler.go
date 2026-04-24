@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,9 +47,11 @@ type AuthService struct {
 	creds        CredentialStore
 	roles        map[string]Role
 	limiter      *rateLimiter
+	loginWindow  time.Duration
 	sessionTTL   time.Duration
 	secureCookie bool
 	cookieDomain string
+	clock        Clock
 	logger       *slog.Logger
 }
 
@@ -103,9 +106,11 @@ func NewAuthService(signer *Signer, creds CredentialStore, roles map[string]Role
 		creds:        creds,
 		roles:        roles,
 		limiter:      newRateLimiter(limit, window, opts.Clock),
+		loginWindow:  window,
 		sessionTTL:   sessionTTL,
 		secureCookie: !opts.InsecureCookie,
 		cookieDomain: opts.CookieDomain,
+		clock:        opts.Clock,
 		logger:       logger,
 	}
 }
@@ -159,7 +164,15 @@ func (s *AuthService) preflightLogin(w http.ResponseWriter, r *http.Request) boo
 		return false
 	}
 	if !s.limiter.allow(clientIP(r)) {
-		w.Header().Set("Retry-After", "60")
+		// Retry-After must be derived from the actual rate-limit
+		// window so tests and callers that tune LoginWindow get an
+		// accurate hint; clamp to at least 1 second so we never
+		// send a zero value.
+		retryAfter := int(s.loginWindow.Seconds())
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeJSONError(w, http.StatusTooManyRequests, "rate_limited",
 			"too many login attempts from this source; try again later")
 		return false
@@ -288,7 +301,10 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to mint csrf token")
 		return
 	}
-	expires := time.Now().UTC().Add(s.sessionTTL)
+	// Use the same clock the signer used so the response's
+	// expires_at cannot drift from the JWT's exp claim; injected
+	// test clocks therefore produce deterministic outputs too.
+	expires := s.clock().UTC().Add(s.sessionTTL)
 	http.SetCookie(w, s.buildCookie(sessionCookieName, token, true))
 	http.SetCookie(w, s.buildCookie(csrfCookieName, csrf, false))
 	w.Header().Set("Cache-Control", "no-store")
