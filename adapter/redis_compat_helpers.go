@@ -548,28 +548,25 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 // scanStreamEntriesAt returns all entries for key in ascending ID order.
 // This path exists to reconstruct the full stream for callers — the Lua
 // stream bridge (streamState) and the legacy compatibility surface — that
-// previously loaded the entire stream as a single blob. The legacy blob
-// had no size cap, so capping this scan at maxWideColumnItems would be a
-// behaviour regression for migrated large streams ("XLEN > 100k" legal
-// before the PR, fatal after). Size the scan from expectedLen (meta.Length
-// at the caller's snapshot) plus a small slack for writes that committed
-// between the meta read and the entry scan.
+// previously loaded the entire stream as a single blob.
 //
-// User-bounded scans (XREAD/XRANGE/XREVRANGE) do keep the cap via
-// scanStreamEntriesAfter / rangeStreamNewLayout; only the
-// materialise-everything path omits it, matching legacy blob semantics.
+// User-bounded scans (XREAD/XRANGE/XREVRANGE) use
+// scanStreamEntriesAfter / rangeStreamNewLayout. For the
+// materialise-everything path, expectedLen <= 0 intentionally yields an
+// empty result; otherwise we cap the scan at meta.Length plus slack,
+// matching existing store ScanAt semantics for non-positive limits.
 func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	const concurrentWriteSlack = 64
-	limit := 0 // unbounded; ScanAt treats 0 as no limit
-	if expectedLen > 0 {
-		// Size to meta.Length + slack so we don't round-trip every entry
-		// through a paging loop, but also don't silently truncate if
-		// concurrent writes grew the stream between the meta read and the
-		// scan.
-		limit = int(expectedLen) + concurrentWriteSlack
+	if expectedLen <= 0 {
+		return []redisStreamEntry{}, nil
 	}
+	// Size to meta.Length + slack so we don't round-trip every entry
+	// through a paging loop, but also don't silently truncate if
+	// concurrent writes grew the stream between the meta read and the
+	// scan.
+	limit := int(expectedLen) + concurrentWriteSlack
 	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -948,17 +945,10 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 // deleteStreamWideColumnElems returns delete operations for all stream
 // wide-column keys: the meta key (if it exists) and every entry under the
-// entry scan prefix.
-//
-// Unlike scanAllDeltaElems (shared with lists/zset), this path does NOT cap
-// at maxWideColumnItems. The legacy blob form let users create streams of
-// arbitrary size and DEL always worked on them; a migrated stream with more
-// than maxWideColumnItems entries would otherwise become undeletable
-// (DEL / EXPIRE 0 / MULTI-EXEC DEL would return ErrCollectionTooLarge and
-// leave the keys stranded in storage). Paginated scan via
-// scanStreamEntryKeysForDelete enumerates every entry key instead of
-// buffering them in one scan; memory is still bounded because callers
-// append Del elems and dispatch them in batches downstream.
+// entry scan prefix. Total results are capped at maxWideColumnItems to
+// prevent unbounded memory growth; DEL/EXPIRE 0/MULTI-EXEC DEL on a stream
+// that exceeds the cap returns ErrCollectionTooLarge, consistent with other
+// wide-column types.
 func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	var elems []*kv.Elem[kv.OP]
 	metaKey := store.StreamMetaKey(key)
@@ -967,34 +957,11 @@ func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byt
 	} else if exists {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
 	}
-	entryElems, err := r.scanStreamEntryKeysForDelete(ctx, store.StreamEntryScanPrefix(key), readTS)
+	entryElems, err := r.scanAllDeltaElems(ctx, store.StreamEntryScanPrefix(key), readTS)
 	if err != nil {
 		return nil, err
 	}
 	return append(elems, entryElems...), nil
-}
-
-// scanStreamEntryKeysForDelete paginates through entry keys under prefix
-// and returns Del elems for each. Intentionally uncapped for stream delete
-// — see deleteStreamWideColumnElems for the rationale.
-func (r *RedisServer) scanStreamEntryKeysForDelete(ctx context.Context, prefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	const cursorAdv = byte(0x00)
-	var elems []*kv.Elem[kv.OP]
-	end := store.PrefixScanEnd(prefix)
-	cursor := prefix
-	for {
-		kvs, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit, readTS)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		for _, pair := range kvs {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		}
-		if len(kvs) < store.MaxDeltaScanLimit {
-			return elems, nil
-		}
-		cursor = append(bytes.Clone(kvs[len(kvs)-1].Key), cursorAdv)
-	}
 }
 
 // deleteZSetWideColumnElems returns delete operations for all ZSet wide-column keys:
