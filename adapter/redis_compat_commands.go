@@ -3696,6 +3696,10 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", err
 	}
 
+	if err := xaddEnforceMaxWideColumn(key, meta.Length, req.maxLen); err != nil {
+		return "", err
+	}
+
 	entryValue, err := marshalStreamEntry(newRedisStreamEntry(id, req.fields))
 	if err != nil {
 		return "", err
@@ -3739,6 +3743,21 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
 	return id, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+// xaddEnforceMaxWideColumn rejects an XADD that would push the stream past
+// maxWideColumnItems when no MAXLEN clause could rescue it. A MAXLEN <= the
+// cap keeps the committed length bounded even when meta.Length is already
+// at the ceiling, so we only reject on the ungated path.
+func xaddEnforceMaxWideColumn(key []byte, currentLength int64, maxLen int) error {
+	if maxLen > 0 && maxLen <= maxWideColumnItems {
+		return nil
+	}
+	if currentLength < int64(maxWideColumnItems) {
+		return nil
+	}
+	return cockerrors.Wrapf(ErrCollectionTooLarge,
+		"stream %q would exceed %d entries", key, maxWideColumnItems)
 }
 
 // xaddTrimIfNeeded returns (finalLength, trimElems, err) for an XADD.
@@ -4246,17 +4265,25 @@ func (r *RedisServer) readStreamAfter(ctx context.Context, key []byte, readTS ui
 
 // scanStreamEntriesAfter runs a [strictly-after(afterID), ∞) range scan over
 // entry keys, capped by count (when positive) or maxWideScanLimit otherwise.
+// When count is non-positive, we mirror scanStreamEntriesAt's guard: request
+// maxWideScanLimit (which is maxWideColumnItems+1) and reject if the scan
+// filled, so an XREAD without COUNT cannot OOM the server on a pathological
+// stream.
 func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, readTS uint64, afterID string, count int) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	start := streamScanStartForAfter(prefix, afterID)
 	limit := count
-	if limit <= 0 {
+	unbounded := limit <= 0
+	if unbounded {
 		limit = maxWideScanLimit
 	}
 	kvs, err := r.store.ScanAt(ctx, start, end, limit, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
+	}
+	if unbounded && len(kvs) > maxWideColumnItems {
+		return nil, cockerrors.Wrapf(ErrCollectionTooLarge, "stream %q exceeds %d entries", key, maxWideColumnItems)
 	}
 	entries := make([]redisStreamEntry, 0, len(kvs))
 	for _, pair := range kvs {
@@ -4274,17 +4301,29 @@ func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, re
 // start at ID+1 so the scan is exclusive of afterID. If afterID is
 // malformed we fall back to the entry prefix, which is conservatively
 // wider and will be filtered above.
+//
+// Edge case: if afterID is (math.MaxUint64-math.MaxUint64), there is no
+// successor ID inside the entry-prefix keyspace, so the correct start is
+// one past the prefix (empty scan). Returning the afterID key itself
+// would make the inclusive scan include it, which is the opposite of
+// "strictly after."
 func streamScanStartForAfter(prefix []byte, afterID string) []byte {
 	parsed, ok := tryParseRedisStreamID(afterID)
 	if !ok {
 		return prefix
 	}
 	ms, seq := parsed.ms, parsed.seq
-	if seq < ^uint64(0) {
+	switch {
+	case seq < ^uint64(0):
 		seq++
-	} else if ms < ^uint64(0) {
+	case ms < ^uint64(0):
 		ms++
 		seq = 0
+	default:
+		// afterID is the largest representable stream ID. No entry can be
+		// strictly after it; return the scan-end sentinel so the scan is
+		// empty instead of silently inclusive.
+		return store.PrefixScanEnd(prefix)
 	}
 	start := make([]byte, 0, len(prefix)+store.StreamIDBytes)
 	start = append(start, prefix...)
@@ -4329,11 +4368,19 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	if blockDuration == 0 {
 		blockDuration = redisDispatchTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), blockDuration)
-	defer cancel()
 	deadline := time.Now().Add(blockDuration)
 
-	if err := r.resolveXReadAfterIDs(ctx, &req); err != nil {
+	// $ resolution uses a short fixed timeout rather than the BLOCK
+	// window: it's a single bounded read per key, not a wait. A tight
+	// BLOCK (e.g. `BLOCK 1`) used to turn any slow $-resolve into a
+	// protocol-level error on this path; use redisDispatchTimeout so
+	// the resolve either succeeds quickly or fails cleanly, leaving
+	// the BLOCK-window timeout semantics (null on expiry) to the
+	// busy-poll below.
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	err = r.resolveXReadAfterIDs(resolveCtx, &req)
+	resolveCancel()
+	if err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -4514,7 +4561,8 @@ func (r *RedisServer) rangeStreamNewLayout(
 		return nil, nil
 	}
 	limit := count
-	if limit <= 0 {
+	unbounded := limit <= 0
+	if unbounded {
 		limit = maxWideScanLimit
 	}
 	var kvs []*store.KVPair
@@ -4525,6 +4573,12 @@ func (r *RedisServer) rangeStreamNewLayout(
 	}
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
+	}
+	// An XRANGE/XREVRANGE without COUNT on a pathological stream must
+	// not be able to pull maxWideScanLimit entries into a single reply.
+	// Mirror scanStreamEntriesAt's guard.
+	if unbounded && len(kvs) > maxWideColumnItems {
+		return nil, cockerrors.Wrapf(ErrCollectionTooLarge, "stream %q exceeds %d entries", key, maxWideColumnItems)
 	}
 	entries := make([]redisStreamEntry, 0, len(kvs))
 	for _, pair := range kvs {
@@ -4568,6 +4622,10 @@ func streamScanBounds(prefix []byte, startRaw, endRaw string, reverse bool) ([]b
 }
 
 // streamBoundLow returns the inclusive lower bound of the scan in binary form.
+// When the bound is "(ID" (exclusive) and ID is the largest representable
+// stream ID, the scan-end sentinel is returned so streamScanBounds'
+// start >= end check collapses the range to empty; otherwise the scan
+// would silently include the exclusive bound entry.
 func streamBoundLow(prefix []byte, raw string) ([]byte, error) {
 	if raw == "-" {
 		return prefix, nil
@@ -4582,11 +4640,14 @@ func streamBoundLow(prefix []byte, raw string) ([]byte, error) {
 	}
 	ms, seq := parsed.ms, parsed.seq
 	if exclusive {
-		if seq < ^uint64(0) {
+		switch {
+		case seq < ^uint64(0):
 			seq++
-		} else if ms < ^uint64(0) {
+		case ms < ^uint64(0):
 			ms++
 			seq = 0
+		default:
+			return store.PrefixScanEnd(prefix), nil
 		}
 	}
 	return appendStreamKey(prefix, ms, seq), nil
