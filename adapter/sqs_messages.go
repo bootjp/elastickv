@@ -362,6 +362,14 @@ func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, 
 	if !exists {
 		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	// AWS rejects SendMessage when MessageBody is empty (InvalidParameterValue
+	// "Message body cannot be empty"). Silently enqueuing a zero-length
+	// message would let producer bugs (missing serialization, a forgotten
+	// body parameter) land in the queue where they later look like real
+	// messages to consumers.
+	if len(body) == 0 {
+		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
+	}
 	if int64(len(body)) > meta.MaximumMessageSize {
 		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
 	}
@@ -594,7 +602,7 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, ma
 	if err != nil {
 		return nil, err
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, meta.Generation, candidates, visibilityTimeout, max, readTS)
+	return s.rotateMessagesForDelivery(ctx, queueName, meta.Generation, candidates, visibilityTimeout, meta.MessageRetentionSeconds, max, readTS)
 }
 
 // resolveReceiveMaxMessages validates MaxNumberOfMessages against the
@@ -654,12 +662,61 @@ func (s *SQSServer) scanVisibleMessageCandidates(ctx context.Context, queueName 
 // failure, storage failure) propagates, because silently returning
 // an empty 200 in those cases would stall consumers and hide the
 // incident.
+// loadCandidateRecord fetches and decodes the message record for a
+// receive candidate. Returns (rec, dataKey, skip, err):
+//   - skip=true, err=nil : ErrKeyNotFound race; caller skips this one.
+//   - skip=false, err!=nil : non-retryable; propagate.
+//   - skip=false, err=nil : record loaded.
+func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, readTS uint64) (*sqsMessageRecord, []byte, bool, error) {
+	dataKey := sqsMsgDataKey(queueName, gen, cand.messageID)
+	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, dataKey, true, nil
+		}
+		return nil, dataKey, false, errors.WithStack(err)
+	}
+	rec, err := decodeSQSMessageRecord(raw)
+	if err != nil {
+		return nil, dataKey, false, err
+	}
+	return rec, dataKey, false, nil
+}
+
+// expireMessage removes a retention-expired record and its current
+// visibility index entry in a single OCC transaction. On
+// ErrWriteConflict (another worker raced us to delete or rotate
+// this same message) we treat it as success: the message is no
+// longer our responsibility either way. Any other error propagates
+// so a coordinator / storage failure does not silently fall through
+// to "delivered empty", matching the receive-error policy.
+func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uint64, visKey, dataKey []byte, readTS uint64) error {
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: visKey},
+			{Op: kv.Del, Key: dataKey},
+		},
+	}
+	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+		if isRetryableTransactWriteError(err) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	_ = gen // reserved for future per-queue expiry metrics
+	return nil
+}
+
 func (s *SQSServer) rotateMessagesForDelivery(
 	ctx context.Context,
 	queueName string,
 	gen uint64,
 	candidates []sqsMsgCandidate,
 	visibilityTimeout int64,
+	retentionSeconds int64,
 	max int,
 	readTS uint64,
 ) ([]map[string]any, error) {
@@ -668,7 +725,7 @@ func (s *SQSServer) rotateMessagesForDelivery(
 		if len(delivered) >= max {
 			break
 		}
-		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, gen, cand, visibilityTimeout, readTS)
+		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, gen, cand, visibilityTimeout, retentionSeconds, readTS)
 		if err != nil {
 			return delivered, err
 		}
@@ -697,23 +754,41 @@ func (s *SQSServer) tryDeliverCandidate(
 	gen uint64,
 	cand sqsMsgCandidate,
 	visibilityTimeout int64,
+	retentionSeconds int64,
 	readTS uint64,
 ) (map[string]any, bool, error) {
-	dataKey := sqsMsgDataKey(queueName, gen, cand.messageID)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
-	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			// Message gone mid-flight (probably deleted by another
-			// worker). Skip; don't fail the batch.
-			return nil, true, nil
-		}
-		return nil, false, errors.WithStack(err)
+	rec, dataKey, skip, err := s.loadCandidateRecord(ctx, queueName, gen, cand, readTS)
+	if skip || err != nil {
+		return nil, skip, err
 	}
-	rec, err := decodeSQSMessageRecord(raw)
-	if err != nil {
-		return nil, false, err
+	if expired, err := s.handleRetentionExpiry(ctx, queueName, gen, cand, dataKey, rec, retentionSeconds, readTS); expired || err != nil {
+		return nil, expired, err
 	}
+	return s.commitReceiveRotation(ctx, queueName, gen, cand, dataKey, rec, visibilityTimeout, readTS)
+}
 
+// handleRetentionExpiry deletes the candidate inline when its
+// send age exceeds MessageRetentionPeriod, so the vis-index scan
+// does not keep re-finding it. Returns (expired, err): expired=true
+// means the candidate has been (or is being) reaped and the caller
+// must skip.
+func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, retentionSeconds int64, readTS uint64) (bool, error) {
+	if retentionSeconds <= 0 {
+		return false, nil
+	}
+	now := time.Now().UnixMilli()
+	if now-rec.SendTimestampMillis <= retentionSeconds*sqsMillisPerSecond {
+		return false, nil
+	}
+	if err := s.expireMessage(ctx, queueName, gen, cand.visKey, dataKey, readTS); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// commitReceiveRotation runs the final OCC dispatch that rotates
+// receipt token + visibility index for a non-expired candidate.
+func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, visibilityTimeout int64, readTS uint64) (map[string]any, bool, error) {
 	newToken, err := newReceiptToken()
 	if err != nil {
 		return nil, false, err
@@ -732,17 +807,10 @@ func (s *SQSServer) tryDeliverCandidate(
 	}
 	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
 	// StartTS pins the OCC read snapshot to the timestamp we actually
-	// loaded the record at. Without it, the coordinator assigns a newer
-	// StartTS at dispatch, so a concurrent rotation that committed
-	// AFTER our read but BEFORE the assigned StartTS would slip through
-	// ReadKeys validation and let this transaction double-deliver.
-	// ReadKeys cover:
-	//   - cand.visKey + dataKey: concurrent receive rotation → conflict.
-	//   - sqsQueueMetaKey / sqsQueueGenKey: concurrent DeleteQueue /
-	//     PurgeQueue → conflict. DeleteQueue only mutates the meta /
-	//     generation records and would otherwise slip past an
-	//     unqualified ReadKeys set, letting this rotation commit a
-	//     message under a dead generation.
+	// loaded the record at. ReadKeys cover: cand.visKey + dataKey so a
+	// concurrent rotation → conflict; sqsQueueMetaKey / sqsQueueGenKey
+	// so a concurrent DeleteQueue / PurgeQueue → conflict (DeleteQueue
+	// only mutates meta + generation and would otherwise slip through).
 	req := &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  readTS,
@@ -755,8 +823,6 @@ func (s *SQSServer) tryDeliverCandidate(
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		if isRetryableTransactWriteError(err) {
-			// Another concurrent receive rotated the same message;
-			// this candidate is no longer ours to deliver.
 			return nil, true, nil
 		}
 		return nil, false, errors.WithStack(err)

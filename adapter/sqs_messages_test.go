@@ -1,12 +1,16 @@
 package adapter
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
 	"net/http"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bootjp/elastickv/kv"
 )
 
 // createSQSQueueForTest is a small helper so every message-path test does
@@ -547,6 +551,124 @@ func TestSQSServer_CreateQueueRequiresExplicitFifoFlag(t *testing.T) {
 	}
 	if out["__type"] != sqsErrValidation {
 		t.Fatalf("error type: %q want %q", out["__type"], sqsErrValidation)
+	}
+}
+
+func TestSQSServer_SendMessageRejectsEmptyBody(t *testing.T) {
+	t.Parallel()
+	// AWS rejects SendMessage with an empty MessageBody
+	// (InvalidParameterValue). Accepting an empty body silently would
+	// let producer bugs (missing serialization, forgotten body
+	// parameter) land on the queue as fake-but-real messages.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "empty-body")
+
+	// Omitted MessageBody.
+	status, body := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl": queueURL,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("omitted body: got %d want 400 (%v)", status, body)
+	}
+
+	// Explicit empty body.
+	status, body = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":    queueURL,
+		"MessageBody": "",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("empty body: got %d want 400 (%v)", status, body)
+	}
+}
+
+func TestSQSServer_ReceiveDropsRetentionExpiredMessages(t *testing.T) {
+	t.Parallel()
+	// Set MessageRetentionPeriod to the minimum (60 s), send a
+	// message, then manually backdate its send_timestamp past
+	// retention. The next ReceiveMessage must NOT return the message
+	// and must also clean it up so a subsequent scan does not
+	// reappear it.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "retention-drop",
+		"Attributes": map[string]string{
+			"MessageRetentionPeriod": "60",
+		},
+	})
+	url, _ := out["QueueUrl"].(string)
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":    url,
+		"MessageBody": "stale",
+	})
+
+	// Cheat: reach into the store and backdate the just-sent record
+	// to simulate a long-retention-expired message. We could not
+	// just time.Sleep(60s) in a unit test.
+	backdateSQSMessageForTest(t, nodes[0], "retention-drop", 120*time.Second)
+
+	// Receive must return nothing and must not replay the message.
+	for i := 0; i < 2; i++ {
+		status, body := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+			"QueueUrl":            url,
+			"MaxNumberOfMessages": 1,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("receive #%d: %d %v", i, status, body)
+		}
+		if msgs, _ := body["Messages"].([]any); len(msgs) != 0 {
+			t.Fatalf("receive #%d delivered an expired message: %v", i, msgs)
+		}
+	}
+}
+
+// backdateSQSMessageForTest walks the data-key prefix for the queue,
+// rewrites the single message record it finds so SendTimestampMillis
+// is `age` in the past, and commits the change through the adapter's
+// coordinator. That simulates a retention-expired message without
+// requiring a time.Sleep in tests.
+func backdateSQSMessageForTest(t *testing.T, node Node, queueName string, age time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	srv := node.sqsServer
+	readTS := srv.nextTxnReadTS(ctx)
+	meta, exists, err := srv.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil || !exists {
+		t.Fatalf("loadQueueMetaAt: err=%v exists=%v", err, exists)
+	}
+	prefix := []byte(SqsMsgDataPrefix + encodeSQSSegment(queueName))
+	// Append gen-u64 so we only scan this generation.
+	prefix = appendU64(prefix, meta.Generation)
+	end := append(bytes.Clone(prefix), 0xff)
+	kvs, err := srv.store.ScanAt(ctx, prefix, end, 16, readTS)
+	if err != nil {
+		t.Fatalf("scan data: %v", err)
+	}
+	if len(kvs) == 0 {
+		t.Fatalf("no data records found for queue %q", queueName)
+	}
+	rec, err := decodeSQSMessageRecord(kvs[0].Value)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	rec.SendTimestampMillis = time.Now().Add(-age).UnixMilli()
+	body, err := encodeSQSMessageRecord(rec)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: readTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: bytes.Clone(kvs[0].Key), Value: body},
+		},
+	}
+	if _, err := srv.coordinator.Dispatch(ctx, req); err != nil {
+		t.Fatalf("dispatch: %v", err)
 	}
 }
 
