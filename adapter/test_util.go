@@ -606,4 +606,3 @@ func lpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key s
 		return rdb.LPush(ctx, key, vals...).Err()
 	})
 }
-
