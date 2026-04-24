@@ -221,15 +221,6 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
-	// Publish the leader address after ~100ms (several poll intervals,
-	// well inside leaderProxyRetryBudget). forwardWithRetry should be
-	// mid-poll at that point and converge on success.
-	publishDelay := 100 * time.Millisecond
-	go func() {
-		time.Sleep(publishDelay)
-		eng.setLeader(lis.Addr().String())
-	}()
-
 	reqs := []*pb.Request{
 		{
 			IsTxn: false,
@@ -241,7 +232,19 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 		},
 	}
 
+	// Anchor start BEFORE launching the publish goroutine so the
+	// publishDelay lower bound on elapsed is measured from the same
+	// instant as the Commit call. Capturing start after the goroutine
+	// launch would subtract the goroutine-scheduling time from
+	// elapsed and can let the GreaterOrEqual(elapsed, publishDelay)
+	// assertion flake when the proxy really did wait the full delay.
+	publishDelay := 100 * time.Millisecond
 	start := time.Now()
+	go func() {
+		time.Sleep(publishDelay)
+		eng.setLeader(lis.Addr().String())
+	}()
+
 	resp, err := p.Commit(reqs)
 	elapsed := time.Since(start)
 	require.NoError(t, err)

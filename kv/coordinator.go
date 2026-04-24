@@ -487,11 +487,16 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 //     node returns adapter.ErrNotLeader (its own sentinel) which gRPC
 //     transports as a generic Unknown status carrying only the message
 //     "not leader". errors.Is cannot traverse that wire boundary, so we
-//     fall back to a case-insensitive substring match on the final error
-//     text. leaderErrorPhrases enumerates the exact phrases the adapter
-//     and coordinator layers emit so the match cannot accidentally
-//     swallow an unrelated business-logic error that happens to contain
-//     "leader" in its text.
+//     fall back to a case-insensitive SUFFIX match on the final error
+//     text (see hasTransientLeaderPhrase). Suffix-only — not a free
+//     Contains — because store.WriteConflictError formats as
+//     "key: <user-key>: write conflict" and a user-chosen key embedding
+//     "not leader" must not be misclassified as transient.
+//     leaderErrorPhrases enumerates the exact phrases the adapter and
+//     coordinator layers emit; every observed wrapper (cockroachdb
+//     Wrapf, fmt.Errorf %w-prefix, gRPC status Errorf) places the
+//     original message at the end of the composed string so suffix
+//     matching catches the real churn signals without false positives.
 //
 // Business-logic failures (write conflict, validation, etc.) are NOT
 // covered here — those must surface to the caller unchanged so client
