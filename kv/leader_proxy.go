@@ -79,12 +79,26 @@ func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 // leader's Internal.Forward returns adapter.ErrNotLeader whose error
 // chain does not survive the gRPC boundary; errors.Is against
 // ErrLeaderNotFound would miss it and exit after only the fast retries.
+//
+// The overall budget is strictly enforced: no new forward() attempt is
+// started once time.Now() has passed deadline, and each per-attempt RPC
+// is bounded by min(leaderForwardTimeout, remaining budget). Without
+// that second bound, a single forward() could run for the full 5s RPC
+// timeout AFTER the budget expired, pushing total latency well past
+// leaderProxyRetryBudget.
 func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
 
 	deadline := time.Now().Add(leaderProxyRetryBudget)
+	// Parent context carries the retry deadline so forward()'s per-call
+	// timeout (derived via context.WithTimeout(parentCtx, ...)) can
+	// never extend past it — context.WithTimeout picks the earlier of
+	// the two expirations.
+	parentCtx, cancelParent := context.WithDeadline(context.Background(), deadline)
+	defer cancelParent()
+
 	var lastErr error
 	for {
 		// Each iteration of the outer loop runs up to maxForwardRetries
@@ -93,7 +107,11 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 		// one leaderProxyRetryInterval and re-poll until
 		// leaderProxyRetryBudget elapses.
 		for attempt := 0; attempt < maxForwardRetries; attempt++ {
-			resp, err := p.forward(reqs)
+			if !time.Now().Before(deadline) {
+				// Budget expired mid-cycle; do not start another RPC.
+				break
+			}
+			resp, err := p.forward(parentCtx, reqs)
 			if err == nil {
 				return resp, nil
 			}
@@ -109,10 +127,17 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 			return nil, lastErr
 		}
 		time.Sleep(leaderProxyRetryInterval)
+		// Re-check the deadline AFTER the back-off: if the budget is
+		// exhausted, do not enter another maxForwardRetries cycle
+		// (which could issue up to three more RPCs, each bounded by
+		// leaderForwardTimeout relative to the now-expired deadline).
+		if !time.Now().Before(deadline) {
+			return nil, lastErr
+		}
 	}
 }
 
-func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) {
+func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	addr := leaderAddrFromEngine(p.engine)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
@@ -124,7 +149,10 @@ func (p *LeaderProxy) forward(reqs []*pb.Request) (*TransactionResponse, error) 
 	}
 
 	cli := pb.NewInternalClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), leaderForwardTimeout)
+	// context.WithTimeout on a deadline-bounded parent yields the
+	// earlier of the two — so a forward() issued with <5s of budget
+	// remaining caps at exactly the budget, not the full RPC timeout.
+	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
 
 	resp, err := cli.Forward(ctx, &pb.ForwardRequest{

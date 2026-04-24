@@ -291,6 +291,15 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if err := waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval); err != nil {
 			return lastResp, err
 		}
+		// Re-check the deadline AFTER the back-off sleep. If the budget
+		// expired while we slept, do not start another dispatchOnce:
+		// redirect()'s gRPC forward carries a 5s per-call timeout, so a
+		// fresh attempt post-budget could push the total call far past
+		// the advertised dispatchLeaderRetryBudget and break the
+		// bounded-failure contract gRPC clients rely on.
+		if !time.Now().Before(deadline) {
+			return lastResp, lastErr
+		}
 	}
 }
 
