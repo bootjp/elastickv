@@ -724,12 +724,17 @@ func (s *SQSServer) tryDeliverCandidate(
 	// StartTS at dispatch, so a concurrent rotation that committed
 	// AFTER our read but BEFORE the assigned StartTS would slip through
 	// ReadKeys validation and let this transaction double-deliver.
-	// ReadKeys cover both the visibility entry and the data record so
-	// any concurrent commit on either produces ErrWriteConflict.
+	// ReadKeys cover:
+	//   - cand.visKey + dataKey: concurrent receive rotation → conflict.
+	//   - sqsQueueMetaKey / sqsQueueGenKey: concurrent DeleteQueue /
+	//     PurgeQueue → conflict. DeleteQueue only mutates the meta /
+	//     generation records and would otherwise slip past an
+	//     unqualified ReadKeys set, letting this rotation commit a
+	//     message under a dead generation.
 	req := &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  readTS,
-		ReadKeys: [][]byte{cand.visKey, dataKey},
+		ReadKeys: [][]byte{cand.visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: cand.visKey},
 			{Op: kv.Put, Key: newVisKey, Value: []byte(cand.messageID)},

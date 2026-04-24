@@ -362,9 +362,18 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		m.ContentBasedDedup = b
 		return nil
 	},
-	"RedrivePolicy": func(m *sqsQueueMeta, v string) error {
-		m.RedrivePolicy = v
-		return nil
+	"RedrivePolicy": func(_ *sqsQueueMeta, _ string) error {
+		// Milestone 1 does not enforce DLQ redrive at receive time,
+		// so silently accepting RedrivePolicy would advertise a
+		// feature clients rely on (poison messages moving to the
+		// DLQ after maxReceiveCount) that this adapter does not
+		// actually provide — receivers would see infinite
+		// redelivery instead. Reject the attribute until the
+		// Milestone-2 receive path that actually performs the DLQ
+		// move lands, so operators get a clear signal instead of
+		// a silently-broken queue.
+		return newSQSAPIError(http.StatusNotImplemented, sqsErrNotImplemented,
+			"RedrivePolicy is not yet supported; DLQ redrive is tracked for Milestone 2")
 	},
 }
 

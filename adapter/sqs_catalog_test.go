@@ -358,6 +358,44 @@ func TestSQSServer_SetQueueAttributesRequiresAttributes(t *testing.T) {
 	}
 }
 
+func TestSQSServer_CreateQueueRejectsRedrivePolicy(t *testing.T) {
+	t.Parallel()
+	// Milestone 1 does not enforce DLQ redrive on the receive path, so
+	// accepting RedrivePolicy would silently advertise a feature the
+	// adapter can't deliver — poison messages would redeliver
+	// indefinitely instead of moving to the DLQ. Until the Milestone-2
+	// receive-side DLQ move lands, reject the attribute loudly.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "with-redrive",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":"5"}`,
+		},
+	})
+	if status != http.StatusNotImplemented {
+		t.Fatalf("CreateQueue with RedrivePolicy: got %d want 501 (%v)", status, out)
+	}
+	if got, _ := out["__type"].(string); got != sqsErrNotImplemented {
+		t.Fatalf("error type: %q want %q", got, sqsErrNotImplemented)
+	}
+
+	// SetQueueAttributes rejects the same attribute on an existing
+	// queue.
+	url := createSQSQueueForTest(t, node, "no-redrive")
+	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
+		"QueueUrl": url,
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"maxReceiveCount":"3"}`,
+		},
+	})
+	if status != http.StatusNotImplemented {
+		t.Fatalf("SetQueueAttributes with RedrivePolicy: got %d want 501 (%v)", status, out)
+	}
+}
+
 func TestSQSServer_ReceiveMessageRejectsOutOfRangeMax(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
