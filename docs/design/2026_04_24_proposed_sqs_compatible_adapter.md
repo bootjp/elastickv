@@ -273,7 +273,7 @@ Steps:
 1. Validate message size (`MaximumMessageSize` from queue attrs, capped at 262144).
 2. Compute `md5_of_body` and `md5_of_message_attributes`.
 3. Resolve queue generation; if queue is tombstoned return `QueueDoesNotExist`.
-4. Compute `available_at_hlc`. Standard queues use `now + max(queue.delay, per-message DelaySeconds)`. **FIFO queues reject per-message `DelaySeconds` with `InvalidParameterValue`** — AWS only allows queue-level `DelaySeconds` on FIFO, and silently accepting a per-message value would diverge from real SQS behavior and let misbehaving clients ship out of order. FIFO sends therefore always compute `available_at_hlc = now + queue.delay`.
+4. Compute `available_at_hlc`. Standard queues use `now + effective_delay`, where `effective_delay` is the **per-message `DelaySeconds` if the caller provided one, otherwise `queue.delay`** (the per-message value is an override, not a floor — AWS's timers override the queue default, they are not `max`'d together). A queue configured with a long default delay must still be able to send an immediate message when the caller passes `DelaySeconds=0`. **FIFO queues reject per-message `DelaySeconds` with `InvalidParameterValue`** — AWS only allows queue-level `DelaySeconds` on FIFO, and silently accepting a per-message value would diverge from real SQS behavior and let misbehaving clients ship out of order. FIFO sends therefore always compute `available_at_hlc = now + queue.delay`.
 5. In one OCC transaction:
    - For FIFO: check and insert `!sqs|msg|dedup|...`. On hit, return the existing message's ID (AWS semantics).
    - For FIFO: increment `!sqs|queue|seq|...` and write it into the record.
@@ -469,7 +469,7 @@ Structured log fields match the rest of the project: `queue`, `message_id`, `rec
 
 ## 11. Failure Handling and Cleanup
 
-1. **Retention expiry**: a background reaper on the leader scans the visibility index for entries older than `send_timestamp + message_retention_seconds` and deletes them in bounded batches. Because visible_at ≤ send_time + retention implies the message is past retention in the common case, the reaper can mostly piggy-back on `ReceiveMessage` scans.
+1. **Retention expiry**: SQS retention is measured by **message age** (`send_timestamp + message_retention_seconds`), including in-flight messages. The reaper therefore cannot drive purely off the visibility index — a message whose `visible_at` has been pushed far into the future via repeated `ChangeMessageVisibility` might never appear in the `visible_at ≤ now` scan even after its retention has elapsed, so it would live forever under a vis-index-only reaper. Instead, retention uses a dedicated **send-age index** `!sqs|msg|byage|<queue-esc><gen-u64><send_timestamp-u64><message-id-esc>` that the send path writes alongside the data + vis entries. A background reaper on the leader scans `!sqs|msg|byage|` for keys whose `send_timestamp ≤ now − retention` and, in one OCC txn per message, deletes the data record, the visibility entry (found via the record's current `visible_at`), the send-age entry, and (FIFO) releases the group lock. `ReceiveMessage` skips any candidate whose send-age stamp has elapsed and files it for reaping instead of delivering it, so a slow reaper cannot cause stale-retention deliveries.
 2. **Old-generation reclaim**: `DeleteQueue` and `PurgeQueue` write `!sqs|queue|tombstone|...` markers. A background task drops remaining keys for the old generation.
 3. **Leader failover during long poll**: waiters drain, clients reconnect. Because every state change was Raft-committed before being acknowledged, no send or delete is lost.
 4. **Clock skew**: visibility timeouts use the cluster HLC, not wall clock. Sends across nodes remain monotonic because the HLC leader renews the physical ceiling every second (same mechanism the Redis/DynamoDB adapters already depend on).
@@ -653,7 +653,7 @@ Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_pre
 
 1. Unit: REST-handler table tests using `httptest.NewRecorder` for auth / validation.
 2. Integration: single-node cluster via `createNode(t, 1)`, drive the console API through `http.Client`, assert queue create → peek → purge → delete round-trip.
-3. UI smoke: a `testdata/console_ui_smoke_test.go` compiles the static bundle through `httptest.NewServer` and runs a handful of headless HTTP GETs to confirm the assets actually ship. (No Chromium; too heavy for CI.)
+3. UI smoke: an `adapter/console_ui_smoke_test.go` file (living at the package root, **not** under a `testdata/` directory — `go test` ignores directories named `testdata` so a test there would silently be skipped in CI) compiles the static bundle through `httptest.NewServer` and runs a handful of headless HTTP GETs to confirm the assets actually ship. Fixtures the test loads (HTML / JS expectations) can live under `adapter/testdata/console_ui/`, but the `_test.go` file itself must sit in a regular package directory.
 4. Auth: token match, token mismatch, loopback-no-token, non-loopback-no-token (rejected at startup).
 
 ### 13.10 Out of scope for Milestone 1
