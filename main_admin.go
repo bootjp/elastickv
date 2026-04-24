@@ -81,8 +81,8 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	// untyped `== nil` check cannot detect a nil-map-valued interface
 	// on its own).
 	if len(staticCreds) == 0 {
-		return errors.New("admin listener is enabled but no static credentials are configured;" +
-			" set -s3CredentialsFile to a file with at least one entry,")
+		return errors.New("admin listener is enabled but no static credentials are configured; " +
+			"set -s3CredentialsFile to a file with at least one entry")
 	}
 	primaryKey, err := resolveSigningKey(*adminSessionSigningKey, *adminSessionSigningKeyFile, envAdminSessionSigningKey)
 	if err != nil {

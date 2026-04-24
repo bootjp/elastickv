@@ -265,7 +265,8 @@ func digestForCompare(s string) []byte {
 }
 
 func (s *AuthService) authenticate(w http.ResponseWriter, req loginRequest) (AuthPrincipal, bool) {
-	secretCompareKeyOnce.Do(initSecretCompareKey)
+	// digestForCompare runs secretCompareKeyOnce.Do internally, so by
+	// the time it returns unknownKeyPlaceholder is already populated.
 	providedHash := digestForCompare(req.SecretKey)
 	expected, known := s.creds.LookupSecret(req.AccessKey)
 	expectedHash := unknownKeyPlaceholder
@@ -316,10 +317,12 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 	_ = json.NewEncoder(w).Encode(loginResponse{Role: principal.Role, ExpiresAt: expires})
 }
 
-// HandleLogout clears both cookies. It does not require authentication —
-// clearing stale cookies after a session has expired is always safe. We
-// best-effort decode the incoming session cookie so the audit log can
-// record who logged out; a missing or invalid cookie leaves actor empty.
+// HandleLogout clears both cookies. The route is wired behind the
+// protected middleware chain (SessionAuth + CSRF), so unauthenticated
+// or cross-site callers are rejected before they reach this handler —
+// that is what prevents logout-CSRF. We still best-effort decode the
+// incoming session cookie so the audit log can record who logged out;
+// a missing or invalid cookie leaves actor empty.
 func (s *AuthService) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	rec := newStatusRecorder(w)
 	defer s.auditLogout(r, rec)

@@ -51,8 +51,9 @@ type ClusterHandler struct {
 	logger *slog.Logger
 }
 
-// NewClusterHandler wires a source into the HTTP handler. Passing a nil
-// logger falls back to slog.Default() so existing callers keep working.
+// NewClusterHandler wires a source into the HTTP handler and seeds
+// logging with slog.Default(). Callers that want a tagged logger can
+// chain WithLogger(...) on the returned handler.
 func NewClusterHandler(source ClusterInfoSource) *ClusterHandler {
 	return &ClusterHandler{source: source, logger: slog.Default()}
 }
