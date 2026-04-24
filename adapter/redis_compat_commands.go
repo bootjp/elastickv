@@ -3708,10 +3708,13 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	// and the end state is correct. TestRedis_StreamMigrationWithMaxLenTrim
 	// guards this apply-order contract.
 	//
-	// Capacity hint covers: migrationElems + one entry Put + variadic trim Dels
-	// (typically 0, bounded by maxLen) + one meta Put.
+	// Capacity hint covers: migrationElems + one entry Put + one meta Put +
+	// the trim Dels that will follow. estimateTrim... avoids a cyclop
+	// bump on xaddTxn by keeping the maxLen arithmetic out of the main
+	// function body.
 	const xaddFixedElemCount = 2
-	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+xaddFixedElemCount)
+	elems := make([]*kv.Elem[kv.OP], 0,
+		len(migrationElems)+xaddFixedElemCount+estimateXAddTrimCount(req.maxLen, meta.Length))
 	elems = append(elems, migrationElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
@@ -3739,6 +3742,21 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 }
 
 // xaddTrimIfNeeded returns (finalLength, trimElems, err) for an XADD.
+// estimateXAddTrimCount returns how many entries the XADD's MAXLEN trim
+// will remove, or 0 when maxLen is unset or the current length fits under
+// it. Used only as a capacity hint for the elems slice; the actual trim
+// list is computed by xaddTrimIfNeeded.
+func estimateXAddTrimCount(maxLen int, currentLength int64) int {
+	if maxLen <= 0 {
+		return 0
+	}
+	nextLen := currentLength + 1
+	if nextLen <= int64(maxLen) {
+		return 0
+	}
+	return int(nextLen) - maxLen
+}
+
 // When maxLen == 0 or the new length fits under it, no trim is emitted and
 // trimElems is nil; otherwise Del operations for the oldest entries are
 // returned and finalLength equals maxLen. All scans use the caller's ctx
@@ -4109,12 +4127,12 @@ func parseXReadRequest(args [][]byte) (xreadRequest, error) {
 	return xreadRequest{block: opts.block, count: opts.count, keys: keys, afterIDs: afterIDs}, nil
 }
 
-func (r *RedisServer) resolveXReadAfterIDs(req *xreadRequest) error {
+func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadRequest) error {
 	for i, afterID := range req.afterIDs {
 		if afterID != "$" {
 			continue
 		}
-		resolved, err := r.resolveXReadDollarID(req.keys[i])
+		resolved, err := r.resolveXReadDollarID(ctx, req.keys[i])
 		if err != nil {
 			return err
 		}
@@ -4127,9 +4145,11 @@ func (r *RedisServer) resolveXReadAfterIDs(req *xreadRequest) error {
 // asking the store for the highest ID ever assigned. New-layout streams
 // answer from meta in one read; legacy blobs fall back to a full load.
 // Returns streamZeroID for non-existent and empty-never-written streams.
-func (r *RedisServer) resolveXReadDollarID(key []byte) (string, error) {
+// ctx threads through the caller's cancellation/deadline so the resolve
+// step doesn't survive past a BLOCK-window cancel.
+func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -4139,15 +4159,15 @@ func (r *RedisServer) resolveXReadDollarID(key []byte) (string, error) {
 	if typ != redisTypeStream {
 		return "", wrongTypeError()
 	}
-	return r.dollarIDFromState(key, readTS)
+	return r.dollarIDFromState(ctx, key, readTS)
 }
 
 // dollarIDFromState returns the highest-ever-assigned stream ID as a string.
 // Prefers the new-layout meta record (O(1)); falls back to the legacy blob
 // load when meta is absent. Kept separate from the type-check in the caller
 // so each function stays within the cyclop budget.
-func (r *RedisServer) dollarIDFromState(key []byte, readTS uint64) (string, error) {
-	meta, found, err := r.loadStreamMetaAt(context.Background(), key, readTS)
+func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS uint64) (string, error) {
+	meta, found, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -4157,7 +4177,7 @@ func (r *RedisServer) dollarIDFromState(key []byte, readTS uint64) (string, erro
 		}
 		return strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10), nil
 	}
-	stream, err := r.loadStreamAt(context.Background(), key, readTS)
+	stream, err := r.loadStreamAt(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -4303,17 +4323,20 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(err.Error())
 		return
 	}
-	if err := r.resolveXReadAfterIDs(&req); err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
 
 	blockDuration := req.block
 	// block=0 means infinite wait in Redis; cap at redisDispatchTimeout to prevent goroutine leak.
 	if blockDuration == 0 {
 		blockDuration = redisDispatchTimeout
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), blockDuration)
+	defer cancel()
 	deadline := time.Now().Add(blockDuration)
+
+	if err := r.resolveXReadAfterIDs(ctx, &req); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
 
 	for {
 		results, err := r.xreadOnce(req)
