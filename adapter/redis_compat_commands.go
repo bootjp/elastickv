@@ -3639,10 +3639,31 @@ func nextXAddID(hasLast bool, lastMs, lastSeq uint64, requested string) (string,
 	if !hasLast || nowMs > lastMs {
 		return strconv.FormatUint(nowMs, 10) + "-0", nil
 	}
-	if nowMs == lastMs {
-		return strconv.FormatUint(nowMs, 10) + "-" + strconv.FormatUint(lastSeq+1, 10), nil
+	// Either nowMs == lastMs (same millisecond), or lastMs is in the future
+	// (monotonic guarantee across a backwards clock step or a corrupted
+	// meta). Advance past lastMs-lastSeq via bumpStreamID; if the ID space
+	// is exhausted, surface an error rather than wrap to 0.
+	ms, seq, err := bumpStreamID(lastMs, lastSeq)
+	if err != nil {
+		return "", err
 	}
-	return strconv.FormatUint(lastMs, 10) + "-" + strconv.FormatUint(lastSeq+1, 10), nil
+	return strconv.FormatUint(ms, 10) + "-" + strconv.FormatUint(seq, 10), nil
+}
+
+// bumpStreamID returns the strictly-greater successor of (ms, seq) within
+// the uint64-uint64 stream ID space. Bumps seq; on seq overflow carries
+// to ms+1, seq=0; on ms overflow returns an error (no representable
+// successor) instead of wrapping to 0-0, which would produce a duplicate
+// or non-monotonic ID.
+func bumpStreamID(ms, seq uint64) (uint64, uint64, error) {
+	switch {
+	case seq < ^uint64(0):
+		return ms, seq + 1, nil
+	case ms < ^uint64(0):
+		return ms + 1, 0, nil
+	default:
+		return 0, 0, errors.New("ERR The stream has exhausted the ID space")
+	}
 }
 
 func compareStreamIDs(lms, lseq, rms, rseq uint64) int {
@@ -3789,7 +3810,18 @@ func estimateXAddTrimCount(maxLen int, currentLength int64) int {
 	if nextLen <= int64(maxLen) {
 		return 0
 	}
-	return int(nextLen) - maxLen
+	// Compute the subtraction in int64 and clamp to [0, math.MaxInt] so a
+	// corrupted meta.Length cannot wrap int and feed make() a negative
+	// capacity (which would panic). This is only a capacity hint; the
+	// actual trim list still comes from xaddTrimIfNeeded.
+	diff := nextLen - int64(maxLen)
+	if diff <= 0 {
+		return 0
+	}
+	if diff > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(diff)
 }
 
 // When maxLen < 0 (unset) or the new length fits under it, no trim is
@@ -3807,7 +3839,20 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	if maxLen < 0 || candidateLen <= int64(maxLen) {
 		return candidateLen, nil, nil
 	}
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, int(candidateLen)-maxLen)
+	// int64 arithmetic + explicit clamp: if candidateLen is a corrupted
+	// huge value, int(candidateLen)-maxLen could overflow into a negative
+	// trim count, which would then skip the trim and leave meta.Length
+	// wrong. Clamp to math.MaxInt so buildXTrimHeadElems at worst scans
+	// the store-imposed page limit, not a wrapped-negative page.
+	diff := candidateLen - int64(maxLen)
+	if diff <= 0 {
+		return candidateLen, nil, nil
+	}
+	count := math.MaxInt
+	if diff <= int64(math.MaxInt) {
+		count = int(diff)
+	}
+	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, count)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -3947,17 +3992,54 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
-func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int, error) {
-	readTS := r.readTS()
+// streamTypeForWrite returns (true, nil) when the key is either absent
+// (no-op write) or already a stream, (false, nil) when the caller should
+// short-circuit with "no stream here", and (_, err) for wrong-type or
+// store errors. Extracted from xtrimTxn so the outer function stays
+// within the cyclop budget.
+func (r *RedisServer) streamTypeForWrite(ctx context.Context, key []byte, readTS uint64) (bool, error) {
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
-		return 0, err
+		return false, err
 	}
-	if typ == redisTypeNone {
+	switch typ {
+	case redisTypeNone:
+		return false, nil
+	case redisTypeStream:
+		return true, nil
+	case redisTypeString, redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet:
+		return false, wrongTypeError()
+	default:
+		return false, wrongTypeError()
+	}
+}
+
+// flushLegacyCleanupOnTrimNoOp commits the legacy-blob Del + meta Put
+// for an XTRIM whose length is already under maxLen. Without this
+// flush a subsequent read would still find the stale legacy blob.
+// Returns 0 removed entries; callers use that directly.
+func (r *RedisServer) flushLegacyCleanupOnTrimNoOp(
+	ctx context.Context, readTS uint64, key []byte,
+	meta store.StreamMeta, legacyCleanup []*kv.Elem[kv.OP],
+) (int, error) {
+	if len(legacyCleanup) == 0 {
 		return 0, nil
 	}
-	if typ != redisTypeStream {
-		return 0, wrongTypeError()
+	metaBytes, err := store.MarshalStreamMeta(meta)
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+1)
+	elems = append(elems, legacyCleanup...)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
+	return 0, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int, error) {
+	readTS := r.readTS()
+	proceed, err := r.streamTypeForWrite(ctx, key, readTS)
+	if err != nil || !proceed {
+		return 0, err
 	}
 
 	legacyCleanup, meta, _, err := r.streamWriteBase(ctx, key, readTS)
@@ -3966,25 +4048,17 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 	}
 
 	if meta.Length <= int64(maxLen) {
-		if len(legacyCleanup) > 0 {
-			// Flush the legacy-blob deletion even when the trim is a no-op,
-			// otherwise a subsequent read would still find the stale blob.
-			// The pre-existing meta may be the zero value (fresh stream with
-			// legacy data on disk); persist it so the next XADD doesn't
-			// re-discover the blob and rewrite this Del.
-			metaBytes, metaErr := store.MarshalStreamMeta(meta)
-			if metaErr != nil {
-				return 0, cockerrors.WithStack(metaErr)
-			}
-			elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+1)
-			elems = append(elems, legacyCleanup...)
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
-			return 0, r.dispatchElems(ctx, true, readTS, elems)
-		}
-		return 0, nil
+		return r.flushLegacyCleanupOnTrimNoOp(ctx, readTS, key, meta, legacyCleanup)
 	}
 
-	removed := int(meta.Length) - maxLen
+	// Compute in int64 + clamp so a corrupted meta.Length cannot wrap int
+	// and produce a negative `removed` count (which would under-trim AND
+	// later pass make(..., negative) to the elems slice).
+	diff := meta.Length - int64(maxLen)
+	removed := math.MaxInt
+	if diff <= int64(math.MaxInt) {
+		removed = int(diff)
+	}
 	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, removed)
 	if err != nil {
 		return 0, err
@@ -4144,28 +4218,23 @@ func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (str
 }
 
 // dollarIDFromState returns the highest-ever-assigned stream ID as a string.
-// Prefers the new-layout meta record (O(1)); falls back to the legacy blob
-// load when meta is absent. Kept separate from the type-check in the caller
-// so each function stays within the cyclop budget.
+// Reads the new-layout meta record (O(1)); when meta is absent the stream
+// is treated as empty — legacy single-blob data is intentionally ignored
+// under the "discard-on-read, delete-on-write" contract (see loadStreamAt
+// and the PR #620 writeup), so $ resolves to streamZeroID for any stream
+// that has never been written in the new layout.
 func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS uint64) (string, error) {
 	meta, found, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
-	if found {
-		if meta.Length == 0 && meta.LastMs == 0 && meta.LastSeq == 0 {
-			return streamZeroID, nil
-		}
-		return strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10), nil
-	}
-	stream, err := r.loadStreamAt(ctx, key, readTS)
-	if err != nil {
-		return "", err
-	}
-	if len(stream.Entries) == 0 {
+	if !found {
 		return streamZeroID, nil
 	}
-	return stream.Entries[len(stream.Entries)-1].ID, nil
+	if meta.Length == 0 && meta.LastMs == 0 && meta.LastSeq == 0 {
+		return streamZeroID, nil
+	}
+	return strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10), nil
 }
 
 func selectXReadEntries(entries []redisStreamEntry, afterID string, count int) []redisStreamEntry {
@@ -4209,20 +4278,23 @@ func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadR
 	return results, nil
 }
 
-// readStreamAfter returns up to `count` entries with ID strictly greater than
-// afterID. When count <= 0 all entries are returned. Prefers the entry-per-key
-// range scan; falls through to the legacy blob when no meta is present.
+// readStreamAfter returns up to `count` entries with ID strictly greater
+// than afterID via the entry-per-key range scan. When the meta key is
+// absent the stream is treated as empty; legacy single-blob data is
+// intentionally ignored under the "discard-on-read, delete-on-write"
+// contract documented on loadStreamAt. A subsequent XADD or XTRIM will
+// delete any lingering legacy blob in the same transaction, so a stream
+// whose meta is still missing here cannot have live legacy data from the
+// caller's perspective.
 func (r *RedisServer) readStreamAfter(ctx context.Context, key []byte, readTS uint64, afterID string, count int) ([]redisStreamEntry, error) {
-	if _, found, err := r.loadStreamMetaAt(ctx, key, readTS); err != nil {
-		return nil, err
-	} else if found {
-		return r.scanStreamEntriesAfter(ctx, key, readTS, afterID, count)
-	}
-	stream, err := r.loadStreamAt(ctx, key, readTS)
+	_, found, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
-	return selectXReadEntries(stream.Entries, afterID, count), nil
+	if !found {
+		return nil, nil
+	}
+	return r.scanStreamEntriesAfter(ctx, key, readTS, afterID, count)
 }
 
 // scanStreamEntriesAfter runs a [strictly-after(afterID), ∞) range scan over

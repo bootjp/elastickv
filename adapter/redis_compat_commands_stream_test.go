@@ -371,14 +371,8 @@ func TestRedis_StreamAutoIDMonotonicAfterTrim(t *testing.T) {
 	require.Greater(t, id, ceiling)
 }
 
-// TestRedis_StreamMigrationWithMaxLenTrim seeds a legacy blob and issues an
-// XADD with MAXLEN small enough to drop some migrated entries in the same
-// transaction. The coordinator applies operations sequentially so the
-// trim-path Del tombstones the migration-path Put at the same commitTS,
-// and the end state matches what Redis would produce running XADD+trim on
-// a native entry-per-key stream.
 // TestRedis_StreamMultiExecDelRemovesWideColumnLayout verifies that a
-// MULTI/EXEC DEL on a migrated stream drops the wide-column meta and every
+// MULTI/EXEC DEL on a wide-column stream drops the meta key and every
 // entry row, not just the (already-empty) legacy blob key. Regression
 // guard for the CodeRabbit-flagged leak where DEL reported success while
 // !stream|meta|... and !stream|entry|... survived.
