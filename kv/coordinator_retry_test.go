@@ -29,7 +29,7 @@ func (stubLeaderEngine) State() raftengine.State { return raftengine.StateLeader
 func (stubLeaderEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
 }
-func (stubLeaderEngine) VerifyLeader(context.Context) error           { return nil }
+func (stubLeaderEngine) VerifyLeader(context.Context) error               { return nil }
 func (stubLeaderEngine) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
 func (stubLeaderEngine) Status() raftengine.Status {
 	return raftengine.Status{State: raftengine.StateLeader}
@@ -60,7 +60,11 @@ func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse
 	if int(idx) < len(s.errs) && s.errs[idx] != nil {
 		return nil, s.errs[idx]
 	}
-	return &TransactionResponse{CommitIndex: uint64(idx + 1)}, nil
+	// idx is strictly non-negative (atomic.Add on an int64 that starts
+	// at 0 and only ever increments), so the conversion to uint64 for
+	// CommitIndex is safe. gosec G115 can't see that invariant, so
+	// silence it inline.
+	return &TransactionResponse{CommitIndex: uint64(idx + 1)}, nil //nolint:gosec
 }
 
 func (s *scriptedTransactional) Abort([]*pb.Request) (*TransactionResponse, error) {
@@ -87,7 +91,6 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			require.Equal(t, tc.want, isTransientLeaderError(tc.err))
