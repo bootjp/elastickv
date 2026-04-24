@@ -1841,3 +1841,261 @@ func TestDispatcherLanesEnabledFromEnv(t *testing.T) {
 		require.Equalf(t, c.want, dispatcherLanesEnabledFromEnv(), "env=%q", c.val)
 	}
 }
+
+// TestMaxInflightMsgFromEnv_Unset pins the "no env var => caller wins"
+// contract of maxInflightMsgFromEnv. normalizeLimitConfig relies on the
+// second return to decide whether to overwrite the caller-supplied value.
+func TestMaxInflightMsgFromEnv_Unset(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	n, ok := maxInflightMsgFromEnv()
+	require.False(t, ok)
+	require.Equal(t, 0, n)
+}
+
+// TestMaxInflightMsgFromEnv_ReadsOverride pins that a valid positive
+// integer is parsed and surfaced to the caller verbatim.
+func TestMaxInflightMsgFromEnv_ReadsOverride(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	n, ok := maxInflightMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, 2048, n)
+}
+
+// TestMaxInflightMsgFromEnv_FallsBackOnInvalid pins the safety behaviour:
+// a non-numeric, zero, or negative value is refused and the compiled-in
+// default is surfaced (ok=true) so that normalizeLimitConfig actually
+// applies the default the warning log promises, instead of letting a
+// caller-supplied value silently win.
+func TestMaxInflightMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
+	cases := []string{"not-a-number", "0", "-3"}
+	for _, v := range cases {
+		t.Setenv(maxInflightMsgEnvVar, v)
+		n, ok := maxInflightMsgFromEnv()
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, defaultMaxInflightMsg, n, "env=%q", v)
+	}
+}
+
+// TestMaxSizePerMsgFromEnv_Unset pins the "no env var => caller wins"
+// contract, symmetric with maxInflightMsgFromEnv above.
+func TestMaxSizePerMsgFromEnv_Unset(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	n, ok := maxSizePerMsgFromEnv()
+	require.False(t, ok)
+	require.Equal(t, uint64(0), n)
+}
+
+// TestMaxSizePerMsgFromEnv_ReadsOverride pins that a valid byte count
+// >= minMaxSizePerMsg is accepted and surfaced to the caller verbatim.
+func TestMaxSizePerMsgFromEnv_ReadsOverride(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, "8388608") // 8 MiB
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, uint64(8388608), n)
+}
+
+// TestMaxSizePerMsgFromEnv_FallsBackOnInvalid covers the three failure
+// modes: non-numeric, zero, and below-floor. The floor is minMaxSizePerMsg
+// (1 KiB) — a smaller cap would make MsgApp batching degenerate. On
+// failure the helper returns (defaultMaxSizePerMsg, true) so the caller
+// actually applies the compiled-in default the log line promises, rather
+// than silently letting a caller-supplied value win.
+func TestMaxSizePerMsgFromEnv_FallsBackOnInvalid(t *testing.T) {
+	cases := []string{"not-a-number", "0", "512"}
+	for _, v := range cases {
+		t.Setenv(maxSizePerMsgEnvVar, v)
+		n, ok := maxSizePerMsgFromEnv()
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, uint64(defaultMaxSizePerMsg), n, "env=%q", v)
+	}
+}
+
+// TestMaxInflightMsgFromEnv_ClampsAboveCap pins the upper-bound safety
+// behaviour: a value above maxMaxInflightMsg is refused (it would
+// trigger multi-GB channel allocations at Open() and crash the process
+// before the node becomes healthy) and the compiled-in default is
+// surfaced with ok=true so normalizeLimitConfig actually applies it.
+func TestMaxInflightMsgFromEnv_ClampsAboveCap(t *testing.T) {
+	cases := []string{
+		strconv.Itoa(maxMaxInflightMsg + 1),
+		"100000000", // fat-fingered value from the Codex P2 report
+	}
+	for _, v := range cases {
+		t.Setenv(maxInflightMsgEnvVar, v)
+		n, ok := maxInflightMsgFromEnv()
+		require.Truef(t, ok, "env=%q", v)
+		require.Equalf(t, defaultMaxInflightMsg, n, "env=%q", v)
+	}
+}
+
+// TestMaxInflightMsgFromEnv_AcceptsAtCap pins the boundary: exactly
+// maxMaxInflightMsg must parse through unchanged. Catches an off-by-one
+// regression that would silently clamp an operator-tuned value.
+func TestMaxInflightMsgFromEnv_AcceptsAtCap(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, strconv.Itoa(maxMaxInflightMsg))
+	n, ok := maxInflightMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, maxMaxInflightMsg, n)
+}
+
+// TestMaxSizePerMsgFromEnv_ClampsAboveTransportBudget pins that a
+// MaxSizePerMsg above the gRPC transport's message-size budget
+// (GRPCMaxMessageBytes) is refused. Without this clamp the override
+// would make Raft emit MsgApp frames the transport physically cannot
+// carry, producing repeated send failures under large batches.
+func TestMaxSizePerMsgFromEnv_ClampsAboveTransportBudget(t *testing.T) {
+	over := strconv.FormatUint(maxMaxSizePerMsg+1, 10)
+	t.Setenv(maxSizePerMsgEnvVar, over)
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), n)
+}
+
+// TestMaxSizePerMsgFromEnv_AcceptsAtCap covers the boundary symmetrically
+// with the inflight test above.
+func TestMaxSizePerMsgFromEnv_AcceptsAtCap(t *testing.T) {
+	t.Setenv(maxSizePerMsgEnvVar, strconv.FormatUint(maxMaxSizePerMsg, 10))
+	n, ok := maxSizePerMsgFromEnv()
+	require.True(t, ok)
+	require.Equal(t, maxMaxSizePerMsg, n)
+}
+
+// TestMaxMaxSizePerMsg_MatchesTransportBudget pins the invariant that
+// the MaxSizePerMsg upper cap equals GRPCMaxMessageBytes. If someone
+// raises the transport budget without updating the Raft cap (or vice
+// versa), MaxSizePerMsg overrides would silently allow values that
+// cannot traverse the wire. Changing this constant MUST be a
+// deliberate, paired action.
+func TestMaxMaxSizePerMsg_MatchesTransportBudget(t *testing.T) {
+	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes), maxMaxSizePerMsg,
+		"maxMaxSizePerMsg must track internal.GRPCMaxMessageBytes — raise both together")
+}
+
+// TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
+// that reach raft.Config when neither the caller nor the operator has
+// overridden them: 512 inflight msgs and 2 MiB per msg. The combination
+// bounds worst-case per-peer buffered Raft traffic at 1 GiB (512 × 2 MiB);
+// see defaultMaxInflightMsg for the memory-footprint rationale.
+func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	got := normalizeLimitConfig(OpenConfig{})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+	require.Equal(t, 512, got.MaxInflightMsg)
+	require.Equal(t, uint64(2<<20), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_EnvOverridesCaller pins that a valid env var
+// takes precedence over any caller-supplied cfg value. This is how an
+// operator retunes a running deployment without a rebuild.
+func TestNormalizeLimitConfig_EnvOverridesCaller(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	t.Setenv(maxSizePerMsgEnvVar, "8388608")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: 256,
+		MaxSizePerMsg:  1 << 20,
+	})
+	require.Equal(t, 2048, got.MaxInflightMsg)
+	require.Equal(t, uint64(8388608), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault pins that a
+// malformed env override does NOT leak through to raft.Config; the
+// compiled-in defaults are applied (even when the caller supplied a
+// different value) so the operator-visible warning log matches reality.
+func TestNormalizeLimitConfig_InvalidEnvFallsBackToDefault(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "not-a-number")
+	t.Setenv(maxSizePerMsgEnvVar, "-1")
+	got := normalizeLimitConfig(OpenConfig{})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_InvalidEnvOverridesCaller pins the fix for
+// the "log message is a lie" gemini reviewer finding: when the env var
+// is malformed, the helper warns "using default" — so the default MUST
+// actually win, even if the caller supplied a non-default value. Prior
+// to the fix the caller's 256 would silently survive, contradicting the
+// log line.
+func TestNormalizeLimitConfig_InvalidEnvOverridesCaller(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "garbage")
+	t.Setenv(maxSizePerMsgEnvVar, "also-garbage")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: 256,
+		MaxSizePerMsg:  1 << 20,
+	})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+}
+
+// TestInboundChannelCap verifies the floor/passthrough behaviour of the
+// stepCh / dispatchReportCh sizing helper: the resolved MaxInflightMsg
+// drives capacity, but never below minInboundChannelCap.
+func TestInboundChannelCap(t *testing.T) {
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(0))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(1))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(minInboundChannelCap-1))
+	require.Equal(t, minInboundChannelCap, inboundChannelCap(minInboundChannelCap))
+	require.Equal(t, 1024, inboundChannelCap(1024))
+	require.Equal(t, 2048, inboundChannelCap(2048))
+}
+
+// TestOpen_InboundChannelsHonourMaxInflightEnv pins the codex P1 fix:
+// when ELASTICKV_RAFT_MAX_INFLIGHT_MSGS is raised above the compiled-in
+// default, the engine's inbound stepCh and dispatchReportCh must be
+// sized from the override, not the default. Previously these were hard-
+// wired to defaultMaxInflightMsg, so a larger override would still hit
+// errStepQueueFull at the compiled-in cap, silently defeating the whole
+// tuning knob.
+func TestOpen_InboundChannelsHonourMaxInflightEnv(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "2048")
+	// Open() normalizes BOTH raft limit env vars; leaving the size var
+	// unset here would let an ambient ELASTICKV_RAFT_MAX_SIZE_PER_MSG
+	// in the shell the test runs in influence config resolution and
+	// confuse an unrelated failure diagnosis. Pin it to "" so the size
+	// path always falls through to the caller's OpenConfig value.
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+	require.Equal(t, 2048, cap(engine.stepCh),
+		"stepCh capacity must reflect the env-overridden MaxInflightMsg")
+	require.Equal(t, 2048, cap(engine.dispatchReportCh),
+		"dispatchReportCh capacity must reflect the env-overridden MaxInflightMsg")
+}
+
+// TestOpen_InboundChannelsDefaultCap pins that with no env override the
+// inbound channels are sized from the compiled-in default (512), the
+// current production value.
+func TestOpen_InboundChannelsDefaultCap(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	// See TestOpen_InboundChannelsHonourMaxInflightEnv for why the size
+	// env var is cleared here too.
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7001",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+	require.Equal(t, defaultMaxInflightMsg, cap(engine.stepCh))
+	require.Equal(t, defaultMaxInflightMsg, cap(engine.dispatchReportCh))
+}
