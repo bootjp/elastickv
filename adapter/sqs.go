@@ -88,12 +88,12 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 		coordinator: coordinate,
 	}
 	s.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
-		sqsCreateQueueTarget:               s.notImplemented("CreateQueue"),
-		sqsDeleteQueueTarget:               s.notImplemented("DeleteQueue"),
-		sqsListQueuesTarget:                s.notImplemented("ListQueues"),
-		sqsGetQueueUrlTarget:               s.notImplemented("GetQueueUrl"),
-		sqsGetQueueAttributesTarget:        s.notImplemented("GetQueueAttributes"),
-		sqsSetQueueAttributesTarget:        s.notImplemented("SetQueueAttributes"),
+		sqsCreateQueueTarget:               s.createQueue,
+		sqsDeleteQueueTarget:               s.deleteQueue,
+		sqsListQueuesTarget:                s.listQueues,
+		sqsGetQueueUrlTarget:               s.getQueueUrl,
+		sqsGetQueueAttributesTarget:        s.getQueueAttributes,
+		sqsSetQueueAttributesTarget:        s.setQueueAttributes,
 		sqsPurgeQueueTarget:                s.notImplemented("PurgeQueue"),
 		sqsSendMessageTarget:               s.notImplemented("SendMessage"),
 		sqsSendMessageBatchTarget:          s.notImplemented("SendMessageBatch"),
