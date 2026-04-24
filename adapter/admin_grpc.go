@@ -117,49 +117,84 @@ func (s *AdminServer) GetClusterOverview(
 }
 
 // snapshotMembers unions the seed members with the live Configuration of each
-// registered group (deduplicating by NodeID). Configuration errors are logged
-// via the returned error in the per-member accumulator; they never fail the
-// overall RPC because the seed list is always available as a fallback.
+// registered group, preferring the live address when the same NodeID appears
+// in both sources. A stale bootstrap entry cannot outvote a readdressed node:
+// if n2 was moved from 10.0.0.12 to 10.0.0.22, the overview reports the
+// current 10.0.0.22 so fan-out dials the right target. Configuration errors
+// on a single group do not fail the RPC — other groups plus the seed list
+// still produce useful output.
 func (s *AdminServer) snapshotMembers(ctx context.Context) []*pb.NodeIdentity {
-	seen := make(map[string]struct{})
-	out := make([]*pb.NodeIdentity, 0, len(s.members))
-	add := func(id, addr string) {
-		if id == "" || id == s.self.NodeID {
-			return
-		}
-		if _, dup := seen[id]; dup {
-			return
-		}
-		seen[id] = struct{}{}
-		out = append(out, &pb.NodeIdentity{NodeId: id, GrpcAddress: addr})
-	}
+	groups := s.cloneGroups()
+	addrByID, order := collectLiveMembers(ctx, groups, s.self.NodeID)
+	mergeSeedMembers(s.members, s.self.NodeID, addrByID, &order)
 
-	// Seed members first — stable order when a group Configuration call
-	// errors or returns an empty list.
-	for _, m := range s.members {
-		add(m.NodeID, m.GRPCAddress)
+	out := make([]*pb.NodeIdentity, 0, len(order))
+	for _, id := range order {
+		out = append(out, &pb.NodeIdentity{NodeId: id, GrpcAddress: addrByID[id]})
 	}
+	return out
+}
 
+// cloneGroups snapshots the registered groups under the read lock so the
+// caller can iterate without holding groupsMu while invoking Configuration
+// (which may block on Raft).
+func (s *AdminServer) cloneGroups() []AdminGroup {
 	s.groupsMu.RLock()
-	groups := make([]AdminGroup, 0, len(s.groups))
+	defer s.groupsMu.RUnlock()
+	out := make([]AdminGroup, 0, len(s.groups))
 	for _, g := range s.groups {
-		groups = append(groups, g)
+		out = append(out, g)
 	}
-	s.groupsMu.RUnlock()
+	return out
+}
 
+// collectLiveMembers polls Configuration for each group and returns the union
+// of server IDs (excluding self) with their live addresses. The order slice
+// preserves first-seen iteration order for stable output.
+func collectLiveMembers(
+	ctx context.Context,
+	groups []AdminGroup,
+	selfID string,
+) (addrByID map[string]string, order []string) {
+	addrByID = make(map[string]string)
+	order = make([]string, 0)
 	for _, g := range groups {
 		cfg, err := g.Configuration(ctx)
 		if err != nil {
-			// A single group failing to report its ConfState does not fail
-			// the RPC; the seed list and other groups still produce useful
-			// output.
 			continue
 		}
 		for _, srv := range cfg.Servers {
-			add(srv.ID, srv.Address)
+			if srv.ID == "" || srv.ID == selfID {
+				continue
+			}
+			if _, dup := addrByID[srv.ID]; dup {
+				continue
+			}
+			addrByID[srv.ID] = srv.Address
+			order = append(order, srv.ID)
 		}
 	}
-	return out
+	return addrByID, order
+}
+
+// mergeSeedMembers fills in seed entries for IDs no live Configuration
+// reported. Seeds never overwrite a live address.
+func mergeSeedMembers(
+	seeds []NodeIdentity,
+	selfID string,
+	addrByID map[string]string,
+	order *[]string,
+) {
+	for _, m := range seeds {
+		if m.NodeID == "" || m.NodeID == selfID {
+			continue
+		}
+		if _, known := addrByID[m.NodeID]; known {
+			continue
+		}
+		addrByID[m.NodeID] = m.GRPCAddress
+		*order = append(*order, m.NodeID)
+	}
 }
 
 // GetRaftGroups returns per-group state snapshots. Phase 0 wires commit/applied

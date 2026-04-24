@@ -127,6 +127,40 @@ func TestGetClusterOverviewUnionsSeedsAndLiveConfig(t *testing.T) {
 	}
 }
 
+// TestGetClusterOverviewLiveConfigWinsOverStaleSeed asserts that when a node
+// is readdressed (same NodeID, new GRPCAddress), the live Raft Configuration
+// wins over the stale bootstrap seed so fan-out dials the current endpoint.
+// Codex P2 on e1f0e532: previously seed was added first and later entries
+// with the same ID were ignored, silently pinning the old address.
+func TestGetClusterOverviewLiveConfigWinsOverStaleSeed(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		// Bootstrap: n2 lived at 10.0.0.12.
+		[]NodeIdentity{{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"}},
+	)
+	// Raft config reports n2 moved to 10.0.0.22.
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.22:50051"},
+		},
+	})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Members) != 1 {
+		t.Fatalf("members = %d, want 1", len(resp.Members))
+	}
+	got := resp.Members[0]
+	if got.NodeId != "n2" || got.GrpcAddress != "10.0.0.22:50051" {
+		t.Fatalf("members[0] = %+v, want n2 @ 10.0.0.22:50051 (live wins over seed)", got)
+	}
+}
+
 // TestGetClusterOverviewSurvivesConfigurationError asserts that a group that
 // errors on Configuration() does NOT fail the RPC — seed members are still
 // returned.
