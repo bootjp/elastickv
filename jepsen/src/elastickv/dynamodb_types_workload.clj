@@ -208,6 +208,20 @@
       (when-not (= "ResourceInUseException" (:type (ex-data e)))
         (throw e)))))
 
+(defn- clear-keys!
+  "Delete every partition key the test will touch, giving re-runs a clean
+   slate.  Without this, reads issued before this run's first write on a
+   key could observe stale items from a previous run (against a shared
+   endpoint or a --no-cluster local run that reuses the Raft data-dir),
+   distorting the register history and producing spurious linearizability
+   failures.  DeleteItem on a missing key is a no-op in DynamoDB, so this
+   is safe on first run too."
+  [ddb table key-count]
+  (doseq [k (range key-count)]
+    (ddb-invoke! ddb :DeleteItem
+                 {:TableName table
+                  :Key       {pk-attr {:S (str k)}}})))
+
 (defn- dynamo-put!
   "PutItem with the encoded value.  Replaces the entire item."
   [ddb table k attr]
@@ -230,7 +244,7 @@
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 
-(defrecord DynamoDBTypesClient [node->port spec read-capacity write-capacity ddb]
+(defrecord DynamoDBTypesClient [node->port spec key-count read-capacity write-capacity ddb]
   client/Client
 
   (open! [this test node]
@@ -239,7 +253,8 @@
       (assoc this :ddb (make-ddb-client host port))))
 
   (setup! [_this _test]
-    (create-table! ddb (:table spec) read-capacity write-capacity))
+    (create-table! ddb (:table spec) read-capacity write-capacity)
+    (clear-keys! ddb (:table spec) key-count))
 
   (teardown! [_this _test])
 
@@ -322,6 +337,7 @@
                           (or (:node->port opts)
                               (zipmap default-nodes (repeat 8000)))
                           spec
+                          key-count
                           read-capacity
                           write-capacity
                           nil)]
