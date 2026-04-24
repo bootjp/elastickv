@@ -64,6 +64,17 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	if err != nil {
 		return errors.Wrapf(err, "load static credentials for admin listener")
 	}
+	// An admin listener with zero credentials would accept logins
+	// only to reject every one of them with invalid_credentials, so a
+	// missing or empty credentials file is a wiring bug rather than a
+	// valid "locked down" state. Failing fast here also guards against
+	// the typed-nil MapCredentialStore case inside NewServer (an
+	// untyped `== nil` check cannot detect a nil-map-valued interface
+	// on its own).
+	if len(staticCreds) == 0 {
+		return errors.New("admin listener is enabled but no static credentials are configured;" +
+			" set -s3CredentialsFile to a file with at least one entry,")
+	}
 	cfg := adminListenerConfig{
 		enabled:                   *adminEnabled,
 		listen:                    *adminListen,

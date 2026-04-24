@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -65,7 +66,7 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	if deps.Verifier == nil {
 		return nil, errMissing("Verifier")
 	}
-	if deps.Credentials == nil {
+	if isNilCredentialStore(deps.Credentials) {
 		return nil, errMissing("Credentials")
 	}
 	if deps.Roles == nil {
@@ -185,6 +186,40 @@ type missingDepError struct{ field string }
 
 func (e *missingDepError) Error() string {
 	return "admin.NewServer: required dependency missing: " + e.field
+}
+
+// isNilCredentialStore treats both untyped-nil and typed-nil reference
+// values (e.g. `MapCredentialStore(nil)`) as missing. Without the typed
+// check, a caller that wraps a nil map in our CredentialStore type slips
+// past a plain `== nil` guard and the admin listener silently rejects
+// every login with "invalid_credentials" at runtime.
+func isNilCredentialStore(cs CredentialStore) bool {
+	if cs == nil {
+		return true
+	}
+	v := reflect.ValueOf(cs)
+	if isNilableKind(v.Kind()) {
+		return v.IsNil()
+	}
+	return false
+}
+
+// nilableKinds is the set of reflect.Kind values that can legitimately
+// hold a nil value. Keeping it as a package-level lookup (rather than a
+// switch) lets the exhaustive linter see that we are intentionally
+// matching a small allow-list rather than forgetting a case.
+var nilableKinds = map[reflect.Kind]struct{}{
+	reflect.Map:       {},
+	reflect.Ptr:       {},
+	reflect.Slice:     {},
+	reflect.Chan:      {},
+	reflect.Func:      {},
+	reflect.Interface: {},
+}
+
+func isNilableKind(k reflect.Kind) bool {
+	_, ok := nilableKinds[k]
+	return ok
 }
 
 // endpointMatches is a small helper kept here for readability in table
