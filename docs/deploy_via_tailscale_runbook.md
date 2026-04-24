@@ -50,7 +50,10 @@ deploy workflow only needs SSH.
 Admin console → Settings → OAuth clients → New client:
 
 - Description: `elastickv GitHub Actions deploy`
-- Scopes: `auth_keys` (write)
+- Scopes: `auth_keys` (write). Recent `tailscale/github-action` versions
+  may additionally require `devices:core` (write); enable that if the
+  join step fails with an authorization error. The action's README is
+  the definitive source for current scope requirements.
 - Tags: `tag:ci-deploy`
 
 Copy the client ID and secret; they go into GitHub in the next step.
@@ -83,7 +86,7 @@ Regenerate on operator rotation.
 |------|-------|---------|
 | `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
-| `NODES_RAFT_MAP`  | Comma-separated `raftId=host:port` | `n1=kv01:50051,n2=kv02:50051,n3=kv03:50051,n4=kv04:50051,n5=kv05:50051` |
+| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`) | `n1=kv01,n2=kv02,n3=kv03,n4=kv04,n5=kv05` |
 | `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host` | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 
 ## 5. Running a deploy

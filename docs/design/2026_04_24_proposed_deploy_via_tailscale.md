@@ -79,8 +79,9 @@ Stored in a GitHub `production` environment (not repo-wide):
   entries. Prevents the first-connect TOFU prompt.
 
 **Variables (non-secret):**
-- `NODES_RAFT_MAP` — `n1=kv01:50051,n2=kv02:50051,...` (advertised addresses
-  as seen from inside the tailnet).
+- `NODES_RAFT_MAP` — `n1=kv01,n2=kv02,...` (advertised hostnames as seen
+  from inside the tailnet; the script appends `RAFT_PORT` automatically,
+  so do NOT include a port here).
 - `SSH_TARGETS_MAP` — `n1=kv01.tailnet.ts.net,...` (MagicDNS).
 - `IMAGE_BASE` — `ghcr.io/bootjp/elastickv` (tag is appended from the input).
 - `SSH_USER` — e.g., `bootjp`.
@@ -90,7 +91,10 @@ Stored in a GitHub `production` environment (not repo-wide):
 Use OAuth ephemeral nodes (not a long-lived auth key):
 
 - Create an OAuth client in Tailscale admin console with scope
-  `devices:write` on tag `tag:ci-deploy`.
+  `auth_keys` (write) on tag `tag:ci-deploy`. (`tailscale/github-action`
+  uses the OAuth client to mint a short-lived auth key on each run;
+  recent action versions may also require `devices:core` — consult the
+  action's README for the current scope list.)
 - Store client ID + secret in GitHub env secrets.
 - `tailscale/github-action@v3` joins the tailnet for the duration of the job
   as an ephemeral tagged node; disconnects automatically on job exit.
