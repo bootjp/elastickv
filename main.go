@@ -134,7 +134,7 @@ func main() {
 		// listeners to return spurious errors during shutdown). Still
 		// log any residual error so a secondary failure during the
 		// graceful shutdown is visible in logs rather than swallowed.
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			slog.Warn("shutdown error after memory pressure", "error", err)
 		}
 		os.Exit(exitCodeMemoryPressure)

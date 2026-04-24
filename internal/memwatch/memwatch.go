@@ -59,6 +59,15 @@ import (
 // meaningful source of latency on its own.
 const DefaultPollInterval = time.Second
 
+// MinPollInterval is the floor enforced by New. ReadMemStats is a STW
+// operation (~tens of microseconds on modern Go); polling faster than
+// 10ms risks accumulating noticeable pause time on its own, and no
+// memory-growth pattern we care about needs sub-10ms detection latency.
+// Values below this floor (including zero from an unset Config) are
+// clamped to DefaultPollInterval; an explicit operator override below
+// MinPollInterval is clamped up to it.
+const MinPollInterval = 10 * time.Millisecond
+
 // Config configures a Watcher.
 type Config struct {
 	// ThresholdBytes is the HeapInuse threshold in bytes. When
@@ -98,8 +107,11 @@ type Watcher struct {
 // New constructs a Watcher from the given Config. The Watcher does not
 // start polling until Start is called.
 func New(cfg Config) *Watcher {
-	if cfg.PollInterval <= 0 {
+	switch {
+	case cfg.PollInterval <= 0:
 		cfg.PollInterval = DefaultPollInterval
+	case cfg.PollInterval < MinPollInterval:
+		cfg.PollInterval = MinPollInterval
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
