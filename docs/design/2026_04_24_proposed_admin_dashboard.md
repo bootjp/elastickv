@@ -78,8 +78,25 @@ elastickv は現在、DynamoDB 互換 (`adapter/dynamodb.go`) と S3 互換 (`ad
 ### 3.1 Why re-use existing adapters instead of going direct to `store/`
 
 - DynamoDB の `CreateTable` は `makeCreateTableRequest` (`adapter/dynamodb.go:926`) でテーブルスキーマを OperationGroup にエンコードする非自明なロジックを含む。S3 の `CreateBucket` も `s3BucketMeta` のメタキー書き込みを含む。これらを再実装すると整合性バグを招く。
-- 既存アダプタ経路を通すことで SigV4 検証・権限モデル・ACL チェックもそのまま再利用できる。
+- 既存アダプタ経路を通すことで権限モデル・ACL チェック・バリデーションをそのまま再利用できる。
 - 将来アダプタ側が変更されても UI 経路に追従の必要がない。
+
+### 3.2 SigV4 bypass for internal calls (important)
+
+Admin handler はセッションを SigV4 ではなく JWT Cookie で認証するため、**SigV4 検証を通過できない**。Admin → adapter の呼び出しで `http.Request` を組み立てて署名するのは (1) サーバ側が secret key を保持しない設計 (Section 6.1) と矛盾し、(2) 自己再認証はムダなオーバヘッドである。
+
+したがって adapter 側のハンドラ関数を、**SigV4 検証をスキップする内部エントリポイント**として切り出す:
+
+```go
+// adapter/dynamodb.go (既存ハンドラを内部呼び出し可能に分割)
+func (a *Dynamo) CreateTable(ctx context.Context, in createTableInput, principal AuthPrincipal) (*dynamoTableSchema, error)
+```
+
+- 外部 (`:8000`) の SigV4 ハンドラは署名を検証 → `principal` を作って `CreateTable` を呼ぶ。
+- Admin handler は JWT から解決した `principal` を直接渡して `CreateTable` を呼ぶ。
+- `principal` には access key / role が含まれ、**認可 (read-only/full) は adapter 側で再評価**する。Admin handler の JWT 検証は認証だけを担当し、認可の真実は常に adapter 側にある。
+
+S3 も同様に `CreateBucket` / `DeleteBucket` / `PutBucketAcl` / `ListBuckets` を内部エントリポイントとして切り出す。SigV4 検証を経ない経路が追加されるため、**adapter 側の既存テストと統合テストの両方で「SigV4 を持たない呼び出し口」の認可を検証する**。
 
 ---
 
@@ -137,7 +154,16 @@ Admin handler は上記ボディを `adapter/dynamodb.go` の `createTableInput`
 
 ### 4.3 Pagination
 
-- `ListTables` / `ListBuckets` は内部で既にページネーションをサポートしているが、管理 UI 側は単一リスト表示で十分なため、admin handler 側で全ページを結合して返す (最大件数 10,000 件でハードキャップ)。
+Admin API は **下位アダプタのページネーションをそのまま露出する**。全ページを admin handler 側で結合して返す案は、大規模クラスタでのメモリ圧・レイテンシを招くため却下。
+
+- レスポンスに `next_token` (opaque string) を含め、クライアントは `?next_token=...` で次ページを要求する。
+- `limit` クエリパラメータ (デフォルト 100、最大 1,000) を受ける。
+- SPA は無限スクロールまたは「Load more」ボタンで逐次取得する (5.2 のページ実装に反映)。
+- `next_token` は内部的に DynamoDB `LastEvaluatedTableName` / S3 `NextContinuationToken` をそのまま base64 で包んだもの。サーバーステートは持たない。
+
+### 4.4 Request body size limits
+
+すべての `POST`/`PUT` エンドポイントは `http.MaxBytesReader` で `64 KiB` にハードキャップする (DynamoDB テーブルスキーマ・S3 バケットメタはいずれもこの上限で十分)。超過時は `413 Payload Too Large` を返す。これはプロジェクト規約に沿った DoS 防止。
 
 ---
 
@@ -187,7 +213,11 @@ Admin handler は `dist/` を `/admin/assets/*` で配信し、すべての `/ad
 ```
 
 - 秘密鍵はサーバー側でのみ検証し、以降のリクエストに渡らない。
-- JWT シグナルキーはノードごとにランダム生成 (プロセスライフタイム)。ノード再起動で全セッションが失効するのは許容する (長期セッションは非ゴール)。
+- **JWT 署名鍵はクラスタ共有**。ノード毎にランダム生成する案は、ロードバランサの背後で複数ノードに分散された時にノード A で発行したトークンがノード B で検証失敗する (断続的なログアウトが発生する) ため却下。
+  - 採用: 起動時に設定ファイル `admin.session_signing_key` (64 byte の base64、Kubernetes Secret 等で配布) を読み込み、全ノードで同一の HS256 鍵を使う。
+  - 設定未指定の場合は admin を `enabled = true` で起動させない (起動時失敗)。
+  - 鍵ローテーションは **2 鍵並行方式**: `admin.session_signing_key` (現行) に加え `admin.session_signing_key_previous` を受け取り、検証時はどちらかで成功すれば可。ローテ完了後に `_previous` を削除。
+  - 将来的には TSO と同様に Raft で管理し、動的ローテーションをノード全台に配る方式へ発展させる (Open Questions 参照)。
 
 ### 6.2 Role Model
 
@@ -219,8 +249,11 @@ full_access_keys      = ["AKIA_ADMIN_1"]
 | 設定キー | デフォルト | 説明 |
 |---|---|---|
 | `admin.enabled` | `false` | Admin handler を有効化するか |
-| `admin.listen` | `:8080` | 管理 UI の listen address |
-| `admin.tls.cert_file` / `admin.tls.key_file` | 空 | TLS 有効化 |
+| `admin.listen` | `127.0.0.1:8080` | 管理 UI の listen address (デフォルトは loopback のみ) |
+| `admin.tls.cert_file` / `admin.tls.key_file` | 空 | TLS 有効化。non-loopback + 未設定なら起動失敗 |
+| `admin.allow_plaintext_non_loopback` | `false` | TLS 強制を明示的に opt-out するエスケープハッチ |
+| `admin.session_signing_key` | (必須) | クラスタ共通の HS256 鍵 (base64 64 byte)。未設定なら `admin.enabled = true` で起動失敗 |
+| `admin.session_signing_key_previous` | 空 | ローテーション時の旧鍵 (検証のみ受け入れる) |
 | `admin.read_only_access_keys` | `[]` | 読み取り専用キー |
 | `admin.full_access_keys` | `[]` | 管理権限キー |
 
@@ -246,12 +279,16 @@ React バンドルは gzip 後 ~150KB を目標。`go:embed` 経由で elastickv
 ## 9. Testing Strategy
 
 1. **Go ユニットテスト** (`internal/admin/handlers_test.go`)
-   - 各エンドポイントに対する happy path / 不正 body / 未認証 / 権限不足 / CSRF 欠落。
+   - 各エンドポイントに対する happy path / 不正 body / 未認証 / 権限不足 / CSRF 欠落 / 本体サイズ超過 (413)。
+   - SigV4 バイパス経路 (`CreateTable(ctx, in, principal)`) に対する認可テスト: read-only principal が write を試みて拒否される、full-access principal が成功する、など。
+   - JWT 鍵ローテーション: `session_signing_key_previous` で署名されたトークンが検証成功することを確認。
 2. **ブラックボックス統合テスト**
    - `main.go` を in-process で起動し、`net/http` クライアントからログイン → テーブル作成 → 既存 DynamoDB API (`:8000`) で `DescribeTable` が成功することを確認。
    - S3 についても同様に `aws s3api head-bucket` 相当 HTTP 呼び出しで確認。
-3. **フロントエンド**: Vitest + React Testing Library で主要 3 ページのスモーク。E2E (Playwright) は将来検討。
-4. **Lint**: 既存 golangci-lint に加え、`dist/` は `.golangciignore` 対象。
+   - TLS 強制: non-loopback + TLS 未設定 + `allow_plaintext_non_loopback=false` で `main.go` が起動失敗することを検証。
+3. **リーダーフォワーディング互換性テスト**: 3 ノード構成で follower に Admin リクエストを送り、書き込みがリーダーに正しく転送されること、旧版ノードが混在する場合に 503 `AdminUpgradeInProgress` が返ることを検証。
+4. **フロントエンド**: Vitest + React Testing Library で主要 3 ページのスモーク。E2E (Playwright) は将来検討。
+5. **Lint**: 既存 golangci-lint に加え、`dist/` は `.golangciignore` 対象。
 
 ---
 
@@ -259,8 +296,9 @@ React バンドルは gzip 後 ~150KB を目標。`go:embed` 経由で elastickv
 
 - Admin listener をパブリック IP にさらさないことを README で強く推奨。`admin.enabled` のデフォルトは `false`。
 - ログインエンドポイントにレート制限 (per-IP、5 req/min)。
+- 全 `POST`/`PUT` エンドポイントで `http.MaxBytesReader` による本体サイズ制限 (4.4 参照) を必須化する。
 - Secret key は JWT payload には入れず、サーバーでのみ照合する。
-- TLS 無効で non-loopback にバインドしようとした場合、起動時に警告ログを出す。
+- **TLS 強制**: `admin.listen` が loopback (`127.0.0.1` / `::1`) 以外にバインドされ、かつ `admin.tls.cert_file` が未設定の場合は**起動時にハードエラーで失敗する** (警告だけで続行しない)。平文ネットワーク越しに `secret_key` が流れるのを防ぐため、`--admin-allow-plaintext-non-loopback` のような明示的 opt-out フラグを付けた場合のみ起動を許す (運用ドキュメント上も強く非推奨)。
 - すべての書き込み系は監査ログ (`slog` 構造化ログ、key: `admin_audit`, `actor`, `action`, `target`) に落とす。
 
 ---
@@ -268,9 +306,14 @@ React バンドルは gzip 後 ~150KB を目標。`go:embed` 経由で elastickv
 ## 11. Open Questions
 
 1. **管理権限キーのローテーション**: 現状、再起動が必要。Raft ベースの動的更新は将来検討。
-2. **マルチノード同一ダッシュボード**: 任意のノードに繋げば同じ一覧が見える (すべて Raft 経由)。リーダーへのフォワードは既存 adapter が行うので追加実装不要のはず。ただしリーダーが不在の時の UX (503) の扱いを決める必要あり。
+2. **マルチノード同一ダッシュボード / リーダーフォワーディング互換性**: 既存 `proxyToLeader` は **follower で受けた SigV4 リクエストを gRPC の internal proxy でリーダーへ転送する**前提になっている。Admin の内部エントリポイント (Section 3.2) は SigV4 を経由しないため、follower で Admin リクエストを受けた場合にそのまま adapter 呼び出しをするとリーダー以外で書き込みが試みられる。
+   採用予定の緩和策:
+   - 書き込み系エンドポイントは adapter 内の既存 `proxyToLeader` を **SigV4 ではなく `AuthPrincipal` を転送するバリアント**として拡張する (internal gRPC メッセージに `principal` フィールドを追加、既存 SigV4 パスと共存)。
+   - ローリングアップグレード中の互換性: 旧ノードは新しい `principal` フィールドを知らないため、トランジション期間は Admin handler 側で「リーダーが自ノードでない & クラスタ内に旧バージョンが混在」を検出したら **503 `AdminUpgradeInProgress` を返し SPA が別ノードに再接続を促す**。すべてのノードが新版に揃った後に principal 転送を有効化するフィーチャーフラグ (`admin.leader_forward_v2`) を持つ。
+   - 無停止アップグレード要件 (AGENTS.md) に合わせて、互換性マトリクス (旧 follower + 新 leader / 新 follower + 旧 leader) のユニットテストを必須化する。
 3. **Audit log sink**: `slog` 先を外部 (Loki 等) に流す統合は次フェーズ。
 4. **DynamoDB `DescribeTable` の項目数**: 近似値で良いか / 厳密値が必要か。近似値 (sampling) を基本とし、厳密カウントは UI 上の明示操作 (「Count items」ボタン) に限定する方針でよいか。
+5. **JWT 鍵の Raft 同期**: 当面は設定ファイル経由。運用で動的ローテが必要になったら TSO と同じ Raft グループに載せる。
 
 ---
 
