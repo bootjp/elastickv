@@ -557,18 +557,36 @@ func isTransientNotLeaderErr(err error) bool {
 // giving the cluster a few seconds to re-settle leadership after startup.
 // Non-"not leader" errors fail the test immediately.
 //
-// Note: we use assert.Eventually (not require.Eventually) so we can capture
-// the last observed error in lastErr and surface it via require.NoError after
-// the loop. Otherwise a timeout would only report "condition never met in 5s"
-// and swallow the underlying error.
+// MUST be called from the main test goroutine only. The final require.NoError
+// calls t.FailNow() on failure; invoking FailNow from a worker goroutine is
+// a testing.T contract violation. For parallel-worker use, call
+// retryNotLeader directly and report errors back via a channel.
 func doEventually(t *testing.T, do func() error) {
 	t.Helper()
+	require.NoError(t, retryNotLeader(context.Background(), do))
+}
+
+// retryNotLeader calls do() repeatedly while it returns a transient
+// leader-unavailable error, capped at leaderChurnRetryTimeout. It returns
+// the final error (or nil on success) without touching testing.T, making
+// it safe to call from worker goroutines in parallel tests.
+func retryNotLeader(ctx context.Context, do func() error) error {
+	deadline := time.Now().Add(leaderChurnRetryTimeout)
 	var lastErr error
-	_ = assert.Eventually(t, func() bool {
+	for {
 		lastErr = do()
-		return lastErr == nil || !isTransientNotLeaderErr(lastErr)
-	}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
-	require.NoError(t, lastErr)
+		if lastErr == nil || !isTransientNotLeaderErr(lastErr) {
+			return lastErr
+		}
+		if !time.Now().Before(deadline) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(leaderChurnRetryInterval):
+		}
+	}
 }
 
 // rpushEventually wraps RPUSH in doEventually so transient leader churn
