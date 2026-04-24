@@ -214,6 +214,10 @@ func warnMissingRedisCommandMeta(upper string) {
 //   - first_key=0: no keys (empty slice).
 //   - last_key=-1: "all args after first_key are keys". step controls spacing
 //     (step=1 → every arg; step=2 → every other arg, as in MSET).
+//   - last_key=-N (N>1): last key index is len(argv)-N. Commands like
+//     BZPOPMIN use -2 to exclude a trailing timeout arg that is NOT a key;
+//     treating every negative as "to end" would wrongly expose the timeout
+//     via COMMAND GETKEYS and break client key-routing decisions.
 //   - otherwise: args in [first_key .. last_key] at `step` stride.
 //
 // This is *positional*. It does not understand option prefixes (e.g. the
@@ -232,8 +236,11 @@ func redisCommandGetKeys(meta redisCommandMeta, argv [][]byte) [][]byte {
 	}
 	last := meta.LastKey
 	if last < 0 {
-		// "to end": last arg index is len(argv)-1.
-		last = len(argv) - 1
+		// Negative last_key is an offset from the end: -1 means the
+		// final arg, -2 means the second-to-last, and so on. Use
+		// len(argv)+last so BZPOPMIN (-2) excludes its trailing
+		// timeout argument instead of claiming the timeout as a key.
+		last = len(argv) + last
 	}
 	if last >= len(argv) {
 		last = len(argv) - 1

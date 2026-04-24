@@ -244,6 +244,36 @@ func TestCommandGetKeys_UnknownCommand(t *testing.T) {
 	require.Contains(t, conn.writes[0].s, "Invalid command specified")
 }
 
+// BZPOPMIN declares last_key=-2: the final argv entry is a blocking timeout
+// that must NOT be reported as a key. This pins the negative-offset
+// semantics so a future change that collapses all negatives to "to end"
+// would trip the test instead of silently mis-routing client writes.
+func TestCommandGetKeys_BZPOPMIN_ExcludesTimeout(t *testing.T) {
+	t.Parallel()
+	conn := runCommand(t, "COMMAND", "GETKEYS", "BZPOPMIN", "k1", "k2", "0")
+	require.Equal(t, "array", conn.writes[0].op)
+	require.Equal(t, 2, conn.writes[0].n)
+	require.Equal(t, "bulk", conn.writes[1].op)
+	require.Equal(t, "k1", conn.writes[1].s)
+	require.Equal(t, "bulk", conn.writes[2].op)
+	require.Equal(t, "k2", conn.writes[2].s)
+}
+
+// Pin the helper against synthetic -2 metadata as well, matching the
+// MSET helper test above. Guards the len(argv)+last arithmetic directly.
+func TestRedisCommandGetKeysHelper_NegativeLastKeyOffset(t *testing.T) {
+	t.Parallel()
+	// BZPOPMIN-shaped: first=1, last=-2 (exclude trailing timeout), step=1.
+	meta := redisCommandMeta{FirstKey: 1, LastKey: -2, Step: 1}
+	argv := [][]byte{[]byte("BZPOPMIN"), []byte("k1"), []byte("k2"), []byte("0")}
+	keys := redisCommandGetKeys(meta, argv)
+	got := make([]string, 0, len(keys))
+	for _, k := range keys {
+		got = append(got, string(k))
+	}
+	require.Equal(t, []string{"k1", "k2"}, got)
+}
+
 func TestCommandList_ReturnsAllNames(t *testing.T) {
 	t.Parallel()
 	conn := runCommand(t, "COMMAND", "LIST")
