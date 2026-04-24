@@ -103,8 +103,12 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 }
 
 // marshalStreamEntry encodes a single stream entry for the entry-per-key
-// layout. The per-entry ID is encoded into the storage key, so only Fields
-// need to be serialized into the value.
+// layout. The per-entry ID is authoritatively encoded in the storage key;
+// we also serialize it into the value so unmarshalStreamEntry can return
+// a fully-formed entry without having to parse the key back. Fields are
+// serialized into the value as well. The ID duplication costs ~16 bytes
+// per entry and is worth the absence of key-parsing plumbing at every
+// caller (XREAD, XRANGE, XREVRANGE, Lua streamState).
 func marshalStreamEntry(entry redisStreamEntry) ([]byte, error) {
 	return marshalStoredRedisMessage(storedRedisStreamEntryProtoPrefix, &pb.RedisStreamEntry{
 		Id:     entry.ID,

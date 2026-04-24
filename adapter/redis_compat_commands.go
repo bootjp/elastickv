@@ -4428,7 +4428,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	if found {
-		conn.WriteInt(int(meta.Length))
+		conn.WriteInt64(meta.Length)
 		return
 	}
 	stream, err := r.loadStreamAt(context.Background(), cmd.Args[1], readTS)
@@ -4436,7 +4436,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(err.Error())
 		return
 	}
-	conn.WriteInt(len(stream.Entries))
+	conn.WriteInt64(int64(len(stream.Entries)))
 }
 
 func parseRangeStreamCount(args [][]byte) (int, error) {
