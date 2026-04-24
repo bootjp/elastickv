@@ -78,16 +78,21 @@ commands stay on the accept-goroutine path. Pool full → reply
 `-BUSY server overloaded` and return. Redis clients already treat
 `-BUSY` as retryable; reusing it means no client-library changes.
 
-Static v1 classification:
+Static v1 classification (name-based only — no argument inspection,
+so the dispatcher can gate on the command byte without allocating):
 
 - **Pool-gated:** `XREAD`, `XRANGE`, `XREVRANGE`, `KEYS`, `SCAN`,
-  `HGETALL`, `SMEMBERS`, full-range `ZRANGE`/`ZRANGEBYSCORE`,
-  `EVAL`/`EVALSHA`, `FCALL`/`FCALL_RO`, the `*SCAN` family.
+  `HGETALL`, `HVALS`, `HKEYS`, `SMEMBERS`, `SUNION`, `SINTER`,
+  `ZRANGE`, `ZRANGEBYSCORE`, `ZRANGEBYLEX`, `EVAL`/`EVALSHA`,
+  `FCALL`/`FCALL_RO`, the `*SCAN` family.
 - **Ungated:** `GET`, `SET`, `DEL`, `EXISTS`, `INCR`, `EXPIRE`, `TTL`,
   `HGET`, `HSET`, `LPUSH`/`RPUSH`, `XADD`, single-key fast paths.
 
-Dynamic (observed-cost) classification is a follow-up; v1 bias is a
-boring, reviewable list.
+The entire `ZRANGE` family is gated, not only "full-range" variants —
+arg inspection (e.g., detecting `LIMIT 0 N`) breaks the "classify by
+command byte" simplicity, and a bounded `ZRANGE 0 10` contributes at
+most one unmarshal per request (cheap). Dynamic (observed-cost)
+classification is a follow-up; v1 bias is a boring, reviewable list.
 
 ### Tradeoffs
 
@@ -123,6 +128,30 @@ point, sized `2 × runtime.GOMAXPROCS(0)` (env-overridable). Gated
 commands in `dispatchCommand` call `Submit`; ungated stay
 synchronous. Static list lives next to `dispatchCommand`. Pool-full →
 `-BUSY server overloaded`. Lua follows option (A).
+
+**Container-aware sizing.** `runtime.GOMAXPROCS(0)` on Linux returns
+the host CPU count, not the container's cgroup quota (unless
+`GOMAXPROCS` is set explicitly or something has configured it).
+Operators running under Kubernetes/Docker with a CPU limit should
+either (a) set `GOMAXPROCS` in the deploy environment to match the
+cgroup quota (the project's rolling-update script is the natural
+place), or (b) wire `go.uber.org/automaxprocs` into `main.go` so the
+correction happens at startup. v1 prefers (a) for auditability;
+(b) is acceptable as a follow-up if operators want it automatic.
+
+**Single pool vs per-class sub-pools.** v1 uses a single global pool.
+The risk: a burst of `KEYS *` or `SCAN` from a management client can
+exhaust all slots and force `-BUSY` onto latency-sensitive `XREAD` or
+Lua requests. Two mitigations exist: (i) classify gated commands into
+priority tiers and reserve a minimum slot share per tier (e.g., 50%
+data-path, 25% scan, 25% Lua), (ii) ship separate sub-pools per
+tier. Both add complexity that's only justified if we actually
+observe a scan-command burst displacing data-path work. **v1 defers
+sub-pools; observability must call this out so the need is
+measurable.** New metric `elastickv_heavy_command_pool_submit_total`
+labelled by command name is sufficient: if pool-full rejections
+concentrate on `XREAD` while `KEYS` dominates successful submissions,
+the tier split is warranted.
 
 ### Where in the code
 
@@ -248,10 +277,13 @@ one check per accept, not per command.
 ### Recommended v1 shape
 
 **Per-peer-IP connection cap, default `N=8`, env-configurable,
-enforced at accept.** On reject, close the TCP connection immediately
-(no RESP — clients retry the connect). Per-client in-flight
-semaphore is deferred: it requires threading client identity through
-every dispatch, which is a bigger change than 2026-04-24 justifies.
+enforced at accept.** On reject, accept the TCP connection, write a
+`-ERR max connections per client exceeded` RESP error, then close —
+so the client sees a protocol-level message instead of a bare
+`connection reset` or `EOF` that's indistinguishable from a real
+network failure. Per-client in-flight semaphore is deferred: it
+requires threading client identity through every dispatch, which is
+a bigger change than 2026-04-24 justifies.
 
 ### Where in the code
 
@@ -317,6 +349,23 @@ rewrite. Dual-format read:
 Remove the legacy fallback later once
 `elastickv_stream_legacy_format_reads_total` has sat at zero across
 all nodes for a soak window.
+
+**Chunked migration for large legacy streams.** A single `XADD` on a
+100k-entry legacy stream would rewrite every entry in one Raft
+transaction — regressing into the same CPU and commit-time spike the
+design is supposed to prevent. The migration write therefore caps how
+many entries it rewrites per transaction (`STREAM_MIGRATION_CHUNK`,
+default 1 024). When the legacy stream exceeds the chunk, the first
+write migrates the oldest `CHUNK` entries and the remaining legacy
+tail stays in a legacy-*suffix* key (the blob minus the entries
+already promoted). Subsequent writes drain another chunk each, until
+the legacy tail is empty and can be deleted. A background "migrator"
+goroutine driven by the same `legacy_format_reads_total` metric is a
+follow-up if operator-driven migration proves too slow.
+
+The existing stream PR (#620) ships the simpler "rewrite all in one
+txn" version; chunked migration is a stacked follow-up once we see
+legacy stream sizes in production.
 
 ### Other one-blob-per-key collections
 
