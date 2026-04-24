@@ -920,8 +920,10 @@ merge_extra_env() {
   # empty here-string returns non-zero, which trips `set -e`. Skip the
   # read when the source string is empty — the empty array is the
   # intended result either way.
+  # IFS is explicitly set per-read so a caller's surrounding IFS
+  # doesn't change how DEFAULT_EXTRA_ENV / EXTRA_ENV are split.
   if [[ -n "$user" ]]; then
-    read -r -a user_pairs <<< "$user"
+    IFS=$' \t\n' read -r -a user_pairs <<< "$user"
   fi
   for pair in "${user_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
@@ -931,7 +933,18 @@ merge_extra_env() {
   done
 
   if [[ -n "$defaults" ]]; then
-    read -r -a default_pairs <<< "$defaults"
+    IFS=$' \t\n' read -r -a default_pairs <<< "$defaults"
+    # Unlike EXTRA_ENV (user-supplied, forgivable typos), DEFAULT_EXTRA_ENV
+    # is baked into deploy.env — a malformed token there means a
+    # safeguard we installed deliberately is silently ignored. Fail
+    # loudly instead of dropping it.
+    for pair in "${default_pairs[@]}"; do
+      [[ -n "$pair" ]] || continue
+      if [[ "$pair" != *=* ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+        return 1
+      fi
+    done
   fi
   for pair in "${default_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
