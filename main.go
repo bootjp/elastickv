@@ -15,6 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
@@ -26,10 +31,6 @@ import (
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/cockroachdb/errors"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 )
 
 const (
@@ -121,17 +122,20 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 // warning and fall through to the default.
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
+const bytesPerMiB = 1024 * 1024
+
 func main() {
 	flag.Parse()
 
-	if err := run(); err != nil {
-		log.Fatalf("%v", err)
-	}
-
+	err := run()
 	if memoryPressureExit.Load() {
-		// run() returned cleanly because cancel() propagated through the
-		// errgroup; mark the exit code so the reason isn't lost.
+		// memwatch fired: surface exit code 2 regardless of whether run()
+		// returned a nil or an error (cancel() can cause in-flight
+		// listeners to return spurious errors during shutdown).
 		os.Exit(exitCodeMemoryPressure)
+	}
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 }
 
@@ -156,7 +160,7 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 	}
 
 	cfg := memwatch.Config{
-		ThresholdBytes: mb * 1024 * 1024,
+		ThresholdBytes: mb * bytesPerMiB,
 	}
 	if rawInterval := strings.TrimSpace(os.Getenv(memoryShutdownPollIntervalEnvVar)); rawInterval != "" {
 		d, err := time.ParseDuration(rawInterval)

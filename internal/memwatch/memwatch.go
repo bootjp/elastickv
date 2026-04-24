@@ -1,7 +1,7 @@
 // Package memwatch provides a user-space memory watchdog that triggers
 // an orderly shutdown before the kernel OOM-killer sends SIGKILL.
 //
-// Motivation
+// # Motivation
 //
 // elastickv runs in memory-constrained containers (e.g. 3GB RAM VMs). Go's
 // runtime is unaware of the container/host memory limit, and even with
@@ -31,7 +31,7 @@
 //	})
 //	eg.Go(func() error { w.Start(runCtx); return nil })
 //
-// Metric choice
+// # Metric choice
 //
 // We read runtime.MemStats.HeapInuse. It is the closest Go-runtime-visible
 // proxy for "how close are we to OOM" without a syscall per poll. RSS from
@@ -88,9 +88,11 @@ type Config struct {
 // and are expected to initiate graceful shutdown; Watcher does not call
 // os.Exit or send signals itself.
 type Watcher struct {
-	cfg    Config
-	fired  atomic.Bool
-	doneCh chan struct{}
+	cfg       Config
+	fired     atomic.Bool
+	started   atomic.Bool
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // New constructs a Watcher from the given Config. The Watcher does not
@@ -114,6 +116,9 @@ func New(cfg Config) *Watcher {
 // subsequent calls return immediately because the done channel has already
 // been closed.
 func (w *Watcher) Start(ctx context.Context) {
+	if !w.started.CompareAndSwap(false, true) {
+		return
+	}
 	defer w.closeDoneOnce()
 
 	if w.cfg.ThresholdBytes == 0 {
@@ -144,22 +149,11 @@ func (w *Watcher) Done() <-chan struct{} {
 	return w.doneCh
 }
 
-// closeDoneOnce guards against the rare case where Start might be invoked
-// twice on the same Watcher (programmer error): the second call would
-// otherwise panic on closing an already-closed channel. We prefer a silent
-// no-op because Start's contract is "runs once"; diagnosing misuse is the
-// caller's job.
-var closeDoneMu sync.Mutex
-
+// closeDoneOnce closes doneCh at most once across the Watcher's lifetime.
+// Per-Watcher sync.Once avoids the contention a shared package-level mutex
+// would introduce if multiple watchers coexisted.
 func (w *Watcher) closeDoneOnce() {
-	closeDoneMu.Lock()
-	defer closeDoneMu.Unlock()
-	select {
-	case <-w.doneCh:
-		return
-	default:
-		close(w.doneCh)
-	}
+	w.closeOnce.Do(func() { close(w.doneCh) })
 }
 
 // checkAndMaybeFire reads MemStats once, and if HeapInuse is at or above
