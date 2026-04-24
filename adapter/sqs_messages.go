@@ -582,7 +582,7 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, ge
 	if err != nil {
 		return nil, err
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS), nil
+	return s.rotateMessagesForDelivery(ctx, queueName, gen, candidates, visibilityTimeout, max, readTS)
 }
 
 // resolveReceiveMaxMessages validates MaxNumberOfMessages against the
@@ -633,10 +633,15 @@ func (s *SQSServer) scanVisibleMessageCandidates(ctx context.Context, queueName 
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to
-// rotate its visibility entry + receipt token. Failures on individual
-// messages (races, write-conflict) are skipped rather than aborting the
-// whole batch — AWS semantics allow ReceiveMessage to return fewer
-// messages than requested.
+// rotate its visibility entry + receipt token. Expected race
+// conditions (the message was deleted between scan and load, or
+// another worker already rotated the same candidate — ErrWriteConflict)
+// skip the candidate rather than aborting the whole batch; AWS lets
+// ReceiveMessage return fewer messages than requested. But any
+// non-retryable dispatch error (coordinator outage, shard routing
+// failure, storage failure) propagates, because silently returning
+// an empty 200 in those cases would stall consumers and hide the
+// incident.
 func (s *SQSServer) rotateMessagesForDelivery(
 	ctx context.Context,
 	queueName string,
@@ -645,21 +650,35 @@ func (s *SQSServer) rotateMessagesForDelivery(
 	visibilityTimeout int64,
 	max int,
 	readTS uint64,
-) []map[string]any {
+) ([]map[string]any, error) {
 	delivered := make([]map[string]any, 0, max)
 	for _, cand := range candidates {
 		if len(delivered) >= max {
 			break
 		}
-		msg, ok := s.tryDeliverCandidate(ctx, queueName, gen, cand, visibilityTimeout, readTS)
-		if !ok {
+		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, gen, cand, visibilityTimeout, readTS)
+		if err != nil {
+			return delivered, err
+		}
+		if skip {
 			continue
 		}
 		delivered = append(delivered, msg)
 	}
-	return delivered
+	return delivered, nil
 }
 
+// tryDeliverCandidate attempts one scan→load→rotate for a single
+// candidate. The return triple is:
+//
+//   - (msg, false, nil)  → delivered, caller appends.
+//   - (nil, true,  nil)  → expected race; skip this candidate only.
+//     Covers ErrKeyNotFound (someone deleted the record between the
+//     vis-index scan and our GetAt) and ErrWriteConflict on dispatch
+//     (another receive rotated the same record).
+//   - (nil, false, err)  → non-retryable failure; propagate up the
+//     stack so ReceiveMessage returns an actionable 5xx instead of
+//     a false-empty 200.
 func (s *SQSServer) tryDeliverCandidate(
 	ctx context.Context,
 	queueName string,
@@ -667,20 +686,25 @@ func (s *SQSServer) tryDeliverCandidate(
 	cand sqsMsgCandidate,
 	visibilityTimeout int64,
 	readTS uint64,
-) (map[string]any, bool) {
+) (map[string]any, bool, error) {
 	dataKey := sqsMsgDataKey(queueName, gen, cand.messageID)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
-		return nil, false
+		if errors.Is(err, store.ErrKeyNotFound) {
+			// Message gone mid-flight (probably deleted by another
+			// worker). Skip; don't fail the batch.
+			return nil, true, nil
+		}
+		return nil, false, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 
 	newToken, err := newReceiptToken()
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	now := time.Now().UnixMilli()
 	newVisibleAt := now + visibilityTimeout*sqsMillisPerSecond
@@ -692,7 +716,7 @@ func (s *SQSServer) tryDeliverCandidate(
 	}
 	recordBytes, err := encodeSQSMessageRecord(rec)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
 	// StartTS pins the OCC read snapshot to the timestamp we actually
@@ -713,12 +737,17 @@ func (s *SQSServer) tryDeliverCandidate(
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		return nil, false
+		if isRetryableTransactWriteError(err) {
+			// Another concurrent receive rotated the same message;
+			// this candidate is no longer ours to deliver.
+			return nil, true, nil
+		}
+		return nil, false, errors.WithStack(err)
 	}
 
 	handle, err := encodeReceiptHandle(gen, cand.messageID, newToken)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	return map[string]any{
 		"MessageId":     cand.messageID,
@@ -730,7 +759,7 @@ func (s *SQSServer) tryDeliverCandidate(
 			"SentTimestamp":                    strconv.FormatInt(rec.SendTimestampMillis, 10),
 			"ApproximateFirstReceiveTimestamp": strconv.FormatInt(rec.FirstReceiveMillis, 10),
 		},
-	}, true
+	}, false, nil
 }
 
 func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
