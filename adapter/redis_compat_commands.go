@@ -3849,13 +3849,17 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 			lastMs, lastSeq = lastParsed.ms, lastParsed.seq
 		}
 	}
-	// Cap migration to maxWideColumnItems entries to bound the transaction
-	// size. Legacy streams exceeding the cap are implicitly trimmed to their
-	// most-recent maxWideColumnItems entries, consistent with the write-path
-	// guard in xaddEnforceMaxWideColumn.
+	// Reject migration when the legacy blob exceeds maxWideColumnItems.
+	// Silently truncating would cause data loss on commands that the client
+	// expects to be no-ops (e.g., XTRIM MAXLEN > stream length). The client
+	// must XTRIM the stream to ≤ maxWideColumnItems entries first so the
+	// migration can proceed without dropping data.
 	entriesToMigrate := val.Entries
 	if len(entriesToMigrate) > maxWideColumnItems {
-		entriesToMigrate = entriesToMigrate[len(entriesToMigrate)-maxWideColumnItems:]
+		return nil, nil, store.StreamMeta{}, false,
+			cockerrors.Wrapf(ErrCollectionTooLarge,
+				"legacy stream %q has %d entries, exceeding migration cap %d; XTRIM to ≤ %d entries before writing",
+				key, len(entriesToMigrate), maxWideColumnItems, maxWideColumnItems)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(entriesToMigrate)+1)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
