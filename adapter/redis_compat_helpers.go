@@ -540,20 +540,21 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 	}
 	meta, err := store.UnmarshalStreamMeta(raw)
 	if err != nil {
-		return store.StreamMeta{}, false, err
+		return store.StreamMeta{}, false, errors.WithStack(err)
 	}
 	return meta, true, nil
 }
 
 // scanStreamEntriesAt returns all entries for key in ascending ID order.
-// expectedLen is used only to size the result slice.
+// expectedLen is currently unused; it is kept on the signature so callers
+// that already know the stream length can later request an exact scan
+// limit without another API change. Until that optimisation lands the
+// scan is always capped at maxWideScanLimit.
 func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+	_ = expectedLen
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	limit := maxWideScanLimit
-	if expectedLen > 0 && int64(limit) > expectedLen {
-		// pass; rely on maxWideScanLimit as the ceiling
-	}
 	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)

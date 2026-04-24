@@ -151,11 +151,11 @@ type RedisRequestReport struct {
 
 // RedisMetrics holds all Prometheus metric vectors for the Redis adapter.
 type RedisMetrics struct {
-	requestsTotal            *prometheus.CounterVec
-	requestDuration          *prometheus.HistogramVec
-	errorsTotal              *prometheus.CounterVec
-	unsupportedCommands      *prometheus.CounterVec
-	streamLegacyFormatReads  prometheus.Counter
+	requestsTotal           *prometheus.CounterVec
+	requestDuration         *prometheus.HistogramVec
+	errorsTotal             *prometheus.CounterVec
+	unsupportedCommands     *prometheus.CounterVec
+	streamLegacyFormatReads prometheus.Counter
 
 	unsupportedMu    sync.RWMutex
 	unsupportedNames map[string]struct{}

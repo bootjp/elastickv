@@ -10,12 +10,12 @@ import (
 )
 
 var (
-	storedRedisHashProtoPrefix   = []byte{0x00, 'R', 'H', 0x01}
-	storedRedisSetProtoPrefix    = []byte{0x00, 'R', 'S', 0x01}
-	storedRedisZSetProtoPrefix   = []byte{0x00, 'R', 'Z', 0x01}
+	storedRedisHashProtoPrefix        = []byte{0x00, 'R', 'H', 0x01}
+	storedRedisSetProtoPrefix         = []byte{0x00, 'R', 'S', 0x01}
+	storedRedisZSetProtoPrefix        = []byte{0x00, 'R', 'Z', 0x01}
 	storedRedisStreamProtoPrefix      = []byte{0x00, 'R', 'X', 0x01}
 	storedRedisStreamEntryProtoPrefix = []byte{0x00, 'R', 'X', 'E', 0x01}
-	storedRedisMarshalOptions    = gproto.MarshalOptions{Deterministic: true}
+	storedRedisMarshalOptions         = gproto.MarshalOptions{Deterministic: true}
 
 	errStoredRedisMessageTooLarge    = errors.New("stored redis message too large")
 	errUnrecognizedStoredRedisFormat = errors.New("unrecognized stored redis format")

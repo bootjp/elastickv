@@ -92,6 +92,13 @@ var redisInternalPrefixes = []string{
 	redisHLLPrefix,
 	redisZSetPrefix,
 	redisStreamPrefix,
+	// New entry-per-key stream layout. The meta prefix is included so
+	// bounded pattern scans (KEYS foo*) can locate migrated streams via
+	// their meta records; the entry prefix is *not* listed here because
+	// every meta maps to one logical key, whereas a single stream can
+	// have millions of entries — we expose each stream once, via its
+	// meta, to avoid exploding the KEYS output.
+	store.StreamMetaPrefix,
 }
 
 const (
@@ -227,20 +234,34 @@ func isKnownInternalKey(key []byte) bool {
 	return false
 }
 
+// redisInternalTrimPrefixes is the fixed ordered list of plain-prefix
+// internal namespaces whose logical user key is just the bytes after the
+// prefix. It's used by extractRedisInternalUserKey to keep the cyclomatic
+// complexity below the package cap; the extra table indirection costs
+// nothing because every entry is a string constant.
+var redisInternalTrimPrefixes = []string{
+	redisStrPrefix,
+	redisHashPrefix,
+	redisSetPrefix,
+	redisZSetPrefix,
+	redisHLLPrefix,
+	redisStreamPrefix,
+}
+
 func extractRedisInternalUserKey(key []byte) []byte {
+	for _, prefix := range redisInternalTrimPrefixes {
+		if bytes.HasPrefix(key, []byte(prefix)) {
+			return bytes.TrimPrefix(key, []byte(prefix))
+		}
+	}
+	// Post-migration streams: the meta record reverse-maps to the logical
+	// key, while entry rows are internal-only so KEYS never emits one line
+	// per entry. redisTTLPrefix is also internal-only.
 	switch {
-	case bytes.HasPrefix(key, []byte(redisStrPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisStrPrefix))
-	case bytes.HasPrefix(key, []byte(redisHashPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisHashPrefix))
-	case bytes.HasPrefix(key, []byte(redisSetPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisSetPrefix))
-	case bytes.HasPrefix(key, []byte(redisZSetPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisZSetPrefix))
-	case bytes.HasPrefix(key, []byte(redisHLLPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisHLLPrefix))
-	case bytes.HasPrefix(key, []byte(redisStreamPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisStreamPrefix))
+	case store.IsStreamMetaKey(key):
+		return store.ExtractStreamUserKeyFromMeta(key)
+	case store.IsStreamEntryKey(key):
+		return nil
 	case bytes.HasPrefix(key, []byte(redisTTLPrefix)):
 		return nil
 	default:

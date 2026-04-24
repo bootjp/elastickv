@@ -202,7 +202,8 @@ func TestRedis_StreamMigrationFromLegacyBlob(t *testing.T) {
 	}}
 	payload, err := marshalStreamValue(legacy)
 	require.NoError(t, err)
-	require.NoError(t, nodes[0].redisServer.store.PutAt(ctx, redisStreamKey(key), payload, uint64(time.Now().UnixNano()), 0))
+	seedTS := nowNanos(t)
+	require.NoError(t, nodes[0].redisServer.store.PutAt(ctx, redisStreamKey(key), payload, seedTS, 0))
 
 	// XREAD from a legacy stream serves via the legacy path.
 	streams, err := rdb.XRead(ctx, &redis.XReadArgs{
@@ -224,8 +225,10 @@ func TestRedis_StreamMigrationFromLegacyBlob(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "1700000000001-0", newID)
 
-	// The legacy blob must be gone post-migration.
-	readTS := uint64(time.Now().UnixNano()) << 1
+	// The legacy blob must be gone post-migration. Pick a readTS that is
+	// clearly in the future of any commit performed above so MVCC visibility
+	// never hides a still-living blob.
+	readTS := nowNanos(t) + uint64(time.Minute)
 	_, getErr := nodes[0].redisServer.store.GetAt(ctx, redisStreamKey(key), readTS)
 	require.Error(t, getErr)
 
@@ -289,6 +292,121 @@ func TestRedis_StreamAutoIDMonotonicAfterTrim(t *testing.T) {
 	require.Greater(t, id, ceiling)
 }
 
+// TestRedis_StreamMigrationWithMaxLenTrim seeds a legacy blob and issues an
+// XADD with MAXLEN small enough to drop some migrated entries in the same
+// transaction. The coordinator applies operations sequentially so the
+// trim-path Del tombstones the migration-path Put at the same commitTS,
+// and the end state matches what Redis would produce running XADD+trim on
+// a native entry-per-key stream.
+func TestRedis_StreamMigrationWithMaxLenTrim(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	registry := monitoring.NewRegistry("n1", "127.0.0.1:0")
+	nodes[0].redisServer.streamLegacyReadObserver = registry.StreamLegacyFormatReadObserver()
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	key := []byte("legacy-maxlen")
+	legacy := redisStreamValue{Entries: []redisStreamEntry{
+		newRedisStreamEntry("1700000000000-0", []string{"i", "0"}),
+		newRedisStreamEntry("1700000000000-1", []string{"i", "1"}),
+		newRedisStreamEntry("1700000000000-2", []string{"i", "2"}),
+		newRedisStreamEntry("1700000000000-3", []string{"i", "3"}),
+		newRedisStreamEntry("1700000000000-4", []string{"i", "4"}),
+	}}
+	payload, err := marshalStreamValue(legacy)
+	require.NoError(t, err)
+	require.NoError(t, nodes[0].redisServer.store.PutAt(ctx, redisStreamKey(key), payload, nowNanos(t), 0))
+
+	// XADD MAXLEN=2 migrates the 5 legacy entries and trims down to the
+	// two newest, plus the freshly-added entry == 2 entries remain.
+	// Using rdb.Do() so the MAXLEN clause lands in the exact position the
+	// server-side parser expects (`XADD key MAXLEN N id field value`).
+	_, err = rdb.Do(ctx, "XADD", "legacy-maxlen", "MAXLEN", "2", "1700000000000-5", "i", "5").Result()
+	require.NoError(t, err)
+
+	// The legacy blob is gone.
+	_, getErr := nodes[0].redisServer.store.GetAt(ctx, redisStreamKey(key), nowNanos(t)+uint64(time.Minute))
+	require.Error(t, getErr)
+
+	xlen, err := rdb.XLen(ctx, "legacy-maxlen").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), xlen)
+
+	entries, err := rdb.XRange(ctx, "legacy-maxlen", "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	require.Equal(t, "1700000000000-4", entries[0].ID)
+	require.Equal(t, "1700000000000-5", entries[1].ID)
+}
+
+// TestRedis_StreamMultiExecDelRemovesWideColumnLayout verifies that a
+// MULTI/EXEC DEL on a migrated stream drops the wide-column meta and every
+// entry row, not just the (already-empty) legacy blob key. Regression
+// guard for the CodeRabbit-flagged leak where DEL reported success while
+// !stream|meta|... and !stream|entry|... survived.
+func TestRedis_StreamMultiExecDelRemovesWideColumnLayout(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	key := "multi-stream-del"
+	for i := range 5 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: key,
+			ID:     fmt.Sprintf("%d-0", 1_700_000_000_000+i),
+			Values: []string{"i", fmt.Sprint(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	// Run the delete inside MULTI/EXEC so stageKeyDeletion is exercised.
+	pipe := rdb.TxPipeline()
+	pipe.Del(ctx, key)
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+
+	xlen, err := rdb.XLen(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), xlen)
+
+	// A subsequent XADD should succeed and see an empty stream, not
+	// inherit any leftover meta / entries.
+	_, err = rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1800000000000-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.NoError(t, err)
+
+	entries, err := rdb.XRange(ctx, key, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+// nowNanos returns the current UnixNano timestamp as uint64, failing the
+// test if the reading is non-positive. Centralising the bounds check here
+// keeps the int64->uint64 conversion safe and the individual test sites
+// free of gosec waivers.
+func nowNanos(t *testing.T) uint64 {
+	t.Helper()
+	ns := time.Now().UnixNano()
+	require.Positive(t, ns)
+	if ns < 0 {
+		// Unreachable after require.Positive, but lets gosec see the bound.
+		return 0
+	}
+	return uint64(ns)
+}
+
 func gatherLegacyReads(t *testing.T, registry *monitoring.Registry) int64 {
 	t.Helper()
 	mfs, err := registry.Gatherer().Gather()
@@ -307,4 +425,3 @@ func gatherLegacyReads(t *testing.T, registry *monitoring.Registry) int64 {
 	}
 	return 0
 }
-

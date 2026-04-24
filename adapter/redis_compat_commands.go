@@ -288,6 +288,9 @@ const (
 	helloAuthOptionArity = 3
 	// helloSetNameOptionArity is keyword + name.
 	helloSetNameOptionArity = 2
+	// streamZeroID is the canonical "empty stream" / "smallest possible ID"
+	// sentinel used by XREAD '$' on an empty or missing stream.
+	streamZeroID = "0-0"
 )
 
 // parseHelloOption decodes one HELLO option starting at args[0] (the
@@ -3675,7 +3678,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -3683,7 +3686,7 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", wrongTypeError()
 	}
 
-	migrationElems, existingEntries, meta, metaFound, err := r.streamWriteBase(context.Background(), key, readTS)
+	migrationElems, existingEntries, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -3693,63 +3696,100 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", err
 	}
 
-	newEntry := newRedisStreamEntry(id, req.fields)
-	entryValue, err := marshalStreamEntry(newEntry)
+	entryValue, err := marshalStreamEntry(newRedisStreamEntry(id, req.fields))
 	if err != nil {
 		return "", err
 	}
 
-	elems := append(migrationElems, &kv.Elem[kv.OP]{
+	// NOTE: when migrationElems is non-empty, its Put(StreamEntryKey) operations
+	// and the trim-path Del(StreamEntryKey) operations below may target the same
+	// entry key. The coordinator applies operations sequentially in insertion
+	// order at a single commitTS, so the later Del tombstones the earlier Put
+	// and the end state is correct. TestRedis_StreamMigrationWithMaxLenTrim
+	// guards this apply-order contract.
+	//
+	// Capacity hint covers: migrationElems + one entry Put + variadic trim Dels
+	// (typically 0, bounded by maxLen) + one meta Put.
+	const xaddFixedElemCount = 2
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+xaddFixedElemCount)
+	elems = append(elems, migrationElems...)
+	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.StreamEntryKey(key, parsedID.ms, parsedID.seq),
 		Value: entryValue,
 	})
 
-	nextLen := meta.Length + 1
-	if req.maxLen > 0 && int(nextLen) > req.maxLen {
-		trim, trimErr := r.buildXTrimHeadElems(ctx, key, readTS, migrationElems != nil, existingEntries, int(nextLen)-req.maxLen)
-		if trimErr != nil {
-			return "", trimErr
-		}
-		elems = append(elems, trim...)
-		nextLen = int64(req.maxLen)
+	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1, migrationElems != nil, existingEntries)
+	if err != nil {
+		return "", err
 	}
+	elems = append(elems, trim...)
 
-	newMeta := store.StreamMeta{
+	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
 		Length:  nextLen,
 		LastMs:  parsedID.ms,
 		LastSeq: parsedID.seq,
-	}
-	metaBytes, err := store.MarshalStreamMeta(newMeta)
+	})
 	if err != nil {
-		return "", err
+		return "", cockerrors.WithStack(err)
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
 	return id, r.dispatchElems(ctx, true, readTS, elems)
 }
 
-// streamWriteBase prepares a write to a stream. When the legacy blob is
-// still present, the returned migrationElems convert the blob into the
-// entry-per-key layout in the same transaction (one Put per entry + one
-// Del of the legacy blob). existingEntries is the materialized entry list
-// at readTS, ordered ascending; meta reflects the post-migration state.
+// xaddTrimIfNeeded returns (finalLength, trimElems, err) for an XADD.
+// When maxLen == 0 or the new length fits under it, no trim is emitted and
+// trimElems is nil; otherwise Del operations for the oldest entries are
+// returned and finalLength equals maxLen. All scans use the caller's ctx
+// and readTS so the trim happens at the same MVCC snapshot as the write.
+func (r *RedisServer) xaddTrimIfNeeded(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	maxLen int,
+	candidateLen int64,
+	migrationActive bool,
+	existingEntries []redisStreamEntry,
+) (int64, []*kv.Elem[kv.OP], error) {
+	if maxLen <= 0 || candidateLen <= int64(maxLen) {
+		return candidateLen, nil, nil
+	}
+	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, migrationActive, existingEntries, int(candidateLen)-maxLen)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int64(maxLen), trim, nil
+}
+
+// streamWriteBase prepares a write to a stream.
 //
-// The caller appends its own Put(entry) and Put(meta) operations to the
-// returned elems list. The legacy blob must never coexist with the new
-// layout in a committed state — violating that would double-count XLEN —
-// so the Del and the new-format Puts go out in a single transaction.
+// Fast path (no legacy blob, stream already in the new layout or absent):
+// only the meta key is read. migrationElems and existingEntries are nil.
+// XADD / XTRIM against a fully-migrated stream issue a bounded meta-only
+// read here, keeping append cost O(1) in the stream size.
+//
+// Migration path (legacy single-blob stream still present): load every
+// legacy entry, return Puts that re-emit them under the entry-per-key
+// layout plus a Del for the legacy blob, and return the materialized
+// entry list so the caller can derive MAXLEN trims from it at the same
+// snapshot. The legacy blob must never coexist with the new layout in a
+// committed state — violating that would double-count XLEN — so the Del
+// and the new-format Puts go out in a single transaction.
+//
+// All reads use the caller-supplied ctx and readTS, so the scan happens
+// at the exact same MVCC snapshot as the outer transaction and honours
+// request cancellation.
 func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], []redisStreamEntry, store.StreamMeta, bool, error) {
 	meta, metaFound, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, nil, store.StreamMeta{}, false, err
 	}
 	if metaFound {
-		entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
-		if err != nil {
-			return nil, nil, store.StreamMeta{}, false, err
-		}
-		return nil, entries, meta, true, nil
+		// Already migrated: meta carries Length/LastMs/LastSeq which is all
+		// XADD/XTRIM need. Entries stay on disk — the caller uses a bounded
+		// range scan only when MAXLEN trimming is requested.
+		return nil, nil, meta, true, nil
 	}
 
 	legacy, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
@@ -3766,14 +3806,11 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(val.Entries)+1)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
-	var (
-		lastMs, lastSeq uint64
-		hasLast         bool
-	)
+	var lastMs, lastSeq uint64
 	for _, entry := range val.Entries {
 		parsed, ok := tryParseRedisStreamID(entry.ID)
 		if !ok {
-			return nil, nil, store.StreamMeta{}, false, cockerrors.Newf("invalid legacy stream ID %q", entry.ID)
+			return nil, nil, store.StreamMeta{}, false, cockerrors.WithStack(cockerrors.Newf("invalid legacy stream ID %q", entry.ID))
 		}
 		value, merr := marshalStreamEntry(entry)
 		if merr != nil {
@@ -3784,14 +3821,13 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 			Key:   store.StreamEntryKey(key, parsed.ms, parsed.seq),
 			Value: value,
 		})
-		lastMs, lastSeq, hasLast = parsed.ms, parsed.seq, true
+		lastMs, lastSeq = parsed.ms, parsed.seq
 	}
 	migratedMeta := store.StreamMeta{
 		Length:  int64(len(val.Entries)),
 		LastMs:  lastMs,
 		LastSeq: lastSeq,
 	}
-	_ = hasLast
 	return elems, val.Entries, migratedMeta, true, nil
 }
 
@@ -3832,12 +3868,14 @@ func resolveXAddID(meta store.StreamMeta, hasMeta bool, existingEntries []redisS
 // buildXTrimHeadElems emits Del operations for the oldest `count` entries.
 // When migrationActive is true the caller has already scheduled Puts for
 // every legacy entry in existingEntries; those Puts must be paired with
-// Dels to keep the trim invariant. Otherwise the Dels target the
-// live-layout entry keys directly.
+// Dels to keep the trim invariant without issuing a redundant scan.
+// Otherwise the Dels target live-layout entry keys fetched via a bounded
+// range scan at the caller's MVCC snapshot (ctx, readTS) — mixing a later
+// timestamp here would let us tombstone keys the caller's view never saw.
 func (r *RedisServer) buildXTrimHeadElems(
-	_ context.Context,
+	ctx context.Context,
 	key []byte,
-	_ uint64,
+	readTS uint64,
 	migrationActive bool,
 	existingEntries []redisStreamEntry,
 	count int,
@@ -3850,7 +3888,7 @@ func (r *RedisServer) buildXTrimHeadElems(
 		for i := 0; i < count && i < len(existingEntries); i++ {
 			parsed, ok := tryParseRedisStreamID(existingEntries[i].ID)
 			if !ok {
-				return nil, cockerrors.Newf("invalid legacy stream ID %q", existingEntries[i].ID)
+				return nil, cockerrors.WithStack(cockerrors.Newf("invalid legacy stream ID %q", existingEntries[i].ID))
 			}
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.StreamEntryKey(key, parsed.ms, parsed.seq)})
 		}
@@ -3859,7 +3897,7 @@ func (r *RedisServer) buildXTrimHeadElems(
 	// Live layout: fetch the oldest `count` entry keys via a bounded range scan.
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	kvs, err := r.store.ScanAt(context.Background(), prefix, end, count, r.readTS())
+	kvs, err := r.store.ScanAt(ctx, prefix, end, count, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -3915,7 +3953,7 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
@@ -3926,7 +3964,7 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 		return 0, wrongTypeError()
 	}
 
-	migrationElems, existingEntries, meta, _, err := r.streamWriteBase(context.Background(), key, readTS)
+	migrationElems, existingEntries, meta, _, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
@@ -3937,9 +3975,11 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 			// otherwise the legacy blob stays and later writes will re-migrate.
 			metaBytes, metaErr := store.MarshalStreamMeta(meta)
 			if metaErr != nil {
-				return 0, metaErr
+				return 0, cockerrors.WithStack(metaErr)
 			}
-			elems := append(migrationElems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
+			elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+1)
+			elems = append(elems, migrationElems...)
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 			return 0, r.dispatchElems(ctx, true, readTS, elems)
 		}
 		return 0, nil
@@ -3951,11 +3991,13 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 		return 0, err
 	}
 
-	elems := append(migrationElems, trim...)
+	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(trim)+1)
+	elems = append(elems, migrationElems...)
+	elems = append(elems, trim...)
 	meta.Length -= int64(removed)
 	metaBytes, err := store.MarshalStreamMeta(meta)
 	if err != nil {
-		return 0, err
+		return 0, cockerrors.WithStack(err)
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 	return removed, r.dispatchElems(ctx, true, readTS, elems)
@@ -4072,44 +4114,57 @@ func (r *RedisServer) resolveXReadAfterIDs(req *xreadRequest) error {
 		if afterID != "$" {
 			continue
 		}
-
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), req.keys[i], readTS)
+		resolved, err := r.resolveXReadDollarID(req.keys[i])
 		if err != nil {
 			return err
 		}
-		if typ == redisTypeNone {
-			req.afterIDs[i] = "0-0"
-			continue
-		}
-		if typ != redisTypeStream {
-			return wrongTypeError()
-		}
-
-		meta, found, err := r.loadStreamMetaAt(context.Background(), req.keys[i], readTS)
-		if err != nil {
-			return err
-		}
-		if found {
-			if meta.Length == 0 && meta.LastMs == 0 && meta.LastSeq == 0 {
-				req.afterIDs[i] = "0-0"
-				continue
-			}
-			req.afterIDs[i] = strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10)
-			continue
-		}
-
-		stream, err := r.loadStreamAt(context.Background(), req.keys[i], readTS)
-		if err != nil {
-			return err
-		}
-		if len(stream.Entries) == 0 {
-			req.afterIDs[i] = "0-0"
-			continue
-		}
-		req.afterIDs[i] = stream.Entries[len(stream.Entries)-1].ID
+		req.afterIDs[i] = resolved
 	}
 	return nil
+}
+
+// resolveXReadDollarID resolves the "$" after-ID for a single stream by
+// asking the store for the highest ID ever assigned. New-layout streams
+// answer from meta in one read; legacy blobs fall back to a full load.
+// Returns streamZeroID for non-existent and empty-never-written streams.
+func (r *RedisServer) resolveXReadDollarID(key []byte) (string, error) {
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	if err != nil {
+		return "", err
+	}
+	if typ == redisTypeNone {
+		return streamZeroID, nil
+	}
+	if typ != redisTypeStream {
+		return "", wrongTypeError()
+	}
+	return r.dollarIDFromState(key, readTS)
+}
+
+// dollarIDFromState returns the highest-ever-assigned stream ID as a string.
+// Prefers the new-layout meta record (O(1)); falls back to the legacy blob
+// load when meta is absent. Kept separate from the type-check in the caller
+// so each function stays within the cyclop budget.
+func (r *RedisServer) dollarIDFromState(key []byte, readTS uint64) (string, error) {
+	meta, found, err := r.loadStreamMetaAt(context.Background(), key, readTS)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		if meta.Length == 0 && meta.LastMs == 0 && meta.LastSeq == 0 {
+			return streamZeroID, nil
+		}
+		return strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10), nil
+	}
+	stream, err := r.loadStreamAt(context.Background(), key, readTS)
+	if err != nil {
+		return "", err
+	}
+	if len(stream.Entries) == 0 {
+		return streamZeroID, nil
+	}
+	return stream.Entries[len(stream.Entries)-1].ID, nil
 }
 
 func selectXReadEntries(entries []redisStreamEntry, afterID string, count int) []redisStreamEntry {
@@ -4529,12 +4584,13 @@ func streamBoundHigh(prefix []byte, raw string) ([]byte, error) {
 	}
 	ms, seq := parsed.ms, parsed.seq
 	if !exclusive {
-		if seq < ^uint64(0) {
+		switch {
+		case seq < ^uint64(0):
 			seq++
-		} else if ms < ^uint64(0) {
+		case ms < ^uint64(0):
 			ms++
 			seq = 0
-		} else {
+		default:
 			return store.PrefixScanEnd(prefix), nil
 		}
 	}

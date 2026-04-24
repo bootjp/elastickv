@@ -20,6 +20,10 @@ const (
 	// 8 bytes big-endian ms || 8 bytes big-endian seq. Big-endian so lex order
 	// over the raw key bytes matches the (ms, seq) numeric order used by XADD / XRANGE.
 	StreamIDBytes = 16
+	// streamMetaLengthSignBit is the bit count used to check that an on-disk
+	// length value still fits in an int64 on decode ((1<<63)-1 == math.MaxInt64).
+	// Pulled out as a named constant to keep the overflow check self-documenting.
+	streamMetaLengthSignBit = 63
 )
 
 // StreamMeta is the per-stream metadata. Length is authoritative for XLEN;
@@ -49,7 +53,7 @@ func UnmarshalStreamMeta(b []byte) (StreamMeta, error) {
 		return StreamMeta{}, errors.WithStack(errors.Newf("invalid stream meta length: %d", len(b)))
 	}
 	length := binary.BigEndian.Uint64(b[0:8])
-	if length > (1<<63)-1 {
+	if length > (1<<streamMetaLengthSignBit)-1 {
 		return StreamMeta{}, errors.New("stream meta length overflows int64")
 	}
 	return StreamMeta{
