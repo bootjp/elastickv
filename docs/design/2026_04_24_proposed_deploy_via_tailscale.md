@@ -40,14 +40,15 @@ logged in on every node, with SSH access enabled over the tailnet.
 
 ### 2.1 Workflow shape
 
-```
+```yaml
 name: Rolling update
-on: workflow_dispatch:
-  inputs:
-    ref:           # git sha/tag of the image to deploy
-    image_tag:     # defaults to $ref; override only for rollbacks
-    nodes:         # subset of raft IDs; empty = full roll
-    dry_run:       # bool, default TRUE — renders plan but doesn't roll
+on:
+  workflow_dispatch:
+    inputs:
+      ref:           # git sha/tag of the image to deploy
+      image_tag:     # defaults to $ref; override only for rollbacks
+      nodes:         # subset of raft IDs; empty = full roll
+      dry_run:       # bool, default TRUE — renders plan but doesn't roll
 
 jobs:
   deploy:
@@ -79,10 +80,13 @@ Stored in a GitHub `production` environment (not repo-wide):
   entries. Prevents the first-connect TOFU prompt.
 
 **Variables (non-secret):**
-- `NODES_RAFT_MAP` — `n1=kv01,n2=kv02,...` (advertised hostnames as seen
-  from inside the tailnet; the script appends `RAFT_PORT` automatically,
-  so do NOT include a port here).
-- `SSH_TARGETS_MAP` — `n1=kv01.tailnet.ts.net,...` (MagicDNS).
+- `NODES_RAFT_MAP` — `n1=kv01.tailnet.ts.net,n2=kv02.tailnet.ts.net,...`
+  (full MagicDNS FQDNs; bare short names can resolve differently
+  depending on each node's search-domain configuration). The script
+  appends `RAFT_PORT` automatically, so do NOT include a port here.
+  The runbook (`docs/deploy_via_tailscale_runbook.md`) carries the
+  same FQDN convention; keep the two in sync if either changes.
+- `SSH_TARGETS_MAP` — `n1=kv01.tailnet.ts.net,...` (MagicDNS FQDN).
 - `IMAGE_BASE` — `ghcr.io/bootjp/elastickv` (tag is appended from the input).
 - `SSH_USER` — e.g., `bootjp`.
 
@@ -93,8 +97,11 @@ Use OAuth ephemeral nodes (not a long-lived auth key):
 - Create an OAuth client in Tailscale admin console with scope
   `auth_keys` (write) on tag `tag:ci-deploy`. (`tailscale/github-action`
   uses the OAuth client to mint a short-lived auth key on each run;
-  recent action versions may also require `devices:core` — consult the
-  action's README for the current scope list.)
+  recent action versions may also require `devices:write` so the
+  ephemeral node can register and be cleaned up — consult the action's
+  README for the current scope list. Earlier drafts of this doc named
+  `devices:core`, which is not a supported Tailscale OAuth scope and
+  would fail authentication.)
 - Store client ID + secret in GitHub env secrets.
 - `tailscale/github-action@v3` joins the tailnet for the duration of the job
   as an ephemeral tagged node; disconnects automatically on job exit.

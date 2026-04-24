@@ -58,9 +58,12 @@ Admin console → Settings → OAuth clients → New client:
 
 - Description: `elastickv GitHub Actions deploy`
 - Scopes: `auth_keys` (write). Recent `tailscale/github-action` versions
-  may additionally require `devices:core` (write); enable that if the
-  join step fails with an authorization error. The action's README is
-  the definitive source for current scope requirements.
+  may additionally require `devices:write` (to register and clean up
+  the ephemeral node); enable that if the join step fails with an
+  authorization error. The action's README is the definitive source
+  for current scope requirements. `devices:core` is NOT a valid
+  Tailscale OAuth scope — earlier drafts of this runbook named it and
+  would have produced an auth failure.
 - Tags: `tag:ci-deploy`
 
 Copy the client ID and secret; they go into GitHub in the next step.
@@ -147,14 +150,20 @@ Re-run the workflow with `image_tag` set to the previous-known-good sha. The
 GitHub cancelling the job between node steps is the one operational
 hazard that needs manual cleanup.
 
-1. **Look at the last log line from the `Roll cluster` step.** The script
-   logs `[rolling-update] rolling n<id>: docker stop/rm/run ...` before
-   each node recreate. Whatever `n<id>` appears last is the one in
+1. **Look at the last log line from the `Roll cluster` step.** The
+   script emits `==> [<raft-id>@<host>] start` at the beginning of
+   each per-node recreate (see `scripts/rolling-update.sh:398`).
+   Whichever `<raft-id>` appears in the last such line is the one in
    flight when the cancel signal landed.
 2. **SSH into that node** over Tailscale and run `docker ps`. If the
-   container is absent or `Exited`, finish the recreate by hand with the
-   docker run arguments the script emitted (which you can see in the
-   workflow log, step `Roll cluster`).
+   container is absent or `Exited`, finish the recreate by hand. The
+   `docker run` invocation itself is redirected to `/dev/null` by the
+   script, so the workflow log does NOT contain the full argv. Use
+   the resolved env instead: the step logs `NODES_RAFT_MAP`,
+   `EXTRA_ENV`, `GOMEMLIMIT`, `CONTAINER_MEMORY_LIMIT`, `IMAGE`, and
+   `DATA_DIR` before invoking the script — those are sufficient to
+   reconstruct the same `docker run` you would see if you re-ran with
+   the same inputs.
 3. **Confirm the new leader via `raftadmin` or metrics** before re-running
    the workflow with `nodes:` scoped to the remaining untouched IDs. Do
    NOT re-run the full rollout if the partial one is still in flight —
@@ -185,9 +194,14 @@ each node in turn regardless of whether it was touched before.
 ## 8. Troubleshooting
 
 ### Job pauses indefinitely at "Waiting for approval"
-Expected for non-dry-run deploys — a reviewer from the `production` environment
-must click Approve. Check the "Required reviewers" list in the environment
-settings.
+Expected for **every** run in v1 — `.github/workflows/rolling-update.yml`
+sets `environment: production` unconditionally, so both dry-run and
+non-dry-run executions pause for approval. A reviewer from the
+`production` environment must click Approve. Check the "Required
+reviewers" list in the environment settings. See §4 "GitHub
+environment" for the dry-run-approval alternatives (approach 2: add a
+second `production-dry-run` environment without required reviewers)
+if the friction becomes intolerable.
 
 ### `tailscale ping` fails for a node
 The node may not be running `tailscaled`, not tagged `tag:elastickv-node`, or
