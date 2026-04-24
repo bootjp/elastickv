@@ -1978,6 +1978,50 @@ func TestMaxMaxSizePerMsg_ReservesEnvelopeHeadroom(t *testing.T) {
 		"maxMaxSizePerMsg must leave strict headroom below the transport budget")
 }
 
+// TestNormalizeLimitConfig_ClampsCallerOverlimitInflight pins that a
+// programmatic caller passing OpenConfig.MaxInflightMsg above
+// maxMaxInflightMsg is clamped to defaultMaxInflightMsg, mirroring the
+// env-side guard. Without this, Open()'s stepCh / dispatchReportCh /
+// per-peer dispatch queue allocations would consume multi-GB on a
+// fat-fingered programmatic config and crash the process before the
+// node became healthy.
+func TestNormalizeLimitConfig_ClampsCallerOverlimitInflight(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: 100_000_000, // fat-fingered value from the Codex P2 report
+	})
+	require.Equal(t, defaultMaxInflightMsg, got.MaxInflightMsg)
+}
+
+// TestNormalizeLimitConfig_ClampsCallerOverlimitSize is the symmetric
+// pin for caller-supplied OpenConfig.MaxSizePerMsg above the transport
+// envelope budget.
+func TestNormalizeLimitConfig_ClampsCallerOverlimitSize(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxSizePerMsg: maxMaxSizePerMsg + 1,
+	})
+	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
+}
+
+// TestNormalizeLimitConfig_AcceptsCallerAtCap is the boundary check:
+// exactly maxMaxInflightMsg / maxMaxSizePerMsg from a caller must
+// pass through unchanged. Catches an off-by-one regression that
+// would silently clamp a legitimate operator-tuned programmatic
+// config.
+func TestNormalizeLimitConfig_AcceptsCallerAtCap(t *testing.T) {
+	t.Setenv(maxInflightMsgEnvVar, "")
+	t.Setenv(maxSizePerMsgEnvVar, "")
+	got := normalizeLimitConfig(OpenConfig{
+		MaxInflightMsg: maxMaxInflightMsg,
+		MaxSizePerMsg:  maxMaxSizePerMsg,
+	})
+	require.Equal(t, maxMaxInflightMsg, got.MaxInflightMsg)
+	require.Equal(t, maxMaxSizePerMsg, got.MaxSizePerMsg)
+}
+
 // TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
 // that reach raft.Config when neither the caller nor the operator has
 // overridden them: 512 inflight msgs and 2 MiB per msg. The combination

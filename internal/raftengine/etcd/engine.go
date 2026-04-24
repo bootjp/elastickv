@@ -2718,6 +2718,24 @@ func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 	if v, ok := maxSizePerMsgFromEnv(); ok {
 		cfg.MaxSizePerMsg = v
 	}
+	// Clamp the resolved values against the same upper bounds we use
+	// for env overrides. Without this, a programmatic caller passing
+	// a fat-fingered OpenConfig{MaxInflightMsg: 100_000_000} would
+	// bypass the env-side guard and trigger multi-GB channel
+	// allocations at Open() — defeating the whole point of
+	// maxMaxInflightMsg / maxMaxSizePerMsg. Symmetric to the env
+	// fallback policy: clamp to the compiled-in default, log a
+	// warning so the misconfiguration is auditable.
+	if cfg.MaxInflightMsg > maxMaxInflightMsg {
+		slog.Warn("OpenConfig.MaxInflightMsg exceeds safe cap; clamping to default",
+			"value", cfg.MaxInflightMsg, "max", maxMaxInflightMsg, "default", defaultMaxInflightMsg)
+		cfg.MaxInflightMsg = defaultMaxInflightMsg
+	}
+	if cfg.MaxSizePerMsg > maxMaxSizePerMsg {
+		slog.Warn("OpenConfig.MaxSizePerMsg exceeds transport budget; clamping to default",
+			"value", cfg.MaxSizePerMsg, "max", maxMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
+		cfg.MaxSizePerMsg = uint64(defaultMaxSizePerMsg)
+	}
 	slog.Info("etcd raft engine: message size limits",
 		"max_inflight_msgs", cfg.MaxInflightMsg,
 		"max_size_per_msg_bytes", cfg.MaxSizePerMsg,
