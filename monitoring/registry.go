@@ -78,6 +78,15 @@ func (r *Registry) RedisObserver() RedisRequestObserver {
 	return r.redis
 }
 
+// StreamLegacyFormatReadObserver returns the observer used by the Redis
+// stream adapter to count reads served by the legacy single-blob format.
+func (r *Registry) StreamLegacyFormatReadObserver() StreamLegacyFormatReadObserver {
+	if r == nil {
+		return nil
+	}
+	return r.redis
+}
+
 // LuaObserver returns the Lua script execution observer backed by this registry.
 func (r *Registry) LuaObserver() LuaScriptObserver {
 	if r == nil {

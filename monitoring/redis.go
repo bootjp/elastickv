@@ -151,13 +151,22 @@ type RedisRequestReport struct {
 
 // RedisMetrics holds all Prometheus metric vectors for the Redis adapter.
 type RedisMetrics struct {
-	requestsTotal       *prometheus.CounterVec
-	requestDuration     *prometheus.HistogramVec
-	errorsTotal         *prometheus.CounterVec
-	unsupportedCommands *prometheus.CounterVec
+	requestsTotal            *prometheus.CounterVec
+	requestDuration          *prometheus.HistogramVec
+	errorsTotal              *prometheus.CounterVec
+	unsupportedCommands      *prometheus.CounterVec
+	streamLegacyFormatReads  prometheus.Counter
 
 	unsupportedMu    sync.RWMutex
 	unsupportedNames map[string]struct{}
+}
+
+// StreamLegacyFormatReadObserver lets stream read paths report that they
+// fell through to the legacy single-blob format. Incrementing this counter
+// is the signal that the dual-read fallback is still exercised and the
+// migration code must stay.
+type StreamLegacyFormatReadObserver interface {
+	ObserveStreamLegacyFormatRead()
 }
 
 func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
@@ -191,6 +200,12 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 			},
 			[]string{"command"},
 		),
+		streamLegacyFormatReads: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "elastickv_stream_legacy_format_reads_total",
+				Help: "Count of Redis stream reads that fell through to the legacy single-blob format. Non-zero means the dual-read fallback is still being exercised.",
+			},
+		),
 		unsupportedNames: make(map[string]struct{}, maxUnsupportedCommandLabels),
 	}
 
@@ -199,9 +214,20 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 		m.requestDuration,
 		m.errorsTotal,
 		m.unsupportedCommands,
+		m.streamLegacyFormatReads,
 	)
 
 	return m
+}
+
+// ObserveStreamLegacyFormatRead increments the legacy-format read counter.
+// Safe to call on a nil receiver (no-op) so tests and stripped-down
+// constructions do not have to wire a registry.
+func (m *RedisMetrics) ObserveStreamLegacyFormatRead() {
+	if m == nil || m.streamLegacyFormatReads == nil {
+		return
+	}
+	m.streamLegacyFormatReads.Inc()
 }
 
 // ObserveRedisRequest records the final outcome of a Redis command.

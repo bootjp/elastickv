@@ -266,9 +266,10 @@ type RedisServer struct {
 	redisAddr           string
 	relay               *RedisPubSubRelay
 	relayConnCache      kv.GRPCConnCache
-	requestObserver     monitoring.RedisRequestObserver
-	luaObserver         monitoring.LuaScriptObserver
-	luaFastPathObserver monitoring.LuaFastPathObserver
+	requestObserver           monitoring.RedisRequestObserver
+	luaObserver               monitoring.LuaScriptObserver
+	luaFastPathObserver       monitoring.LuaFastPathObserver
+	streamLegacyReadObserver  monitoring.StreamLegacyFormatReadObserver
 	// luaFastPathZRange is the pre-resolved counter bundle for the
 	// ZRANGEBYSCORE / ZREVRANGEBYSCORE Lua fast path. Resolved once in
 	// WithLuaFastPathObserver so the hot path does not pay for
@@ -325,6 +326,14 @@ func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 func WithRedisRequestObserver(observer monitoring.RedisRequestObserver) RedisServerOption {
 	return func(r *RedisServer) {
 		r.requestObserver = observer
+	}
+}
+
+// WithStreamLegacyFormatReadObserver wires the counter that tracks Redis
+// stream reads served by the legacy single-blob format.
+func WithStreamLegacyFormatReadObserver(observer monitoring.StreamLegacyFormatReadObserver) RedisServerOption {
+	return func(r *RedisServer) {
+		r.streamLegacyReadObserver = observer
 	}
 }
 

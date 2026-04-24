@@ -170,6 +170,12 @@ func redisZSetKey(userKey []byte) []byte {
 	return append([]byte(redisZSetPrefix), userKey...)
 }
 
+// redisStreamKey is the legacy single-blob stream key. New writes use the
+// entry-per-key layout under store.StreamMetaKey / store.StreamEntryKey.
+// This helper survives only to keep the dual-read migration path working.
+//
+// Deprecated: remove once elastickv_stream_legacy_format_reads_total stays
+// at zero for long enough to guarantee no in-flight legacy streams exist.
 func redisStreamKey(userKey []byte) []byte {
 	return append([]byte(redisStreamPrefix), userKey...)
 }
@@ -206,6 +212,7 @@ var knownInternalPrefixes = [][]byte{
 	[]byte("!zs|"),
 	[]byte("!hs|"),
 	[]byte("!st|"),
+	[]byte("!stream|"),
 }
 
 func isKnownInternalKey(key []byte) bool {
