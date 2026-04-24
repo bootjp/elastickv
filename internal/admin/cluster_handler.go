@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -47,15 +48,30 @@ func (f ClusterInfoFunc) Describe(ctx context.Context) (ClusterInfo, error) {
 // ClusterHandler serves GET /admin/api/v1/cluster.
 type ClusterHandler struct {
 	source ClusterInfoSource
+	logger *slog.Logger
 }
 
-// NewClusterHandler wires a source into the HTTP handler.
+// NewClusterHandler wires a source into the HTTP handler. Passing a nil
+// logger falls back to slog.Default() so existing callers keep working.
 func NewClusterHandler(source ClusterInfoSource) *ClusterHandler {
-	return &ClusterHandler{source: source}
+	return &ClusterHandler{source: source, logger: slog.Default()}
+}
+
+// WithLogger overrides the default slog destination. Kept as an option
+// so main.go can attach a component tag without changing the
+// constructor signature.
+func (h *ClusterHandler) WithLogger(l *slog.Logger) *ClusterHandler {
+	if l == nil {
+		return h
+	}
+	h.logger = l
+	return h
 }
 
 // ServeHTTP renders the cluster snapshot as JSON. Errors from the source
-// become 500s; the body never exposes internal state beyond an error code.
+// are logged on the server with full detail and surfaced to the client as
+// a generic "cluster_describe_failed" code. Leaking err.Error() to
+// unauthenticated-ish clients would reveal raft/store internals.
 func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
@@ -63,7 +79,11 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := h.source.Describe(r.Context())
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "cluster_describe_failed", err.Error())
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin cluster describe failed",
+			slog.String("error", err.Error()),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "cluster_describe_failed",
+			"failed to describe cluster state; see server logs")
 		return
 	}
 	if info.Timestamp.IsZero() {

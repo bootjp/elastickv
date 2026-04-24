@@ -2,9 +2,11 @@ package admin
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -38,12 +40,14 @@ func (m MapCredentialStore) LookupSecret(accessKey string) (string, bool) {
 // startup and reuse across the admin listener's lifetime.
 type AuthService struct {
 	signer       *Signer
+	verifier     *Verifier
 	creds        CredentialStore
 	roles        map[string]Role
 	limiter      *rateLimiter
 	sessionTTL   time.Duration
 	secureCookie bool
 	cookieDomain string
+	logger       *slog.Logger
 }
 
 // AuthServiceOpts covers the knobs a caller may want to vary in tests.
@@ -62,6 +66,14 @@ type AuthServiceOpts struct {
 	LoginWindow time.Duration
 	// Clock drives rate-limiter aging. Defaults to SystemClock.
 	Clock Clock
+	// Verifier lets the logout handler best-effort decode the
+	// incoming session cookie and include the actor in the audit
+	// log. When nil, logout events are still audited but with an
+	// empty actor field.
+	Verifier *Verifier
+	// Logger is the slog destination for admin_audit entries emitted
+	// by the login/logout handlers. nil falls back to slog.Default().
+	Logger *slog.Logger
 }
 
 // NewAuthService constructs an AuthService. The signer must be primary
@@ -79,14 +91,20 @@ func NewAuthService(signer *Signer, creds CredentialStore, roles map[string]Role
 	if opts.Clock == nil {
 		opts.Clock = SystemClock
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &AuthService{
 		signer:       signer,
+		verifier:     opts.Verifier,
 		creds:        creds,
 		roles:        roles,
 		limiter:      newRateLimiter(limit, window, opts.Clock),
 		sessionTTL:   sessionTTL,
 		secureCookie: !opts.InsecureCookie,
 		cookieDomain: opts.CookieDomain,
+		logger:       logger,
 	}
 }
 
@@ -109,19 +127,28 @@ type loginResponse struct {
 // It is safe to expose without the SessionAuth middleware because this is
 // where a session first comes from; rate limiting, Content-Type validation,
 // and constant-time credential comparison guard it.
+//
+// Login events (success and failure) emit admin_audit slog entries
+// directly. The generic Audit middleware cannot do this because it runs
+// before the handler knows who the caller is claiming to be.
 func (s *AuthService) HandleLogin(w http.ResponseWriter, r *http.Request) {
-	if !s.preflightLogin(w, r) {
+	rec := newStatusRecorder(w)
+	defer s.auditLogin(r, rec)
+
+	if !s.preflightLogin(rec, r) {
 		return
 	}
-	req, ok := readLoginRequest(w, r)
+	req, ok := readLoginRequest(rec, r)
+	rec.claimedActor = req.AccessKey
 	if !ok {
 		return
 	}
-	principal, ok := s.authenticate(w, req)
+	principal, ok := s.authenticate(rec, req)
 	if !ok {
 		return
 	}
-	s.issueSession(w, principal)
+	s.issueSession(rec, principal)
+	rec.actor = principal.AccessKey
 }
 
 func (s *AuthService) preflightLogin(w http.ResponseWriter, r *http.Request) bool {
@@ -159,8 +186,13 @@ func readLoginRequest(w http.ResponseWriter, r *http.Request) (loginRequest, boo
 		writeJSONError(w, http.StatusBadRequest, "invalid_body", "body is not valid JSON")
 		return loginRequest{}, false
 	}
+	// Access keys are AWS-style identifiers that users sometimes copy
+	// with surrounding whitespace; trimming there is harmless and
+	// matches how the S3 adapter normalises its credential table at
+	// load time. Secrets, by contrast, are opaque bytes — trimming
+	// would accept inputs the SigV4 adapter would reject, creating a
+	// cross-protocol inconsistency. Leave SecretKey untouched.
 	req.AccessKey = strings.TrimSpace(req.AccessKey)
-	req.SecretKey = strings.TrimSpace(req.SecretKey)
 	if req.AccessKey == "" || req.SecretKey == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing_fields",
 			"access_key and secret_key are required")
@@ -169,23 +201,31 @@ func readLoginRequest(w http.ResponseWriter, r *http.Request) (loginRequest, boo
 	return req, true
 }
 
-// dummySecretLen is the length we pad the timing-safe comparison with
-// when the access key is unknown. It roughly matches the length of a
-// typical AWS secret-access-key.
-const dummySecretLen = 40
+// sha256Digest returns the SHA-256 hash of s as a []byte of length 32.
+// We compare hashes, not raw secrets, so length-based timing attacks
+// through subtle.ConstantTimeCompare are neutralised: both sides are
+// always 32 bytes regardless of the underlying secret's length.
+func sha256Digest(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// unknownKeyPlaceholder is the deterministic digest we compare against
+// when the caller-supplied access key is not in the credential store.
+// Using a fixed digest keeps the work done here roughly equivalent to
+// the "known key, wrong secret" path, so a timing side-channel cannot
+// distinguish "unknown access key" from "wrong secret".
+var unknownKeyPlaceholder = sha256Digest("admin-auth-unknown-key-placeholder")
 
 func (s *AuthService) authenticate(w http.ResponseWriter, req loginRequest) (AuthPrincipal, bool) {
+	providedHash := sha256Digest(req.SecretKey)
 	expected, known := s.creds.LookupSecret(req.AccessKey)
-	if !known {
-		// Still compare against a dummy secret to keep timing
-		// roughly equivalent between known and unknown keys.
-		dummy := strings.Repeat("x", dummySecretLen)
-		_ = subtle.ConstantTimeCompare([]byte(req.SecretKey), []byte(dummy))
-		writeJSONError(w, http.StatusUnauthorized, "invalid_credentials",
-			"access_key or secret_key is invalid")
-		return AuthPrincipal{}, false
+	expectedHash := unknownKeyPlaceholder
+	if known {
+		expectedHash = sha256Digest(expected)
 	}
-	if subtle.ConstantTimeCompare([]byte(req.SecretKey), []byte(expected)) != 1 {
+	match := subtle.ConstantTimeCompare(providedHash, expectedHash) == 1
+	if !known || !match {
 		writeJSONError(w, http.StatusUnauthorized, "invalid_credentials",
 			"access_key or secret_key is invalid")
 		return AuthPrincipal{}, false
@@ -220,16 +260,84 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 }
 
 // HandleLogout clears both cookies. It does not require authentication —
-// clearing stale cookies after a session has expired is always safe.
+// clearing stale cookies after a session has expired is always safe. We
+// best-effort decode the incoming session cookie so the audit log can
+// record who logged out; a missing or invalid cookie leaves actor empty.
 func (s *AuthService) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	rec := newStatusRecorder(w)
+	defer s.auditLogout(r, rec)
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "logout requires POST")
+		writeJSONError(rec, http.StatusMethodNotAllowed, "method_not_allowed", "logout requires POST")
 		return
 	}
-	http.SetCookie(w, s.buildExpiredCookie(sessionCookieName, true))
-	http.SetCookie(w, s.buildExpiredCookie(csrfCookieName, false))
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	if s.verifier != nil {
+		if c, err := r.Cookie(sessionCookieName); err == nil && strings.TrimSpace(c.Value) != "" {
+			if p, verr := s.verifier.Verify(c.Value); verr == nil {
+				rec.actor = p.AccessKey
+			}
+		}
+	}
+	http.SetCookie(rec, s.buildExpiredCookie(sessionCookieName, true))
+	http.SetCookie(rec, s.buildExpiredCookie(csrfCookieName, false))
+	rec.Header().Set("Cache-Control", "no-store")
+	rec.WriteHeader(http.StatusNoContent)
+}
+
+// statusRecorder captures the response status + writes we emit so the
+// audit log can include both the final code and the claimed actor.
+type statusRecorder struct {
+	http.ResponseWriter
+	status       int
+	claimedActor string // what the caller said they were
+	actor        string // what we authenticated them as (empty on failure)
+}
+
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w}
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	if err != nil {
+		return n, errors.Wrap(err, "status recorder write")
+	}
+	return n, nil
+}
+
+func (s *AuthService) auditLogin(r *http.Request, rec *statusRecorder) {
+	s.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
+		slog.String("action", "login"),
+		slog.String("actor", rec.actor),
+		slog.String("claimed_actor", rec.claimedActor),
+		slog.String("remote", r.RemoteAddr),
+		slog.Int("status", nonZero(rec.status, http.StatusOK)),
+	)
+}
+
+func (s *AuthService) auditLogout(r *http.Request, rec *statusRecorder) {
+	s.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
+		slog.String("action", "logout"),
+		slog.String("actor", rec.actor),
+		slog.String("remote", r.RemoteAddr),
+		slog.Int("status", nonZero(rec.status, http.StatusOK)),
+	)
+}
+
+func nonZero(v, fallback int) int {
+	if v == 0 {
+		return fallback
+	}
+	return v
 }
 
 func (s *AuthService) buildCookie(name, value string, httpOnly bool) *http.Cookie {

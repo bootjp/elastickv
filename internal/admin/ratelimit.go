@@ -7,9 +7,13 @@ import (
 	"time"
 )
 
-// rateLimiterMaxEntries is the point at which the limiter performs a
-// sweep of stale entries. Tuned so a reasonable burst of distinct
-// source IPs does not force a pathological cleanup on every login.
+// rateLimiterMaxEntries is a hard cap on the number of distinct source
+// IPs the limiter will track at once. Hitting the cap means an attacker
+// is spraying us with unique source addresses; we respond by refusing
+// to add new entries (and therefore refusing those logins) until the
+// window ages them out. We first sweep expired windows before
+// concluding the map is full, so well-behaved traffic never trips on
+// the cap.
 const rateLimiterMaxEntries = 1024
 
 // rateLimiter is a fixed-window, in-memory per-IP rate limiter. It is
@@ -51,27 +55,45 @@ func (rl *rateLimiter) allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Opportunistic cleanup: if the map ever exceeds a threshold, walk
-	// entries and drop stale windows. Keeps memory bounded against a
-	// spray of distinct source IPs.
-	if len(rl.entries) > rateLimiterMaxEntries {
-		for k, v := range rl.entries {
-			if now.Sub(v.windowStart) > rl.window {
-				delete(rl.entries, k)
-			}
-		}
-	}
-
 	e, ok := rl.entries[ip]
-	if !ok || now.Sub(e.windowStart) >= rl.window {
-		rl.entries[ip] = &rateLimiterEntry{windowStart: now, count: 1}
+	if ok {
+		if now.Sub(e.windowStart) >= rl.window {
+			e.windowStart = now
+			e.count = 1
+			return true
+		}
+		if e.count >= rl.limit {
+			return false
+		}
+		e.count++
 		return true
 	}
-	if e.count >= rl.limit {
-		return false
+
+	// Unknown IP — we need to create a new entry. Enforce the hard
+	// cap on distinct tracked IPs before doing so.
+	if len(rl.entries) >= rateLimiterMaxEntries {
+		// Try to reclaim space from expired windows first. If that
+		// still leaves us at cap, refuse the new entry. Refusing
+		// (rather than evicting an arbitrary old entry) is safer:
+		// it prevents a spray of fresh IPs from silently erasing a
+		// legitimate user's in-progress rate-limit state.
+		rl.sweepExpiredLocked(now)
+		if len(rl.entries) >= rateLimiterMaxEntries {
+			return false
+		}
 	}
-	e.count++
+	rl.entries[ip] = &rateLimiterEntry{windowStart: now, count: 1}
 	return true
+}
+
+// sweepExpiredLocked drops entries whose window has elapsed. The caller
+// must hold rl.mu.
+func (rl *rateLimiter) sweepExpiredLocked(now time.Time) {
+	for k, v := range rl.entries {
+		if now.Sub(v.windowStart) >= rl.window {
+			delete(rl.entries, k)
+		}
+	}
 }
 
 // clientIP extracts the IP part of the request's remote address. It falls

@@ -51,7 +51,15 @@ type adminListenerConfig struct {
 // startAdminFromFlags is the single entrypoint main.run() uses to stand
 // up the admin listener. It owns the flag → config translation and the
 // credentials loading so run() does not inherit that complexity.
+//
+// When admin is disabled (the default) the function returns immediately
+// without touching --s3CredentialsFile: pulling the admin feature into
+// a hard dependency on that file would break deployments that never
+// intended to use it.
 func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime) error {
+	if !*adminEnabled {
+		return nil
+	}
 	staticCreds, err := loadS3StaticCredentials(*s3CredsFile)
 	if err != nil {
 		return errors.Wrapf(err, "load static credentials for admin listener")

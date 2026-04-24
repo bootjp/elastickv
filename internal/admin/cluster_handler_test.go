@@ -55,7 +55,7 @@ func TestClusterHandler_PreservesExplicitTimestamp(t *testing.T) {
 
 func TestClusterHandler_SourceErrorReturns500(t *testing.T) {
 	source := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
-		return ClusterInfo{}, errors.New("describe failed")
+		return ClusterInfo{}, errors.New("raft storage sentinel XYZ123")
 	})
 	h := NewClusterHandler(source)
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/cluster", nil)
@@ -64,6 +64,9 @@ func TestClusterHandler_SourceErrorReturns500(t *testing.T) {
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	require.Contains(t, rec.Body.String(), "cluster_describe_failed")
+	// The raw error must not leak to the client.
+	require.NotContains(t, rec.Body.String(), "XYZ123")
+	require.NotContains(t, rec.Body.String(), "raft storage sentinel")
 }
 
 func TestClusterHandler_OnlyGET(t *testing.T) {

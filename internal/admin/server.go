@@ -76,8 +76,20 @@ func NewServer(deps ServerDeps) (*Server, error) {
 		logger = slog.Default()
 	}
 
-	auth := NewAuthService(deps.Signer, deps.Credentials, deps.Roles, deps.AuthOpts)
-	mux := buildAPIMux(auth, deps.Verifier, deps.ClusterInfo, logger)
+	// Inject verifier + logger into AuthService so login/logout can
+	// emit admin_audit entries themselves (the generic Audit
+	// middleware cannot, because those endpoints do not run through
+	// SessionAuth).
+	authOpts := deps.AuthOpts
+	if authOpts.Verifier == nil {
+		authOpts.Verifier = deps.Verifier
+	}
+	if authOpts.Logger == nil {
+		authOpts.Logger = logger
+	}
+	auth := NewAuthService(deps.Signer, deps.Credentials, deps.Roles, authOpts)
+	cluster := NewClusterHandler(deps.ClusterInfo).WithLogger(logger)
+	mux := buildAPIMux(auth, deps.Verifier, cluster, logger)
 	router := NewRouter(mux, deps.StaticFS)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -102,13 +114,13 @@ func (s *Server) APIHandler() http.Handler {
 //	POST   /admin/api/v1/auth/logout    (no auth required)
 //	GET    /admin/api/v1/cluster        (auth required)
 //
-// Body limit + audit apply uniformly. CSRF applies to writes that require
-// a session; login has its own CSRF story (the cookie is minted inside
-// it, so we cannot require double-submit on the first call).
-func buildAPIMux(auth *AuthService, verifier *Verifier, cluster ClusterInfoSource, logger *slog.Logger) http.Handler {
+// Body limit applies uniformly. CSRF and Audit middleware apply to
+// write-capable protected endpoints; login and logout carry their own
+// audit path inside AuthService because the generic Audit middleware
+// cannot see the claimed actor at that point in the chain.
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
-	clusterHandler := NewClusterHandler(cluster)
 
 	// The protected chain: body limit → session auth → CSRF → audit.
 	protect := func(next http.Handler) http.Handler {
@@ -120,9 +132,10 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, cluster ClusterInfoSourc
 			),
 		)
 	}
-	// Login / logout: body limit + audit, but NOT session auth or CSRF.
+	// Login / logout: body limit only. Audit is handled inside the
+	// AuthService so the actor field is populated correctly.
 	publicAuth := func(next http.Handler) http.Handler {
-		return BodyLimit(defaultBodyLimit)(Audit(logger)(next))
+		return BodyLimit(defaultBodyLimit)(next)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
