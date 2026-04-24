@@ -141,15 +141,21 @@ unreachable over the tailnet) before touching any live container.
 
 ### 2.6 Production environment approval
 
-Mark the `production` GitHub environment as requiring approval from a list of
-reviewers. A non-dry-run deploy will pause until approved; the dry-run run
-itself does not need approval (it only needs the tailnet join).
+Mark the `production` GitHub environment as requiring approval from a list
+of reviewers. GitHub's native environment-protection rules do NOT support
+conditioning approval on workflow inputs, so **both** dry-run and non-
+dry-run runs will pause for approval when `environment: production` is
+declared unconditionally on the job. That is the v1 policy — simpler,
+one environment, one approver list; see runbook §4 for the dry-run-
+approval alternatives (a second `production-dry-run` environment without
+required reviewers, or a deployment-protection-rule GitHub App).
 
 Alternative: require approval unconditionally and treat the dry-run as a
-"preview" that an approver must ack. Simpler policy, slightly more friction.
+"preview" that an approver must ack. This is the v1 shape by default.
 
-**Recommendation:** approval required for non-dry-run only. Dry-runs are
-cheap and useful.
+**Recommendation:** approval required for every run in v1 (one
+environment). Add the second environment only when the dry-run friction
+becomes annoying.
 
 ### 2.7 Rollback
 

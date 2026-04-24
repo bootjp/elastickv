@@ -158,12 +158,19 @@ hazard that needs manual cleanup.
 2. **SSH into that node** over Tailscale and run `docker ps`. If the
    container is absent or `Exited`, finish the recreate by hand. The
    `docker run` invocation itself is redirected to `/dev/null` by the
-   script, so the workflow log does NOT contain the full argv. Use
-   the resolved env instead: the step logs `NODES_RAFT_MAP`,
-   `EXTRA_ENV`, `GOMEMLIMIT`, `CONTAINER_MEMORY_LIMIT`, `IMAGE`, and
-   `DATA_DIR` before invoking the script — those are sufficient to
-   reconstruct the same `docker run` you would see if you re-ran with
-   the same inputs.
+   script, so the workflow log does NOT contain the full argv. To
+   reconstruct it, read the `Roll cluster` step's rendered
+   environment — the workflow exports `IMAGE`, `DATA_DIR`,
+   `RAFT_PORT`, `REDIS_PORT`, `S3_PORT`, `ENABLE_S3`, `NODES`,
+   `SSH_TARGETS`, and the merged `EXTRA_ENV` before invoking the
+   script. Anything not explicitly set (e.g., `RAFT_PORT` in a
+   minimally-overridden deploy) falls back to the script's default
+   (`RAFT_PORT=50051`, `REDIS_PORT=6379`, `S3_PORT=9000`,
+   `ENABLE_S3=true`). GOMEMLIMIT / CONTAINER_MEMORY_LIMIT (PR #617)
+   are propagated via `EXTRA_ENV` once that PR lands. Together the
+   rendered env + the node's `deploy.env` is enough to reconstruct
+   the same `docker run` you would see if you re-ran with the same
+   inputs.
 3. **Confirm the new leader via `raftadmin` or metrics** before re-running
    the workflow with `nodes:` scoped to the remaining untouched IDs. Do
    NOT re-run the full rollout if the partial one is still in flight —
@@ -172,10 +179,13 @@ hazard that needs manual cleanup.
    workflow to set a start-marker on each node and fast-skip completed
    nodes on re-run.
 
-The script is idempotent for the "container exists and is up" case, so
-re-running the workflow with the same `ref` after confirming the
-interrupted node is healthy is safe — the script will stop+recreate
-each node in turn regardless of whether it was touched before.
+The script is idempotent. `scripts/rolling-update.sh:794-798` skips a
+node when its running image id equals the target image and its gRPC
+endpoint is healthy — an already-rolled node is a no-op, not a
+redundant stop/recreate. Re-running the workflow with the same
+`ref` after confirming the interrupted node is healthy is therefore
+safe: nodes that already match the target image are passed over,
+and only the still-stale one gets recreated.
 
 ## 7. What the workflow does NOT do (yet)
 
