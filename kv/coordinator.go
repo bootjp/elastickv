@@ -310,17 +310,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if !time.Now().Before(deadline) {
 			return lastResp, lastErr
 		}
-		if leaderAssignsTS {
-			// Force dispatchOnce to mint a fresh StartTS on the next
-			// attempt; keep CommitTS tied to StartTS by clearing it too
-			// (the same invariant dispatchOnce enforces). Re-using a
-			// stale StartTS would race the OCC conflict check in
-			// fsm.validateConflicts (LatestCommitTS > startTS) against
-			// writes that committed during the election window.
-			reqs.StartTS = 0
-			reqs.CommitTS = 0
-		}
-		if err := waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval); err != nil {
+		if err := prepareDispatchRetry(ctx, reqs, leaderAssignsTS, timer); err != nil {
 			return lastResp, err
 		}
 		// Re-check the deadline AFTER the back-off sleep. If the budget
@@ -369,6 +359,22 @@ func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.
 	case <-timer.C:
 		return nil
 	}
+}
+
+// prepareDispatchRetry groups the pre-back-off bookkeeping Dispatch
+// must do between attempts: clear StartTS/CommitTS when the caller
+// asked the coordinator to mint them (so the next dispatchOnce issues
+// against the post-churn HLC instead of a stale timestamp that could
+// trip fsm.validateConflicts), then sleep one retry interval — or
+// return ctx.Err() wrapped if the caller cancels during the sleep.
+// Factored out of Dispatch to keep that function's cyclomatic
+// complexity under the cyclop threshold without shuffling semantics.
+func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderAssignsTS bool, timer *time.Timer) error {
+	if leaderAssignsTS {
+		reqs.StartTS = 0
+		reqs.CommitTS = 0
+	}
+	return waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval)
 }
 
 // dispatchOnce runs a single Dispatch attempt without retry. It is the

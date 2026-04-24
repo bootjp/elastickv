@@ -101,37 +101,24 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 
 	var lastErr error
 	for {
-		// Each iteration of the outer loop runs up to maxForwardRetries
-		// fast retries against whatever leader is currently visible. If
-		// none is (or the forward bounced off a stale leader), we sleep
-		// one leaderProxyRetryInterval and re-poll until
-		// leaderProxyRetryBudget elapses.
-		for attempt := 0; attempt < maxForwardRetries; attempt++ {
-			if !time.Now().Before(deadline) {
-				// Budget expired mid-cycle; do not start another RPC.
-				break
-			}
-			resp, err := p.forward(parentCtx, reqs)
-			if err == nil {
-				return resp, nil
-			}
-			lastErr = err
-			if isTransientLeaderError(err) {
-				break
-			}
+		// runForwardCycle runs up to maxForwardRetries fast retries against
+		// whatever leader is currently visible and returns either a
+		// committed response, a terminal error, or the last transient
+		// leader error for the outer loop to re-poll on.
+		resp, err, done := p.runForwardCycle(parentCtx, reqs, deadline)
+		if done {
+			return resp, err
 		}
-		// Defensive: if the inner loop exited on the deadline guard
+		lastErr = err
+		// Defensive: if runForwardCycle exited on the deadline guard
 		// before ever calling forward() (e.g. a future refactor
 		// shortens the budget, or the clock jumps forward between the
 		// outer deadline computation and the inner check), lastErr
-		// stays nil and errors.Wrapf(nil, ...) would silently yield
-		// nil — handing callers a (nil, nil) "success" that never
+		// stays nil. errors.Wrapf(nil, ...) would silently yield nil
+		// — handing callers a (nil, nil) "success" that never
 		// happened. Surface a real error instead.
 		if lastErr == nil {
 			return nil, errors.WithStack(ErrLeaderNotFound)
-		}
-		if !isTransientLeaderError(lastErr) {
-			return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries)
 		}
 		if !time.Now().Before(deadline) {
 			return nil, lastErr
@@ -145,6 +132,40 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 			return nil, lastErr
 		}
 	}
+}
+
+// runForwardCycle issues up to maxForwardRetries forward() attempts
+// against the current leader, short-circuiting on the budget.
+// Returns:
+//   - (resp, nil, true) on a committed success — caller should return it.
+//   - (nil, err, true) on a non-transient error wrapped with the
+//     retry-count context — caller should return it.
+//   - (nil, lastTransientErr, false) when every attempt failed with a
+//     transient leader-unavailable signal — caller should back off and
+//     retry the cycle.
+//   - (nil, nil, false) when the inner loop exited on the deadline
+//     guard before calling forward() at all; caller surfaces
+//     ErrLeaderNotFound for that defensive path.
+func (p *LeaderProxy) runForwardCycle(parentCtx context.Context, reqs []*pb.Request, deadline time.Time) (*TransactionResponse, error, bool) {
+	var lastErr error
+	for attempt := 0; attempt < maxForwardRetries; attempt++ {
+		if !time.Now().Before(deadline) {
+			// Budget expired mid-cycle; do not start another RPC.
+			break
+		}
+		resp, err := p.forward(parentCtx, reqs)
+		if err == nil {
+			return resp, nil, true
+		}
+		lastErr = err
+		if isTransientLeaderError(err) {
+			break
+		}
+	}
+	if lastErr != nil && !isTransientLeaderError(lastErr) {
+		return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries), true
+	}
+	return nil, lastErr, false
 }
 
 func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
