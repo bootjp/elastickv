@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -519,8 +520,13 @@ func (s *SQSServer) tryDeliverCandidate(
 		return nil, false
 	}
 	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
+	// ReadKeys include the visibility entry and the data record so a
+	// concurrent ReceiveMessage that rotated the same message commits a
+	// newer version and forces our Dispatch to return ErrWriteConflict.
+	// Skipping the candidate on conflict prevents duplicate delivery.
 	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
+		IsTxn:    true,
+		ReadKeys: [][]byte{cand.visKey, dataKey},
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: cand.visKey},
 			{Op: kv.Put, Key: newVisKey, Value: []byte(cand.messageID)},
@@ -559,24 +565,47 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	rec, dataKey, apiErr := s.loadAndVerifyMessage(r.Context(), queueName, handle)
-	if apiErr != nil {
-		writeSQSErrorFromErr(w, apiErr)
-		return
-	}
-	visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: dataKey},
-			{Op: kv.Del, Key: visKey},
-		},
-	}
-	if _, err := s.coordinator.Dispatch(r.Context(), req); err != nil {
+	if err := s.deleteMessageWithRetry(r.Context(), queueName, handle); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+// deleteMessageWithRetry runs the receipt-token check and the delete
+// transaction under one OCC budget. A concurrent ReceiveMessage /
+// ChangeMessageVisibility that rotates the token between validate and
+// commit produces ErrWriteConflict; we retry by re-validating the
+// current token against the handle. If the token has actually been
+// rotated under us, the next pass returns InvalidReceiptHandle.
+func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string, handle *decodedReceiptHandle) error {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	for range transactRetryMaxAttempts {
+		rec, dataKey, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
+		if apiErr != nil {
+			return apiErr
+		}
+		visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		req := &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			ReadKeys: [][]byte{dataKey, visKey},
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: dataKey},
+				{Op: kv.Del, Key: visKey},
+			},
+		}
+		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+			return nil
+		} else if !isRetryableTransactWriteError(err) {
+			return errors.WithStack(err)
+		}
+		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+			return errors.WithStack(err)
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "delete message retry attempts exhausted")
 }
 
 func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Request) {
@@ -594,38 +623,56 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	rec, dataKey, apiErr := s.loadAndVerifyMessage(r.Context(), queueName, handle)
-	if apiErr != nil {
-		writeSQSErrorFromErr(w, apiErr)
-		return
-	}
-	now := time.Now().UnixMilli()
-	if rec.VisibleAtMillis <= now {
-		writeSQSError(w, http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
-		return
-	}
-
-	oldVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-	rec.VisibleAtMillis = now + in.VisibilityTimeout*sqsMillisPerSecond
-	recordBytes, err := encodeSQSMessageRecord(rec)
-	if err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	newVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-	req := &kv.OperationGroup[kv.OP]{
-		IsTxn: true,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: oldVisKey},
-			{Op: kv.Put, Key: newVisKey, Value: []byte(rec.MessageID)},
-			{Op: kv.Put, Key: dataKey, Value: recordBytes},
-		},
-	}
-	if _, err := s.coordinator.Dispatch(r.Context(), req); err != nil {
+	if err := s.changeVisibilityWithRetry(r.Context(), queueName, handle, in.VisibilityTimeout); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+// changeVisibilityWithRetry runs the validate-and-swap flow under an OCC
+// retry budget. ReadKeys cover the data record and the current vis
+// entry; a concurrent receive or delete will bump their commitTS past
+// our startTS and we re-validate.
+func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName string, handle *decodedReceiptHandle, newTimeout int64) error {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	for range transactRetryMaxAttempts {
+		rec, dataKey, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
+		if apiErr != nil {
+			return apiErr
+		}
+		now := time.Now().UnixMilli()
+		if rec.VisibleAtMillis <= now {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
+		}
+		oldVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		rec.VisibleAtMillis = now + newTimeout*sqsMillisPerSecond
+		recordBytes, err := encodeSQSMessageRecord(rec)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		newVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		req := &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			ReadKeys: [][]byte{dataKey, oldVisKey},
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: oldVisKey},
+				{Op: kv.Put, Key: newVisKey, Value: []byte(rec.MessageID)},
+				{Op: kv.Put, Key: dataKey, Value: recordBytes},
+			},
+		}
+		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+			return nil
+		} else if !isRetryableTransactWriteError(err) {
+			return errors.WithStack(err)
+		}
+		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+			return errors.WithStack(err)
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "change visibility retry attempts exhausted")
 }
 
 // parseQueueAndReceipt extracts the queue name and decodes the receipt
@@ -685,14 +732,7 @@ func md5OfAttributesHex(attrs map[string]string) string {
 	for k := range attrs {
 		keys = append(keys, k)
 	}
-	// Stable order for determinism.
-	for i := 0; i < len(keys); i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[j] < keys[i] {
-				keys[i], keys[j] = keys[j], keys[i]
-			}
-		}
-	}
+	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
 		b.WriteString(k)
