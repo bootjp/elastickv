@@ -99,15 +99,44 @@ jobs:
         working-directory: jepsen
         timeout-minutes: 10
         run: |
-          set -e
+          # Run every type even if one fails, so the log shows which
+          # specific attribute types pass and which fail.  The step
+          # still fails at the end if any single type failed.
+          declare -A RESULT
+          FAILED=()
           for t in string number binary bool null string-set number-set binary-set list map; do
             echo "::group::value-type=${t}"
+            set +e
             timeout 120 ~/lein run -m elastickv.dynamodb-types-workload --local \
               --time-limit 5 --rate 5 --concurrency 4 \
               --value-type "${t}" \
               --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              RESULT[$t]="pass"
+            else
+              RESULT[$t]="fail(${rc})"
+              FAILED+=("$t")
+            fi
             echo "::endgroup::"
           done
+          echo
+          echo "=== per-type jepsen summary ==="
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            printf '  %-12s %s\n' "$t" "${RESULT[$t]}"
+          done
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "FAILED types: ${FAILED[*]}"
+            exit 1
+          fi
+      - name: Upload Jepsen store on per-type failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-types
+          path: jepsen/store
+          retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3

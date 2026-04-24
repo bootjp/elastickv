@@ -60,16 +60,19 @@
 
 (defn- ->byte-array
   "Coerce a value returned by cognitect/aws-api for a Binary attribute into a
-   Java byte[].  Different SDK versions return either byte[] or ByteBuffer,
-   so we accept both (and pass through nil for missing attributes)."
+   Java byte[].  Different SDK versions return byte[], ByteBuffer, or a
+   Seqable of bytes, so we handle all three (and pass through nil for
+   missing attributes)."
   ^bytes [b]
   (cond
-    (nil? b)                            nil
-    (instance? java.nio.ByteBuffer b)   (let [^java.nio.ByteBuffer buf (.duplicate ^java.nio.ByteBuffer b)
-                                              arr (byte-array (.remaining buf))]
-                                          (.get buf arr)
-                                          arr)
-    :else                               b))
+    (nil? b)                          nil
+    (bytes? b)                        b
+    (instance? java.nio.ByteBuffer b) (let [^java.nio.ByteBuffer buf (.duplicate ^java.nio.ByteBuffer b)
+                                            arr (byte-array (.remaining buf))]
+                                        (.get buf arr)
+                                        arr)
+    ;; Fallback: treat as a sequence of byte-coercible numbers.
+    :else                             (byte-array (map unchecked-byte b))))
 
 (defn- bytes->vec
   "Canonicalise binary data to a vector of unsigned ints so that equality

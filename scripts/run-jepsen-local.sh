@@ -111,6 +111,7 @@ fi
 # All DynamoDB attribute types currently supported by elastickv.
 # Each runs as its own register/linearizable test.
 TYPES=(string number binary bool null string-set number-set binary-set list map)
+declare -A TYPE_RESULT
 for t in "${TYPES[@]}"; do
   echo "[jepsen] running DynamoDB types workload: ${t}..."
   set +e
@@ -127,7 +128,16 @@ for t in "${TYPES[@]}"; do
   if [ $TYPE_EXIT -ne 0 ]; then
     echo "[jepsen] type=${t} FAILED (exit $TYPE_EXIT)"
     EXIT_CODE=$TYPE_EXIT
+    TYPE_RESULT[$t]="fail(${TYPE_EXIT})"
+  else
+    TYPE_RESULT[$t]="pass"
   fi
+done
+
+echo
+echo "[jepsen] per-type summary:"
+for t in "${TYPES[@]}"; do
+  printf '  %-12s %s\n' "$t" "${TYPE_RESULT[$t]}"
 done
 
 if [ $EXIT_CODE -eq 0 ]; then
