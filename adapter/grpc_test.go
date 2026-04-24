@@ -163,12 +163,18 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 				context.Background(),
 				&pb.RawPutRequest{Key: key, Value: want},
 			)
-			assert.NoError(t, err, "Put RPC failed")
+			if !assert.NoError(t, err, "Put RPC failed") {
+				return
+			}
 			_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
-			assert.NoError(t, err, "Put RPC failed")
+			if !assert.NoError(t, err, "Put RPC failed") {
+				return
+			}
 
 			resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
-			assert.NoError(t, err, "Get RPC failed")
+			if !assert.NoError(t, err, "Get RPC failed") {
+				return
+			}
 			assert.Equal(t, want, resp.Value, "consistency check failed")
 		}(i)
 	}
@@ -190,13 +196,19 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			context.Background(),
 			&pb.RawPutRequest{Key: key, Value: want},
 		)
-		assert.NoError(t, err, "Put RPC failed")
+		if !assert.NoError(t, err, "Put RPC failed") {
+			continue
+		}
 
-		_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
-		assert.NoError(t, err, "Put RPC failed")
+		_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
+		if !assert.NoError(t, err, "Put RPC failed") {
+			continue
+		}
 
-		resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			continue
+		}
 
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 	}
@@ -216,16 +228,24 @@ func Test_grpc_transaction(t *testing.T) {
 			context.Background(),
 			&pb.PutRequest{Key: key, Value: want},
 		)
-		assert.NoError(t, err, "Put RPC failed")
-		resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		if !assert.NoError(t, err, "Put RPC failed") {
+			continue
+		}
+		resp, err := c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			continue
+		}
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 
-		_, err = c.Delete(context.TODO(), &pb.DeleteRequest{Key: key})
-		assert.NoError(t, err, "Delete RPC failed")
+		_, err = c.Delete(context.Background(), &pb.DeleteRequest{Key: key})
+		if !assert.NoError(t, err, "Delete RPC failed") {
+			continue
+		}
 
-		resp, err = c.Get(context.TODO(), &pb.GetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		resp, err = c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			continue
+		}
 		assert.Nil(t, resp.Value, "consistency check failed")
 	}
 }

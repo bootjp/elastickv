@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -380,7 +381,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 // isTransientLeaderError reports whether err is a transient
 // leader-unavailable signal worth retrying inside Dispatch.
 //
-// Two distinct conditions qualify:
+// Three distinct conditions qualify:
 //   - ErrLeaderNotFound — no leader address resolvable on this node yet
 //     (election in progress, or the previous leader stepped down and the
 //     successor has not propagated). Recoverable as soon as a new leader
@@ -389,6 +390,16 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 //     because it just lost leadership (ErrNotLeader / ErrLeadershipLost
 //     / ErrLeadershipTransferInProgress). Recoverable by re-routing
 //     through the new leader (redirect path).
+//   - Forwarded "not leader" / "leader not found" strings — when
+//     Coordinate.redirect forwards to a stale leader, the destination
+//     node returns adapter.ErrNotLeader (its own sentinel) which gRPC
+//     transports as a generic Unknown status carrying only the message
+//     "not leader". errors.Is cannot traverse that wire boundary, so we
+//     fall back to a case-insensitive substring match on the final error
+//     text. leaderErrorPhrases enumerates the exact phrases the adapter
+//     and coordinator layers emit so the match cannot accidentally
+//     swallow an unrelated business-logic error that happens to contain
+//     "leader" in its text.
 //
 // Business-logic failures (write conflict, validation, etc.) are NOT
 // covered here — those must surface to the caller unchanged so client
@@ -401,7 +412,38 @@ func isTransientLeaderError(err error) bool {
 	if errors.Is(err, ErrLeaderNotFound) {
 		return true
 	}
-	return isLeadershipLossError(err)
+	if isLeadershipLossError(err) {
+		return true
+	}
+	return hasTransientLeaderPhrase(err)
+}
+
+// leaderErrorPhrases is the closed set of wire-level error strings the
+// coordinator is willing to treat as transient once the typed sentinel
+// has been dropped by a gRPC boundary. Keep this list tight — any
+// addition must correspond to an error the system actually emits for
+// leader churn, not a generic "failed" message that happens to mention
+// leaders.
+var leaderErrorPhrases = []string{
+	"not leader",       // adapter.ErrNotLeader, raftengine.ErrNotLeader, ErrLeadershipLost messages
+	"leader not found", // kv.ErrLeaderNotFound, adapter.ErrLeaderNotFound
+}
+
+// hasTransientLeaderPhrase reports whether err.Error() contains one of
+// the well-known transient-leader substrings. It is the last resort used
+// after errors.Is fails across a gRPC boundary that strips the original
+// sentinel chain.
+func hasTransientLeaderPhrase(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range leaderErrorPhrases {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshLeaseAfterDispatch extends the lease only when the dispatch

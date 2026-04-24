@@ -67,11 +67,18 @@ func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 //
 //   - Forward-RPC failures are bounded by maxForwardRetries (each attempt
 //     re-resolves the leader address inside forward()).
-//   - ErrLeaderNotFound (no leader published yet) is bounded by
-//     leaderProxyRetryBudget so a brief re-election window does not bubble
-//     up to gRPC clients as a hard failure. Linearizable callers expect
-//     the proxy to either commit atomically or fail definitively, not to
-//     leak transient raft-internal churn.
+//   - Transient leader-unavailable errors (no leader published yet, or
+//     the forwarded RPC landed on a stale leader that returned
+//     adapter.ErrNotLeader over the wire) are bounded by
+//     leaderProxyRetryBudget so a brief re-election window does not
+//     bubble up to gRPC clients as a hard failure. Linearizable callers
+//     expect the proxy to either commit atomically or fail definitively,
+//     not to leak transient raft-internal churn.
+//
+// The wire-level "not leader" string match is necessary because a stale
+// leader's Internal.Forward returns adapter.ErrNotLeader whose error
+// chain does not survive the gRPC boundary; errors.Is against
+// ErrLeaderNotFound would miss it and exit after only the fast retries.
 func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
@@ -82,19 +89,20 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 	for {
 		// Each iteration of the outer loop runs up to maxForwardRetries
 		// fast retries against whatever leader is currently visible. If
-		// none is, we sleep one leaderProxyRetryInterval and re-poll
-		// until leaderProxyRetryBudget elapses.
+		// none is (or the forward bounced off a stale leader), we sleep
+		// one leaderProxyRetryInterval and re-poll until
+		// leaderProxyRetryBudget elapses.
 		for attempt := 0; attempt < maxForwardRetries; attempt++ {
 			resp, err := p.forward(reqs)
 			if err == nil {
 				return resp, nil
 			}
 			lastErr = err
-			if errors.Is(err, ErrLeaderNotFound) {
+			if isTransientLeaderError(err) {
 				break
 			}
 		}
-		if !errors.Is(lastErr, ErrLeaderNotFound) {
+		if !isTransientLeaderError(lastErr) {
 			return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries)
 		}
 		if !time.Now().Before(deadline) {
