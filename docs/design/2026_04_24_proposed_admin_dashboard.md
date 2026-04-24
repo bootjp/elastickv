@@ -101,6 +101,39 @@ func (a *Dynamo) CreateTable(ctx context.Context, in createTableInput, principal
 
 S3 も同様に `CreateBucket` / `DeleteBucket` / `PutBucketAcl` / `ListBuckets` を内部エントリポイントとして切り出す。SigV4 検証を経ない経路が追加されるため、**adapter 側の既存テストと統合テストの両方で「SigV4 を持たない呼び出し口」の認可を検証する**。
 
+### 3.3 Follower → Leader Forwarding (Required, not optional)
+
+ロードバランサ背後のマルチノード構成では admin の書き込みリクエストが日常的に follower にも着信する。既存の adapter 側 `proxyToLeader` は **SigV4 ヘッダを保持したまま HTTP で leader に再送する**前提のため、SigV4 を持たない admin 内部エントリポイントをそのまま呼ぶと以下が起きる:
+
+- follower でローカル書き込みが試みられ、`etcd raft engine is not leader` で失敗する (data loss や inconsistency ではないが、UX として常時エラーになる)。
+- あるいは admin が愚直に HTTP 転送を試みる場合、leader 側で SigV4 検証に失敗して 4xx を返す。
+
+このため **follower→leader 転送は P1 の必須要件**として実装する (Open Question から昇格、Section 11 にはもう置かない)。
+
+#### 3.3.1 採用方式: Principal-aware internal RPC
+
+- 既存の `proxyToLeader` (HTTP 再送) と並行して、**admin 専用の internal gRPC メソッド `AdminForward(principal, operation)`** を raft engine に追加する。
+- `principal` には admin JWT から解決した `access_key` と `role` (`read_only` / `full`) が入る。SigV4 ヘッダは含めない。
+- follower の admin handler は「自ノードがリーダーでない」と判定したら、gRPC クラスタ内 peer 経由で `AdminForward` をリーダーに送る。
+- リーダーは **受信した `principal` を信用せず、クラスタで同期された access-key 設定に照らして再評価** (認可の真実はリーダー側にある)。
+- 既存 SigV4 パスの `proxyToLeader` は変更しない。admin パスだけが新 RPC を使う。
+
+#### 3.3.2 受け入れ基準 (acceptance criteria)
+
+書き込み対応の admin API をリリースする前に、以下のユニット + 統合テストをすべてグリーンにする:
+
+1. **リーダー直接接続**: リーダーノードに admin write を投げて成功。
+2. **follower 転送**: follower ノードに admin write を投げて成功 (透過的に `AdminForward` 経由でリーダー到達)。
+3. **リーダー不在**: 選挙中は `503 AdminLeaderUnavailable` + `Retry-After: 1` を返し、クライアント再試行で最終成功することを確認。
+4. **権限の二重チェック**: follower 側で full-access JWT を持ち、`AdminForward` の途中で設定が reload され read-only に降格 → リーダー側で 403 になることを確認 (principal を信用しない設計の検証)。
+5. **ローリングアップグレード互換性マトリクス** (AGENTS.md の無停止要件):
+   - 旧 follower + 新 leader: 旧 follower の admin は `AdminForward` を知らないので **feature flag `admin.leader_forward_v2` が有効になる前は admin write を 503 `AdminUpgradeInProgress` で返す**。
+   - 新 follower + 旧 leader: リーダーが `AdminForward` を受け取れないので同じく 503。
+   - クラスタ全台が新版に揃った (バージョンベクタを Raft 経由で確認) 後にフラグを有効化し、以降は透過的に動く。
+6. **監査ログ**: 転送された書き込みにも `actor=principal.access_key`、`forwarded_from=<follower node id>` を監査ログに残すこと。
+
+上記 1〜6 を満たさないと P1 の DoD (Definition of Done) 未達とし、マージしない。
+
 ---
 
 ## 4. Admin HTTP API
@@ -281,12 +314,12 @@ React バンドルは gzip 後 ~150KB を目標。`go:embed` 経由で elastickv
 
 | Phase | 内容 | 目安 |
 |---|---|---|
-| **P1** | `internal/admin/` 新規作成。Go 側 API スケルトン、auth、DynamoDB テーブル一覧/作成/削除の 3 エンドポイント | ~1 週 |
+| **P1** | `internal/admin/` 新規作成。Go 側 API スケルトン、auth、DynamoDB テーブル一覧/作成/削除、**`AdminForward` RPC と follower→leader 転送 (Section 3.3 受け入れ基準 1〜6)** | ~1.5 週 |
 | **P2** | S3 バケット一覧/作成/削除/ACL、`DescribeTable` 対応 | ~1 週 |
 | **P3** | React SPA 実装 + embed | ~1.5 週 |
 | **P4** | TLS、read-only ロール、CSRF、ドキュメント (`docs/admin.md`) | ~3 日 |
 
-各フェーズ末にユニット + 統合テストを必ず通す。
+**P1 の DoD**: Section 3.3.2 の受け入れ基準 1〜6 がすべてグリーンでない限り、書き込み対応の admin API はマージしない。各フェーズ末にユニット + 統合テストを必ず通す。
 
 ---
 
@@ -320,14 +353,11 @@ React バンドルは gzip 後 ~150KB を目標。`go:embed` 経由で elastickv
 ## 11. Open Questions
 
 1. **管理権限キーのローテーション**: 現状、再起動が必要。Raft ベースの動的更新は将来検討。
-2. **マルチノード同一ダッシュボード / リーダーフォワーディング互換性**: 既存 `proxyToLeader` は **follower で受けた SigV4 リクエストを gRPC の internal proxy でリーダーへ転送する**前提になっている。Admin の内部エントリポイント (Section 3.2) は SigV4 を経由しないため、follower で Admin リクエストを受けた場合にそのまま adapter 呼び出しをするとリーダー以外で書き込みが試みられる。
-   採用予定の緩和策:
-   - 書き込み系エンドポイントは adapter 内の既存 `proxyToLeader` を **SigV4 ではなく `AuthPrincipal` を転送するバリアント**として拡張する (internal gRPC メッセージに `principal` フィールドを追加、既存 SigV4 パスと共存)。
-   - ローリングアップグレード中の互換性: 旧ノードは新しい `principal` フィールドを知らないため、トランジション期間は Admin handler 側で「リーダーが自ノードでない & クラスタ内に旧バージョンが混在」を検出したら **503 `AdminUpgradeInProgress` を返し SPA が別ノードに再接続を促す**。すべてのノードが新版に揃った後に principal 転送を有効化するフィーチャーフラグ (`admin.leader_forward_v2`) を持つ。
-   - 無停止アップグレード要件 (AGENTS.md) に合わせて、互換性マトリクス (旧 follower + 新 leader / 新 follower + 旧 leader) のユニットテストを必須化する。
-3. **Audit log sink**: `slog` 先を外部 (Loki 等) に流す統合は次フェーズ。
-4. **DynamoDB `DescribeTable` の項目数**: 近似値で良いか / 厳密値が必要か。近似値 (sampling) を基本とし、厳密カウントは UI 上の明示操作 (「Count items」ボタン) に限定する方針でよいか。
-5. **JWT 鍵の Raft 同期**: 当面は設定ファイル経由。運用で動的ローテが必要になったら TSO と同じ Raft グループに載せる。
+2. **Audit log sink**: `slog` 先を外部 (Loki 等) に流す統合は次フェーズ。
+3. **DynamoDB `DescribeTable` の項目数**: 近似値で良いか / 厳密値が必要か。近似値 (sampling) を基本とし、厳密カウントは UI 上の明示操作 (「Count items」ボタン) に限定する方針でよいか。
+4. **JWT 鍵の Raft 同期**: 当面は設定ファイル経由。運用で動的ローテが必要になったら TSO と同じ Raft グループに載せる。
+
+_(follower→leader 転送は当初 Open Question として扱っていたが、書き込み系 API の正しさそのものに関わるため Section 3.3 に必須要件として昇格した)_
 
 ---
 
