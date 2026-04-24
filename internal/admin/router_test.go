@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -191,5 +190,4 @@ func TestRouter_APIHandlerReceivesFullPath(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, "/admin/api/v1/dynamo/tables", received)
-	_ = io.Discard
 }
