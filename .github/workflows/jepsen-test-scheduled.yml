@@ -116,13 +116,22 @@ jobs:
             --host 127.0.0.1
       - name: Run DynamoDB per-type Jepsen workloads against elastickv
         working-directory: jepsen
+        # The per-type sweep is a coverage check across all 10 attribute
+        # types, not the deep stress run — it uses its own shorter
+        # time-limit so the 10-type loop fits comfortably inside the job
+        # timeout regardless of the workflow_dispatch time-limit input.
+        # The per-invocation `timeout` is derived from TYPE_TL + buffer
+        # so bumping TYPE_TL never races against the outer timeout.
         timeout-minutes: 30
+        env:
+          TYPE_TL: "60"
         run: |
           set -e
+          PER_TYPE_TIMEOUT=$((TYPE_TL + 180))
           for t in string number binary bool null string-set number-set binary-set list map; do
             echo "::group::value-type=${t}"
-            timeout 240 ~/lein run -m elastickv.dynamodb-types-workload --local \
-              --time-limit ${{ inputs.time-limit || '60' }} \
+            timeout "${PER_TYPE_TIMEOUT}" ~/lein run -m elastickv.dynamodb-types-workload --local \
+              --time-limit "${TYPE_TL}" \
               --rate ${{ inputs.rate || '5' }} \
               --concurrency ${{ inputs.concurrency || '8' }} \
               --key-count ${{ inputs.key-count || '8' }} \

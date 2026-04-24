@@ -97,7 +97,12 @@
    :bool    {:table  "jepsen_types_bool"
              :gen    (fn [i] (odd? i))
              :encode (fn [v] {:BOOL v})
-             :decode (fn [a] (boolean (:BOOL a)))}
+             ;; Return (:BOOL a) directly, not (boolean ...): coercing to
+             ;; boolean would turn a nil payload (missing or wrong-typed
+             ;; attribute) into false, which is indistinguishable from a
+             ;; legitimately-written false.  Preserving nil lets the
+             ;; register checker surface shape/type regressions.
+             :decode (fn [a] (:BOOL a))}
 
    ;; NULL has only one valid value.  The register check still verifies that
    ;; reads observe the written attribute (and never an absent / wrong-typed
@@ -180,15 +185,25 @@
                          :resp     resp})))
       resp)))
 
+;; Default provisioned throughput for test tables.  elastickv does not
+;; enforce these numbers today, but we pick something high enough that a
+;; real DynamoDB endpoint would not throttle a stress run (which would
+;; otherwise manifest as ProvisionedThroughputExceededException :info
+;; operations and waste test time).  Overridable via --read-capacity /
+;; --write-capacity.
+(def ^:private default-read-capacity  100)
+(def ^:private default-write-capacity 100)
+
 (defn- create-table!
   "Create a table for the type under test; ignore ResourceInUseException."
-  [ddb table]
+  [ddb table read-capacity write-capacity]
   (try
     (ddb-invoke! ddb :CreateTable
                  {:TableName             table
                   :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
                   :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
-                  :ProvisionedThroughput {:ReadCapacityUnits 5 :WriteCapacityUnits 5}})
+                  :ProvisionedThroughput {:ReadCapacityUnits  read-capacity
+                                          :WriteCapacityUnits write-capacity}})
     (catch clojure.lang.ExceptionInfo e
       (when-not (= "ResourceInUseException" (:type (ex-data e)))
         (throw e)))))
@@ -215,7 +230,7 @@
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 
-(defrecord DynamoDBTypesClient [node->port spec ddb]
+(defrecord DynamoDBTypesClient [node->port spec read-capacity write-capacity ddb]
   client/Client
 
   (open! [this test node]
@@ -224,7 +239,7 @@
       (assoc this :ddb (make-ddb-client host port))))
 
   (setup! [_this _test]
-    (create-table! ddb (:table spec)))
+    (create-table! ddb (:table spec) read-capacity write-capacity))
 
   (teardown! [_this _test])
 
@@ -256,7 +271,14 @@
                     :cognitect.anomalies/unavailable} category))
             (assoc op :type :info :error :network-error)
 
-            (contains? #{"InternalServerError"} err-type)
+            ;; Transient server-side errors that may or may not have been
+            ;; applied.  Mark them :info so Jepsen treats them as
+            ;; indeterminate rather than a definite failure.
+            (contains? #{"InternalServerError"
+                         "ServiceUnavailableException"
+                         "ThrottlingException"
+                         "ProvisionedThroughputExceededException"}
+                       err-type)
             (assoc op :type :info :error (str err-type))
 
             (= "ValidationException" err-type)
@@ -294,10 +316,14 @@
         key-count       (or (:key-count opts) 5)
         max-writes      (or (:max-writes-per-key opts) 50)
         threads-per-key (or (:threads-per-key opts) 2)
+        read-capacity   (or (:read-capacity opts)  default-read-capacity)
+        write-capacity  (or (:write-capacity opts) default-write-capacity)
         client          (->DynamoDBTypesClient
                           (or (:node->port opts)
                               (zipmap default-nodes (repeat 8000)))
                           spec
+                          read-capacity
+                          write-capacity
                           nil)]
     {:client    client
      :generator (independent/concurrent-generator
@@ -397,6 +423,12 @@
     :parse-fn parse-value-type]
    [nil "--threads-per-key N" "Concurrent threads per register key."
     :default 2
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--read-capacity N" "ProvisionedThroughput.ReadCapacityUnits for the test table."
+    :default default-read-capacity
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--write-capacity N" "ProvisionedThroughput.WriteCapacityUnits for the test table."
+    :default default-write-capacity
     :parse-fn #(Integer/parseInt %)]])
 
 (defn- prepare-types-opts
@@ -407,10 +439,12 @@
                        (cli/ports->node-map dynamo-ports (:nodes options))
                        (zipmap (:nodes options) (repeat (:dynamo-port options))))]
     (assoc options
-      :dynamo-host (:host options)
-      :node->port  node->port
-      :dynamo-port (:dynamo-port options)
-      :redis-port  (:redis-port options))))
+      :dynamo-host    (:host options)
+      :node->port     node->port
+      :dynamo-port    (:dynamo-port options)
+      :redis-port     (:redis-port options)
+      :read-capacity  (:read-capacity options)
+      :write-capacity (:write-capacity options))))
 
 (defn -main
   [& args]
