@@ -17,6 +17,13 @@ sudo tailscale up \
   --accept-routes=false
 ```
 
+`--ssh=false` disables Tailscale SSH, so the node's regular system
+sshd must be running and authorised to accept connections on the
+tailnet interface. The workflow uses plain SSH over the tailnet
+(Tailscale is only the network layer); if you rely on Tailscale SSH
+for operator access elsewhere, drop this flag but keep in mind the
+workflow still connects to the system sshd.
+
 Verify the node is reachable by MagicDNS from another tailnet peer:
 
 ```
@@ -75,7 +82,7 @@ friction for previews).
 | `TS_OAUTH_CLIENT_ID`        | Tailscale OAuth client ID from step 3 |
 | `TS_OAUTH_SECRET`           | Tailscale OAuth secret from step 3 |
 | `DEPLOY_SSH_PRIVATE_KEY`    | OpenSSH private key, authorized on every node under the deploy user |
-| `DEPLOY_KNOWN_HOSTS`        | `ssh-keyscan kv01.<tailnet>.ts.net kv02.<tailnet>.ts.net …` output (one host per line) |
+| `DEPLOY_KNOWN_HOSTS`        | `ssh-keyscan -H kv01.<tailnet>.ts.net kv02.<tailnet>.ts.net …` output. Use `-H` to hash hostnames so the secret's contents don't leak the tailnet topology if the runner environment is compromised. |
 
 The SSH key should be ed25519, dedicated to CI (not a reused developer key).
 Regenerate on operator rotation.
@@ -86,8 +93,15 @@ Regenerate on operator rotation.
 |------|-------|---------|
 | `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
-| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`) | `n1=kv01,n2=kv02,n3=kv03,n4=kv04,n5=kv05` |
-| `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host` | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). The workflow renders this into the script's `NODES` env var. | `n1=kv01,n2=kv02,n3=kv03,n4=kv04,n5=kv05` |
+| `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+
+**Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
+in the `production` environment to keep the GitHub-side names
+distinct from the script-side env var names it hands to
+`rolling-update.sh`. If you run the script by hand from a workstation
+you must export `NODES` and `SSH_TARGETS` directly — the workflow-side
+names are only understood by the workflow's render step.
 
 ## 5. Running a deploy
 
@@ -149,5 +163,5 @@ the tag is a moving tag (`latest`) that the verification step can't
 distinguish from stale. Specify an immutable tag.
 
 ### SSH `Host key verification failed`
-`DEPLOY_KNOWN_HOSTS` is stale. Re-run `ssh-keyscan` against every node and
+`DEPLOY_KNOWN_HOSTS` is stale. Re-run `ssh-keyscan -H` against every node and
 update the secret.

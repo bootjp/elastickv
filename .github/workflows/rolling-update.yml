@@ -30,6 +30,7 @@ on:
 permissions:
   contents: read
   id-token: write   # required by tailscale/github-action OIDC flow
+  packages: read    # required by `docker manifest inspect` on ghcr.io private images
 
 concurrency:
   group: rolling-update
