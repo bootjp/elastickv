@@ -124,7 +124,7 @@ func (s *AdminServer) GetClusterOverview(
 // on a single group do not fail the RPC — other groups plus the seed list
 // still produce useful output.
 func (s *AdminServer) snapshotMembers(ctx context.Context) []*pb.NodeIdentity {
-	groups := s.cloneGroups()
+	groups := s.cloneGroupsSorted()
 	addrByID, order := collectLiveMembers(ctx, groups, s.self.NodeID)
 	mergeSeedMembers(s.members, s.self.NodeID, addrByID, &order)
 
@@ -135,31 +135,45 @@ func (s *AdminServer) snapshotMembers(ctx context.Context) []*pb.NodeIdentity {
 	return out
 }
 
-// cloneGroups snapshots the registered groups under the read lock so the
-// caller can iterate without holding groupsMu while invoking Configuration
-// (which may block on Raft).
-func (s *AdminServer) cloneGroups() []AdminGroup {
+// groupEntry pairs a Raft group ID with its AdminGroup so callers can iterate
+// in a deterministic (ID-ascending) order. Sorting matters for
+// collectLiveMembers: when two groups report the same NodeID with different
+// addresses (e.g., mid-readdress), the iteration order picks which address
+// wins, and a Go map's range order is unspecified.
+type groupEntry struct {
+	id    uint64
+	group AdminGroup
+}
+
+// cloneGroupsSorted snapshots the registered groups under the read lock and
+// returns them sorted by group ID so iteration and tie-break decisions are
+// stable across calls.
+func (s *AdminServer) cloneGroupsSorted() []groupEntry {
 	s.groupsMu.RLock()
 	defer s.groupsMu.RUnlock()
-	out := make([]AdminGroup, 0, len(s.groups))
-	for _, g := range s.groups {
-		out = append(out, g)
+	out := make([]groupEntry, 0, len(s.groups))
+	for id, g := range s.groups {
+		out = append(out, groupEntry{id: id, group: g})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
 	return out
 }
 
-// collectLiveMembers polls Configuration for each group and returns the union
-// of server IDs (excluding self) with their live addresses. The order slice
-// preserves first-seen iteration order for stable output.
+// collectLiveMembers polls Configuration for each group (in ascending group
+// ID order supplied by the caller) and returns the union of server IDs
+// (excluding self) with their live addresses. When two groups report the
+// same server ID with different addresses — e.g. mid-readdress before every
+// group has converged — the lowest-ID group wins, which is stable across
+// calls and matches "trust the primary group" intuition.
 func collectLiveMembers(
 	ctx context.Context,
-	groups []AdminGroup,
+	groups []groupEntry,
 	selfID string,
 ) (addrByID map[string]string, order []string) {
 	addrByID = make(map[string]string)
 	order = make([]string, 0)
-	for _, g := range groups {
-		cfg, err := g.Configuration(ctx)
+	for _, entry := range groups {
+		cfg, err := entry.group.Configuration(ctx)
 		if err != nil {
 			continue
 		}

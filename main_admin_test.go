@@ -97,6 +97,31 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 	}
 }
 
+// TestCanonicalSelfAddressPicksLowestGroup pins the deterministic choice of
+// Self.GRPCAddress when --raftGroups is set — the fan-out path has to dial an
+// endpoint that this process actually listens on, so --address (which may be
+// unrelated) must not win over the real group listeners.
+func TestCanonicalSelfAddressPicksLowestGroup(t *testing.T) {
+	t.Parallel()
+	runtimes := []*raftGroupRuntime{
+		{spec: groupSpec{id: 5, address: "10.0.0.1:50055"}},
+		{spec: groupSpec{id: 2, address: "10.0.0.1:50052"}},
+		{spec: groupSpec{id: 9, address: "10.0.0.1:50059"}},
+	}
+	got := canonicalSelfAddress("localhost:50051", runtimes)
+	if got != "10.0.0.1:50052" {
+		t.Fatalf("got %q, want lowest-group address 10.0.0.1:50052", got)
+	}
+}
+
+func TestCanonicalSelfAddressFallsBackWithoutRuntimes(t *testing.T) {
+	t.Parallel()
+	got := canonicalSelfAddress("localhost:50051", nil)
+	if got != "localhost:50051" {
+		t.Fatalf("got %q, want fallback localhost:50051", got)
+	}
+}
+
 func TestLoadAdminTokenFileRejectsOversize(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

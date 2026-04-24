@@ -501,10 +501,16 @@ func setupAdminService(
 	bootstrapServers []raftengine.Server,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
+	// In multi-group mode the process does not listen on *myAddr — each group
+	// has its own rt.spec.address. Use the lowest-group-ID listener as the
+	// canonical self address so GetClusterOverview.Self advertises an
+	// endpoint the fan-out can actually dial. Falls back to the flag value
+	// when no runtimes are registered (single-node dev runs).
+	selfAddr := canonicalSelfAddress(grpcAddress, runtimes)
 	srv, icept, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
-		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: grpcAddress},
+		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
 	)
 	if err != nil {
@@ -520,6 +526,32 @@ func setupAdminService(
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
 	}
 	return srv, icept, nil
+}
+
+// canonicalSelfAddress picks the listener address AdminServer should advertise
+// as Self.GRPCAddress. The Admin gRPC service is registered on every Raft
+// group's listener in startRaftServers, so any runtime's address is reachable;
+// we pick the lowest group ID to make the choice deterministic across
+// restarts. Returns the supplied fallback when no runtimes exist (e.g., a
+// single-node dev invocation without --raftGroups).
+func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string {
+	var (
+		bestID   uint64
+		bestAddr string
+		found    bool
+	)
+	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
+		if !found || rt.spec.id < bestID {
+			bestID, bestAddr, found = rt.spec.id, rt.spec.address, true
+		}
+	}
+	if !found {
+		return fallback
+	}
+	return bestAddr
 }
 
 // adminMembersFromBootstrap extracts the peer list (everyone except self) from

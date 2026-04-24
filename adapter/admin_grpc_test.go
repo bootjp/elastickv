@@ -127,6 +127,46 @@ func TestGetClusterOverviewUnionsSeedsAndLiveConfig(t *testing.T) {
 	}
 }
 
+// TestGetClusterOverviewDuplicateMemberIDsDeterministic pins the tie-break
+// when two Raft groups disagree on a server's address (e.g. mid-readdress,
+// before every group has converged): the group with the smallest ID wins and
+// the result is stable across calls, so fan-out doesn't flap between stale
+// and current addresses.
+func TestGetClusterOverviewDuplicateMemberIDsDeterministic(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)
+	// Group 1 (lower ID): n2 already moved to new address.
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.22:50051"},
+		},
+	})
+	// Group 7 (higher ID): still reports n2 at the stale address.
+	srv.RegisterGroup(7, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.12:50051"},
+		},
+	})
+
+	// Run overview 5 times. All must return the low-ID group's n2 address.
+	for i := 0; i < 5; i++ {
+		resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Members) != 1 {
+			t.Fatalf("iter %d: members=%d want 1", i, len(resp.Members))
+		}
+		if resp.Members[0].GrpcAddress != "10.0.0.22:50051" {
+			t.Fatalf("iter %d: got %s, want low-ID group's n2 @ 10.0.0.22:50051", i, resp.Members[0].GrpcAddress)
+		}
+	}
+}
+
 // TestGetClusterOverviewLiveConfigWinsOverStaleSeed asserts that when a node
 // is readdressed (same NodeID, new GRPCAddress), the live Raft Configuration
 // wins over the stale bootstrap seed so fan-out dials the current endpoint.
