@@ -509,3 +509,23 @@ func TestXAddEnforceMaxWideColumn(t *testing.T) {
 		})
 	}
 }
+
+// nextXAddID must reject explicit ID "0-0" (and shorthand "0") even when the
+// stream is empty, because an entry at 0-0 is unreachable via XREAD ... 0.
+func TestNextXAddID_RejectsZeroID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		requested string
+	}{
+		{"explicit-0-0", "0-0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := nextXAddID(false, 0, 0, tc.requested)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "greater than 0-0")
+		})
+	}
+}
