@@ -72,7 +72,7 @@ The adapter should dispatch by request content-type / `X-Amz-Target` header and 
 | `StartMessageMoveTask` and friends | Not planned | |
 | Server-side KMS | Not planned | |
 
-Payload limits match AWS defaults: 256 KiB per message, 120,000 in-flight messages per standard queue, 20,000 in-flight per FIFO queue. These should be enforced at the adapter, not silently truncated.
+Payload limits match AWS defaults: 256 KiB per message, 120,000 in-flight messages per Standard queue, and 120,000 in-flight per FIFO queue (current AWS quota — the old 20,000 FIFO ceiling was raised). These should be enforced at the adapter, not silently truncated.
 
 ## 4. High-Level Architecture
 
@@ -212,7 +212,7 @@ receipt_handle = base64url(
 
 FIFO queues add three invariants on top of the standard schema:
 
-1. **Group lock**: `!sqs|msg|group|<queue><gen><group>` is held by at most one message at a time. `ReceiveMessage` skips the entire group while the lock is held. The lock is released when the locking message is deleted, expires its visibility (and the next receive within the group rotates ownership), or the message retention expires.
+1. **Group lock**: `!sqs|msg|group|<queue><gen><group>` is held by at most one message at a time. `ReceiveMessage` skips the entire group while the lock is held. Critically, the lock stays **pinned to the same head message** across visibility-timeout expiries: when the head message's visibility expires, the lock is **not** released — it remains held by that message so a later message in the same group cannot overtake it on the next receive. Instead, the next `ReceiveMessage` that hits the group re-delivers the same head message (with a bumped receive count + rotated receipt token) and extends its visibility. The lock is only released when the head message is deleted by the consumer, moved to the DLQ (receive count exceeded `maxReceiveCount`), or expired by `message_retention_seconds`. Releasing on visibility expiry would violate strict per-`MessageGroupId` ordering because a later message with an earlier effective `visible_at` could be scanned first.
 2. **Deduplication**: `!sqs|msg|dedup|<queue><gen><dedup-id>` blocks a duplicate `SendMessage` for 5 minutes. For `ContentBasedDeduplication = true` the dedup id is `SHA-256(body)`.
 3. **Per-queue sequence number**: `!sqs|queue|seq|<queue-esc><gen-u64>` → `uint64`, bumped by every FIFO send. Written into the message record for strict ordering.
 
@@ -273,7 +273,7 @@ Steps:
 1. Validate message size (`MaximumMessageSize` from queue attrs, capped at 262144).
 2. Compute `md5_of_body` and `md5_of_message_attributes`.
 3. Resolve queue generation; if queue is tombstoned return `QueueDoesNotExist`.
-4. Compute `available_at_hlc = now + max(queue.delay, per-message DelaySeconds)`.
+4. Compute `available_at_hlc`. Standard queues use `now + max(queue.delay, per-message DelaySeconds)`. **FIFO queues reject per-message `DelaySeconds` with `InvalidParameterValue`** — AWS only allows queue-level `DelaySeconds` on FIFO, and silently accepting a per-message value would diverge from real SQS behavior and let misbehaving clients ship out of order. FIFO sends therefore always compute `available_at_hlc = now + queue.delay`.
 5. In one OCC transaction:
    - For FIFO: check and insert `!sqs|msg|dedup|...`. On hit, return the existing message's ID (AWS semantics).
    - For FIFO: increment `!sqs|queue|seq|...` and write it into the record.
@@ -619,10 +619,16 @@ No framework, no bundler: the JS file is hand-written, runs in modern browsers (
 
 ### 13.6 Authentication
 
-1. Loopback + no token configured: the console is open. This is the "one-liner dev" case.
-2. Non-loopback or token configured: every `/console/*` request must carry `Authorization: Bearer <token>`. Missing or wrong token returns `401 Unauthorized`. No cookie / session; the token is supplied by the operator (typed into a small login screen and stored in `sessionStorage`).
-3. The token is compared with `subtle.ConstantTimeCompare`, same pattern as `metricsToken` / `pprofToken`.
-4. The console never sees or proxies SigV4 credentials; it uses the coordinator directly via `SQSServer` methods that already run on the authenticated-as-the-server path.
+The console distinguishes **bootstrap assets** (the static HTML + JS that renders the login screen) from the **REST API** (everything the login screen talks to after the operator types their token). Requiring a bearer header on the bootstrap fetch would create a chicken-and-egg problem: the browser cannot attach `Authorization` before the login UI that collects the token has loaded.
+
+1. Loopback + no token configured: the console is fully open. This is the "one-liner dev" case.
+2. Token configured (any address): the split is:
+   - `GET /console/`, `GET /console/index.html`, `GET /console/assets/**` — **unauthenticated**. These serve the static bundle (HTML + JS + CSS) so the login UI can render.
+   - `GET/POST/PUT/DELETE /console/api/**` — **authenticated**. Every API call must carry `Authorization: Bearer <token>`. Missing or wrong token returns `401 Unauthorized`.
+   - `GET /console/api/health` is the one API endpoint that is also unauthenticated when a token is configured, so the login UI can render "leader: yes/no" before the operator signs in.
+3. The login UI submits the typed token to `/console/api/auth/ping` (a trivial authenticated no-op); on 200 it caches the token in `sessionStorage` and uses it for subsequent fetches. On 401 it shows the error and clears state.
+4. The token is compared with `subtle.ConstantTimeCompare`, same pattern as `metricsToken` / `pprofToken`.
+5. The console never sees or proxies SigV4 credentials; it uses the coordinator directly via `SQSServer` methods that already run on the authenticated-as-the-server path.
 
 ### 13.7 Failure and safety behaviors
 
