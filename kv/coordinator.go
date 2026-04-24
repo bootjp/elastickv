@@ -485,17 +485,29 @@ var leaderErrorPhrases = []string{
 	"leadership transfer in progress", // raftengine.ErrLeadershipTransferInProgress
 }
 
-// hasTransientLeaderPhrase reports whether err.Error() contains one of
-// the well-known transient-leader substrings. It is the last resort used
-// after errors.Is fails across a gRPC boundary that strips the original
-// sentinel chain.
+// hasTransientLeaderPhrase reports whether err.Error() ENDS WITH one of
+// the well-known transient-leader substrings. It is the last resort
+// used after errors.Is fails across a gRPC boundary that strips the
+// original sentinel chain.
+//
+// Suffix matching — not free-form Contains — is load-bearing here:
+// several non-leader errors embed user-controlled text in the middle
+// of their message. store.WriteConflictError, for example, formats as
+// "key: <user-key>: write conflict"; a conflicted key literally named
+// "not leader" would trip a Contains-based classifier and cause the
+// coordinator to spin retries (and reissue with fresh timestamps) on
+// what is actually a terminal business failure. Every wrapper we
+// observe in practice (cockroachdb Wrapf, fmt.Errorf %w-prefix, gRPC
+// status.Errorf's "rpc error: code = X desc = <orig>" form, plus any
+// stacking of those) places the original message at the END of the
+// composed string, so a suffix check is both tight and sufficient.
 func hasTransientLeaderPhrase(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	for _, phrase := range leaderErrorPhrases {
-		if strings.Contains(msg, phrase) {
+		if strings.HasSuffix(msg, phrase) {
 			return true
 		}
 	}

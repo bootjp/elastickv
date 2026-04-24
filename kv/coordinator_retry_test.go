@@ -95,6 +95,16 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 			fmt.Errorf("rpc error: code = Unknown desc = raft engine: leadership lost"), true},
 		{"unrelated error", errors.New("write conflict"), false},
 		{"validation error", errors.New("invalid request"), false},
+		// Codex P2 regression: before the HasSuffix switch this was
+		// misclassified as transient because the substring matcher
+		// saw "not leader" in the middle. store.WriteConflictError
+		// literally formats as "key: <user-key>: write conflict",
+		// and a user-chosen key can embed any of the phrases. Must
+		// stay a terminal business error.
+		{"write conflict with sneaky key matching leader phrase",
+			errors.New("key: not leader: write conflict"), false},
+		{"write conflict with key containing leadership lost",
+			errors.New("key: raft engine: leadership lost: write conflict"), false},
 	}
 
 	for _, tc := range cases {
