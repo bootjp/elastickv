@@ -71,9 +71,12 @@ elastickv は現在、DynamoDB 互換 (`adapter/dynamodb.go`) と S3 互換 (`ad
                         └─────────────┘
 ```
 
-- **Admin HTTP handler** (新規): 既存の `main.go` が起動する HTTP listener に `/admin/*` を追加する。
+- **Admin HTTP handler** (新規): `main.go` が **DynamoDB / S3 のデータプレーン listener (`:8000` / `:9000`) とは別に、専用の admin listener を起動する**。デフォルトは `127.0.0.1:8080` で loopback のみ (Section 7.1)。データプレーン listener と共有しない理由:
+  - admin 固有のガードレール (TLS 強制 / ボディサイズ 64 KiB / レート制限 / `allow_plaintext_non_loopback` フラグ) をデータプレーンのパブリック listener に誤適用しない。
+  - データプレーンを `0.0.0.0` で公開しつつ admin だけ loopback に閉じる、という典型的な運用を自然に許す。
+  - admin を完全に無効化する (`admin.enabled = false`) ときにデータプレーンのルーティングに影響しない。
 - **SPA** (新規): React + Vite でビルドした静的ファイルを `go:embed` し、admin handler が配信。
-- Admin handler は内部的に **DynamoDB / S3 adapter と同じハンドラ関数を呼び出す**。独自のストレージ書き込みは実装しない。
+- Admin handler は内部的に **DynamoDB / S3 adapter と同じハンドラ関数を呼び出す** (Section 3.2 の内部エントリポイント経由)。独自のストレージ書き込みは実装しない。
 
 ### 3.1 Why re-use existing adapters instead of going direct to `store/`
 
