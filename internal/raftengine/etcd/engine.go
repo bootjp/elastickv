@@ -113,34 +113,34 @@ const (
 	// a warning (same policy as sub-1 values) so a misconfigured
 	// operator never hard-breaks startup.
 	maxMaxInflightMsg = 8192
-	// raftMessageEnvelopeHeadroom is the safety margin subtracted from
-	// GRPCMaxMessageBytes when computing maxMaxSizePerMsg. etcd/raft's
-	// MaxSizePerMsg caps the *entries data* per MsgApp, not the
-	// serialized raftpb.Message envelope that actually crosses the
-	// transport. The envelope adds Term/Index/From/To/LogTerm/Commit
-	// plus per-entry framing around every Entry, so a batch that
-	// exactly hits MaxSizePerMsg serializes to a frame slightly
-	// larger than MaxSizePerMsg. If MaxSizePerMsg == GRPCMaxMessageBytes,
-	// a full-sized batch can tip the frame a few KiB past the
-	// transport limit and replication fails with ResourceExhausted
-	// even though the env-var value passed validation.
-	//
-	// 1 MiB is an order-of-magnitude cushion over the observed wire
-	// overhead for 8192-entry batches at MaxSizePerMsg (~tens of KiB).
-	// Reserving it here keeps the transport budget as the single
-	// source of truth while making the env override a *safe* bound.
-	raftMessageEnvelopeHeadroom uint64 = 1 << 20
 	// maxMaxSizePerMsg caps the environment override for
-	// MaxSizePerMsg at the Raft transport's per-message budget MINUS
-	// the envelope headroom (see raftMessageEnvelopeHeadroom). The
-	// server- and dial-side gRPC options (see internal.GRPCMaxMessageBytes)
-	// reject frames larger than 64 MiB, so allowing MaxSizePerMsg to
-	// reach the transport limit exactly can still make Raft emit
-	// MsgApp frames the transport cannot carry once envelope overhead
-	// is added. Clamping to (budget - headroom) makes the override a
-	// *safe* bound under real batching. Values above this clamp back
-	// to the default with a warning.
-	maxMaxSizePerMsg = uint64(internalutil.GRPCMaxMessageBytes) - raftMessageEnvelopeHeadroom
+	// MaxSizePerMsg at HALF of the Raft transport's per-message budget
+	// (internal.GRPCMaxMessageBytes). Half — not an arbitrary subtraction
+	// — because etcd-raft's limitSize counts only Entry.Size() per entry
+	// when deciding whether to extend a batch, but the serialized
+	// raftpb.Message that actually crosses the wire ALSO carries
+	// per-entry framing inside its Entries repeated field
+	// (`1 + len(varint) + entry`), plus the outer Message envelope
+	// (Term/Index/From/To/LogTerm/Commit/etc.).
+	//
+	// Worst-case ratio analysis: a minimal Entry (no Data) has
+	// Size() ≈ 4 B (Term + Index + Type tags+varints). Its outer-
+	// Message framing is `1 + sovRaft(4)` = 2 B. So tiny-entry
+	// batches encode at up to 1.5× the entries-data budget on the
+	// wire. Realistic data-bearing entries (e.g. 100 B+ payloads)
+	// shrink this ratio to <1.05×, but the cap MUST cover the
+	// worst case to make the env override a safe bound rather than
+	// pushing the failure mode out to "ResourceExhausted under
+	// tiny-entry workloads".
+	//
+	// Halving the transport budget admits the worst-case 1.5× growth
+	// (32 MiB entries-data → 48 MiB on wire ≪ 64 MiB transport limit)
+	// and leaves ample headroom for realistic batching. Operators
+	// who genuinely need a higher cap should raise GRPCMaxMessageBytes
+	// in a deliberate, paired action and adjust this divisor with the
+	// same worst-case analysis.
+	maxMaxSizePerMsgDivisor uint64 = 2
+	maxMaxSizePerMsg               = uint64(internalutil.GRPCMaxMessageBytes) / maxMaxSizePerMsgDivisor
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages

@@ -1961,21 +1961,41 @@ func TestMaxSizePerMsgFromEnv_AcceptsAtCap(t *testing.T) {
 }
 
 // TestMaxMaxSizePerMsg_ReservesEnvelopeHeadroom pins the invariant that
-// the MaxSizePerMsg upper cap is strictly less than GRPCMaxMessageBytes,
-// by exactly raftMessageEnvelopeHeadroom bytes. etcd/raft's
-// MaxSizePerMsg caps the entries-data size per MsgApp; the full
-// serialized raftpb.Message envelope adds Term/Index/From/To plus
-// per-entry framing, so a batch that exactly hits MaxSizePerMsg
-// serializes to a frame a few KiB larger than MaxSizePerMsg. If the
-// cap matched the transport budget exactly, a full-sized batch could
-// overflow the transport and fail replication with ResourceExhausted.
-// Raising GRPCMaxMessageBytes without updating this cap (or vice
-// versa) MUST be a deliberate, paired action.
+// the MaxSizePerMsg upper cap is at most half the gRPC transport budget.
+// etcd-raft's limitSize counts only Entry.Size() per entry, but the
+// serialized raftpb.Message also carries per-entry framing (`1 + len-
+// varint + entry`) inside its Entries repeated field. For minimal
+// 4-byte entries, the outer framing is 2 bytes per entry, so the wire
+// representation can be up to 1.5x the entries-data budget. Halving
+// the transport budget covers that worst case (32 MiB entries-data →
+// 48 MiB on wire, well below the 64 MiB transport limit) and is the
+// minimum cap that makes the env override safe under tiny-entry
+// workloads. Raising GRPCMaxMessageBytes without re-deriving this
+// divisor MUST be a deliberate, paired action.
 func TestMaxMaxSizePerMsg_ReservesEnvelopeHeadroom(t *testing.T) {
-	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes)-raftMessageEnvelopeHeadroom, maxMaxSizePerMsg,
-		"maxMaxSizePerMsg must be GRPCMaxMessageBytes - raftMessageEnvelopeHeadroom")
+	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes)/maxMaxSizePerMsgDivisor, maxMaxSizePerMsg,
+		"maxMaxSizePerMsg must be GRPCMaxMessageBytes / maxMaxSizePerMsgDivisor")
+	require.LessOrEqual(t, maxMaxSizePerMsg, uint64(internalutil.GRPCMaxMessageBytes)/2,
+		"maxMaxSizePerMsg must be at most half the transport budget to absorb worst-case per-entry framing on tiny-entry batches")
 	require.Less(t, maxMaxSizePerMsg, uint64(internalutil.GRPCMaxMessageBytes),
 		"maxMaxSizePerMsg must leave strict headroom below the transport budget")
+}
+
+// TestMaxMaxSizePerMsg_AbsorbsTinyEntryFraming pins the *quantitative*
+// safety claim: even at the worst-case per-entry framing ratio
+// (minimum Entry.Size() = 4 B + 2 B framing = 1.5x growth), a fully
+// packed MsgApp at maxMaxSizePerMsg fits inside GRPCMaxMessageBytes
+// with margin to spare. Catches a future change that raises
+// maxMaxSizePerMsgDivisor below 2 (which would re-introduce the
+// "tiny-entry workloads can ResourceExhaust gRPC" failure mode Codex
+// flagged).
+func TestMaxMaxSizePerMsg_AbsorbsTinyEntryFraming(t *testing.T) {
+	const minEntrySize = uint64(4) // Term + Index + Type tags+varints, no Data
+	const minFraming = uint64(2)   // 1 (field tag) + sovRaft(4) = 1 (length varint)
+	const worstCaseRatio = minEntrySize + minFraming
+	maxWireBytes := maxMaxSizePerMsg / minEntrySize * worstCaseRatio
+	require.LessOrEqual(t, maxWireBytes, uint64(internalutil.GRPCMaxMessageBytes),
+		"worst-case wire size for tiny-entry batches must fit inside the transport budget")
 }
 
 // TestNormalizeLimitConfig_ClampsCallerOverlimitInflight pins that a
