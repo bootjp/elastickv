@@ -248,10 +248,24 @@ var redisInternalTrimPrefixes = []string{
 	redisStreamPrefix,
 }
 
+// redisInternalTrimPrefixBytes is a pre-allocated [][]byte mirror of
+// redisInternalTrimPrefixes so extractRedisInternalUserKey does not
+// allocate a new []byte on every call.
+var redisInternalTrimPrefixBytes = func() [][]byte {
+	out := make([][]byte, len(redisInternalTrimPrefixes))
+	for i, s := range redisInternalTrimPrefixes {
+		out[i] = []byte(s)
+	}
+	return out
+}()
+
+// redisTTLPrefixBytes is the pre-allocated []byte form of redisTTLPrefix.
+var redisTTLPrefixBytes = []byte(redisTTLPrefix)
+
 func extractRedisInternalUserKey(key []byte) []byte {
-	for _, prefix := range redisInternalTrimPrefixes {
-		if bytes.HasPrefix(key, []byte(prefix)) {
-			return bytes.TrimPrefix(key, []byte(prefix))
+	for _, prefix := range redisInternalTrimPrefixBytes {
+		if bytes.HasPrefix(key, prefix) {
+			return bytes.TrimPrefix(key, prefix)
 		}
 	}
 	// Post-migration streams: the meta record reverse-maps to the logical
@@ -262,7 +276,7 @@ func extractRedisInternalUserKey(key []byte) []byte {
 		return store.ExtractStreamUserKeyFromMeta(key)
 	case store.IsStreamEntryKey(key):
 		return nil
-	case bytes.HasPrefix(key, []byte(redisTTLPrefix)):
+	case bytes.HasPrefix(key, redisTTLPrefixBytes):
 		return nil
 	default:
 		return nil

@@ -120,7 +120,7 @@ func marshalStreamEntry(entry redisStreamEntry) ([]byte, error) {
 // supplies the raw value bytes loaded from an entry key.
 func unmarshalStreamEntry(raw []byte) (redisStreamEntry, error) {
 	if len(raw) == 0 {
-		return redisStreamEntry{}, nil
+		return redisStreamEntry{}, errUnrecognizedStoredRedisFormat
 	}
 	if !hasStoredRedisPrefix(raw, storedRedisStreamEntryProtoPrefix) {
 		return redisStreamEntry{}, errUnrecognizedStoredRedisFormat

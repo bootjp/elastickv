@@ -4283,7 +4283,16 @@ func (r *RedisServer) readStreamAfter(ctx context.Context, key []byte, readTS ui
 // maxWideScanLimit (which is maxWideColumnItems+1) and reject if the scan
 // filled, so an XREAD without COUNT cannot OOM the server on a pathological
 // stream.
+//
+// afterID must be a parseable stream ID in either the strict "ms-seq" form or
+// the shorthand "ms" form (no dash), which Redis normalises to "ms-0".
+// Genuinely malformed IDs are rejected immediately so the caller never
+// receives a full-stream result set for invalid input.
 func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, readTS uint64, afterID string, count int) ([]redisStreamEntry, error) {
+	afterID, ok := normalizeStreamAfterID(afterID)
+	if !ok {
+		return nil, errors.New("ERR Invalid stream ID specified as stream command argument")
+	}
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	start := streamScanStartForAfter(prefix, afterID)
@@ -4312,9 +4321,9 @@ func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, re
 
 // streamScanStartForAfter returns the inclusive start key to use for an
 // XREAD-style "after afterID" range scan. If afterID parses cleanly we
-// start at ID+1 so the scan is exclusive of afterID. If afterID is
-// malformed we fall back to the entry prefix, which is conservatively
-// wider and will be filtered above.
+// start at ID+1 so the scan is exclusive of afterID. Callers must validate
+// afterID before calling this function; if afterID is unparseable, the
+// returned prefix is the entry-prefix start, which gives a full scan.
 //
 // Edge case: if afterID is (math.MaxUint64-math.MaxUint64), there is no
 // successor ID inside the entry-prefix keyspace, so the correct start is
@@ -4343,6 +4352,23 @@ func streamScanStartForAfter(prefix []byte, afterID string) []byte {
 	start = append(start, prefix...)
 	start = append(start, store.EncodeStreamID(ms, seq)...)
 	return start
+}
+
+// normalizeStreamAfterID normalises an XREAD afterID to the strict "ms-seq"
+// form used by tryParseRedisStreamID. Redis accepts a shorthand "ms" form
+// (no dash) as meaning "ms-0". Truly invalid IDs — those that are neither
+// valid "ms-seq" strings nor parseable as a bare uint64 — return ("", false).
+func normalizeStreamAfterID(id string) (string, bool) {
+	if strings.IndexByte(id, '-') >= 0 {
+		_, ok := tryParseRedisStreamID(id)
+		return id, ok
+	}
+	// Shorthand: bare millisecond component only. Redis treats "ms" as "ms-0"
+	// for XREAD after-IDs (entries strictly after ms-0).
+	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+		return "", false
+	}
+	return id + "-0", true
 }
 
 func writeStreamEntry(conn redcon.Conn, entry redisStreamEntry) {
