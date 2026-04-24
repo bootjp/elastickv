@@ -234,10 +234,18 @@ func readLoginRequest(w http.ResponseWriter, r *http.Request) (loginRequest, boo
 // expensive KDF would add latency to every login attempt without
 // changing the threat model.
 var (
-	secretCompareKey      []byte
-	secretCompareKeyOnce  sync.Once
-	unknownKeyPlaceholder []byte
+	secretCompareKey     []byte
+	secretCompareKeyOnce sync.Once
 )
+
+// unknownKeySecretPlaceholder is a deterministic dummy we hash when
+// the incoming access key is unknown. We hash it fresh on every call
+// (rather than precomputing the digest once) so the unknown-key
+// branch performs the same HMAC work as the known-key branch —
+// otherwise an attacker could enumerate valid access keys by
+// measuring login latency. It is NOT a credential: nothing grants
+// access to any resource, and grepping for it finds only this file.
+const unknownKeySecretPlaceholder = "admin-auth-unknown-key-placeholder" //nolint:gosec // intentional non-credential sentinel; see comment above.
 
 func initSecretCompareKey() {
 	secretCompareKey = make([]byte, sha256.Size)
@@ -247,12 +255,6 @@ func initSecretCompareKey() {
 		// cannot authenticate anyone anyway.
 		panic("admin: crypto/rand failure while initialising secret compare key: " + err.Error())
 	}
-	// Materialise the unknown-key-placeholder digest exactly once so
-	// the login failure hot path does not re-run HMAC on every try;
-	// the value is deterministic given secretCompareKey.
-	mac := hmac.New(sha256.New, secretCompareKey)
-	mac.Write([]byte("admin-auth-unknown-key-placeholder"))
-	unknownKeyPlaceholder = mac.Sum(nil)
 }
 
 // digestForCompare returns HMAC-SHA256(secretCompareKey, s). Used only
@@ -265,14 +267,18 @@ func digestForCompare(s string) []byte {
 }
 
 func (s *AuthService) authenticate(w http.ResponseWriter, req loginRequest) (AuthPrincipal, bool) {
-	// digestForCompare runs secretCompareKeyOnce.Do internally, so by
-	// the time it returns unknownKeyPlaceholder is already populated.
 	providedHash := digestForCompare(req.SecretKey)
 	expected, known := s.creds.LookupSecret(req.AccessKey)
-	expectedHash := unknownKeyPlaceholder
-	if known {
-		expectedHash = digestForCompare(expected)
+	// Compute the expected digest fresh in BOTH branches so the
+	// amount of HMAC work is identical regardless of whether the
+	// access key is known. A precomputed placeholder digest would
+	// make the unknown-key path measurably faster, letting an
+	// attacker enumerate valid access keys via login latency.
+	expectedSecret := expected
+	if !known {
+		expectedSecret = unknownKeySecretPlaceholder
 	}
+	expectedHash := digestForCompare(expectedSecret)
 	match := subtle.ConstantTimeCompare(providedHash, expectedHash) == 1
 	if !known || !match {
 		writeJSONError(w, http.StatusUnauthorized, "invalid_credentials",
