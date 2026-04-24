@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -112,17 +113,34 @@ const (
 	// a warning (same policy as sub-1 values) so a misconfigured
 	// operator never hard-breaks startup.
 	maxMaxInflightMsg = 8192
+	// raftMessageEnvelopeHeadroom is the safety margin subtracted from
+	// GRPCMaxMessageBytes when computing maxMaxSizePerMsg. etcd/raft's
+	// MaxSizePerMsg caps the *entries data* per MsgApp, not the
+	// serialized raftpb.Message envelope that actually crosses the
+	// transport. The envelope adds Term/Index/From/To/LogTerm/Commit
+	// plus per-entry framing around every Entry, so a batch that
+	// exactly hits MaxSizePerMsg serializes to a frame slightly
+	// larger than MaxSizePerMsg. If MaxSizePerMsg == GRPCMaxMessageBytes,
+	// a full-sized batch can tip the frame a few KiB past the
+	// transport limit and replication fails with ResourceExhausted
+	// even though the env-var value passed validation.
+	//
+	// 1 MiB is an order-of-magnitude cushion over the observed wire
+	// overhead for 8192-entry batches at MaxSizePerMsg (~tens of KiB).
+	// Reserving it here keeps the transport budget as the single
+	// source of truth while making the env override a *safe* bound.
+	raftMessageEnvelopeHeadroom uint64 = 1 << 20
 	// maxMaxSizePerMsg caps the environment override for
-	// MaxSizePerMsg at the Raft transport's per-message budget. The
+	// MaxSizePerMsg at the Raft transport's per-message budget MINUS
+	// the envelope headroom (see raftMessageEnvelopeHeadroom). The
 	// server- and dial-side gRPC options (see internal.GRPCMaxMessageBytes)
-	// reject frames larger than 64 MiB, so a MaxSizePerMsg above that
-	// makes Raft emit MsgApp payloads the transport physically cannot
-	// carry, producing repeated send failures / unreachable reports
-	// under large batches. Keeping this equal to GRPCMaxMessageBytes
-	// makes the transport budget the single source of truth — raise
-	// BOTH together, never this one alone. Values above this clamp
-	// back to the default with a warning.
-	maxMaxSizePerMsg uint64 = 64 << 20
+	// reject frames larger than 64 MiB, so allowing MaxSizePerMsg to
+	// reach the transport limit exactly can still make Raft emit
+	// MsgApp frames the transport cannot carry once envelope overhead
+	// is added. Clamping to (budget - headroom) makes the override a
+	// *safe* bound under real batching. Values above this clamp back
+	// to the default with a warning.
+	maxMaxSizePerMsg = uint64(internalutil.GRPCMaxMessageBytes) - raftMessageEnvelopeHeadroom
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages

@@ -1960,15 +1960,22 @@ func TestMaxSizePerMsgFromEnv_AcceptsAtCap(t *testing.T) {
 	require.Equal(t, maxMaxSizePerMsg, n)
 }
 
-// TestMaxMaxSizePerMsg_MatchesTransportBudget pins the invariant that
-// the MaxSizePerMsg upper cap equals GRPCMaxMessageBytes. If someone
-// raises the transport budget without updating the Raft cap (or vice
-// versa), MaxSizePerMsg overrides would silently allow values that
-// cannot traverse the wire. Changing this constant MUST be a
-// deliberate, paired action.
-func TestMaxMaxSizePerMsg_MatchesTransportBudget(t *testing.T) {
-	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes), maxMaxSizePerMsg,
-		"maxMaxSizePerMsg must track internal.GRPCMaxMessageBytes — raise both together")
+// TestMaxMaxSizePerMsg_ReservesEnvelopeHeadroom pins the invariant that
+// the MaxSizePerMsg upper cap is strictly less than GRPCMaxMessageBytes,
+// by exactly raftMessageEnvelopeHeadroom bytes. etcd/raft's
+// MaxSizePerMsg caps the entries-data size per MsgApp; the full
+// serialized raftpb.Message envelope adds Term/Index/From/To plus
+// per-entry framing, so a batch that exactly hits MaxSizePerMsg
+// serializes to a frame a few KiB larger than MaxSizePerMsg. If the
+// cap matched the transport budget exactly, a full-sized batch could
+// overflow the transport and fail replication with ResourceExhausted.
+// Raising GRPCMaxMessageBytes without updating this cap (or vice
+// versa) MUST be a deliberate, paired action.
+func TestMaxMaxSizePerMsg_ReservesEnvelopeHeadroom(t *testing.T) {
+	require.Equal(t, uint64(internalutil.GRPCMaxMessageBytes)-raftMessageEnvelopeHeadroom, maxMaxSizePerMsg,
+		"maxMaxSizePerMsg must be GRPCMaxMessageBytes - raftMessageEnvelopeHeadroom")
+	require.Less(t, maxMaxSizePerMsg, uint64(internalutil.GRPCMaxMessageBytes),
+		"maxMaxSizePerMsg must leave strict headroom below the transport budget")
 }
 
 // TestNormalizeLimitConfig_DefaultsWhenUnset pins the production defaults
