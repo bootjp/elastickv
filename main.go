@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -14,11 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/cockroachdb/errors"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
@@ -31,6 +27,10 @@ import (
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 const (
@@ -131,7 +131,12 @@ func main() {
 	if memoryPressureExit.Load() {
 		// memwatch fired: surface exit code 2 regardless of whether run()
 		// returned a nil or an error (cancel() can cause in-flight
-		// listeners to return spurious errors during shutdown).
+		// listeners to return spurious errors during shutdown). Still
+		// log any residual error so a secondary failure during the
+		// graceful shutdown is visible in logs rather than swallowed.
+		if err != nil {
+			slog.Warn("shutdown error after memory pressure", "error", err)
+		}
 		os.Exit(exitCodeMemoryPressure)
 	}
 	if err != nil {
@@ -158,10 +163,20 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 	if mb == 0 {
 		return memwatch.Config{}, false
 	}
+	// Guard against mb * bytesPerMiB wrapping past math.MaxUint64. The
+	// value has no real use above this ceiling (the host does not have
+	// exabytes of RAM), and a wrapped value would set an absurdly low
+	// threshold that fires immediately.
+	if mb > math.MaxUint64/bytesPerMiB {
+		slog.Warn("value for "+memoryShutdownThresholdEnvVar+" would overflow uint64; watcher disabled",
+			"value_mb", mb)
+		return memwatch.Config{}, false
+	}
 
 	cfg := memwatch.Config{
 		ThresholdBytes: mb * bytesPerMiB,
 	}
+	cfg.PollInterval = memwatch.DefaultPollInterval
 	if rawInterval := strings.TrimSpace(os.Getenv(memoryShutdownPollIntervalEnvVar)); rawInterval != "" {
 		d, err := time.ParseDuration(rawInterval)
 		if err != nil || d <= 0 {
