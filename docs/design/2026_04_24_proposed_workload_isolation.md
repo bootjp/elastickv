@@ -94,17 +94,30 @@ command byte" simplicity, and a bounded `ZRANGE 0 10` contributes at
 most one unmarshal per request (cheap). Dynamic (observed-cost)
 classification is a follow-up; v1 bias is a boring, reviewable list.
 
-**Blocking `XREAD BLOCK ms` is a special case** — it may hold a
-worker slot for up to `ms` milliseconds while doing no work, which
-can trivially exhaust the pool if even a handful of long-polling
-consumers are active. v1 resolution: **blocking variants (`XREAD
-BLOCK`, `BLPOP`, `BRPOP`, `BZPOPMIN`/`MAX`) bypass the heavy-command
-pool and are handled on their own goroutine**. They are I/O-bound
-waiting, not CPU-bound; their CPU cost lands on wake-up, when the
-dispatcher can re-evaluate whether to gate the follow-up work. The
-gating decision is made in `dispatchCommand` when it sees the command
-name plus the `BLOCK`/`B*` prefix — the simplest arg inspection we
-allow, limited to "is this command blocking?".
+**Blocking variants are NOT I/O-bound in the current implementation.**
+`XREAD BLOCK ms`, `BLPOP`, `BRPOP`, `BZPOPMIN`/`MAX` look idle from
+the outside but the adapter (`adapter/redis_compat_commands.go:xread`,
+`:bzpopmin` around line 3432) implements them as a **busy-poll loop**:
+on a miss it calls `time.Sleep(redisBusyPollBackoff)` and re-issues
+the underlying KV+leader lookup. Every wake-up does CPU work and a
+Raft leadership round-trip, then sleeps again. A pool-bypass for
+"blocking" variants under this implementation would hand them
+unbounded CPU on the fast path, the opposite of what we want.
+
+**v1 resolution: keep the blocking variants gated** alongside the
+other heavy commands. Reject with `-BUSY` when the pool is full,
+same as XREAD. The behaviour is strictly worse than a true
+condition-variable wake-up (which would be slot-free), but correct
+under the existing busy-poll, and consistent with the rest of the
+heavy-command accounting.
+
+**Stacked follow-up to unblock a real bypass:** replace the
+busy-poll with a condvar/notification hook fed by the write path.
+Only after that lands can blocking variants honestly be called
+I/O-bound; at that point carve them out of the pool with the
+simplest form of arg inspection (`XREAD …BLOCK…`, `B*POP`) and
+re-evaluate pool sizing. Tracked as a separate item in the stream
+and list/zset adapters; not required by Layer 1 v1.
 
 ### Tradeoffs
 
@@ -143,6 +156,22 @@ that reliably distinguishes "new client request" from "inner call"
 without tagging every goroutine or holding a pool-wide set of
 goroutine IDs. The sentinel must be package-private so external
 callers cannot fake it.
+
+**Caveat — `runLuaScript` currently clobbers the parent ctx.**
+`adapter/redis_lua.go:runLuaScript` builds its per-script context as
+`context.WithTimeout(context.Background(), ...)`, which throws away
+the `ctxKeyInPoolSlot` sentinel that `Submit` attached when it
+dispatched the outer `EVAL`/`EVALSHA`. Option (A) is therefore not
+implementable as-is — the inner `redis.call` would see a plain
+background context and try to acquire another pool slot, triggering
+the exact deadlock we were trying to avoid.
+
+The implementation PR MUST fix this before enabling the pool gate
+on Lua. The fix is to replace `context.Background()` with the
+caller-supplied `ctx` (a timeout derived from it, not from
+`Background`) so the sentinel propagates. This is a one-line change
+but a blocker for Layer 1 v1; Layer 1 must not ship without it or
+Lua inside the pool will self-deadlock under steady load.
 
 ### Recommended v1 shape
 
@@ -417,10 +446,36 @@ during chunked migration — entries still in the legacy suffix would
 be invisible to readers until the suffix was fully drained. Mode B
 must ship together with the "always merge" read rule.
 
-`elastickv_stream_legacy_format_reads_total` counts reads that
-touched a legacy-format key in either mode. Remove the legacy
-fallback only after it has sat at zero across all nodes for a soak
-window.
+**Mode B cost model.** Decoding the legacy-suffix blob on every read
+is O(N_suffix) protobuf unmarshal — the exact cost that Layer 4 was
+introduced to eliminate. A partially-migrated stream therefore
+still has the pre-fix hot path, just bounded by the suffix size
+rather than the full stream size. Two mitigations:
+
+- The migrator uses a **read-driven drain**: when a read observes a
+  suffix blob, it enqueues a low-priority rewrite-N-entries job so
+  hot streams drain first. Cold streams drain on their next write.
+- Exporting `elastickv_stream_legacy_suffix_entries{stream}` as a
+  top-N sketch lets operators see which streams still carry a
+  suffix and size the `STREAM_MIGRATION_CHUNK` accordingly.
+
+Neither fully reclaims Layer 4's O(new) guarantee during the
+migration window; operators who cannot tolerate the transient cost
+must stay on Mode A and accept the single-txn cost of the initial
+migration instead.
+
+**Legacy-fallback removal criterion.** Just watching
+`elastickv_stream_legacy_format_reads_total == 0` is insufficient —
+a cold legacy-format stream that is neither read nor written for
+the soak window would keep the counter at zero while still needing
+the fallback. Add a paired counter
+`elastickv_stream_legacy_format_keys_total` populated from a
+periodic prefix scan (`!redis|stream|<...>` with no matching
+`!stream|meta|<...>`). The fallback is safe to remove only when
+**both** counters are zero across every node. The periodic scan
+runs at the same cadence as snapshot cleanup; its cost is bounded
+by the number of legacy keys remaining, which decays as migration
+progresses.
 
 The existing stream PR (#620) ships **Mode A only**. Chunked
 migration (Mode B) is explicitly deferred and must not be enabled
