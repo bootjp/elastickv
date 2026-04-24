@@ -353,11 +353,17 @@
                                         (range))
                                    (gen/repeat {:f :read})])
                          (gen/limit max-writes))))
+     ;; :competition runs Knossos's graph-search (:linear) and tree-search
+     ;; (:wgl) algorithms in parallel and returns whichever proves a verdict
+     ;; first.  :linear alone times out on dense Jepsen histories and yields
+     ;; :valid? :unknown, which fail-on-invalid! then treats as a hard
+     ;; failure; :competition avoids that by letting :wgl win on the
+     ;; workloads where it is faster.
      :checker   (independent/checker
                   (checker/compose
                     {:linear   (checker/linearizable
                                  {:model     (model/register)
-                                  :algorithm :linear})
+                                  :algorithm :competition})
                      :timeline (timeline/html)}))}))
 
 (defn elastickv-dynamodb-types-test
