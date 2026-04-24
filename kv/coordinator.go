@@ -471,9 +471,18 @@ func isTransientLeaderError(err error) bool {
 // addition must correspond to an error the system actually emits for
 // leader churn, not a generic "failed" message that happens to mention
 // leaders.
+//
+// Every string here MUST be paired with a kv/raftengine/adapter
+// sentinel in isLeadershipLossError or isTransientLeaderError so the
+// typed-sentinel path catches the same condition when the error chain
+// is intact. TestIsTransientLeaderError_PinsRealSentinels locks the
+// sentinel .Error() texts to this list; a rename on the sentinel side
+// will fail that test and force a matching update here.
 var leaderErrorPhrases = []string{
-	"not leader",       // adapter.ErrNotLeader, raftengine.ErrNotLeader, ErrLeadershipLost messages
-	"leader not found", // kv.ErrLeaderNotFound, adapter.ErrLeaderNotFound
+	"not leader",                      // adapter.ErrNotLeader, raftengine.ErrNotLeader ("raft engine: not leader")
+	"leader not found",                // kv.ErrLeaderNotFound, adapter.ErrLeaderNotFound
+	"leadership lost",                 // raftengine.ErrLeadershipLost ("raft engine: leadership lost")
+	"leadership transfer in progress", // raftengine.ErrLeadershipTransferInProgress
 }
 
 // hasTransientLeaderPhrase reports whether err.Error() contains one of

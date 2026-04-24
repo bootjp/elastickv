@@ -83,9 +83,16 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 		{"kv.ErrLeaderNotFound", cerrors.WithStack(ErrLeaderNotFound), true},
 		{"raftengine.ErrNotLeader", cerrors.WithStack(raftengine.ErrNotLeader), true},
 		{"raftengine.ErrLeadershipLost", cerrors.WithStack(raftengine.ErrLeadershipLost), true},
+		{"raftengine.ErrLeadershipTransferInProgress",
+			cerrors.WithStack(raftengine.ErrLeadershipTransferInProgress), true},
 		{"wire not-leader string", errors.New("not leader"), true},
 		{"wire leader-not-found string", errors.New("leader not found"), true},
+		{"wire leadership-lost string", errors.New("raft engine: leadership lost"), true},
+		{"wire leadership-transfer string",
+			errors.New("raft engine: leadership transfer in progress"), true},
 		{"gRPC status wrapping not leader", fmt.Errorf("rpc error: code = Unknown desc = not leader"), true},
+		{"gRPC status wrapping leadership lost",
+			fmt.Errorf("rpc error: code = Unknown desc = raft engine: leadership lost"), true},
 		{"unrelated error", errors.New("write conflict"), false},
 		{"validation error", errors.New("invalid request"), false},
 	}
@@ -270,6 +277,8 @@ func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
 		{"kv.ErrLeaderNotFound", ErrLeaderNotFound},
 		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader},
 		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost},
+		{"raftengine.ErrLeadershipTransferInProgress",
+			raftengine.ErrLeadershipTransferInProgress},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
