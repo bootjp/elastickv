@@ -327,6 +327,132 @@ func TestServer_DynamoTables_NilSourceFallsThroughTo404(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// loginAsFullAdminAndCookies returns cookies for a full-access
+// principal so write-path integration tests can hit
+// POST/DELETE endpoints without copy-pasting the login dance.
+func loginAsFullAdminAndCookies(t *testing.T, ts *httptest.Server) []*http.Cookie {
+	t.Helper()
+	body, _ := json.Marshal(loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "ADMIN_SECRET"})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/auth/login", strings.NewReader(string(body)))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cookies := resp.Cookies()
+	_ = resp.Body.Close()
+	return cookies
+}
+
+// csrfHeaderFromCookies extracts the admin_csrf cookie value so the
+// write tests can attach the X-Admin-CSRF header. The double-submit
+// middleware compares the two; missing the header would reject the
+// request before it reaches the dynamo handler under test.
+func csrfHeaderFromCookies(cookies []*http.Cookie) string {
+	for _, c := range cookies {
+		if c.Name == csrfCookieName {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+func TestServer_DynamoCreateTable_FullRoleHappyPath(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAsFullAdminAndCookies(t, ts)
+	body := strings.NewReader(`{"table_name":"users","partition_key":{"name":"id","type":"S"}}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/dynamo/tables", body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, csrfHeaderFromCookies(cookies))
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	require.Equal(t, "users", src.lastCreateInput.TableName)
+	require.Equal(t, RoleFull, src.lastCreatePrincipal.Role)
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoCreateTable_ReadOnlyRoleRejected(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAndCookies(t, ts) // read-only key
+	body := strings.NewReader(`{"table_name":"users","partition_key":{"name":"id","type":"S"}}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/dynamo/tables", body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, csrfHeaderFromCookies(cookies))
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	require.Empty(t, src.lastCreateInput.TableName, "source must not be reached on role rejection")
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoCreateTable_MissingCSRFRejected(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAsFullAdminAndCookies(t, ts)
+	body := strings.NewReader(`{"table_name":"users","partition_key":{"name":"id","type":"S"}}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/dynamo/tables", body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately *no* X-Admin-CSRF header. CSRFDoubleSubmit must
+	// reject before the handler ever sees the body.
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	require.Empty(t, src.lastCreateInput.TableName, "CSRF gate must run before the handler")
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoDeleteTable_FullRoleHappyPath(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"users": {Name: "users", PartitionKey: "id"},
+	}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAsFullAdminAndCookies(t, ts)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete,
+		ts.URL+"/admin/api/v1/dynamo/tables/users", nil)
+	require.NoError(t, err)
+	req.Header.Set(csrfHeaderName, csrfHeaderFromCookies(cookies))
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	require.Equal(t, "users", src.lastDeleteName)
+	require.Equal(t, RoleFull, src.lastDeletePrincipal.Role)
+	_ = resp.Body.Close()
+}
+
 func TestServer_WriteRejectsMissingCSRF(t *testing.T) {
 	// Login to obtain a session, then hit cluster with POST to trigger
 	// CSRF on what the router normally rejects as method_not_allowed.

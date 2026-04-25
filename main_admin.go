@@ -153,6 +153,93 @@ func (b *dynamoTablesBridge) AdminDescribeTable(ctx context.Context, name string
 	return convertAdminTableSummary(summary), true, nil
 }
 
+func (b *dynamoTablesBridge) AdminCreateTable(ctx context.Context, principal admin.AuthPrincipal, in admin.CreateTableRequest) (*admin.DynamoTableSummary, error) {
+	summary, err := b.server.AdminCreateTable(ctx, convertAdminPrincipal(principal), convertCreateTableInput(in))
+	if err != nil {
+		return nil, translateAdminTablesError(err)
+	}
+	return convertAdminTableSummary(summary), nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteTable(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteTable(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminTablesError(err)
+	}
+	return nil
+}
+
+// convertAdminPrincipal mirrors admin.AuthPrincipal onto the
+// adapter's parallel struct. Both packages keep the principal type
+// independent so the adapter stays free of internal/admin
+// dependencies, but the role / access-key fields are deliberately
+// 1:1 — any drift is a wiring bug, not a feature.
+func convertAdminPrincipal(p admin.AuthPrincipal) adapter.AdminPrincipal {
+	role := adapter.AdminRoleReadOnly
+	if p.Role.AllowsWrite() {
+		role = adapter.AdminRoleFull
+	}
+	return adapter.AdminPrincipal{AccessKey: p.AccessKey, Role: role}
+}
+
+// convertCreateTableInput translates the admin-handler request DTO
+// into the adapter's parallel input struct. We do this here — not
+// in the admin package — to keep `internal/admin` free of any
+// adapter import.
+func convertCreateTableInput(in admin.CreateTableRequest) adapter.AdminCreateTableInput {
+	out := adapter.AdminCreateTableInput{
+		TableName:    in.TableName,
+		PartitionKey: adapter.AdminAttribute{Name: in.PartitionKey.Name, Type: in.PartitionKey.Type},
+	}
+	if in.SortKey != nil {
+		out.SortKey = &adapter.AdminAttribute{Name: in.SortKey.Name, Type: in.SortKey.Type}
+	}
+	if len(in.GSI) == 0 {
+		return out
+	}
+	out.GSI = make([]adapter.AdminCreateGSI, len(in.GSI))
+	for i, g := range in.GSI {
+		gsi := adapter.AdminCreateGSI{
+			Name:             g.Name,
+			PartitionKey:     adapter.AdminAttribute{Name: g.PartitionKey.Name, Type: g.PartitionKey.Type},
+			ProjectionType:   g.Projection.Type,
+			NonKeyAttributes: append([]string(nil), g.Projection.NonKeyAttributes...),
+		}
+		if g.SortKey != nil {
+			gsi.SortKey = &adapter.AdminAttribute{Name: g.SortKey.Name, Type: g.SortKey.Type}
+		}
+		out.GSI[i] = gsi
+	}
+	return out
+}
+
+// translateAdminTablesError maps the adapter's error vocabulary
+// onto the admin-package sentinels the HTTP handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, so a future adapter error mode does not leak
+// raw text to clients while we are still adding the translation.
+func translateAdminTablesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrTablesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrTablesNotLeader
+	case adapter.IsAdminTableAlreadyExists(err):
+		return admin.ErrTablesAlreadyExists
+	case adapter.IsAdminTableNotFound(err):
+		return admin.ErrTablesNotFound
+	case adapter.IsAdminValidation(err):
+		msg := adapter.AdminErrorMessage(err)
+		if msg == "" {
+			msg = "validation failed"
+		}
+		return &admin.ValidationError{Message: msg}
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
 func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
 	out := &admin.DynamoTableSummary{
 		Name:         in.Name,

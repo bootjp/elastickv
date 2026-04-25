@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -60,11 +61,87 @@ type DynamoGSISummary struct {
 //
 // AdminDescribeTable returns (nil, false, nil) for a missing table so
 // callers can distinguish "not found" from a storage error without
-// sniffing sentinels. This mirrors the adapter signature exactly so
-// the bridge remains a thin pass-through.
+// sniffing sentinels. The write entrypoints return the structured
+// errors below (ErrTablesForbidden / ErrTablesNotLeader / ...) so
+// the handler can map them to HTTP statuses without leaking the
+// adapter's internal error shape into the admin package.
 type TablesSource interface {
 	AdminListTables(ctx context.Context) ([]string, error)
 	AdminDescribeTable(ctx context.Context, name string) (*DynamoTableSummary, bool, error)
+	AdminCreateTable(ctx context.Context, principal AuthPrincipal, in CreateTableRequest) (*DynamoTableSummary, error)
+	AdminDeleteTable(ctx context.Context, principal AuthPrincipal, name string) error
+}
+
+// CreateTableRequest is the JSON body shape for POST /tables per
+// design Section 4.2. The handler validates each field before
+// passing the request to the source.
+type CreateTableRequest struct {
+	TableName    string                `json:"table_name"`
+	PartitionKey CreateTableAttribute  `json:"partition_key"`
+	SortKey      *CreateTableAttribute `json:"sort_key,omitempty"`
+	GSI          []CreateTableGSI      `json:"gsi,omitempty"`
+}
+
+// CreateTableAttribute names a single primary-key or GSI key
+// column. Type must be one of "S", "N", "B".
+type CreateTableAttribute struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// CreateTableGSI describes a single global secondary index in a
+// CreateTableRequest. SortKey is optional (hash-only GSI). When
+// Projection.Type is "INCLUDE", Projection.NonKeyAttributes lists
+// the projected attribute names; otherwise it is ignored.
+type CreateTableGSI struct {
+	Name         string                `json:"name"`
+	PartitionKey CreateTableAttribute  `json:"partition_key"`
+	SortKey      *CreateTableAttribute `json:"sort_key,omitempty"`
+	Projection   CreateTableProjection `json:"projection"`
+}
+
+// CreateTableProjection mirrors the DynamoDB Projection sub-struct
+// in admin-friendly snake_case. Type defaults to "ALL" when omitted.
+type CreateTableProjection struct {
+	Type             string   `json:"type,omitempty"`
+	NonKeyAttributes []string `json:"non_key_attributes,omitempty"`
+}
+
+// Errors the source layer may return to signal a structured
+// failure mode the handler maps to a specific HTTP response.
+//
+// They are sentinel values so a bridge implementation can map any
+// adapter-internal error onto exactly one of these without the
+// admin package importing the adapter package's private types.
+var (
+	// ErrTablesForbidden is returned when the principal lacks the
+	// role required for the operation. Maps to 403.
+	ErrTablesForbidden = errors.New("admin tables: principal lacks required role")
+	// ErrTablesNotLeader is returned when the local node is not the
+	// Raft leader. Maps to 503 + Retry-After: 1 today; the future
+	// AdminForward RPC catches this as the trigger to forward.
+	ErrTablesNotLeader = errors.New("admin tables: local node is not the raft leader")
+	// ErrTablesNotFound is returned when DELETE / DESCRIBE / a
+	// follow-up read targets a table that does not exist. Maps to
+	// 404. AdminDescribeTable's (nil, false, nil) tuple is the
+	// preferred signal for the read path; this sentinel covers the
+	// write paths only.
+	ErrTablesNotFound = errors.New("admin tables: table not found")
+	// ErrTablesAlreadyExists is returned when CreateTable hits a
+	// pre-existing table with the same name. Maps to 409.
+	ErrTablesAlreadyExists = errors.New("admin tables: table already exists")
+)
+
+// ValidationError is what the source returns when the input fails
+// adapter-side validation. Surfaces a sanitised message back to the
+// SPA — adapter-internal err.Error() output is never sent verbatim.
+type ValidationError struct{ Message string }
+
+func (e *ValidationError) Error() string {
+	if e == nil || e.Message == "" {
+		return "admin tables: validation failed"
+	}
+	return e.Message
 }
 
 // DynamoHandler serves /admin/api/v1/dynamo/tables and
@@ -96,16 +173,26 @@ func (h *DynamoHandler) WithLogger(l *slog.Logger) *DynamoHandler {
 // /admin/api/v1/* prefix — adding another mux here would just
 // duplicate the path-parsing logic.
 func (h *DynamoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is implemented")
-		return
-	}
 	switch {
 	case r.URL.Path == pathDynamoTables:
-		h.handleList(w, r)
+		switch r.Method {
+		case http.MethodGet:
+			h.handleList(w, r)
+		case http.MethodPost:
+			h.handleCreate(w, r)
+		default:
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or POST")
+		}
 	case strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables):
 		name := strings.TrimPrefix(r.URL.Path, pathPrefixDynamoTables)
-		h.handleDescribe(w, r, name)
+		switch r.Method {
+		case http.MethodGet:
+			h.handleDescribe(w, r, name)
+		case http.MethodDelete:
+			h.handleDelete(w, r, name)
+		default:
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+		}
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 	}
@@ -170,6 +257,171 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	// without an explicit nil-check here. The Tables array
 	// contract is enforced at the producer.
 	writeAdminJSON(w, r.Context(), h.logger, resp)
+}
+
+// handleCreate is the POST /tables handler. It validates the body
+// up front, requires a write-capable principal, and translates any
+// structured error from the source into the appropriate HTTP status.
+// Success response is 201 Created with the freshly-stored table
+// summary in the body — same shape as a GET /tables/{name} call.
+func (h *DynamoHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		// Should be unreachable — SessionAuth runs before this
+		// handler and rejects any request without a principal — but
+		// failing closed here is the right defence-in-depth posture.
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
+		return
+	}
+	if !principal.Role.AllowsWrite() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+		return
+	}
+	body, err := decodeCreateTableRequest(r.Body)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	summary, err := h.source.AdminCreateTable(r.Context(), principal, body)
+	if err != nil {
+		h.writeTablesError(w, r, "create", err)
+		return
+	}
+	writeAdminJSONStatus(w, r.Context(), h.logger, http.StatusCreated, summary)
+}
+
+// handleDelete is the DELETE /tables/{name} handler. Success is
+// 204 No Content; the body is intentionally empty so the SPA can
+// treat both 200 and 204 as success without parsing.
+func (h *DynamoHandler) handleDelete(w http.ResponseWriter, r *http.Request, name string) {
+	if name == "" || strings.ContainsRune(name, '/') {
+		writeJSONError(w, http.StatusNotFound, "not_found", "")
+		return
+	}
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
+		return
+	}
+	if !principal.Role.AllowsWrite() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+		return
+	}
+	if err := h.source.AdminDeleteTable(r.Context(), principal, name); err != nil {
+		h.writeTablesError(w, r, "delete", err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeTablesError translates a TablesSource error into the
+// appropriate HTTP response. Internal-server-error fallthrough logs
+// the raw err.Error() but never sends it to the client, matching
+// the read-path policy.
+func (h *DynamoHandler) writeTablesError(w http.ResponseWriter, r *http.Request, op string, err error) {
+	switch {
+	case errors.Is(err, ErrTablesForbidden):
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+	case errors.Is(err, ErrTablesNotLeader):
+		// The follower→leader forwarding RPC (design 3.3) will
+		// catch this case in a follow-up PR. Until then, surface
+		// 503 + Retry-After: 1 so the SPA / curl can re-issue.
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+			"this admin node is not the raft leader")
+	case errors.Is(err, ErrTablesNotFound):
+		writeJSONError(w, http.StatusNotFound, "not_found", "table does not exist")
+	case errors.Is(err, ErrTablesAlreadyExists):
+		writeJSONError(w, http.StatusConflict, "already_exists", "table already exists")
+	default:
+		var verr *ValidationError
+		if errors.As(err, &verr) {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request", verr.Error())
+			return
+		}
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" table failed",
+			slog.String("error", err.Error()),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "dynamo_"+op+"_failed",
+			"failed to "+op+" table; see server logs")
+	}
+}
+
+// decodeCreateTableRequest parses + validates the JSON body. Each
+// failure mode maps to a specific human-readable message so the SPA
+// can show a useful error without the user having to look at the
+// network tab.
+func decodeCreateTableRequest(body io.Reader) (CreateTableRequest, error) {
+	if body == nil {
+		return CreateTableRequest{}, errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(body)
+	dec.DisallowUnknownFields()
+	var out CreateTableRequest
+	if err := dec.Decode(&out); err != nil {
+		if IsMaxBytesError(err) {
+			return CreateTableRequest{}, errors.New("request body exceeds the 64 KiB admin limit")
+		}
+		return CreateTableRequest{}, errors.New("request body is not valid JSON")
+	}
+	if strings.TrimSpace(out.TableName) == "" {
+		return CreateTableRequest{}, errors.New("table_name is required")
+	}
+	if err := validateAttribute(out.PartitionKey, "partition_key"); err != nil {
+		return CreateTableRequest{}, err
+	}
+	if out.SortKey != nil {
+		if err := validateAttribute(*out.SortKey, "sort_key"); err != nil {
+			return CreateTableRequest{}, err
+		}
+	}
+	for i := range out.GSI {
+		if err := validateGSI(&out.GSI[i], i); err != nil {
+			return CreateTableRequest{}, err
+		}
+	}
+	return out, nil
+}
+
+// validateAttribute enforces the "S | N | B" rule for primary-key
+// and GSI key columns. We deliberately do not silently accept
+// lower-case or whitespace-padded variants — Dynamo's wire format
+// requires the exact upper-case letter.
+func validateAttribute(attr CreateTableAttribute, field string) error {
+	if strings.TrimSpace(attr.Name) == "" {
+		return errors.New(field + ".name is required")
+	}
+	switch attr.Type {
+	case "S", "N", "B":
+		return nil
+	default:
+		return errors.New(field + `.type must be one of "S", "N", "B"`)
+	}
+}
+
+func validateGSI(gsi *CreateTableGSI, index int) error {
+	prefix := "gsi[" + strconv.Itoa(index) + "]"
+	if strings.TrimSpace(gsi.Name) == "" {
+		return errors.New(prefix + ".name is required")
+	}
+	if err := validateAttribute(gsi.PartitionKey, prefix+".partition_key"); err != nil {
+		return err
+	}
+	if gsi.SortKey != nil {
+		if err := validateAttribute(*gsi.SortKey, prefix+".sort_key"); err != nil {
+			return err
+		}
+	}
+	switch strings.TrimSpace(strings.ToUpper(gsi.Projection.Type)) {
+	case "", "ALL", "KEYS_ONLY", "INCLUDE":
+		return nil
+	default:
+		return errors.New(prefix + `.projection.type must be one of "ALL", "KEYS_ONLY", "INCLUDE"`)
+	}
 }
 
 func (h *DynamoHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name string) {
@@ -268,15 +520,23 @@ func paginateDynamoTableNames(names []string, startAfter string, limit int) ([]s
 	return page, ""
 }
 
-// writeAdminJSON marshals `body` to a buffer first, *then* writes
-// status + body — never streaming an encoder directly to the
-// ResponseWriter. The streaming form would commit a 200 header and
-// then truncate mid-body if json.Marshal failed on a value deep in
-// the struct (an unsupported type, a Marshaler returning an error,
-// etc.), leaving a malformed JSON object on the wire that the SPA
-// has no way to recover from. Marshalling first lets us upgrade the
-// encode failure to a 500 with a well-formed error envelope.
+// writeAdminJSON is the 200-OK convenience wrapper around
+// writeAdminJSONStatus. It exists only so the read-path call sites
+// stay compact; both routes share the same marshal-then-write
+// safety guarantee.
 func writeAdminJSON(w http.ResponseWriter, ctx context.Context, logger *slog.Logger, body any) {
+	writeAdminJSONStatus(w, ctx, logger, http.StatusOK, body)
+}
+
+// writeAdminJSONStatus marshals `body` to a buffer first, *then*
+// writes status + body — never streaming an encoder directly to the
+// ResponseWriter. The streaming form would commit the status header
+// and then truncate mid-body if json.Marshal failed on a value deep
+// in the struct (an unsupported type, a Marshaler returning an
+// error), leaving a malformed JSON object on the wire that the SPA
+// has no way to recover from. Marshalling first lets us upgrade an
+// encode failure to a clean 500 with a well-formed error envelope.
+func writeAdminJSONStatus(w http.ResponseWriter, ctx context.Context, logger *slog.Logger, status int, body any) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		if logger == nil {
@@ -297,7 +557,7 @@ func writeAdminJSON(w http.ResponseWriter, ctx context.Context, logger *slog.Log
 	// Content-Type make this cheap and standard.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	if _, werr := w.Write(payload); werr != nil {
 		// Status is already on the wire, so we can only log. Write
 		// failures here usually mean the client closed the connection.

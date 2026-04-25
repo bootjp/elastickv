@@ -18,9 +18,19 @@ import (
 // tests use. AdminListTables returns names in lex order, matching
 // the adapter's contract.
 type stubTablesSource struct {
-	tables  map[string]*DynamoTableSummary
-	listErr error
-	descErr error
+	tables    map[string]*DynamoTableSummary
+	listErr   error
+	descErr   error
+	createErr error
+	deleteErr error
+
+	// Last-call tracking: tests assert the principal that reached
+	// the source so we can prove SessionAuth wired through
+	// correctly without parsing slog audit lines.
+	lastCreatePrincipal AuthPrincipal
+	lastCreateInput     CreateTableRequest
+	lastDeletePrincipal AuthPrincipal
+	lastDeleteName      string
 }
 
 func (s *stubTablesSource) AdminListTables(_ context.Context) ([]string, error) {
@@ -45,6 +55,44 @@ func (s *stubTablesSource) AdminDescribeTable(_ context.Context, name string) (*
 	}
 	return t, true, nil
 }
+
+func (s *stubTablesSource) AdminCreateTable(_ context.Context, principal AuthPrincipal, in CreateTableRequest) (*DynamoTableSummary, error) {
+	s.lastCreatePrincipal = principal
+	s.lastCreateInput = in
+	if s.createErr != nil {
+		return nil, s.createErr
+	}
+	if _, exists := s.tables[in.TableName]; exists {
+		return nil, ErrTablesAlreadyExists
+	}
+	summary := &DynamoTableSummary{
+		Name:         in.TableName,
+		PartitionKey: in.PartitionKey.Name,
+		Generation:   1,
+	}
+	if in.SortKey != nil {
+		summary.SortKey = in.SortKey.Name
+	}
+	if s.tables == nil {
+		s.tables = map[string]*DynamoTableSummary{}
+	}
+	s.tables[in.TableName] = summary
+	return summary, nil
+}
+
+func (s *stubTablesSource) AdminDeleteTable(_ context.Context, principal AuthPrincipal, name string) error {
+	s.lastDeletePrincipal = principal
+	s.lastDeleteName = name
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	if _, exists := s.tables[name]; !exists {
+		return ErrTablesNotFound
+	}
+	delete(s.tables, name)
+	return nil
+}
+
 
 func newDynamoHandlerForTest(src TablesSource) *DynamoHandler {
 	return NewDynamoHandler(src)
@@ -270,13 +318,26 @@ func TestDynamoHandler_DescribeTable_SourceErrorIsHidden(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "QQ-808")
 }
 
-func TestDynamoHandler_OnlyGET(t *testing.T) {
+func TestDynamoHandler_RejectsUnsupportedMethods(t *testing.T) {
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
-	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+	// /tables accepts GET + POST; PUT/PATCH/DELETE on the
+	// collection root are 405. Wrapping the principal lets the
+	// handler reach the method-dispatch arm rather than 401-ing
+	// on missing principal first.
+	for _, m := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
 		req := httptest.NewRequest(m, pathDynamoTables, nil)
+		req = withWritePrincipal(req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		require.Equal(t, http.StatusMethodNotAllowed, rec.Code, "method %s", m)
+		require.Equal(t, http.StatusMethodNotAllowed, rec.Code, "collection method %s", m)
+	}
+	// /tables/{name} accepts GET + DELETE; POST/PUT/PATCH are 405.
+	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
+		req := httptest.NewRequest(m, pathDynamoTables+"/x", nil)
+		req = withWritePrincipal(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusMethodNotAllowed, rec.Code, "item method %s", m)
 	}
 }
 
@@ -296,6 +357,228 @@ func TestDynamoHandler_DescribeTable_TrailingSlashIsRejected(t *testing.T) {
 	// would otherwise pass an empty name down to the source.
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// withWritePrincipal injects a full-access principal into the
+// request context so handler tests bypass the SessionAuth middleware
+// while keeping the role check live. Mirrors how SessionAuth wires
+// the value in production.
+func withWritePrincipal(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}))
+}
+
+func withReadOnlyPrincipal(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleReadOnly}))
+}
+
+// validCreateBody returns a minimal-but-valid POST body the
+// happy-path tests share.
+func validCreateBody() string {
+	return `{"table_name":"users","partition_key":{"name":"id","type":"S"}}`
+}
+
+func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Equal(t, AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}, src.lastCreatePrincipal)
+	require.Equal(t, "users", src.lastCreateInput.TableName)
+	var got DynamoTableSummary
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "users", got.Name)
+	require.Equal(t, "id", got.PartitionKey)
+}
+
+func TestDynamoHandler_CreateTable_RejectsReadOnlyPrincipal(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	// The source must not be touched at all when the role check
+	// fires — leaking a read-only call into the source layer would
+	// be a defence-in-depth regression.
+	require.Empty(t, src.lastCreateInput.TableName)
+}
+
+func TestDynamoHandler_CreateTable_RejectsMissingPrincipal(t *testing.T) {
+	// Without a principal in context (SessionAuth would normally
+	// reject earlier, but defence-in-depth here matters), the
+	// handler must answer 401 rather than crashing on a zero
+	// AuthPrincipal.
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	cases := []string{
+		``,
+		`{`,
+		`{"table_name":""}`,
+		`{"table_name":"u"}`, // missing partition_key
+		`{"table_name":"u","partition_key":{"name":"id","type":"X"}}`,                                   // bad type
+		`{"table_name":"u","partition_key":{"name":"id","type":"S"},"sort_key":{"name":"","type":"S"}}`, // bad sort key
+		`{"table_name":"u","partition_key":{"name":"id","type":"S"},"unknown_field":1}`,                 // strict decode
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(body))
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code, "body=%q", body)
+			require.Contains(t, rec.Body.String(), "invalid_body")
+		})
+	}
+}
+
+func TestDynamoHandler_CreateTable_AlreadyExistsReturns409(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"users": {Name: "users", PartitionKey: "id"},
+	}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Contains(t, rec.Body.String(), "already_exists")
+}
+
+func TestDynamoHandler_CreateTable_NotLeaderReturns503WithRetryAfter(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{},
+		createErr: ErrTablesNotLeader,
+	}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.Contains(t, rec.Body.String(), "leader_unavailable")
+}
+
+func TestDynamoHandler_CreateTable_ForbiddenFromSourceMaps403(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{},
+		createErr: ErrTablesForbidden,
+	}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestDynamoHandler_CreateTable_ValidationErrorMaps400(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{},
+		createErr: &ValidationError{Message: "conflicting attribute type for id"},
+	}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "conflicting attribute type for id")
+}
+
+func TestDynamoHandler_CreateTable_GenericErrorIsHidden(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{},
+		createErr: errors.New("storage backing sentinel ZQ-993"),
+	}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.NotContains(t, rec.Body.String(), "ZQ-993")
+	require.NotContains(t, rec.Body.String(), "storage backing sentinel")
+}
+
+func TestDynamoHandler_DeleteTable_HappyPath(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"users": {Name: "users", PartitionKey: "id"},
+	}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Empty(t, rec.Body.Bytes())
+	require.Equal(t, "users", src.lastDeleteName)
+	require.Equal(t, AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}, src.lastDeletePrincipal)
+}
+
+func TestDynamoHandler_DeleteTable_ReadOnlyPrincipalRejected(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"users": {Name: "users", PartitionKey: "id"},
+	}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, src.lastDeleteName, "source must not be reached when role check fails")
+}
+
+func TestDynamoHandler_DeleteTable_MissingReturns404(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/absent", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "not_found")
+}
+
+func TestDynamoHandler_DeleteTable_NotLeaderReturns503WithRetryAfter(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
+		deleteErr: ErrTablesNotLeader,
+	}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+}
+
+func TestDynamoHandler_DeleteTable_RejectsTrailingSlash(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/", nil)
+	req = withWritePrincipal(req)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
