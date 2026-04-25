@@ -169,8 +169,13 @@ func TestDynamoHandler_ForwarderTransportErrorReturns503(t *testing.T) {
 // be silently re-applied at the leader. Claude review on PR #644
 // noted the test gap; locking it down protects against a future
 // change accidentally removing the !errors.Is guard.
+//
+// Both create and delete paths share the same gate logic, so we
+// sweep both surfaces together — a typo-class change to either
+// tryForwardCreate or tryForwardDelete will fail one of the
+// sub-tests.
 func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
-	cases := []struct {
+	createCases := []struct {
 		name     string
 		err      error
 		wantCode int
@@ -179,8 +184,8 @@ func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
 		{"validation", &ValidationError{Message: "bad input"}, http.StatusBadRequest},
 		{"generic", errors.New("opaque storage failure"), http.StatusInternalServerError},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, tc := range createCases {
+		t.Run("create/"+tc.name, func(t *testing.T) {
 			fwd := &stubLeaderForwarder{}
 			src := &stubTablesSource{createErr: tc.err}
 			h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
@@ -191,9 +196,84 @@ func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
 
 			require.Equal(t, tc.wantCode, rec.Code)
 			require.Empty(t, fwd.lastCreateInput.TableName,
-				"forwarder must not be invoked for source error: %s", tc.name)
+				"forwarder must not be invoked for create source error: %s", tc.name)
 		})
 	}
+	deleteCases := []struct {
+		name     string
+		err      error
+		wantCode int
+	}{
+		// not_found is the realistic delete-path counterpart to
+		// already_exists on create.
+		{"not_found", ErrTablesNotFound, http.StatusNotFound},
+		{"forbidden", ErrTablesForbidden, http.StatusForbidden},
+		{"generic", errors.New("opaque storage failure"), http.StatusInternalServerError},
+	}
+	for _, tc := range deleteCases {
+		t.Run("delete/"+tc.name, func(t *testing.T) {
+			fwd := &stubLeaderForwarder{}
+			src := &stubTablesSource{
+				tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
+				deleteErr: tc.err,
+			}
+			h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
+			req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			require.Equal(t, tc.wantCode, rec.Code)
+			require.Empty(t, fwd.lastDeleteName,
+				"forwarder must not be invoked for delete source error: %s", tc.name)
+		})
+	}
+}
+
+// TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete
+// mirrors the create-side ErrLeaderUnavailable path — election in
+// flight on the leader must surface as 503 + Retry-After: 1 from
+// the delete endpoint too. ErrLeaderUnavailable is the
+// "no leader known" sentinel from the forwarder layer; tryForwardDelete
+// catches it and routes through writeForwardFailure.
+func TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete(t *testing.T) {
+	fwd := &stubLeaderForwarder{deleteErr: ErrLeaderUnavailable}
+	src := &notLeaderSource{stubTablesSource: stubTablesSource{
+		tables: map[string]*DynamoTableSummary{"users": {Name: "users"}},
+	}}
+	h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.Contains(t, rec.Body.String(), "leader_unavailable")
+}
+
+// TestDynamoHandler_ForwarderTransportErrorReturns503_Delete is
+// the delete-side counterpart of the create transport-error test:
+// a generic gRPC failure from the forwarder must produce 503 +
+// Retry-After: 1 with no internal error detail leaking to the SPA.
+// The raw error is logged on the server (covered by inspection of
+// slog output in the create-side test); the assertion here is
+// strictly on the wire shape.
+func TestDynamoHandler_ForwarderTransportErrorReturns503_Delete(t *testing.T) {
+	fwd := &stubLeaderForwarder{deleteErr: errors.New("gRPC transport sentinel DEL-TX-1")}
+	src := &notLeaderSource{stubTablesSource: stubTablesSource{
+		tables: map[string]*DynamoTableSummary{"users": {Name: "users"}},
+	}}
+	h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.NotContains(t, rec.Body.String(), "DEL-TX-1")
+	require.NotContains(t, rec.Body.String(), "transport sentinel")
 }
 
 // TestDynamoHandler_ForwarderForwardsLeaderResponseSetsNosniff
