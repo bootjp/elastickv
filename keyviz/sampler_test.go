@@ -454,3 +454,34 @@ func columnTimes(cols []MatrixColumn) []time.Time {
 	}
 	return out
 }
+
+// TestSnapshotReturnsDeepCopy guards the public-API contract that the
+// Snapshot result is fully owned by the caller: mutating row bounds or
+// member-route slices must not corrupt later snapshots, and must not
+// race with concurrent Flush/RegisterRoute.
+func TestSnapshotReturnsDeepCopy(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("aaaa"), []byte("bbbb")) {
+		t.Fatal("RegisterRoute(1) returned false")
+	}
+	s.Observe(1, OpRead, 1, 2)
+	s.Flush()
+
+	first := s.Snapshot(time.Time{}, time.Time{})
+	if len(first) == 0 || len(first[0].Rows) == 0 {
+		t.Fatalf("expected at least one row in first snapshot, got %+v", first)
+	}
+	first[0].Rows[0].Start[0] = 'X'
+	first[0].Rows[0].End[0] = 'Y'
+	first[0].Rows = nil
+
+	second := s.Snapshot(time.Time{}, time.Time{})
+	if len(second) == 0 || len(second[0].Rows) == 0 {
+		t.Fatalf("second snapshot lost rows after caller mutation: %+v", second)
+	}
+	r := second[0].Rows[0]
+	if string(r.Start) != "aaaa" || string(r.End) != "bbbb" {
+		t.Fatalf("snapshot bounds aliased live state: start=%q end=%q", r.Start, r.End)
+	}
+}

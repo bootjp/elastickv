@@ -161,13 +161,14 @@ type routeSlot struct {
 
 // snapshotMeta returns a defensive copy of the slot's metadata under
 // the read lock. Used by Flush so the row it emits doesn't share
-// MemberRoutes with the live slot (which a later RegisterRoute may
-// extend).
+// Start/End/MemberRoutes with the live slot (which a later
+// RegisterRoute may extend, and which the snapshot API exports to
+// external consumers that may mutate the bounds).
 func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64) {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
-	start = s.Start
-	end = s.End
+	start = cloneBytes(s.Start)
+	end = cloneBytes(s.End)
 	aggregate = s.Aggregate
 	if len(s.MemberRoutes) > 0 {
 		members = append([]uint64(nil), s.MemberRoutes...)

@@ -42,8 +42,10 @@ func (r *ringBuffer) Push(col MatrixColumn) {
 
 // Range returns the columns whose At falls in [from, to), oldest
 // first. Either bound may be the zero Time, meaning unbounded on that
-// side. The returned slice is freshly allocated; callers may mutate
-// it freely.
+// side. The returned slice is a deep copy: each column has its own
+// Rows slice and each row owns its Start/End byte slices, so callers
+// may mutate any field without corrupting stored history or racing
+// with concurrent flushes.
 func (r *ringBuffer) Range(from, to time.Time) []MatrixColumn {
 	all := r.snapshotOrdered()
 	// snapshotOrdered is already chronologically ordered.
@@ -63,8 +65,25 @@ func (r *ringBuffer) Range(from, to time.Time) []MatrixColumn {
 		return nil
 	}
 	out := make([]MatrixColumn, hi-lo)
-	copy(out, all[lo:hi])
+	for i, src := range all[lo:hi] {
+		out[i] = cloneColumn(src)
+	}
 	return out
+}
+
+// cloneColumn returns a deep copy of col: a fresh Rows slice with
+// each row's Start/End and MemberRoutes independently allocated.
+func cloneColumn(col MatrixColumn) MatrixColumn {
+	rows := make([]MatrixRow, len(col.Rows))
+	for i, row := range col.Rows {
+		rows[i] = row
+		rows[i].Start = cloneBytes(row.Start)
+		rows[i].End = cloneBytes(row.End)
+		if len(row.MemberRoutes) > 0 {
+			rows[i].MemberRoutes = append([]uint64(nil), row.MemberRoutes...)
+		}
+	}
+	return MatrixColumn{At: col.At, Rows: rows}
 }
 
 // snapshotOrdered returns a chronologically ordered (oldest first)
