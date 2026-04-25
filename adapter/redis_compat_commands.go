@@ -208,32 +208,87 @@ func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(1)
 }
 
+// clientSubcommandArgCount is the total cmd.Args length (including
+// CLIENT + subcommand) required by no-operand CLIENT subcommands
+// like GETNAME / ID / INFO.
+const clientSubcommandArgCount = 2
+
+// checkClientArity verifies cmd.Args has exactly want elements and
+// writes the standard Redis wrong-arity error otherwise. Returns
+// true when the caller should stop handling (bad arity).
+func checkClientArity(conn redcon.Conn, cmd redcon.Command, sub string, want int) bool {
+	if len(cmd.Args) == want {
+		return false
+	}
+	conn.WriteError("ERR wrong number of arguments for 'client|" + strings.ToLower(sub) + "' command")
+	return true
+}
+
+// clientSetName handles CLIENT SETNAME. SETNAME is shared with
+// HELLO's SETNAME clause; both write into the same connState.clientName
+// slot so a client that uses HELLO SETNAME once and then queries
+// CLIENT GETNAME gets the right answer without having to re-issue
+// CLIENT SETNAME.
+func clientSetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "SETNAME", clientSetNameArgCount) {
+		return
+	}
+	state.clientName = string(cmd.Args[2])
+	conn.WriteString("OK")
+}
+
+func clientGetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "GETNAME", clientSubcommandArgCount) {
+		return
+	}
+	if state.clientName == "" {
+		conn.WriteNull()
+		return
+	}
+	conn.WriteBulkString(state.clientName)
+}
+
+func (r *RedisServer) clientID(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "ID", clientSubcommandArgCount) {
+		return
+	}
+	conn.WriteInt64(int64(r.ensureConnID(state))) //nolint:gosec // connID monotonic counter, guaranteed <= math.MaxInt64 in practice
+}
+
+func (r *RedisServer) clientInfo(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "INFO", clientSubcommandArgCount) {
+		return
+	}
+	id := r.ensureConnID(state)
+	conn.WriteBulkString(fmt.Sprintf("id=%d addr=%s name=%s", id, conn.RemoteAddr(), state.clientName))
+}
+
+// clientSetInfo handles CLIENT SETINFO <attr> <value>. elastickv does
+// not persist the advertised attributes (lib-name / lib-ver, etc.), but
+// it MUST still enforce exact arity — otherwise `CLIENT SETINFO` with
+// no operands returns OK and masks a client bug that real Redis would
+// have surfaced as a wrong-arity error.
+func clientSetInfo(conn redcon.Conn, cmd redcon.Command) {
+	if checkClientArity(conn, cmd, "SETINFO", clientSetInfoArgCount) {
+		return
+	}
+	conn.WriteString("OK")
+}
+
 func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 	sub := strings.ToUpper(string(cmd.Args[1]))
 	state := getConnState(conn)
 	switch sub {
 	case "SETINFO":
-		conn.WriteString("OK")
+		clientSetInfo(conn, cmd)
 	case "SETNAME":
-		// SETNAME is shared with HELLO's SETNAME clause; both write into
-		// the same connState.clientName slot so a client that uses
-		// HELLO SETNAME once and then queries CLIENT GETNAME gets the
-		// right answer without having to re-issue CLIENT SETNAME.
-		if len(cmd.Args) >= clientSetNameMinArgs {
-			state.clientName = string(cmd.Args[2])
-		}
-		conn.WriteString("OK")
+		clientSetName(conn, cmd, state)
 	case "GETNAME":
-		if state.clientName == "" {
-			conn.WriteNull()
-			return
-		}
-		conn.WriteBulkString(state.clientName)
+		clientGetName(conn, cmd, state)
 	case "ID":
-		conn.WriteInt64(int64(r.ensureConnID(state))) //nolint:gosec // connID monotonic counter, guaranteed <= math.MaxInt64 in practice
+		r.clientID(conn, cmd, state)
 	case "INFO":
-		id := r.ensureConnID(state)
-		conn.WriteBulkString(fmt.Sprintf("id=%d addr=%s name=%s", id, conn.RemoteAddr(), state.clientName))
+		r.clientInfo(conn, cmd, state)
 	default:
 		conn.WriteError("ERR unsupported CLIENT subcommand '" + sub + "'")
 	}
@@ -257,9 +312,20 @@ const (
 	// helloReplyArrayLen is the number of elements in the flat
 	// alternating key/value reply: 7 pairs = 14 elements.
 	helloReplyArrayLen = 14
-	// clientSetNameMinArgs is the arg count at which CLIENT SETNAME
-	// has its <name> operand (CLIENT + SETNAME + name = 3).
-	clientSetNameMinArgs = 3
+	// clientSetNameArgCount is the EXACT cmd.Args length for CLIENT
+	// SETNAME (CLIENT + SETNAME + name = 3). Kept as an exact-arity
+	// constant — not a minimum — because checkClientArity compares
+	// `len(cmd.Args) == want`; renaming it to *MinArgs would invite a
+	// future refactor that "just" swaps the helper for a >= check and
+	// silently re-introduces the wrong-arity silent-OK bug.
+	clientSetNameArgCount = 3
+	// clientSetInfoArgCount is the EXACT cmd.Args length for CLIENT
+	// SETINFO (CLIENT + SETINFO + attr + value = 4). Real Redis
+	// rejects any other arity for `client|setinfo`; without this
+	// check we would keep returning OK for `CLIENT SETINFO` with no
+	// operands, matching exactly the silent-success behaviour this
+	// PR is supposed to eliminate for every CLIENT subcommand.
+	clientSetInfoArgCount = 4
 )
 
 // helloParseError is the internal signal used by parseHelloArgs to
