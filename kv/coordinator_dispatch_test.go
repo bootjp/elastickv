@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -17,8 +16,8 @@ func TestCoordinateDispatch_RawPut(t *testing.T) {
 	r, stop := newSingleRaft(t, "dispatch-raw-put", fsm)
 	t.Cleanup(stop)
 
-	tm := NewTransaction(r)
-	c := NewCoordinator(tm, r)
+	tm := NewTransactionWithProposer(r)
+	c := NewCoordinatorWithEngine(tm, r)
 	ctx := context.Background()
 
 	resp, err := c.Dispatch(ctx, &OperationGroup[OP]{
@@ -43,8 +42,8 @@ func TestCoordinateDispatch_RawDel(t *testing.T) {
 	r, stop := newSingleRaft(t, "dispatch-raw-del", fsm)
 	t.Cleanup(stop)
 
-	tm := NewTransaction(r)
-	c := NewCoordinator(tm, r)
+	tm := NewTransactionWithProposer(r)
+	c := NewCoordinatorWithEngine(tm, r)
 	ctx := context.Background()
 
 	// Write a value first.
@@ -76,8 +75,8 @@ func TestCoordinateDispatch_TxnOnePhase(t *testing.T) {
 	r, stop := newSingleRaft(t, "dispatch-txn", fsm)
 	t.Cleanup(stop)
 
-	tm := NewTransaction(r)
-	c := NewCoordinator(tm, r)
+	tm := NewTransactionWithProposer(r)
+	c := NewCoordinatorWithEngine(tm, r)
 	ctx := context.Background()
 
 	startTS := c.clock.Next()
@@ -135,7 +134,7 @@ func TestCoordinateDispatch_TxnAssignsStartTS(t *testing.T) {
 
 	c := &Coordinate{
 		transactionManager: tx,
-		engine:             hashicorpraftengine.New(r),
+		engine:             r,
 		clock:              NewHLC(),
 	}
 
@@ -167,7 +166,7 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 
 	c := &Coordinate{
 		transactionManager: tx,
-		engine:             hashicorpraftengine.New(r),
+		engine:             r,
 		clock:              NewHLC(),
 	}
 

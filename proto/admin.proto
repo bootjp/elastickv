@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+// Admin is the node-side read-only admin gRPC service consumed by
+// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
+// metadata unless the node was started with --adminInsecureNoAuth.
+// See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
+service Admin {
+  rpc GetClusterOverview (GetClusterOverviewRequest) returns (GetClusterOverviewResponse) {}
+  rpc GetRaftGroups (GetRaftGroupsRequest) returns (GetRaftGroupsResponse) {}
+  rpc GetAdapterSummary (GetAdapterSummaryRequest) returns (GetAdapterSummaryResponse) {}
+  rpc GetKeyVizMatrix (GetKeyVizMatrixRequest) returns (GetKeyVizMatrixResponse) {}
+  rpc GetRouteDetail (GetRouteDetailRequest) returns (GetRouteDetailResponse) {}
+  rpc StreamEvents (StreamEventsRequest) returns (stream StreamEventsEvent) {}
+}
+
+message NodeIdentity {
+  string node_id = 1;
+  string grpc_address = 2;
+}
+
+message GroupLeader {
+  uint64 raft_group_id = 1;
+  string leader_node_id = 2;
+  uint64 leader_term = 3;
+}
+
+message GetClusterOverviewRequest {}
+
+message GetClusterOverviewResponse {
+  NodeIdentity self = 1;
+  repeated NodeIdentity members = 2;
+  repeated GroupLeader group_leaders = 3;
+  uint64 aggregate_qps = 4;
+}
+
+message RaftGroupState {
+  uint64 raft_group_id = 1;
+  string leader_node_id = 2;
+  uint64 leader_term = 3;
+  uint64 commit_index = 4;
+  uint64 applied_index = 5;
+  // last_contact_unix_ms is the unix-ms timestamp of the most recent leader
+  // contact observed on this node. Zero means "unknown" (for example, the
+  // engine is a follower that has never heard from a leader); UIs should
+  // render that case as "unknown" rather than "contacted at epoch".
+  int64 last_contact_unix_ms = 6;
+}
+
+message GetRaftGroupsRequest {}
+
+message GetRaftGroupsResponse {
+  repeated RaftGroupState groups = 1;
+}
+
+message AdapterSummary {
+  string adapter = 1;
+  string operation = 2;
+  uint64 requests = 3;
+  uint64 in_flight = 4;
+  uint64 bytes_in = 5;
+  uint64 bytes_out = 6;
+  double p50_ns = 7;
+  double p95_ns = 8;
+  double p99_ns = 9;
+}
+
+message GetAdapterSummaryRequest {}
+
+message GetAdapterSummaryResponse {
+  repeated AdapterSummary summaries = 1;
+}
+
+enum KeyVizSeries {
+  KEYVIZ_SERIES_UNSPECIFIED = 0;
+  KEYVIZ_SERIES_READS = 1;
+  KEYVIZ_SERIES_WRITES = 2;
+  KEYVIZ_SERIES_READ_BYTES = 3;
+  KEYVIZ_SERIES_WRITE_BYTES = 4;
+}
+
+enum SampleRole {
+  SAMPLE_ROLE_UNSPECIFIED = 0;
+  SAMPLE_ROLE_LEADER_WRITE = 1;
+  SAMPLE_ROLE_LEADER_READ = 2;
+  SAMPLE_ROLE_FOLLOWER_READ = 3;
+}
+
+message KeyVizRow {
+  // bucket_id is either "route:<routeID>" or "virtual:<lineageID-or-hash>".
+  string bucket_id = 1;
+  bytes start = 2;
+  bytes end = 3;
+  string label = 4;
+  bool aggregate = 5;
+  repeated uint64 route_ids = 6;
+  bool route_ids_truncated = 7;
+  uint64 route_count = 8;
+  repeated SampleRole sample_roles = 9;
+  string lineage_id = 10;
+  // values[j] is the series value at time column j.
+  repeated uint64 values = 11;
+  // soft_columns[j] is true when the j-th column missed the estimator SLO.
+  repeated bool soft_columns = 12;
+}
+
+message GetKeyVizMatrixRequest {
+  KeyVizSeries series = 1;
+  int64 from_unix_ms = 2;
+  int64 to_unix_ms = 3;
+  uint32 rows = 4;
+}
+
+message GetKeyVizMatrixResponse {
+  repeated int64 column_unix_ms = 1;
+  repeated KeyVizRow rows = 2;
+}
+
+message GetRouteDetailRequest {
+  // Either a concrete route:<routeID> or a virtual:<id> emitted in a previous
+  // GetKeyVizMatrix response.
+  string bucket_id = 1;
+  int64 from_unix_ms = 2;
+  int64 to_unix_ms = 3;
+}
+
+message GetRouteDetailResponse {
+  KeyVizRow row = 1;
+  repeated AdapterSummary per_adapter = 2;
+}
+
+message StreamEventsRequest {}
+
+message StreamEventsEvent {
+  oneof event {
+    RouteTransition route_transition = 1;
+    KeyVizColumn keyviz_column = 2;
+  }
+}
+
+message RouteTransition {
+  uint64 parent_route_id = 1;
+  repeated uint64 child_route_ids = 2;
+  string lineage_id = 3;
+  int64 unix_ms = 4;
+}
+
+message KeyVizColumn {
+  int64 column_unix_ms = 1;
+  KeyVizSeries series = 2;
+  repeated KeyVizRow rows = 3;
+}

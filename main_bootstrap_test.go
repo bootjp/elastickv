@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
 
@@ -12,8 +12,8 @@ func TestResolveBootstrapServers(t *testing.T) {
 	t.Run("members imply fixed bootstrap servers", func(t *testing.T) {
 		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, "n1=10.0.0.11:50051")
 		require.NoError(t, err)
-		require.Equal(t, []raft.Server{
-			{Suffrage: raft.Voter, ID: "n1", Address: "10.0.0.11:50051"},
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
 		}, servers)
 	})
 
@@ -30,9 +30,9 @@ func TestResolveBootstrapServers(t *testing.T) {
 			"n1=10.0.0.11:50051,n2=10.0.0.12:50051",
 		)
 		require.NoError(t, err)
-		require.Equal(t, []raft.Server{
-			{Suffrage: raft.Voter, ID: "n1", Address: "10.0.0.11:50051"},
-			{Suffrage: raft.Voter, ID: "n2", Address: "10.0.0.12:50051"},
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+			{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
 		}, servers)
 	})
 

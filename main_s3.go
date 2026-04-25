@@ -2,27 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net"
-	"os"
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"golang.org/x/sync/errgroup"
 )
-
-type s3CredentialFile struct {
-	Credentials []s3CredentialEntry `json:"credentials"`
-}
-
-type s3CredentialEntry struct {
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
-}
 
 func startS3Server(
 	ctx context.Context,
@@ -31,7 +18,7 @@ func startS3Server(
 	s3Addr string,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
-	leaderS3 map[raft.ServerAddress]string,
+	leaderS3 map[string]string,
 	region string,
 	credentialsFile string,
 	pathStyleOnly bool,
@@ -84,30 +71,5 @@ func startS3Server(
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer f.Close()
-	file := s3CredentialFile{}
-	if err := json.NewDecoder(f).Decode(&file); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	out := make(map[string]string, len(file.Credentials))
-	for _, cred := range file.Credentials {
-		accessKeyID := strings.TrimSpace(cred.AccessKeyID)
-		secretAccessKey := strings.TrimSpace(cred.SecretAccessKey)
-		if accessKeyID == "" || secretAccessKey == "" {
-			return nil, errors.New("s3 credentials file contains an empty access key or secret key")
-		}
-		if _, exists := out[accessKeyID]; exists {
-			return nil, errors.WithStack(fmt.Errorf("s3 credentials file contains duplicate access key ID: %q", accessKeyID))
-		}
-		out[accessKeyID] = secretAccessKey
-	}
-	return out, nil
+	return loadSigV4StaticCredentialsFile(path, "s3")
 }

@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 type ShardGroup struct {
@@ -42,7 +42,7 @@ type leaseRefreshingTxn struct {
 }
 
 func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	start := time.Now()
+	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(reqs)
 	if err != nil {
@@ -65,7 +65,7 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 }
 
 func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
-	start := time.Now()
+	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Abort(reqs)
 	if err != nil {
@@ -83,7 +83,7 @@ func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, er
 // underlying Commit/Abort so an invalidation that fires during that
 // call observes a generation mismatch inside extend and the refresh
 // is rejected. See the struct doc comment for why.
-func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time, expectedGen uint64) {
+func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start monoclock.Instant, expectedGen uint64) {
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
@@ -686,7 +686,7 @@ func (c *ShardedCoordinator) VerifyLeader() error {
 	return verifyLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) RaftLeader() raft.ServerAddress {
+func (c *ShardedCoordinator) RaftLeader() string {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok {
 		return ""
@@ -718,7 +718,7 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
 	return verifyLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) raft.ServerAddress {
+func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return ""
@@ -774,10 +774,10 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	if leaseDur <= 0 {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Single time.Now() sample so primary/secondary/extension all see
-	// the same instant. Clock-skew safety delegated to
-	// engineLeaseAckValid (see Coordinate.LeaseRead).
-	now := time.Now()
+	// Single monoclock.Now() sample so primary/secondary/extension
+	// all see the same monotonic-raw instant. Clock-skew safety
+	// delegated to engineLeaseAckValid (see Coordinate.LeaseRead).
+	now := monoclock.Now()
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		observeLeaseRead(observer, true)

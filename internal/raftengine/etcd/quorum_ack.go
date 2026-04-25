@@ -4,12 +4,14 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"github.com/bootjp/elastickv/internal/monoclock"
 )
 
 // quorumAckTracker records the most recent response time from each
-// follower and publishes the "majority-ack instant" -- the wall clock
-// at which a majority of followers had all been confirmed live.
+// follower and publishes the "majority-ack instant" -- the monotonic-
+// raw reading at which a majority of followers had all been confirmed
+// live.
 //
 // LeaseRead callers pair the published instant with LeaseDuration to
 // serve a leader-local read without issuing a fresh ReadIndex round.
@@ -18,27 +20,33 @@ import (
 // amortise reads whose own latency exceeded LeaseDuration (the bug
 // that kept production GET at ~1 s under step-queue congestion).
 //
-// Safety: we record time.Now() when the leader OBSERVES the follower
-// response, which is an UPPER bound on the follower's true ack time.
-// Because lease = recorded_instant + lease_duration, that upper bound
-// makes the lease extend slightly past the strictly-safe
+// Timestamps are CLOCK_MONOTONIC_RAW readings (see internal/monoclock).
+// Using the raw monotonic source instead of Go's time.Now() keeps the
+// lease-vs-safety-window comparison immune to NTP rate adjustment and
+// wall-clock step events -- TiKV's choice, adopted here per #551.
+//
+// Safety: we record monoclock.Now() when the leader OBSERVES the
+// follower response, which is an UPPER bound on the follower's true
+// ack time. Because lease = recorded_instant + lease_duration, that
+// upper bound makes the lease extend slightly past the strictly-safe
 // follower_ack_time + electionTimeout boundary by at most the one-way
 // network delay plus scheduling slop. leaseSafetyMargin is sized to
 // cover that overshoot, so leaseDuration = electionTimeout -
 // leaseSafetyMargin keeps the lease strictly inside the no-new-leader
-// window. See docs/lease_read_design.md for the full argument.
+// window. See docs/design/2026_04_20_implemented_lease_read.md for the full argument.
 type quorumAckTracker struct {
 	mu       sync.Mutex
-	peerAcks map[uint64]int64 // peer ID → last ack unix nano observed on leader
+	peerAcks map[uint64]int64 // peer ID → last ack monoclock ns observed on leader
 	// ackBuf is reused by recomputeLocked to avoid allocating a fresh
 	// []int64 on every MsgAppResp / MsgHeartbeatResp. Sized to
 	// len(peerAcks) on first use and grown via append when the cluster
 	// expands. Caller must hold t.mu.
 	ackBuf []int64
-	// quorumAckUnixNano is the Nth-most-recent peer ack where N equals
-	// the number of follower acks required for majority (clusterSize/2).
-	// Updated under mu; read lock-free via atomic.Load.
-	quorumAckUnixNano atomic.Int64
+	// quorumAckMonoNs is the Nth-most-recent peer ack where N equals
+	// the number of follower acks required for majority (clusterSize/2),
+	// stored as a monoclock.Instant nanosecond counter. Updated under
+	// mu; read lock-free via atomic.Load.
+	quorumAckMonoNs atomic.Int64
 }
 
 // recordAck notes that peerID responded to us and recomputes the
@@ -52,7 +60,7 @@ func (t *quorumAckTracker) recordAck(peerID uint64, followerQuorum int) {
 	if followerQuorum <= 0 {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := monoclock.Now().Nanos()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.peerAcks == nil {
@@ -100,7 +108,7 @@ func (t *quorumAckTracker) removePeer(peerID uint64, followerQuorum int) {
 func (t *quorumAckTracker) recomputeLocked(followerQuorum int) {
 	if len(t.peerAcks) < followerQuorum {
 		// Not enough peers have reported to form a majority yet.
-		t.quorumAckUnixNano.Store(0)
+		t.quorumAckMonoNs.Store(0)
 		return
 	}
 	t.ackBuf = t.ackBuf[:0]
@@ -114,7 +122,7 @@ func (t *quorumAckTracker) recomputeLocked(followerQuorum int) {
 	// peers), so sort.Slice is cheaper than a quickselect once the
 	// buffer is reused.
 	sort.Slice(t.ackBuf, func(i, j int) bool { return t.ackBuf[i] > t.ackBuf[j] })
-	t.quorumAckUnixNano.Store(t.ackBuf[followerQuorum-1])
+	t.quorumAckMonoNs.Store(t.ackBuf[followerQuorum-1])
 }
 
 // reset clears all recorded peer acks. Call when the local node
@@ -125,15 +133,15 @@ func (t *quorumAckTracker) reset() {
 	defer t.mu.Unlock()
 	t.peerAcks = nil
 	t.ackBuf = t.ackBuf[:0]
-	t.quorumAckUnixNano.Store(0)
+	t.quorumAckMonoNs.Store(0)
 }
 
-// load returns the current majority-ack instant or the zero time if
-// no quorum has been observed since the last reset.
-func (t *quorumAckTracker) load() time.Time {
-	ns := t.quorumAckUnixNano.Load()
+// load returns the current majority-ack instant or the zero Instant
+// if no quorum has been observed since the last reset.
+func (t *quorumAckTracker) load() monoclock.Instant {
+	ns := t.quorumAckMonoNs.Load()
 	if ns == 0 {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	return time.Unix(0, ns)
+	return monoclock.FromNanos(ns)
 }

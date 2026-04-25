@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -38,7 +37,7 @@ func TestGRPCConnCache_ReusesConnection(t *testing.T) {
 		_ = lis.Close()
 	})
 
-	addr := raft.ServerAddress(lis.Addr().String())
+	addr := lis.Addr().String()
 
 	var c GRPCConnCache
 	conn1, err := c.ConnFor(addr)
@@ -72,7 +71,7 @@ func TestGRPCConnCache_ConcurrentConnFor(t *testing.T) {
 		_ = lis.Close()
 	})
 
-	addr := raft.ServerAddress(lis.Addr().String())
+	addr := lis.Addr().String()
 
 	var c GRPCConnCache
 

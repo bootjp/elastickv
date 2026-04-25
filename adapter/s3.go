@@ -28,7 +28,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -36,13 +35,44 @@ const (
 	s3LeaderHealthPath          = "/healthz/leader"
 	s3HealthMaxRequestBodyBytes = 1024
 	s3ChunkSize                 = 1 << 20
-	s3ChunkBatchOps             = 16
-	s3XMLNamespace              = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion             = "us-east-1"
-	s3MaxKeys                   = 1000
-	s3ListPageSize              = 256
-	s3ManifestCleanupTimeout    = 2 * time.Minute
-	s3MaxObjectSizeBytes        = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
+	// s3ChunkBatchOps caps how many s3ChunkSize chunks fit in a single
+	// coordinator.Dispatch call on the data-write path
+	// (PutObject / UploadPart). Sized so the resulting Raft entry stays
+	// strictly under the post-PR-#593 default `MaxSizePerMsg = 4 MiB`
+	// even after protobuf framing overhead — each pb.Mutation carries
+	// the Op tag, Key tag + bytes, and Value length prefix; the
+	// pb.Request envelope wraps them; marshalRaftCommand prepends one
+	// byte. Empirically the per-Mutation overhead is ~60 B for normal
+	// keys and grows linearly with the bucket / objectKey length, so
+	// `4 × 1 MiB = 4 MiB` exactly is *over* MaxSizePerMsg in practice
+	// and falls into etcd/raft's util.go:limitSize oversized-first-
+	// entry path, bypassing the documented
+	// `MaxInflight × MaxSizePerMsg` per-peer memory bound. Capping at
+	// `3 × 1 MiB ≈ 3 MiB + few hundred bytes` leaves ~1 MiB of headroom
+	// even with kilobyte-scale object keys, so the entry rides the
+	// normal batched-MsgApp path and the bound holds. Per-PUT Raft
+	// commit count grows ~5× from the pre-PR-#636 baseline (a 5 GiB
+	// PUT goes from 320 → ~1707 entries) but each fsync is ~5×
+	// smaller; the WAL group commit landed in PR #600 absorbs the
+	// higher commit rate. See TestS3ChunkBatchFitsInRaftMaxSize
+	// for the encoded-size invariant.
+	s3ChunkBatchOps = 3
+	// s3MetaBatchOps batches key-only Del / scan ops on cleanup paths
+	// (cleanupPartBlobsAsync, deleteByPrefix, cleanupManifestBlobs).
+	// These ops carry no chunk payload, so the MaxSizePerMsg cap
+	// translates to a pure key-count budget: 64 BlobKey-shaped keys
+	// × ~100 B each ≈ 6 KiB per batch, three orders of magnitude
+	// under the 4 MiB limit. Keeping this batch large means a
+	// 5 GiB-object cleanup commits ~80 batches instead of ~1707, so
+	// orphaned-blob garbage collection finishes proportionally faster
+	// and does not amplify Raft load relative to the data-write path.
+	s3MetaBatchOps           = 64
+	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion          = "us-east-1"
+	s3MaxKeys                = 1000
+	s3ListPageSize           = 256
+	s3ManifestCleanupTimeout = 2 * time.Minute
+	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
@@ -73,7 +103,7 @@ type S3Server struct {
 	region      string
 	store       store.MVCCStore
 	coordinator kv.Coordinator
-	leaderS3    map[raft.ServerAddress]string
+	leaderS3    map[string]string
 	staticCreds map[string]string
 	readTracker *kv.ActiveTimestampTracker
 	httpServer  *http.Server
@@ -282,7 +312,7 @@ type s3ListPartEntry struct {
 	Size         int64  `xml:"Size"`
 }
 
-func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[raft.ServerAddress]string, opts ...S3ServerOption) *S3Server {
+func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[string]string, opts ...S3ServerOption) *S3Server {
 	s := &S3Server{
 		listen:      listen,
 		s3Addr:      s3Addr,
@@ -299,7 +329,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	}
 	if s.s3Addr != "" {
 		if s.leaderS3 == nil {
-			s.leaderS3 = map[raft.ServerAddress]string{}
+			s.leaderS3 = map[string]string{}
 		}
 		if leader := s.coordinatorLeaderAddress(); leader != "" {
 			if _, exists := s.leaderS3[leader]; !exists {
@@ -1877,7 +1907,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
-		pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+		pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 		flush := func() {
 			if len(pending) == 0 {
 				return
@@ -1898,7 +1928,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 				Op:  kv.Del,
 				Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion),
 			})
-			if len(pending) >= s3ChunkBatchOps {
+			if len(pending) >= s3MetaBatchOps {
 				flush()
 			}
 		}
@@ -1931,7 +1961,7 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 	for {
 		readTS := s.readTS()
 		readPin := s.pinReadTS(readTS)
-		kvs, err := s.store.ScanAt(ctx, cursor, end, s3ChunkBatchOps, readTS)
+		kvs, err := s.store.ScanAt(ctx, cursor, end, s3MetaBatchOps, readTS)
 		readPin.Release()
 		if err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
@@ -2190,7 +2220,7 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 	if s == nil || manifest == nil || manifest.UploadID == "" || s.coordinator == nil {
 		return
 	}
-	pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+	pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 	flush := func() {
 		if len(pending) == 0 {
 			return
@@ -2207,29 +2237,39 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 		pending = pending[:0]
 	}
 	for _, part := range manifest.Parts {
-		var ok bool
-		if pending, ok = s.appendPartBlobKeys(pending, bucket, generation, objectKey, manifest.UploadID, part, flush); !ok {
+		if !s.appendPartBlobKeys(&pending, bucket, generation, objectKey, manifest.UploadID, part, flush) {
 			return
 		}
 	}
 	flush()
 }
 
-func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) ([]*kv.Elem[kv.OP], bool) {
+// appendPartBlobKeys queues every blob-chunk Del for one manifest part
+// onto *pending and triggers flush whenever the batch reaches
+// s3MetaBatchOps. The slice is taken by pointer so that the caller's
+// `flush` closure (which captures pending from the enclosing
+// cleanupManifestBlobs scope) observes appends performed here. A
+// previous value-passing version silently no-op'd flush — flush saw
+// the outer `pending` whose header still pointed at length 0, and the
+// helper accumulated every chunk into one batch on return, defeating
+// the s3MetaBatchOps cap and re-opening the OOM / oversized-MsgApp
+// risk the cap was meant to bound. See TestS3CleanupManifestBlobs
+// _RespectsMetaBatchOps for the regression guard.
+func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) bool {
 	for chunkNo := range part.ChunkSizes {
 		chunkIndex, err := uint64FromInt(chunkNo)
 		if err != nil {
-			return pending, false
+			return false
 		}
-		pending = append(pending, &kv.Elem[kv.OP]{
+		*pending = append(*pending, &kv.Elem[kv.OP]{
 			Op:  kv.Del,
 			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
 		})
-		if len(pending) >= s3ChunkBatchOps {
+		if len(*pending) >= s3MetaBatchOps {
 			flush()
 		}
 	}
-	return pending, true
+	return true
 }
 
 //nolint:cyclop // Proxying depends on root, bucket, and object-level leadership decisions.
@@ -2241,7 +2281,7 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	if err != nil {
 		return false
 	}
-	var leader raft.ServerAddress
+	var leader string
 	if len(key) > 0 {
 		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(key) == nil {
 			return false
@@ -2303,7 +2343,7 @@ func (s *S3Server) clock() *kv.HLC {
 	return s.coordinator.Clock()
 }
 
-func (s *S3Server) coordinatorLeaderAddress() raft.ServerAddress {
+func (s *S3Server) coordinatorLeaderAddress() string {
 	if s == nil || s.coordinator == nil {
 		return ""
 	}
@@ -2964,11 +3004,11 @@ func validateS3PutPreconditions(r *http.Request, previous *s3ObjectManifest) err
 	return nil
 }
 
-func cloneLeaderAddrMap(src map[raft.ServerAddress]string) map[raft.ServerAddress]string {
+func cloneLeaderAddrMap(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make(map[raft.ServerAddress]string, len(src))
+	out := make(map[string]string, len(src))
 	for key, value := range src {
 		out[key] = value
 	}

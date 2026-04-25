@@ -3600,16 +3600,56 @@ func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, comm
 	}}
 }
 
+// streamCommitElems writes the script's final stream state in the
+// wide-column layout — one StreamEntryKey Put per entry plus a StreamMetaKey
+// Put for the aggregate meta. The legacy single-blob path is no longer
+// emitted: the read path (XRANGE / XREAD / XLEN, see loadStreamAt) is
+// "new-layout only, discard-on-read" since PR #620, so writing to the
+// legacy blob here would silently drop every Lua-mediated XADD / XTRIM
+// from the visible state. The caller (commitPlanForKey) prepends
+// deleteLogicalKeyElems which clears every prior layout for this key, so
+// we can safely rewrite the new-layout entries from scratch instead of
+// computing a delta against the original load.
 func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.streamState([]byte(key))
 	if err != nil {
 		return nil, err
 	}
-	payload, err := marshalStreamValue(st.value)
-	if err != nil {
-		return nil, err
+	keyBytes := []byte(key)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.value.Entries)+1)
+	var meta store.StreamMeta
+	for _, entry := range st.value.Entries {
+		parsed, err := parseRedisStreamID(entry.ID)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		entryValue, err := marshalStreamEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.StreamEntryKey(keyBytes, parsed.ms, parsed.seq),
+			Value: entryValue,
+		})
+		// Track the highest ID — entries may not be strictly sorted in the
+		// in-memory slice if a script writes IDs explicitly, so take the
+		// max rather than trusting the tail position.
+		if parsed.ms > meta.LastMs || (parsed.ms == meta.LastMs && parsed.seq > meta.LastSeq) {
+			meta.LastMs, meta.LastSeq = parsed.ms, parsed.seq
+		}
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisStreamKey([]byte(key)), Value: payload}}, nil
+	meta.Length = int64(len(st.value.Entries))
+	metaBytes, err := store.MarshalStreamMeta(meta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.StreamMetaKey(keyBytes),
+		Value: metaBytes,
+	})
+	return elems, nil
 }
 
 func (c *luaScriptContext) finalType(key []byte) (redisValueType, error) {

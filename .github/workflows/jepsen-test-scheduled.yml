@@ -124,6 +124,70 @@ jobs:
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --dynamo-ports 63801,63802,63803 \
             --host 127.0.0.1
+      - name: Run DynamoDB per-type Jepsen workloads against elastickv
+        working-directory: jepsen
+        # The per-type sweep is a coverage check across all 10 attribute
+        # types, not the deep stress run — it uses its own shorter
+        # time-limit so the 10-type loop fits comfortably inside the job
+        # timeout regardless of the workflow_dispatch time-limit input.
+        # The per-invocation `timeout` is derived from TYPE_TL + buffer
+        # so bumping TYPE_TL never races against the outer timeout.
+        timeout-minutes: 30
+        env:
+          # Per-type sweep is a coverage check, not the deep stress run, so
+          # it uses its own shorter runtime and smaller history density than
+          # the parent dynamodb-workload step.  Keeping per-key ops modest
+          # also keeps Knossos's linearizability analysis inside its
+          # time budget (dense histories cause :valid? :unknown verdicts).
+          TYPE_TL: "60"
+          TYPE_CONCURRENCY: "4"
+          TYPE_KEY_COUNT: "8"
+          TYPE_MAX_WRITES: "80"
+        run: |
+          # Run every type independently: one failure does not stop
+          # the sweep so the final summary shows which specific types
+          # passed/failed.  The step still fails if any type failed.
+          PER_TYPE_TIMEOUT=$((TYPE_TL + 180))
+          declare -A RESULT
+          FAILED=()
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            echo "::group::value-type=${t}"
+            set +e
+            timeout "${PER_TYPE_TIMEOUT}" ~/lein run -m elastickv.dynamodb-types-workload --local \
+              --time-limit "${TYPE_TL}" \
+              --rate ${{ inputs.rate || '5' }} \
+              --concurrency "${TYPE_CONCURRENCY}" \
+              --key-count "${TYPE_KEY_COUNT}" \
+              --max-writes-per-key "${TYPE_MAX_WRITES}" \
+              --value-type "${t}" \
+              --dynamo-ports 63801,63802,63803 \
+              --host 127.0.0.1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              RESULT[$t]="pass"
+            else
+              RESULT[$t]="fail(${rc})"
+              FAILED+=("$t")
+            fi
+            echo "::endgroup::"
+          done
+          echo
+          echo "=== per-type jepsen summary ==="
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            printf '  %-12s %s\n' "$t" "${RESULT[$t]}"
+          done
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "FAILED types: ${FAILED[*]}"
+            exit 1
+          fi
+      - name: Upload Jepsen store on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-types
+          path: jepsen/store
+          retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 10

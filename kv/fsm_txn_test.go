@@ -7,7 +7,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,7 +17,7 @@ func applyFSMRequest(t *testing.T, fsm *kvFSM, req *pb.Request) error {
 	data, err := proto.Marshal(req)
 	require.NoError(t, err)
 
-	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	resp := fsm.Apply(data)
 	if resp == nil {
 		return nil
 	}

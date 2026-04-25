@@ -9,7 +9,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
 
 // LeaderRoutedStore is an MVCCStore wrapper that serves reads from the local
@@ -64,7 +63,7 @@ func (s *LeaderRoutedStore) leaderOKForKey(ctx context.Context, key []byte) bool
 	return ok
 }
 
-func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) raft.ServerAddress {
+func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) string {
 	if s.coordinator == nil {
 		return ""
 	}
@@ -265,11 +264,28 @@ func (s *LeaderRoutedStore) ApplyMutations(ctx context.Context, mutations []*sto
 	return errors.WithStack(s.local.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaft forwards to the local store's raft-apply variant. See
+// store.MVCCStore for the durability contract.
+func (s *LeaderRoutedStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS))
+}
+
+// DeletePrefixAtRaft forwards to the local store's raft-apply variant.
+func (s *LeaderRoutedStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS))
 }
 
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {

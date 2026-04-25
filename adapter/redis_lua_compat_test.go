@@ -121,8 +121,12 @@ func TestRedis_LuaRPopLPushBullMQLikeLists(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	defer func() { _ = rdb.Close() }()
 
-	require.NoError(t, rdb.RPush(ctx, "bull:test:wait", "job-1", "job-2", "job-3").Err())
-	require.NoError(t, rdb.LPush(ctx, "bull:test:active", "job-0").Err())
+	// Raft leadership can briefly churn right after createNode returns — the
+	// freshly-elected leader can step down if the initial heartbeats miss
+	// quorum on a slow CI runner (see waitForRaftReadiness). Retry the first
+	// writes so they ride out that re-election instead of failing the test.
+	rpushEventually(t, ctx, rdb, "bull:test:wait", "job-1", "job-2", "job-3")
+	lpushEventually(t, ctx, rdb, "bull:test:active", "job-0")
 
 	result, err := rdb.Eval(ctx, `
 local moved = redis.call("RPOPLPUSH", KEYS[1], KEYS[2])

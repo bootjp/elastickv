@@ -319,6 +319,8 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 // structured warning with enough context to diagnose EVALSHA timeouts.
 func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapsed time.Duration, attempts int, usedNOSCRIPTFallback bool, sErr error) {
 	d.metrics.SecondaryWriteErrors.Inc()
+	reason := classifySecondaryWriteError(sErr)
+	d.metrics.SecondaryWriteErrorsByReason.WithLabelValues(cmd, reason).Inc()
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "error").Inc()
 	fingerprint := fmt.Sprintf("secondary_write_%s", cmd)
 	if d.sentry.ShouldReport(fingerprint) {
@@ -487,4 +489,43 @@ func argsToBytes(iArgs []any) [][]byte {
 		}
 	}
 	return out
+}
+
+// secondaryWriteErrorPatterns maps substrings found in secondary-write error
+// messages to their Prometheus reason label. The list is scanned in order so
+// more-specific patterns (e.g. "retry limit exceeded" which embeds "write
+// conflict") must precede the generic ones to win the classification.
+var secondaryWriteErrorPatterns = []struct {
+	substr string
+	reason string
+}{
+	{"retry limit exceeded", "retry_limit"},
+	{"write conflict", "write_conflict"},
+	{"deadline exceeded", "deadline_exceeded"},
+	{"not leader", "not_leader"},
+	{"leader not found", "not_leader"},
+	{"txn already committed", "txn_already_finalized"},
+	{"txn already aborted", "txn_already_finalized"},
+	{"txn locked", "txn_locked"},
+}
+
+// classifySecondaryWriteError maps a secondary-write error to a small fixed set
+// of reason labels suitable for a Prometheus counter. The elastickv secondary
+// backend is in-house, so matching on substrings of the error message is safe.
+//
+// Order in secondaryWriteErrorPatterns matters (see its doc).
+func classifySecondaryWriteError(err error) string {
+	if err == nil {
+		return "other"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	msg := err.Error()
+	for _, p := range secondaryWriteErrorPatterns {
+		if strings.Contains(msg, p.substr) {
+			return p.reason
+		}
+	}
+	return "other"
 }

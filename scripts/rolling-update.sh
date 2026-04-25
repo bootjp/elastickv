@@ -55,6 +55,25 @@ Optional environment:
   RAFTADMIN_RPC_TIMEOUT_SECONDS
   RAFTADMIN_ALLOW_INSECURE
 
+  EXTRA_ENV
+    Whitespace-separated list of additional container environment variables to
+    forward to the remote docker run as `-e KEY=VALUE` flags. Format:
+    "KEY=VALUE [KEY=VALUE ...]" (e.g. "ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512").
+    Each pair must be KEY=VALUE with a non-empty KEY; pairs themselves must not
+    contain whitespace.
+
+    DEFAULT_EXTRA_ENV defaults to "GOMEMLIMIT=1800MiB" (Go runtime soft memory
+    ceiling; GC works harder before approaching the hard --memory limit so the
+    kernel OOM killer is not triggered). Merged with EXTRA_ENV before forwarding;
+    if a user-supplied EXTRA_ENV entry sets the same KEY, the user value wins.
+    Set DEFAULT_EXTRA_ENV="" to disable the default.
+
+  CONTAINER_MEMORY_LIMIT
+    docker run --memory value (default: 2500m). Hard container-scoped memory
+    ceiling; any OOM kill is contained to the elastickv container rather than
+    cascading to host processes (e.g. qemu-guest-agent, systemd). Paired with
+    GOMEMLIMIT=1800MiB so Go GC preempts the kill. Set to "" to disable.
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
@@ -106,6 +125,9 @@ SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+# Container OOM defenses. See usage() for rationale. Empty string disables.
+DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
+CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -394,11 +416,11 @@ update_one_node() {
 
   ssh "${SSH_BASE_OPTS[@]}" "$ssh_target" \
     env \
-      IMAGE="$IMAGE" \
-      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN" \
-      CONTAINER_NAME="$CONTAINER_NAME" \
-      DATA_DIR="$DATA_DIR" \
-      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT" \
+      IMAGE="$IMAGE_Q" \
+      RAFTADMIN_BIN_PATH="$RAFTADMIN_REMOTE_BIN_Q" \
+      CONTAINER_NAME="$CONTAINER_NAME_Q" \
+      DATA_DIR="$DATA_DIR_Q" \
+      SERVER_ENTRYPOINT="$SERVER_ENTRYPOINT_Q" \
       RAFT_ENGINE="$RAFT_ENGINE" \
       RAFT_PORT="$RAFT_PORT" \
       REDIS_PORT="$REDIS_PORT" \
@@ -406,7 +428,7 @@ update_one_node() {
       S3_PORT="$S3_PORT" \
       ENABLE_S3="$ENABLE_S3" \
       S3_REGION="$S3_REGION" \
-      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE" \
+      S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
@@ -417,8 +439,10 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
-      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP" \
-      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP" \
+      RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
+      RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
+      EXTRA_ENV="$EXTRA_ENV_Q" \
+      CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -665,12 +689,57 @@ run_container() {
     )
   fi
 
+  # Pass through additional container environment variables from EXTRA_ENV.
+  # Accepts a whitespace-separated list of KEY=VALUE pairs, e.g.:
+  #   EXTRA_ENV="ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512"
+  # Each pair is forwarded as a single `-e KEY=VALUE` flag so VALUE may contain
+  # characters that bash would otherwise interpret; pairs themselves must not
+  # contain whitespace.
+  local extra_env_flags=()
+  if [[ -n "${EXTRA_ENV:-}" ]]; then
+    # Split on whitespace without triggering filename globbing. Normalise
+    # newlines to spaces first so multi-line EXTRA_ENV values (common in
+    # long deploy.env overrides) are fully parsed — a here-string consumes
+    # only up to the first newline, so without this step subsequent lines
+    # would be silently dropped.
+    local -a extra_env_pairs=()
+    local extra_env_normalised="${EXTRA_ENV//$'\n'/ }"
+    # Explicit IFS so splitting is immune to any earlier mutation. Default
+    # whitespace is already space/tab/newline; pinning it here makes the
+    # behaviour self-documenting.
+    IFS=$' \t\n' read -r -a extra_env_pairs <<< "${extra_env_normalised}"
+    local pair
+    for pair in "${extra_env_pairs[@]}"; do
+      if [[ "$pair" != *=* || "$pair" == =* ]]; then
+        echo "invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
+        exit 1
+      fi
+      local key="${pair%%=*}"
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "invalid EXTRA_ENV key '$key' in entry '$pair'; key must match [A-Za-z_][A-Za-z0-9_]*" >&2
+        exit 1
+      fi
+      extra_env_flags+=(-e "$pair")
+    done
+  fi
+
+  # Optional hard container-scoped memory limit. Keeps any OOM kill contained
+  # to the elastickv container rather than cascading to host processes
+  # (e.g. qemu-guest-agent, systemd). Pair with GOMEMLIMIT via EXTRA_ENV so
+  # the Go runtime GCs before the kernel kills the container.
+  local memory_flags=()
+  if [[ -n "${CONTAINER_MEMORY_LIMIT:-}" ]]; then
+    memory_flags=(--memory "$CONTAINER_MEMORY_LIMIT")
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
+    "${memory_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
     --redisAddress "${NODE_HOST}:${REDIS_PORT}" \
@@ -806,6 +875,112 @@ fi
 
 ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
+
+# ssh joins remaining arguments into a single command string which the remote
+# login shell re-parses before `bash -s` is exec'd, so values containing
+# whitespace or shell metacharacters must be escaped before transport.
+# EXTRA_ENV is documented as a whitespace-separated list of KEY=VALUE pairs
+# and therefore always needs quoting; other forwarded variables are
+# structurally whitespace-free today but we still escape the path-like
+# ones most likely to evolve for defense in depth. Escape once here since
+# these don't change per node.
+#
+# EXTRA_ENV may legitimately span multiple lines in deploy.env; normalise
+# all non-space whitespace (newline, carriage return, tab) to spaces
+# *before* `printf %q` so the escape emits plain backslash-quoting rather
+# than ANSI-C $'...' quoting. Common remote login shells (/bin/sh -> dash
+# on Debian/Ubuntu) don't grok $'...' and would pass it through as literal
+# characters, breaking the `KEY=VALUE` validator in run_container.
+# CR handling additionally covers deploy.env files edited on Windows.
+# `${EXTRA_ENV:-}` is required because `set -u` is active and EXTRA_ENV
+# may be unset (the variable is optional in deploy.env).
+# Merge DEFAULT_EXTRA_ENV (operator-safety defaults like GOMEMLIMIT) with any
+# user-supplied EXTRA_ENV. User-supplied KEYs win over defaults for the same
+# KEY; the remote parser forwards pairs via `-e KEY=VALUE` so docker evaluates
+# the last occurrence, which means pre-pending defaults is correct: later user
+# entries override earlier defaults. We still de-duplicate here so the printed
+# command line stays clean.
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV:-}"
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV_USER_NORMALISED//[$'\t\r\n']/ }"
+EXTRA_ENV_DEFAULT_NORMALISED="${DEFAULT_EXTRA_ENV:-}"
+EXTRA_ENV_DEFAULT_NORMALISED="${EXTRA_ENV_DEFAULT_NORMALISED//[$'\t\r\n']/ }"
+
+merge_extra_env() {
+  local defaults="$1"
+  local user="$2"
+  # Portable across Bash 3.2 (macOS default) which lacks associative
+  # arrays: concatenate user KEYs into a space-padded string and match
+  # with " KEY " to test set membership. The EXTRA_ENV list is typically
+  # a handful of entries, so the linear check is negligible.
+  local -a user_pairs=()
+  local -a default_pairs=()
+  local pair key seen=" " merged=""
+
+  # Guard the here-strings: on Bash 3.2 (macOS default) `read` on an
+  # empty here-string returns non-zero, which trips `set -e`. Skip the
+  # read when the source string is empty — the empty array is the
+  # intended result either way.
+  # IFS is explicitly set per-read so a caller's surrounding IFS
+  # doesn't change how DEFAULT_EXTRA_ENV / EXTRA_ENV are split.
+  if [[ -n "$user" ]]; then
+    IFS=$' \t\n' read -r -a user_pairs <<< "$user"
+  fi
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    seen+="${key} "
+  done
+
+  if [[ -n "$defaults" ]]; then
+    IFS=$' \t\n' read -r -a default_pairs <<< "$defaults"
+    # Unlike EXTRA_ENV (user-supplied, forgivable typos), DEFAULT_EXTRA_ENV
+    # is baked into deploy.env — a malformed token there means a
+    # safeguard we installed deliberately is silently ignored. Fail
+    # loudly instead of dropping it.
+    # Three failure modes to catch early:
+    #   - no `=` at all (e.g. GOMEMLIMIT)           -> malformed
+    #   - empty key before `=` (e.g. =1800MiB)     -> malformed
+    #     (the `*=*` pattern match alone accepts this)
+    #   - empty pair (covered by the continue above)
+    for pair in "${default_pairs[@]}"; do
+      [[ -n "$pair" ]] || continue
+      if [[ "$pair" != *=* ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+        return 1
+      fi
+      if [[ "${pair%%=*}" == "" ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (empty key)" >&2
+        return 1
+      fi
+    done
+  fi
+  for pair in "${default_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    if [[ "$seen" != *" ${key} "* ]]; then
+      merged+="${merged:+ }$pair"
+    fi
+  done
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    merged+="${merged:+ }$pair"
+  done
+  printf '%s' "$merged"
+}
+
+EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
+EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
+CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
+S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
+IMAGE_Q="$(printf '%q' "$IMAGE")"
+DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
+SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
+RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
+CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
+RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

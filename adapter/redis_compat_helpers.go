@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -279,7 +280,9 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 }
 
 // probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
-// encodings left by pre-wide-column code paths.
+// encodings left by pre-wide-column code paths. For streams, both the new
+// entry-per-key meta and the legacy single-blob key are probed here so
+// type-detection is unaffected by the migration state.
 func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	checks := []struct {
 		typ redisValueType
@@ -288,6 +291,7 @@ func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte
 		{typ: redisTypeHash, key: redisHashKey(key)},
 		{typ: redisTypeSet, key: redisSetKey(key)},
 		{typ: redisTypeZSet, key: redisZSetKey(key)},
+		{typ: redisTypeStream, key: store.StreamMetaKey(key)},
 		{typ: redisTypeStream, key: redisStreamKey(key)},
 	}
 	for _, check := range checks {
@@ -494,16 +498,101 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
+// loadStreamAt reads the entire stream as a redisStreamValue from the
+// entry-per-key layout. Per the PR #620 operator directive, any legacy
+// single-blob data is explicitly discarded: if the new meta key is absent
+// we return an empty stream, even when a legacy blob still exists on disk.
+// The legacy blob is actively deleted by the next write (see
+// streamWriteBase) and by any DEL via deleteStreamWideColumnElems.
 func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, error) {
-	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
+	meta, metaFound, err := r.loadStreamMetaAt(ctx, key, readTS)
+	if err != nil {
+		return redisStreamValue{}, err
+	}
+	if !metaFound {
+		return redisStreamValue{}, nil
+	}
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
+	if err != nil {
+		return redisStreamValue{}, err
+	}
+	return redisStreamValue{Entries: entries}, nil
+}
+
+// loadStreamMetaAt returns the current StreamMeta for key, or (_, false, nil)
+// when the meta key does not exist.
+func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS uint64) (store.StreamMeta, bool, error) {
+	raw, err := r.store.GetAt(ctx, store.StreamMetaKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisStreamValue{}, nil
+			return store.StreamMeta{}, false, nil
 		}
-		return redisStreamValue{}, errors.WithStack(err)
+		return store.StreamMeta{}, false, errors.WithStack(err)
 	}
-	val, err := unmarshalStreamValue(raw)
-	return val, err
+	meta, err := store.UnmarshalStreamMeta(raw)
+	if err != nil {
+		return store.StreamMeta{}, false, errors.WithStack(err)
+	}
+	return meta, true, nil
+}
+
+// scanStreamEntriesAt returns all entries for key in ascending ID order.
+// This path exists to reconstruct the full stream for callers — the Lua
+// stream bridge (streamState) and the legacy compatibility surface — that
+// previously loaded the entire stream as a single blob.
+//
+// User-bounded scans (XREAD/XRANGE/XREVRANGE) use
+// scanStreamEntriesAfter / rangeStreamNewLayout. For the
+// materialise-everything path, expectedLen <= 0 represents an empty or
+// uninitialized stream (meta.Length == 0) and intentionally yields an
+// empty slice — this is the correct state for a newly-created or empty
+// stream; callers need not distinguish it from a missing stream.
+// When expectedLen > 0 we cap the scan at meta.Length plus slack,
+// matching existing store ScanAt semantics for non-positive limits.
+func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+	prefix := store.StreamEntryScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	limit := scanStreamEntriesLimit(expectedLen)
+	if limit == 0 && expectedLen <= 0 {
+		return []redisStreamEntry{}, nil
+	}
+	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	entries := make([]redisStreamEntry, 0, len(kvs))
+	for _, pair := range kvs {
+		entry, err := unmarshalStreamEntry(pair.Value)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// scanStreamEntriesLimit derives the ScanAt limit for scanStreamEntriesAt.
+// Arithmetic is performed in int64 and the result is clamped to math.MaxInt
+// before narrowing; this keeps the helper correct on 32-bit targets and
+// when expectedLen is corrupted into a value that would otherwise overflow
+// int on addition with the slack. A negative or zero expectedLen falls
+// through to the ScanAt "limit==0 means no limit" convention.
+func scanStreamEntriesLimit(expectedLen int64) int {
+	const concurrentWriteSlack = int64(64)
+	if expectedLen <= 0 {
+		return 0
+	}
+	want := expectedLen + concurrentWriteSlack
+	// Overflow guard: expectedLen is a corrupted meta away from anything;
+	// if the sum wraps, fall back to "no limit" (ScanAt stores its own
+	// hard caps downstream) rather than pass a negative value.
+	if want < expectedLen {
+		return 0
+	}
+	if want > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(want)
 }
 
 func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uint64, elems []*kv.Elem[kv.OP]) error {
@@ -848,7 +937,47 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	}
 	elems = append(elems, zsetElems...)
 
+	// Wide-column stream cleanup: delete the meta key and every entry key.
+	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, streamElems...)
+
 	return elems, existed, nil
+}
+
+// deleteStreamWideColumnElems returns delete operations for all stream
+// wide-column keys: the meta key (if it exists) and every entry under the
+// entry scan prefix. Total results are capped at maxWideColumnItems to
+// prevent unbounded memory growth; DEL/EXPIRE 0/MULTI-EXEC DEL on a stream
+// that exceeds the cap returns ErrCollectionTooLarge, consistent with other
+// wide-column types (Hash, Set, ZSet). Streams are also capped at
+// maxWideColumnItems via xaddEnforceMaxWideColumn in XADD, so a stream that
+// migrated from a legacy blob larger than the cap will require a XTRIM before
+// it can be deleted.
+func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	// Delete any legacy single-blob remnant in the same commit so DEL
+	// leaves no stale data on disk even when the stream was never
+	// migrated. ExistsAt is cheap; the Del is a no-op on the storage
+	// side when the key is already absent.
+	legacyCleanup, err := r.legacyStreamCleanupElems(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	elems = append(elems, legacyCleanup...)
+	metaKey := store.StreamMetaKey(key)
+	if exists, err := r.store.ExistsAt(ctx, metaKey, readTS); err != nil {
+		return nil, errors.WithStack(err)
+	} else if exists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
+	}
+	entryElems, err := r.scanAllDeltaElems(ctx, store.StreamEntryScanPrefix(key), readTS)
+	if err != nil {
+		return nil, err
+	}
+	return append(elems, entryElems...), nil
 }
 
 // deleteZSetWideColumnElems returns delete operations for all ZSet wide-column keys:

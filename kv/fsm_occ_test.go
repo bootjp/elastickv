@@ -6,7 +6,6 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
-	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -44,7 +43,7 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	data, err := proto.Marshal(put)
 	require.NoError(t, err)
 
-	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	resp := fsm.Apply(data)
 	require.Nil(t, resp)
 
 	// Stale transaction attempts to prewrite with startTS=90.
@@ -60,7 +59,7 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 	data, err = proto.Marshal(conflict)
 	require.NoError(t, err)
 
-	resp = fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	resp = fsm.Apply(data)
 
 	err, ok = resp.(error)
 	require.True(t, ok)
@@ -93,7 +92,7 @@ func TestOnePhaseTxnDetectsWriteConflict(t *testing.T) {
 	data, err := proto.Marshal(req)
 	require.NoError(t, err)
 
-	resp := fsm.Apply(&raft.Log{Type: raft.LogCommand, Data: data})
+	resp := fsm.Apply(data)
 	err, ok = resp.(error)
 	require.True(t, ok)
 	require.ErrorIs(t, err, store.ErrWriteConflict)

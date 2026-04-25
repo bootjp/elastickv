@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -32,7 +33,7 @@ const (
 	// duration of a leader-local read lease. It absorbs goroutine scheduling
 	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
 	// and bounded wall-clock skew between the leader and a partition's new
-	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	// leader candidate. See docs/design/2026_04_20_implemented_lease_read.md for the safety argument.
 	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK. It also sizes the inbound
@@ -82,8 +83,15 @@ const (
 	// 2-lane layout (heartbeat + normal) is used. Opt-in by design: the
 	// raft hot path is high blast radius and a regression here can cause
 	// cluster-wide elections.
-	dispatcherLanesEnvVar    = "ELASTICKV_RAFT_DISPATCHER_LANES"
+	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
+	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
+	// snapshot once the applied index has advanced this many entries past
+	// the last snapshot's index. etcd/raft itself uses 10_000 as a default,
+	// but with fat proposal payloads (e.g. Lua scripts) this can produce a
+	// multi-GiB WAL between snapshots. Operators can lower via
+	// ELASTICKV_RAFT_SNAPSHOT_COUNT without a rebuild.
 	defaultSnapshotEvery     = 10_000
+	snapshotEveryEnvVar      = "ELASTICKV_RAFT_SNAPSHOT_COUNT"
 	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
 	defaultMaxPendingConfigs = 64
@@ -174,15 +182,26 @@ type Engine struct {
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
 	dispatcherLanesEnabled bool
-	dispatchStopCh         chan struct{}
-	dispatchCtx            context.Context
-	dispatchCancel         context.CancelFunc
-	snapshotReqCh          chan snapshotRequest
-	snapshotResCh          chan snapshotResult
-	snapshotStopCh         chan struct{}
-	closeCh                chan struct{}
-	doneCh                 chan struct{}
-	startedCh              chan struct{}
+	// snapshotEvery is the FSM-snapshot trigger threshold captured once at
+	// Open from ELASTICKV_RAFT_SNAPSHOT_COUNT. maybePersistLocalSnapshot
+	// runs on every Ready-drain pass, so re-parsing the env var (and
+	// potentially emitting a warning on malformed input) on every call
+	// would flood logs and burn CPU on the raft hot path. Cache it once.
+	snapshotEvery uint64
+	// maxWALFiles is the WAL retention cap captured once at Open from
+	// ELASTICKV_RAFT_MAX_WAL_FILES. Purges are relatively rare (only after
+	// snapshot release) but caching avoids a second warning-per-invalid
+	// call site and keeps the knob consistent across the engine lifetime.
+	maxWALFiles    int
+	dispatchStopCh chan struct{}
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
+	snapshotReqCh  chan snapshotRequest
+	snapshotResCh  chan snapshotResult
+	snapshotStopCh chan struct{}
+	closeCh        chan struct{}
+	doneCh         chan struct{}
+	startedCh      chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -236,18 +255,21 @@ type Engine struct {
 	stepQueueFullCount atomic.Uint64
 
 	// ackTracker records per-peer last-response times on the leader and
-	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// publishes the majority-ack instant via quorumAckMonoNs. It is
 	// read lock-free from LastQuorumAck() on the hot lease-read path
 	// and updated inside the single event-loop goroutine from
 	// handleStep when a follower response arrives.
 	ackTracker quorumAckTracker
-	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// singleNodeLeaderAckMonoNs short-circuits LastQuorumAck on the
 	// single-node leader path: self IS the quorum, so there are no
 	// follower responses to observe. refreshStatus keeps this value
-	// current (set to time.Now().UnixNano() each tick while leader and
-	// cluster size is 1; cleared otherwise) so the lease-read hot path
-	// never has to acquire e.mu to check peer count or leader state.
-	singleNodeLeaderAckUnixNano atomic.Int64
+	// current (set to monoclock.Now().Nanos() each tick while leader
+	// and cluster size is 1; cleared otherwise) so the lease-read hot
+	// path never has to acquire e.mu to check peer count or leader
+	// state. Stored as int64 nanoseconds on the CLOCK_MONOTONIC_RAW
+	// scale so the lease comparison is immune to NTP rate adjustment
+	// and wall-clock steps (see internal/monoclock).
+	singleNodeLeaderAckMonoNs atomic.Int64
 	// isLeader mirrors status.State == StateLeader for lock-free reads
 	// on the hot path. refreshStatus writes it on every tick;
 	// recordQuorumAck reads it before admitting a follower response
@@ -430,6 +452,13 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		pendingProposals: map[uint64]proposalRequest{},
 		pendingReads:     map[uint64]readRequest{},
 		pendingConfigs:   map[uint64]adminRequest{},
+		// Parse env-tunable retention/snapshot knobs once at Open. Both
+		// are consulted on hot paths (maybePersistLocalSnapshot runs per
+		// Ready-drain; purge runs after each snapshot persist) and the
+		// underlying env parsers emit warnings on malformed input, so
+		// re-reading them would flood logs under a misconfiguration.
+		snapshotEvery: snapshotEveryFromEnv(),
+		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
@@ -693,29 +722,31 @@ func (e *Engine) AppliedIndex() uint64 {
 	return e.appliedIndex.Load()
 }
 
-// LastQuorumAck returns the wall-clock instant by which a majority of
-// followers most recently responded to the leader, or the zero time
-// when no such observation exists (follower / candidate / startup).
+// LastQuorumAck returns the monotonic-raw instant by which a majority
+// of followers most recently responded to the leader, or the zero
+// Instant when no such observation exists (follower / candidate /
+// startup).
 //
 // Lock-free: reads atomic.Int64 values published by recordQuorumAck
 // (multi-node cluster) or refreshStatus (single-node cluster keeps
-// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
-// the hot lease-read path performs zero lock work). See
-// raftengine.LeaseProvider for the lease-read correctness contract.
-func (e *Engine) LastQuorumAck() time.Time {
+// singleNodeLeaderAckMonoNs alive with monoclock.Now() while leader,
+// so the hot lease-read path performs zero lock work). The monotonic-
+// raw source keeps the lease safe against NTP-slew / wall-clock-step
+// events; see raftengine.LeaseProvider for the correctness contract.
+func (e *Engine) LastQuorumAck() monoclock.Instant {
 	if e == nil {
-		return time.Time{}
+		return monoclock.Zero
 	}
 	// Honor the LeaseProvider contract that non-leaders always return
-	// the zero time. Without this guard a late MsgAppResp that sneaks
-	// past recordQuorumAck (or a tracker entry that survived a brief
-	// step-down/step-up window) could leak stale liveness into the
-	// caller's fast-path validation.
+	// the zero Instant. Without this guard a late MsgAppResp that
+	// sneaks past recordQuorumAck (or a tracker entry that survived a
+	// brief step-down/step-up window) could leak stale liveness into
+	// the caller's fast-path validation.
 	if !e.isLeader.Load() {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
-		return time.Unix(0, ns)
+	if ns := e.singleNodeLeaderAckMonoNs.Load(); ns != 0 {
+		return monoclock.FromNanos(ns)
 	}
 	return e.ackTracker.load()
 }
@@ -725,7 +756,7 @@ func (e *Engine) LastQuorumAck() time.Time {
 // heartbeat channel was full. Monotonic across the life of the engine.
 // Surfaced to Prometheus via the monitoring package so the hot-path
 // dashboard can graph stepCh saturation alongside LinearizableRead
-// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+// rate (see the "Hot Path" row in monitoring/grafana/dashboards/elastickv-redis-summary.json).
 func (e *Engine) DispatchDropCount() uint64 {
 	if e == nil {
 		return 0
@@ -1661,7 +1692,7 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < defaultSnapshotEvery {
+	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < e.snapshotThreshold() {
 		return nil
 	}
 	snapshot, err := e.fsm.Snapshot()
@@ -2067,6 +2098,10 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 		slog.Warn("failed to purge old snap files", "error", purgeErr)
 	}
+	walDir := filepath.Join(e.dataDir, walDirName)
+	if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
+		slog.Warn("failed to purge old wal files", "error", purgeErr)
+	}
 	return nil
 }
 
@@ -2139,9 +2174,9 @@ func (e *Engine) refreshStatus() {
 	e.isLeader.Store(status.State == raftengine.StateLeader)
 
 	if status.State == raftengine.StateLeader && clusterSize <= 1 {
-		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+		e.singleNodeLeaderAckMonoNs.Store(monoclock.Now().Nanos())
 	} else {
-		e.singleNodeLeaderAckUnixNano.Store(0)
+		e.singleNodeLeaderAckMonoNs.Store(0)
 	}
 
 	if status.State == raftengine.StateLeader {
@@ -2768,6 +2803,54 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 }
 
+// walRetention returns the WAL segment retention cap for this engine. As
+// with snapshotThreshold, the value is cached at Open so the purge path
+// does not re-parse ELASTICKV_RAFT_MAX_WAL_FILES on every snapshot release.
+// A zero cache (tests that bypass Open) falls back to defaultMaxWALFiles.
+func (e *Engine) walRetention() int {
+	if e.maxWALFiles == 0 {
+		return defaultMaxWALFiles
+	}
+	return e.maxWALFiles
+}
+
+// snapshotThreshold returns the FSM-snapshot trigger threshold for this
+// engine. The value is cached once at Open via snapshotEveryFromEnv so the
+// hot path (maybePersistLocalSnapshot runs per Ready-drain) does not re-parse
+// the env var or re-emit warnings on every loop iteration. When the engine is
+// constructed directly (e.g. in unit tests that bypass Open) snapshotEvery is
+// zero; fall back to defaultSnapshotEvery rather than treating zero as "never
+// snapshot", which would silently break those tests.
+func (e *Engine) snapshotThreshold() uint64 {
+	if e.snapshotEvery == 0 {
+		return defaultSnapshotEvery
+	}
+	return e.snapshotEvery
+}
+
+// snapshotEveryFromEnv returns the FSM-snapshot trigger threshold (in applied
+// raft entries past the last snapshot). Operators can override via
+// ELASTICKV_RAFT_SNAPSHOT_COUNT; invalid or missing values fall back to
+// defaultSnapshotEvery. Values < 1 are clamped to 1 rather than rejected so a
+// misconfiguration errs on the side of MORE-frequent snapshots (smaller WAL
+// footprint) instead of disabling snapshotting entirely.
+func snapshotEveryFromEnv() uint64 {
+	v := strings.TrimSpace(os.Getenv(snapshotEveryEnvVar))
+	if v == "" {
+		return defaultSnapshotEvery
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		slog.Warn("invalid ELASTICKV_RAFT_SNAPSHOT_COUNT; using default",
+			"value", v, "default", defaultSnapshotEvery)
+		return defaultSnapshotEvery
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 // dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has
 // been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. The value
 // is parsed with strconv.ParseBool, which accepts the standard tokens
@@ -3253,6 +3336,10 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 		snapDir := filepath.Join(e.dataDir, snapDirName)
 		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
 			slog.Warn("failed to purge old snap files", "error", purgeErr)
+		}
+		walDir := filepath.Join(e.dataDir, walDirName)
+		if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
+			slog.Warn("failed to purge old wal files", "error", purgeErr)
 		}
 		return nil
 	case errors.Is(err, etcdraft.ErrCompacted):

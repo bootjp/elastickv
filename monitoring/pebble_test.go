@@ -31,6 +31,19 @@ func (f *fakePebbleSource) Metrics() *pebble.Metrics {
 	return f.metrics
 }
 
+// fakePebbleCapacitySource additionally implements PebbleCacheCapacitySource
+// so the collector emits elastickv_pebble_block_cache_capacity_bytes.
+type fakePebbleCapacitySource struct {
+	fakePebbleSource
+	capacity int64
+}
+
+func (f *fakePebbleCapacitySource) BlockCacheCapacityBytes() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.capacity
+}
+
 // newFakeMetrics builds a *pebble.Metrics populated only with the
 // fields the collector reads. Other fields stay at their zero value.
 func newFakeMetrics(l0Sub int32, l0Files int64, debt uint64, inProg int64, compactCount int64,
@@ -190,6 +203,58 @@ func TestPebbleCollectorSkipsNilSnapshot(t *testing.T) {
 	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.compactCountTotal))
 }
 
+func TestPebbleCollectorEmitsBlockCacheCapacity(t *testing.T) {
+	// When the source implements PebbleCacheCapacitySource, the
+	// collector mirrors the configured capacity into
+	// elastickv_pebble_block_cache_capacity_bytes alongside the current
+	// usage gauge. This lets operators see a low hit rate and
+	// immediately tell whether the cache is undersized vs simply cold.
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.PebbleCollector()
+	require.NotNil(t, collector)
+
+	src := &fakePebbleCapacitySource{capacity: 256 << 20}
+	src.set(newFakeMetrics(
+		0, 0, 0, 0, 0,
+		0, 0, 0,
+		4096, 0, 0,
+	))
+	sources := []PebbleSource{{GroupID: 3, GroupIDStr: "3", Source: src}}
+	collector.ObserveOnce(sources)
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_pebble_block_cache_capacity_bytes Configured maximum size of Pebble's block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.
+# TYPE elastickv_pebble_block_cache_capacity_bytes gauge
+elastickv_pebble_block_cache_capacity_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 2.68435456e+08
+# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by Pebble's block cache.
+# TYPE elastickv_pebble_block_cache_size_bytes gauge
+elastickv_pebble_block_cache_size_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 4096
+`),
+		"elastickv_pebble_block_cache_capacity_bytes",
+		"elastickv_pebble_block_cache_size_bytes",
+	)
+	require.NoError(t, err)
+}
+
+func TestPebbleCollectorSkipsCapacityWhenUnsupported(t *testing.T) {
+	// A PebbleMetricsSource that does NOT additionally implement
+	// PebbleCacheCapacitySource must not cause the capacity gauge to be
+	// populated for its group. This preserves backward compatibility
+	// with sources that pre-date the capacity interface.
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.PebbleCollector()
+	require.NotNil(t, collector)
+
+	src := &fakePebbleSource{}
+	src.set(newFakeMetrics(0, 0, 0, 0, 0, 0, 0, 0, 1024, 0, 0))
+	collector.ObserveOnce([]PebbleSource{{GroupID: 4, GroupIDStr: "4", Source: src}})
+
+	// The capacity vector should remain empty (no label sets observed).
+	require.Equal(t, 0, testutil.CollectAndCount(registry.pebble.blockCacheCapacityBytes))
+}
+
 func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
 	// Code paths that bypass the registry (tests, bootstrap helpers)
 	// must tolerate a nil collector / empty sources without panicking.
@@ -199,4 +264,77 @@ func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.PebbleCollector()
 	require.NotPanics(t, func() { collector.ObserveOnce(nil) })
+}
+
+// TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive verifies that
+// calling SetFSMApplySyncMode("nosync") drives the sync label to 0
+// and the nosync label to 1 (and vice versa). Operators rely on this
+// gauge to alert on unexpected durability posture changes, so the
+// two-row shape must stay stable across successive calls.
+func TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+
+	registry.SetFSMApplySyncMode("sync")
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+
+	registry.SetFSMApplySyncMode("nosync")
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+}
+
+// TestSetFSMApplySyncMode_NilRegistryIsSafe matches the pattern of
+// other monitoring helpers: bootstrap paths that construct an engine
+// without a registry (tests, the redis-proxy binary) must not panic.
+func TestSetFSMApplySyncMode_NilRegistryIsSafe(t *testing.T) {
+	var r *Registry
+	require.NotPanics(t, func() { r.SetFSMApplySyncMode("sync") })
+}
+
+// TestSetFSMApplySyncMode_UnknownLabelCoercesToSync verifies that an
+// unrecognised label is coerced to "sync" rather than pinning a third
+// row on the gauge. This mirrors store.resolveFSMApplyWriteOpts, which
+// also falls back to sync on unknown input; the two paths must agree
+// or the gauge will disagree with the actual WriteOptions the store
+// uses.
+func TestSetFSMApplySyncMode_UnknownLabelCoercesToSync(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+
+	// Prime the gauge with a legitimate nosync posture so we can prove
+	// the follow-up unknown-label call flips sync to 1 (not leaves it
+	// at its prior value).
+	registry.SetFSMApplySyncMode("nosync")
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
+
+	registry.SetFSMApplySyncMode("batch") // never implemented, treated as sync
+	require.InEpsilon(t,
+		float64(1),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("sync")),
+		0.0,
+	)
+	require.InDelta(t,
+		float64(0),
+		testutil.ToFloat64(registry.pebble.fsmApplySyncMode.WithLabelValues("nosync")),
+		0.0,
+	)
 }

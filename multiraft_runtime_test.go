@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
-	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -26,44 +25,11 @@ func TestGroupDataDir(t *testing.T) {
 	})
 }
 
-func TestBuildRuntimeForGroupBootstrap(t *testing.T) {
-	baseDir := t.TempDir()
-
-	factory, err := newRaftFactory(raftEngineHashicorp)
-	require.NoError(t, err)
-
-	st := store.NewMVCCStore()
-	sm := etcdraftengine.AdaptHashicorpFSM(kv.NewKvFSMWithHLC(st, kv.NewHLC()))
-
-	runtime, err := buildRuntimeForGroup(
-		"n1",
-		groupSpec{id: 1, address: "127.0.0.1:0"},
-		baseDir,
-		true, // multi
-		true, // bootstrap
-		nil,
-		st,
-		sm,
-		factory,
-	)
-	require.NoError(t, err)
-	require.NotNil(t, runtime)
-	require.NotNil(t, runtime.engine)
-	t.Cleanup(func() { runtime.Close() })
-
-	dir := groupDataDir(baseDir, "n1", 1, true)
-	_, err = os.Stat(dir)
-	require.NoError(t, err)
-
-	_, err = os.Stat(filepath.Join(dir, "raft.db"))
-	require.NoError(t, err)
-}
-
 func TestParseRaftEngineType(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		engineType, err := parseRaftEngineType("")
 		require.NoError(t, err)
-		require.Equal(t, raftEngineHashicorp, engineType)
+		require.Equal(t, raftEngineEtcd, engineType)
 	})
 
 	t.Run("etcd", func(t *testing.T) {
@@ -200,23 +166,6 @@ func TestEnsureRaftEngineDataDir(t *testing.T) {
 		require.Equal(t, "etcd\n", string(data))
 	})
 
-	t.Run("rejects mismatched existing artifacts", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("not-a-real-db"), 0o600))
-		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
-		require.Error(t, err)
-		require.ErrorIs(t, err, ErrRaftEngineDataDir)
-	})
-
-	t.Run("detects mixed engine artifacts", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("not-a-real-db"), 0o600))
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, "member", "wal"), 0o755))
-		_, _, err := detectRaftEngineFromDataDir(dir)
-		require.Error(t, err)
-		require.ErrorIs(t, err, ErrMixedRaftEngineArtifacts)
-	})
-
 	t.Run("detects etcd peers metadata artifact", func(t *testing.T) {
 		dir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "etcd-raft-peers.bin"), []byte("placeholder"), 0o600))
@@ -245,12 +194,25 @@ func TestEnsureRaftEngineDataDir(t *testing.T) {
 		require.Equal(t, raftEngineEtcd, engineType)
 	})
 
-	t.Run("detects mixed engine artifacts with bare wal", func(t *testing.T) {
+	t.Run("rejects legacy hashicorp raft.db", func(t *testing.T) {
 		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("dummy"), 0o600))
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, "wal"), 0o755))
-		_, _, err := detectRaftEngineFromDataDir(dir)
-		require.Error(t, err)
-		require.ErrorIs(t, err, ErrMixedRaftEngineArtifacts)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
 	})
+
+	t.Run("rejects legacy hashicorp logs.dat", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "logs.dat"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
+	})
+
+	t.Run("rejects legacy hashicorp stable.dat", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "stable.dat"), []byte("legacy"), 0o600))
+		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
+		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
+	})
+
 }

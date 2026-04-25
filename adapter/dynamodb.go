@@ -12,8 +12,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,7 +24,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -135,7 +132,7 @@ type DynamoDBServer struct {
 	requestObserver monitoring.DynamoDBRequestObserver
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
-	leaderDynamo    map[raft.ServerAddress]string
+	leaderDynamo    map[string]string
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -154,9 +151,9 @@ func WithDynamoDBActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) Dyna
 // WithDynamoDBLeaderMap configures the Raft-address-to-DynamoDB-address mapping
 // used to forward requests from followers to the current leader.
 // The format mirrors the raftRedisMap / raftS3Map convention.
-func WithDynamoDBLeaderMap(m map[raft.ServerAddress]string) DynamoDBServerOption {
+func WithDynamoDBLeaderMap(m map[string]string) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
-		server.leaderDynamo = make(map[raft.ServerAddress]string, len(m))
+		server.leaderDynamo = make(map[string]string, len(m))
 		for k, v := range m {
 			server.leaderDynamo[k] = v
 		}
@@ -295,33 +292,15 @@ func (d *DynamoDBServer) Stop() {
 // (either proxied or an error response was written), false if the request
 // should be handled locally (i.e. this node is the leader or no leader map is
 // configured).
+//
+// Serving reads or writes locally on a follower would expose G2-item-realtime
+// stale reads, so every follower request is forwarded to the leader.
 func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
-	if len(d.leaderDynamo) == 0 || d.coordinator == nil {
-		return false
-	}
-	if d.coordinator.IsLeader() {
-		return false
-	}
-	// This node is a follower.  All requests must be forwarded to the leader to
-	// preserve linearizability — serving reads or writes locally on a follower
-	// causes stale-read anomalies (G2-item-realtime).
-	leader := d.coordinator.RaftLeader()
-	if leader == "" {
-		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "no raft leader currently available")
-		return true
-	}
-	targetAddr, ok := d.leaderDynamo[leader]
-	if !ok || strings.TrimSpace(targetAddr) == "" {
-		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrInternal, "leader dynamo address not found")
-		return true
-	}
-	target := &url.URL{Scheme: "http", Host: targetAddr}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		writeDynamoError(rw, http.StatusServiceUnavailable, dynamoErrInternal, "leader proxy error: "+err.Error())
-	}
-	proxy.ServeHTTP(w, r)
-	return true
+	return proxyHTTPRequestToLeader(d.coordinator, d.leaderDynamo, dynamoLeaderProxyErrorWriter, w, r)
+}
+
+func dynamoLeaderProxyErrorWriter(w http.ResponseWriter, status int, message string) {
+	writeDynamoError(w, status, dynamoErrInternal, message)
 }
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {

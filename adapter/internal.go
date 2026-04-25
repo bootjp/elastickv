@@ -5,16 +5,10 @@ import (
 	"context"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
-	hashicorpraftengine "github.com/bootjp/elastickv/internal/raftengine/hashicorp"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"github.com/hashicorp/raft"
 )
-
-func NewInternal(txm kv.Transactional, r *raft.Raft, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
-	return NewInternalWithEngine(txm, hashicorpraftengine.New(r), clock, relay)
-}
 
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
 	return &Internal{
