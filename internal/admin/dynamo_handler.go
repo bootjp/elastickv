@@ -131,17 +131,23 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// AdminListTables materialises the full table-name list before
-	// paginate-and-slice. The adapter's listTableNames already
-	// scans the entire metadata prefix in one shot for the SigV4
-	// listTables path, so streaming here would not change the
-	// adapter's memory profile; the dashboard's bounded `limit`
-	// (default 100, hard max 1000) and the lex-sorted name list
-	// keep the per-request slice small enough that this is the
-	// pragmatic shape rather than the limiting factor. If a future
-	// admin-cluster scale ever changes that calculus, the fix is to
-	// teach the adapter to stream, then plumb that through here —
-	// not to add a streaming layer on top of the materialised list.
+	// AdminListTables returns the full lex-sorted name list that
+	// the adapter's metadata prefix scan produces; we then slice
+	// to the requested page. The adapter's listTableNames already
+	// materialises the same list for the SigV4 listTables path
+	// (adapter/dynamodb.go:1146), which has been in production
+	// since DynamoDB-compat shipped — admin's memory profile is
+	// strictly the SigV4 path's, not a regression on top of it.
+	//
+	// Worst-case bound: a Dynamo table name caps at 255 bytes, so
+	// 1k tables ≈ 256 KiB and 10k tables ≈ 2.5 MiB of name
+	// strings on the heap during a single list call. That is well
+	// inside the per-request budget the admin listener targets.
+	// Beyond that scale the right fix is to teach the adapter to
+	// stream the metadata scan via a callback (and plumb it
+	// through here), not to bolt a streaming layer on top of the
+	// already-materialised slice. Tracked separately; this
+	// endpoint is not the limiting factor.
 	names, err := h.source.AdminListTables(r.Context())
 	if err != nil {
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo list tables failed",

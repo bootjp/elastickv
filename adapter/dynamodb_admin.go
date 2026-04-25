@@ -38,10 +38,18 @@ func (d *DynamoDBServer) AdminListTables(ctx context.Context) ([]string, error) 
 // (result, present, error) lets admin callers distinguish a genuine
 // "not found" from a storage error without sniffing sentinels: when
 // the table is missing the function returns (nil, false, nil).
+//
+// Unlike the SigV4 describeTable handler, AdminDescribeTable does
+// NOT invoke ensureLegacyTableMigration. The admin dashboard is a
+// strictly read-only surface (Gemini medium review on PR #633), so
+// triggering Raft-coordinated key-encoding migrations as a side
+// effect of routine polling would (a) violate the read-only
+// contract and (b) cause every dashboard refresh to write to the
+// cluster. Migration still runs lazily on the next SigV4 read or
+// write of the same table — the schema we return here is just a
+// snapshot for display, not a guarantee that the table is
+// up-to-date for serving.
 func (d *DynamoDBServer) AdminDescribeTable(ctx context.Context, name string) (*AdminTableSummary, bool, error) {
-	if err := d.ensureLegacyTableMigration(ctx, name); err != nil {
-		return nil, false, err
-	}
 	schema, exists, err := d.loadTableSchema(ctx, name)
 	if err != nil {
 		return nil, false, err
