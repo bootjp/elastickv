@@ -687,6 +687,47 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+// TestReRegisterDuringPruneGraceCancelsPrune pins Codex round-9 P2:
+// a virtual-member route that gets removed and re-registered inside
+// the prune grace window must not have its routeID stripped from
+// bucket.MemberRoutes when grace expires — the route is alive again
+// and Observe is feeding fresh traffic into the bucket.
+func TestReRegisterDuringPruneGraceCancelsPrune(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 1,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 should fold into virtual bucket")
+	}
+	s.RemoveRoute(2)
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 should still fold (over budget)")
+	}
+
+	clk.Advance(s.graceWindow() + time.Second)
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+
+	rows := lastSnapshotColumn(t, s).Rows
+	agg := findAggregateRow(t, rows)
+	if !memberRoutesContain(agg.MemberRoutes, 2) {
+		t.Fatalf("re-registered route 2 dropped from MemberRoutes after grace: %v", agg.MemberRoutes)
+	}
+	count := 0
+	for _, m := range agg.MemberRoutes {
+		if m == 2 {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("MemberRoutes contains route 2 %d times, want exactly 1: %v", count, agg.MemberRoutes)
+	}
+}
+
 // TestNonPositiveOptionsFallBackToDefaults pins Codex round-8 P2: a
 // negative MaxTrackedRoutes used to bypass the zero-check and force
 // every route into a virtual bucket. Confirm both zero and negative

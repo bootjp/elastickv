@@ -342,12 +342,21 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 // MaxTrackedRoutes cap was hit and the route was folded into a
 // virtual aggregate bucket. Idempotent: calling twice with the same
 // RouteID is a no-op (the original slot stays in place).
+//
+// If a previous RemoveRoute(routeID) queued a deferred member-prune
+// for this same RouteID and the grace window has not elapsed yet,
+// that prune is cancelled here — otherwise re-registering during
+// route churn would still see the routeID disappear from
+// bucket.MemberRoutes once grace expires, despite Observe attributing
+// fresh traffic to that ID.
 func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 	if s == nil {
 		return false
 	}
 	s.routesMu.Lock()
 	defer s.routesMu.Unlock()
+
+	s.cancelPendingPrune(routeID)
 
 	cur := s.table.Load()
 	if _, ok := cur.slots[routeID]; ok {
@@ -403,7 +412,8 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 // the routeID is not added to the visible member list.
 func (s *MemSampler) foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
 	bucket.metaMu.Lock()
-	if len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
+	if !memberRoutesContains(bucket.MemberRoutes, routeID) &&
+		len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
 		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
 	}
 	if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
@@ -551,6 +561,37 @@ func advancePendingPrunes(pending []memberPrune, now time.Time, grace time.Durat
 	}
 	clearPruneTail(pending, len(keep))
 	return keep
+}
+
+// cancelPendingPrune drops any pendingPrune entries matching routeID,
+// stopping a deferred prune from executing after the route has been
+// re-registered inside the grace window. Holds retiredMu briefly off
+// the hot path; callers must already hold routesMu so the
+// cancellation pairs atomically with the route-table mutation.
+func (s *MemSampler) cancelPendingPrune(routeID uint64) {
+	s.retiredMu.Lock()
+	defer s.retiredMu.Unlock()
+	keep := s.pendingPrunes[:0]
+	for _, p := range s.pendingPrunes {
+		if p.routeID == routeID {
+			continue
+		}
+		keep = append(keep, p)
+	}
+	clearPruneTail(s.pendingPrunes, len(keep))
+	s.pendingPrunes = keep
+}
+
+// memberRoutesContains reports whether routeID is already listed in
+// members. Used as a dedup guard so re-registering a routeID inside
+// the prune grace window doesn't add a duplicate MemberRoutes entry.
+func memberRoutesContains(members []uint64, routeID uint64) bool {
+	for _, m := range members {
+		if m == routeID {
+			return true
+		}
+	}
+	return false
 }
 
 // clearTail zeroes the [keepLen, len(s)) range of s so dropped entries
