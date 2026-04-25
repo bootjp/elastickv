@@ -20,7 +20,7 @@
 
 Today every byte of an S3 object travels through the Raft log:
 
-```
+```text
 HTTP PUT body  ─►  s3ChunkSize (1 MiB) chunks
                  ─►  s3ChunkBatchOps × 1 MiB Raft entry
                  ─►  Raft log entry (Pebble WAL on every node)
@@ -102,7 +102,7 @@ themselves*.
 
 ### 3.1 New keyspace
 
-```
+```text
 !s3|chunkref|<bucket>|<gen>|<objectKey>|<uploadID>|<partNo>|<chunkNo>
     → ChunkRef{
         ContentSHA256 [32]byte
@@ -128,7 +128,7 @@ Two separate keyspaces:
 
 ### 3.2 PUT path
 
-```
+```text
 client ─► HTTP PUT body
         ─► chunk loop (s3ChunkSize):
              1. compute SHA-256 of chunk
@@ -355,7 +355,7 @@ sweeper needs to know not just *that* the RC reached zero but
    would drive it to zero, the *same* txn additionally writes
    `!s3|chunkblob-gc-queue|<commitTS-nanos>|<SHA>` → empty. The
    commitTS-prefixed key is the time signal: the queue is
-   naturally sorted by elegibility-start time, and any node can
+   naturally sorted by eligibility-start time, and any node can
    determine the grace-period boundary by scanning the queue with
    `endKey = !s3|chunkblob-gc-queue|<now-gracePeriod>|`. If a
    subsequent txn re-references the same SHA before the sweeper

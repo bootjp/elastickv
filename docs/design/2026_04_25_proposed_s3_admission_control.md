@@ -22,7 +22,7 @@ with `MaxSizePerMsg`, the **aggregate** in-flight memory bound is
 governed by client concurrency, which the server cannot currently
 limit:
 
-```
+```text
 leader-side worst-case  =  concurrent_PUTs × pending_entries_per_PUT × entry_size
                         ≈  concurrent_PUTs × MaxInflight × 4 MiB
 ```
@@ -105,7 +105,7 @@ Recommended: **both, at different scales**.
   fails with 503 mid-stream. Dispatch latency stays bounded by the
   semaphore size rather than by client behaviour.
 
-```
+```text
 client ─[Content-Length]─► (A) reserve full body bytes
                                 │
                                 ▼
@@ -323,7 +323,7 @@ materialise by default.
 
 ### 3.5 Metrics
 
-```
+```text
 elastickv_s3_put_admission_inflight_bytes        gauge
 elastickv_s3_put_admission_rejections_total      counter (labels:
                                                     stage    = "prereserve" | "perbatch",
