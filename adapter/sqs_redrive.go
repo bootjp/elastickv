@@ -121,38 +121,9 @@ func (s *SQSServer) redriveCandidateToDLQ(
 	srcArn string,
 	readTS uint64,
 ) (bool, error) {
-	// Self-referential RedrivePolicy is rejected at attribute-apply
-	// time, but a defense-in-depth check here keeps the receive path
-	// safe even against records committed before the validator
-	// existed (or under a future relaxation of the validator).
-	// Without this, redrive would delete and rewrite the same record
-	// in place, looping the poison message forever.
-	if policy.DLQName == srcQueueName {
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
-	}
-	dlqMeta, exists, err := s.loadQueueMetaAt(ctx, policy.DLQName, readTS)
+	dlqMeta, err := s.validateRedriveTargets(ctx, srcQueueName, srcRec, policy, readTS)
 	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	if !exists {
-		// DLQ vanished between policy-set and receive. Refusing the
-		// move keeps the source message in flight; the operator can
-		// recreate the DLQ or detach the policy.
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy targets non-existent DLQ "+policy.DLQName)
-	}
-	// FIFO DLQs require source records to carry MessageGroupId so the
-	// DLQ-side ReceiveMessage enforces group-lock semantics. Without
-	// this gate, a redrive from a Standard source into a FIFO DLQ
-	// would write records with empty MessageGroupId — tryDeliverCandidate
-	// only takes the FIFO path when MessageGroupId is non-empty, so
-	// those messages would bypass FIFO ordering inside what clients
-	// believe is a strictly-ordered queue. We refuse the move and
-	// surface the misconfiguration to operators.
-	if dlqMeta.IsFIFO && srcRec.MessageGroupId == "" {
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"FIFO DLQ requires source records to carry MessageGroupId")
+		return false, err
 	}
 	dlqRec, dlqRecordBytes, err := buildDLQRecord(srcRec, dlqMeta, srcArn)
 	if err != nil {
@@ -169,6 +140,61 @@ func (s *SQSServer) redriveCandidateToDLQ(
 		return false, errors.WithStack(err)
 	}
 	return true, nil
+}
+
+// validateRedriveTargets enforces every static precondition on the
+// (source, DLQ, policy) triple before the OCC dispatch is built.
+// Returns the loaded DLQ meta on success so the caller does not have
+// to re-load it.
+//
+// Failure modes (all surfaced as 4xx sqsAPIError):
+//   - self-referential RedrivePolicy (defense-in-depth against records
+//     that predate the attribute-time validator),
+//   - DLQ vanished between policy-set and receive,
+//   - source queue vanished mid-redrive (DeleteQueue race),
+//   - source/DLQ queue-type mismatch (FIFO ↔ Standard) — AWS forbids
+//     this and runtime is the only place it can be enforced because
+//     the catalog accepts a RedrivePolicy that names a queue created
+//     or recreated later as a different type,
+//   - FIFO DLQ paired with a source record lacking MessageGroupId
+//     (defense in depth against malformed records that slip past the
+//     type-equality check).
+func (s *SQSServer) validateRedriveTargets(
+	ctx context.Context,
+	srcQueueName string,
+	srcRec *sqsMessageRecord,
+	policy *parsedRedrivePolicy,
+	readTS uint64,
+) (*sqsQueueMeta, error) {
+	if policy.DLQName == srcQueueName {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
+	}
+	dlqMeta, dlqExists, err := s.loadQueueMetaAt(ctx, policy.DLQName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !dlqExists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy targets non-existent DLQ "+policy.DLQName)
+	}
+	srcMeta, srcExists, err := s.loadQueueMetaAt(ctx, srcQueueName, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !srcExists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist,
+			"source queue disappeared during redrive")
+	}
+	if srcMeta.IsFIFO != dlqMeta.IsFIFO {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy queue-type mismatch: source and DLQ must both be FIFO or both Standard")
+	}
+	if dlqMeta.IsFIFO && srcRec.MessageGroupId == "" {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FIFO DLQ requires source records to carry MessageGroupId")
+	}
+	return dlqMeta, nil
 }
 
 // buildDLQRecord assembles the DLQ-side message record. Reset

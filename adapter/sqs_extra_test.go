@@ -1654,6 +1654,77 @@ func TestSQSServer_RedrivePolicyFifoDlqRejectsStandardSource(t *testing.T) {
 	}
 }
 
+func TestSQSServer_RedrivePolicyStandardDlqRejectsFifoSource(t *testing.T) {
+	t.Parallel()
+	// Symmetric to RedrivePolicyFifoDlqRejectsStandardSource: the
+	// existing guard rejected only the Standard→FIFO direction, but
+	// FIFO→Standard was equally broken. A FIFO source carries
+	// MessageGroupId on every record; copying that into a Standard
+	// DLQ and then issuing ReceiveMessage on the DLQ trips
+	// tryDeliverCandidate's FIFO group-lock branch (gated solely on
+	// MessageGroupId != ""), which serializes delivery in a queue
+	// clients believe behaves as Standard. AWS rejects mixed-type
+	// redrive policies; this test pins that behavior.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	// Standard DLQ (no FifoQueue attribute).
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "dlq-standard",
+	})
+	dlqURL, _ := out["QueueUrl"].(string)
+	if dlqURL == "" {
+		t.Fatalf("Standard DLQ create failed: %v", out)
+	}
+
+	// FIFO source with RedrivePolicy targeting the Standard DLQ.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-standard","maxReceiveCount":1}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "src-fifo.fifo",
+		"Attributes": map[string]string{
+			"FifoQueue":     "true",
+			"RedrivePolicy": policy,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create FIFO source with Standard-DLQ policy: %d %v", status, out)
+	}
+	srcURL, _ := out["QueueUrl"].(string)
+
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":               srcURL,
+		"MessageBody":            "poison",
+		"MessageGroupId":         "g1",
+		"MessageDeduplicationId": "d1",
+	})
+	// First receive bumps ReceiveCount to 1 == maxReceiveCount;
+	// second receive (after visibility expiry) should attempt redrive.
+	// The runtime type-compatibility gate must trip, leaving the DLQ
+	// empty and the source message intact.
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+		"VisibilityTimeout":   1,
+	})
+	time.Sleep(1100 * time.Millisecond)
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+	})
+
+	// Direct DLQ receive: a successful redrive would have written a
+	// record with non-empty MessageGroupId here; the fix must keep
+	// the DLQ empty.
+	_, body := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            dlqURL,
+		"MaxNumberOfMessages": 10,
+	})
+	if msgs, _ := body["Messages"].([]any); len(msgs) > 0 {
+		t.Fatalf("Standard DLQ received a redriven FIFO record (would carry MessageGroupId): %v", msgs)
+	}
+}
+
 func TestSQSServer_TagQueueRequiresTags(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
