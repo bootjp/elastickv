@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"net/http"
@@ -1083,6 +1084,91 @@ func TestSQSServer_RetentionReaperRemovesOldMessage(t *testing.T) {
 	if attrs["ApproximateNumberOfMessages"] != "0" {
 		t.Fatalf("approx counter after reap = %v, want 0", attrs)
 	}
+}
+
+func TestSQSServer_PurgeThenDeleteOrphansCleaned(t *testing.T) {
+	t.Parallel()
+	// Regression: PurgeQueue followed by DeleteQueue, both committing
+	// before any reaper tick, used to permanently leak the pre-purge
+	// generation. PurgeQueue advanced the generation counter without
+	// writing a tombstone for the old gen, then DeleteQueue removed
+	// the meta row and only tombstoned the post-purge gen. After that,
+	//   * reapAllQueues -> scanQueueNames sees no meta -> skip,
+	//   * reapTombstonedQueues only finds the post-purge gen's
+	//     tombstone -> reapDeadByAge filters by that gen -> the older
+	//     gen's byage / data / vis records are never visited.
+	// Fix: PurgeQueue tombstones the pre-bump gen in the same OCC
+	// transaction that bumps the counter, so the tombstone-driven
+	// reaper sweeps both generations.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "purge-del-orphans")
+	stampSQSMessages(t, node, queueURL, "g1-", 3)
+	expectSQSOK(t, node, sqsPurgeQueueTarget, map[string]any{"QueueUrl": queueURL}, "purge")
+	expectSQSOK(t, node, sqsDeleteQueueTarget, map[string]any{"QueueUrl": queueURL}, "delete")
+
+	srv := node.sqsServer
+	ctx := t.Context()
+	byagePrefix := sqsMsgByAgePrefixAllGenerations("purge-del-orphans")
+	byageEnd := prefixScanEnd(byagePrefix)
+
+	// Sanity: gen-1 byage rows exist before any reaper pass; otherwise
+	// the test would pass trivially even if the bug were still present.
+	if got := scanCount(t, srv, ctx, byagePrefix, byageEnd); got == 0 {
+		t.Fatalf("expected gen-1 byage rows after purge+delete, got none")
+	}
+
+	if err := srv.reapAllQueues(ctx); err != nil {
+		t.Fatalf("reapAllQueues: %v", err)
+	}
+
+	if got := scanCount(t, srv, ctx, byagePrefix, byageEnd); got != 0 {
+		t.Fatalf("byage rows leaked after purge+delete+reap: %d entries", got)
+	}
+	// Both tombstones (pre-purge gen + post-delete gen) must be
+	// drained too, otherwise every subsequent reaper tick re-scans an
+	// empty cohort forever.
+	tombPrefix := []byte(SqsQueueTombstonePrefix)
+	if got := scanCount(t, srv, ctx, tombPrefix, prefixScanEnd(tombPrefix)); got != 0 {
+		t.Fatalf("tombstones leaked after purge+delete+reap: %d entries", got)
+	}
+}
+
+// stampSQSMessages sends `count` bodies tagged with `prefix` + index.
+// Send errors are intentionally ignored: callers use this to set up
+// state, and per-message failures show up downstream as missing rows.
+func stampSQSMessages(t *testing.T, node Node, queueURL, prefix string, count int) {
+	t.Helper()
+	for i := range count {
+		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":    queueURL,
+			"MessageBody": prefix + strconv.Itoa(i),
+		})
+	}
+}
+
+// expectSQSOK calls the named SQS target and fails the test if the
+// HTTP status is not 200. The label is used in the error message so
+// chained calls in a single test produce distinguishable failures.
+func expectSQSOK(t *testing.T, node Node, target string, in map[string]any, label string) {
+	t.Helper()
+	status, body := callSQS(t, node, target, in)
+	if status != http.StatusOK {
+		t.Fatalf("%s: %d %v", label, status, body)
+	}
+}
+
+// scanCount returns the number of entries under [prefix, end) at a
+// fresh read timestamp. Errors are fatal so callers do not have to
+// thread an extra branch through their assertions.
+func scanCount(t *testing.T, srv *SQSServer, ctx context.Context, prefix, end []byte) int {
+	t.Helper()
+	pairs, err := srv.store.ScanAt(ctx, prefix, end, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("scan [%x, %x): %v", prefix, end, err)
+	}
+	return len(pairs)
 }
 
 func TestSQSServer_RetentionReaperReclaimsPurgedGenerations(t *testing.T) {

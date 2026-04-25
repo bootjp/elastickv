@@ -87,6 +87,15 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 	}
 	metaKey := sqsQueueMetaKey(queueName)
 	genKey := sqsQueueGenKey(queueName)
+	// Tombstone the pre-bump generation so the reaper can find its
+	// orphan keyspace even if DeleteQueue lands before the next reaper
+	// tick. Without this, a Purge → Delete sequence within the
+	// reaper interval permanently leaks data/vis/byage/dedup/group
+	// rows for the pre-purge generation: scanQueueNames sees no meta,
+	// and reapTombstonedQueues only sees the post-delete tombstone
+	// (which is keyed on the post-purge gen). reapDeadByAge filters
+	// by exact generation, so the older cohort is never visited.
+	tombstoneKey := sqsQueueTombstoneKey(queueName, lastGen)
 	// StartTS + ReadKeys fence against a concurrent CreateQueue /
 	// DeleteQueue / SetQueueAttributes / PurgeQueue landing between
 	// our load and dispatch. ErrWriteConflict surfaces via the
@@ -98,6 +107,7 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: metaKey, Value: metaBytes},
 			{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(meta.Generation, 10))},
+			{Op: kv.Put, Key: tombstoneKey, Value: []byte{1}},
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
