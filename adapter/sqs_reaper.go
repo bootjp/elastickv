@@ -77,9 +77,9 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 		meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 		if err != nil || !exists {
 			// Even when meta is gone (DeleteQueue), prior-generation
-			// orphans need reaping; reapDeletedQueueOrphans handles
-			// that case. Here we only skip the queue if loading
-			// itself failed (transient).
+			// orphans need reaping; reapTombstonedQueues (called
+			// after this loop) handles that case. Here we only skip
+			// the queue if loading itself failed (transient).
 			continue
 		}
 		if err := s.reapQueue(ctx, name, meta, readTS); err != nil {
