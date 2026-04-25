@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,7 +17,7 @@ func TestQuorumAckTracker_SingleNodeFollowerQuorumZeroIsNoop(t *testing.T) {
 	// that case elsewhere. recordAck must not mutate state, otherwise
 	// a re-election into multi-node would surface a stale instant.
 	tr.recordAck(42, 0)
-	require.Equal(t, time.Time{}, tr.load())
+	require.True(t, tr.load().IsZero())
 }
 
 func TestQuorumAckTracker_QuorumAckWaitsForMajority(t *testing.T) {
@@ -32,7 +33,7 @@ func TestQuorumAckTracker_QuorumAckWaitsForMajority(t *testing.T) {
 	// reported before publishing.
 	var tr2 quorumAckTracker
 	tr2.recordAck(2, 2)
-	require.Equal(t, time.Time{}, tr2.load(), "one follower is not a 5-node quorum")
+	require.True(t, tr2.load().IsZero(), "one follower is not a 5-node quorum")
 	tr2.recordAck(3, 2)
 	require.False(t, tr2.load().IsZero(), "two followers + self make a 5-node quorum")
 }
@@ -51,13 +52,13 @@ func TestQuorumAckTracker_QuorumAckIsOldestOfTopN(t *testing.T) {
 	second := tr.load()
 	require.False(t, second.IsZero())
 
-	// Now peer 4 acks. Even if time.Now() granularity places every
-	// sample at the same nanosecond, the quorum instant must NOT
-	// regress: the 5-node quorum requires 2 follower acks (self makes
-	// 3 = majority), and the OLDEST of the top two followers bounds
-	// the boundary. require.False(third.Before(second)) holds trivially
-	// when timestamps are equal, so this test does not rely on wall-
-	// clock granularity and is deterministic on fast CI.
+	// Now peer 4 acks. Even if monoclock.Now() granularity places
+	// every sample at the same nanosecond, the quorum instant must
+	// NOT regress: the 5-node quorum requires 2 follower acks (self
+	// makes 3 = majority), and the OLDEST of the top two followers
+	// bounds the boundary. require.False(third.Before(second)) holds
+	// trivially when timestamps are equal, so this test does not rely
+	// on clock granularity and is deterministic on fast CI.
 	tr.recordAck(4, 2)
 	third := tr.load()
 	require.False(t, third.Before(second), "quorum instant must not regress")
@@ -81,7 +82,7 @@ func TestQuorumAckTracker_RemovedPeerCannotSatisfyQuorum(t *testing.T) {
 	// satisfy even the smaller quorum.
 	tr.removePeer(2, 1)
 	tr.removePeer(3, 1)
-	require.Equal(t, time.Time{}, tr.load(),
+	require.True(t, tr.load().IsZero(),
 		"after removing every acked peer the quorum instant must clear")
 }
 
@@ -107,11 +108,36 @@ func TestQuorumAckTracker_ResetClearsState(t *testing.T) {
 	require.False(t, tr.load().IsZero())
 
 	tr.reset()
-	require.Equal(t, time.Time{}, tr.load())
+	require.True(t, tr.load().IsZero())
 
 	// After reset, a subsequent ack must still populate correctly.
 	tr.recordAck(2, 1)
 	require.False(t, tr.load().IsZero())
+}
+
+// TestQuorumAckTracker_LoadReturnsMonotonicRaw pins the clock source:
+// quorum acks must be CLOCK_MONOTONIC_RAW readings, not time.Now().
+// A regression that stored wall-clock unix nanos would put the tracker
+// back on the NTP-slew-sensitive path that #551 removed.
+func TestQuorumAckTracker_LoadReturnsMonotonicRaw(t *testing.T) {
+	t.Parallel()
+	var tr quorumAckTracker
+	before := monoclock.Now()
+	tr.recordAck(2, 1)
+	after := monoclock.Now()
+
+	got := tr.load()
+	require.False(t, got.IsZero())
+	require.False(t, got.Before(before),
+		"recorded ack must not predate the monotonic-raw sample taken before recordAck")
+	require.False(t, got.After(after),
+		"recorded ack must not postdate the monotonic-raw sample taken after recordAck")
+	// Sanity: the gap between before and after bounds the recorded
+	// value; if recordAck stored wall-clock time, the comparison
+	// arithmetic below would be against a different epoch entirely
+	// and this subtraction would produce an out-of-range duration.
+	require.Less(t, got.Sub(before), time.Second,
+		"recorded ack must sit inside the [before, after] monotonic window")
 }
 
 func TestQuorumAckTracker_ConcurrentRecordAndLoad(t *testing.T) {

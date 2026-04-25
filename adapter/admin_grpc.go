@@ -171,19 +171,40 @@ func (s *AdminServer) cloneGroupsSorted() []groupEntry {
 // shadow a usable seed entry for the same NodeID and cause GetClusterOverview
 // to drop the peer from fan-out altogether. Letting the seed list backfill
 // keeps the peer reachable until the live Configuration converges.
+//
+// Per-group Configuration calls run concurrently because a sequential loop
+// would stall the entire RPC behind any one slow group; results are written
+// into a pre-allocated slice indexed by the sorted-order position so the
+// merge step still walks groups in ascending-ID order and preserves the
+// deterministic tie-break.
 func collectLiveMembers(
 	ctx context.Context,
 	groups []groupEntry,
 	selfID string,
 ) (addrByID map[string]string, order []string) {
+	type configResult struct {
+		cfg raftengine.Configuration
+		err error
+	}
+	results := make([]configResult, len(groups))
+	var wg sync.WaitGroup
+	for i, entry := range groups {
+		wg.Add(1)
+		go func(i int, entry groupEntry) {
+			defer wg.Done()
+			cfg, err := entry.group.Configuration(ctx)
+			results[i] = configResult{cfg: cfg, err: err}
+		}(i, entry)
+	}
+	wg.Wait()
+
 	addrByID = make(map[string]string)
 	order = make([]string, 0)
-	for _, entry := range groups {
-		cfg, err := entry.group.Configuration(ctx)
-		if err != nil {
+	for _, res := range results {
+		if res.err != nil {
 			continue
 		}
-		for _, srv := range cfg.Servers {
+		for _, srv := range res.cfg.Servers {
 			if srv.ID == "" || srv.ID == selfID || srv.Address == "" {
 				continue
 			}

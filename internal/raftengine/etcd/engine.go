@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -32,7 +33,7 @@ const (
 	// duration of a leader-local read lease. It absorbs goroutine scheduling
 	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
 	// and bounded wall-clock skew between the leader and a partition's new
-	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	// leader candidate. See docs/design/2026_04_20_implemented_lease_read.md for the safety argument.
 	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK. It also sizes the inbound
@@ -254,18 +255,21 @@ type Engine struct {
 	stepQueueFullCount atomic.Uint64
 
 	// ackTracker records per-peer last-response times on the leader and
-	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// publishes the majority-ack instant via quorumAckMonoNs. It is
 	// read lock-free from LastQuorumAck() on the hot lease-read path
 	// and updated inside the single event-loop goroutine from
 	// handleStep when a follower response arrives.
 	ackTracker quorumAckTracker
-	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// singleNodeLeaderAckMonoNs short-circuits LastQuorumAck on the
 	// single-node leader path: self IS the quorum, so there are no
 	// follower responses to observe. refreshStatus keeps this value
-	// current (set to time.Now().UnixNano() each tick while leader and
-	// cluster size is 1; cleared otherwise) so the lease-read hot path
-	// never has to acquire e.mu to check peer count or leader state.
-	singleNodeLeaderAckUnixNano atomic.Int64
+	// current (set to monoclock.Now().Nanos() each tick while leader
+	// and cluster size is 1; cleared otherwise) so the lease-read hot
+	// path never has to acquire e.mu to check peer count or leader
+	// state. Stored as int64 nanoseconds on the CLOCK_MONOTONIC_RAW
+	// scale so the lease comparison is immune to NTP rate adjustment
+	// and wall-clock steps (see internal/monoclock).
+	singleNodeLeaderAckMonoNs atomic.Int64
 	// isLeader mirrors status.State == StateLeader for lock-free reads
 	// on the hot path. refreshStatus writes it on every tick;
 	// recordQuorumAck reads it before admitting a follower response
@@ -718,29 +722,31 @@ func (e *Engine) AppliedIndex() uint64 {
 	return e.appliedIndex.Load()
 }
 
-// LastQuorumAck returns the wall-clock instant by which a majority of
-// followers most recently responded to the leader, or the zero time
-// when no such observation exists (follower / candidate / startup).
+// LastQuorumAck returns the monotonic-raw instant by which a majority
+// of followers most recently responded to the leader, or the zero
+// Instant when no such observation exists (follower / candidate /
+// startup).
 //
 // Lock-free: reads atomic.Int64 values published by recordQuorumAck
 // (multi-node cluster) or refreshStatus (single-node cluster keeps
-// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
-// the hot lease-read path performs zero lock work). See
-// raftengine.LeaseProvider for the lease-read correctness contract.
-func (e *Engine) LastQuorumAck() time.Time {
+// singleNodeLeaderAckMonoNs alive with monoclock.Now() while leader,
+// so the hot lease-read path performs zero lock work). The monotonic-
+// raw source keeps the lease safe against NTP-slew / wall-clock-step
+// events; see raftengine.LeaseProvider for the correctness contract.
+func (e *Engine) LastQuorumAck() monoclock.Instant {
 	if e == nil {
-		return time.Time{}
+		return monoclock.Zero
 	}
 	// Honor the LeaseProvider contract that non-leaders always return
-	// the zero time. Without this guard a late MsgAppResp that sneaks
-	// past recordQuorumAck (or a tracker entry that survived a brief
-	// step-down/step-up window) could leak stale liveness into the
-	// caller's fast-path validation.
+	// the zero Instant. Without this guard a late MsgAppResp that
+	// sneaks past recordQuorumAck (or a tracker entry that survived a
+	// brief step-down/step-up window) could leak stale liveness into
+	// the caller's fast-path validation.
 	if !e.isLeader.Load() {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
-		return time.Unix(0, ns)
+	if ns := e.singleNodeLeaderAckMonoNs.Load(); ns != 0 {
+		return monoclock.FromNanos(ns)
 	}
 	return e.ackTracker.load()
 }
@@ -750,7 +756,7 @@ func (e *Engine) LastQuorumAck() time.Time {
 // heartbeat channel was full. Monotonic across the life of the engine.
 // Surfaced to Prometheus via the monitoring package so the hot-path
 // dashboard can graph stepCh saturation alongside LinearizableRead
-// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+// rate (see the "Hot Path" row in monitoring/grafana/dashboards/elastickv-redis-summary.json).
 func (e *Engine) DispatchDropCount() uint64 {
 	if e == nil {
 		return 0
@@ -2168,9 +2174,9 @@ func (e *Engine) refreshStatus() {
 	e.isLeader.Store(status.State == raftengine.StateLeader)
 
 	if status.State == raftengine.StateLeader && clusterSize <= 1 {
-		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+		e.singleNodeLeaderAckMonoNs.Store(monoclock.Now().Nanos())
 	} else {
-		e.singleNodeLeaderAckUnixNano.Store(0)
+		e.singleNodeLeaderAckMonoNs.Store(0)
 	}
 
 	if status.State == raftengine.StateLeader {

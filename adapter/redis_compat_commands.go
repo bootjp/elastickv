@@ -206,18 +206,270 @@ func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(1)
 }
 
+// clientSubcommandArgCount is the total cmd.Args length (including
+// CLIENT + subcommand) required by no-operand CLIENT subcommands
+// like GETNAME / ID / INFO.
+const clientSubcommandArgCount = 2
+
+// checkClientArity verifies cmd.Args has exactly want elements and
+// writes the standard Redis wrong-arity error otherwise. Returns
+// true when the caller should stop handling (bad arity).
+func checkClientArity(conn redcon.Conn, cmd redcon.Command, sub string, want int) bool {
+	if len(cmd.Args) == want {
+		return false
+	}
+	conn.WriteError("ERR wrong number of arguments for 'client|" + strings.ToLower(sub) + "' command")
+	return true
+}
+
+// clientSetName handles CLIENT SETNAME. SETNAME is shared with
+// HELLO's SETNAME clause; both write into the same connState.clientName
+// slot so a client that uses HELLO SETNAME once and then queries
+// CLIENT GETNAME gets the right answer without having to re-issue
+// CLIENT SETNAME.
+func clientSetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "SETNAME", clientSetNameArgCount) {
+		return
+	}
+	state.clientName = string(cmd.Args[2])
+	conn.WriteString("OK")
+}
+
+func clientGetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "GETNAME", clientSubcommandArgCount) {
+		return
+	}
+	if state.clientName == "" {
+		conn.WriteNull()
+		return
+	}
+	conn.WriteBulkString(state.clientName)
+}
+
+func (r *RedisServer) clientID(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "ID", clientSubcommandArgCount) {
+		return
+	}
+	conn.WriteInt64(int64(r.ensureConnID(state))) //nolint:gosec // connID monotonic counter, guaranteed <= math.MaxInt64 in practice
+}
+
+func (r *RedisServer) clientInfo(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if checkClientArity(conn, cmd, "INFO", clientSubcommandArgCount) {
+		return
+	}
+	id := r.ensureConnID(state)
+	conn.WriteBulkString(fmt.Sprintf("id=%d addr=%s name=%s", id, conn.RemoteAddr(), state.clientName))
+}
+
+// clientSetInfo handles CLIENT SETINFO <attr> <value>. elastickv does
+// not persist the advertised attributes (lib-name / lib-ver, etc.), but
+// it MUST still enforce exact arity — otherwise `CLIENT SETINFO` with
+// no operands returns OK and masks a client bug that real Redis would
+// have surfaced as a wrong-arity error.
+func clientSetInfo(conn redcon.Conn, cmd redcon.Command) {
+	if checkClientArity(conn, cmd, "SETINFO", clientSetInfoArgCount) {
+		return
+	}
+	conn.WriteString("OK")
+}
+
 func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 	sub := strings.ToUpper(string(cmd.Args[1]))
+	state := getConnState(conn)
 	switch sub {
-	case "SETINFO", "SETNAME":
-		conn.WriteString("OK")
+	case "SETINFO":
+		clientSetInfo(conn, cmd)
+	case "SETNAME":
+		clientSetName(conn, cmd, state)
 	case "GETNAME":
-		conn.WriteNull()
+		clientGetName(conn, cmd, state)
+	case "ID":
+		r.clientID(conn, cmd, state)
 	case "INFO":
-		conn.WriteBulkString("id=1 addr=" + conn.RemoteAddr())
+		r.clientInfo(conn, cmd, state)
 	default:
 		conn.WriteError("ERR unsupported CLIENT subcommand '" + sub + "'")
 	}
+}
+
+// HELLO reply and protocol constants. Kept as named constants so the
+// linter's "no magic numbers" rule accepts the wire-format values.
+const (
+	// helloReplyVersion is the version string returned by HELLO's
+	// `version` field. Clients like ioredis and jedis perform loose
+	// version checks against this field; returning a recent Redis
+	// version string keeps maximum compatibility. Intentionally not
+	// elastickv's own version — clients that fail to parse a
+	// non-Redis version string would treat elastickv as an
+	// unsupported backend.
+	helloReplyVersion = "7.0.0"
+	// helloReplyProto is the RESP protocol version advertised by the
+	// server. elastickv is RESP2-only because redcon exposes no RESP3
+	// map-reply API.
+	helloReplyProto = 2
+	// helloReplyArrayLen is the number of elements in the flat
+	// alternating key/value reply: 7 pairs = 14 elements.
+	helloReplyArrayLen = 14
+	// clientSetNameArgCount is the EXACT cmd.Args length for CLIENT
+	// SETNAME (CLIENT + SETNAME + name = 3). Kept as an exact-arity
+	// constant — not a minimum — because checkClientArity compares
+	// `len(cmd.Args) == want`; renaming it to *MinArgs would invite a
+	// future refactor that "just" swaps the helper for a >= check and
+	// silently re-introduces the wrong-arity silent-OK bug.
+	clientSetNameArgCount = 3
+	// clientSetInfoArgCount is the EXACT cmd.Args length for CLIENT
+	// SETINFO (CLIENT + SETINFO + attr + value = 4). Real Redis
+	// rejects any other arity for `client|setinfo`; without this
+	// check we would keep returning OK for `CLIENT SETINFO` with no
+	// operands, matching exactly the silent-success behaviour this
+	// PR is supposed to eliminate for every CLIENT subcommand.
+	clientSetInfoArgCount = 4
+)
+
+// helloParseError is the internal signal used by parseHelloArgs to
+// surface a client-facing error without forcing the top-level hello
+// handler to pay for additional branches. The caller writes err to
+// the wire verbatim.
+type helloParseError struct{ msg string }
+
+func (e *helloParseError) Error() string { return e.msg }
+
+// parseHelloArgs walks the optional HELLO argument list and mutates
+// connState for any recognized options. Returns a non-nil error
+// containing the exact wire-format string to emit via WriteError.
+// Split out of hello() so the handler's cyclomatic complexity stays
+// within the linter's budget.
+// parsedHelloOption is the pure-function result of a single option
+// token. advance is the number of input args consumed. Exactly one
+// of (advance > 0) or (err != nil) is non-zero.
+type parsedHelloOption struct {
+	name    string
+	hasName bool
+	advance int
+}
+
+const (
+	// helloAuthOptionArity is the total token count a HELLO AUTH
+	// clause consumes: keyword + username + password.
+	helloAuthOptionArity = 3
+	// helloSetNameOptionArity is keyword + name.
+	helloSetNameOptionArity = 2
+)
+
+// parseHelloOption decodes one HELLO option starting at args[0] (the
+// option keyword). Returns how many input tokens the option consumed
+// and any client-side staging it wants applied.
+func parseHelloOption(args [][]byte) (parsedHelloOption, error) {
+	opt := strings.ToUpper(string(args[0]))
+	switch opt {
+	case "AUTH":
+		if len(args) < helloAuthOptionArity {
+			return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO AUTH"}
+		}
+		// elastickv's Redis adapter has no AUTH layer. Rejecting rather
+		// than silently accepting keeps operators honest.
+		return parsedHelloOption{}, &helloParseError{msg: "NOPERM HELLO AUTH is not supported"}
+	case "SETNAME":
+		if len(args) < helloSetNameOptionArity {
+			return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO SETNAME"}
+		}
+		return parsedHelloOption{
+			name:    string(args[1]),
+			hasName: true,
+			advance: helloSetNameOptionArity,
+		}, nil
+	default:
+		return parsedHelloOption{}, &helloParseError{msg: "ERR Syntax error in HELLO option '" + opt + "'"}
+	}
+}
+
+func parseHelloArgs(state *connState, args [][]byte) error {
+	if len(args) == 0 {
+		return nil
+	}
+	protover, err := strconv.Atoi(string(args[0]))
+	if err != nil || protover != helloReplyProto {
+		// Non-numeric, RESP3 (3), or any other requested version:
+		// reject with NOPROTO so well-behaved clients fall back to
+		// RESP2.
+		return &helloParseError{msg: "NOPROTO unsupported protocol version"}
+	}
+	// Buffer side effects locally so a partial parse (e.g. SETNAME
+	// followed by a bad option or AUTH) leaves connState untouched —
+	// the command must be all-or-nothing, matching real Redis.
+	var (
+		pendingName    string
+		pendingNameSet bool
+	)
+	for i := 1; i < len(args); {
+		opt, err := parseHelloOption(args[i:])
+		if err != nil {
+			return err
+		}
+		if opt.hasName {
+			pendingName = opt.name
+			pendingNameSet = true
+		}
+		i += opt.advance
+	}
+	if pendingNameSet {
+		state.clientName = pendingName
+	}
+	return nil
+}
+
+// hello implements the Redis HELLO command. Syntax:
+//
+//	HELLO [protover [AUTH username password] [SETNAME clientname]]
+//
+// elastickv speaks RESP2 only (redcon is RESP2-only and exposes no
+// RESP3 map-reply API), so:
+//
+//   - No protover, or protover == 2: succeed and return the server-info
+//     array.
+//   - protover == 3 or any other non-2 value: reply with the
+//     NOPROTO error the real Redis server uses when a client requests
+//     an unsupported protocol version. go-redis and friends fall back
+//     to RESP2 when they see this.
+//   - AUTH is rejected because elastickv has no auth layer wired into
+//     the Redis adapter; silently accepting any credentials would be a
+//     security footgun for operators who assume AUTH means something.
+//     We return a NOPERM-style error so clients surface a clear error
+//     rather than assuming auth succeeded.
+//   - SETNAME is wired into the existing connState.clientName slot, so
+//     a subsequent CLIENT GETNAME observes the name set here.
+func (r *RedisServer) hello(conn redcon.Conn, cmd redcon.Command) {
+	state := getConnState(conn)
+	if err := parseHelloArgs(state, cmd.Args[1:]); err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	role := "slave"
+	if r.coordinator != nil && r.coordinator.IsLeader() {
+		role = "master"
+	}
+	id := r.ensureConnID(state)
+
+	// Reply as a flat RESP2 array of alternating key/value pairs, the
+	// same wire shape Redis uses when a client negotiates RESP2 via
+	// HELLO. Order matches real Redis so clients that parse
+	// positionally (jedis has done this historically) still work.
+	conn.WriteArray(helloReplyArrayLen)
+	conn.WriteBulkString("server")
+	conn.WriteBulkString("redis")
+	conn.WriteBulkString("version")
+	conn.WriteBulkString(helloReplyVersion)
+	conn.WriteBulkString("proto")
+	conn.WriteInt(helloReplyProto)
+	conn.WriteBulkString("id")
+	conn.WriteInt64(int64(id)) //nolint:gosec // connID monotonic counter, fits in int64 in practice.
+	conn.WriteBulkString("mode")
+	conn.WriteBulkString("standalone")
+	conn.WriteBulkString("role")
+	conn.WriteBulkString(role)
+	conn.WriteBulkString("modules")
+	conn.WriteArray(0)
 }
 
 func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {

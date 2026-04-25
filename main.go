@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -11,11 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -79,6 +83,9 @@ var (
 	s3Region             = flag.String("s3Region", "us-east-1", "S3 signing region")
 	s3CredsFile          = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyleOnly      = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
+	sqsAddr              = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsRegion            = flag.String("sqsRegion", "us-east-1", "SQS signing region")
+	sqsCredsFile         = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
 	metricsAddr          = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
 	metricsToken         = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddr            = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
@@ -93,18 +100,101 @@ var (
 	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
+	raftSqsMap           = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
 	adminTokenFile       = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
 	adminInsecureNoAuth  = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
 )
 
 const adminTokenMaxBytes = 4 << 10
 
+// memoryPressureExit is set to true by the memwatch OnExceed callback to
+// signal that the subsequent graceful shutdown was triggered by user-space
+// OOM avoidance rather than an ordinary SIGTERM. The process exits with a
+// distinct non-zero code (exitCodeMemoryPressure) so operators reading
+// logs can distinguish this case from a crash or an ordinary stop.
+var memoryPressureExit atomic.Bool
+
+// exitCodeMemoryPressure is reported by main when memwatch triggered the
+// shutdown. It is non-zero so supervisors see a non-success exit, but
+// distinct from log.Fatalf's 1 and from os.Exit(1) in the other binaries
+// so log scraping can tell them apart.
+const exitCodeMemoryPressure = 2
+
+// memoryShutdownThresholdEnvVar configures the heap-inuse ceiling at
+// which memwatch triggers a graceful shutdown. Empty or "0" disables the
+// watchdog (the default; existing operators see no behaviour change).
+const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
+
+// memoryShutdownPollIntervalEnvVar overrides memwatch's default poll
+// cadence. Accepts any time.ParseDuration string. Invalid values log a
+// warning and fall through to the default.
+const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
+
+const bytesPerMiB = 1024 * 1024
+
 func main() {
 	flag.Parse()
 
-	if err := run(); err != nil {
+	err := run()
+	if memoryPressureExit.Load() {
+		// memwatch fired: surface exit code 2 regardless of whether run()
+		// returned a nil or an error (cancel() can cause in-flight
+		// listeners to return spurious errors during shutdown). Still
+		// log any residual error so a secondary failure during the
+		// graceful shutdown is visible in logs rather than swallowed.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("shutdown error after memory pressure", "error", err)
+		}
+		os.Exit(exitCodeMemoryPressure)
+	}
+	if err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+// memwatchConfigFromEnv resolves the memwatch Config from environment
+// variables. It returns (cfg, true) when the watcher should run, or
+// (_, false) when the operator has not opted in (the default). Errors in
+// the optional poll-interval override are logged and ignored so a typo
+// cannot take the process down.
+func memwatchConfigFromEnv() (memwatch.Config, bool) {
+	raw := strings.TrimSpace(os.Getenv(memoryShutdownThresholdEnvVar))
+	if raw == "" {
+		return memwatch.Config{}, false
+	}
+	mb, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		slog.Warn("invalid "+memoryShutdownThresholdEnvVar+"; watcher disabled",
+			"value", raw, "error", err)
+		return memwatch.Config{}, false
+	}
+	if mb == 0 {
+		return memwatch.Config{}, false
+	}
+	// Guard against mb * bytesPerMiB wrapping past math.MaxUint64. The
+	// value has no real use above this ceiling (the host does not have
+	// exabytes of RAM), and a wrapped value would set an absurdly low
+	// threshold that fires immediately.
+	if mb > math.MaxUint64/bytesPerMiB {
+		slog.Warn("value for "+memoryShutdownThresholdEnvVar+" would overflow uint64; watcher disabled",
+			"value_mb", mb)
+		return memwatch.Config{}, false
+	}
+
+	cfg := memwatch.Config{
+		ThresholdBytes: mb * bytesPerMiB,
+	}
+	cfg.PollInterval = memwatch.DefaultPollInterval
+	if rawInterval := strings.TrimSpace(os.Getenv(memoryShutdownPollIntervalEnvVar)); rawInterval != "" {
+		d, err := time.ParseDuration(rawInterval)
+		if err != nil || d <= 0 {
+			slog.Warn("invalid "+memoryShutdownPollIntervalEnvVar+"; using default",
+				"value", rawInterval, "error", err)
+		} else {
+			cfg.PollInterval = d
+		}
+	}
+	return cfg, true
 }
 
 func run() error {
@@ -143,6 +233,15 @@ func run() error {
 		return err
 	}
 
+	// Record the active FSM apply sync mode so operators can see on the
+	// /metrics endpoint which durability posture this node is running in.
+	// The label is resolved per-pebbleStore from ELASTICKV_FSM_SYNC_MODE
+	// in NewPebbleStore; read it off the first constructed store (all
+	// shards share the same env and therefore the same label).
+	if label := fsmApplySyncModeLabelFromRuntimes(runtimes); label != "" {
+		metricsRegistry.SetFSMApplySyncMode(label)
+	}
+
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
@@ -168,6 +267,7 @@ func run() error {
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
+	startMemoryWatchdog(runCtx, eg, cancel)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
@@ -214,6 +314,10 @@ func run() error {
 		s3Region:        *s3Region,
 		s3CredsFile:     *s3CredsFile,
 		s3PathStyleOnly: *s3PathStyleOnly,
+		sqsAddress:      *sqsAddr,
+		leaderSQS:       cfg.leaderSQS,
+		sqsRegion:       *sqsRegion,
+		sqsCredsFile:    *sqsCredsFile,
 		metricsAddress:  *metricsAddr,
 		metricsToken:    *metricsToken,
 		pprofAddress:    *pprofAddr,
@@ -240,7 +344,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server,
 		return runtimeConfig{}, "", nil, false, err
 	}
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap)
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *sqsAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap)
 	if err != nil {
 		return runtimeConfig{}, "", nil, false, err
 	}
@@ -260,10 +364,11 @@ type runtimeConfig struct {
 	leaderRedis  map[string]string
 	leaderS3     map[string]string
 	leaderDynamo map[string]string
+	leaderSQS    map[string]string
 	multi        bool
 }
 
-func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap string) (runtimeConfig, error) {
+func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap, raftSqsMap string) (runtimeConfig, error) {
 	groups, err := parseRaftGroups(raftGroups, myAddr)
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft groups")
@@ -290,6 +395,10 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, raftGroups, shard
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft dynamo map")
 	}
+	leaderSQS, err := buildLeaderSQS(groups, sqsAddr, raftSqsMap)
+	if err != nil {
+		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft sqs map")
+	}
 
 	return runtimeConfig{
 		groups:       groups,
@@ -298,6 +407,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, raftGroups, shard
 		leaderRedis:  leaderRedis,
 		leaderS3:     leaderS3,
 		leaderDynamo: leaderDynamo,
+		leaderSQS:    leaderSQS,
 		multi:        len(groups) > 1,
 	}, nil
 }
@@ -316,6 +426,10 @@ func buildLeaderRedis(groups []groupSpec, redisAddr string, raftRedisMap string)
 
 func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, s3Addr, raftS3Map, parseRaftS3Map)
+}
+
+func buildLeaderSQS(groups []groupSpec, sqsAddr string, raftSqsMap string) (map[string]string, error) {
+	return buildLeaderAddrMap(groups, sqsAddr, raftSqsMap, parseRaftSQSMap)
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
@@ -439,6 +553,35 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 		})
 	}
 	return out
+}
+
+// fsmApplySyncModeLabeler narrows an MVCCStore to those implementations
+// that can report the resolved ELASTICKV_FSM_SYNC_MODE label. The
+// pebble-backed store satisfies this today; alternate backends (none
+// yet) would either implement it or be skipped.
+type fsmApplySyncModeLabeler interface {
+	FSMApplySyncModeLabel() string
+}
+
+// fsmApplySyncModeLabelFromRuntimes returns the FSM apply sync-mode
+// label resolved by the first shard store that exposes it. All shards
+// on a node read the same ELASTICKV_FSM_SYNC_MODE env var at
+// construction time so the label is uniform across the runtimes;
+// returning the first one suffices. Returns "" when no runtime
+// exposes the accessor, in which case the caller skips emitting the
+// gauge to avoid publishing a misleading default.
+func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.store == nil {
+			continue
+		}
+		src, ok := runtime.store.(fsmApplySyncModeLabeler)
+		if !ok {
+			continue
+		}
+		return src.FSMApplySyncModeLabel()
+	}
+	return ""
 }
 
 // pebbleMonitorSources extracts the MVCC stores that expose
@@ -637,6 +780,33 @@ func loadAdminTokenFile(path string) (string, error) {
 		return "", errors.Wrap(err, "load admin token")
 	}
 	return tok, nil
+}
+
+// startMemoryWatchdog optionally starts the memwatch goroutine. The
+// watcher is off by default; it is enabled only when the operator sets
+// ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
+// callback flips the memoryPressureExit sentinel and cancels the root
+// context, routing through the exact same shutdown path SIGTERM would
+// use (errgroup unwinds, CleanupStack runs, WAL is synced). We do NOT
+// send a signal, call os.Exit, or touch the raft engine directly here.
+func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context.CancelFunc) {
+	cfg, enabled := memwatchConfigFromEnv()
+	if !enabled {
+		return
+	}
+	cfg.OnExceed = func() {
+		memoryPressureExit.Store(true)
+		cancel()
+	}
+	w := memwatch.New(cfg)
+	slog.Info("memory watchdog enabled",
+		"threshold_bytes", cfg.ThresholdBytes,
+		"poll_interval", cfg.PollInterval,
+	)
+	eg.Go(func() error {
+		w.Start(ctx)
+		return nil
+	})
 }
 
 // startMonitoringCollectors wires up the per-tick Prometheus
@@ -966,6 +1136,10 @@ type runtimeServerRunner struct {
 	s3Region        string
 	s3CredsFile     string
 	s3PathStyleOnly bool
+	sqsAddress      string
+	leaderSQS       map[string]string
+	sqsRegion       string
+	sqsCredsFile    string
 	metricsAddress  string
 	metricsToken    string
 	pprofAddress    string
@@ -998,6 +1172,9 @@ func (r runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {

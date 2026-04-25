@@ -464,6 +464,13 @@ func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool,
 	return ver.TS, true, nil
 }
 
+// ApplyMutationsRaft is provided to satisfy the MVCCStore interface. The
+// in-memory store has no WAL and therefore no sync-mode distinction; this
+// method delegates to ApplyMutations.
+func (s *mvccStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
 func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -527,6 +534,12 @@ func (s *mvccStore) WriteConflictCount() uint64 {
 // DeletePrefixAt deletes all visible keys matching prefix by writing tombstones
 // at commitTS. An empty prefix deletes all keys. Keys matching excludePrefix
 // are preserved.
+// DeletePrefixAtRaft delegates to DeletePrefixAt; the in-memory store has
+// no WAL and therefore no sync-mode distinction.
+func (s *mvccStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS)
+}
+
 func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
