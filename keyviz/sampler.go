@@ -30,6 +30,7 @@
 package keyviz
 
 import (
+	"bytes"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -379,8 +380,11 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		return true
 	}
 
-	// Coarsening: route is folded into the closest-by-start virtual
-	// bucket (or one is created if no virtual bucket exists yet).
+	// Coarsening: prefer the first virtual bucket whose [Start, End)
+	// covers `start`; if none does, fall back to the first aggregate
+	// in sortedSlots order (lowest Start). A new bucket is created
+	// only when no virtual bucket exists yet. See findVirtualBucket
+	// for the exact selection.
 	bucket := findVirtualBucket(next.sortedSlots, start)
 	if bucket == nil {
 		bucket = &routeSlot{
@@ -772,15 +776,7 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-func bytesLT(a, b []byte) bool {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return len(a) < len(b)
-}
-
-func bytesLE(a, b []byte) bool { return !bytesGT(a, b) }
-func bytesGE(a, b []byte) bool { return !bytesLT(a, b) }
-func bytesGT(a, b []byte) bool { return bytesLT(b, a) }
+func bytesLT(a, b []byte) bool { return bytes.Compare(a, b) < 0 }
+func bytesLE(a, b []byte) bool { return bytes.Compare(a, b) <= 0 }
+func bytesGT(a, b []byte) bool { return bytes.Compare(a, b) > 0 }
+func bytesGE(a, b []byte) bool { return bytes.Compare(a, b) >= 0 }

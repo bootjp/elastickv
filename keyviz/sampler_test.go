@@ -291,7 +291,7 @@ func TestRemoveRouteHarvestsPendingCounts(t *testing.T) {
 // the grace-window half of this contract.
 func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 	t.Parallel()
-	s, clk := setupVirtualBucketWithThreeMembers(t)
+	s, clk := setupOneIndividualPlusVirtualBucket(t)
 	s.RemoveRoute(2)
 	// Drain at least once within grace, then advance past grace so the
 	// next Flush actually executes the prune. One more Flush captures
@@ -304,8 +304,7 @@ func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 	s.Observe(3, OpRead, 1, 0)
 	s.Flush()
 
-	cols := s.Snapshot(time.Time{}, time.Time{})
-	agg := cols[len(cols)-1].Rows[0]
+	agg := findAggregateRow(t, lastSnapshotColumn(t, s).Rows)
 	if memberRoutesContain(agg.MemberRoutes, 2) {
 		t.Fatalf("after grace, removed route 2 still in MemberRoutes: %v", agg.MemberRoutes)
 	}
@@ -320,7 +319,7 @@ func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 // that route's pre-removal increments attribute the traffic correctly.
 func TestRemoveVirtualMemberPruneDeferred(t *testing.T) {
 	t.Parallel()
-	s, _ := setupVirtualBucketWithThreeMembers(t)
+	s, _ := setupOneIndividualPlusVirtualBucket(t)
 	s.RemoveRoute(2)
 	// Two flushes inside the grace window — the clock is not advanced,
 	// so each Flush sees now-retiredAt == 0 < grace and keeps the
@@ -354,7 +353,7 @@ func memberRoutesContain(members []uint64, target uint64) bool {
 	return false
 }
 
-func setupVirtualBucketWithThreeMembers(t *testing.T) (*MemSampler, *fakeClock) {
+func setupOneIndividualPlusVirtualBucket(t *testing.T) (*MemSampler, *fakeClock) {
 	t.Helper()
 	s, clk := newTestSampler(t, MemSamplerOptions{
 		Step:             time.Second,
