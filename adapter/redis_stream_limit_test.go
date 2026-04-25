@@ -1,10 +1,15 @@
 package adapter
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"strings"
 	"testing"
+
+	cockerrors "github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestScanStreamEntriesLimit exercises the boundary cases of the limit
@@ -222,6 +227,42 @@ func TestParseRangeStreamCount_Clamp(t *testing.T) {
 			}
 			if tc.ok && got != tc.want {
 				t.Fatalf("parseRangeStreamCount(%q): want %d, got %d", tc.raw, tc.want, got)
+			}
+		})
+	}
+}
+
+// TestIsXReadIterCtxError covers the four error shapes the XREAD
+// busy-poll loop must silently translate to "empty iteration" rather than
+// surface to the client as -ERR: bare context sentinels, cockroachdb/errors
+// wraps, and gRPC status codes (DeadlineExceeded / Canceled). Anything
+// else must be reported faithfully so genuine errors (auth, wrong type,
+// transport failures) still reach the client.
+func TestIsXReadIterCtxError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"bare DeadlineExceeded", context.DeadlineExceeded, true},
+		{"bare Canceled", context.Canceled, true},
+		{"cockroach-wrapped DeadlineExceeded", cockerrors.WithStack(context.DeadlineExceeded), true},
+		{"cockroach-wrapped Canceled", cockerrors.WithStack(context.Canceled), true},
+		{"grpc DeadlineExceeded status", status.Error(codes.DeadlineExceeded, "iter ctx fired"), true},
+		{"grpc Canceled status", status.Error(codes.Canceled, "iter ctx cancelled"), true},
+		// Genuine non-ctx errors must NOT be swallowed by the helper.
+		{"grpc Unavailable", status.Error(codes.Unavailable, "leader gone"), false},
+		{"grpc Internal", status.Error(codes.Internal, "boom"), false},
+		{"plain non-ctx error", cockerrors.New("wrong type"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isXReadIterCtxError(tc.err); got != tc.want {
+				t.Fatalf("isXReadIterCtxError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

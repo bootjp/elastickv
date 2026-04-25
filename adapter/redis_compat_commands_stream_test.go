@@ -12,6 +12,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestRedis_StreamXReadIterCtxDeadlineReturnsNull guards Codex P1 (round 6):
+// when the per-iteration ctx fires *during* xreadOnce (e.g. a tight BLOCK
+// against a busy / slow node where ScanAt overshoots its slice of the BLOCK
+// budget), the busy-poll loop must treat the resulting
+// context.DeadlineExceeded / context.Canceled as an empty iteration and
+// continue to the deadline / null reply — not surface it to the client as
+// `-ERR context deadline exceeded`. Pre-fix (commit 6e5364e8 and earlier),
+// any error from xreadOnce was written as a -ERR; post-fix, only non-ctx
+// errors propagate.
+//
+// The previous TestRedis_StreamXReadShortBlockReturnsNullNotError covers
+// the `iterTimeout <= 0` early-return path. This test covers the
+// distinct mid-call path where iterTimeout starts > 0 but the iter ctx
+// then expires inside xreadOnce.
+func TestRedis_StreamXReadIterCtxDeadlineReturnsNull(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-iterctx",
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.NoError(t, err)
+
+	// 30 ms BLOCK reading after the only entry. iterTimeout starts at
+	// ~30 ms, well above 0, so the early-return branch does not fire;
+	// each xreadOnce call has up to 30 ms minus elapsed-loop-time. On a
+	// busy CI runner the ScanAt round trip can land near or past that
+	// budget, exercising the mid-call DeadlineExceeded path. The reply
+	// must still be redis.Nil.
+	for i := 0; i < 5; i++ {
+		streams, err := rdb.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{"stream-iterctx", "1-0"},
+			Count:   1,
+			Block:   30 * time.Millisecond,
+		}).Result()
+		if !errors.Is(err, redis.Nil) {
+			t.Fatalf("attempt %d: BLOCK timeout must return redis.Nil, got err=%v streams=%v", i, err, streams)
+		}
+	}
+}
+
 // TestRedis_StreamXReadShortBlockReturnsNullNotError guards the Codex P1
 // regression: when the BLOCK window has already elapsed by the time the
 // poll loop starts (very small BLOCK, or `$` resolution consumes the

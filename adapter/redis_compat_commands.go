@@ -18,6 +18,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	cockerrors "github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -4522,6 +4524,28 @@ func writeXReadResults(conn redcon.Conn, results []xreadResult) {
 	}
 }
 
+// isXReadIterCtxError reports whether err originates from the per-iteration
+// XREAD context firing (BLOCK budget consumed mid-call). The check covers
+// the bare context sentinels, cockroachdb/errors-wrapped variants, and
+// gRPC's status.Error(codes.DeadlineExceeded / codes.Canceled, ...) which
+// is what bubbles up through coordinator.Dispatch when the iter ctx fires
+// during a Raft-mediated read. Hits on this path must be silently
+// translated to "empty iteration" so the BLOCK-window null contract holds.
+func isXReadIterCtxError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if cockerrors.Is(err, context.DeadlineExceeded) || cockerrors.Is(err, context.Canceled) {
+		return true
+	}
+	switch status.Code(err) { //nolint:exhaustive // only the two ctx-related codes matter; the rest must propagate as real errors
+	case codes.DeadlineExceeded, codes.Canceled:
+		return true
+	default:
+		return false
+	}
+}
+
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	req, err := parseXReadRequest(cmd.Args)
 	if err != nil {
@@ -4551,6 +4575,12 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
+	r.xreadBusyPoll(conn, req, deadline)
+}
+
+// xreadBusyPoll runs the BLOCK-window busy-poll loop. Extracted from xread
+// so the parent function stays under the cyclop budget.
+func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline time.Time) {
 	for {
 		// BLOCK-expired before the loop body: respect the Redis contract
 		// that a BLOCK timeout returns null, not an error. If we fell
@@ -4571,7 +4601,17 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		iterCtx, iterCancel := context.WithTimeout(context.Background(), iterTimeout)
 		results, err := r.xreadOnce(iterCtx, req)
 		iterCancel()
-		if err != nil {
+		// Per-iteration ctx hitting its deadline (or being cancelled by
+		// the upstream BLOCK timeout) is not a client-facing error — it
+		// just means this poll round did not see any new entries. Treat
+		// it as an empty iteration so the loop continues to the next
+		// round (or falls through to the null-on-deadline branch below).
+		// Without this, a tight BLOCK (e.g. BLOCK 10 against a busy /
+		// slow node) leaks the iteration ctx-deadline into a -ERR reply,
+		// which violates the Redis BLOCK-timeout contract (null on
+		// timeout). xreadOnce returns nil results on any error, so
+		// suppressing iter-ctx errors here is sound.
+		if err != nil && !isXReadIterCtxError(err) {
 			conn.WriteError(err.Error())
 			return
 		}
@@ -4626,7 +4666,9 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 func parseRangeStreamCount(args [][]byte) (int, error) {
 	count := -1
 	for i := 4; i < len(args); i += redisPairWidth {
-		if i+1 >= len(args) || !strings.EqualFold(string(args[i]), redisKeywordCount) {
+		// args[i] is safe: the for-loop guard `i < len(args)` ensures it.
+		// gosec G602 false-positives here under flow analysis.
+		if i+1 >= len(args) || !strings.EqualFold(string(args[i]), redisKeywordCount) { //nolint:gosec
 			return 0, errors.New("ERR syntax error")
 		}
 		nextCount, err := strconv.Atoi(string(args[i+1]))
