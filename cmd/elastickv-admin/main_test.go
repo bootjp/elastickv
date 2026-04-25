@@ -276,6 +276,33 @@ func TestMembersFromCapsAtMaxDiscoveredNodes(t *testing.T) {
 	}
 }
 
+// TestFanoutSeedTargetsClampsToMaxNodes asserts that the seed-fallback path
+// clamps to f.maxNodes and deduplicates so an oversized --nodes list cannot
+// bypass the per-overview fan-out bound enforced in membersFrom. Codex P2 on
+// 501b0173: previously these paths returned the raw seeds list, letting an
+// outage spawn more concurrent RPCs than configured.
+func TestFanoutSeedTargetsClampsToMaxNodes(t *testing.T) {
+	t.Parallel()
+	const cap_ = 5
+	seeds := []string{
+		"a:1", "b:1", "c:1", "d:1", "e:1", "f:1", "g:1", "h:1",
+		"a:1", // duplicate — must be deduplicated, not counted twice
+	}
+	f := newFanout(seeds, "", time.Second, insecure.NewCredentials(), cap_)
+	defer f.Close()
+
+	got := f.seedTargets()
+	if len(got) != cap_ {
+		t.Fatalf("len = %d, want %d (clamped to maxNodes)", len(got), cap_)
+	}
+	seen := map[string]struct{}{}
+	for _, s := range got {
+		if _, dup := seen[s]; dup {
+			t.Fatalf("seedTargets returned duplicates: %v", got)
+		}
+		seen[s] = struct{}{}
+	}
+}
 
 // TestFanoutClientForDeduplicatesConcurrentDials asserts that N goroutines
 // asking for the same fresh address run only one grpc.NewClient call between

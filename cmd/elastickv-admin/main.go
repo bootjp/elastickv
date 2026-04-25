@@ -313,7 +313,7 @@ type fanout struct {
 	// "skip seed entries" check. Seeds are immutable after construction so
 	// rebuilding the map on every cache-full eviction (under f.mu) is pure
 	// waste — Gemini flagged the per-call allocation.
-	seedSet         map[string]struct{}
+	seedSet map[string]struct{}
 	// maxNodes bounds both the per-overview discovery list and the gRPC
 	// client cache. Configurable via --maxDiscoveredNodes; values ≤0 fall
 	// back to defaultMaxDiscoveredNodes so the bound is never disabled.
@@ -669,7 +669,7 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 			return addrs
 		}
 		log.Printf("elastickv-admin: membership refresh returned unexpected type %T; falling back to seeds", r.Val)
-		return append([]string(nil), f.seeds...)
+		return f.seedTargets()
 	case <-ctx.Done():
 		// Caller bailed. Give them whatever targets we can assemble without
 		// blocking: the last cached membership if we have one, else seeds.
@@ -680,8 +680,38 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 		if f.members != nil {
 			return append([]string(nil), f.members.addrs...)
 		}
-		return append([]string(nil), f.seeds...)
+		return f.seedTargets()
 	}
+}
+
+// seedTargets returns a deduplicated copy of f.seeds clamped to f.maxNodes.
+// Callers use it on seed-fallback paths (discovery error, ctx cancel,
+// unexpected refresh result, no cached members yet) so a misconfigured huge
+// --nodes list never bypasses the fan-out bound that membersFrom otherwise
+// enforces. Codex P2 on 501b0173: previously these paths returned the raw
+// f.seeds, which under outages or oversized seed lists could spawn more
+// concurrent RPCs than configured.
+func (f *fanout) seedTargets() []string {
+	cap := f.maxNodes
+	if cap <= 0 {
+		cap = defaultMaxDiscoveredNodes
+	}
+	if len(f.seeds) < cap {
+		cap = len(f.seeds)
+	}
+	out := make([]string, 0, cap)
+	seen := make(map[string]struct{}, cap)
+	for _, s := range f.seeds {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		if len(out) >= f.maxNodes && f.maxNodes > 0 {
+			break
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // refreshMembership performs the actual discovery RPC. It honours the caller's
@@ -713,7 +743,7 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 	}
 
 	log.Printf("elastickv-admin: all seeds unreachable for membership refresh; falling back to static seed list")
-	return append([]string(nil), f.seeds...)
+	return f.seedTargets()
 }
 
 // membersFrom extracts a deduplicated address list from a cluster overview
