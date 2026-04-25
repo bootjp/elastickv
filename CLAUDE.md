@@ -90,3 +90,5 @@ After every code change, run **five independent review passes** — one lens at 
 ## Design Documents
 
 `docs/design/` is dated proposals and as-implemented records (`*_proposed_*.md` / `*_implemented_*.md`). Check it before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, etc.). `docs/design/README.md` indexes them.
+
+**Design-doc-first workflow.** For any change that goes beyond a single-file edit — new feature, new adapter, new control-plane RPC, schema/wire-format change, or any modification touching replication / MVCC / OCC / HLC / routing — **write a `*_proposed_*.md` design doc first and land it before the implementation**. Do not start implementation until the proposal has been reviewed and accepted. The PR may carry both the doc and the implementation (in that order: doc commit first, implementation commits after) as long as the doc is reviewable on its own. Once shipped, rename / supersede the doc to `*_implemented_*.md` so the as-built record is preserved (see existing `*_implemented_*.md` examples for the format).
