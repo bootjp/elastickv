@@ -35,13 +35,27 @@ const (
 	s3LeaderHealthPath          = "/healthz/leader"
 	s3HealthMaxRequestBodyBytes = 1024
 	s3ChunkSize                 = 1 << 20
-	s3ChunkBatchOps             = 16
-	s3XMLNamespace              = "http://s3.amazonaws.com/doc/2006-03-01/"
-	s3DefaultRegion             = "us-east-1"
-	s3MaxKeys                   = 1000
-	s3ListPageSize              = 256
-	s3ManifestCleanupTimeout    = 2 * time.Minute
-	s3MaxObjectSizeBytes        = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
+	// s3ChunkBatchOps caps how many s3ChunkSize chunks fit in a single
+	// coordinator.Dispatch call. The Raft entry produced by Dispatch is
+	// roughly s3ChunkBatchOps × s3ChunkSize plus protobuf overhead, so
+	// 4 × 1 MiB = 4 MiB matches the post-PR-#593 default
+	// `MaxSizePerMsg = 4 MiB`. This alignment matters because
+	// etcd/raft sends a single entry that is *larger* than
+	// MaxSizePerMsg as a solo MsgApp (see util.go:limitSize), bypassing
+	// the documented `MaxInflight × MaxSizePerMsg` per-peer memory
+	// bound. With 16 × 1 MiB = 16 MiB entries the worst-case leader
+	// buffer was 1024 × 16 MiB = 16 GiB / peer; at 4 × 1 MiB the bound
+	// drops to 1024 × 4 MiB = 4 GiB / peer and matches the cap PR #593
+	// advertises. Per-PUT Raft commit count grows 4× (a 5 GiB PUT goes
+	// from 320 to 1280 entries) — absorbed by the WAL group commit
+	// landed in PR #600 and the smaller per-entry fsync.
+	s3ChunkBatchOps          = 4
+	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
+	s3DefaultRegion          = "us-east-1"
+	s3MaxKeys                = 1000
+	s3ListPageSize           = 256
+	s3ManifestCleanupTimeout = 2 * time.Minute
+	s3MaxObjectSizeBytes     = 5 * 1024 * 1024 * 1024 // 5 GiB, matching AWS S3 single PUT limit.
 
 	s3TxnRetryInitialBackoff = 2 * time.Millisecond
 	s3TxnRetryMaxBackoff     = 32 * time.Millisecond
