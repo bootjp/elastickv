@@ -192,10 +192,19 @@ type configResult struct {
 // asynchronously when their per-RPC ctx unwinds. The early-return is the
 // reason this lives in its own function: reading a shared []configResult
 // slice across the cancel boundary would race the still-running goroutines.
+//
+// Each spawned goroutine checks ctx before issuing the RPC so a goroutine
+// scheduled after the parent ctx already fired exits immediately instead
+// of doing wasted gRPC work. After the RPC the goroutine drains its result
+// without blocking thanks to the len(groups)-buffered channel.
 func fanoutConfigurationCalls(ctx context.Context, groups []groupEntry) []configResult {
 	resultsCh := make(chan configResult, len(groups))
 	for i, entry := range groups {
 		go func(i int, entry groupEntry) {
+			if err := ctx.Err(); err != nil {
+				resultsCh <- configResult{i: i, err: err}
+				return
+			}
 			cfg, err := entry.group.Configuration(ctx)
 			resultsCh <- configResult{i: i, cfg: cfg, err: err}
 		}(i, entry)

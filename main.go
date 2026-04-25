@@ -880,8 +880,14 @@ func startRaftServers(
 	adminServer *adapter.AdminServer,
 	adminGRPCOpts adminGRPCInterceptors,
 ) error {
+	// extraOptsCap reserves slots for the unary + stream admin interceptor
+	// options appended below. Sized as a constant so the magic-number
+	// linter does not complain.
+	const extraOptsCap = 2
 	for _, rt := range runtimes {
-		opts := append([]grpc.ServerOption(nil), internalutil.GRPCServerOptions()...)
+		baseOpts := internalutil.GRPCServerOptions()
+		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
+		opts = append(opts, baseOpts...)
 		// Collapse all interceptors into a single ChainUnaryInterceptor /
 		// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
 		// (single-interceptor) option added anywhere in this chain cannot

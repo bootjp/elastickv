@@ -317,6 +317,14 @@ type fanout struct {
 	// of browser requests immediately after cache expiry collapses into a
 	// single GetClusterOverview call against one seed.
 	refreshGroup singleflight.Group
+
+	// dialGroup deduplicates concurrent grpc.NewClient calls for the same
+	// address. Without it, N goroutines that all miss the cache for the
+	// same addr would each run a parallel dial (DNS/parsing/setup); only
+	// one is kept. With singleflight, only one dial runs and every waiter
+	// gets the same *grpc.ClientConn — refcount is bumped per waiter
+	// before they each return.
+	dialGroup singleflight.Group
 }
 
 // errFanoutClosed is returned by clientFor when Close has already run, so
@@ -397,13 +405,13 @@ func (f *fanout) Close() {
 // borrower has released; this prevents an eviction from canceling a healthy
 // concurrent GetClusterOverview.
 //
-// The dial step (grpc.NewClient) runs outside f.mu. Although NewClient is
-// non-blocking, it parses the target and may run synchronous DNS resolution
-// depending on resolver configuration; holding the global fanout mutex for
-// that wall-clock time would serialize concurrent clientFor calls for
-// distinct addrs. After the dial we re-take the lock and re-check whether
-// another goroutine raced us to insert a client for the same addr — the
-// loser closes its just-dialed conn so we never leak a duplicate.
+// The dial step (grpc.NewClient) runs outside f.mu through a singleflight
+// keyed by addr — concurrent dials for the same addr collapse into one,
+// avoiding wasted DNS/parsing work plus the post-dial close-the-loser
+// dance. NewClient itself is non-blocking but parses the target and may
+// trigger synchronous DNS depending on resolver config, so holding the
+// global mutex for that wall-clock time would serialize concurrent
+// clientFor calls for distinct addrs.
 func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 	f.mu.Lock()
 	if f.closed {
@@ -418,13 +426,20 @@ func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 	}
 	f.mu.Unlock()
 
-	conn, err := grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(f.creds),
-		internalutil.GRPCCallOptions(),
-	)
+	// Collapse concurrent first-time dials for the same addr.
+	v, err, _ := f.dialGroup.Do(addr, func() (any, error) {
+		return grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(f.creds),
+			internalutil.GRPCCallOptions(),
+		)
+	})
 	if err != nil {
 		return nil, func() {}, errors.Wrapf(err, "dial %s", addr)
+	}
+	conn, ok := v.(*grpc.ClientConn)
+	if !ok {
+		return nil, func() {}, fmt.Errorf("dial %s: unexpected singleflight value type %T", addr, v)
 	}
 
 	f.mu.Lock()
@@ -433,50 +448,67 @@ func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 		_ = conn.Close()
 		return nil, func() {}, errFanoutClosed
 	}
-	// Race: another goroutine inserted while we were dialing. Close the loser
-	// conn outside the lock and return the cached entry instead.
+	// If another waiter on the same singleflight already installed the cache
+	// entry, take a lease on it. (Singleflight returns the same conn to all
+	// waiters, but only the first one runs the install path below.)
 	if c, ok := f.clients[addr]; ok {
 		c.refcount++
 		release := f.releaseFunc(c)
 		f.mu.Unlock()
-		_ = conn.Close()
 		return c, release, nil
 	}
+	var evicted *grpc.ClientConn
 	if len(f.clients) >= maxCachedClients {
-		f.evictOneLocked()
+		evicted = f.evictOneLocked()
 	}
 	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn), refcount: 1}
 	f.clients[addr] = c
 	release := f.releaseFunc(c)
 	f.mu.Unlock()
+	if evicted != nil {
+		if err := evicted.Close(); err != nil {
+			log.Printf("elastickv-admin: evict-close: %v", err)
+		}
+	}
 	return c, release, nil
 }
 
 // releaseFunc returns the closer used to drop a lease. On the last release
-// of an evicted client the underlying connection is finally closed. Extra
-// release() calls after the conn is already closed are safe no-ops.
+// of an evicted client the underlying connection is finally closed; that
+// Close() runs after f.mu is dropped because grpc.ClientConn.Close can do
+// network I/O and waits for the transport to drain — holding the global
+// fanout mutex across that would block any concurrent clientFor /
+// invalidateClient / RPC waiting on f.mu. Extra release() calls after the
+// conn is already closed are safe no-ops.
 func (f *fanout) releaseFunc(c *nodeClient) func() {
 	return func() {
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		if c.refcount > 0 {
 			c.refcount--
 		}
+		var toClose *grpc.ClientConn
 		if c.refcount == 0 && c.evicted && !c.closed {
 			c.closed = true
-			if err := c.conn.Close(); err != nil {
-				log.Printf("elastickv-admin: deferred close for %s: %v", c.addr, err)
-			}
+			toClose = c.conn
+		}
+		f.mu.Unlock()
+
+		if toClose == nil {
+			return
+		}
+		if err := toClose.Close(); err != nil {
+			log.Printf("elastickv-admin: deferred close for %s: %v", c.addr, err)
 		}
 	}
 }
 
 // evictOneLocked removes exactly one entry from f.clients. Prefers non-seed
 // entries; falls back to any entry if none are eligible (for example when
-// len(seeds) >= maxCachedClients). The underlying connection is closed only
-// if no borrowers still hold a lease; otherwise closing is deferred to the
-// last release (see releaseFunc). Caller must hold f.mu.
-func (f *fanout) evictOneLocked() {
+// len(seeds) >= maxCachedClients). Returns the *grpc.ClientConn that needs
+// closing (or nil if the entry has outstanding leases or was already
+// closed) — caller must run Close() outside f.mu. Closing is deferred to
+// the last release (see releaseFunc) when leases are still held.
+func (f *fanout) evictOneLocked() *grpc.ClientConn {
 	seeds := make(map[string]struct{}, len(f.seeds))
 	for _, s := range f.seeds {
 		seeds[s] = struct{}{}
@@ -490,32 +522,32 @@ func (f *fanout) evictOneLocked() {
 		if _, keep := seeds[victim]; keep {
 			continue
 		}
-		f.retireLocked(victim, vc)
-		return
+		return f.retireLocked(victim, vc)
 	}
 	if fallbackClient != nil {
-		f.retireLocked(fallback, fallbackClient)
+		return f.retireLocked(fallback, fallbackClient)
 	}
+	return nil
 }
 
 // retireLocked removes a client from the cache and, if no lease is currently
-// held, closes its connection. Otherwise the connection stays open until the
-// last borrower releases, so an evicted entry never cancels an in-flight
-// RPC. Idempotent — double-retiring or retiring after the last release is a
-// no-op. Caller must hold f.mu.
-func (f *fanout) retireLocked(addr string, c *nodeClient) {
+// held, marks it for closing. Returns the connection that needs to be closed
+// (or nil) so the caller can run conn.Close() outside f.mu — Close() blocks
+// on transport teardown and must not run with the global fanout mutex held.
+// Otherwise the connection stays open until the last borrower releases, so
+// an evicted entry never cancels an in-flight RPC. Idempotent — double-retiring
+// or retiring after the last release is a no-op. Caller must hold f.mu.
+func (f *fanout) retireLocked(addr string, c *nodeClient) *grpc.ClientConn {
 	delete(f.clients, addr)
 	if c.evicted {
-		return
+		return nil
 	}
 	c.evicted = true
 	if c.refcount > 0 || c.closed {
-		return
+		return nil
 	}
 	c.closed = true
-	if err := c.conn.Close(); err != nil {
-		log.Printf("elastickv-admin: retire %s: close: %v", addr, err)
-	}
+	return c.conn
 }
 
 // invalidateClient drops a cached connection — used when a peer returns
@@ -524,13 +556,21 @@ func (f *fanout) retireLocked(addr string, c *nodeClient) {
 // does not cancel other goroutines' in-flight RPCs.
 func (f *fanout) invalidateClient(addr string) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.closed {
+		f.mu.Unlock()
 		return
 	}
 	f.members = nil
+	var toClose *grpc.ClientConn
 	if c, ok := f.clients[addr]; ok {
-		f.retireLocked(addr, c)
+		toClose = f.retireLocked(addr, c)
+	}
+	f.mu.Unlock()
+
+	if toClose != nil {
+		if err := toClose.Close(); err != nil {
+			log.Printf("elastickv-admin: invalidate %s: close: %v", addr, err)
+		}
 	}
 }
 

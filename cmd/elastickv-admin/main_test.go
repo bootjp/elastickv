@@ -244,6 +244,63 @@ func strconvItoa(i int) string {
 	return string(digits)
 }
 
+// TestFanoutClientForDeduplicatesConcurrentDials asserts that N goroutines
+// asking for the same fresh address run only one grpc.NewClient call between
+// them — singleflight collapses the dial; everyone else waits and takes a
+// lease on the same cached entry.
+func TestFanoutClientForDeduplicatesConcurrentDials(t *testing.T) {
+	t.Parallel()
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	addr := startFakeAdmin(t, peer)
+
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	const concurrency = 32
+	type result struct {
+		c   *nodeClient
+		rel func()
+		err error
+	}
+	out := make(chan result, concurrency)
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			start.Wait()
+			c, rel, err := f.clientFor(addr)
+			out <- result{c, rel, err}
+		}()
+	}
+	start.Done()
+
+	first := <-out
+	if first.err != nil {
+		t.Fatalf("clientFor: %v", first.err)
+	}
+	defer first.rel()
+	for i := 1; i < concurrency; i++ {
+		r := <-out
+		if r.err != nil {
+			t.Fatalf("clientFor[%d]: %v", i, r.err)
+		}
+		// All callers must observe the same cached *nodeClient (singleflight
+		// + cache lookup). Releasing then re-checking same identity makes
+		// the dedup observable without depending on race-prone counters.
+		if r.c != first.c {
+			t.Fatalf("nodeClient pointer mismatch — duplicate dial leaked")
+		}
+		r.rel()
+	}
+	// The cache must contain exactly one entry for addr.
+	f.mu.Lock()
+	size := len(f.clients)
+	f.mu.Unlock()
+	if size != 1 {
+		t.Fatalf("cache size = %d, want 1 (dedup expected)", size)
+	}
+}
+
 // TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds asserts that when
 // operators configure more seeds than maxCachedClients the cache still honors
 // its cap — without the seed-fallback, the eviction loop would skip every
