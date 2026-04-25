@@ -143,21 +143,30 @@ type loginResponse struct {
 // Login events (success and failure) emit admin_audit slog entries
 // directly. The generic Audit middleware cannot do this because it runs
 // before the handler knows who the caller is claiming to be.
+//
+// Preflight runs before any body inspection so a rejected request
+// (wrong method, wrong content type, or rate-limited) returns
+// without forcing a body read. That trade-off costs the
+// claimed_actor signal on those audit lines — but the IP recorded
+// by remote_addr is already enough to follow up on, and reading
+// the body before throttling would let a hostile client hold
+// handler goroutines open with slow bodies.
 func (s *AuthService) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	rec := newStatusRecorder(w)
 	defer s.auditLogin(r, rec)
 
-	// Best-effort peek at the claimed access key so the audit line
-	// includes it even when preflight (415/429) or readLoginRequest
-	// rejects the call. On the happy path readLoginRequest will
-	// overwrite the same field with the canonical trimmed value.
-	rec.claimedActor = peekClaimedActor(r)
-
 	if !s.preflightLogin(rec, r) {
 		return
 	}
+	// Best-effort peek at the claimed access key so the audit line
+	// captures it even when readLoginRequest rejects the body. The
+	// happy path overwrites the same field with the canonical
+	// trimmed value below.
+	rec.claimedActor = peekClaimedActor(r)
 	req, ok := readLoginRequest(rec, r)
-	rec.claimedActor = req.AccessKey
+	if ok {
+		rec.claimedActor = req.AccessKey
+	}
 	if !ok {
 		return
 	}
