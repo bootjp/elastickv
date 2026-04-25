@@ -165,6 +165,12 @@ func (s *AdminServer) cloneGroupsSorted() []groupEntry {
 // same server ID with different addresses — e.g. mid-readdress before every
 // group has converged — the lowest-ID group wins, which is stable across
 // calls and matches "trust the primary group" intuition.
+//
+// Entries with an empty `srv.Address` (the etcd engine can emit those when
+// peer metadata is still missing) are skipped: storing a blank address would
+// shadow a usable seed entry for the same NodeID and cause GetClusterOverview
+// to drop the peer from fan-out altogether. Letting the seed list backfill
+// keeps the peer reachable until the live Configuration converges.
 func collectLiveMembers(
 	ctx context.Context,
 	groups []groupEntry,
@@ -178,7 +184,7 @@ func collectLiveMembers(
 			continue
 		}
 		for _, srv := range cfg.Servers {
-			if srv.ID == "" || srv.ID == selfID {
+			if srv.ID == "" || srv.ID == selfID || srv.Address == "" {
 				continue
 			}
 			if _, dup := addrByID[srv.ID]; dup {

@@ -167,6 +167,40 @@ func TestGetClusterOverviewDuplicateMemberIDsDeterministic(t *testing.T) {
 	}
 }
 
+// TestGetClusterOverviewSeedBackfillsBlankLiveAddress asserts that when a
+// Raft group reports a server with NodeID set but Address="" (the etcd
+// engine emits these mid-membership-update), the seed list still gets to
+// backfill that ID instead of being shadowed by a blank live entry. Without
+// this, GetClusterOverview would drop the peer from fan-out entirely until
+// the live Configuration converged.
+func TestGetClusterOverviewSeedBackfillsBlankLiveAddress(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1"},
+		[]NodeIdentity{{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"}},
+	)
+	// Live config knows n2 exists but has no address yet.
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: ""},
+		},
+	})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Members) != 1 {
+		t.Fatalf("members = %d, want 1", len(resp.Members))
+	}
+	got := resp.Members[0]
+	if got.NodeId != "n2" || got.GrpcAddress != "10.0.0.12:50051" {
+		t.Fatalf("members[0] = %+v, want seed n2 @ 10.0.0.12:50051 (blank live skipped)", got)
+	}
+}
+
 // TestGetClusterOverviewLiveConfigWinsOverStaleSeed asserts that when a node
 // is readdressed (same NodeID, new GRPCAddress), the live Raft Configuration
 // wins over the stale bootstrap seed so fan-out dials the current endpoint.
