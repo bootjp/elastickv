@@ -68,9 +68,13 @@ type SQSServer struct {
 	leaderSQS      map[string]string
 	region         string
 	staticCreds    map[string]string
-	// reaperCancel terminates the retention sweeper goroutine. Run()
-	// starts the sweeper; Stop() cancels it. The cancel is nil before
-	// Run() executes so Stop() on an unstarted server is safe.
+	// reaperCtx / reaperCancel drive the retention sweeper goroutine.
+	// Both are initialized in NewSQSServer (never reassigned) so a
+	// concurrent Stop() that lands before Run() completes still reads
+	// a stable cancel func — unlike a Run-time assignment, which the
+	// race detector flagged because Run and Stop run on different
+	// goroutines without ordering between them.
+	reaperCtx    context.Context
 	reaperCancel context.CancelFunc
 }
 
@@ -87,10 +91,13 @@ func WithSQSLeaderMap(m map[string]string) SQSServerOption {
 }
 
 func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator, opts ...SQSServerOption) *SQSServer {
+	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	s := &SQSServer{
-		listen:      listen,
-		store:       st,
-		coordinator: coordinate,
+		listen:       listen,
+		store:        st,
+		coordinator:  coordinate,
+		reaperCtx:    reaperCtx,
+		reaperCancel: reaperCancel,
 	}
 	s.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		sqsCreateQueueTarget:               s.createQueue,
@@ -123,9 +130,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 }
 
 func (s *SQSServer) Run() error {
-	reaperCtx, cancel := context.WithCancel(context.Background())
-	s.reaperCancel = cancel
-	s.startReaper(reaperCtx)
+	s.startReaper(s.reaperCtx)
 	if err := s.httpServer.Serve(s.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}

@@ -373,34 +373,29 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 // under the standard retry budget. Stamping the dedup record + new
 // sequence number happens inside one transaction so a concurrent send
 // either observes the dedup hit or loses the OCC race.
-func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, queueName string, meta *sqsQueueMeta, in sqsSendMessageInput, delay int64, initialReadTS uint64) {
+//
+// On retry, both readTS and meta are re-read: a concurrent PurgeQueue /
+// DeleteQueue / SetQueueAttributes that wins the OCC race bumps the
+// queue generation or rotates attributes, and the next attempt must
+// observe that — otherwise the retry could commit under a stale
+// generation, silently writing a message that is unreachable via
+// routing (acknowledged-loss bug). The single-message Standard path
+// has no inner retry budget; it returns to the client on the first
+// OCC conflict and the SDK retries against a fresh meta read, so this
+// loop is FIFO-specific.
+func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, queueName string, meta *sqsQueueMeta, in sqsSendMessageInput, delay int64, _ uint64) {
 	dedupID := resolveFifoDedupID(meta, in)
 	if dedupID == "" {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter,
 			"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
 		return
 	}
-	backoff := transactRetryInitialBackoff
-	deadline := time.Now().Add(transactRetryMaxDuration)
-	readTS := initialReadTS
-	for range transactRetryMaxAttempts {
-		resp, retry, err := s.sendFifoMessage(r.Context(), queueName, meta, in, dedupID, delay, readTS)
-		if err != nil {
-			writeSQSErrorFromErr(w, err)
-			return
-		}
-		if !retry {
-			writeSQSJSON(w, resp)
-			return
-		}
-		if err := waitRetryWithDeadline(r.Context(), deadline, backoff); err != nil {
-			writeSQSErrorFromErr(w, errors.WithStack(err))
-			return
-		}
-		backoff = nextTransactRetryBackoff(backoff)
-		readTS = s.nextTxnReadTS(r.Context())
+	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, meta, in, dedupID, delay)
+	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
 	}
-	writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure, "FIFO send retry attempts exhausted")
+	writeSQSJSON(w, resp)
 }
 
 // loadQueueMetaForSend reads the queue metadata and body-size-gates the

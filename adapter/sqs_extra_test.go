@@ -786,6 +786,83 @@ func sendFifoMessage(t *testing.T, node Node, url, groupID, dedupID, body string
 	return seq
 }
 
+func TestSQSServer_SendMessageBatchFifoDedupAndSequence(t *testing.T) {
+	t.Parallel()
+	// SendMessageBatch on a FIFO queue must (a) honor per-entry dedup —
+	// two entries with the same MessageDeduplicationId only land once
+	// and report the same MessageId, and (b) assign strictly increasing
+	// SequenceNumbers across distinct entries. The standard-queue
+	// single-OCC fast path would lose both invariants by skipping the
+	// dedup record and writing identical sequence numbers, which is
+	// the regression flagged by Codex P1.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "fifo-batch.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	url, _ := out["QueueUrl"].(string)
+
+	entries := []map[string]any{
+		{"Id": "a", "MessageBody": "alpha", "MessageGroupId": "g", "MessageDeduplicationId": "d-a"},
+		{"Id": "b", "MessageBody": "beta", "MessageGroupId": "g", "MessageDeduplicationId": "d-b"},
+		// Duplicate dedup id of "a" — must collapse to the same MessageId.
+		{"Id": "c", "MessageBody": "alpha-again", "MessageGroupId": "g", "MessageDeduplicationId": "d-a"},
+	}
+	status, body := callSQS(t, node, sqsSendMessageBatchTarget, map[string]any{
+		"QueueUrl": url,
+		"Entries":  entries,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("send batch fifo: %d %v", status, body)
+	}
+	successful, _ := body["Successful"].([]any)
+	if len(successful) != 3 {
+		t.Fatalf("expected 3 successful, got %d (%v)", len(successful), successful)
+	}
+
+	byID := map[string]map[string]any{}
+	for _, s := range successful {
+		m, _ := s.(map[string]any)
+		id, _ := m["Id"].(string)
+		byID[id] = m
+	}
+	if byID["a"]["MessageId"] != byID["c"]["MessageId"] {
+		t.Fatalf("dedup hit must reuse original MessageId; a=%v c=%v",
+			byID["a"]["MessageId"], byID["c"]["MessageId"])
+	}
+	seqAStr, _ := byID["a"]["SequenceNumber"].(string)
+	seqBStr, _ := byID["b"]["SequenceNumber"].(string)
+	seqCStr, _ := byID["c"]["SequenceNumber"].(string)
+	seqA, _ := strconv.ParseUint(seqAStr, 10, 64)
+	seqB, _ := strconv.ParseUint(seqBStr, 10, 64)
+	seqC, _ := strconv.ParseUint(seqCStr, 10, 64)
+	if seqA == 0 || seqB == 0 {
+		t.Fatalf("FIFO batch sends must assign sequence numbers: a=%d b=%d", seqA, seqB)
+	}
+	if seqA >= seqB {
+		t.Fatalf("SequenceNumber must be strictly increasing: a=%d b=%d", seqA, seqB)
+	}
+	if seqC != seqA {
+		t.Fatalf("dedup hit must reuse original sequence; a=%d c=%d", seqA, seqC)
+	}
+
+	// Only two messages should be deliverable (a, b) — the dedup
+	// hit on c collapsed back to a's record.
+	_, body = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            url,
+		"MaxNumberOfMessages": 10,
+		"VisibilityTimeout":   60,
+	})
+	msgs, _ := body["Messages"].([]any)
+	// FIFO group lock means we only receive the head until it is deleted.
+	if len(msgs) != 1 {
+		t.Fatalf("FIFO batch + group lock expected exactly 1 head message, got %d", len(msgs))
+	}
+}
+
 func TestSQSServer_FifoDedupBlocksDuplicateSend(t *testing.T) {
 	t.Parallel()
 	// A second FIFO send with the same MessageDeduplicationId inside
