@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"path"
 	"strings"
@@ -218,7 +219,20 @@ func (rt *Router) serveStaticFile(w http.ResponseWriter, r *http.Request, name s
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to open asset")
 		return
 	}
-	defer f.Close()
+	defer func() {
+		// embed.FS.Close is essentially a no-op, but the
+		// fs.FS contract still allows other implementations
+		// (e.g. an OS-backed test FS) to surface real errors.
+		// Surface them via slog so cleanup problems do not
+		// silently disappear, matching the project rule that
+		// resource Close errors must be visible.
+		if cerr := f.Close(); cerr != nil {
+			slog.Warn("admin static file close failed",
+				slog.String("name", name),
+				slog.String("error", cerr.Error()),
+			)
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
 		rt.notFound.ServeHTTP(w, r)
