@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -296,7 +297,7 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 			groups = append(groups, admin.GroupInfo{
 				GroupID:  rt.spec.id,
 				LeaderID: status.Leader.ID,
-				IsLeader: strings.EqualFold(string(status.State), "leader"),
+				IsLeader: status.State == raftengine.StateLeader,
 				Members:  members,
 			})
 		}

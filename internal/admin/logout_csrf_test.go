@@ -2,9 +2,13 @@ package admin
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +47,61 @@ func TestLogout_RequiresCSRF(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, req)
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	require.Contains(t, rec.Body.String(), "csrf_missing")
+}
+
+// TestLogout_AuditEmittedOnce ensures the logout response carries
+// exactly one admin_audit log line — the one HandleLogout emits with
+// actor decoded from the session cookie. The generic Audit middleware
+// is intentionally skipped on the logout chain to avoid a duplicate
+// (less informative) audit entry per request.
+func TestLogout_AuditEmittedOnce(t *testing.T) {
+	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
+	signer := newSignerForTest(t, 1, clk)
+	verifier := newVerifierForTest(t, []byte{1}, clk)
+	creds := MapCredentialStore{"AKIA_ADMIN": "ADMIN_SECRET"}
+	roles := map[string]Role{"AKIA_ADMIN": RoleFull}
+	cluster := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
+		return ClusterInfo{NodeID: "n"}, nil
+	})
+	buf := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	srv, err := NewServer(ServerDeps{
+		Signer:      signer,
+		Verifier:    verifier,
+		Credentials: creds,
+		Roles:       roles,
+		ClusterInfo: cluster,
+		AuthOpts:    AuthServiceOpts{Clock: clk},
+		Logger:      logger,
+	})
+	require.NoError(t, err)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginForTest(t, ts)
+	var csrfValue string
+	for _, c := range cookies {
+		if c.Name == csrfCookieName {
+			csrfValue = c.Value
+		}
+	}
+	require.NotEmpty(t, csrfValue)
+	buf.Reset()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	req.Header.Set(csrfHeaderName, csrfValue)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	out := buf.String()
+	count := strings.Count(out, `"msg":"admin_audit"`)
+	require.Equalf(t, 1, count, "expected exactly one admin_audit line on logout, got %d:\n%s", count, out)
+	require.Contains(t, out, `"action":"logout"`)
 }
 
 // TestLogout_HappyPath verifies that a well-formed logout (session

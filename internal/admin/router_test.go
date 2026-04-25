@@ -75,6 +75,15 @@ func TestRouter_StaticAssetServed(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "console.log")
 }
 
+func TestRouter_StaticAssetRejectsPost(t *testing.T) {
+	r := NewRouter(nil, newTestStatic())
+	req := httptest.NewRequest(http.MethodPost, "/admin/assets/app.js", strings.NewReader("payload"))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	require.Contains(t, rec.Body.String(), "method_not_allowed")
+}
+
 func TestRouter_StaticAssetMissingReturnsJSONNotFound(t *testing.T) {
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets/missing.js", nil)

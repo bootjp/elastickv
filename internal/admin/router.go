@@ -164,24 +164,46 @@ func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
+	// Static assets are read-only resources; rejecting non-GET/HEAD
+	// here keeps the response uniform with /admin/healthz and the
+	// SPA fallback. Without this, a POST/PUT/DELETE would fall
+	// through to the fs.FS open path and either succeed (serving
+	// the file body for a write request) or surface as a confusing
+	// 404 — neither matches the API contract for assets.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		return
+	}
 	if rt.static == nil {
 		rt.notFind.ServeHTTP(w, r)
 		return
 	}
-	// Drop /admin/assets/ prefix → relative path under pathRootAssetsDir.
-	rel := strings.TrimPrefix(r.URL.Path, pathPrefixAssets)
-	// Defence against traversal and malformed paths: require the
-	// already-normalised form that fs.ValidPath enforces (no
-	// ".." segments, no "//" segments, no leading "/"). Anything
-	// that does not pass validation resolves to a 404 JSON rather
-	// than risking a 500 from the underlying fs.FS — legitimate
-	// filenames containing ".." as a substring (e.g. "app..js")
-	// still pass because ValidPath checks segments, not substrings.
-	if rel == "" || !fs.ValidPath(rel) {
+	name, ok := rt.assetPath(r.URL.Path)
+	if !ok {
 		rt.notFind.ServeHTTP(w, r)
 		return
 	}
-	name := path.Join(pathRootAssetsDir, rel)
+	rt.serveStaticFile(w, r, name)
+}
+
+// assetPath strips the /admin/assets/ prefix and validates the
+// remainder against fs.ValidPath, which enforces the io/fs rules
+// (no ".." segments, no "//" segments, no leading "/"). Returning
+// (path, false) lets the caller answer with the standard 404 JSON
+// without leaking why a particular shape was rejected.
+func (rt *Router) assetPath(urlPath string) (string, bool) {
+	rel := strings.TrimPrefix(urlPath, pathPrefixAssets)
+	if rel == "" || !fs.ValidPath(rel) {
+		return "", false
+	}
+	return path.Join(pathRootAssetsDir, rel), true
+}
+
+// serveStaticFile is the file-open + http.ServeContent half of
+// serveAsset and serveSPA. Splitting it out keeps each entrypoint
+// under the cyclomatic-complexity ceiling and makes the file-handling
+// failure paths uniform.
+func (rt *Router) serveStaticFile(w http.ResponseWriter, r *http.Request, name string) {
 	f, err := rt.static.Open(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

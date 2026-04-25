@@ -144,6 +144,19 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 			),
 		)
 	}
+	// Logout shares SessionAuth + CSRF with `protect` but skips the
+	// generic Audit middleware: HandleLogout emits its own
+	// admin_audit entry (action=logout, actor decoded from the
+	// session cookie) that carries strictly more context than the
+	// generic line. Wrapping Audit too would produce two audit lines
+	// per logout for no extra information.
+	protectNoAudit := func(next http.Handler) http.Handler {
+		return BodyLimit(defaultBodyLimit)(
+			SessionAuth(verifier)(
+				CSRFDoubleSubmit()(next),
+			),
+		)
+	}
 	// Login is the only endpoint that runs without a pre-existing
 	// session — every other write must go through session + CSRF so
 	// a cross-site page cannot force a user to perform any state
@@ -159,7 +172,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 	// Build each route's middleware stack exactly once at startup
 	// rather than rebuilding 4–5 closures per inbound request.
 	loginChain := publicAuth(loginHandler)
-	logoutChain := protect(logoutHandler)
+	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
