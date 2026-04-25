@@ -36,11 +36,15 @@ const (
 	// can find every record whose retention deadline has elapsed with
 	// one bounded scan, without having to load every message body.
 	SqsMsgByAgePrefix = "!sqs|msg|byage|"
-	// SqsQueueTombstonePrefix prefixes a "queue was deleted" marker.
-	// DeleteQueue writes one (queue, gen) tombstone alongside the meta
-	// delete, and the reaper enumerates these markers to clean up
-	// orphan data / vis / byage / dedup / group keys whose meta row no
-	// longer exists. The tombstone is itself deleted once the reaper
+	// SqsQueueTombstonePrefix prefixes a generation-orphan marker.
+	// DeleteQueue and PurgeQueue each write one (queue, gen) tombstone
+	// in the same OCC transaction that supersedes that generation —
+	// DeleteQueue tombstones the gen it removes the meta row at, and
+	// PurgeQueue tombstones the pre-bump gen so the reaper can find
+	// pre-purge orphans even if the queue is deleted before the next
+	// reaper tick. The reaper enumerates these markers to clean up
+	// orphan data / vis / byage / dedup / group keys for superseded
+	// generations. The tombstone is itself deleted once the reaper
 	// confirms no message-keyspace state remains for that (queue, gen).
 	SqsQueueTombstonePrefix = "!sqs|queue|tombstone|"
 )
