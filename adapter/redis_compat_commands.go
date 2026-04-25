@@ -4446,11 +4446,19 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	for {
-		// Derive a per-iteration context from the BLOCK deadline so
-		// ScanAt/ReverseScanAt respect the remaining BLOCK window.
-		// Each iteration also caps at redisDispatchTimeout to avoid
-		// holding storage resources longer than a single dispatch.
+		// BLOCK-expired before the loop body: respect the Redis contract
+		// that a BLOCK timeout returns null, not an error. If we fell
+		// through here without remaining time (very small BLOCK, or
+		// $-resolution consumed the budget) creating an
+		// already-expired context.WithTimeout would make xreadOnce
+		// return DeadlineExceeded, which we'd then surface as an error.
 		iterTimeout := time.Until(deadline)
+		if iterTimeout <= 0 {
+			conn.WriteNull()
+			return
+		}
+		// Cap each iteration at redisDispatchTimeout to avoid holding
+		// storage resources longer than a single dispatch.
 		if iterTimeout > redisDispatchTimeout {
 			iterTimeout = redisDispatchTimeout
 		}

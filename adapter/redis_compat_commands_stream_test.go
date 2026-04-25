@@ -12,6 +12,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestRedis_StreamXReadShortBlockReturnsNullNotError guards the Codex P1
+// regression: when the BLOCK window has already elapsed by the time the
+// poll loop starts (very small BLOCK, or `$` resolution consumes the
+// budget), the previous loop body created an already-expired
+// context.WithTimeout, xreadOnce returned DeadlineExceeded, and the
+// command replied with `-ERR context deadline exceeded` instead of the
+// Redis-spec null. The fix checks `iterTimeout <= 0` at the top of each
+// iteration and writes null directly.
+func TestRedis_StreamXReadShortBlockReturnsNullNotError(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed one entry so the stream exists in the new layout (so we hit
+	// the busy-poll loop, not the early "stream missing" return path).
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-shortblock",
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.NoError(t, err)
+
+	// 1 ms BLOCK on `$` resolves to "1-0", then the loop polls for any
+	// strictly-newer entry. None exists; the loop should hit the "BLOCK
+	// expired" early-return and reply with null. The pre-fix code would
+	// have created context.WithTimeout(0) on the first iteration and
+	// returned `context deadline exceeded` as a redis error.
+	streams, err := rdb.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{"stream-shortblock", "$"},
+		Count:   1,
+		Block:   1 * time.Millisecond,
+	}).Result()
+	if !errors.Is(err, redis.Nil) {
+		t.Fatalf("short BLOCK must return redis.Nil (timeout), got err=%v streams=%v", err, streams)
+	}
+}
+
 func TestRedis_StreamXAddXReadRoundTrip(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
