@@ -284,24 +284,72 @@ func TestRemoveRouteHarvestsPendingCounts(t *testing.T) {
 
 // TestRemoveVirtualMemberPrunesMemberRoutes pins Codex P2: when a
 // coarsened (virtual-bucket) RouteID is removed, the bucket's
-// MemberRoutes list must drop that ID so later snapshots don't
-// advertise stale members.
+// MemberRoutes list must eventually drop that ID. Pruning is deferred
+// across retainedFlushes cycles so the row attribution stays correct
+// while the bucket counters still include the removed route's
+// pre-removal increments — TestRemoveVirtualMemberPruneDeferred pins
+// the grace-window half of this contract.
 func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 	t.Parallel()
 	s := setupVirtualBucketWithThreeMembers(t)
 	s.RemoveRoute(2)
+	for i := 0; i < retainedFlushes; i++ {
+		s.Observe(3, OpRead, 1, 0)
+		s.Flush()
+	}
+	// One more flush after the grace window to capture the post-prune
+	// MemberRoutes state in a row.
 	s.Observe(3, OpRead, 1, 0)
 	s.Flush()
 
-	agg := findAggregateAcrossSnapshot(t, s.Snapshot(time.Time{}, time.Time{}))
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	agg := cols[len(cols)-1].Rows[0]
 	for _, m := range agg.MemberRoutes {
 		if m == 2 {
-			t.Fatalf("removed route 2 still in MemberRoutes: %v", agg.MemberRoutes)
+			t.Fatalf("after grace, removed route 2 still in MemberRoutes: %v", agg.MemberRoutes)
 		}
 	}
 	if len(agg.MemberRoutes) != 1 || agg.MemberRoutes[0] != 3 {
 		t.Fatalf("MemberRoutes = %v, want [3]", agg.MemberRoutes)
 	}
+}
+
+// TestRemoveVirtualMemberPruneDeferred pins the deferred-prune
+// contract: the removed routeID stays in MemberRoutes for the
+// retainedFlushes grace window so flushed rows whose counters still
+// include that route's pre-removal increments attribute the traffic
+// correctly.
+func TestRemoveVirtualMemberPruneDeferred(t *testing.T) {
+	t.Parallel()
+	s := setupVirtualBucketWithThreeMembers(t)
+	s.RemoveRoute(2)
+	for i := 0; i < retainedFlushes; i++ {
+		s.Observe(3, OpRead, 1, 0)
+		s.Flush()
+		col := lastSnapshotColumn(t, s)
+		agg := findAggregateRow(t, col.Rows)
+		if !memberRoutesContain(agg.MemberRoutes, 2) {
+			t.Fatalf("flush %d within grace dropped route 2 too early: %v", i, agg.MemberRoutes)
+		}
+	}
+}
+
+func lastSnapshotColumn(t *testing.T, s *MemSampler) MatrixColumn {
+	t.Helper()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 {
+		t.Fatal("snapshot empty")
+	}
+	return cols[len(cols)-1]
+}
+
+func memberRoutesContain(members []uint64, target uint64) bool {
+	for _, m := range members {
+		if m == target {
+			return true
+		}
+	}
+	return false
 }
 
 func setupVirtualBucketWithThreeMembers(t *testing.T) *MemSampler {
@@ -321,19 +369,6 @@ func setupVirtualBucketWithThreeMembers(t *testing.T) *MemSampler {
 		t.Fatal("route 3 should fold (over budget)")
 	}
 	return s
-}
-
-func findAggregateAcrossSnapshot(t *testing.T, cols []MatrixColumn) MatrixRow {
-	t.Helper()
-	for _, c := range cols {
-		for _, r := range c.Rows {
-			if r.Aggregate {
-				return r
-			}
-		}
-	}
-	t.Fatal("no aggregate row in snapshot")
-	return MatrixRow{}
 }
 
 // TestRegisterDoesNotRaceFlushOnVirtualBucket pins Codex P1: folding
@@ -453,6 +488,25 @@ func columnTimes(cols []MatrixColumn) []time.Time {
 		out[i] = c.At
 	}
 	return out
+}
+
+// TestFlushSortsMixedLiveAndRetiredRows pins the row-ordering
+// invariant when retired-slot drains land in the same column as live
+// slot drains. Without a final sort the retired rows would be appended
+// in queue order, producing a column whose Rows are not monotone by
+// Start.
+func TestFlushSortsMixedLiveAndRetiredRows(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	mustRegister(t, s, 1, "a", "b")
+	mustRegister(t, s, 2, "m", "n")
+	mustRegister(t, s, 3, "z", "{")
+	s.Observe(2, OpRead, 0, 0)
+	s.RemoveRoute(2)
+	s.Observe(1, OpRead, 0, 0)
+	s.Observe(3, OpRead, 0, 0)
+	s.Flush()
+	flushedRowsSorted(t, s)
 }
 
 // TestRetiredSlotGracePeriod asserts that a retired slot stays in the
