@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+// AdminForward is the SigV4-bypass RPC the admin dashboard uses to
+// reach the Raft leader from a follower. Design Section 3.3.
+//
+// The admin's HTTP layer authenticates the caller with a JWT cookie,
+// resolves an access-key + role principal, and — if the local node
+// is not the verified Raft leader — calls Forward over this RPC.
+//
+// The leader does NOT trust the inbound principal: it re-evaluates
+// access-key membership and role against its own access-key
+// configuration before dispatching to the adapter (Section 3.3.1
+// "principal-aware internal RPC"). A follower whose configuration is
+// mid-rolling-update can therefore not bypass the leader's view of
+// authorisation.
+//
+// AdminForward is intentionally separate from the existing
+// `Internal.Forward` RPC, which carries SigV4 traffic and has no
+// principal field — sharing the same RPC would force the admin path
+// to either smuggle a principal through reserved fields or strip
+// the SigV4-only assumptions out of the existing Forward server.
+service AdminForward {
+  // Forward dispatches an admin write operation on the leader's
+  // behalf. Returns a structured response carrying the same JSON
+  // payload the leader's handler would have written to the wire.
+  rpc Forward(AdminForwardRequest) returns (AdminForwardResponse) {}
+}
+
+// AdminPrincipal captures the access-key + role the follower
+// resolved from the inbound JWT. The leader re-validates this
+// against its own access-key map before acting on it; the follower
+// could be operating with a stale role assignment.
+message AdminPrincipal {
+  string access_key = 1;
+  string role = 2;        // "read_only" | "full"
+}
+
+// AdminOperation enumerates the operations the dashboard can issue.
+// Adding a new operation requires both ends of the cluster to
+// understand it; mismatches are caught by the version compatibility
+// flag (`admin.leader_forward_v2`) before the call goes out.
+enum AdminOperation {
+  ADMIN_OP_UNSPECIFIED = 0;
+  ADMIN_OP_CREATE_TABLE = 1;
+  ADMIN_OP_DELETE_TABLE = 2;
+}
+
+message AdminForwardRequest {
+  AdminPrincipal principal = 1;
+  AdminOperation operation = 2;
+  // payload is the JSON-encoded operation-specific request body —
+  // the same bytes the SPA sent to the follower's HTTP endpoint.
+  // The leader decodes this with the operation's known schema.
+  bytes payload = 3;
+  // forwarded_from is the follower's node id; the leader echoes it
+  // into the audit log line for the operation so operators can
+  // trace which follower carried the request (design Section 3.3.2
+  // acceptance criteria 6).
+  string forwarded_from = 4;
+}
+
+message AdminForwardResponse {
+  // status_code is the HTTP status the leader's handler would have
+  // written. The follower returns this verbatim to the SPA so the
+  // failure semantics (404 vs 409 vs 400) match a leader-direct
+  // call exactly.
+  int32 status_code = 1;
+  // payload is the JSON-encoded response body. Empty when
+  // status_code is 204 No Content (DELETE success).
+  bytes payload = 2;
+  // content_type is the response content type the leader chose; in
+  // practice always "application/json; charset=utf-8" but echoed
+  // explicitly so the follower does not have to guess.
+  string content_type = 3;
+  // retry_after_seconds carries a Retry-After hint the follower's
+  // bridge translates back into an HTTP Retry-After header. The
+  // direct HTTP path sets Retry-After: 1 on 503 leader_unavailable
+  // (mid-dispatch leadership churn); without this field the same
+  // response shape would lose its retry timing once forwarded —
+  // clients would see 503 with no Retry-After and fall back to
+  // their default backoff. Codex P2 on PR #635 flagged the gap.
+  // Zero means "no Retry-After header"; the field is only meaningful
+  // for status codes that traditionally carry one (typically 503).
+  int32 retry_after_seconds = 4;
+}

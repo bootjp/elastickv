@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -66,7 +68,7 @@ type adminListenerConfig struct {
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime) error {
+func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, dynamoServer *adapter.DynamoDBServer) error {
 	if !*adminEnabled {
 		return nil
 	}
@@ -106,8 +108,207 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, buildVersion())
+	tablesSrc := newDynamoTablesSource(dynamoServer)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, buildVersion())
 	return err
+}
+
+// newDynamoTablesSource adapts *adapter.DynamoDBServer to the
+// admin.TablesSource interface. The bridge stays in this file (rather
+// than internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree (gRPC, Raft, store).
+//
+// Returns nil when dynamoServer is nil; admin.NewServer handles a nil
+// Tables field by leaving the dynamo paths off the wire entirely,
+// which is the right behaviour for builds that ship without the
+// Dynamo adapter.
+func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSource {
+	if dynamoServer == nil {
+		return nil
+	}
+	return &dynamoTablesBridge{server: dynamoServer}
+}
+
+// dynamoTablesBridge is the thin adapter that re-shapes the adapter's
+// AdminTableSummary DTO into the admin package's DynamoTableSummary.
+// The two structs are deliberately isomorphic so this translation
+// does no allocation more than necessary; if a future GSI field is
+// added on one side, the build breaks here, which is exactly the
+// drift signal we want.
+type dynamoTablesBridge struct {
+	server *adapter.DynamoDBServer
+}
+
+func (b *dynamoTablesBridge) AdminListTables(ctx context.Context) ([]string, error) {
+	return b.server.AdminListTables(ctx) //nolint:wrapcheck // pure pass-through; the adapter owns the error context.
+}
+
+func (b *dynamoTablesBridge) AdminDescribeTable(ctx context.Context, name string) (*admin.DynamoTableSummary, bool, error) {
+	summary, exists, err := b.server.AdminDescribeTable(ctx, name)
+	if err != nil {
+		return nil, false, err //nolint:wrapcheck // adapter wraps internally.
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminTableSummary(summary), true, nil
+}
+
+func (b *dynamoTablesBridge) AdminCreateTable(ctx context.Context, principal admin.AuthPrincipal, in admin.CreateTableRequest) (*admin.DynamoTableSummary, error) {
+	summary, err := b.server.AdminCreateTable(ctx, convertAdminPrincipal(principal), convertCreateTableInput(in))
+	if err != nil {
+		return nil, translateAdminTablesError(err)
+	}
+	return convertAdminTableSummary(summary), nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteTable(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteTable(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminTablesError(err)
+	}
+	return nil
+}
+
+// convertAdminPrincipal mirrors admin.AuthPrincipal onto the
+// adapter's parallel struct. Both packages keep the principal type
+// independent so the adapter stays free of internal/admin
+// dependencies, but the role / access-key fields are deliberately
+// 1:1 — any drift is a wiring bug, not a feature.
+func convertAdminPrincipal(p admin.AuthPrincipal) adapter.AdminPrincipal {
+	role := adapter.AdminRoleReadOnly
+	if p.Role.AllowsWrite() {
+		role = adapter.AdminRoleFull
+	}
+	return adapter.AdminPrincipal{AccessKey: p.AccessKey, Role: role}
+}
+
+// convertCreateTableInput translates the admin-handler request DTO
+// into the adapter's parallel input struct. We do this here — not
+// in the admin package — to keep `internal/admin` free of any
+// adapter import.
+func convertCreateTableInput(in admin.CreateTableRequest) adapter.AdminCreateTableInput {
+	out := adapter.AdminCreateTableInput{
+		TableName:    in.TableName,
+		PartitionKey: adapter.AdminAttribute{Name: in.PartitionKey.Name, Type: in.PartitionKey.Type},
+	}
+	if in.SortKey != nil {
+		out.SortKey = &adapter.AdminAttribute{Name: in.SortKey.Name, Type: in.SortKey.Type}
+	}
+	if len(in.GSI) == 0 {
+		return out
+	}
+	out.GSI = make([]adapter.AdminCreateGSI, len(in.GSI))
+	for i, g := range in.GSI {
+		gsi := adapter.AdminCreateGSI{
+			Name:             g.Name,
+			PartitionKey:     adapter.AdminAttribute{Name: g.PartitionKey.Name, Type: g.PartitionKey.Type},
+			ProjectionType:   g.Projection.Type,
+			NonKeyAttributes: append([]string(nil), g.Projection.NonKeyAttributes...),
+		}
+		if g.SortKey != nil {
+			gsi.SortKey = &adapter.AdminAttribute{Name: g.SortKey.Name, Type: g.SortKey.Type}
+		}
+		out.GSI[i] = gsi
+	}
+	return out
+}
+
+// translateAdminTablesError maps the adapter's error vocabulary
+// onto the admin-package sentinels the HTTP handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, so a future adapter error mode does not leak
+// raw text to clients while we are still adding the translation.
+func translateAdminTablesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrTablesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrTablesNotLeader
+	// Check structured adapter errors BEFORE the leader-churn
+	// matcher: a ValidationException whose message contains
+	// "not leader" (e.g., a user-supplied attribute name like
+	// `not leader` triggering the conflicting-attribute-type
+	// validator) must be classified as 400 invalid_request, not
+	// 503 leader_unavailable. The kv-internal sentinel checks
+	// in isLeaderChurnError still catch real leadership churn
+	// because they are typed-sentinel matches, not substring.
+	case adapter.IsAdminTableAlreadyExists(err):
+		return admin.ErrTablesAlreadyExists
+	case adapter.IsAdminTableNotFound(err):
+		return admin.ErrTablesNotFound
+	case adapter.IsAdminValidation(err):
+		msg := adapter.AdminErrorMessage(err)
+		if msg == "" {
+			msg = "validation failed"
+		}
+		return &admin.ValidationError{Message: msg}
+	case isLeaderChurnError(err):
+		// Cover leader-churn that surfaces between the up-front
+		// isVerifiedDynamoLeader check and createTableWithRetry's
+		// dispatch — the kv coordinator can drop leadership in
+		// that window and the resulting transient error should
+		// surface as 503 leader_unavailable + Retry-After: 1
+		// rather than a generic 500. Codex P2 on PR #634.
+		return admin.ErrTablesNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+// isLeaderChurnError reports whether err looks like one of the
+// transient leader sentinels the kv coordinator and adapter
+// internals emit during a leadership change. The set mirrors the
+// closed list in kv.leaderErrorPhrases — keep them in sync if a
+// new sentinel is added on the kv side.
+//
+// Phrase matching uses HasSuffix (not Contains) on the standard
+// canonical strings because every kv-internal sentinel emits the
+// phrase at the END of its error chain (e.g.,
+// "raft engine: not leader", "dispatch failed: leader not found").
+// A user-supplied string that happens to contain a leader phrase
+// in the MIDDLE of an unrelated error message therefore does not
+// false-positive — Codex P2 on PR #634 flagged the original
+// strings.Contains form for misclassifying validation messages
+// like "conflicting attribute type for <user-name>" when the
+// name itself was "not leader".
+func isLeaderChurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, adapter.ErrNotLeader) ||
+		errors.Is(err, adapter.ErrLeaderNotFound) {
+		return true
+	}
+	msg := err.Error()
+	return strings.HasSuffix(msg, "not leader") ||
+		strings.HasSuffix(msg, "leader not found") ||
+		strings.HasSuffix(msg, "leadership lost") ||
+		strings.HasSuffix(msg, "leadership transfer in progress")
+}
+
+func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
+	out := &admin.DynamoTableSummary{
+		Name:         in.Name,
+		PartitionKey: in.PartitionKey,
+		SortKey:      in.SortKey,
+		Generation:   in.Generation,
+	}
+	if len(in.GlobalSecondaryIndexes) == 0 {
+		return out
+	}
+	out.GlobalSecondaryIndexes = make([]admin.DynamoGSISummary, len(in.GlobalSecondaryIndexes))
+	for i, g := range in.GlobalSecondaryIndexes {
+		out.GlobalSecondaryIndexes[i] = admin.DynamoGSISummary{
+			Name:           g.Name,
+			PartitionKey:   g.PartitionKey,
+			SortKey:        g.SortKey,
+			ProjectionType: g.ProjectionType,
+		}
+	}
+	return out
 }
 
 // buildAdminConfig translates flag values into an admin.Config.
@@ -144,6 +345,7 @@ func startAdminServer(
 	cfg adminListenerConfig,
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
+	tables admin.TablesSource,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -151,7 +353,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables)
 	if err != nil {
 		return "", err
 	}
@@ -191,7 +393,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -210,6 +412,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Credentials: admin.MapCredentialStore(creds),
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
+		Tables:      tables,
 		StaticFS:    nil,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
