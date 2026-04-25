@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -14,30 +15,23 @@ import (
 )
 
 // stubTablesSource is the in-memory test double the dynamo handler
-// tests use. Returning sorted names from a map iteration mirrors the
-// adapter contract (lex-sorted by AdminListTables).
+// tests use. AdminListTables returns names in lex order, matching
+// the adapter's contract.
 type stubTablesSource struct {
-	tables    map[string]*DynamoTableSummary
-	listErr   error
-	descErr   error
-	listOrder []string // overrides sorted order if non-nil; lets us simulate adapter ordering bugs
+	tables  map[string]*DynamoTableSummary
+	listErr error
+	descErr error
 }
 
 func (s *stubTablesSource) AdminListTables(_ context.Context) ([]string, error) {
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
-	if s.listOrder != nil {
-		out := make([]string, len(s.listOrder))
-		copy(out, s.listOrder)
-		return out, nil
-	}
 	out := make([]string, 0, len(s.tables))
 	for k := range s.tables {
 		out = append(out, k)
 	}
-	// AdminListTables's contract is sorted output.
-	stableSort(out)
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -50,16 +44,6 @@ func (s *stubTablesSource) AdminDescribeTable(_ context.Context, name string) (*
 		return nil, false, nil
 	}
 	return t, true, nil
-}
-
-// stableSort is a tiny helper to avoid importing sort in test files
-// that already have their own sort dependency style.
-func stableSort(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 func newDynamoHandlerForTest(src TablesSource) *DynamoHandler {

@@ -1213,10 +1213,12 @@ type runtimeServerRunner struct {
 	pprofToken      string
 	metricsRegistry *monitoring.Registry
 
-	// dynamoServer is populated by start() and exposed so the admin
-	// listener can call its SigV4-bypass admin entrypoints (see
-	// adapter/dynamodb_admin.go) without going through HTTP. It is
-	// nil until start() reaches the dynamo step.
+	// dynamoServer is populated by start() and made available to
+	// startAdminFromFlags in this package so the admin listener can
+	// call SigV4-bypass admin entrypoints (see
+	// adapter/dynamodb_admin.go) without going through HTTP. The
+	// field is unexported on purpose — it is package-private state,
+	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
 }
 

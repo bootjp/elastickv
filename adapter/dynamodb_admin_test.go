@@ -172,6 +172,12 @@ func TestDynamoDB_AdminDescribeTable_GSI_SortedDeterministic(t *testing.T) {
 
 func newDynamoClient(t *testing.T, address string) *dynamodb.Client {
 	t.Helper()
+	// Region is intentionally arbitrary here. The test DynamoDB
+	// server does not enforce a region match in its SigV4 path —
+	// every existing adapter test uses "us-west-2" as a placeholder
+	// for the same reason. If the server later starts requiring a
+	// specific region, source it from the same constant the server
+	// reads instead of hardcoding it on each side independently.
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion("us-west-2"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
