@@ -473,7 +473,9 @@ func (f *fanout) installOrAttach(addr string, conn *grpc.ClientConn) (*nodeClien
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
-		_ = conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Printf("elastickv-admin: close orphaned dial for %s after shutdown: %v", addr, err)
+		}
 		return nil, func() {}, errFanoutClosed
 	}
 	// If another waiter already installed a cache entry, take a lease on it.
@@ -876,12 +878,13 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 // (≤maxDiscoveredNodes entries × ~few-hundred bytes each) plus the group
 // leaders map (one entry per Raft group; clusters carry tens, not hundreds),
 // so the per-node JSON is bounded around ~150 KiB and the aggregated body is
-// bounded around 75 MiB even before deduplication. The 32 MiB cap below
-// covers the typical response and still rejects a clearly oversized one;
-// operators running clusters where the overview legitimately exceeds this
-// can raise the constant. Keep this aligned with handleOverview's fan-out
-// cap so a misbehaving node cannot force unbounded memory growth.
-const maxResponseBodyBytes = 32 << 20
+// bounded around 75 MiB even before deduplication. The 128 MiB cap below
+// comfortably covers that worst case while still rejecting clearly
+// oversized payloads; operators running clusters where the overview
+// legitimately exceeds this can raise the constant. Keep this aligned with
+// handleOverview's fan-out cap so a misbehaving node cannot force unbounded
+// memory growth.
+const maxResponseBodyBytes = 128 << 20
 
 // writeJSONBufferPool reuses encode buffers across requests so a steady stream
 // of /api/* calls doesn't churn the heap with per-request allocations. The

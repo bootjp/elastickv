@@ -125,12 +125,12 @@ func (s *AdminServer) GetClusterOverview(
 // still produce useful output.
 func (s *AdminServer) snapshotMembers(ctx context.Context) []*pb.NodeIdentity {
 	groups := s.cloneGroupsSorted()
-	addrByID, order := collectLiveMembers(ctx, groups, s.self.NodeID)
-	mergeSeedMembers(s.members, s.self.NodeID, addrByID, &order)
+	live := collectLiveMembers(ctx, groups, s.self.NodeID)
+	mergeSeedMembers(s.members, s.self.NodeID, &live)
 
-	out := make([]*pb.NodeIdentity, 0, len(order))
-	for _, id := range order {
-		out = append(out, &pb.NodeIdentity{NodeId: id, GrpcAddress: addrByID[id]})
+	out := make([]*pb.NodeIdentity, 0, len(live.order))
+	for _, id := range live.order {
+		out = append(out, &pb.NodeIdentity{NodeId: id, GrpcAddress: live.addrByID[id]})
 	}
 	return out
 }
@@ -221,11 +221,25 @@ func fanoutConfigurationCalls(ctx context.Context, groups []groupEntry) []config
 	return got
 }
 
+// liveMembers bundles the result of polling every Raft group's Configuration:
+// addrByID lists the usable (non-blank) addresses, seenID is every NodeID any
+// group reported (even with blank address) so seed backfill can distinguish
+// "node still exists with bad metadata" from "node was removed", and
+// authoritative is true when at least one Configuration succeeded — meaning
+// the live config can be trusted to enumerate cluster membership and seeds
+// should not re-add removed nodes.
+type liveMembers struct {
+	addrByID      map[string]string
+	seenID        map[string]struct{}
+	order         []string
+	authoritative bool
+}
+
 func collectLiveMembers(
 	ctx context.Context,
 	groups []groupEntry,
 	selfID string,
-) (addrByID map[string]string, order []string) {
+) liveMembers {
 	got := fanoutConfigurationCalls(ctx, groups)
 
 	// Merge in the original group-ID order so the lowest-ID-wins tie-break
@@ -233,43 +247,65 @@ func collectLiveMembers(
 	// which Configuration() returned first.)
 	sort.Slice(got, func(a, b int) bool { return got[a].i < got[b].i })
 
-	addrByID = make(map[string]string)
-	order = make([]string, 0)
+	live := liveMembers{
+		addrByID: map[string]string{},
+		seenID:   map[string]struct{}{},
+		order:    []string{},
+	}
 	for _, res := range got {
 		if res.err != nil {
 			continue
 		}
+		live.authoritative = true
 		for _, srv := range res.cfg.Servers {
-			if srv.ID == "" || srv.ID == selfID || srv.Address == "" {
+			if srv.ID == "" || srv.ID == selfID {
 				continue
 			}
-			if _, dup := addrByID[srv.ID]; dup {
+			live.seenID[srv.ID] = struct{}{}
+			if srv.Address == "" {
+				// Known node with missing metadata — seed will backfill.
 				continue
 			}
-			addrByID[srv.ID] = srv.Address
-			order = append(order, srv.ID)
+			if _, dup := live.addrByID[srv.ID]; dup {
+				continue
+			}
+			live.addrByID[srv.ID] = srv.Address
+			live.order = append(live.order, srv.ID)
 		}
 	}
-	return addrByID, order
+	return live
 }
 
-// mergeSeedMembers fills in seed entries for IDs no live Configuration
-// reported. Seeds never overwrite a live address.
-func mergeSeedMembers(
-	seeds []NodeIdentity,
-	selfID string,
-	addrByID map[string]string,
-	order *[]string,
-) {
+// mergeSeedMembers fills in seed entries against the live membership:
+//
+//   - If the NodeID was seen in some live config but with a blank address,
+//     the seed supplies the address (handles the etcd convergence transient).
+//   - If the NodeID was not seen at all and the live result is authoritative
+//     (≥1 Configuration succeeded), the seed is a removed node — drop it
+//     instead of re-advertising it forever.
+//   - If the NodeID was not seen and the live result is non-authoritative
+//     (cold start or every Configuration errored), fall back to the seed so
+//     the admin binary still has someone to fan-out to.
+//
+// Codex P2 on 14698e8d: previously seeds were re-added unconditionally for
+// any NodeID missing from live config, so a removed node stayed in the
+// overview forever and the admin fan-out kept dialing it.
+func mergeSeedMembers(seeds []NodeIdentity, selfID string, live *liveMembers) {
 	for _, m := range seeds {
 		if m.NodeID == "" || m.NodeID == selfID {
 			continue
 		}
-		if _, known := addrByID[m.NodeID]; known {
+		if _, hasAddr := live.addrByID[m.NodeID]; hasAddr {
 			continue
 		}
-		addrByID[m.NodeID] = m.GRPCAddress
-		*order = append(*order, m.NodeID)
+		_, seen := live.seenID[m.NodeID]
+		if !seen && live.authoritative {
+			// Live config is authoritative and doesn't know this node:
+			// it was removed via raft RemoveServer. Skip.
+			continue
+		}
+		live.addrByID[m.NodeID] = m.GRPCAddress
+		live.order = append(live.order, m.NodeID)
 	}
 }
 

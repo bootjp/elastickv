@@ -44,8 +44,16 @@ func TestGetClusterOverviewReturnsSelfAndLeaders(t *testing.T) {
 		NodeIdentity{NodeID: "node-a", GRPCAddress: "127.0.0.1:50051"},
 		[]NodeIdentity{{NodeID: "node-b", GRPCAddress: "127.0.0.1:50052"}},
 	)
-	srv.RegisterGroup(1, fakeGroup{leaderID: "node-a", term: 7})
-	srv.RegisterGroup(2, fakeGroup{leaderID: "node-b", term: 3})
+	// Populate the live Raft config with both nodes so the bootstrap seed
+	// for node-b is accepted by mergeSeedMembers (the scale-in fix only
+	// drops seeds when the live config is authoritatively empty for that
+	// NodeID — i.e., the node was removed via raft RemoveServer).
+	servers := []raftengine.Server{
+		{ID: "node-a", Address: "127.0.0.1:50051"},
+		{ID: "node-b", Address: "127.0.0.1:50052"},
+	}
+	srv.RegisterGroup(1, fakeGroup{leaderID: "node-a", term: 7, servers: servers})
+	srv.RegisterGroup(2, fakeGroup{leaderID: "node-b", term: 3, servers: servers})
 
 	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
 	if err != nil {
@@ -198,6 +206,40 @@ func TestGetClusterOverviewSeedBackfillsBlankLiveAddress(t *testing.T) {
 	got := resp.Members[0]
 	if got.NodeId != "n2" || got.GrpcAddress != "10.0.0.12:50051" {
 		t.Fatalf("members[0] = %+v, want seed n2 @ 10.0.0.12:50051 (blank live skipped)", got)
+	}
+}
+
+// TestGetClusterOverviewDropsRemovedSeedAfterScaleIn asserts that a node
+// that was removed from the live Raft configuration is also dropped from
+// GetClusterOverview, even when it remains in the bootstrap seed list.
+// Codex P2 on 14698e8d: previously mergeSeedMembers re-added any seed whose
+// NodeID was missing from live config, so a decommissioned peer stayed in
+// the overview forever and the admin fan-out kept dialing it.
+func TestGetClusterOverviewDropsRemovedSeedAfterScaleIn(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1"},
+		// Bootstrap remembered both n2 and n3, but n3 has since been removed.
+		[]NodeIdentity{
+			{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"},
+			{NodeID: "n3", GRPCAddress: "10.0.0.13:50051"},
+		},
+	)
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.12:50051"},
+			// n3 absent — was removed via raft RemoveServer.
+		},
+	})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Members) != 1 || resp.Members[0].NodeId != "n2" {
+		t.Fatalf("members = %v, want [n2] only (n3 removed via scale-in)", resp.Members)
 	}
 }
 
@@ -443,14 +485,9 @@ func TestCollectLiveMembersHonoursCtxCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	type result struct {
-		addrByID map[string]string
-		order    []string
-	}
-	resCh := make(chan result, 1)
+	resCh := make(chan liveMembers, 1)
 	go func() {
-		addrByID, order := collectLiveMembers(ctx, groups, "self")
-		resCh <- result{addrByID: addrByID, order: order}
+		resCh <- collectLiveMembers(ctx, groups, "self")
 	}()
 
 	select {

@@ -3,6 +3,7 @@ package internal
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,11 @@ func LoadBearerTokenFile(path string, maxBytes int64, humanName string) (string,
 	if err != nil {
 		return "", errors.Wrapf(err, "open %s file", humanName)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("internal: close %s file %s: %v", humanName, abs, cerr)
+		}
+	}()
 	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
 		return "", errors.Wrapf(err, "read %s file", humanName)
