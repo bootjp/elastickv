@@ -1,9 +1,7 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -152,60 +150,36 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
+	defer shutdown(nodes)
 
-	// 1000 concurrent clients × 3 RPCs saturates the single raft leader
-	// hard enough to provoke brief quorum checks to fail on CI, so retry
-	// transient leader-unavailable errors. The *Eventually helpers are
-	// intentionally NOT used here: they end in require.NoError, and
-	// require calls t.FailNow() which must run on the main test goroutine.
-	// Workers use retryNotLeader + an errors channel instead so all
-	// require/assert calls happen on the main goroutine after wg.Wait().
-	ctx := context.Background()
-	const workers = 1000
-	errCh := make(chan error, workers)
 	wg := sync.WaitGroup{}
+	const workers = 1000
 	wg.Add(workers)
 	for i := range workers {
 		go func(i int) {
 			defer wg.Done()
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
 			want := []byte(strconv.Itoa(i))
-			put := func() error {
-				_, err := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
-				return err
-			}
-			if err := retryNotLeader(ctx, put); err != nil {
-				errCh <- err
+			_, err := c.RawPut(
+				context.Background(),
+				&pb.RawPutRequest{Key: key, Value: want},
+			)
+			if !assert.NoError(t, err, "Put RPC failed") {
 				return
 			}
-			if err := retryNotLeader(ctx, put); err != nil {
-				errCh <- err
+			_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
+			if !assert.NoError(t, err, "Put RPC failed") {
 				return
 			}
-			var resp *pb.RawGetResponse
-			err := retryNotLeader(ctx, func() error {
-				r, err := c.RawGet(ctx, &pb.RawGetRequest{Key: key})
-				if err != nil {
-					return err
-				}
-				resp = r
-				return nil
-			})
-			if err != nil {
-				errCh <- err
+
+			resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+			if !assert.NoError(t, err, "Get RPC failed") {
 				return
 			}
-			if !bytes.Equal(want, resp.Value) {
-				errCh <- fmt.Errorf("consistency check failed for key %s: want %q got %q", key, want, resp.Value)
-			}
+			assert.Equal(t, want, resp.Value, "consistency check failed")
 		}(i)
 	}
 	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		assert.NoError(t, err)
-	}
-	shutdown(nodes)
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
@@ -216,18 +190,30 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 
 	key := []byte("test-key-sequence")
 
-	// Use *Eventually helpers because a 9999-iteration loop across three
-	// t.Parallel adapter tests loads CI enough that the raft leader can
-	// briefly lose quorum and step down mid-run, surfacing as transient
-	// "not leader" / "leader not found" RPC errors. The helpers retry
-	// only those transient errors; any other error still fails the test.
-	ctx := context.Background()
 	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
-		rawPutEventually(t, ctx, c, &pb.RawPutRequest{Key: key, Value: want})
-		rawPutEventually(t, ctx, c, &pb.RawPutRequest{Key: key, Value: want})
+		_, err := c.RawPut(
+			context.Background(),
+			&pb.RawPutRequest{Key: key, Value: want},
+		)
+		// Stop at the first RPC failure instead of continuing: a
+		// genuine regression would otherwise cascade into 9998 more
+		// iterations, each reporting the same broken invariant, and
+		// drown the real cause in test-output noise.
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
 
-		resp := rawGetEventually(t, ctx, c, &pb.RawGetRequest{Key: key})
+		_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
+
+		resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
+
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 	}
 }
@@ -240,18 +226,33 @@ func Test_grpc_transaction(t *testing.T) {
 
 	key := []byte("test-key-sequence")
 
-	// See Test_consistency_satisfy_write_after_read_sequence for why the
-	// *Eventually helpers are necessary here.
-	ctx := context.Background()
 	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
-		txnPutEventually(t, ctx, c, &pb.PutRequest{Key: key, Value: want})
-		resp := txnGetEventually(t, ctx, c, &pb.GetRequest{Key: key})
+		_, err := c.Put(
+			context.Background(),
+			&pb.PutRequest{Key: key, Value: want},
+		)
+		// See Test_consistency_satisfy_write_after_read_sequence:
+		// break on first RPC failure so a single broken invariant
+		// does not amplify into thousands of assertion lines.
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
+		resp, err := c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 
-		txnDeleteEventually(t, ctx, c, &pb.DeleteRequest{Key: key})
+		_, err = c.Delete(context.Background(), &pb.DeleteRequest{Key: key})
+		if !assert.NoError(t, err, "Delete RPC failed") {
+			break
+		}
 
-		resp = txnGetEventually(t, ctx, c, &pb.GetRequest{Key: key})
+		resp, err = c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
 		assert.Nil(t, resp.Value, "consistency check failed")
 	}
 }
