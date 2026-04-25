@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -9,6 +10,15 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/goccy/go-json"
 )
+
+// adminForwardPayloadLimit caps the JSON payload the leader will
+// decode for any Forward operation. Mirrors defaultBodyLimit on the
+// HTTP path (64 KiB) so a single Forward call cannot consume more
+// memory than the same operation would over /admin/api/v1/dynamo/.
+// gRPC has its own 4 MiB max-message default, but that is way too
+// permissive for admin: a follower-forwarded request must obey the
+// same 64 KiB ceiling we promise on the public API surface.
+const adminForwardPayloadLimit = 64 << 10
 
 // ForwardServer is the leader-side gRPC handler for the AdminForward
 // RPC (design Section 3.3). The follower's admin HTTP layer calls it
@@ -122,9 +132,20 @@ func (s *ForwardServer) validatePrincipal(p *pb.AdminPrincipal) (AuthPrincipal, 
 }
 
 func (s *ForwardServer) handleCreate(ctx context.Context, principal AuthPrincipal, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
-	var body CreateTableRequest
-	if err := json.Unmarshal(req.GetPayload(), &body); err != nil {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "request body is not valid JSON")
+	payload := req.GetPayload()
+	if len(payload) > adminForwardPayloadLimit {
+		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+	}
+	// Reuse the HTTP handler's strict decoder so the forwarded
+	// path enforces the same shape contract — DisallowUnknownFields,
+	// trailing-token rejection, slash-in-name rejection, and the
+	// rest of validateCreateTableRequest. Bypassing it here would
+	// let a hostile follower (or a misbehaving SPA on the follower
+	// side) sneak past validations the leader-direct path enforces.
+	body, err := decodeCreateTableRequest(bytes.NewReader(payload))
+	if err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body", err.Error())
 	}
 	summary, err := s.source.AdminCreateTable(ctx, principal, body)
 	if err != nil {
@@ -145,10 +166,23 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 	// proto stays operation-agnostic — there is no operation-specific
 	// field in AdminForwardRequest, by design (adding one per op
 	// would couple every new admin endpoint to the proto schema).
+	payload := req.GetPayload()
+	if len(payload) > adminForwardPayloadLimit {
+		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(req.GetPayload(), &body); err != nil || body.Name == "" {
+	if err := dec.Decode(&body); err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload is not valid JSON")
+	}
+	if dec.More() {
+		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload has trailing data")
+	}
+	if body.Name == "" {
 		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload missing name")
 	}
 	if err := s.source.AdminDeleteTable(ctx, principal, body.Name); err != nil {

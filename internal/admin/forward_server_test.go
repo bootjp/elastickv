@@ -163,6 +163,75 @@ func TestForwardServer_UnknownOperationRejected(t *testing.T) {
 	require.Contains(t, string(resp.GetPayload()), "unknown admin operation")
 }
 
+// TestForwardServer_CreateTable_PayloadTooLargeReturns413 exercises
+// the size cap added in response to the Gemini security-medium
+// finding. The leader must refuse to decode payloads bigger than
+// the HTTP path's 64 KiB limit; gRPC's own 4 MiB default is too
+// permissive for the admin surface.
+func TestForwardServer_CreateTable_PayloadTooLargeReturns413(t *testing.T) {
+	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	oversize := make([]byte, adminForwardPayloadLimit+1)
+	for i := range oversize {
+		oversize[i] = 'x'
+	}
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:   oversize,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusRequestEntityTooLarge), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "payload_too_large")
+}
+
+// TestForwardServer_CreateTable_RejectsUnknownFields confirms the
+// decode path now reuses decodeCreateTableRequest's
+// DisallowUnknownFields setting (Codex P1). Without this, a
+// follower could smuggle silently-ignored fields the leader-direct
+// HTTP path would have rejected.
+func TestForwardServer_CreateTable_RejectsUnknownFields(t *testing.T) {
+	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:   []byte(`{"table_name":"u","partition_key":{"name":"id","type":"S"},"unknown_field":1}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "invalid_body")
+}
+
+// TestForwardServer_CreateTable_RejectsSlashInName confirms the
+// strict validation pulled in via decodeCreateTableRequest also
+// catches the slash-rejection rule the HTTP path enforces.
+func TestForwardServer_CreateTable_RejectsSlashInName(t *testing.T) {
+	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:   []byte(`{"table_name":"foo/bar","partition_key":{"name":"id","type":"S"}}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "must not contain")
+}
+
+// TestForwardServer_DeleteTable_PayloadTooLargeReturns413 mirrors
+// the create-side cap: an oversized delete payload must be refused
+// before the JSON decoder runs, regardless of how the gRPC layer
+// configures its own message limits.
+func TestForwardServer_DeleteTable_PayloadTooLargeReturns413(t *testing.T) {
+	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	oversize := make([]byte, adminForwardPayloadLimit+1)
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+		Payload:   oversize,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusRequestEntityTooLarge), resp.GetStatusCode())
+}
+
 func TestForwardServer_CreateTable_GenericErrorReturns500(t *testing.T) {
 	// A non-sentinel error from the source must surface as 500 with
 	// a sanitised message. The leader logs the raw error; nothing
