@@ -197,14 +197,38 @@ type configResult struct {
 // scheduled after the parent ctx already fired exits immediately instead
 // of doing wasted gRPC work. After the RPC the goroutine drains its result
 // without blocking thanks to the len(groups)-buffered channel.
+// configFanoutMaxConcurrency caps how many Configuration polls run at the
+// same time so a node hosting hundreds of Raft groups does not spawn a
+// matching goroutine + gRPC burst on every GetClusterOverview. Sized to
+// cover typical multi-raft deployments while keeping the goroutine /
+// connection footprint bounded under load. Smaller than maxDiscoveredNodes
+// (per-fanout target cap) on purpose: this is per-RPC concurrency, not
+// total target count.
+const configFanoutMaxConcurrency = 64
+
 func fanoutConfigurationCalls(ctx context.Context, groups []groupEntry) []configResult {
 	resultsCh := make(chan configResult, len(groups))
+	// sem bounds the number of goroutines actively running Configuration at
+	// once. We still spawn len(groups) goroutines total, but only
+	// configFanoutMaxConcurrency of them can be inside Configuration at the
+	// same time — the rest park on the semaphore acquire. Using buffered
+	// channel sends/receives as the semaphore avoids an extra dep.
+	sem := make(chan struct{}, configFanoutMaxConcurrency)
 	for i, entry := range groups {
 		go func(i int, entry groupEntry) {
+			// Bail out early if the parent already cancelled — avoids
+			// taking the semaphore + RPC path just to fail the call.
 			if err := ctx.Err(); err != nil {
 				resultsCh <- configResult{i: i, err: err}
 				return
 			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				resultsCh <- configResult{i: i, err: ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
 			cfg, err := entry.group.Configuration(ctx)
 			resultsCh <- configResult{i: i, cfg: cfg, err: err}
 		}(i, entry)

@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -241,6 +242,90 @@ func TestGetClusterOverviewDropsRemovedSeedAfterScaleIn(t *testing.T) {
 	if len(resp.Members) != 1 || resp.Members[0].NodeId != "n2" {
 		t.Fatalf("members = %v, want [n2] only (n3 removed via scale-in)", resp.Members)
 	}
+}
+
+// TestFanoutConfigurationCallsBoundedConcurrency asserts that
+// fanoutConfigurationCalls never has more than configFanoutMaxConcurrency
+// Configuration goroutines inside the RPC call at once, even when the node
+// hosts more groups than the cap. Prevents a goroutine/conn burst on every
+// GetClusterOverview when a node carries hundreds of shards.
+func TestFanoutConfigurationCallsBoundedConcurrency(t *testing.T) {
+	t.Parallel()
+	const numGroups = configFanoutMaxConcurrency * 4
+
+	var (
+		mu       sync.Mutex
+		inFlight int
+		peakSeen int
+		release  = make(chan struct{})
+	)
+	groups := make([]groupEntry, 0, numGroups)
+	for i := 0; i < numGroups; i++ {
+
+		groups = append(groups, groupEntry{
+			id: uint64(i + 1), //nolint:gosec // i ranges over a small bounded loop; conversion is safe.
+			group: testProbeGroup{cb: func() {
+				mu.Lock()
+				inFlight++
+				if inFlight > peakSeen {
+					peakSeen = inFlight
+				}
+				mu.Unlock()
+				<-release // hold the call open until released
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+			}},
+		})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = fanoutConfigurationCalls(t.Context(), groups)
+		close(done)
+	}()
+
+	// Give the runtime a beat to schedule goroutines and pump them through
+	// the semaphore. We don't need a precise wait — peakSeen is a high-water
+	// mark, so any sampling moment works as long as the calls have stalled.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		if inFlight >= configFanoutMaxConcurrency {
+			mu.Unlock()
+			break
+		}
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	got := peakSeen
+	mu.Unlock()
+	if got > configFanoutMaxConcurrency {
+		t.Fatalf("peak in-flight = %d, want ≤%d", got, configFanoutMaxConcurrency)
+	}
+
+	close(release) // let everything drain
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fanoutConfigurationCalls did not return after release")
+	}
+}
+
+// testProbeGroup is a minimal AdminGroup for concurrency tests; it runs cb
+// on every Configuration call so the test can observe in-flight count.
+type testProbeGroup struct {
+	cb func()
+}
+
+func (t testProbeGroup) Status() raftengine.Status { return raftengine.Status{} }
+func (t testProbeGroup) Configuration(context.Context) (raftengine.Configuration, error) {
+	if t.cb != nil {
+		t.cb()
+	}
+	return raftengine.Configuration{}, nil
 }
 
 // TestGetClusterOverviewKeepsSeedOnPartialConfigFailure asserts that a
