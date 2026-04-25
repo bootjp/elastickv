@@ -423,3 +423,36 @@ func TestCommand_RouteMatchesTable(t *testing.T) {
 	}
 	_ = srv
 }
+
+// TestRedisCommandSpecs_NoDuplicateConstants guards the structural
+// invariant the spec list maintains: every Constant appears exactly
+// once. Without this, the derived argsLen / redisCommandTable maps
+// would silently shadow earlier entries (whichever spec listed last
+// would win), and a subtle regression in Arity / Flags / key positions
+// could ride in unnoticed.
+func TestRedisCommandSpecs_NoDuplicateConstants(t *testing.T) {
+	t.Parallel()
+	seen := make(map[string]int, len(redisCommandSpecs))
+	for i, s := range redisCommandSpecs {
+		if prev, dup := seen[s.Constant]; dup {
+			t.Fatalf("duplicate spec for %q at indices %d and %d", s.Constant, prev, i)
+		}
+		seen[s.Constant] = i
+	}
+}
+
+// TestRedisCommandSpecs_HELLOPresent is the explicit regression test
+// for the round-N CI failure that triggered this refactor: HELLO was
+// added to r.route + argsLen on main but missed from
+// redisCommandTable, so COMMAND INFO HELLO returned nil and TestCommand
+// _RouteMatchesTable fired. With the unified spec list, HELLO must be
+// in redisCommandTable by construction; this test pins the invariant
+// in case anyone is tempted to delete the row "for symmetry".
+func TestRedisCommandSpecs_HELLOPresent(t *testing.T) {
+	t.Parallel()
+	hello, ok := redisCommandTable[cmdHello]
+	require.Truef(t, ok, "HELLO must have a redisCommandTable row (regression #607)")
+	require.Equal(t, "hello", hello.Name)
+	require.Equal(t, -1, hello.Arity)
+	require.Equal(t, 0, hello.FirstKey)
+}

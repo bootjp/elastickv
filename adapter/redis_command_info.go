@@ -1,18 +1,12 @@
 package adapter
 
-// redis_command_info.go holds the static metadata table consumed by the
-// Redis `COMMAND` handler. It is intentionally a single, grep-able file so
-// that adding a new command is a one-liner:
-//
-//	1) Register the new handler in RedisServer.route (redis.go).
-//	2) Add an argsLen entry (redis.go).
-//	3) Add a row below. Forgetting step 3 is NOT fatal — the COMMAND
-//	   handler falls back to a zero-metadata entry and emits one warning
-//	   log per command name so the omission is discoverable — but you
-//	   should do step 3 anyway.
-//
-// The table is the source of truth for `COMMAND`, `COMMAND INFO`,
-// `COMMAND COUNT`, `COMMAND LIST`, `COMMAND DOCS`, and `COMMAND GETKEYS`.
+// redis_command_info.go holds the COMMAND-family helpers. The metadata
+// table itself (redisCommandTable) and the routed-set source of truth
+// (argsLen) both live in adapter/redis_command_specs.go and are derived
+// from the canonical redisCommandSpecs slice — adding a new command is
+// a single row there, with no risk of drifting between r.route /
+// argsLen / redisCommandTable the way HELLO did when it was added to
+// the route + arity check but missed the metadata table.
 //
 // Shape notes (Redis reference):
 //   - arity: exact positive arity, or negative meaning "at least |arity|"
@@ -51,97 +45,6 @@ type redisCommandMeta struct {
 	FirstKey int
 	LastKey  int
 	Step     int
-}
-
-// redisCommandTable maps UPPERCASE command name -> metadata. Every entry
-// routed by RedisServer.route should appear here. Entries are listed in
-// alphabetical order to keep diffs small when adding new commands.
-//
-//nolint:mnd // magic numbers here are literal Redis metadata (arity, key positions)
-var redisCommandTable = map[string]redisCommandMeta{
-	"BZPOPMIN": {Name: "bzpopmin", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: -2, Step: 1},
-	"CLIENT":   {Name: "client", Arity: -2, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"COMMAND":  {Name: "command", Arity: -1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"DBSIZE":   {Name: "dbsize", Arity: 1, Flags: []string{redisCmdFlagReadonly}, FirstKey: 0, LastKey: 0, Step: 0},
-	"DEL":      {Name: "del", Arity: -2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: -1, Step: 1},
-	"DISCARD":  {Name: "discard", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"EVAL":     {Name: "eval", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
-	"EVALSHA":  {Name: "evalsha", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
-	"EXEC":     {Name: "exec", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"EXISTS":   {Name: "exists", Arity: -2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: -1, Step: 1},
-	"EXPIRE":   {Name: "expire", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"FLUSHALL": {Name: "flushall", Arity: 1, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
-	"FLUSHDB":  {Name: "flushdb", Arity: 1, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
-	// FLUSHLEGACY is an elastickv-internal alias; mirror FLUSHDB metadata.
-	"FLUSHLEGACY":      {Name: "flushlegacy", Arity: 1, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
-	"GET":              {Name: "get", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"GETDEL":           {Name: "getdel", Arity: 2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HDEL":             {Name: "hdel", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HEXISTS":          {Name: "hexists", Arity: 3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HGET":             {Name: "hget", Arity: 3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HGETALL":          {Name: "hgetall", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HINCRBY":          {Name: "hincrby", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HLEN":             {Name: "hlen", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HMGET":            {Name: "hmget", Arity: -3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HMSET":            {Name: "hmset", Arity: -4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"HSET":             {Name: "hset", Arity: -4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"INCR":             {Name: "incr", Arity: 2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"INFO":             {Name: "info", Arity: -1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"KEYS":             {Name: "keys", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 0, LastKey: 0, Step: 0},
-	"LINDEX":           {Name: "lindex", Arity: 3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LLEN":             {Name: "llen", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LPOP":             {Name: "lpop", Arity: 2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LPOS":             {Name: "lpos", Arity: -3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LPUSH":            {Name: "lpush", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LRANGE":           {Name: "lrange", Arity: 4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LREM":             {Name: "lrem", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LSET":             {Name: "lset", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"LTRIM":            {Name: "ltrim", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"MULTI":            {Name: "multi", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"PEXPIRE":          {Name: "pexpire", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"PFADD":            {Name: "pfadd", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"PFCOUNT":          {Name: "pfcount", Arity: -2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: -1, Step: 1},
-	"PING":             {Name: "ping", Arity: -1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"PTTL":             {Name: "pttl", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"PUBLISH":          {Name: "publish", Arity: 3, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"PUBSUB":           {Name: "pubsub", Arity: -2, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"QUIT":             {Name: "quit", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"RENAME":           {Name: "rename", Arity: 3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 2, Step: 1},
-	"RPOP":             {Name: "rpop", Arity: 2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"RPOPLPUSH":        {Name: "rpoplpush", Arity: 3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 2, Step: 1},
-	"RPUSH":            {Name: "rpush", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SADD":             {Name: "sadd", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SCAN":             {Name: "scan", Arity: -2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 0, LastKey: 0, Step: 0},
-	"SCARD":            {Name: "scard", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SELECT":           {Name: "select", Arity: 2, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"SET":              {Name: "set", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SETEX":            {Name: "setex", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SETNX":            {Name: "setnx", Arity: 3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SISMEMBER":        {Name: "sismember", Arity: 3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SMEMBERS":         {Name: "smembers", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SREM":             {Name: "srem", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"SUBSCRIBE":        {Name: "subscribe", Arity: -2, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
-	"TTL":              {Name: "ttl", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"TYPE":             {Name: "type", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"XADD":             {Name: "xadd", Arity: -5, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"XLEN":             {Name: "xlen", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"XRANGE":           {Name: "xrange", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"XREAD":            {Name: "xread", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 0, LastKey: 0, Step: 0},
-	"XREVRANGE":        {Name: "xrevrange", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"XTRIM":            {Name: "xtrim", Arity: -4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZADD":             {Name: "zadd", Arity: -4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZCARD":            {Name: "zcard", Arity: 2, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZCOUNT":           {Name: "zcount", Arity: 4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZINCRBY":          {Name: "zincrby", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZPOPMIN":          {Name: "zpopmin", Arity: -2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZRANGE":           {Name: "zrange", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZRANGEBYSCORE":    {Name: "zrangebyscore", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZREM":             {Name: "zrem", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZREMRANGEBYRANK":  {Name: "zremrangebyrank", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZREMRANGEBYSCORE": {Name: "zremrangebyscore", Arity: 4, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZREVRANGE":        {Name: "zrevrange", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZREVRANGEBYSCORE": {Name: "zrevrangebyscore", Arity: -4, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
-	"ZSCORE":           {Name: "zscore", Arity: 3, Flags: []string{redisCmdFlagReadonly}, FirstKey: 1, LastKey: 1, Step: 1},
 }
 
 // redisCommandFallbackWarnedOnce deduplicates the "missing metadata" log so
