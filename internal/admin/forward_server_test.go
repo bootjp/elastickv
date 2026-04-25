@@ -314,6 +314,46 @@ func TestForwardServer_DeleteTable_GenericErrorUsesOperationSpecificCode(t *test
 	require.NotContains(t, string(resp.GetPayload()), "DEL-1")
 }
 
+// TestForwardServer_CreateTable_LeaderSteppedDownReturns503 covers
+// the race-window comment in forwardErrorResponse: even though the
+// leader passed isVerifiedDynamoLeader at the top of
+// AdminCreateTable, leadership can still drop mid-dispatch and the
+// adapter then returns ErrTablesNotLeader. The forward server must
+// surface that as a 503 leader_unavailable response so the
+// follower's bridge can re-emit the exact 503 contract clients
+// already know — Claude review on PR #635 flagged the gap (no test
+// exercised this code path despite the comment).
+func TestForwardServer_CreateTable_LeaderSteppedDownReturns503(t *testing.T) {
+	src := &stubTablesSource{createErr: ErrTablesNotLeader}
+	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:   mustJSON(t, CreateTableRequest{TableName: "users", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusServiceUnavailable), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "leader_unavailable")
+}
+
+// TestForwardServer_DeleteTable_LeaderSteppedDownReturns503 mirrors
+// the create-side coverage on the delete path.
+func TestForwardServer_DeleteTable_LeaderSteppedDownReturns503(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
+		deleteErr: ErrTablesNotLeader,
+	}
+	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+		Payload:   []byte(`{"name":"users"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusServiceUnavailable), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "leader_unavailable")
+}
+
 // TestForwardServer_LogsUnexpectedSourceError confirms the leader
 // emits an error log line for non-sentinel source failures so
 // operators can investigate forwarded write 500s without
