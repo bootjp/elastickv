@@ -201,6 +201,65 @@ func TestRedis_StreamXTrimMaxLen(t *testing.T) {
 	}
 }
 
+// TestRedis_StreamXTrimReturnAndMetaTrackLenTrim guards Gemini's MEDIUM
+// concerns that the XTRIM return value and meta.Length update must reflect
+// `len(trim)` — the entries actually deleted — rather than the requested
+// diff. The cases that can diverge are:
+//   - Stream length is below the requested trim diff (XTRIM MAXLEN N where
+//     stream has <N entries but >0): the diff would say to remove
+//     `meta.Length - N`, but if the scan returns fewer rows (fast path:
+//     concurrent writes) we must report the actual deletions.
+//   - len(stream)<diff: XTRIM N when length is < N+diff returns the actual
+//     entry count removed.
+//
+// Without the fix the client sees a removed-count larger than the entries
+// that physically left storage, and meta.Length silently drifts away from
+// the on-disk row count.
+func TestRedis_StreamXTrimReturnAndMetaTrackLenTrim(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed a small populated stream.
+	for i := range 5 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: "stream-trim-actual",
+			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
+			Values: []string{"i", fmt.Sprint(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	// Trim to 3: 2 entries should be removed; XTRIM returns 2; XLEN is 3.
+	removed, err := rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "3").Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), removed,
+		"XTRIM must report the actual number of entries removed (len(trim)), not the requested diff")
+
+	xlen, err := rdb.XLen(ctx, "stream-trim-actual").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(3), xlen, "meta.Length must equal len(remaining), not the planned post-trim count")
+
+	entries, err := rdb.XRange(ctx, "stream-trim-actual", "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 3,
+		"XRANGE must return as many entries as XLEN claims; meta.Length and physical rows must agree")
+
+	// Trim to a value greater than the current length: zero deletions, zero
+	// reported, meta.Length unchanged. Guards against returning a negative
+	// or absurd count when diff <= 0.
+	removed, err = rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "100").Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), removed)
+	xlen, err = rdb.XLen(ctx, "stream-trim-actual").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(3), xlen)
+}
+
 // TestRedis_StreamXAddMaxLenZero verifies that XADD ... MAXLEN 0 advances
 // LastMs/LastSeq for auto-ID monotonicity but leaves the stream empty
 // (Length==0 and no live entry keys). The previous implementation wrote the

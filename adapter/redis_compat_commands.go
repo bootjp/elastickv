@@ -3810,16 +3810,19 @@ func estimateXAddTrimCount(maxLen int, currentLength int64) int {
 	if nextLen <= int64(maxLen) {
 		return 0
 	}
-	// Compute the subtraction in int64 and clamp to [0, math.MaxInt] so a
-	// corrupted meta.Length cannot wrap int and feed make() a negative
-	// capacity (which would panic). This is only a capacity hint; the
-	// actual trim list still comes from xaddTrimIfNeeded.
+	// Compute in int64 and clamp at maxWideColumnItems. A capacity hint
+	// of math.MaxInt would let make() try to allocate ~16 EiB on 64-bit
+	// targets and either panic or OOM; capping at the wide-column ceiling
+	// keeps the hint useful (saves slice growth in the common case) while
+	// preventing pathological allocation when meta.Length is corrupted.
+	// xaddTrimIfNeeded enforces the same cap on the actual trim count;
+	// this hint just sizes the elems slice.
 	diff := nextLen - int64(maxLen)
 	if diff <= 0 {
 		return 0
 	}
-	if diff > int64(math.MaxInt) {
-		return math.MaxInt
+	if diff > int64(maxWideColumnItems) {
+		return maxWideColumnItems
 	}
 	return int(diff)
 }
@@ -3839,24 +3842,36 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	if maxLen < 0 || candidateLen <= int64(maxLen) {
 		return candidateLen, nil, nil
 	}
-	// int64 arithmetic + explicit clamp: if candidateLen is a corrupted
-	// huge value, int(candidateLen)-maxLen could overflow into a negative
-	// trim count, which would then skip the trim and leave meta.Length
-	// wrong. Clamp to math.MaxInt so buildXTrimHeadElems at worst scans
-	// the store-imposed page limit, not a wrapped-negative page.
+	// int64 arithmetic + clamp at maxWideColumnItems. A single XADD must
+	// not emit more than maxWideColumnItems Del operations: it would risk
+	// exceeding the Raft message-size limit and would force a single
+	// commit to materialise an unbounded list of keys. The cap is loose
+	// enough that it never bites in normal operation (xaddEnforceMaxWideColumn
+	// rejects streams whose committed length is already at the ceiling),
+	// but defends against a corrupted meta.Length feeding the trim path.
 	diff := candidateLen - int64(maxLen)
 	if diff <= 0 {
 		return candidateLen, nil, nil
 	}
-	count := math.MaxInt
-	if diff <= int64(math.MaxInt) {
+	count := maxWideColumnItems
+	if diff <= int64(maxWideColumnItems) {
 		count = int(diff)
 	}
 	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, count)
 	if err != nil {
 		return 0, nil, err
 	}
-	return int64(maxLen), trim, nil
+	// Final length must reflect the trim that actually committed, not
+	// the requested maxLen, so that meta.Length stays consistent with
+	// the entries on disk when the cap kicks in or the scan returns
+	// fewer rows than requested. MAXLEN 0 is a special case: the
+	// freshly-added entry is removed by appendMaxLenZeroSelfDel in the
+	// caller, so the post-commit length is 0 regardless of what trim
+	// did to the pre-existing rows.
+	if maxLen == 0 {
+		return 0, trim, nil
+	}
+	return candidateLen - int64(len(trim)), trim, nil
 }
 
 // streamWriteBase prepares a write to a stream. Returns the loaded meta
@@ -3934,6 +3949,14 @@ func (r *RedisServer) buildXTrimHeadElems(
 ) ([]*kv.Elem[kv.OP], error) {
 	if count <= 0 {
 		return nil, nil
+	}
+	// Defense-in-depth cap on the per-trim scan so a caller that asked
+	// for math.MaxInt (corrupted meta upstream) cannot try to materialise
+	// an unbounded list of Del elems in a single transaction. Callers
+	// (xaddTrimIfNeeded, xtrimTxn) already cap; this is a belt-and-braces
+	// guard on the boundary that actually allocates.
+	if count > maxWideColumnItems {
+		count = maxWideColumnItems
 	}
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
@@ -4051,29 +4074,38 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 		return r.flushLegacyCleanupOnTrimNoOp(ctx, readTS, key, meta, legacyCleanup)
 	}
 
-	// Compute in int64 + clamp so a corrupted meta.Length cannot wrap int
-	// and produce a negative `removed` count (which would under-trim AND
-	// later pass make(..., negative) to the elems slice).
+	// Cap the trim request at maxWideColumnItems so a single XTRIM cannot
+	// emit an unbounded list of Del operations in one Raft commit. int64
+	// arithmetic upfront also keeps a corrupted meta.Length (>MaxInt)
+	// from wrapping into a negative scan count.
 	diff := meta.Length - int64(maxLen)
-	removed := math.MaxInt
-	if diff <= int64(math.MaxInt) {
-		removed = int(diff)
+	requestedRemoved := maxWideColumnItems
+	if diff <= int64(maxWideColumnItems) {
+		requestedRemoved = int(diff)
 	}
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, removed)
+	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, requestedRemoved)
 	if err != nil {
 		return 0, err
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+len(trim)+1)
+	// Use len(trim) — the actual entries we are about to delete — for
+	// both the meta.Length update and the XTRIM return value. The
+	// requested count and the actual count can diverge when the trim
+	// hits the per-txn cap or the underlying scan returns fewer rows
+	// than requested (concurrent writes / partial consistency); using
+	// the actual count keeps meta.Length consistent with on-disk state
+	// and reports the truth back to the client.
+	actualRemoved := len(trim)
+	elems := make([]*kv.Elem[kv.OP], 0, len(legacyCleanup)+actualRemoved+1)
 	elems = append(elems, legacyCleanup...)
 	elems = append(elems, trim...)
-	meta.Length -= int64(removed)
+	meta.Length -= int64(actualRemoved)
 	metaBytes, err := store.MarshalStreamMeta(meta)
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
-	return removed, r.dispatchElems(ctx, true, readTS, elems)
+	return actualRemoved, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) xrange(conn redcon.Conn, cmd redcon.Command) {

@@ -37,10 +37,12 @@ func TestScanStreamEntriesLimit(t *testing.T) {
 	}
 }
 
-// TestEstimateXAddTrimCount guards the int-overflow clamp added after the
-// Copilot review: a corrupted meta.Length that would cause
-// `int(nextLen) - maxLen` to wrap negative on 32-bit targets (or to exceed
-// math.MaxInt on 64-bit) must clamp rather than feed make() a bogus capacity.
+// TestEstimateXAddTrimCount guards two clamps on the trim-count capacity
+// hint: (a) int-overflow on a corrupted meta.Length, (b) the
+// maxWideColumnItems ceiling that prevents make() from being asked for a
+// 16 EiB allocation on 64-bit targets when the diff exceeds what fits
+// comfortably in one Raft txn. Gemini-flagged HIGH after the
+// math.MaxInt clamp landed in the previous round.
 func TestEstimateXAddTrimCount(t *testing.T) {
 	t.Parallel()
 
@@ -57,12 +59,13 @@ func TestEstimateXAddTrimCount(t *testing.T) {
 		{"over cap → excess count", 10, 20, 11},
 		{"MAXLEN 0 on empty stream → 1 (the just-added entry)", 0, 0, 1},
 		{"MAXLEN 0 on populated stream → whole length + 1", 0, 99, 100},
+		{"diff equal to maxWideColumnItems passes through", 0, int64(maxWideColumnItems) - 1, maxWideColumnItems},
+		{"diff above maxWideColumnItems clamps to maxWideColumnItems", 0, int64(maxWideColumnItems) + 5, maxWideColumnItems},
 		// currentLength = MaxInt64: currentLength+1 overflows to a negative
 		// int64 (MinInt64), which the "nextLen <= maxLen" early return
 		// then catches. Returning 0 on this corrupted input is strictly
 		// safer than feeding make() a wrapped negative; the scan path
-		// still runs at the store-imposed page limit. Guard against a
-		// regression that would panic / allocate absurdly.
+		// still runs at the store-imposed page limit.
 		{"MaxInt64 length → safe 0 (arithmetic overflow early-returns)", 10, math.MaxInt64, 0},
 	}
 	for _, tc := range cases {
