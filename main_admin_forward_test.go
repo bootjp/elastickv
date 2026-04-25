@@ -1,0 +1,148 @@
+package main
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/kv"
+	"github.com/stretchr/testify/require"
+)
+
+func TestBuildLeaderForwarder_RejectsMissingDeps(t *testing.T) {
+	cache := &kv.GRPCConnCache{}
+	cases := []struct {
+		name      string
+		coord     kv.Coordinator
+		cache     *kv.GRPCConnCache
+		nodeID    string
+		wantSubst string
+	}{
+		{"nil coordinator", nil, cache, "n1", "coordinator"},
+		{"nil conn cache", &kv.Coordinate{}, nil, "n1", "gRPC connection cache"},
+		// admin.NewGRPCForwardClient owns the empty-nodeID rejection;
+		// we confirm the wrapped error preserves that vocabulary so a
+		// misconfigured deployment fails fast at startup with a
+		// pinpointed message rather than mysterious 500s at runtime.
+		{"empty node id", &kv.Coordinate{}, cache, "", "node id is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fwd, err := buildLeaderForwarder(tc.coord, tc.cache, tc.nodeID)
+			require.Error(t, err)
+			require.Nil(t, fwd)
+			require.Contains(t, err.Error(), tc.wantSubst)
+		})
+	}
+}
+
+func TestBuildLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
+	// The production bridge does not dial during construction —
+	// resolver / dial calls only happen on the first Forward — so
+	// passing real (zero-value) collaborators is enough to confirm
+	// the wiring itself is well-formed.
+	fwd, err := buildLeaderForwarder(&kv.Coordinate{}, &kv.GRPCConnCache{}, "n1")
+	require.NoError(t, err)
+	require.NotNil(t, fwd)
+}
+
+func TestAdminForwardConnFactory_RejectsEmptyAddr(t *testing.T) {
+	// kv.GRPCConnCache.ConnFor returns ErrLeaderNotFound on "". The
+	// LeaderForwarder catches the empty address before this layer is
+	// reached, but the bridge still surfaces an error rather than a
+	// nil client when invoked directly — so a future caller that
+	// bypasses the resolver does not get a typed-nil PBAdminForwardClient.
+	f := &adminForwardConnFactory{cache: &kv.GRPCConnCache{}}
+	cli, err := f.ConnFor("")
+	require.Error(t, err)
+	require.Nil(t, cli)
+}
+
+func TestRoleStoreFromFlags(t *testing.T) {
+	cases := []struct {
+		name         string
+		full         []string
+		readOnly     []string
+		wantNil      bool
+		wantFull     []string
+		wantReadOnly []string
+	}{
+		{name: "both empty produces nil store", wantNil: true},
+		{
+			name:     "full only",
+			full:     []string{"AKIA_F"},
+			wantFull: []string{"AKIA_F"},
+		},
+		{
+			name:         "read-only only",
+			readOnly:     []string{"AKIA_R"},
+			wantReadOnly: []string{"AKIA_R"},
+		},
+		{
+			name:         "mixed roles",
+			full:         []string{"AKIA_F1", "AKIA_F2"},
+			readOnly:     []string{"AKIA_R1"},
+			wantFull:     []string{"AKIA_F1", "AKIA_F2"},
+			wantReadOnly: []string{"AKIA_R1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := roleStoreFromFlags(tc.full, tc.readOnly)
+			if tc.wantNil {
+				require.Nil(t, store)
+				return
+			}
+			require.NotNil(t, store)
+			for _, k := range tc.wantFull {
+				role, ok := store.LookupRole(k)
+				require.True(t, ok, "expected %s present", k)
+				require.Equal(t, admin.RoleFull, role)
+			}
+			for _, k := range tc.wantReadOnly {
+				role, ok := store.LookupRole(k)
+				require.True(t, ok, "expected %s present", k)
+				require.Equal(t, admin.RoleReadOnly, role)
+			}
+		})
+	}
+}
+
+func TestAdminForwardServerDeps_ReadyForRegistration(t *testing.T) {
+	// The bundle's readyForRegistration gate decides whether
+	// startRaftServers wires the gRPC ForwardServer at all. A nil
+	// TablesSource (cluster-only build) or nil RoleStore (admin
+	// auth disabled) means a registered service would 500 every
+	// forwarded call — silently skipping registration is the
+	// preferred behaviour.
+	require.False(t, adminForwardServerDeps{}.readyForRegistration())
+	require.False(t, adminForwardServerDeps{tables: dummyTablesSource{}}.readyForRegistration())
+	require.False(t, adminForwardServerDeps{roles: admin.MapRoleStore{}}.readyForRegistration())
+	require.True(t, adminForwardServerDeps{
+		tables: dummyTablesSource{},
+		roles:  admin.MapRoleStore{},
+	}.readyForRegistration())
+}
+
+// dummyTablesSource is the smallest concrete admin.TablesSource for
+// the readyForRegistration gate test — no method body needs to
+// execute, so every method just panics. Using a real implementation
+// would pull adapter dependencies into a main_admin test that has
+// nothing to do with adapter behaviour.
+type dummyTablesSource struct{}
+
+func (dummyTablesSource) AdminListTables(_ context.Context) ([]string, error) {
+	panic("dummyTablesSource.AdminListTables should not be invoked")
+}
+
+func (dummyTablesSource) AdminDescribeTable(_ context.Context, _ string) (*admin.DynamoTableSummary, bool, error) {
+	panic("dummyTablesSource.AdminDescribeTable should not be invoked")
+}
+
+func (dummyTablesSource) AdminCreateTable(_ context.Context, _ admin.AuthPrincipal, _ admin.CreateTableRequest) (*admin.DynamoTableSummary, error) {
+	panic("dummyTablesSource.AdminCreateTable should not be invoked")
+}
+
+func (dummyTablesSource) AdminDeleteTable(_ context.Context, _ admin.AuthPrincipal, _ string) error {
+	panic("dummyTablesSource.AdminDeleteTable should not be invoked")
+}
