@@ -490,6 +490,34 @@ func columnTimes(cols []MatrixColumn) []time.Time {
 	return out
 }
 
+// TestRemoveLastVirtualMemberHarvestsBucket pins Codex round-5 P1:
+// removing the last member of a virtual bucket leaves the bucket
+// orphaned in the route table — rebuildSorted no longer reaches it
+// from virtualForRoute, so without the orphan-retire path Flush would
+// silently lose any pre-removal counters the bucket still holds.
+func TestRemoveLastVirtualMemberHarvestsBucket(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 1,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 over budget should fold into virtual bucket")
+	}
+	s.Observe(2, OpRead, 5, 7)
+	s.RemoveRoute(2)
+	s.Flush()
+
+	rows := lastSnapshotColumn(t, s).Rows
+	agg := findAggregateRow(t, rows)
+	if agg.Reads != 1 || agg.ReadBytes != 12 {
+		t.Fatalf("orphan bucket counts dropped: reads=%d bytes=%d (want 1, 12)",
+			agg.Reads, agg.ReadBytes)
+	}
+}
+
 // TestFlushSortsMixedLiveAndRetiredRows pins the row-ordering
 // invariant when retired-slot drains land in the same column as live
 // slot drains. Without a final sort the retired rows would be appended

@@ -424,6 +424,17 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 		s.pendingPrunes = append(s.pendingPrunes, memberPrune{
 			bucket: bucket, routeID: routeID, remaining: retainedFlushes,
 		})
+		// If this delete left the bucket with no remaining
+		// virtualForRoute mapping, rebuildSorted will drop it from the
+		// live sortedSlots. Queue it as a retired slot so Flush keeps
+		// draining its counters across retainedFlushes — otherwise
+		// pre-removal increments and any in-flight Observe writers
+		// hitting the prior table snapshot would be silently lost.
+		if !bucketStillReferenced(next.virtualForRoute, bucket) {
+			s.retiredSlots = append(s.retiredSlots, retiredSlot{
+				slot: bucket, remaining: retainedFlushes,
+			})
+		}
 		s.retiredMu.Unlock()
 	}
 
@@ -496,6 +507,19 @@ func advancePendingPrunes(pending []memberPrune) []memberPrune {
 		pruneMemberRoute(p.bucket, p.routeID)
 	}
 	return keep
+}
+
+// bucketStillReferenced reports whether any RouteID in
+// virtualForRoute still maps to bucket. Used by RemoveRoute to detect
+// when a virtual bucket has lost its last member and must be retired
+// for grace draining.
+func bucketStillReferenced(virtualForRoute map[uint64]*routeSlot, bucket *routeSlot) bool {
+	for _, b := range virtualForRoute {
+		if b == bucket {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneMemberRoute removes routeID from bucket.MemberRoutes under the
