@@ -30,6 +30,7 @@ import (
 const (
 	cmdBZPopMin         = "BZPOPMIN"
 	cmdClient           = "CLIENT"
+	cmdCommand          = "COMMAND"
 	cmdDBSize           = "DBSIZE"
 	cmdDel              = "DEL"
 	cmdDiscard          = "DISCARD"
@@ -164,91 +165,9 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
 }
 
-//nolint:mnd
-var argsLen = map[string]int{
-	cmdBZPopMin:         -3,
-	cmdClient:           -2,
-	cmdDBSize:           1,
-	cmdDel:              -2,
-	cmdDiscard:          1,
-	cmdEval:             -3,
-	cmdEvalSHA:          -3,
-	cmdExec:             1,
-	cmdExists:           -2,
-	cmdExpire:           -3,
-	cmdFlushAll:         1,
-	cmdFlushDB:          1,
-	cmdFlushLegacy:      1,
-	cmdGet:              2,
-	cmdGetDel:           2,
-	cmdHDel:             -3,
-	cmdHExists:          3,
-	cmdHGet:             3,
-	cmdHGetAll:          2,
-	cmdHIncrBy:          4,
-	cmdHLen:             2,
-	cmdHMGet:            -3,
-	cmdHMSet:            -4,
-	cmdHSet:             -4,
-	cmdHello:            -1,
-	cmdInfo:             -1,
-	cmdIncr:             2,
-	cmdKeys:             2,
-	cmdLIndex:           3,
-	cmdLLen:             2,
-	cmdLPop:             2,
-	cmdLPush:            -3,
-	cmdLPos:             -3,
-	cmdLRange:           4,
-	cmdLRem:             4,
-	cmdLSet:             4,
-	cmdLTrim:            4,
-	cmdMulti:            1,
-	cmdPExpire:          -3,
-	cmdPFAdd:            -3,
-	cmdPFCount:          -2,
-	cmdPing:             -1,
-	cmdPTTL:             2,
-	cmdPublish:          3,
-	cmdPubSub:           -2,
-	cmdQuit:             1,
-	cmdRename:           3,
-	cmdRPop:             2,
-	cmdRPopLPush:        3,
-	cmdRPush:            -3,
-	cmdSAdd:             -3,
-	cmdSCard:            2,
-	cmdScan:             -2,
-	cmdSelect:           2,
-	cmdSet:              -3,
-	cmdSetEx:            4,
-	cmdSetNX:            3,
-	cmdSIsMember:        3,
-	cmdSMembers:         2,
-	cmdSRem:             -3,
-	cmdSubscribe:        -2,
-	cmdTTL:              2,
-	cmdType:             2,
-	cmdXAdd:             -5,
-	cmdXLen:             2,
-	cmdXRead:            -4,
-	cmdXRange:           -4,
-	cmdXRevRange:        -4,
-	cmdXTrim:            -4,
-	cmdZAdd:             -4,
-	cmdZCard:            2,
-	cmdZCount:           4,
-	cmdZIncrBy:          4,
-	cmdZRange:           -4,
-	cmdZRangeByScore:    -4,
-	cmdZRem:             -3,
-	cmdZRemRangeByScore: 4,
-	cmdZRemRangeByRank:  4,
-	cmdZPopMin:          -2,
-	cmdZRevRange:        -4,
-	cmdZRevRangeByScore: -4,
-	cmdZScore:           3,
-}
+// argsLen is derived from redisCommandSpecs in adapter/redis_command_specs.go.
+// See that file for the canonical row list and the rationale for the
+// single source of truth.
 
 type RedisServer struct {
 	listen              net.Listener
@@ -432,90 +351,11 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	}
 	r.relay.Bind(r.publishLocal)
 
-	r.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		cmdBZPopMin:         r.bzpopmin,
-		cmdClient:           r.client,
-		cmdDBSize:           r.dbsize,
-		cmdDel:              r.del,
-		cmdDiscard:          r.discard,
-		cmdEval:             r.eval,
-		cmdEvalSHA:          r.evalsha,
-		cmdExec:             r.exec,
-		cmdExists:           r.exists,
-		cmdExpire:           r.expire,
-		cmdFlushAll:         r.flushall,
-		cmdFlushDB:          r.flushdb,
-		cmdFlushLegacy:      r.flushlegacy,
-		cmdGet:              r.get,
-		cmdGetDel:           r.getdel,
-		cmdHDel:             r.hdel,
-		cmdHExists:          r.hexists,
-		cmdHGet:             r.hget,
-		cmdHGetAll:          r.hgetall,
-		cmdHIncrBy:          r.hincrby,
-		cmdHLen:             r.hlen,
-		cmdHMGet:            r.hmget,
-		cmdHMSet:            r.hmset,
-		cmdHSet:             r.hset,
-		cmdHello:            r.hello,
-		cmdInfo:             r.info,
-		cmdIncr:             r.incr,
-		cmdKeys:             r.keys,
-		cmdLIndex:           r.lindex,
-		cmdLLen:             r.llen,
-		cmdLPop:             r.lpop,
-		cmdLPos:             r.lpos,
-		cmdLPush:            r.lpush,
-		cmdLRange:           r.lrange,
-		cmdLRem:             r.lrem,
-		cmdLSet:             r.lset,
-		cmdLTrim:            r.ltrim,
-		cmdMulti:            r.multi,
-		cmdPExpire:          r.pexpire,
-		cmdPFAdd:            r.pfadd,
-		cmdPFCount:          r.pfcount,
-		cmdPing:             r.ping,
-		cmdPTTL:             r.pttl,
-		cmdPublish:          r.publish,
-		cmdPubSub:           r.pubsubCmd,
-		cmdQuit:             r.quit,
-		cmdRename:           r.rename,
-		cmdRPop:             r.rpop,
-		cmdRPopLPush:        r.rpoplpush,
-		cmdRPush:            r.rpush,
-		cmdSAdd:             r.sadd,
-		cmdSCard:            r.scard,
-		cmdScan:             r.scan,
-		cmdSelect:           r.selectDB,
-		cmdSet:              r.set,
-		cmdSetEx:            r.setex,
-		cmdSetNX:            r.setnx,
-		cmdSIsMember:        r.sismember,
-		cmdSMembers:         r.smembers,
-		cmdSRem:             r.srem,
-		cmdSubscribe:        r.subscribe,
-		cmdTTL:              r.ttl,
-		cmdType:             r.typeCmd,
-		cmdXAdd:             r.xadd,
-		cmdXLen:             r.xlen,
-		cmdXRead:            r.xread,
-		cmdXRange:           r.xrange,
-		cmdXRevRange:        r.xrevrange,
-		cmdXTrim:            r.xtrim,
-		cmdZAdd:             r.zadd,
-		cmdZCard:            r.zcard,
-		cmdZCount:           r.zcount,
-		cmdZIncrBy:          r.zincrby,
-		cmdZRange:           r.zrange,
-		cmdZRangeByScore:    r.zrangebyscore,
-		cmdZRem:             r.zrem,
-		cmdZRemRangeByScore: r.zremrangebyscore,
-		cmdZRemRangeByRank:  r.zremrangebyrank,
-		cmdZPopMin:          r.zpopmin,
-		cmdZRevRange:        r.zrevrange,
-		cmdZRevRangeByScore: r.zrevrangebyscore,
-		cmdZScore:           r.zscore,
-	}
+	// route, argsLen, and redisCommandTable all derive from the single
+	// redisCommandSpecs slice (adapter/redis_command_specs.go) so adding
+	// a command is a one-row diff there and the three views can never
+	// drift. See buildRouteMap for the per-server bind.
+	r.route = r.buildRouteMap()
 	for _, opt := range opts {
 		if opt != nil {
 			opt(r)
@@ -1496,6 +1336,15 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 		return err
 	}
 	for _, prefix := range redisInternalPrefixes {
+		// !stream|meta| keys are length-prefixed (see store.StreamMetaKey):
+		// a pattern-bound scan over the raw prefix would mask out every
+		// migrated stream because the user-key bytes do not start at
+		// prefix[len(prefix):]. Delegate to the wide-column scan below,
+		// which uses streamMetaScanStart(start) to place the user-key
+		// lower bound past the length field.
+		if prefix == store.StreamMetaPrefix {
+			continue
+		}
 		internalStart, internalEnd := listPatternScanBounds(prefix, pattern)
 		if err := mergeScannedKeys(internalStart, internalEnd); err != nil {
 			return err
@@ -1518,7 +1367,27 @@ func (r *RedisServer) mergeInternalNamespaces(start []byte, pattern []byte, merg
 	}
 	zsetMemberStart := store.ZSetMemberScanPrefix(start)
 	zsetMemberEnd := prefixScanEnd([]byte(store.ZSetMemberPrefix))
-	return mergeScannedKeys(zsetMemberStart, zsetMemberEnd)
+	if err := mergeScannedKeys(zsetMemberStart, zsetMemberEnd); err != nil {
+		return err
+	}
+	// Post-migration streams live under !stream|meta|<len><userKey>.
+	// The meta record is enough to expose the logical key via KEYS;
+	// entry rows are filtered out by redisVisibleUserKey / collectUserKeys
+	// so the result stays one-line-per-stream regardless of entry count.
+	streamMetaStart := streamMetaScanStart(start)
+	streamMetaEnd := prefixScanEnd([]byte(store.StreamMetaPrefix))
+	return mergeScannedKeys(streamMetaStart, streamMetaEnd)
+}
+
+// streamMetaScanStart returns the lower bound for scanning stream meta
+// keys that begin with the given user-key prefix. The store helper
+// already returns StreamMetaPrefix + len(userKey) + userKey, so callers
+// only need to supply the bounded pattern prefix.
+func streamMetaScanStart(userPrefix []byte) []byte {
+	if len(userPrefix) == 0 {
+		return []byte(store.StreamMetaPrefix)
+	}
+	return store.StreamMetaKey(userPrefix)
 }
 
 func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
@@ -1664,7 +1533,23 @@ func wideColumnVisibleUserKey(key []byte) (userKey []byte, isWide bool) {
 	if store.IsSetMemberKey(key) {
 		return store.ExtractSetUserKeyFromMember(key), true
 	}
+	if userKey, ok := streamWideColumnVisibleUserKey(key); ok {
+		return userKey, true
+	}
 	return zsetWideColumnVisibleUserKey(key)
+}
+
+// streamWideColumnVisibleUserKey maps a wide-column stream key to its
+// visible user key. Meta keys expose the stream exactly once; entry keys
+// are internal-only so KEYS / SCAN don't leak one result per entry.
+func streamWideColumnVisibleUserKey(key []byte) ([]byte, bool) {
+	if store.IsStreamMetaKey(key) {
+		return store.ExtractStreamUserKeyFromMeta(key), true
+	}
+	if store.IsStreamEntryKey(key) {
+		return nil, true
+	}
+	return nil, false
 }
 
 func redisVisibleUserKey(key []byte) []byte {
@@ -1863,7 +1748,13 @@ type txnContext struct {
 	zsetStates map[string]*zsetTxnState
 	ttlStates  map[string]*ttlTxnState
 	readKeys   map[string][]byte
-	startTS    uint64
+	// streamDeletions tracks user keys whose stream wide-column layout must
+	// be tombstoned on commit: the !stream|meta|<key> record plus every
+	// !stream|entry|<key><ID> row. stageKeyDeletion seeds this (MULTI/EXEC
+	// DEL / EXPIRE 0) so migrated streams are properly removed rather than
+	// leaking entry keys past the DEL's apparent success.
+	streamDeletions map[string][]byte
+	startTS         uint64
 }
 
 type listTxnState struct {
@@ -1918,7 +1809,8 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 		redisHashKey(key),
 		redisSetKey(key),
 		redisZSetKey(key),
-		redisStreamKey(key),
+		redisStreamKey(key),      // legacy single-blob stream key
+		store.StreamMetaKey(key), // post-migration wide-column stream meta
 		redisHLLKey(key),
 		redisStrKey(key),
 		key, // legacy bare key for fallback reads
@@ -2459,7 +2351,7 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	zs.members = map[string]float64{}
 	zs.exists = false
 	zs.dirty = true
-	// Mark hash, set, stream, and HLL internal keys for deletion.
+	// Mark hash, set, stream (legacy blob), and HLL internal keys for deletion.
 	for _, internalKey := range [][]byte{
 		redisHashKey(key),
 		redisSetKey(key),
@@ -2473,6 +2365,19 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 		iv.deleted = true
 		iv.dirty = true
 	}
+	// Stage the wide-column stream cleanup: the !stream|meta| record and
+	// every !stream|entry| row must also be tombstoned when the user deletes
+	// a migrated stream via MULTI/EXEC DEL or EXPIRE 0. Without this step
+	// the command would report success but leave rows behind, and a later
+	// XLEN / XREAD would "resurrect" the stream. commit() expands this
+	// entry into concrete Del elems by scanning the entry-key prefix.
+	// The map is lazy-initialised so test fixtures that build a minimal
+	// txnContext literal without this field still work.
+	if t.streamDeletions == nil {
+		t.streamDeletions = map[string][]byte{}
+	}
+	t.streamDeletions[string(key)] = bytes.Clone(key)
+	t.trackReadKey(store.StreamMetaKey(key))
 	// Mark legacy bare string key for deletion. We bypass load() here
 	// because load() auto-prefixes bare keys to !redis|str|.
 	// Track the bare key in the read set for conflict detection.
@@ -2553,9 +2458,23 @@ func (t *txnContext) commit() error {
 	// non-string keys get a !redis|ttl| element written in the same transaction.
 	ttlElems := t.buildTTLElems()
 
+	// Derive a single redisDispatchTimeout-bounded context covering both the
+	// stream-deletion scans (paginated ScanAt/ExistsAt over StreamEntryScanPrefix)
+	// and the final Dispatch. Without this bound, buildStreamDeletionElems would
+	// run on the server-lifetime handlerContext, leaving its scans uncancellable
+	// from the request side on a slow disk or hot-key pathological commit.
+	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+
+	streamElems, err := t.buildStreamDeletionElems(ctx)
+	if err != nil {
+		return err
+	}
+
 	elems = append(elems, listElems...)
 	elems = append(elems, zsetElems...)
 	elems = append(elems, ttlElems...)
+	elems = append(elems, streamElems...)
 	if len(elems) == 0 {
 		return nil
 	}
@@ -2571,8 +2490,6 @@ func (t *txnContext) commit() error {
 		CommitTS: commitTS,
 		ReadKeys: readKeys,
 	}
-	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
-	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
 		return errors.WithStack(err)
 	}
@@ -2795,6 +2712,39 @@ func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64)
 	return elems, lenDelta
 }
 
+// buildStreamDeletionElems expands every user key queued in streamDeletions
+// into the Del operations that actually tombstone a migrated stream:
+// !stream|meta|<key> and every !stream|entry|<key><ID> row. Called from
+// commit() so that MULTI/EXEC DEL / EXPIRE 0 on a migrated stream leaves
+// the store in a consistent state instead of only dropping the legacy blob.
+// Each scan runs at t.startTS so the delete honours the transaction's
+// snapshot view.
+//
+// ctx is the redisDispatchTimeout-bounded context derived in commit(); it
+// caps the paginated ExistsAt + scanAllDeltaElems inside
+// deleteStreamWideColumnElems so a pathological staged-stream count cannot
+// hold the EXEC handler open past the per-request budget.
+func (t *txnContext) buildStreamDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	if len(t.streamDeletions) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(t.streamDeletions))
+	for k := range t.streamDeletions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var elems []*kv.Elem[kv.OP]
+	for _, k := range keys {
+		userKey := t.streamDeletions[k]
+		streamElems, err := t.server.deleteStreamWideColumnElems(ctx, userKey, t.startTS)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, streamElems...)
+	}
+	return elems, nil
+}
+
 // buildTTLElems returns !redis|ttl| Raft elements for non-string keys with dirty TTL state.
 // String keys have TTL embedded in the value; they are handled by buildKeyElems.
 func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
@@ -2827,13 +2777,14 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 		defer readPin.Release()
 
 		txn := &txnContext{
-			server:     r,
-			working:    map[string]*txnValue{},
-			listStates: map[string]*listTxnState{},
-			zsetStates: map[string]*zsetTxnState{},
-			ttlStates:  map[string]*ttlTxnState{},
-			readKeys:   map[string][]byte{},
-			startTS:    startTS,
+			server:          r,
+			working:         map[string]*txnValue{},
+			listStates:      map[string]*listTxnState{},
+			zsetStates:      map[string]*zsetTxnState{},
+			ttlStates:       map[string]*ttlTxnState{},
+			readKeys:        map[string][]byte{},
+			streamDeletions: map[string][]byte{},
+			startTS:         startTS,
 		}
 
 		nextResults := make([]redisResult, 0, len(queue))

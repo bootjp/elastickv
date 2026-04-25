@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -15,6 +16,23 @@ import (
 )
 
 const redirectForwardTimeout = 5 * time.Second
+
+// dispatchLeaderRetryBudget bounds how long Dispatch keeps absorbing
+// transient leader-unavailable errors (no leader resolvable yet, local
+// node just stepped down, forwarded RPC bounced off a stale leader).
+// gRPC callers expect linearizable semantics — i.e. an operation either
+// commits atomically or fails definitively — so the coordinator hides
+// raft-internal leader churn behind a bounded retry instead of leaking
+// "not leader" / "leader not found" errors out through the API.
+//
+// The budget is large enough to cover one or two complete re-elections
+// even on a slow runner (etcd/raft randomised election timeout up to
+// ~1s), and small enough that a permanent loss of quorum still surfaces
+// to the caller in bounded time.
+const dispatchLeaderRetryBudget = 5 * time.Second
+
+// dispatchLeaderRetryInterval is the poll interval between retries.
+const dispatchLeaderRetryInterval = 25 * time.Millisecond
 
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
 // physical ceiling extends ahead of the current wall clock. Modelled after
@@ -225,10 +243,194 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 
 	// Validate the request before any use to avoid panics on malformed input.
+	// Validation errors are not retryable, so do this once outside the loop.
 	if err := validateOperationGroup(reqs); err != nil {
 		return nil, err
 	}
 
+	// Wrap the actual dispatch in a bounded retry loop so that transient
+	// leader-unavailable errors (no leader resolvable yet, local node just
+	// stepped down, forwarded RPC bounced off a stale leader) are absorbed
+	// inside the coordinator instead of leaking out through the gRPC API.
+	// The gRPC contract is linearizable: a single client call either
+	// commits atomically or returns a definitive error. "Leader not found"
+	// during a re-election is neither, so we wait briefly for the cluster
+	// to re-stabilise. Non-leader errors that exceed the retry budget are
+	// surfaced unchanged for callers to observe.
+	leaderAssignsTS := coordinatorAssignsTimestamps(reqs)
+	deadline := time.Now().Add(dispatchLeaderRetryBudget)
+	// Reuse a single Timer across retries. time.After would allocate a
+	// fresh timer per iteration whose Go runtime entry lingers until the
+	// interval elapses, producing a short-term leak proportional to the
+	// retry rate. Under heavy mid-dispatch leader churn this is a hot
+	// loop, so we Reset the timer in place instead. Go 1.23+ timer
+	// semantics make Reset on an unfired/expired Timer safe without an
+	// explicit drain.
+	timer := time.NewTimer(dispatchLeaderRetryInterval)
+	defer timer.Stop()
+	// boundedCtx caps every dispatchOnce call by the retry deadline so
+	// that a forward RPC inside redirect (which itself uses
+	// context.WithTimeout(ctx, redirectForwardTimeout)) can never run
+	// past the advertised dispatchLeaderRetryBudget. Without this bound,
+	// a near-expiry iteration could legitimately enter dispatchOnce and
+	// then sit in cli.Forward for the full 5s redirectForwardTimeout —
+	// the wall-clock check between iterations would trip on the next
+	// pass, but the offending call has already exceeded the budget.
+	// context.WithDeadline picks the earlier of the caller's deadline
+	// and ours, so callers with a tighter deadline still get their
+	// own cancellation semantics.
+	boundedCtx, cancelBounded := context.WithDeadline(ctx, deadline)
+	defer cancelBounded()
+	var lastResp *CoordinateResponse
+	// lastErr tracks the most recent dispatchOnce result. lastTransientErr
+	// separately retains the most recent TRANSIENT leader error we
+	// actually observed from a leader-routing failure, distinct from a
+	// context.DeadlineExceeded that boundedCtx propagates when our
+	// retry budget fires mid-attempt. The distinction matters for the
+	// final surfaced error: see finalDispatchErr.
+	var lastErr, lastTransientErr error
+	for {
+		lastResp, lastErr = c.dispatchOnce(boundedCtx, reqs)
+		// A successful dispatch means the commit already happened on
+		// the raft FSM. Do NOT let a racing caller cancellation
+		// convert that success into a reported failure: returning
+		// ctx.Err() now would mask the commit, and a client that
+		// retries a non-idempotent write could observe duplicate
+		// effects. This ordering MUST run before the ctx.Err() check
+		// below.
+		if lastErr == nil {
+			return lastResp, nil
+		}
+		// Caller-supplied ctx cancellation/deadline takes precedence
+		// over the error dispatchOnce returned (which may itself wrap
+		// context.Canceled / context.DeadlineExceeded propagated
+		// through boundedCtx). gRPC clients rely on the wrapped
+		// ctx.Err() to distinguish "I gave up" from "system was
+		// unavailable".
+		if err := ctx.Err(); err != nil {
+			return lastResp, errors.WithStack(err)
+		}
+		if !shouldRetryDispatch(lastErr) {
+			return lastResp, finalDispatchErr(lastErr, lastTransientErr, deadline)
+		}
+		lastTransientErr = lastErr
+		if !time.Now().Before(deadline) {
+			return lastResp, lastErr
+		}
+		if err := prepareDispatchRetry(ctx, reqs, leaderAssignsTS, timer, deadline); err != nil {
+			return lastResp, err
+		}
+		// Re-check the deadline AFTER the back-off sleep. If the budget
+		// expired while we slept, do not start another dispatchOnce —
+		// boundedCtx would just cancel it immediately, but exiting here
+		// keeps the surfaced error as the last transient leader signal
+		// instead of a context-deadline error from inside the gRPC
+		// stack.
+		if !time.Now().Before(deadline) {
+			return lastResp, lastErr
+		}
+	}
+}
+
+// coordinatorAssignsTimestamps reports whether the caller expects the
+// coordinator to mint StartTS/CommitTS on this dispatch. When true, each
+// retry MUST reset the timestamps back to zero so dispatchOnce re-issues
+// against the post-churn leader's HLC.
+func coordinatorAssignsTimestamps(reqs *OperationGroup[OP]) bool {
+	if !reqs.IsTxn {
+		return false
+	}
+	return reqs.StartTS == 0
+}
+
+// shouldRetryDispatch reports whether Dispatch should loop again on the
+// error returned by dispatchOnce. Only transient leader-unavailable
+// signals qualify; a nil error and every other non-retryable error
+// (write conflict, validation, etc.) must surface unchanged.
+func shouldRetryDispatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isTransientLeaderError(err)
+}
+
+// finalDispatchErr picks the error Dispatch surfaces when the retry
+// loop terminates via shouldRetryDispatch == false. There are two
+// cases:
+//
+//   - The attempt returned a genuine non-transient error (write
+//     conflict, validation failure, etc.) while the budget was still
+//     healthy. Return lastErr unchanged; the caller needs the real
+//     failure reason, not a stale leader signal.
+//   - Our bounded retry budget fired mid-attempt, so dispatchOnce
+//     propagates a context.DeadlineExceeded from boundedCtx rather
+//     than a genuine failure. That deadline is just how the retry
+//     loop noticed it ran out; the *actual* failure mode is the
+//     transient leader churn we saw during the window. Return
+//     lastTransientErr so clients see "leader unavailable" instead
+//     of an internal gRPC timeout after bounded retries.
+//
+// The time.Now() check distinguishes the two: if now ≥ deadline, the
+// budget is exhausted and the most recent non-transient lastErr is
+// the deadline marker, not a real business error.
+func finalDispatchErr(lastErr, lastTransientErr error, deadline time.Time) error {
+	if lastTransientErr != nil && !time.Now().Before(deadline) {
+		return lastTransientErr
+	}
+	return lastErr
+}
+
+// waitForDispatchRetry sleeps for interval on timer or until ctx fires,
+// whichever comes first. A ctx cancellation returns a wrapped ctx.Err()
+// so gRPC clients can distinguish "I gave up waiting" from "cluster is
+// unavailable"; timer expiry returns nil and the caller loops again.
+//
+// The sleep is additionally capped at time.Until(deadline). Without
+// that cap, a caller that hits the retry budget with <interval left
+// would sleep the full interval — pushing total Dispatch latency up
+// to one dispatchLeaderRetryInterval past the advertised
+// dispatchLeaderRetryBudget. Capping keeps the budget strictly
+// bounded: on return the caller's next time.Now().Before(deadline)
+// check trips and the loop exits with the last transient error.
+func waitForDispatchRetry(ctx context.Context, timer *time.Timer, interval time.Duration, deadline time.Time) error {
+	sleep := interval
+	if until := time.Until(deadline); until > 0 && until < sleep {
+		sleep = until
+	}
+	timer.Reset(sleep)
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+// prepareDispatchRetry groups the pre-back-off bookkeeping Dispatch
+// must do between attempts: clear StartTS/CommitTS when the caller
+// asked the coordinator to mint them (so the next dispatchOnce issues
+// against the post-churn HLC instead of a stale timestamp that could
+// trip fsm.validateConflicts), then sleep one retry interval — or
+// return ctx.Err() wrapped if the caller cancels during the sleep.
+// Factored out of Dispatch to keep that function's cyclomatic
+// complexity under the cyclop threshold without shuffling semantics.
+func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderAssignsTS bool, timer *time.Timer, deadline time.Time) error {
+	if leaderAssignsTS {
+		reqs.StartTS = 0
+		reqs.CommitTS = 0
+	}
+	return waitForDispatchRetry(ctx, timer, dispatchLeaderRetryInterval, deadline)
+}
+
+// dispatchOnce runs a single Dispatch attempt without retry. It is the
+// transactional unit retried by Dispatch on transient leader errors.
+//
+// StartTS issuance is intentionally inside the per-attempt path: if a
+// previous attempt was rejected by a stale leader, the new leader's
+// HLC must mint a fresh StartTS so it floors above any committed
+// physical-ceiling lease. Re-using the previous StartTS could violate
+// monotonicity across the leader transition.
+func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
 		return c.redirect(ctx, reqs)
 	}
@@ -266,6 +468,100 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
+}
+
+// isTransientLeaderError reports whether err is a transient
+// leader-unavailable signal worth retrying inside Dispatch.
+//
+// Three distinct conditions qualify:
+//   - ErrLeaderNotFound — no leader address resolvable on this node yet
+//     (election in progress, or the previous leader stepped down and the
+//     successor has not propagated). Recoverable as soon as a new leader
+//     publishes its identity.
+//   - isLeadershipLossError — the etcd/raft engine rejected a Propose
+//     because it just lost leadership (ErrNotLeader / ErrLeadershipLost
+//     / ErrLeadershipTransferInProgress). Recoverable by re-routing
+//     through the new leader (redirect path).
+//   - Forwarded "not leader" / "leader not found" strings — when
+//     Coordinate.redirect forwards to a stale leader, the destination
+//     node returns adapter.ErrNotLeader (its own sentinel) which gRPC
+//     transports as a generic Unknown status carrying only the message
+//     "not leader". errors.Is cannot traverse that wire boundary, so we
+//     fall back to a case-insensitive SUFFIX match on the final error
+//     text (see hasTransientLeaderPhrase). Suffix-only — not a free
+//     Contains — because store.WriteConflictError formats as
+//     "key: <user-key>: write conflict" and a user-chosen key embedding
+//     "not leader" must not be misclassified as transient.
+//     leaderErrorPhrases enumerates the exact phrases the adapter and
+//     coordinator layers emit; every observed wrapper (cockroachdb
+//     Wrapf, fmt.Errorf %w-prefix, gRPC status Errorf) places the
+//     original message at the end of the composed string so suffix
+//     matching catches the real churn signals without false positives.
+//
+// Business-logic failures (write conflict, validation, etc.) are NOT
+// covered here — those must surface to the caller unchanged so client
+// retry logic can distinguish "system was unavailable" from "your write
+// was rejected on its merits".
+func isTransientLeaderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrLeaderNotFound) {
+		return true
+	}
+	if isLeadershipLossError(err) {
+		return true
+	}
+	return hasTransientLeaderPhrase(err)
+}
+
+// leaderErrorPhrases is the closed set of wire-level error strings the
+// coordinator is willing to treat as transient once the typed sentinel
+// has been dropped by a gRPC boundary. Keep this list tight — any
+// addition must correspond to an error the system actually emits for
+// leader churn, not a generic "failed" message that happens to mention
+// leaders.
+//
+// Every string here MUST be paired with a kv/raftengine/adapter
+// sentinel in isLeadershipLossError or isTransientLeaderError so the
+// typed-sentinel path catches the same condition when the error chain
+// is intact. TestIsTransientLeaderError_PinsRealSentinels locks the
+// sentinel .Error() texts to this list; a rename on the sentinel side
+// will fail that test and force a matching update here.
+var leaderErrorPhrases = []string{
+	"not leader",                      // adapter.ErrNotLeader, raftengine.ErrNotLeader ("raft engine: not leader")
+	"leader not found",                // kv.ErrLeaderNotFound, adapter.ErrLeaderNotFound
+	"leadership lost",                 // raftengine.ErrLeadershipLost ("raft engine: leadership lost")
+	"leadership transfer in progress", // raftengine.ErrLeadershipTransferInProgress
+}
+
+// hasTransientLeaderPhrase reports whether err.Error() ENDS WITH one of
+// the well-known transient-leader substrings. It is the last resort
+// used after errors.Is fails across a gRPC boundary that strips the
+// original sentinel chain.
+//
+// Suffix matching — not free-form Contains — is load-bearing here:
+// several non-leader errors embed user-controlled text in the middle
+// of their message. store.WriteConflictError, for example, formats as
+// "key: <user-key>: write conflict"; a conflicted key literally named
+// "not leader" would trip a Contains-based classifier and cause the
+// coordinator to spin retries (and reissue with fresh timestamps) on
+// what is actually a terminal business failure. Every wrapper we
+// observe in practice (cockroachdb Wrapf, fmt.Errorf %w-prefix, gRPC
+// status.Errorf's "rpc error: code = X desc = <orig>" form, plus any
+// stacking of those) places the original message at the END of the
+// composed string, so a suffix check is both tight and sufficient.
+func hasTransientLeaderPhrase(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range leaderErrorPhrases {
+		if strings.HasSuffix(msg, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshLeaseAfterDispatch extends the lease only when the dispatch

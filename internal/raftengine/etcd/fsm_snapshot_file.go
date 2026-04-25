@@ -19,6 +19,7 @@ import (
 
 const (
 	fsmSnapDirName       = "fsm-snap"
+	snapFileExt          = ".snap"
 	snapshotTokenSize    = 17 // 4 (magic) + 1 (version) + 8 (index) + 4 (crc32c)
 	snapshotTokenVersion = byte(0x01)
 
@@ -135,7 +136,7 @@ func fsmSnapPath(fsmSnapDir string, index uint64) string {
 // Snap files are named "{term:016x}-{index:016x}.snap".
 // Returns 0 on parse failure.
 func parseSnapFileIndex(name string) uint64 {
-	base := strings.TrimSuffix(name, ".snap")
+	base := strings.TrimSuffix(name, snapFileExt)
 	idx := strings.LastIndex(base, "-")
 	if idx < 0 {
 		return 0
@@ -554,7 +555,7 @@ func collectLiveSnapIndexes(snapDir string) (map[uint64]bool, error) {
 	}
 	liveIndexes := make(map[uint64]bool, len(snapEntries))
 	for _, e := range snapEntries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".snap" {
+		if !e.IsDir() && filepath.Ext(e.Name()) == snapFileExt {
 			if idx := parseSnapFileIndex(e.Name()); idx > 0 {
 				liveIndexes[idx] = true
 			}
@@ -644,7 +645,7 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 func collectSnapNames(entries []os.DirEntry) []string {
 	var snaps []string
 	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".snap" {
+		if !e.IsDir() && filepath.Ext(e.Name()) == snapFileExt {
 			snaps = append(snaps, e.Name())
 		}
 	}
