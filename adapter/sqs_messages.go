@@ -372,25 +372,11 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 // sendMessageFifoLoop runs the dedup-aware OCC send for FIFO queues
 // under the standard retry budget. Stamping the dedup record + new
 // sequence number happens inside one transaction so a concurrent send
-// either observes the dedup hit or loses the OCC race.
-//
-// On retry, both readTS and meta are re-read: a concurrent PurgeQueue /
-// DeleteQueue / SetQueueAttributes that wins the OCC race bumps the
-// queue generation or rotates attributes, and the next attempt must
-// observe that — otherwise the retry could commit under a stale
-// generation, silently writing a message that is unreachable via
-// routing (acknowledged-loss bug). The single-message Standard path
-// has no inner retry budget; it returns to the client on the first
-// OCC conflict and the SDK retries against a fresh meta read, so this
-// loop is FIFO-specific.
-func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, queueName string, meta *sqsQueueMeta, in sqsSendMessageInput, delay int64, _ uint64) {
-	dedupID := resolveFifoDedupID(meta, in)
-	if dedupID == "" {
-		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter,
-			"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
-		return
-	}
-	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, in, dedupID, delay)
+// either observes the dedup hit or loses the OCC race. The actual
+// retry loop and per-attempt meta / dedup / delay re-derivation live
+// in runFifoSendWithRetry.
+func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, queueName string, _ *sqsQueueMeta, in sqsSendMessageInput, _ int64, _ uint64) {
+	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, in)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return

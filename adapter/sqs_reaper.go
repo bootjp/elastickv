@@ -89,7 +89,186 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 			slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
 		}
 	}
+	// Tombstones fire on DeleteQueue and outlive the meta row, so a
+	// purely meta-driven enumeration would never reach orphan keys
+	// for deleted queues. Walk them after the live-queue pass.
+	if err := s.reapTombstonedQueues(ctx); err != nil {
+		slog.Warn("sqs reaper tombstone pass failed", "err", err)
+	}
 	return nil
+}
+
+// reapTombstonedQueues enumerates every (queue, gen) tombstone left
+// by DeleteQueue and reaps the message keyspace for that
+// (queue, gen). Once a tombstone has nothing left to clean — no
+// byage, dedup, or group rows — the tombstone itself is deleted so
+// the next pass does not re-walk an empty queue forever.
+func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
+	prefix := []byte(SqsQueueTombstonePrefix)
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	for {
+		readTS := s.nextTxnReadTS(ctx)
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, kvp := range page {
+			if err := ctx.Err(); err != nil {
+				return errors.WithStack(err)
+			}
+			queueName, gen, ok := parseSqsQueueTombstoneKey(kvp.Key)
+			if !ok {
+				continue
+			}
+			s.reapTombstonedGeneration(ctx, queueName, gen, kvp.Key, readTS)
+		}
+		if len(page) < sqsReaperPageLimit {
+			return nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+		if bytes.Compare(start, upper) >= 0 {
+			return nil
+		}
+	}
+}
+
+// reapTombstonedGeneration cleans a single (queue, gen) cohort under
+// its own per-queue budget. Once every prefix the cohort can occupy
+// is empty, the tombstone itself is deleted; otherwise it stays so
+// the next tick can finish what was left.
+func (s *SQSServer) reapTombstonedGeneration(ctx context.Context, queueName string, gen uint64, tombstoneKey []byte, readTS uint64) {
+	dataDone, err := s.reapDeadByAge(ctx, queueName, gen, readTS)
+	if err != nil {
+		slog.Warn("sqs tombstone byage reap failed", "queue", queueName, "gen", gen, "err", err)
+		return
+	}
+	dedupDone, err := s.deleteAllPrefix(ctx, sqsMsgDedupKeyPrefix(queueName, gen), readTS)
+	if err != nil {
+		slog.Warn("sqs tombstone dedup reap failed", "queue", queueName, "gen", gen, "err", err)
+		return
+	}
+	groupDone, err := s.deleteAllPrefix(ctx, sqsMsgGroupKeyPrefix(queueName, gen), readTS)
+	if err != nil {
+		slog.Warn("sqs tombstone group reap failed", "queue", queueName, "gen", gen, "err", err)
+		return
+	}
+	if dataDone && dedupDone && groupDone {
+		_ = s.dispatchDedupDelete(ctx, tombstoneKey, readTS)
+	}
+}
+
+// reapDeadByAge walks the byage prefix for one (queue, gen) cohort
+// and reaps each record found, regardless of retention age — every
+// row under a tombstoned generation is by definition orphaned.
+// Returns done=true when the cohort is fully drained.
+func (s *SQSServer) reapDeadByAge(ctx context.Context, queueName string, gen uint64, readTS uint64) (bool, error) {
+	prefix := append(sqsMsgByAgePrefixAllGenerations(queueName), encodedU64(gen)...)
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	processed := 0
+	for processed < sqsReaperPerQueueBudget {
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return true, nil
+		}
+		done, newProcessed, err := s.reapDeadByAgePage(ctx, queueName, gen, page, readTS, processed)
+		if err != nil {
+			return false, err
+		}
+		processed = newProcessed
+		if done {
+			return processed < sqsReaperPerQueueBudget, nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+	}
+	return false, nil
+}
+
+// reapDeadByAgePage processes one ScanAt page during a tombstone reap
+// pass. Returns done=true when either the page was the last one or
+// the per-queue budget ran out.
+func (s *SQSServer) reapDeadByAgePage(ctx context.Context, queueName string, gen uint64, page []*store.KVPair, readTS uint64, processed int) (bool, int, error) {
+	for _, kvp := range page {
+		if err := ctx.Err(); err != nil {
+			return true, processed, errors.WithStack(err)
+		}
+		parsed, ok := parseSqsMsgByAgeKey(kvp.Key, queueName)
+		if !ok || parsed.Generation != gen {
+			continue
+		}
+		if err := s.reapOneRecord(ctx, queueName, gen, kvp.Key, parsed.MessageID, readTS); err != nil {
+			return true, processed, err
+		}
+		processed++
+		if processed >= sqsReaperPerQueueBudget {
+			return true, processed, nil
+		}
+	}
+	if len(page) < sqsReaperPageLimit {
+		return true, processed, nil
+	}
+	return false, processed, nil
+}
+
+// deleteAllPrefix scans the given prefix and Dispatch-deletes every
+// key it finds, one at a time. Returns done=true when the prefix is
+// empty (or empty enough that this tick exhausted its work).
+func (s *SQSServer) deleteAllPrefix(ctx context.Context, prefix []byte, readTS uint64) (bool, error) {
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	processed := 0
+	for processed < sqsReaperPerQueueBudget {
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return true, nil
+		}
+		for _, kvp := range page {
+			if err := ctx.Err(); err != nil {
+				return false, errors.WithStack(err)
+			}
+			if err := s.dispatchDedupDelete(ctx, kvp.Key, readTS); err != nil {
+				return false, err
+			}
+			processed++
+			if processed >= sqsReaperPerQueueBudget {
+				return false, nil
+			}
+		}
+		if len(page) < sqsReaperPageLimit {
+			return true, nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+	}
+	return false, nil
+}
+
+// sqsMsgDedupKeyPrefix / sqsMsgGroupKeyPrefix return the (queue, gen)
+// prefix for the dedup and group keyspaces. Pulled out as helpers
+// so the tombstone reaper does not need to know the encoding.
+func sqsMsgDedupKeyPrefix(queueName string, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsMsgDedupPrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsMsgDedupPrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = appendU64(buf, gen)
+	return buf
+}
+
+func sqsMsgGroupKeyPrefix(queueName string, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsMsgGroupPrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsMsgGroupPrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = appendU64(buf, gen)
+	return buf
 }
 
 // reapQueue scans the byage index across every queue generation and

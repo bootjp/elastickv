@@ -36,6 +36,13 @@ const (
 	// can find every record whose retention deadline has elapsed with
 	// one bounded scan, without having to load every message body.
 	SqsMsgByAgePrefix = "!sqs|msg|byage|"
+	// SqsQueueTombstonePrefix prefixes a "queue was deleted" marker.
+	// DeleteQueue writes one (queue, gen) tombstone alongside the meta
+	// delete, and the reaper enumerates these markers to clean up
+	// orphan data / vis / byage / dedup / group keys whose meta row no
+	// longer exists. The tombstone is itself deleted once the reaper
+	// confirms no message-keyspace state remains for that (queue, gen).
+	SqsQueueTombstonePrefix = "!sqs|queue|tombstone|"
 )
 
 func sqsQueueMetaKey(queueName string) []byte {
@@ -66,6 +73,39 @@ func sqsMsgGroupKey(queueName string, gen uint64, groupID string) []byte {
 	buf = appendU64(buf, gen)
 	buf = append(buf, encodeSQSSegment(groupID)...)
 	return buf
+}
+
+func sqsQueueTombstoneKey(queueName string, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsQueueTombstonePrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsQueueTombstonePrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = appendU64(buf, gen)
+	return buf
+}
+
+// sqsGenerationSuffixLen is the byte length of the trailing big-endian
+// uint64 generation segment in tombstone and byage keys.
+const sqsGenerationSuffixLen = 8
+
+// parseSqsQueueTombstoneKey reverses sqsQueueTombstoneKey. The
+// generation is fixed at the last 8 bytes of the key, so the queue
+// name segment is everything between the prefix and that suffix —
+// no delimiter needed.
+func parseSqsQueueTombstoneKey(key []byte) (queueName string, gen uint64, ok bool) {
+	if !bytes.HasPrefix(key, []byte(SqsQueueTombstonePrefix)) {
+		return "", 0, false
+	}
+	rest := key[len(SqsQueueTombstonePrefix):]
+	if len(rest) < sqsGenerationSuffixLen {
+		return "", 0, false
+	}
+	encQueue := rest[:len(rest)-sqsGenerationSuffixLen]
+	gen = binary.BigEndian.Uint64(rest[len(rest)-sqsGenerationSuffixLen:])
+	name, err := decodeSQSSegment(string(encQueue))
+	if err != nil {
+		return "", 0, false
+	}
+	return name, gen, true
 }
 
 func sqsMsgByAgeKey(queueName string, gen uint64, sendTimestampMs int64, messageID string) []byte {

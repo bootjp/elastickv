@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1208,6 +1209,111 @@ func TestSQSServer_RetentionReaperDropsExpiredFifoDedup(t *testing.T) {
 
 	if _, err := srv.store.GetAt(ctx, dedupKey, srv.nextTxnReadTS(ctx)); err == nil {
 		t.Fatalf("expired dedup record still present after reap")
+	}
+}
+
+func TestSQSServer_ReaperCleansDeletedQueueOrphans(t *testing.T) {
+	t.Parallel()
+	// DeleteQueue removes the meta row but leaves data / vis / byage /
+	// dedup / group keys keyed by the old generation. Without a
+	// tombstone-driven reaper pass, scanQueueNames would never visit
+	// the deleted queue again and those keys would leak forever. Here
+	// we send a few messages, delete the queue, and confirm the
+	// orphan rows are gone after a reaper pass and the tombstone is
+	// cleaned up.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "del-orphans")
+
+	for i := range 3 {
+		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":    queueURL,
+			"MessageBody": "x-" + strconv.Itoa(i),
+		})
+	}
+	if status, body := callSQS(t, node, sqsDeleteQueueTarget, map[string]any{
+		"QueueUrl": queueURL,
+	}); status != http.StatusOK {
+		t.Fatalf("delete: %d %v", status, body)
+	}
+
+	srv := node.sqsServer
+	ctx := t.Context()
+	// Tombstone is present pre-reap.
+	tombPrefix := []byte(SqsQueueTombstonePrefix)
+	tombEnd := prefixScanEnd(tombPrefix)
+	preTomb, err := srv.store.ScanAt(ctx, tombPrefix, tombEnd, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("pre-reap tombstone scan: %v", err)
+	}
+	if len(preTomb) == 0 {
+		t.Fatalf("DeleteQueue did not write a tombstone")
+	}
+
+	// One reaper pass should clear byage + dedup + group + tombstone.
+	if err := srv.reapAllQueues(ctx); err != nil {
+		t.Fatalf("reapAllQueues: %v", err)
+	}
+
+	byagePrefix := sqsMsgByAgePrefixAllGenerations("del-orphans")
+	byageEnd := prefixScanEnd(byagePrefix)
+	leftover, err := srv.store.ScanAt(ctx, byagePrefix, byageEnd, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("post-reap byage scan: %v", err)
+	}
+	if len(leftover) != 0 {
+		t.Fatalf("byage rows leaked after delete + reap: %v", leftover)
+	}
+	postTomb, err := srv.store.ScanAt(ctx, tombPrefix, tombEnd, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("post-reap tombstone scan: %v", err)
+	}
+	if len(postTomb) != 0 {
+		t.Fatalf("tombstone leaked after orphan reap: %d entries", len(postTomb))
+	}
+}
+
+func TestSQSServer_SendMessageBatchRejectsInvalidEntryId(t *testing.T) {
+	t.Parallel()
+	// AWS limits batch entry Ids to 1-80 chars of [a-zA-Z0-9_-].
+	// Anything outside that grammar must return InvalidBatchEntryId,
+	// not be silently passed through.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "bad-id")
+
+	bad := []string{
+		"has space",
+		"emoji-😀",
+		"slash/unsafe",
+		strings.Repeat("a", 81),
+	}
+	for _, id := range bad {
+		status, out := callSQS(t, node, sqsSendMessageBatchTarget, map[string]any{
+			"QueueUrl": url,
+			"Entries": []map[string]any{
+				{"Id": id, "MessageBody": "x"},
+			},
+		})
+		if status != http.StatusBadRequest {
+			t.Fatalf("bad id %q: got %d want 400 (%v)", id, status, out)
+		}
+		if got, _ := out["__type"].(string); got != sqsErrInvalidBatchEntryId {
+			t.Fatalf("bad id %q: error type %q want %q", id, got, sqsErrInvalidBatchEntryId)
+		}
+	}
+
+	// Valid ids still work.
+	status, _ := callSQS(t, node, sqsSendMessageBatchTarget, map[string]any{
+		"QueueUrl": url,
+		"Entries": []map[string]any{
+			{"Id": "valid-id_1", "MessageBody": "x"},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("valid id: status %d", status)
 	}
 }
 

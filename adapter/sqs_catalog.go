@@ -624,14 +624,18 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		}
 
 		// Bump the generation counter so any stragglers under the old
-		// generation are unreachable by routing. Actual message cleanup
-		// lands in a follow-up PR along with the message keyspace.
+		// generation are unreachable by routing. The tombstone gives the
+		// reaper a way to find leftover data / vis / byage / dedup /
+		// group records once meta is gone — without it, scanQueueNames
+		// would never see the deleted queue again and its message
+		// keyspace would leak forever.
 		lastGen, err := s.loadQueueGenerationAt(ctx, queueName, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
 		metaKey := sqsQueueMetaKey(queueName)
 		genKey := sqsQueueGenKey(queueName)
+		tombstoneKey := sqsQueueTombstoneKey(queueName, lastGen)
 		// StartTS + ReadKeys fence against a concurrent CreateQueue /
 		// SetQueueAttributes landing between our load and dispatch.
 		req := &kv.OperationGroup[kv.OP]{
@@ -641,6 +645,7 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: metaKey},
 				{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(lastGen+1, 10))},
+				{Op: kv.Put, Key: tombstoneKey, Value: []byte{1}},
 			},
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {

@@ -3,11 +3,17 @@ package adapter
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
+
+// sqsBatchEntryIdPattern is AWS's allowed character set for the
+// per-entry Id of any batch operation: 1-80 chars, alphanumeric
+// plus `-` and `_`. Anything else returns InvalidBatchEntryId.
+var sqsBatchEntryIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}$`)
 
 // AWS-documented per-batch limits.
 const (
@@ -278,6 +284,10 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 		MessageGroupId:         entry.MessageGroupId,
 		MessageDeduplicationId: entry.MessageDeduplicationId,
 	}
+	// Pre-flight checks against the most recent meta we have. The
+	// retry loop re-validates against fresh meta on each attempt, but
+	// running the cheap shape checks here first gives the caller a
+	// per-entry error response without paying for a Dispatch.
 	if len(entry.MessageBody) == 0 {
 		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id,
 			newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required"))
@@ -289,18 +299,8 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 	if err := validateSendFIFOParams(meta, asSingle); err != nil {
 		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, err)
 	}
-	delay, err := resolveSendDelay(meta, entry.DelaySeconds)
-	if err != nil {
-		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, err)
-	}
-	dedupID := resolveFifoDedupID(meta, asSingle)
-	if dedupID == "" {
-		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id,
-			newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter,
-				"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true"))
-	}
 
-	resp, err := s.runFifoSendWithRetry(ctx, queueName, asSingle, dedupID, delay)
+	resp, err := s.runFifoSendWithRetry(ctx, queueName, asSingle)
 	if err != nil {
 		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, err)
 	}
@@ -319,20 +319,18 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 // whole-call failure.
 //
 // Each attempt — including the first — re-loads queue metadata at the
-// same readTS used for the OCC dispatch. Without that re-load, attempt
-// 1 would pair a fresh readTS with a meta snapshot taken at a strictly
-// earlier wall-clock time, and a PurgeQueue / DeleteQueue /
-// SetQueueAttributes that committed in between would slip past
-// ReadKeys (which only fence writes that commit *after* StartTS) —
-// the dispatch could then commit under a stale generation and silently
-// produce an unreachable record. Reloading per attempt guarantees the
-// (meta, readTS) pair is coherent.
+// same readTS used for the OCC dispatch *and* re-derives the FIFO
+// dedup id and effective delay from that fresh meta. Without that,
+// attempt N would pair a fresh readTS with stale FIFO rules — if
+// SetQueueAttributes flipped ContentBasedDeduplication or rotated
+// DelaySeconds between the original meta read and the chosen retry
+// snapshot, the send could commit with the previous generation's
+// rules. Re-deriving per attempt guarantees the (meta, readTS,
+// dedupID, delay) tuple is coherent.
 func (s *SQSServer) runFifoSendWithRetry(
 	ctx context.Context,
 	queueName string,
 	in sqsSendMessageInput,
-	dedupID string,
-	delay int64,
 ) (map[string]string, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
@@ -344,6 +342,15 @@ func (s *SQSServer) runFifoSendWithRetry(
 		}
 		if !exists {
 			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		}
+		dedupID := resolveFifoDedupID(meta, in)
+		if dedupID == "" {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter,
+				"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
+		}
+		delay, delayErr := resolveSendDelay(meta, in.DelaySeconds)
+		if delayErr != nil {
+			return nil, delayErr
 		}
 		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
 		if err != nil {
@@ -562,6 +569,15 @@ func validateBatchEntryShape(count int, ids []string) error {
 		if id == "" {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidBatchEntryId,
 				"every batch entry requires a non-empty Id")
+		}
+		// AWS limits batch entry Ids to 1-80 alphanumeric + `-` / `_`.
+		// Without this check, malformed Ids (e.g. arbitrary user
+		// strings, whitespace, multi-byte unicode) would pass through
+		// to per-entry processing instead of returning the documented
+		// InvalidBatchEntryId error.
+		if !sqsBatchEntryIDPattern.MatchString(id) {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidBatchEntryId,
+				"batch entry Id must be 1-80 chars of alphanumeric, hyphen, or underscore")
 		}
 		if seen[id] {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrBatchEntryIdsNotDistinct,
