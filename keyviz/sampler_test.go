@@ -687,6 +687,48 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+// TestNonPositiveOptionsFallBackToDefaults pins Codex round-8 P2: a
+// negative MaxTrackedRoutes used to bypass the zero-check and force
+// every route into a virtual bucket. Confirm both zero and negative
+// inputs land on the documented defaults so a bad CLI/env value
+// doesn't silently destroy keyviz fidelity.
+func TestNonPositiveOptionsFallBackToDefaults(t *testing.T) {
+	t.Parallel()
+	for _, val := range []int{0, -1, -10_000} {
+		s, _ := newTestSampler(t, MemSamplerOptions{
+			Step:                   time.Second,
+			HistoryColumns:         val,
+			MaxTrackedRoutes:       val,
+			MaxMemberRoutesPerSlot: val,
+		})
+		if s.opts.HistoryColumns != DefaultHistoryColumns {
+			t.Fatalf("HistoryColumns=%d → %d, want default %d", val, s.opts.HistoryColumns, DefaultHistoryColumns)
+		}
+		if s.opts.MaxTrackedRoutes != DefaultMaxTrackedRoutes {
+			t.Fatalf("MaxTrackedRoutes=%d → %d, want default %d", val, s.opts.MaxTrackedRoutes, DefaultMaxTrackedRoutes)
+		}
+		if s.opts.MaxMemberRoutesPerSlot != DefaultMaxMemberRoutesPerSlot {
+			t.Fatalf("MaxMemberRoutesPerSlot=%d → %d, want default %d", val, s.opts.MaxMemberRoutesPerSlot, DefaultMaxMemberRoutesPerSlot)
+		}
+	}
+}
+
+// TestStepAccessor pins the Step() accessor contract: returns the
+// configured Step (after defaulting) for a constructed sampler, and
+// returns DefaultStep for a typed nil so callers wiring RunFlusher
+// against a disabled sampler don't crash.
+func TestStepAccessor(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: 250 * time.Millisecond})
+	if got := s.Step(); got != 250*time.Millisecond {
+		t.Fatalf("Step() = %v, want 250ms", got)
+	}
+	var nilSampler *MemSampler
+	if got := nilSampler.Step(); got != DefaultStep {
+		t.Fatalf("nil Step() = %v, want DefaultStep %v", got, DefaultStep)
+	}
+}
+
 // TestMemberRoutesCappedAtConfiguredCap pins Codex round-7 P2: per-
 // bucket MemberRoutes growth is bounded by MaxMemberRoutesPerSlot, so
 // flushed columns don't scale with total folded routes when the

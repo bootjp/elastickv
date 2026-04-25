@@ -273,7 +273,7 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	if opts.HistoryColumns <= 0 {
 		opts.HistoryColumns = DefaultHistoryColumns
 	}
-	if opts.MaxTrackedRoutes == 0 {
+	if opts.MaxTrackedRoutes <= 0 {
 		opts.MaxTrackedRoutes = DefaultMaxTrackedRoutes
 	}
 	if opts.MaxMemberRoutesPerSlot <= 0 {
