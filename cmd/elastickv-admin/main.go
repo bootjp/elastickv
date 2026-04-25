@@ -347,29 +347,45 @@ func newFanout(
 
 func (f *fanout) Close() {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.closed {
+		f.mu.Unlock()
 		return
 	}
 	f.closed = true
 	// Shutdown is an intentional cancellation of any in-flight RPCs; close
 	// connections eagerly and let borrowers see the cancel. Borrowers that
 	// still hold leases will observe the conn as closed on their next call.
-	// Mark each client closed so the deferred release path does not attempt
-	// a double-close.
+	// Mark each client closed inside the lock so the deferred release path
+	// does not attempt a double-close, then collect the *grpc.ClientConn
+	// references and run conn.Close() outside the lock — Close() can do
+	// network I/O and waits for the gRPC client transport to drain, which
+	// would block any concurrent clientFor / invalidateClient / RPC waiting
+	// on f.mu for the entire shutdown window.
+	conns := make([]struct {
+		addr string
+		conn *grpc.ClientConn
+	}, 0, len(f.clients))
 	for _, c := range f.clients {
 		if c.closed {
 			continue
 		}
 		c.closed = true
-		if err := c.conn.Close(); err != nil {
-			log.Printf("elastickv-admin: close gRPC connection to %s: %v", c.addr, err)
-		}
+		conns = append(conns, struct {
+			addr string
+			conn *grpc.ClientConn
+		}{addr: c.addr, conn: c.conn})
 	}
 	// Replace with an empty map rather than nil so the remaining
 	// closed-guarded accessors can still iterate or lookup without panicking
 	// while still releasing the client references for GC.
 	f.clients = map[string]*nodeClient{}
+	f.mu.Unlock()
+
+	for _, e := range conns {
+		if err := e.conn.Close(); err != nil {
+			log.Printf("elastickv-admin: close gRPC connection to %s: %v", e.addr, err)
+		}
+	}
 }
 
 // clientFor returns a leased nodeClient that callers must release once they
@@ -380,26 +396,60 @@ func (f *fanout) Close() {
 // but their underlying *grpc.ClientConn is kept alive until every outstanding
 // borrower has released; this prevents an eviction from canceling a healthy
 // concurrent GetClusterOverview.
+//
+// The dial step (grpc.NewClient) runs outside f.mu. Although NewClient is
+// non-blocking, it parses the target and may run synchronous DNS resolution
+// depending on resolver configuration; holding the global fanout mutex for
+// that wall-clock time would serialize concurrent clientFor calls for
+// distinct addrs. After the dial we re-take the lock and re-check whether
+// another goroutine raced us to insert a client for the same addr — the
+// loser closes its just-dialed conn so we never leak a duplicate.
 func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.closed {
+		f.mu.Unlock()
 		return nil, func() {}, errFanoutClosed
 	}
 	if c, ok := f.clients[addr]; ok {
 		c.refcount++
-		return c, f.releaseFunc(c), nil
+		release := f.releaseFunc(c)
+		f.mu.Unlock()
+		return c, release, nil
+	}
+	f.mu.Unlock()
+
+	conn, err := grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(f.creds),
+		internalutil.GRPCCallOptions(),
+	)
+	if err != nil {
+		return nil, func() {}, errors.Wrapf(err, "dial %s", addr)
+	}
+
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		_ = conn.Close()
+		return nil, func() {}, errFanoutClosed
+	}
+	// Race: another goroutine inserted while we were dialing. Close the loser
+	// conn outside the lock and return the cached entry instead.
+	if c, ok := f.clients[addr]; ok {
+		c.refcount++
+		release := f.releaseFunc(c)
+		f.mu.Unlock()
+		_ = conn.Close()
+		return c, release, nil
 	}
 	if len(f.clients) >= maxCachedClients {
 		f.evictOneLocked()
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(f.creds))
-	if err != nil {
-		return nil, func() {}, errors.Wrapf(err, "dial %s", addr)
-	}
 	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn), refcount: 1}
 	f.clients[addr] = c
-	return c, f.releaseFunc(c), nil
+	release := f.releaseFunc(c)
+	f.mu.Unlock()
+	return c, release, nil
 }
 
 // releaseFunc returns the closer used to drop a lease. On the last release

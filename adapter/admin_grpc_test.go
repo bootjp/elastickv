@@ -414,3 +414,52 @@ func TestAdminTokenAuthEmptyTokenDisabled(t *testing.T) {
 		t.Fatal("empty token should disable interceptors")
 	}
 }
+
+// hangingGroup never returns from Configuration until ctx fires. Used to
+// prove collectLiveMembers stops blocking the merge phase as soon as the
+// caller cancels, even if one Configuration call is stuck.
+type hangingGroup struct{ fakeGroup }
+
+func (h hangingGroup) Configuration(ctx context.Context) (raftengine.Configuration, error) {
+	<-ctx.Done()
+	return raftengine.Configuration{}, ctx.Err()
+}
+
+// TestCollectLiveMembersHonoursCtxCancel asserts that collectLiveMembers
+// returns promptly when ctx is cancelled, even if one Configuration call
+// is stuck. Pre-fix, the wg.Wait() inside collectLiveMembers would block
+// the merge phase (and the entire GetClusterOverview RPC) on the slowest
+// group regardless of ctx state. Post-fix, the merge runs over whatever
+// landed before the cancel; the stuck Configuration goroutine unwinds
+// asynchronously when its ctx.Done fires.
+func TestCollectLiveMembersHonoursCtxCancel(t *testing.T) {
+	t.Parallel()
+
+	groups := []groupEntry{
+		{id: 1, group: hangingGroup{}},
+		{id: 2, group: hangingGroup{}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	type result struct {
+		addrByID map[string]string
+		order    []string
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		addrByID, order := collectLiveMembers(ctx, groups, "self")
+		resCh <- result{addrByID: addrByID, order: order}
+	}()
+
+	select {
+	case r := <-resCh:
+		// With ctx already cancelled, no live config landed; expect empty maps.
+		if len(r.addrByID) != 0 || len(r.order) != 0 {
+			t.Fatalf("expected empty results on early cancel, got addrByID=%v order=%v", r.addrByID, r.order)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("collectLiveMembers blocked past 1s despite cancelled ctx — wg.Wait() regression?")
+	}
+}

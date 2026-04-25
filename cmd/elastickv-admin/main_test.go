@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -635,4 +636,100 @@ func TestHandleOverviewUsesProtojson(t *testing.T) {
 	if !strings.Contains(body, "grpcAddress") {
 		t.Fatalf("response missing protojson camelCase field; body=%q", body)
 	}
+}
+
+// TestFanoutClientForRaceDeduplicates exercises the dial-outside-the-lock
+// path in clientFor: many goroutines racing for the same addr must all
+// converge on a single cached *grpc.ClientConn (the loser of each race
+// closes its just-dialed conn). Pre-fix, the dial happened under the
+// lock so the race was impossible by construction; post-fix, the race
+// is intentional but bounded.
+func TestFanoutClientForRaceDeduplicates(t *testing.T) {
+	t.Parallel()
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	addr := startFakeAdmin(t, peer)
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	defer f.Close()
+
+	const racers = 32
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	clients := make([]*nodeClient, racers)
+	releases := make([]func(), racers)
+	for i := 0; i < racers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			c, release, err := f.clientFor(addr)
+			if err != nil {
+				t.Errorf("racer %d clientFor: %v", i, err)
+				return
+			}
+			clients[i] = c
+			releases[i] = release
+		}(i)
+	}
+	wg.Wait()
+
+	for _, release := range releases {
+		if release != nil {
+			release()
+		}
+	}
+
+	first := clients[0]
+	for i, c := range clients {
+		if c != first {
+			t.Fatalf("racer %d got distinct nodeClient %p, want %p — clientFor de-duplication broke", i, c, first)
+		}
+	}
+	f.mu.Lock()
+	size := len(f.clients)
+	f.mu.Unlock()
+	if size != 1 {
+		t.Fatalf("cache size after race = %d, want 1 (race created %d duplicates)", size, size-1)
+	}
+}
+
+// TestFanoutCloseDoesNotHoldLockDuringConnClose pins the round-5 fix:
+// fanout.Close must release f.mu before invoking conn.Close on each
+// cached connection. The test populates the cache, takes the lock from
+// another goroutine *after* the Close goroutine has started, and
+// asserts the lock is acquirable before Close returns — proving Close
+// runs the conn.Close calls outside the lock. Pre-fix, the inverted
+// timing would have wedged the test goroutine.
+func TestFanoutCloseDoesNotHoldLockDuringConnClose(t *testing.T) {
+	t.Parallel()
+	peer := &fakeAdminServer{members: []string{"m:1"}}
+	addr := startFakeAdmin(t, peer)
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+
+	if _, release, err := f.clientFor(addr); err != nil {
+		t.Fatal(err)
+	} else {
+		release()
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		f.Close()
+	}()
+
+	// Race the Close goroutine: by the time we get the lock, Close must
+	// already have transferred the cached conns into a local slice and
+	// dropped the lock. A 2-second budget accounts for slow CI runners.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("could not acquire f.mu while Close was running — Close is holding the lock during conn.Close")
+		default:
+		}
+		if f.mu.TryLock() {
+			f.mu.Unlock()
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	<-closeDone
 }

@@ -177,30 +177,56 @@ func (s *AdminServer) cloneGroupsSorted() []groupEntry {
 // into a pre-allocated slice indexed by the sorted-order position so the
 // merge step still walks groups in ascending-ID order and preserves the
 // deterministic tie-break.
+// configResult bundles a Configuration RPC outcome with its position in the
+// caller-supplied groups slice so the merge step can re-sort by group-ID
+// even when results land out of completion order.
+type configResult struct {
+	i   int
+	cfg raftengine.Configuration
+	err error
+}
+
+// fanoutConfigurationCalls launches a Configuration(ctx) goroutine per
+// group and collects results. Returns whatever has landed by the time ctx
+// fires; remaining goroutines drain into the (buffered) channel and exit
+// asynchronously when their per-RPC ctx unwinds. The early-return is the
+// reason this lives in its own function: reading a shared []configResult
+// slice across the cancel boundary would race the still-running goroutines.
+func fanoutConfigurationCalls(ctx context.Context, groups []groupEntry) []configResult {
+	resultsCh := make(chan configResult, len(groups))
+	for i, entry := range groups {
+		go func(i int, entry groupEntry) {
+			cfg, err := entry.group.Configuration(ctx)
+			resultsCh <- configResult{i: i, cfg: cfg, err: err}
+		}(i, entry)
+	}
+	got := make([]configResult, 0, len(groups))
+	for range groups {
+		select {
+		case res := <-resultsCh:
+			got = append(got, res)
+		case <-ctx.Done():
+			return got
+		}
+	}
+	return got
+}
+
 func collectLiveMembers(
 	ctx context.Context,
 	groups []groupEntry,
 	selfID string,
 ) (addrByID map[string]string, order []string) {
-	type configResult struct {
-		cfg raftengine.Configuration
-		err error
-	}
-	results := make([]configResult, len(groups))
-	var wg sync.WaitGroup
-	for i, entry := range groups {
-		wg.Add(1)
-		go func(i int, entry groupEntry) {
-			defer wg.Done()
-			cfg, err := entry.group.Configuration(ctx)
-			results[i] = configResult{cfg: cfg, err: err}
-		}(i, entry)
-	}
-	wg.Wait()
+	got := fanoutConfigurationCalls(ctx, groups)
+
+	// Merge in the original group-ID order so the lowest-ID-wins tie-break
+	// stays deterministic. (Completion order would otherwise depend on
+	// which Configuration() returned first.)
+	sort.Slice(got, func(a, b int) bool { return got[a].i < got[b].i })
 
 	addrByID = make(map[string]string)
 	order = make([]string, 0)
-	for _, res := range results {
+	for _, res := range got {
 		if res.err != nil {
 			continue
 		}
