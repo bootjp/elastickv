@@ -17,6 +17,13 @@ import (
 // session cookie in the design doc (Section 6.1).
 const sessionTTL = 1 * time.Hour
 
+// defaultClockSkewTolerance is the slack we allow on the "issued in
+// the future" check so that minor NTP drift between admin nodes does
+// not produce spurious 401s. Operators in distributed environments
+// with looser clock synchronisation can override the per-verifier
+// value via Verifier.WithClockSkewTolerance.
+const defaultClockSkewTolerance = 30 * time.Second
+
 // jwtSegments is the fixed number of dot-separated segments in a valid
 // HS256 JWT (header.payload.signature).
 const jwtSegments = 3
@@ -153,13 +160,6 @@ func (v *Verifier) Verify(token string) (AuthPrincipal, error) {
 	return v.validateClaims(claims)
 }
 
-// defaultClockSkewTolerance is the slack we allow on the "issued in
-// the future" check so that minor NTP drift between admin nodes does
-// not produce spurious 401s. Operators in distributed environments
-// with looser clock synchronisation can override the per-verifier
-// value via Verifier.WithClockSkewTolerance.
-const defaultClockSkewTolerance = 30 * time.Second
-
 func splitSignedToken(token string) (signingInput, payloadSeg string, sig []byte, err error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != jwtSegments {
@@ -199,8 +199,8 @@ func decodeClaims(payloadSeg string) (jwtClaims, error) {
 }
 
 func (v *Verifier) validateClaims(claims jwtClaims) (AuthPrincipal, error) {
-	now := v.clock().UTC().Unix()
-	if claims.EXP == 0 || now >= claims.EXP {
+	now := v.clock().UTC()
+	if claims.EXP == 0 || now.Unix() >= claims.EXP {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "token expired")
 	}
 	// A missing iat is treated the same as a missing exp: the admin
@@ -210,7 +210,13 @@ func (v *Verifier) validateClaims(claims jwtClaims) (AuthPrincipal, error) {
 	if claims.IAT == 0 {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "missing iat")
 	}
-	if now+int64(v.clockTolerance.Seconds()) < claims.IAT {
+	// Compare with full Duration precision rather than truncating
+	// the tolerance to whole seconds. A caller that configured
+	// 500*time.Millisecond should still get half a second of slack;
+	// the previous int64(.Seconds()) round-down silently dropped
+	// any sub-second value to zero.
+	iat := time.Unix(claims.IAT, 0).UTC()
+	if now.Add(v.clockTolerance).Before(iat) {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "token issued in the future")
 	}
 	if claims.Sub == "" {

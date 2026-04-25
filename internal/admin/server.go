@@ -220,9 +220,9 @@ func isNilCredentialStore(cs CredentialStore) bool {
 }
 
 // nilableKinds is the set of reflect.Kind values that can legitimately
-// hold a nil value. Keeping it as a package-level lookup (rather than a
-// switch) lets the exhaustive linter see that we are intentionally
-// matching a small allow-list rather than forgetting a case.
+// hold a nil value — every reference kind, plus interface. Keeping it
+// as a package-level lookup (rather than a switch) makes the intent
+// — an explicit allow-list of nilable kinds — easier to audit.
 var nilableKinds = map[reflect.Kind]struct{}{
 	reflect.Map:       {},
 	reflect.Ptr:       {},

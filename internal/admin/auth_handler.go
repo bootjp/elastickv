@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -146,6 +147,12 @@ func (s *AuthService) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	rec := newStatusRecorder(w)
 	defer s.auditLogin(r, rec)
 
+	// Best-effort peek at the claimed access key so the audit line
+	// includes it even when preflight (415/429) or readLoginRequest
+	// rejects the call. On the happy path readLoginRequest will
+	// overwrite the same field with the canonical trimmed value.
+	rec.claimedActor = peekClaimedActor(r)
+
 	if !s.preflightLogin(rec, r) {
 		return
 	}
@@ -160,6 +167,37 @@ func (s *AuthService) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.issueSession(rec, principal)
 	rec.actor = principal.AccessKey
+}
+
+// peekClaimedActor extracts the access_key value from a JSON body
+// without consuming the body for downstream readers. It returns "" on
+// any malformed input — the goal is solely to seed the audit line so
+// brute-force traces still record which key was being targeted, not
+// to validate input.
+func peekClaimedActor(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	// Cap how much we peek so a hostile client cannot exhaust memory
+	// here even if BodyLimit later rejects the full payload. Bodies
+	// past peekLimit stay on the original reader; MultiReader splices
+	// the peeked bytes back in front of them so the BodyLimit /
+	// MaxBytesReader downstream sees the same full sequence the
+	// caller sent.
+	const peekLimit int64 = 16 * 1024
+	raw, err := io.ReadAll(io.LimitReader(r.Body, peekLimit))
+	if err != nil {
+		// Restore whatever we consumed before bailing out so the
+		// downstream reader is not silently truncated.
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), r.Body))
+		return ""
+	}
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), r.Body))
+	var lr loginRequest
+	if err := json.Unmarshal(raw, &lr); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(lr.AccessKey)
 }
 
 func (s *AuthService) preflightLogin(w http.ResponseWriter, r *http.Request) bool {

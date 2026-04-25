@@ -48,9 +48,9 @@ type APIHandler http.Handler
 // its LongestPrefix matching rules would let /admin/api/v1/... slip into
 // the SPA catch-all when the JSON handler returns a 404.
 type Router struct {
-	api     http.Handler
-	static  fs.FS
-	notFind http.Handler
+	api      http.Handler
+	static   fs.FS
+	notFound http.Handler
 }
 
 // NewRouter builds the admin router.
@@ -63,9 +63,9 @@ type Router struct {
 //     while the SPA has not been built yet.
 func NewRouter(api http.Handler, static fs.FS) *Router {
 	return &Router{
-		api:     api,
-		static:  static,
-		notFind: http.HandlerFunc(writeJSONNotFound),
+		api:      api,
+		static:   static,
+		notFound: http.HandlerFunc(writeJSONNotFound),
 	}
 }
 
@@ -115,7 +115,12 @@ func classifyAPI(p string) (routeKind, bool) {
 	switch {
 	case strings.HasPrefix(p, pathPrefixAPIv1):
 		return routeAPIv1, true
-	case p == pathAPIRoot, p == pathAPIv1Root, strings.HasPrefix(p, pathPrefixAPI):
+	case p == pathAPIRoot, strings.HasPrefix(p, pathPrefixAPI):
+		// /admin/api (bare, no trailing slash) is matched by the
+		// equality check; everything under /admin/api/ — including
+		// /admin/api/v1 (no trailing) and /admin/api/v2/... — is
+		// matched by the HasPrefix check, so naming pathAPIv1Root
+		// explicitly here would be redundant.
 		return routeAPIOther, true
 	}
 	return 0, false
@@ -135,7 +140,7 @@ func (rt *Router) dispatch(k routeKind) http.Handler {
 	switch k {
 	case routeAPIv1:
 		if rt.api == nil {
-			return rt.notFind
+			return rt.notFound
 		}
 		return rt.api
 	case routeHealthz:
@@ -145,9 +150,9 @@ func (rt *Router) dispatch(k routeKind) http.Handler {
 	case routeSPA:
 		return http.HandlerFunc(rt.serveSPA)
 	case routeAPIOther, routeAssetsRoot, routeUnknown:
-		return rt.notFind
+		return rt.notFound
 	}
-	return rt.notFind
+	return rt.notFound
 }
 
 func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
@@ -175,12 +180,12 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rt.static == nil {
-		rt.notFind.ServeHTTP(w, r)
+		rt.notFound.ServeHTTP(w, r)
 		return
 	}
 	name, ok := rt.assetPath(r.URL.Path)
 	if !ok {
-		rt.notFind.ServeHTTP(w, r)
+		rt.notFound.ServeHTTP(w, r)
 		return
 	}
 	rt.serveStaticFile(w, r, name)
@@ -207,7 +212,7 @@ func (rt *Router) serveStaticFile(w http.ResponseWriter, r *http.Request, name s
 	f, err := rt.static.Open(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			rt.notFind.ServeHTTP(w, r)
+			rt.notFound.ServeHTTP(w, r)
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to open asset")
@@ -216,7 +221,7 @@ func (rt *Router) serveStaticFile(w http.ResponseWriter, r *http.Request, name s
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
-		rt.notFind.ServeHTTP(w, r)
+		rt.notFound.ServeHTTP(w, r)
 		return
 	}
 	readSeeker, ok := f.(io.ReadSeeker)
@@ -239,27 +244,11 @@ func (rt *Router) serveSPA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rt.static == nil {
-		rt.notFind.ServeHTTP(w, r)
-		return
-	}
-	f, err := rt.static.Open(pathIndexHTML)
-	if err != nil {
-		rt.notFind.ServeHTTP(w, r)
-		return
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		rt.notFind.ServeHTTP(w, r)
-		return
-	}
-	readSeeker, ok := f.(io.ReadSeeker)
-	if !ok {
-		writeJSONError(w, http.StatusInternalServerError, "internal", "index.html is not seekable")
+		rt.notFound.ServeHTTP(w, r)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, pathIndexHTML, info.ModTime(), readSeeker)
+	rt.serveStaticFile(w, r, pathIndexHTML)
 }
 
 // errorResponse is the JSON shape for every admin error.
