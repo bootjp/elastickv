@@ -502,6 +502,12 @@ func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"}} 42`,                                // trailing scalar
 		`{"table_name":"foo/bar","partition_key":{"name":"id","type":"S"}}`,                             // slash in name
 		`{"table_name":"a/b/c","partition_key":{"name":"id","type":"S"}}`,                               // multiple slashes
+		// NUL-delimited smuggling vector (Codex P2). goccy/go-json
+		// treats raw NUL as end-of-input so dec.More() would
+		// otherwise return false; the explicit NUL scan catches it.
+		"{\"table_name\":\"u\",\"partition_key\":{\"name\":\"id\",\"type\":\"S\"}}\x00{\"extra\":1}",
+		// Lone NUL inside the JSON object — same vector, less obvious.
+		"{\"table_name\":\"u\",\"partition_key\":{\"name\":\"id\",\"type\":\"S\"}}\x00",
 	}
 	for _, body := range cases {
 		t.Run(body, func(t *testing.T) {

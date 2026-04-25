@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -359,13 +360,27 @@ func decodeCreateTableRequest(body io.Reader) (CreateTableRequest, error) {
 	if body == nil {
 		return CreateTableRequest{}, errors.New("request body is empty")
 	}
-	dec := json.NewDecoder(body)
-	dec.DisallowUnknownFields()
-	var out CreateTableRequest
-	if err := dec.Decode(&out); err != nil {
+	raw, err := io.ReadAll(body)
+	if err != nil {
 		if IsMaxBytesError(err) {
 			return CreateTableRequest{}, errors.New("request body exceeds the 64 KiB admin limit")
 		}
+		return CreateTableRequest{}, errors.New("request body could not be read")
+	}
+	// Reject any NUL byte in the body. JSON has no need for a
+	// raw NUL (control characters must be \u-escaped), and at
+	// least one of our decoders (goccy/go-json) treats a raw
+	// NUL as end-of-input, so a body like
+	// `{"table_name":...}\x00{"extra":1}` would otherwise sneak
+	// past dec.More(). Codex P2 on PR #634 flagged this as a
+	// payload-smuggling vector.
+	if bytes.IndexByte(raw, 0) >= 0 {
+		return CreateTableRequest{}, errors.New("request body contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var out CreateTableRequest
+	if err := dec.Decode(&out); err != nil {
 		return CreateTableRequest{}, errors.New("request body is not valid JSON")
 	}
 	// Reject trailing JSON tokens — `{"table_name":"a", ...}{...}`
