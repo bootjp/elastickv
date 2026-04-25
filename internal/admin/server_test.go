@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +168,163 @@ func TestServer_APIHandlerReturnsBareMux(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// newServerWithTablesForTest mirrors newServerForTest but also wires
+// in a stub TablesSource so the dynamo paths are reachable. The same
+// test setup pattern (single fixed clock, two access keys, JSON
+// logger) keeps the assertion surface compact.
+func newServerWithTablesForTest(t *testing.T, src TablesSource) *Server {
+	t.Helper()
+	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
+	signer := newSignerForTest(t, 1, clk)
+	verifier := newVerifierForTest(t, []byte{1}, clk)
+	creds := MapCredentialStore{
+		"AKIA_ADMIN": "ADMIN_SECRET",
+		"AKIA_RO":    "RO_SECRET",
+	}
+	roles := map[string]Role{
+		"AKIA_ADMIN": RoleFull,
+		"AKIA_RO":    RoleReadOnly,
+	}
+	cluster := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
+		return ClusterInfo{NodeID: "node-1", Version: "0.1.0"}, nil
+	})
+	buf := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	srv, err := NewServer(ServerDeps{
+		Signer:      signer,
+		Verifier:    verifier,
+		Credentials: creds,
+		Roles:       roles,
+		ClusterInfo: cluster,
+		Tables:      src,
+		AuthOpts:    AuthServiceOpts{Clock: clk},
+		Logger:      logger,
+	})
+	require.NoError(t, err)
+	return srv
+}
+
+// loginAndCookies completes a successful login and returns the
+// session + CSRF cookies the SPA would carry on follow-up requests.
+// Tests that exercise protected GET endpoints reuse this helper to
+// avoid copy-pasting the login dance everywhere.
+func loginAndCookies(t *testing.T, ts *httptest.Server) []*http.Cookie {
+	t.Helper()
+	body, _ := json.Marshal(loginRequest{AccessKey: "AKIA_RO", SecretKey: "RO_SECRET"})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/auth/login", strings.NewReader(string(body)))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cookies := resp.Cookies()
+	_ = resp.Body.Close()
+	return cookies
+}
+
+func TestServer_DynamoTables_RequiresSession(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"orders": {Name: "orders", PartitionKey: "id"},
+	}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		ts.URL+"/admin/api/v1/dynamo/tables", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoTables_ReadOnlyRoleAllowed(t *testing.T) {
+	// Tables list is a GET — the read-only role must succeed without
+	// any extra opt-in. This guards against accidentally bolting
+	// RequireWriteRole onto the read chain.
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"orders":   {Name: "orders", PartitionKey: "id"},
+		"products": {Name: "products", PartitionKey: "sku"},
+	}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAndCookies(t, ts)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		ts.URL+"/admin/api/v1/dynamo/tables", nil)
+	require.NoError(t, err)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var body dynamoListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, []string{"orders", "products"}, body.Tables)
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoDescribeTable_AuthenticatedHappyPath(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"orders": {
+			Name:         "orders",
+			PartitionKey: "id",
+			SortKey:      "ts",
+			Generation:   7,
+		},
+	}}
+	srv := newServerWithTablesForTest(t, src)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAndCookies(t, ts)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		ts.URL+"/admin/api/v1/dynamo/tables/orders", nil)
+	require.NoError(t, err)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got DynamoTableSummary
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "orders", got.Name)
+	require.Equal(t, "id", got.PartitionKey)
+	require.Equal(t, "ts", got.SortKey)
+	require.EqualValues(t, 7, got.Generation)
+	_ = resp.Body.Close()
+}
+
+func TestServer_DynamoTables_NilSourceFallsThroughTo404(t *testing.T) {
+	// A build that ships only the cluster page (Tables nil) must keep
+	// the dynamo paths off the wire entirely. The expected response is
+	// the standard "unknown_endpoint" JSON 404 — same as any other
+	// unregistered admin URL — so the SPA can detect the feature is
+	// disabled by HTTP status alone.
+	srv := newServerForTest(t) // built without Tables
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	cookies := loginAndCookies(t, ts)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		ts.URL+"/admin/api/v1/dynamo/tables", nil)
+	require.NoError(t, err)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "unknown_endpoint")
+	_ = resp.Body.Close()
 }
 
 func TestServer_WriteRejectsMissingCSRF(t *testing.T) {

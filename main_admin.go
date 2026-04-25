@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -66,7 +67,7 @@ type adminListenerConfig struct {
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime) error {
+func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, dynamoServer *adapter.DynamoDBServer) error {
 	if !*adminEnabled {
 		return nil
 	}
@@ -106,8 +107,72 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, buildVersion())
+	tablesSrc := newDynamoTablesSource(dynamoServer)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, buildVersion())
 	return err
+}
+
+// newDynamoTablesSource adapts *adapter.DynamoDBServer to the
+// admin.TablesSource interface. The bridge stays in this file (rather
+// than internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree (gRPC, Raft, store).
+//
+// Returns nil when dynamoServer is nil; admin.NewServer handles a nil
+// Tables field by leaving the dynamo paths off the wire entirely,
+// which is the right behaviour for builds that ship without the
+// Dynamo adapter.
+func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSource {
+	if dynamoServer == nil {
+		return nil
+	}
+	return &dynamoTablesBridge{server: dynamoServer}
+}
+
+// dynamoTablesBridge is the thin adapter that re-shapes the adapter's
+// AdminTableSummary DTO into the admin package's DynamoTableSummary.
+// The two structs are deliberately isomorphic so this translation
+// does no allocation more than necessary; if a future GSI field is
+// added on one side, the build breaks here, which is exactly the
+// drift signal we want.
+type dynamoTablesBridge struct {
+	server *adapter.DynamoDBServer
+}
+
+func (b *dynamoTablesBridge) AdminListTables(ctx context.Context) ([]string, error) {
+	return b.server.AdminListTables(ctx) //nolint:wrapcheck // pure pass-through; the adapter owns the error context.
+}
+
+func (b *dynamoTablesBridge) AdminDescribeTable(ctx context.Context, name string) (*admin.DynamoTableSummary, bool, error) {
+	summary, exists, err := b.server.AdminDescribeTable(ctx, name)
+	if err != nil {
+		return nil, false, err //nolint:wrapcheck // adapter wraps internally.
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminTableSummary(summary), true, nil
+}
+
+func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
+	out := &admin.DynamoTableSummary{
+		Name:         in.Name,
+		PartitionKey: in.PartitionKey,
+		SortKey:      in.SortKey,
+		Generation:   in.Generation,
+	}
+	if len(in.GlobalSecondaryIndexes) == 0 {
+		return out
+	}
+	out.GlobalSecondaryIndexes = make([]admin.DynamoGSISummary, len(in.GlobalSecondaryIndexes))
+	for i, g := range in.GlobalSecondaryIndexes {
+		out.GlobalSecondaryIndexes[i] = admin.DynamoGSISummary{
+			Name:           g.Name,
+			PartitionKey:   g.PartitionKey,
+			SortKey:        g.SortKey,
+			ProjectionType: g.ProjectionType,
+		}
+	}
+	return out
 }
 
 // buildAdminConfig translates flag values into an admin.Config.
@@ -144,6 +209,7 @@ func startAdminServer(
 	cfg adminListenerConfig,
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
+	tables admin.TablesSource,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -151,7 +217,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables)
 	if err != nil {
 		return "", err
 	}
@@ -191,7 +257,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -210,6 +276,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Credentials: admin.MapCredentialStore(creds),
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
+		Tables:      tables,
 		StaticFS:    nil,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,

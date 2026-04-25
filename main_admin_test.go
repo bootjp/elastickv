@@ -196,7 +196,7 @@ func TestStartAdminServer_DisabledNoOp(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
-	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, nil, "")
 	require.NoError(t, err)
 }
 
@@ -209,7 +209,7 @@ func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
 		listen:  "127.0.0.1:0",
 		// missing signing key
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, "")
 	require.Error(t, err)
 }
 
@@ -222,7 +222,7 @@ func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
 		listen:            "0.0.0.0:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS")
 }
@@ -236,7 +236,7 @@ func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
 		listen:            "127.0.0.1:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cluster info source")
 }
@@ -259,7 +259,7 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n1", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, "test")
 	require.NoError(t, err)
 
 	// Poll /admin/healthz until success or the test deadline.
@@ -302,7 +302,7 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n-tls", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, "test")
 	require.NoError(t, err)
 
 	transport := &http.Transport{TLSClientConfig: &tls.Config{

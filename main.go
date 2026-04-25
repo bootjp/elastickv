@@ -688,7 +688,12 @@ func startServers(in serversInput) error {
 	if err := runner.start(); err != nil {
 		return err
 	}
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes); err != nil {
+	// runner.start() populates runner.dynamoServer for the admin
+	// listener's SigV4-bypass entrypoints (see adapter/dynamodb_admin.go).
+	// Passing nil here would leave the admin dashboard with no
+	// access to table metadata; the admin handler answers
+	// /admin/api/v1/dynamo/* with 404 in that case.
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1037,10 +1042,10 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, error) {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
+		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
 	}
 	dynamoServer := adapter.NewDynamoDBServer(
 		dynamoL,
@@ -1067,7 +1072,7 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		}
 		return errors.WithStack(err)
 	})
-	return nil
+	return dynamoServer, nil
 }
 
 func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
@@ -1207,9 +1212,15 @@ type runtimeServerRunner struct {
 	pprofAddress    string
 	pprofToken      string
 	metricsRegistry *monitoring.Registry
+
+	// dynamoServer is populated by start() and exposed so the admin
+	// listener can call its SigV4-bypass admin entrypoints (see
+	// adapter/dynamodb_admin.go) without going through HTTP. It is
+	// nil until start() reaches the dynamo step.
+	dynamoServer *adapter.DynamoDBServer
 }
 
-func (r runtimeServerRunner) start() error {
+func (r *runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
@@ -1230,9 +1241,11 @@ func (r runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker); err != nil {
+	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
+	r.dynamoServer = dynamoServer
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
