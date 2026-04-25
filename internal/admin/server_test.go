@@ -453,6 +453,57 @@ func TestServer_DynamoDeleteTable_FullRoleHappyPath(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestServer_ServerDepsForwarderIsWired confirms that a non-nil
+// ServerDeps.Forwarder reaches the DynamoHandler so a follower-side
+// CreateTable that the source returns ErrTablesNotLeader for is
+// transparently forwarded. Without the wire, the request would 503 +
+// Retry-After:1 — the no-forwarder fallback path. With it, the
+// leader's response status (here, 201) is replayed verbatim.
+func TestServer_ServerDepsForwarderIsWired(t *testing.T) {
+	src := &notLeaderSource{}
+	fwd := &stubLeaderForwarder{createRes: &ForwardResult{
+		StatusCode:  http.StatusCreated,
+		Payload:     []byte(`{"name":"users"}`),
+		ContentType: "application/json; charset=utf-8",
+	}}
+	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
+	signer := newSignerForTest(t, 1, clk)
+	verifier := newVerifierForTest(t, []byte{1}, clk)
+	cluster := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
+		return ClusterInfo{NodeID: "node-1", Version: "0.1.0"}, nil
+	})
+	srv, err := NewServer(ServerDeps{
+		Signer:      signer,
+		Verifier:    verifier,
+		Credentials: MapCredentialStore{"AKIA_ADMIN": "ADMIN_SECRET"},
+		Roles:       map[string]Role{"AKIA_ADMIN": RoleFull},
+		ClusterInfo: cluster,
+		Tables:      src,
+		Forwarder:   fwd,
+		AuthOpts:    AuthServiceOpts{Clock: clk},
+	})
+	require.NoError(t, err)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	cookies := loginAsFullAdminAndCookies(t, ts)
+	body := strings.NewReader(`{"table_name":"users","partition_key":{"name":"id","type":"S"}}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/admin/api/v1/dynamo/tables", body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, csrfHeaderFromCookies(cookies))
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	require.Equal(t, "users", fwd.lastCreateInput.TableName,
+		"forwarder must be invoked when source returns ErrTablesNotLeader")
+	_ = resp.Body.Close()
+}
+
 func TestServer_WriteRejectsMissingCSRF(t *testing.T) {
 	// Login to obtain a session, then hit cluster with POST to trigger
 	// CSRF on what the router normally rejects as method_not_allowed.

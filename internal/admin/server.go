@@ -39,6 +39,14 @@ type ServerDeps struct {
 	// cluster page deploy without standing up the dynamo bridge.
 	Tables TablesSource
 
+	// Forwarder is the LeaderForwarder that the Dynamo handler hands
+	// off ErrTablesNotLeader writes to (design 3.3, AdminForward).
+	// Optional: a nil value disables follower→leader forwarding, in
+	// which case the handler surfaces 503 + Retry-After: 1 directly.
+	// Single-node and leader-only deployments leave this nil; multi-
+	// node clusters wire the production gRPC client.
+	Forwarder LeaderForwarder
+
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
 	// /admin/assets/* and the SPA fallback in that case.
@@ -110,9 +118,13 @@ func NewServer(deps ServerDeps) (*Server, error) {
 		// operators must restart the listener for revocation to
 		// take effect, but the JWT no longer extends a revoked
 		// key past the next request.
-		dynamo = NewDynamoHandler(deps.Tables).
+		dynamoHandler := NewDynamoHandler(deps.Tables).
 			WithLogger(logger).
 			WithRoleStore(MapRoleStore(deps.Roles))
+		if deps.Forwarder != nil {
+			dynamoHandler = dynamoHandler.WithLeaderForwarder(deps.Forwarder)
+		}
+		dynamo = dynamoHandler
 	}
 	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, logger)
 	router := NewRouter(mux, deps.StaticFS)
