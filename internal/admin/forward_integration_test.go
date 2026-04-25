@@ -63,7 +63,10 @@ func (s *notLeaderSource) AdminDeleteTable(_ context.Context, _ AuthPrincipal, _
 
 func newFollowerHandler(t *testing.T, fwd LeaderForwarder) *DynamoHandler {
 	t.Helper()
-	src := &notLeaderSource{stubTablesSource: stubTablesSource{tables: map[string]*DynamoTableSummary{}}}
+	// notLeaderSource overrides the write methods to unconditionally
+	// return ErrTablesNotLeader, so the embedded stubTablesSource
+	// never reads its tables map.
+	src := &notLeaderSource{}
 	h := NewDynamoHandler(src)
 	if fwd != nil {
 		h = h.WithLeaderForwarder(fwd)

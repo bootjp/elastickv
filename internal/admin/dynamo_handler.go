@@ -119,8 +119,10 @@ var (
 	// role required for the operation. Maps to 403.
 	ErrTablesForbidden = errors.New("admin tables: principal lacks required role")
 	// ErrTablesNotLeader is returned when the local node is not the
-	// Raft leader. Maps to 503 + Retry-After: 1 today; the future
-	// AdminForward RPC catches this as the trigger to forward.
+	// Raft leader. When a LeaderForwarder is configured,
+	// tryForwardCreate / tryForwardDelete catch this before it reaches
+	// writeTablesError and forward the request to the leader
+	// transparently. Without a forwarder, maps to 503 + Retry-After: 1.
 	ErrTablesNotLeader = errors.New("admin tables: local node is not the raft leader")
 	// ErrTablesNotFound is returned when DELETE / DESCRIBE / a
 	// follow-up read targets a table that does not exist. Maps to
