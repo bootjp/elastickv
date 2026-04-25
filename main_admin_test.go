@@ -393,6 +393,28 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	}
 }
 
+// TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
+// the false-positive class Codex P2 flagged: a message that
+// happens to contain a leader phrase NOT at the suffix must NOT
+// be classified as leader-churn. Switching from strings.Contains
+// to strings.HasSuffix is what makes this test pass.
+func TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
+	cases := []string{
+		// Phrase mid-message — kv-internal sentinels never look
+		// like this; they always end with the canonical phrase.
+		"not leader: actually a downstream error",
+		"leader not found, but recovered automatically",
+		"leadership lost mid-snapshot, retried successfully",
+	}
+	for _, msg := range cases {
+		t.Run(msg, func(t *testing.T) {
+			out := translateAdminTablesError(errors.New(msg))
+			require.NotErrorIs(t, out, admin.ErrTablesNotLeader,
+				"mid-message leader phrase %q must not classify as leader-churn", msg)
+		})
+	}
+}
+
 // TestTranslateAdminTablesError_UnrelatedErrorPassesThrough confirms
 // the leader-churn detector does not swallow unrelated errors that
 // happen to mention the word "leader" outside the canonical phrases.

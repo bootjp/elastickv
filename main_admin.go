@@ -224,17 +224,16 @@ func translateAdminTablesError(err error) error {
 		return nil
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrTablesForbidden
-	case errors.Is(err, adapter.ErrAdminNotLeader),
-		isLeaderChurnError(err):
-		// Cover both the up-front isVerifiedDynamoLeader check
-		// and leader-churn during Dispatch — the kv coordinator
-		// can drop leadership between AdminCreateTable's initial
-		// guard and its createTableWithRetry call, returning
-		// transient leader errors that should still surface as
-		// 503 leader_unavailable + Retry-After: 1 (Codex P2 on
-		// PR #634). Without this, churn shows up as a generic
-		// 500 and the retry contract for write paths is broken.
+	case errors.Is(err, adapter.ErrAdminNotLeader):
 		return admin.ErrTablesNotLeader
+	// Check structured adapter errors BEFORE the leader-churn
+	// matcher: a ValidationException whose message contains
+	// "not leader" (e.g., a user-supplied attribute name like
+	// `not leader` triggering the conflicting-attribute-type
+	// validator) must be classified as 400 invalid_request, not
+	// 503 leader_unavailable. The kv-internal sentinel checks
+	// in isLeaderChurnError still catch real leadership churn
+	// because they are typed-sentinel matches, not substring.
 	case adapter.IsAdminTableAlreadyExists(err):
 		return admin.ErrTablesAlreadyExists
 	case adapter.IsAdminTableNotFound(err):
@@ -245,6 +244,14 @@ func translateAdminTablesError(err error) error {
 			msg = "validation failed"
 		}
 		return &admin.ValidationError{Message: msg}
+	case isLeaderChurnError(err):
+		// Cover leader-churn that surfaces between the up-front
+		// isVerifiedDynamoLeader check and createTableWithRetry's
+		// dispatch — the kv coordinator can drop leadership in
+		// that window and the resulting transient error should
+		// surface as 503 leader_unavailable + Retry-After: 1
+		// rather than a generic 500. Codex P2 on PR #634.
+		return admin.ErrTablesNotLeader
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
@@ -256,13 +263,16 @@ func translateAdminTablesError(err error) error {
 // closed list in kv.leaderErrorPhrases — keep them in sync if a
 // new sentinel is added on the kv side.
 //
-// Checking against the typed sentinels (kv.ErrLeaderNotFound and
-// adapter.ErrNotLeader / adapter.ErrLeaderNotFound) covers the
-// in-process path; the wire-string fallback catches the same
-// errors when they have crossed a gRPC boundary and lost their
-// type. A focused match — substring on the canonical phrases
-// rather than any "leader" mention — keeps unrelated errors that
-// happen to mention leadership out of the 503 path.
+// Phrase matching uses HasSuffix (not Contains) on the standard
+// canonical strings because every kv-internal sentinel emits the
+// phrase at the END of its error chain (e.g.,
+// "raft engine: not leader", "dispatch failed: leader not found").
+// A user-supplied string that happens to contain a leader phrase
+// in the MIDDLE of an unrelated error message therefore does not
+// false-positive — Codex P2 on PR #634 flagged the original
+// strings.Contains form for misclassifying validation messages
+// like "conflicting attribute type for <user-name>" when the
+// name itself was "not leader".
 func isLeaderChurnError(err error) bool {
 	if err == nil {
 		return false
@@ -273,10 +283,10 @@ func isLeaderChurnError(err error) bool {
 		return true
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "not leader") ||
-		strings.Contains(msg, "leader not found") ||
-		strings.Contains(msg, "leadership lost") ||
-		strings.Contains(msg, "leadership transfer in progress")
+	return strings.HasSuffix(msg, "not leader") ||
+		strings.HasSuffix(msg, "leader not found") ||
+		strings.HasSuffix(msg, "leadership lost") ||
+		strings.HasSuffix(msg, "leadership transfer in progress")
 }
 
 func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
