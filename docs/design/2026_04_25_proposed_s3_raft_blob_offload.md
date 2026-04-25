@@ -74,9 +74,22 @@ themselves*.
   offload uses Pebble itself plus a peer-to-peer fetch protocol;
   introducing an external dependency would re-create the operational
   surface elastickv exists to replace.
-- No deduplication across objects. Each `(bucket, objectKey,
-  uploadID, partNo, chunkNo)` keeps its own key. Real S3 also does
-  not deduplicate at this layer.
+- No *user-facing* deduplication API or storage-accounting credit.
+  The `chunkblob` keyspace is content-addressed by SHA-256 (§3.1)
+  and reference-counted (§3.5), which means two distinct objects
+  whose chunks happen to hash identically will share one
+  `chunkblob` row at the storage layer — that is a structural
+  property of content addressing, not a feature we expose. We do
+  *not*: surface dedup ratios, charge storage by post-dedup bytes,
+  rebalance dedup credit across tenants, or treat dedup hits as
+  semantically observable from S3 verbs. The reference layer
+  (`chunkref`) keeps `(bucket, objectKey, uploadID, partNo,
+  chunkNo)` granular and per-object, so DELETE / lifecycle still
+  reason about objects independently. Authorisation enforcement
+  remains on `chunkref` reads, never on `chunkblob` reads
+  (§3.3 covers the proxy-on-miss path; ACL checks fire before the
+  blob fetch is initiated, so a tenant cannot dereference a peer's
+  `chunkblob` by guessing a SHA — see §6 *Cross-tenant blob fetch*).
 - No change to MVCC semantics. Manifest commits remain the
   serialisation point; blob fetch is a side channel that does not
   change visibility rules.
@@ -309,6 +322,21 @@ Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=
   peers asynchronously before returning 200 (e.g. quorum write
   outside of Raft). N defaults to 2 (one extra copy = parity with
   Raft's quorum durability).
+- **Cross-tenant blob fetch via SHA-256 guessing.** Because
+  `chunkblob` keys are SHA-256-addressed, *if* a malicious tenant
+  could (a) guess a victim tenant's chunk SHA and (b) bypass
+  authorisation, they could exfiltrate the chunk. SHA-256 guessing
+  is computationally infeasible for non-trivial content, but we
+  remove the second prerequisite by enforcing authorisation
+  *exclusively at the `chunkref` layer*. The `S3BlobFetch.FetchChunkBlob`
+  RPC is internal-only (raft-transport credentials, not exposed to
+  S3 clients); user-facing GET resolves through `chunkref` first,
+  which carries the bucket / key tenancy context, and only after
+  the ACL check does the server proxy to a peer for the
+  corresponding `chunkblob`. A future design that exposes
+  blob fetch on a public surface would need to reintroduce
+  tenant-scoped authorisation at the blob layer; this proposal
+  intentionally does not.
 
 ## 7. Out of scope (future work)
 
