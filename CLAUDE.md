@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Elastickv is an experimental, cloud-oriented distributed key-value store written in Go (module `github.com/bootjp/elastickv`, Go 1.25+). It exposes multiple wire protocols (gRPC RawKV/Transactional, Redis, DynamoDB-compatible HTTP, S3-compatible HTTP) on top of a Raft-replicated, MVCC/OCC storage engine. **Not production-ready.**
+Elastickv is an experimental, cloud-oriented distributed key-value store written in Go (module `github.com/bootjp/elastickv`, Go 1.25.0 with `toolchain go1.26.2`). It exposes multiple wire protocols (gRPC RawKV/Transactional, Redis, DynamoDB-compatible HTTP, S3-compatible HTTP) on top of a Raft-replicated, MVCC/OCC storage engine. **Not production-ready.**
 
 ## Common Commands
 
@@ -59,7 +59,7 @@ The full diagrams live in `docs/architecture_overview.md` — read it before non
 - **Replication (`internal/raftengine/`, `kv/fsm.go`)** — Only backend is `etcd/raft` under `internal/raftengine/etcd` (the hashicorp backend was dropped in `a35245a`; the `--raftEngine` flag still advertises `hashicorp` in `main.go` but `newRaftFactory` rejects anything other than `etcd`). Each Raft data dir contains a `raft-engine` marker so the process refuses to reopen a dir under a different backend. Note: README and `docs/etcd_raft_migration_operations.md` still reference `go run ./cmd/etcd-raft-migrate`, but that directory was deleted in `a35245a` — the migrator is no longer in-tree. The KV FSM (`kv/fsm.go`) applies committed entries to the storage layer and to the HLC ceiling.
 - **Storage (`store/`)** — MVCC over Pebble (`mvcc_store.go`, `lsm_store.go`); OCC, TTL/expiry, snapshots (`snapshot_pebble.go`), and per-type helpers for Redis collections (`hash_helpers.go`, `list_helpers.go`, `set_helpers.go`, `zset_helpers.go`, `stream_helpers.go`).
 - **Control plane (`distribution/`)** — Durable route catalog persisted in reserved keys of the **default Raft group**. `engine.go` is the read-side cache; `watcher.go` polls the catalog and applies versioned snapshots into the engine; `catalog.go` is the storage layer. Operator RPCs (`ListRoutes`, `SplitRange` — same-group split only) are on `proto.Distribution`. **All routing decisions read from the cached `RouteEngine`, not from the catalog directly.**
-- **Timestamp Oracle (`kv/hlc.go`, `kv/hlc_wall.go`)** — 64-bit HLC: 48-bit physical (Unix ms) + 16-bit logical. The logical half advances in-memory via atomic CAS — no Raft round-trip per `Next()`. The physical half is bounded by a leader-lease ceiling: leader periodically (`hlcRenewalInterval ≈ 1s`, window `hlcPhysicalWindowMs = 3s`) commits a lease entry replicated through the default Raft group; FSM apply calls `SetPhysicalCeiling`. The coordinator and FSM **must share the same `*HLC`** (wired via `WithHLC` / `NewKvFSMWithHLC`).
+- **Timestamp Oracle (`kv/hlc.go`, `kv/hlc_wall.go`)** — 64-bit HLC: 48-bit physical (Unix ms) + 16-bit logical. The logical half advances in-memory via atomic CAS — no Raft round-trip per `Next()`. The physical half is bounded by a leader-lease ceiling: leader periodically (`hlcRenewalInterval = 1s`, window `hlcPhysicalWindowMs = 3s`) commits a lease entry replicated through the default Raft group; FSM apply calls `SetPhysicalCeiling`. The coordinator and FSM **must share the same `*HLC`** (wired via `WithHLC` / `NewKvFSMWithHLC`).
 - **Process entrypoints** — `main.go` is the multi-binary server (gRPC + Redis + DynamoDB + S3 + admin + metrics + pprof). `cmd/server/demo.go` is a single-process 3-node demo. `cmd/client/`, `cmd/redis-proxy/`, `cmd/elastickv-admin/`, and `cmd/raftadmin/` are standalone tools. `multiraft_runtime.go` and `shard_config.go` wire shard groups to addresses for multi-group deployments.
 
 ## Conventions
@@ -71,6 +71,7 @@ The full diagrams live in `docs/architecture_overview.md` — read it before non
 - After changes to replication, MVCC, OCC, or the Redis adapter, run the relevant Jepsen suite — these are the integration-level safety net.
 - HLC: do **not** issue persistence timestamps from non-leader nodes; OCC decisions assume leader-issued ts. Keep wall clocks reasonably synchronized across nodes.
 - Route catalog mutations must go through `SplitRange` (or future control-plane RPCs) so the catalog version bumps and watchers fan out — never write catalog keys directly.
+- Commits: short imperative summary, optional scope prefix matching the touched area (`store:`, `adapter:`, `kv:`, `docs:`, …). PR descriptions should call out behavior change, risk, and the test evidence (`go test`, `make lint`, relevant Jepsen suite).
 
 ## Design Documents
 
