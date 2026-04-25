@@ -168,15 +168,22 @@ func (e *ValidationError) Error() string {
 // — the JWT freezes the role at login time, and tokens last one
 // hour. Codex P1 on PR #635 flagged the gap on the HTTP path;
 // the forward server already does this re-evaluation on its side.
+//
+// When the source returns ErrTablesNotLeader and a LeaderForwarder
+// is configured, write requests are forwarded to the leader
+// transparently — the SPA sees a leader-direct response shape
+// regardless of which node it hit (design Section 3.3 criterion 2).
 type DynamoHandler struct {
-	source TablesSource
-	roles  RoleStore
-	logger *slog.Logger
+	source    TablesSource
+	roles     RoleStore
+	forwarder LeaderForwarder
+	logger    *slog.Logger
 }
 
 // NewDynamoHandler binds the source and seeds logging with
-// slog.Default(). Use WithLogger to attach a tagged logger and
-// WithRoleStore to plug in the live access-key role lookup.
+// slog.Default(). Use WithLogger to attach a tagged logger,
+// WithRoleStore to plug in the live access-key role lookup, and
+// WithLeaderForwarder to plug in the follower→leader forwarder.
 func NewDynamoHandler(source TablesSource) *DynamoHandler {
 	return &DynamoHandler{source: source, logger: slog.Default()}
 }
@@ -198,6 +205,16 @@ func (h *DynamoHandler) WithLogger(l *slog.Logger) *DynamoHandler {
 // production wiring in main_admin.go always sets this.
 func (h *DynamoHandler) WithRoleStore(r RoleStore) *DynamoHandler {
 	h.roles = r
+	return h
+}
+
+// WithLeaderForwarder enables transparent follower→leader
+// forwarding. Without it, write requests on a follower fall back
+// to the standard 503 leader_unavailable response. Production
+// wires this to the gRPCForwardClient in main_admin.go; tests
+// inject a stub.
+func (h *DynamoHandler) WithLeaderForwarder(f LeaderForwarder) *DynamoHandler {
+	h.forwarder = f
 	return h
 }
 
@@ -313,10 +330,46 @@ func (h *DynamoHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	summary, err := h.source.AdminCreateTable(r.Context(), principal, body)
 	if err != nil {
+		// On a follower, the source returns ErrTablesNotLeader. If
+		// a forwarder is wired, dispatch to the leader and re-emit
+		// the leader's response verbatim — the SPA cannot tell the
+		// difference between a leader-direct call and a forwarded
+		// one. Without a forwarder, fall through to the standard
+		// 503 leader_unavailable response.
+		if h.tryForwardCreate(w, r, principal, body, err) {
+			return
+		}
 		h.writeTablesError(w, r, "create", err)
 		return
 	}
 	writeAdminJSONStatus(w, r.Context(), h.logger, http.StatusCreated, summary)
+}
+
+// tryForwardCreate handles the follower→leader forwarding path
+// for POST /tables. Returns true when the response has been
+// written (regardless of forward success/failure); the caller
+// should then return without further processing.
+//
+// The "fall through to 503" path runs only when:
+//   - the source error is something other than ErrTablesNotLeader,
+//   - or no LeaderForwarder was configured,
+//   - or the forwarder itself returned ErrLeaderUnavailable
+//     (election in progress on the leader, criterion 3).
+//
+// Any other forwarder failure (gRPC transport error, etc.) is
+// also surfaced as 503 + Retry-After: 1 so the SPA can re-issue.
+// We log the raw error for operators and never echo it to clients.
+func (h *DynamoHandler) tryForwardCreate(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, body CreateTableRequest, sourceErr error) bool {
+	if !errors.Is(sourceErr, ErrTablesNotLeader) || h.forwarder == nil {
+		return false
+	}
+	res, err := h.forwarder.ForwardCreateTable(r.Context(), principal, body)
+	if err != nil {
+		h.writeForwardFailure(w, r, "create", err)
+		return true
+	}
+	h.writeForwardResult(w, r, res)
+	return true
 }
 
 // handleDelete is the DELETE /tables/{name} handler. Success is
@@ -332,6 +385,9 @@ func (h *DynamoHandler) handleDelete(w http.ResponseWriter, r *http.Request, nam
 		return
 	}
 	if err := h.source.AdminDeleteTable(r.Context(), principal, name); err != nil {
+		if h.tryForwardDelete(w, r, principal, name, err) {
+			return
+		}
 		h.writeTablesError(w, r, "delete", err)
 		return
 	}
@@ -388,6 +444,66 @@ func (h *DynamoHandler) principalForWrite(w http.ResponseWriter, r *http.Request
 		principal.Role = liveRole
 	}
 	return principal, true
+}
+
+// tryForwardDelete is the DELETE counterpart of tryForwardCreate.
+// Same semantics: only the ErrTablesNotLeader source error
+// triggers forwarding, and only when a forwarder is configured.
+func (h *DynamoHandler) tryForwardDelete(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, name string, sourceErr error) bool {
+	if !errors.Is(sourceErr, ErrTablesNotLeader) || h.forwarder == nil {
+		return false
+	}
+	res, err := h.forwarder.ForwardDeleteTable(r.Context(), principal, name)
+	if err != nil {
+		h.writeForwardFailure(w, r, "delete", err)
+		return true
+	}
+	h.writeForwardResult(w, r, res)
+	return true
+}
+
+// writeForwardResult re-emits the leader's structured response
+// verbatim. Status, payload, and content-type all come from the
+// gRPC response so a forwarded request looks identical to a
+// leader-direct call from the SPA's point of view.
+func (h *DynamoHandler) writeForwardResult(w http.ResponseWriter, r *http.Request, res *ForwardResult) {
+	w.Header().Set("Content-Type", res.ContentType)
+	w.Header().Set("Cache-Control", "no-store")
+	// 503 from the leader (e.g. it stepped down mid-request) must
+	// carry Retry-After so the client retries; preserve the
+	// criterion-3 contract on the wire whether the 503 originated
+	// here or at the leader.
+	if res.StatusCode == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	w.WriteHeader(res.StatusCode)
+	if len(res.Payload) > 0 {
+		if _, err := w.Write(res.Payload); err != nil {
+			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin forward response write failed",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+}
+
+// writeForwardFailure handles forwarder errors that did not
+// produce a structured leader response: ErrLeaderUnavailable
+// (election in flight) and gRPC transport errors. Both surface as
+// 503 + Retry-After: 1 — the SPA's retry contract is identical
+// regardless of whether the leader is briefly absent or the
+// network hiccupped.
+func (h *DynamoHandler) writeForwardFailure(w http.ResponseWriter, r *http.Request, op string, err error) {
+	if !errors.Is(err, ErrLeaderUnavailable) {
+		// Not the "no leader known" case — log the raw error so
+		// operators can investigate. Client still sees the same
+		// 503 + Retry-After so they retry uniformly.
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" forward failed",
+			slog.String("error", err.Error()),
+		)
+	}
+	w.Header().Set("Retry-After", "1")
+	writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+		"raft leader currently unavailable; retry shortly")
 }
 
 // writeTablesError translates a TablesSource error into the
