@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Elastickv is an experimental, cloud-oriented distributed key-value store written in Go (module `github.com/bootjp/elastickv`, Go 1.25.0 with `toolchain go1.26.2`). It exposes multiple wire protocols (gRPC RawKV/Transactional, Redis, DynamoDB-compatible HTTP, S3-compatible HTTP) on top of a Raft-replicated, MVCC/OCC storage engine. **Not production-ready.**
+Elastickv is an experimental, cloud-oriented distributed key-value store written in Go (module `github.com/bootjp/elastickv`, Go 1.25.0 with `toolchain go1.26.2`). It exposes multiple wire protocols (gRPC RawKV/Transactional, Redis, DynamoDB-compatible HTTP, S3-compatible HTTP, SQS-compatible HTTP) on top of a Raft-replicated, MVCC/OCC storage engine. **Not production-ready.**
 
 ## Common Commands
 
@@ -54,7 +54,7 @@ Pre-commit hook (runs `make lint`) is opt-in: `git config --local core.hooksPath
 
 The full diagrams live in `docs/architecture_overview.md` — read it before non-trivial changes touching coordination, replication, or routing. Big picture:
 
-- **Adapters (`adapter/`)** — Per-protocol ingress: `redis.go`, `dynamodb.go`, `grpc.go`, `s3.go`, `distribution_server.go` (operator/control plane). `redis_proxy.go` and the standalone `cmd/redis-proxy/` implement a phased Redis-to-Elastickv migration proxy with dual-write/shadow-read modes (see `proxy/`).
+- **Adapters (`adapter/`)** — Per-protocol ingress: `redis.go`, `dynamodb.go`, `grpc.go`, `s3.go`, `sqs.go` (with `sqs_auth.go` / `sqs_catalog.go` / `sqs_keys.go` / `sqs_messages.go`), `distribution_server.go` (operator/control plane). The S3 and SQS adapters share the SigV4 path (`sigv4.go`, `s3_auth.go`, `sqs_auth.go`) and static-credentials loader. `redis_proxy.go` and the standalone `cmd/redis-proxy/` implement a phased Redis-to-Elastickv migration proxy with dual-write/shadow-read modes (see `proxy/`).
 - **Data plane (`kv/`)** — `ShardedCoordinator` (`sharded_coordinator.go`) is the entry point all adapters dispatch into. It resolves keys via `ShardRouter` (`shard_router.go`) against the in-memory `RouteEngine` cache, then drives `ShardStore` (`shard_store.go`) per Raft group. Transactions live in `transaction.go` / `txn_codec.go`; OCC and lock resolution in `lock_resolver.go`. Leader-only reads go through `lease_state.go`.
 - **Replication (`internal/raftengine/`, `kv/fsm.go`)** — Only backend is `etcd/raft` under `internal/raftengine/etcd` (the hashicorp backend was dropped in `a35245a`; the `--raftEngine` flag still advertises `hashicorp` in `main.go` but `newRaftFactory` rejects anything other than `etcd`). Each Raft data dir contains a `raft-engine` marker so the process refuses to reopen a dir under a different backend. Note: README and `docs/etcd_raft_migration_operations.md` still reference `go run ./cmd/etcd-raft-migrate`, but that directory was deleted in `a35245a` — the migrator is no longer in-tree. The KV FSM (`kv/fsm.go`) applies committed entries to the storage layer and to the HLC ceiling.
 - **Storage (`store/`)** — MVCC over Pebble (`mvcc_store.go`, `lsm_store.go`); OCC, TTL/expiry, snapshots (`snapshot_pebble.go`), and per-type helpers for Redis collections (`hash_helpers.go`, `list_helpers.go`, `set_helpers.go`, `zset_helpers.go`, `stream_helpers.go`).
@@ -63,7 +63,7 @@ The full diagrams live in `docs/architecture_overview.md` — read it before non
   - **Physical (upper 48 bits) — Raft-agreed.** The leader periodically (`hlcRenewalInterval = 1s`, window `hlcPhysicalWindowMs = 3s`) proposes a ceiling entry through the default Raft group; FSM apply on every node calls `SetPhysicalCeiling`. `Next()` clamps the physical half to `max(wall_ms, ceiling_ms)`, so a newly elected leader can never issue a timestamp inside the previous leader's lease window.
   - **Logical (lower 16 bits) — in-memory only.** Advanced by atomic CAS on each `Next()` call; **no Raft round-trip and no consensus per timestamp**. This is what keeps issuance in the nanosecond range.
   - The coordinator and FSM **must share the same `*HLC`** instance (wired via `WithHLC` / `NewKvFSMWithHLC`) so the in-memory counter and the replicated ceiling stay coupled.
-- **Process entrypoints** — `main.go` is the multi-binary server (gRPC + Redis + DynamoDB + S3 + admin + metrics + pprof). `cmd/server/demo.go` is a single-process 3-node demo. `cmd/client/`, `cmd/redis-proxy/`, `cmd/elastickv-admin/`, and `cmd/raftadmin/` are standalone tools. `multiraft_runtime.go` and `shard_config.go` wire shard groups to addresses for multi-group deployments.
+- **Process entrypoints** — `main.go` is the multi-binary server (gRPC + Redis + DynamoDB + S3 + SQS + admin + metrics + pprof). Per-protocol bootstrapping is split into `main_s3.go` and `main_sqs.go`; SigV4 static credentials load via `main_sigv4_creds.go`. SQS exposure is opt-in via `--sqsAddress` (with `--sqsRegion` and `--sqsCredentialsFile`); leave `--sqsAddress` empty to disable. `cmd/server/demo.go` is a single-process 3-node demo. `cmd/client/`, `cmd/redis-proxy/`, `cmd/elastickv-admin/`, and `cmd/raftadmin/` are standalone tools. `multiraft_runtime.go` and `shard_config.go` wire shard groups to addresses for multi-group deployments (`--raftRedisMap`, `--raftDynamoMap`, `--raftS3Map`, `--raftSqsMap`).
 
 ## Conventions
 
