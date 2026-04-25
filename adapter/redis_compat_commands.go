@@ -3702,10 +3702,34 @@ func nextXAddID(hasLast bool, lastMs, lastSeq uint64, requested string) (string,
 		}
 		return requested, nil
 	}
+	return autoXAddID(safeUnixMilliToUint64(time.Now().UnixMilli()), hasLast, lastMs, lastSeq)
+}
 
-	nowMs := safeUnixMilliToUint64(time.Now().UnixMilli())
+// autoXAddID resolves XADD '*' to a concrete stream ID given a wall-clock
+// nowMs. Pulled out of nextXAddID so the auto-ID branch is testable
+// without depending on time.Now() — the only un-injectable dependency is
+// already isolated in the caller.
+//
+// Two corner cases the caller cannot rely on the wall clock to avoid:
+//
+//   - nowMs == 0 on a fresh stream (!hasLast). A naive "<nowMs>-0" reply
+//     yields "0-0", which Redis explicitly rejects as a stream ID and
+//     which XREAD ... 0 would treat as the empty after-marker. Bump the
+//     seq to 1 so the first auto-generated entry is "0-1" — strictly
+//     greater than 0-0 and reachable via XREAD ... 0. (This case fires
+//     only when safeUnixMilliToUint64 clamped a pre-epoch clock to 0;
+//     under any sane clock, nowMs is well above 0.)
+//
+//   - nowMs <= lastMs. Advance past lastMs/lastSeq via bumpStreamID so
+//     the stream stays strictly monotonic even across a backwards clock
+//     step or a corrupted meta where lastMs is far in the future.
+func autoXAddID(nowMs uint64, hasLast bool, lastMs, lastSeq uint64) (string, error) {
 	if !hasLast || nowMs > lastMs {
-		return strconv.FormatUint(nowMs, 10) + "-0", nil
+		seq := uint64(0)
+		if nowMs == 0 {
+			seq = 1
+		}
+		return strconv.FormatUint(nowMs, 10) + "-" + strconv.FormatUint(seq, 10), nil
 	}
 	// Either nowMs == lastMs (same millisecond), or lastMs is in the future
 	// (monotonic guarantee across a backwards clock step or a corrupted

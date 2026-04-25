@@ -338,3 +338,58 @@ func TestSafeUnixMilliToUint64(t *testing.T) {
 		})
 	}
 }
+
+// TestAutoXAddID covers the XADD '*' path of nextXAddID with synthetic
+// nowMs values, including the Codex P2 / Gemini-medium edge case:
+// safeUnixMilliToUint64 clamps a pre-epoch clock to 0, and a naive
+// "0-0" auto-ID is rejected by Redis (XREAD ... 0 treats it as the
+// after-marker and skips it). autoXAddID must bump seq to 1 in that
+// case so the first auto-generated entry is "0-1".
+func TestAutoXAddID(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		nowMs   uint64
+		hasLast bool
+		lastMs  uint64
+		lastSeq uint64
+		want    string
+		wantErr bool
+	}{
+		// Fresh stream, healthy clock: nowMs > 0, seq starts at 0.
+		{"fresh stream, sane clock", 1_777_000_000_000, false, 0, 0, "1777000000000-0", false},
+		// Fresh stream, clock pre-epoch (clamped to 0): MUST yield 0-1
+		// rather than 0-0 — the original Codex P2 / Gemini-medium case.
+		{"fresh stream, clamped clock → 0-1", 0, false, 0, 0, "0-1", false},
+		// Existing stream, nowMs strictly greater: seq resets to 0.
+		{"clock advanced past lastMs", 200, true, 100, 5, "200-0", false},
+		// Existing stream, nowMs == lastMs: bumpStreamID seq carry.
+		{"same ms as lastMs", 100, true, 100, 5, "100-6", false},
+		// Existing stream, nowMs < lastMs (clock went backwards):
+		// bumpStreamID carries from lastMs/lastSeq, NOT from nowMs.
+		{"clock behind lastMs", 50, true, 100, 5, "100-6", false},
+		// seq at MaxUint64 carries to ms+1.
+		{"seq at max carries", 100, true, 100, ^uint64(0), "101-0", false},
+		// Both ms and seq at MaxUint64: ID space exhausted, error.
+		{"ID space exhausted", 100, true, ^uint64(0), ^uint64(0), "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := autoXAddID(tc.nowMs, tc.hasLast, tc.lastMs, tc.lastSeq)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("autoXAddID(%d,%v,%d,%d): expected error, got %q", tc.nowMs, tc.hasLast, tc.lastMs, tc.lastSeq, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("autoXAddID(%d,%v,%d,%d): unexpected error %v", tc.nowMs, tc.hasLast, tc.lastMs, tc.lastSeq, err)
+			}
+			if got != tc.want {
+				t.Fatalf("autoXAddID(%d,%v,%d,%d): want %q, got %q", tc.nowMs, tc.hasLast, tc.lastMs, tc.lastSeq, tc.want, got)
+			}
+		})
+	}
+}
