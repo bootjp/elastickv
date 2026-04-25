@@ -133,11 +133,15 @@ const (
     // memtables.
     s3PutAdmissionMaxInflightBytes = 256 << 20 // 256 MiB
     // dispatchAdmissionTimeout is how long a per-batch flush will wait
-    // for a slot before giving up. Sized comfortably above the Raft
-    // in-flight queue's drain time at 1 Gbps (1024 × 4 MiB / 125 MB/s
-    // ≈ 33 s) so a transient stall does not surface as 503; longer
-    // stalls indicate the cluster is genuinely overloaded and rejection
-    // is the right signal.
+    // for a slot before giving up. The 256 MiB cap drains in ~2 s at
+    // 1 Gbps under steady-state Raft throughput (256 MiB / 125 MB/s),
+    // so 30 s is *not* sized against normal drain — it is the budget
+    // for a transiently stalled follower (GC pause, slow disk fsync,
+    // bounded leader re-election) to recover before we conclude the
+    // cluster is genuinely overloaded. Longer stalls surface as 503,
+    // which is the right signal: at that point the right action is
+    // operator intervention (scale out, investigate the stall), not
+    // continued accumulation.
     dispatchAdmissionTimeout = 30 * time.Second
 )
 ```
@@ -162,25 +166,54 @@ type putAdmission struct {
 
 func newPutAdmission(maxBytes int64) *putAdmission { … }
 
-// reserve charges (bytes) units against the semaphore. Returns a
-// release closure that the caller MUST call exactly once. Returns
-// ErrAdmissionExhausted if the deadline elapses before the budget
-// is available.
-func (a *putAdmission) reserve(ctx context.Context, bytes int64) (func(), error) { … }
+// peekHeadroom is admission A. It returns ErrAdmissionExhausted
+// without acquiring slots when the requested byte count exceeds
+// the *current* free capacity of the semaphore. It does NOT take
+// out a reservation — the only effect is "fail fast at request
+// entry instead of partway through the body" — so it cannot
+// double-count against admission B.
+func (a *putAdmission) peekHeadroom(bytes int64) error { … }
+
+// acquire is admission B. It blocks until (bytes / s3ChunkSize)
+// slots are available or ctx fires. The returned release closure
+// MUST be called exactly once. If `bytes > capacity * s3ChunkSize`
+// (a malformed client whose frame exceeds the entire budget),
+// returns ErrAdmissionExhausted *immediately* without waiting —
+// otherwise we would block until ctx (typically
+// dispatchAdmissionTimeout) for a request that can never fit.
+func (a *putAdmission) acquire(ctx context.Context, bytes int64) (func(), error) { … }
 ```
 
-`reserve` is non-trivial because we need partial-charge semantics:
+The two-step contract avoids the double-charge / unbounded-window
+hazard the obvious "A is also an acquire" design would have:
 
-1. Pre-charge `Content-Length` total at request entry (admission A).
-   The release fires in a deferred handler on the request goroutine
-   regardless of success / failure.
-2. Per-batch sub-lease (admission B) is *not* a separate budget — it's
-   a synchronisation primitive on the existing semaphore. The PUT
-   handler acquires `s3ChunkSize × s3ChunkBatchOps = 4 MiB` units
-   before reading the next 4 MiB window from the body and releases
-   them on `coordinator.Dispatch` ack. This way the same budget covers
-   both the "request is in flight" and "this batch is buffered for
-   Raft" phases.
+1. **Admission A — request-entry headroom check (peek only).** When
+   a PUT arrives with `Content-Length: N`, the handler calls
+   `peekHeadroom(N)`. If the result is `ErrAdmissionExhausted`,
+   reply 503 immediately and never read from the body. If `nil`,
+   admission A is done — no slots have been taken out of the
+   semaphore. This is intentionally racy with concurrent PUTs:
+   admission A only promises "at the moment we asked, the budget
+   *would have fit* this request"; it does not reserve the budget.
+2. **Admission B — per-batch acquire/release (the only path that
+   touches the semaphore).** The PUT handler then loops the body
+   in `s3ChunkSize × s3ChunkBatchOps = 4 MiB` windows; each window
+   acquires 4 MiB worth of slots via `acquire`, reads the next
+   window from the body, dispatches, and releases on Dispatch
+   ack. This is the bound that actually holds — at any instant the
+   sum of held slots across all in-flight PUTs cannot exceed the
+   semaphore's capacity. If admission A's racy estimate turns out
+   to be wrong (another PUT raced in between A's check and the
+   first B-acquire), the first B-acquire blocks until the
+   contending PUT releases or `dispatchAdmissionTimeout` fires.
+
+The semaphore is therefore charged **only by admission B**. Bytes
+in flight = `held_B_slots × s3ChunkSize`, full stop; admission A is
+a fast-fail gate, not a reservation. This is the model
+implementations MUST follow — a "both A and B charge" design would
+double-count every PUT against itself and an admission-A-only
+design would lose its bound the moment a PUT's body exceeded its
+declared `Content-Length` (chunked transfers, malformed clients).
 
 ### 3.3.1 aws-chunked transfers (`Content-Length: -1`)
 
@@ -272,10 +305,24 @@ suggests bumping the cap or scaling out (more nodes spreads PUT load).
 - **Workload isolation proposal.** That doc proposes per-class CPU
   reservation for Raft. Admission control is the memory-axis sibling.
   Both are needed — limiting CPU does not bound queue depth.
-- **`coordinator.Dispatch` retries.** Today the S3 path has its own
-  retry loop (`s3TxnRetryMaxAttempts = 8`). Admission must release
-  its budget around retries, otherwise a long retry chain double-
-  counts.
+- **`coordinator.Dispatch` retries.** Today the S3 path has its
+  own retry loop (`s3TxnRetryMaxAttempts = 8` with exponential
+  backoff capped at `s3TxnRetryMaxBackoff = 32 ms`). The admission
+  contract is **hold-through-retry**: the per-batch slot acquired
+  in admission B is released exactly once, on the *final* outcome
+  of the retry chain (success ack, terminal error, or
+  `dispatchAdmissionTimeout` expiring), not between attempts.
+  Rationale: the bytes are still buffered in the PUT handler's
+  pendingBatch slice for the entire retry window, so the budget
+  must reflect them; a release-between-retries scheme would let a
+  second PUT proceed while the first is still memory-resident,
+  breaking the bound. The total wall-clock cost of holding through
+  one full retry chain is bounded by
+  `s3TxnRetryMaxAttempts × (redisDispatchTimeout + s3TxnRetryMaxBackoff)`;
+  if that ever exceeds `dispatchAdmissionTimeout` the per-batch
+  acquire on the *next* batch surfaces as 503, which is the right
+  failure mode (chronic dispatch failure → caller learns instead of
+  silently consuming the budget).
 
 ## 5. Implementation plan
 
@@ -333,10 +380,21 @@ Acceptance criteria:
 - **Operator confusion.** "Why does S3 return 503 when CPU is at
   20%?" Mitigated by a sharp Grafana panel and a clear `Retry-After`
   value so SDK behaviour is predictable.
-- **aws-chunked overcharge.** A small chunked PUT charges 5 GiB
-  against the budget until M4 lands. We accept this temporarily
-  because aws-chunked traffic is rare in practice and the
-  conservative cap fails safe.
+- **New chunked-PUT 503 surface.** Pay-as-you-decode admission
+  (§3.3.1) ships in M1 alongside fixed-length admission, so the
+  legacy 5 GiB pre-charge hazard does not materialise as a
+  steady-state risk. The residual risk it introduces is the
+  inverse: a chunked PUT that would have silently succeeded under
+  the no-admission code can now 503 mid-stream when Raft drain
+  falls behind. This is by design — that is the failure mode
+  admission control exists to surface — but it is the only
+  client-visible behaviour change in M1 and is what operators
+  should expect to see in dashboards. The
+  `stage="perbatch", protocol="chunked"` label on the rejection
+  counter (§3.5) isolates the signal; the operator escape hatch
+  is `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`, which
+  reverts to bootstrap-only charging at the cost of
+  re-introducing the 5 GiB head-of-line hazard.
 
 ## 7. Out of scope (future work)
 

@@ -168,6 +168,35 @@ follower that crashes after acking the push but before the chunkref
 commits is fine — the chunkref will be retried by the leader on the
 next attempt because it has not yet entered the Raft log.
 
+**Behaviour during cluster shrink / partial outage.** A controlled
+decommission (5 → 3 nodes) or a transient partition can leave the
+leader with fewer reachable peers than `(N/2)+1` configured at the
+last membership commit. Blocking PUTs until the configured minimum
+is reachable would surface as an indefinite hang, which is worse
+than the legacy "every byte through Raft" path (which fails when
+Raft itself loses quorum, but otherwise succeeds). The contract is
+therefore degraded availability with a hard floor:
+
+- If reachable peers ≥ `chunkBlobMinReplicas`, normal path: ack
+  after the configured minimum.
+- If reachable peers < `chunkBlobMinReplicas` but ≥ `floor(N/2)+1`
+  (Raft quorum is intact), degrade to "as many as currently
+  available, but never fewer than 2 — i.e. leader + at least one
+  follower." Emit `s3_chunkblob_replication_degraded_total` so
+  operators see the degradation. This matches Raft's own behaviour
+  during the same window: Raft would still commit at quorum, just
+  with one fewer redundant ack.
+- If reachable peers < 2 (leader-only durability), fail the PUT
+  with 503 — single-node durability is what `BlobKey`-on-Raft
+  already loses on leader crash, and is the regression this design
+  exists to prevent.
+
+The floor of 2 is the strict invariant: leader-only writes are the
+case the design refuses to accept regardless of operator
+configuration. Tuning `chunkBlobMinReplicas` higher trades PUT
+availability for stronger durability; tuning lower than 2 is
+rejected at config-load.
+
 The trade-off is PUT latency: a PUT now blocks on
 `chunkBlobMinReplicas - 1` follower fsyncs in addition to the Raft
 quorum write of the chunkref. Empirically the chunkblob fsync is
@@ -195,16 +224,53 @@ When a follower's apply loop sees a `chunkref` Put:
    `!s3|chunkblob|<SHA>` once the body arrives and verifies the
    SHA-256 (mismatch → drop and retry from another peer).
 
+`SourcePeer` is a **best-effort hint** captured at write time
+(§3.1). It is *not* authoritative — the recorded peer may have
+crashed, restarted, evicted the blob via §3.5 GC, or simply lost
+the local copy to disk failure. Callers MUST treat
+`FetchChunkBlob → NOT_FOUND` from `SourcePeer` as a normal fallback
+trigger, not an error: drop to fanout against the rest of the
+peer set and accept the first peer that returns the bytes (with
+SHA-256 verification at the receiving end). Treating
+`NOT_FOUND` as a hard failure would make a single peer's GC tick
+pin clients on a bad source.
+
 GET / range-read on the follower checks the local `chunkblob`
 first; if absent (because the async fetch is still pending), it
 either:
 
-- proxies the read to a peer that *does* have the chunk (using the
-  `SourcePeer` hint and falling back to a fanout), or
+- proxies the read to a peer that holds the chunk (using the
+  `SourcePeer` hint, falling back to fanout on `NOT_FOUND`), or
 - replies 503 with `Retry-After`, identical to S3's behaviour
   during a region failover.
 
 The choice is per-deployment; Phase-1 ships proxy-on-miss.
+
+#### 3.3.1 GET vs. GC delete race
+
+Even with the §3.5 grace window, a GET that proxies to peer X for
+a chunkblob can lose a race against peer X's sweeper if the
+sweeper deletes the local copy *between* the GET arriving on the
+caller's node and the proxy RPC reaching peer X. The blob remains
+reachable globally (other peers still hold it; the chunkref is
+unchanged), so the right behaviour is for the caller to fall back
+to fanout. We therefore mandate:
+
+- `FetchChunkBlob` on a peer whose local sweeper just removed the
+  blob returns `NOT_FOUND`, **not** an internal error.
+- The caller's GET handler treats both `NOT_FOUND` and
+  `INVALID_ARGUMENT (sha mismatch)` as fallback triggers and
+  cycles through the remaining peers in randomised order.
+- If the entire peer set returns `NOT_FOUND` for an SHA whose
+  `chunkref` is still present, that is a genuine durability
+  failure (every replica including the leader's GC raced); the
+  GET surfaces 500 *and* the read path emits a
+  `s3_chunkblob_unrecoverable_total` metric so operators detect
+  the underlying GC bug. With the §3.2 quorum-write durability
+  and the §3.5 grace window, this case requires a coincident
+  failure across a quorum of nodes within a 1-hour window — vastly
+  more unlikely than the per-peer 404 the fanout absorbs as a
+  matter of course.
 
 ### 3.4 Snapshot
 
@@ -230,22 +296,58 @@ amortised across reads."
 ### 3.5 Garbage collection
 
 A blob whose `chunkref` has been deleted (DELETE, lifecycle policy,
-object version pruned, manifest aborted) is reclaimable. We handle
-this two-staged:
+object version pruned, manifest aborted) is reclaimable. The
+sweeper needs to know not just *that* the RC reached zero but
+*when*, otherwise the documented grace window is unimplementable
+(a plain counter at zero carries no time signal). We make the
+"became eligible at T" fact a first-class Raft entry:
 
-1. Reference counting via a `!s3|chunkref-rc|<SHA>` counter
+1. **Reference counting** via `!s3|chunkref-rc|<SHA>`, a counter
    updated inside the same Raft txn that adds / removes a
-   `chunkref`. RC == 0 marks the blob as eligible.
-2. A node-local sweeper periodically (e.g. every 5 minutes)
-   scans `!s3|chunkblob|*` and deletes blobs whose RC is 0 and
-   whose RC has been 0 for at least `chunkBlobGCGracePeriod`
-   (proposed default 1 hour). The grace window covers in-flight
-   reads and avoids deleting a blob a peer is just about to fetch.
+   `chunkref`. The atomic `(chunkref change, RC update)` pair is
+   the linearisation point for "this blob is now / no longer
+   reachable."
+2. **GC eligibility queue.** When the txn that decrements an RC
+   would drive it to zero, the *same* txn additionally writes
+   `!s3|chunkblob-gc-queue|<commitTS-nanos>|<SHA>` → empty. The
+   commitTS-prefixed key is the time signal: the queue is
+   naturally sorted by elegibility-start time, and any node can
+   determine the grace-period boundary by scanning the queue with
+   `endKey = !s3|chunkblob-gc-queue|<now-gracePeriod>|`. If a
+   subsequent txn re-references the same SHA before the sweeper
+   runs (e.g. an upload reuses a content hash), that txn deletes
+   the queue entry as part of incrementing the RC; the queue
+   therefore reflects "currently RC==0" rather than "ever was zero."
+3. **Node-local sweeper.** Each node runs an independent sweeper
+   every `chunkBlobGCInterval` (proposed default 5 minutes) that:
+   a. scans the queue range `[!s3|chunkblob-gc-queue|, !s3|chunkblob-gc-queue|<now-gracePeriod>|)`
+      for entries whose grace window has elapsed,
+   b. for each `<SHA>` returned, re-checks the RC counter at the
+      sweeper's read timestamp; if the RC is still 0, deletes the
+      local `!s3|chunkblob|<SHA>` AND deletes the queue entry —
+      both as a single Raft txn so the queue stays consistent with
+      the keyspace,
+   c. if the RC has bounced above 0 in the meantime, the queue
+      entry is stale (a re-reference txn forgot to remove it, or
+      the sweeper raced) and the sweeper deletes only the queue
+      entry, leaving the chunkblob in place.
 
-Sweeper deletion is local — it does not pass through Raft, because
-the authoritative state ("is this blob unreachable?") is the
-already-committed RC. Followers run independent sweepers and arrive
-at the same conclusion.
+The queue is the authoritative "blob is GC-eligible since T"
+signal; the RC is the authoritative "is reachable" signal. Both
+are Raft-replicated, so every node arrives at the same set of
+sweepable SHAs and the same eligibility window. Different nodes
+running sweepers concurrently is safe because step (3b) commits
+through Raft and the txn fails with a write-write conflict on the
+second sweeper, leaving the first sweeper's deletion authoritative.
+
+`chunkBlobGCGracePeriod` defaults to 1 hour. The grace window
+absorbs in-flight reads (a peer that has already started fetching
+the blob completes its fetch before the sweeper runs), in-flight
+upload aborts (a multipart abort flips RCs to zero, then a retry
+creates a new manifest with the same chunks and bumps them back),
+and clock skew between nodes (we use the Raft `commitTS` from the
+RC-update txn, not wall clock, so skew is bounded to the
+HLC-physical-shift the cluster already tolerates).
 
 ### 3.6 Fetch protocol
 
@@ -392,9 +494,9 @@ capability-advertising peers exists.
 | Milestone | Scope | Risk |
 |---|---|---|
 | M0 | Spike: prove the chunkref + chunkblob keyspaces under a feature flag with 1 % traffic. Measure local Pebble write amp & blob fetch latency. | Low (observability only). |
-| M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. GET path checks chunkblob locally with proxy-on-miss. | Medium (race ordering). |
-| M2 | Follower fetch protocol + async fetch worker pool. SHA verification + retry from alternate peer on mismatch. | Medium (fanout cost on snapshot apply). |
-| M3 | Reference-count + grace-period GC. | Medium (correctness of RC under concurrent ops). |
+| M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Medium (race ordering, RPC plumbing on the request goroutine). |
+| M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Medium (fanout cost on snapshot apply). |
+| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Medium (correctness of RC under concurrent ops). |
 | M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0–M3 burn in for 30 days in production. | High (long-running batch over live traffic). |
 
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
