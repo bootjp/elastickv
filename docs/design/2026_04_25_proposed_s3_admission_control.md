@@ -283,12 +283,18 @@ Failure modes:
   flushes on stream EOF: a final `acquire(actual_buffered_bytes)`
   rounded up to one slot is taken (semaphore charges in 1-slot
   units regardless of actual byte count), so the bound holds.
-- If the awsChunkedReader frame size ever exceeds
-  `s3RaftEntryByteBudget` (a malformed client whose decoded
-  cumulative output between framing acks already exceeds 4 MiB),
-  the first per-frame acquire asks for more than the cap allows
-  and we 503 immediately — same as a fixed-length PUT whose
-  `Content-Length` exceeds the global cap.
+- A malformed client that decodes bytes faster than Raft drains
+  *cannot* trigger the immediate-503 path the way a fixed-length
+  PUT can. The accumulation design (callback always calls
+  `acquire(s3ChunkSize)`, never larger) means the per-frame
+  acquire request is bounded by 1 MiB — the
+  "if `bytes > capacity * s3ChunkSize`" early-return in
+  `acquire`'s spec is never hit on the chunked path. Instead,
+  successive 1 MiB acquires block under Raft pressure and the
+  PUT eventually surfaces 503 on `dispatchAdmissionTimeout` —
+  the same path a slow follower triggers. The "immediate 503 for
+  oversized request" failure mode applies only to fixed-length
+  PUTs (via `peekHeadroom(Content-Length > 256 MiB)`).
 
 This change moves chunked admission from M4 (originally "deferred
 optimisation") into M1 (the first shippable milestone). M1 ships
@@ -383,8 +389,8 @@ suggests bumping the cap or scaling out (more nodes spreads PUT load).
 
 | Milestone | Scope | Risk |
 |---|---|---|
-| M1 | Add `putAdmission` type + per-node singleton + fixed-length `Content-Length` admission. Wire `prepareStreamingPutBody` to acquire / release. **aws-chunked progress-callback admission** (§3.3.1) ships in this milestone too — the conservative 5 GiB pre-charge fallback only sits behind `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`. Metric scaffolding (gauge + counter). | Medium. Chunked progress callback needs `awsChunkedReader` to expose a hook. |
-| M2 | Per-batch admission B inside `flushBatch` for fixed-length PUTs. Add `dispatchAdmissionTimeout`. Mid-stream 503 with cleanup. (Chunked PUTs already use this path through their incremental charging.) | Medium. Cleanup path on partial failure. |
+| M1 | Add `putAdmission` type + per-node singleton + fixed-length `Content-Length` admission (`peekHeadroom`). Wire `prepareStreamingPutBody` to acquire / release. **aws-chunked progress-callback admission** (§3.3.1) ships in this milestone too — the conservative 5 GiB pre-charge fallback only sits behind `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`. **`dispatchAdmissionTimeout` ships here** (the chunked per-frame `acquire(s3ChunkSize)` path is gated on it from day one), not in M2. Metric scaffolding (gauge + counter). | Medium. Chunked progress callback needs `awsChunkedReader` to expose a hook. |
+| M2 | Per-batch admission B inside `flushBatch` for **fixed-length** PUTs (chunked PUTs already use admission B as of M1). Mid-stream 503 with cleanup on the fixed-length path. | Medium. Cleanup path on partial failure. |
 | M3 | Env-var tunables. Histogram metric. Grafana panel. | Low. |
 | M4 | Per-tenant / per-bucket admission classes (handed off to the workload-isolation rollout). | Medium. Out-of-scope for the v1 cap. |
 

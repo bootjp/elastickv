@@ -133,8 +133,15 @@ client ─► HTTP PUT body
         ─► chunk loop (s3ChunkSize):
              1. compute SHA-256 of chunk
              2. write chunk to LOCAL Pebble at !s3|chunkblob|<SHA>
-             3. *** synchronously replicate to ≥ chunkBlobMinReplicas peers ***
-             4. queue ChunkRef into pendingBatch
+                (fsync)         ─┐ pipelined: bytes also stream out
+             3. PushChunkBlob to ─┤ to chunkBlobMinReplicas-1 followers
+                followers in parallel (one RPC per follower; bytes
+                start flowing the moment the leader has them — not
+                after local fsync completes)
+             4. wait until BOTH local fsync AND a quorum of follower
+                fsync-acks have returned (= chunkBlobMinReplicas
+                durable copies including the leader)
+             5. queue ChunkRef into pendingBatch
         ─► flushBatch:
              coordinator.Dispatch(OperationGroup{
                  Elems: [ chunkref Puts ... + manifest Put ],
@@ -151,13 +158,27 @@ quorum guarantees the chunkref but tells you nothing about the
 blob payload. We close that gap by treating the chunkblob like a
 mini-Raft entry of its own with **semi-synchronous quorum**:
 
-1. Leader writes the chunkblob to local Pebble (fsync).
-2. Leader pushes the chunkblob to `chunkBlobMinReplicas - 1`
-   followers via the `S3BlobFetch.PushChunkBlob` RPC and waits for
-   each follower's "fsync ack." (`PushChunkBlob` is the leader-
-   initiated counterpart to the follower-initiated `FetchChunkBlob`
-   defined in §3.6.)
-3. Only after the chunkblob is durable on a quorum of nodes does
+1. Leader starts writing the chunkblob to local Pebble (fsync in
+   flight).
+2. **Concurrently** with step 1, the leader streams the chunkblob
+   to `chunkBlobMinReplicas - 1` followers via parallel
+   `S3BlobFetch.PushChunkBlob` RPCs. Pushes are **fanned out in
+   parallel**, not sequential — each follower's RPC is started
+   immediately, and the leader waits on a quorum of fsync-acks
+   rather than serially blocking on each one. (`PushChunkBlob` is
+   the leader-initiated counterpart to the follower-initiated
+   `FetchChunkBlob` defined in §3.6.)
+3. The leader waits for *both* the local fsync AND a quorum of
+   follower fsync-acks. The dominant cost is therefore
+   `max(local_fsync, slowest_quorum_follower_fsync)` — typically
+   ≈ 10 ms on consumer SSD, equivalent to a Raft quorum write.
+   This is what makes the p99 latency claim below load-bearing:
+   if step 1 and step 2 were *sequential* (write local → then
+   push to followers → then wait), per-chunk latency would be
+   `chunkBlobMinReplicas × fsync_latency` and silently double the
+   PUT p99 vs. the legacy path. The pipelined / parallel model
+   is part of the contract, not an optimization.
+4. Only after the chunkblob is durable on a quorum of nodes does
    the leader propose the chunkref through Raft.
 
 `chunkBlobMinReplicas` defaults to **2** on a 3-node cluster (= a
@@ -386,10 +407,31 @@ sweeper needs to know not just *that* the RC reached zero but
       that for the inverse failure mode: a crash between the two
       phases leaves the queue entry deleted but the local
       chunkblob still on disk — a **bounded local space leak,
-      not a correctness bug**. A periodic "orphan scan" (chunkblob
-      keys whose SHA has RC=0 *and* no queue entry) reclaims
-      these without urgency. The orphan scan runs at low priority
-      out of band from the sweeper.
+      not a correctness bug**. A periodic "orphan scan" reclaims
+      these.
+
+      The orphan scan covers two distinct sources of orphans:
+
+      - **Sweeper crash between Phase (3b.i) and (3b.ii)** — the
+        case described above; queue entry was removed via Raft
+        but the local Pebble delete never fired.
+      - **PUT failure before chunkref Dispatch** — chunkblob
+        bytes were written to local Pebble in §3.2 step 2, then
+        the PUT aborted before reaching `coordinator.Dispatch`
+        (admission control 503, client disconnect, `PushChunkBlob`
+        quorum failure, request context cancel). In that
+        scenario neither an RC entry nor a GC queue entry was
+        ever written, so the sweeper's queue-range scan never
+        sees these orphans — only the orphan scan does.
+
+      Detection criterion (covers both): `!s3|chunkblob|<SHA>`
+      keys whose SHA has either no RC entry at all, or RC=0 with
+      no corresponding queue entry. The orphan scan runs at low
+      priority out of band from the sweeper (proposed default
+      `chunkBlobOrphanScanInterval = 1 hour`); it is the safety
+      net behind both the sweeper crash path and the PUT-abort
+      cleanup path, so the PUT handler does not need its own
+      best-effort local-delete on the abort path.
    c. if the RC has bounced above 0 in the meantime, the queue
       entry is stale (a re-reference txn forgot to remove it, or
       the sweeper raced) and the sweeper deletes only the queue
