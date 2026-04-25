@@ -109,12 +109,28 @@ type MemSampler struct {
 	history   *ringBuffer
 
 	// retiredSlots holds slots that RemoveRoute removed from the live
-	// table since the last Flush. Flush drains and clears the list so
-	// counts accumulated between (last flush, RemoveRoute) are not
-	// silently dropped during route churn.
+	// table. Each entry is drained for `remaining` Flushes — a grace
+	// period that lets late Observe writers (which loaded the route
+	// table before RemoveRoute's atomic.Store) finish their Add into
+	// the slot before we forget about it. retainedFlushes controls the
+	// length of that window.
 	retiredMu    sync.Mutex
-	retiredSlots []*routeSlot
+	retiredSlots []retiredSlot
 }
+
+// retiredSlot tracks a removed slot through its post-removal grace
+// period. remaining counts down to zero across successive Flushes.
+type retiredSlot struct {
+	slot      *routeSlot
+	remaining int
+}
+
+// retainedFlushes is how many Flush cycles a retired slot stays in
+// the drain queue after RemoveRoute. Two cycles is enough in practice:
+// any goroutine still holding a pre-RemoveRoute table snapshot will
+// have completed its single atomic.Add long before the second flush
+// tick (Step is at human timescales, microseconds suffice).
+const retainedFlushes = 2
 
 // routeTable is the COW snapshot Observe operates on. Once published
 // via MemSampler.table.Store, fields are read-only.
@@ -314,25 +330,34 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		}
 		next.sortedSlots = appendSorted(next.sortedSlots, bucket)
 	} else {
-		// Mutate the existing bucket under its metaMu so a concurrent
-		// Flush iterating the previous table's snapshot doesn't observe
-		// a half-extended MemberRoutes slice or a partially-updated
-		// Start/End. Counters stay in place — they live next to the
-		// metadata fields but are protected by the atomic ops, not the
-		// mutex.
-		bucket.metaMu.Lock()
-		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
-		if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
-			bucket.End = cloneBytes(end)
-		}
-		if bytesLT(start, bucket.Start) {
-			bucket.Start = cloneBytes(start)
-		}
-		bucket.metaMu.Unlock()
+		foldIntoBucket(next, bucket, routeID, start, end)
 	}
 	next.virtualForRoute[routeID] = bucket
 	s.table.Store(next)
 	return false
+}
+
+// foldIntoBucket extends an existing virtual bucket to cover routeID's
+// [start, end). Mutates bucket under its metaMu so a concurrent Flush
+// iterating the previous table's snapshot doesn't observe a
+// half-extended MemberRoutes slice or partially-updated Start/End.
+// Counters live next to the metadata but are protected by their own
+// atomic ops, not metaMu. If Start is lowered, sortedSlots is rebuilt
+// to preserve Flush's key-order contract.
+func foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
+	bucket.metaMu.Lock()
+	bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+	if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
+		bucket.End = cloneBytes(end)
+	}
+	startLowered := bytesLT(start, bucket.Start)
+	if startLowered {
+		bucket.Start = cloneBytes(start)
+	}
+	bucket.metaMu.Unlock()
+	if startLowered {
+		next.sortedSlots = rebuildSorted(next)
+	}
 }
 
 // RemoveRoute drops a RouteID from tracking. Counts accumulated since
@@ -359,10 +384,14 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 
 	switch {
 	case isIndividual:
-		// Pending counters in this slot must be harvested by the next
-		// Flush; queue the slot rather than letting GC eat the counts.
+		// Pending counters in this slot must be harvested by upcoming
+		// Flush cycles. Drain across `retainedFlushes` cycles so an
+		// Observe call that loaded the prior table just before this
+		// atomic.Store can still complete its Add into the slot — that
+		// in-flight write is caught by the next drain rather than
+		// silently lost.
 		s.retiredMu.Lock()
-		s.retiredSlots = append(s.retiredSlots, individual)
+		s.retiredSlots = append(s.retiredSlots, retiredSlot{slot: individual, remaining: retainedFlushes})
 		s.retiredMu.Unlock()
 	case isVirtual:
 		// Prune the removed RouteID from the bucket's MemberRoutes so
@@ -398,12 +427,16 @@ func (s *MemSampler) Flush() {
 	}
 
 	s.retiredMu.Lock()
-	retired := s.retiredSlots
-	s.retiredSlots = nil
-	s.retiredMu.Unlock()
-	for _, slot := range retired {
-		col.Rows = appendDrainedRow(col.Rows, slot)
+	keep := s.retiredSlots[:0]
+	for _, r := range s.retiredSlots {
+		col.Rows = appendDrainedRow(col.Rows, r.slot)
+		r.remaining--
+		if r.remaining > 0 {
+			keep = append(keep, r)
+		}
 	}
+	s.retiredSlots = keep
+	s.retiredMu.Unlock()
 
 	s.historyMu.Lock()
 	s.history.Push(col)

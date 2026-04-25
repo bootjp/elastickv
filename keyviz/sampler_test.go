@@ -455,6 +455,121 @@ func columnTimes(cols []MatrixColumn) []time.Time {
 	return out
 }
 
+// TestRetiredSlotGracePeriod asserts that a retired slot stays in the
+// drain queue for `retainedFlushes` cycles so an Observe goroutine
+// that loaded the pre-RemoveRoute table snapshot can complete its
+// atomic.Add into the slot and still have the increment harvested by
+// a subsequent Flush. We simulate the late writer by reaching into
+// the retired-slot queue directly and bumping the counter between the
+// two flushes.
+func TestRetiredSlotGracePeriod(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+		t.Fatal("RegisterRoute(1) returned false")
+	}
+	s.Observe(1, OpRead, 1, 2)
+	s.RemoveRoute(1)
+
+	lateSlot := graceQueueSingleSlot(t, s)
+	s.Flush()
+	lateSlot.reads.Add(7)
+	s.Flush()
+
+	total := totalReadsForRoute(s.Snapshot(time.Time{}, time.Time{}), 1)
+	if total != 1+7 {
+		t.Fatalf("expected reads 8 (pre-remove + late-writer), got %d", total)
+	}
+
+	s.retiredMu.Lock()
+	leftover := len(s.retiredSlots)
+	s.retiredMu.Unlock()
+	if leftover != 0 {
+		t.Fatalf("retired slot not released after grace, len=%d", leftover)
+	}
+}
+
+func graceQueueSingleSlot(t *testing.T, s *MemSampler) *routeSlot {
+	t.Helper()
+	s.retiredMu.Lock()
+	defer s.retiredMu.Unlock()
+	if len(s.retiredSlots) != 1 {
+		t.Fatalf("expected 1 retired slot, got %d", len(s.retiredSlots))
+	}
+	return s.retiredSlots[0].slot
+}
+
+func totalReadsForRoute(cols []MatrixColumn, routeID uint64) uint64 {
+	var total uint64
+	for _, c := range cols {
+		for _, r := range c.Rows {
+			if r.RouteID == routeID {
+				total += r.Reads
+			}
+		}
+	}
+	return total
+}
+
+// TestRegisterFoldLowerStartReorders guards the sortedSlots ordering
+// invariant: when an over-budget route folds into an existing virtual
+// bucket and lowers the bucket's Start, the bucket must be repositioned
+// in sortedSlots so Flush emits matrix rows in key order.
+func TestRegisterFoldLowerStartReorders(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 2,
+	})
+	mustRegister(t, s, 1, "m", "n")
+	mustRegister(t, s, 2, "p", "q")
+	// Route 3 is over budget — creates a virtual bucket at Start=r.
+	if s.RegisterRoute(3, []byte("r"), []byte("s")) {
+		t.Fatal("route 3 over budget should fold into virtual bucket")
+	}
+	// Route 4 is over budget AND has a Start ("a") below the bucket's
+	// existing Start ("r"). The fold must lower bucket.Start to "a"
+	// AND reposition the bucket within sortedSlots.
+	if s.RegisterRoute(4, []byte("a"), []byte("b")) {
+		t.Fatal("route 4 over budget should fold into virtual bucket")
+	}
+	s.Observe(1, OpRead, 0, 0)
+	s.Observe(2, OpRead, 0, 0)
+	s.Observe(3, OpRead, 0, 0)
+	s.Observe(4, OpRead, 0, 0)
+	s.Flush()
+
+	rows := flushedRowsSorted(t, s)
+	agg := findAggregateRow(t, rows)
+	if string(agg.Start) != "a" {
+		t.Fatalf("aggregate.Start = %q, want %q (fold did not lower Start)", agg.Start, "a")
+	}
+}
+
+func mustRegister(t *testing.T, s *MemSampler, routeID uint64, start, end string) {
+	t.Helper()
+	if !s.RegisterRoute(routeID, []byte(start), []byte(end)) {
+		t.Fatalf("RegisterRoute(%d) returned false", routeID)
+	}
+}
+
+func flushedRowsSorted(t *testing.T, s *MemSampler) []MatrixRow {
+	t.Helper()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 || len(cols[0].Rows) == 0 {
+		t.Fatal("no rows after flush")
+	}
+	rows := cols[0].Rows
+	for i := 1; i < len(rows); i++ {
+		if !bytesLE(rows[i-1].Start, rows[i].Start) {
+			t.Fatalf("rows not sorted: rows[%d].Start=%q > rows[%d].Start=%q",
+				i-1, rows[i-1].Start, i, rows[i].Start)
+		}
+	}
+	return rows
+}
+
 // TestSnapshotReturnsDeepCopy guards the public-API contract that the
 // Snapshot result is fully owned by the caller: mutating row bounds or
 // member-route slices must not corrupt later snapshots, and must not
