@@ -82,14 +82,11 @@ func NewServer(deps ServerDeps) (*Server, error) {
 		logger = slog.Default()
 	}
 
-	// Inject verifier + logger into AuthService so login/logout can
-	// emit admin_audit entries themselves (the generic Audit
-	// middleware cannot, because those endpoints do not run through
-	// SessionAuth).
+	// Inject the logger into AuthService so login/logout can emit
+	// their own admin_audit entries (login runs before SessionAuth,
+	// so the generic Audit middleware cannot record the claimed
+	// actor on its own).
 	authOpts := deps.AuthOpts
-	if authOpts.Verifier == nil {
-		authOpts.Verifier = deps.Verifier
-	}
 	if authOpts.Logger == nil {
 		authOpts.Logger = logger
 	}

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,6 @@ func newAuthServiceWithAudit(t *testing.T) (*AuthService, *bytes.Buffer) {
 	t.Helper()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
-	verifier := newVerifierForTest(t, []byte{1}, clk)
 
 	creds := MapCredentialStore{
 		"AKIA_ADMIN": "ADMIN_SECRET",
@@ -26,9 +26,8 @@ func newAuthServiceWithAudit(t *testing.T) (*AuthService, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	svc := NewAuthService(signer, creds, roles, AuthServiceOpts{
-		Clock:    clk,
-		Verifier: verifier,
-		Logger:   logger,
+		Clock:  clk,
+		Logger: logger,
 	})
 	return svc, buf
 }
@@ -65,23 +64,19 @@ func TestAudit_LoginFailureRecordsClaimedActor(t *testing.T) {
 	require.Contains(t, out, `"status":401`)
 }
 
-func TestAudit_LogoutDecodesCookieForActor(t *testing.T) {
+func TestAudit_LogoutReadsActorFromContext(t *testing.T) {
 	svc, buf := newAuthServiceWithAudit(t)
 
-	// Log in first.
-	loginReq := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "ADMIN_SECRET"})
-	loginRec := httptest.NewRecorder()
-	svc.HandleLogin(loginRec, loginReq)
-	require.Equal(t, http.StatusOK, loginRec.Code)
-	cookies := loginRec.Result().Cookies()
-	buf.Reset()
-
-	// Now log out with the session cookie — audit must record actor.
+	// HandleLogout reads the principal from the request context (the
+	// production wiring puts SessionAuth in front of it). Mirror that
+	// here by injecting a principal directly so we can exercise the
+	// audit branch without standing up the full router.
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
 	req.RemoteAddr = "127.0.0.1:1"
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
+	ctx := context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_ADMIN", Role: RoleFull})
+	req = req.WithContext(ctx)
+
 	rec := httptest.NewRecorder()
 	svc.HandleLogout(rec, req)
 

@@ -44,7 +44,6 @@ func (m MapCredentialStore) LookupSecret(accessKey string) (string, bool) {
 // startup and reuse across the admin listener's lifetime.
 type AuthService struct {
 	signer         *Signer
-	verifier       *Verifier
 	creds          CredentialStore
 	roles          map[string]Role
 	limiter        *rateLimiter
@@ -73,11 +72,6 @@ type AuthServiceOpts struct {
 	LoginWindow time.Duration
 	// Clock drives rate-limiter aging. Defaults to SystemClock.
 	Clock Clock
-	// Verifier lets the logout handler best-effort decode the
-	// incoming session cookie and include the actor in the audit
-	// log. When nil, logout events are still audited but with an
-	// empty actor field.
-	Verifier *Verifier
 	// Logger is the slog destination for admin_audit entries emitted
 	// by the login/logout handlers. nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -111,7 +105,6 @@ func NewAuthService(signer *Signer, creds CredentialStore, roles map[string]Role
 	}
 	return &AuthService{
 		signer:         signer,
-		verifier:       opts.Verifier,
 		creds:          creds,
 		roles:          roles,
 		limiter:        newRateLimiter(limit, window, opts.Clock),
@@ -339,9 +332,9 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 // HandleLogout clears both cookies. The route is wired behind the
 // protected middleware chain (SessionAuth + CSRF), so unauthenticated
 // or cross-site callers are rejected before they reach this handler —
-// that is what prevents logout-CSRF. We still best-effort decode the
-// incoming session cookie so the audit log can record who logged out;
-// a missing or invalid cookie leaves actor empty.
+// that is what prevents logout-CSRF. SessionAuth has already populated
+// the AuthPrincipal on the request context, so we reuse it for the
+// audit line instead of re-parsing the session cookie ourselves.
 func (s *AuthService) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	rec := newStatusRecorder(w)
 	defer s.auditLogout(r, rec)
@@ -349,12 +342,8 @@ func (s *AuthService) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(rec, http.StatusMethodNotAllowed, "method_not_allowed", "logout requires POST")
 		return
 	}
-	if s.verifier != nil {
-		if c, err := r.Cookie(sessionCookieName); err == nil && strings.TrimSpace(c.Value) != "" {
-			if p, verr := s.verifier.Verify(c.Value); verr == nil {
-				rec.actor = p.AccessKey
-			}
-		}
+	if p, ok := PrincipalFromContext(r.Context()); ok {
+		rec.actor = p.AccessKey
 	}
 	http.SetCookie(rec, s.buildExpiredCookie(sessionCookieName, true))
 	http.SetCookie(rec, s.buildExpiredCookie(csrfCookieName, false))
