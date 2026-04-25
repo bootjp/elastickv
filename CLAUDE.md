@@ -77,6 +77,16 @@ The full diagrams live in `docs/architecture_overview.md` — read it before non
 - Route catalog mutations must go through `SplitRange` (or future control-plane RPCs) so the catalog version bumps and watchers fan out — never write catalog keys directly.
 - Commits: short imperative summary, optional scope prefix matching the touched area (`store:`, `adapter:`, `kv:`, `docs:`, …). PR descriptions should call out behavior change, risk, and the test evidence (`go test`, `make lint`, relevant Jepsen suite).
 
+## Self-review of code changes
+
+After every code change, run **five independent review passes** — one lens at a time, do not collapse them. Each lens has a different failure mode and merging them tends to skip cases. Record the result of each pass (even a one-line "no issues") in the PR description.
+
+1. **Data loss** — Can any committed write be lost or silently overwritten? Check Raft propose/apply ordering, FSM idempotency, snapshot/restore round-trips, Pebble sync semantics (`lsm_store_sync_mode_*`), TTL/expiry deletes, retention/compaction (`store/mvcc_store_retention_test.go`, `kv/compactor.go`), and crash-restart paths. New failure modes (`return nil` after an error, swallowed `Apply` errors, missing `WAL.Sync`) are the usual culprits.
+2. **Concurrency / distributed failures** — Race conditions, lock ordering, deadlocks, leader change mid-operation, follower forwarding while leadership flips, partial Raft membership changes, partition + heal, slow follower, snapshot-during-apply, OCC conflict resolver paths (`kv/lock_resolver.go`), and the lease-read window (`kv/lease_state.go`). Run the relevant `go test -race` and the matching Jepsen suite.
+3. **Performance** — Hot-path allocations, lock contention, fan-out across shards, extra Raft round-trips per request (especially anything that would force consensus on a per-`Next()` HLC tick), N+1 reads against Pebble, Lua/transcoder churn (`adapter/redis_lua_pool.go`, `adapter/grpc_transcoder.go`), and metric cardinality. Check existing benchmarks (`*_benchmark_test.go`) and add one if a hot path changed.
+4. **Data consistency** — MVCC visibility, OCC commit-ts ordering, HLC physical-ceiling invariant, snapshot read isolation, route-catalog versioning + watcher fan-out, cross-shard transaction atomicity (`kv/transaction.go`, `kv/txn_codec.go`), DynamoDB/Redis adapter semantics versus the upstream contract, and the lease-read freshness bound. Reads that bypass `HLC.Next()` or the leader-issued read pipeline are bugs.
+5. **Test coverage** — New/changed branches must have unit tests (table-driven, co-located `*_test.go`); property tests via `pgregory.net/rapid` for codecs/transcoders; OCC/HLC/MVCC behavior changes need targeted tests under `kv/` and `store/`; replication/Redis/MVCC changes need the corresponding Jepsen workload. If a reviewer found the defect, the regression test (per the convention above) must be in the same PR.
+
 ## Design Documents
 
 `docs/design/` is dated proposals and as-implemented records (`*_proposed_*.md` / `*_implemented_*.md`). Check it before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, etc.). `docs/design/README.md` indexes them.
