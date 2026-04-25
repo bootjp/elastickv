@@ -277,6 +277,11 @@ func writeJSONNotFound(w http.ResponseWriter, _ *http.Request) {
 
 func writeJSONError(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Defence-in-depth header: the admin surface is JSON-only, so
+	// declare nosniff to prevent a misbehaving browser from
+	// content-sniffing an error body into something executable.
+	// Cheap and standard for cookie-gated admin endpoints.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: code, Message: msg})

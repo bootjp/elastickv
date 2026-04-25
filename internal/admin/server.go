@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"strings"
 )
 
 // ServerDeps bundles the collaborators the admin HTTP surface needs. All
@@ -30,6 +31,13 @@ type ServerDeps struct {
 
 	// ClusterInfo describes the local node's Raft state.
 	ClusterInfo ClusterInfoSource
+
+	// Tables is the DynamoDB admin source — covers list, describe,
+	// create, and delete via TablesSource. Optional: a nil value
+	// disables /admin/api/v1/dynamo/tables{,/{name}} (the mux
+	// answers them with 404). This lets a build that ships only the
+	// cluster page deploy without standing up the dynamo bridge.
+	Tables TablesSource
 
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
@@ -92,7 +100,21 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	}
 	auth := NewAuthService(deps.Signer, deps.Credentials, deps.Roles, authOpts)
 	cluster := NewClusterHandler(deps.ClusterInfo).WithLogger(logger)
-	mux := buildAPIMux(auth, deps.Verifier, cluster, logger)
+	var dynamo http.Handler
+	if deps.Tables != nil {
+		// Re-evaluate the principal's role on every state-
+		// changing request against the live role map (Codex P1
+		// on PR #635). MapRoleStore wraps the same map the auth
+		// layer uses for login, so a config reload that updates
+		// deps.Roles does NOT automatically propagate here —
+		// operators must restart the listener for revocation to
+		// take effect, but the JWT no longer extends a revoked
+		// key past the next request.
+		dynamo = NewDynamoHandler(deps.Tables).
+			WithLogger(logger).
+			WithRoleStore(MapRoleStore(deps.Roles))
+	}
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, logger)
 	router := NewRouter(mux, deps.StaticFS)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -119,15 +141,23 @@ func (s *Server) APIHandler() http.Handler {
 //
 // Layout:
 //
-//	POST   /admin/api/v1/auth/login     (no auth, rate-limited)
-//	POST   /admin/api/v1/auth/logout    (no auth required)
-//	GET    /admin/api/v1/cluster        (auth required)
+//	POST   /admin/api/v1/auth/login                 (no auth, rate-limited)
+//	POST   /admin/api/v1/auth/logout                (auth required)
+//	GET    /admin/api/v1/cluster                    (auth required)
+//	GET    /admin/api/v1/dynamo/tables              (auth required)
+//	POST   /admin/api/v1/dynamo/tables              (auth required, full role)
+//	GET    /admin/api/v1/dynamo/tables/{name}       (auth required)
+//	DELETE /admin/api/v1/dynamo/tables/{name}       (auth required, full role)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to
 // write-capable protected endpoints; login and logout carry their own
 // audit path inside AuthService because the generic Audit middleware
 // cannot see the claimed actor at that point in the chain.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Handler, logger *slog.Logger) http.Handler {
+//
+// dynamoHandler may be nil; in that case the dynamo paths fall through
+// to the unknown-endpoint 404, matching the behaviour of any other
+// unregistered admin path.
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -177,15 +207,27 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler http.Hand
 	loginChain := publicAuth(loginHandler)
 	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
+	// Dynamo endpoints (reads and writes) share the protect chain
+	// so a missing session or CSRF token 401s/403s the same way
+	// regardless of method. The Audit middleware is a no-op for
+	// GET (it only logs state-changing methods) so dashboard polls
+	// don't flood the audit log, while POST/DELETE always do.
+	var dynamoChain http.Handler
+	if dynamoHandler != nil {
+		dynamoChain = protect(dynamoHandler)
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/admin/api/v1/auth/login":
+		switch {
+		case r.URL.Path == "/admin/api/v1/auth/login":
 			loginChain.ServeHTTP(w, r)
-		case "/admin/api/v1/auth/logout":
+		case r.URL.Path == "/admin/api/v1/auth/logout":
 			logoutChain.ServeHTTP(w, r)
-		case "/admin/api/v1/cluster":
+		case r.URL.Path == "/admin/api/v1/cluster":
 			clusterChain.ServeHTTP(w, r)
+		case dynamoChain != nil && (r.URL.Path == pathDynamoTables ||
+			strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables)):
+			dynamoChain.ServeHTTP(w, r)
 		default:
 			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 				"no admin API handler is registered for this path")
