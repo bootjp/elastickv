@@ -150,7 +150,8 @@ func (s *ForwardServer) handleCreate(ctx context.Context, principal AuthPrincipa
 	}
 	summary, err := s.source.AdminCreateTable(ctx, principal, body)
 	if err != nil {
-		return forwardErrorResponse(err), nil
+		s.logUnexpectedSourceError(ctx, "create_table", body.TableName, req.GetForwardedFrom(), err)
+		return forwardErrorResponse("create", err), nil
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
 		slog.String("actor", principal.AccessKey),
@@ -203,7 +204,8 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload name must not contain '/'")
 	}
 	if err := s.source.AdminDeleteTable(ctx, principal, body.Name); err != nil {
-		return forwardErrorResponse(err), nil
+		s.logUnexpectedSourceError(ctx, "delete_table", body.Name, req.GetForwardedFrom(), err)
+		return forwardErrorResponse("delete", err), nil
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
 		slog.String("actor", principal.AccessKey),
@@ -220,7 +222,14 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 // is the leader-side counterpart of writeTablesError: every status /
 // JSON code the HTTP handler chooses is mirrored here so a forwarded
 // call is indistinguishable to the SPA from a leader-direct call.
-func forwardErrorResponse(err error) *pb.AdminForwardResponse {
+//
+// op is "create" or "delete" so the unmapped 500 fallthrough emits
+// dynamo_create_failed / dynamo_delete_failed — the same
+// operation-specific codes the leader-direct HTTP path produces in
+// writeTablesError. Without this, forwarded write failures showed
+// up to clients as a generic "internal" code, breaking parity with
+// the leader-direct path (Codex P2 on PR #635).
+func forwardErrorResponse(op string, err error) *pb.AdminForwardResponse {
 	switch {
 	case errors.Is(err, ErrTablesForbidden):
 		return mustForwardJSON(http.StatusForbidden, errorBody{Error: "forbidden", Message: "this endpoint requires a full-access role"})
@@ -238,7 +247,45 @@ func forwardErrorResponse(err error) *pb.AdminForwardResponse {
 	if errors.As(err, &verr) {
 		return mustForwardJSON(http.StatusBadRequest, errorBody{Error: "invalid_request", Message: verr.Error()})
 	}
-	return mustForwardJSON(http.StatusInternalServerError, errorBody{Error: "internal", Message: "internal error; see leader logs"})
+	return mustForwardJSON(http.StatusInternalServerError, errorBody{
+		Error:   "dynamo_" + op + "_failed",
+		Message: "failed to " + op + " table; see leader logs",
+	})
+}
+
+// logUnexpectedSourceError emits an error log for non-sentinel
+// source failures so operators have a breadcrumb when forwarded
+// writes 500. Sentinel errors that map to specific HTTP statuses
+// (forbidden, not-found, validation, ...) are deliberately
+// silent: those are routine client-side failures, not server
+// regressions, and logging them at LevelError would drown the
+// operational signal. The HTTP path's writeTablesError applies
+// the same policy (Codex P2 on PR #635 flagged the silent path).
+func (s *ForwardServer) logUnexpectedSourceError(ctx context.Context, op, table, forwardedFrom string, err error) {
+	if isStructuredSourceError(err) {
+		return
+	}
+	s.logger.LogAttrs(ctx, slog.LevelError, "admin_forward_"+op+"_failed",
+		slog.String("table", table),
+		slog.String("forwarded_from", forwardedFrom),
+		slog.String("error", err.Error()),
+	)
+}
+
+// isStructuredSourceError reports whether err is one of the
+// admin-package sentinels or a ValidationError — i.e., a known
+// failure mode the handler maps to a non-500 status. These are
+// expected and not log-worthy.
+func isStructuredSourceError(err error) bool {
+	switch {
+	case errors.Is(err, ErrTablesForbidden),
+		errors.Is(err, ErrTablesNotLeader),
+		errors.Is(err, ErrTablesNotFound),
+		errors.Is(err, ErrTablesAlreadyExists):
+		return true
+	}
+	var verr *ValidationError
+	return errors.As(err, &verr)
 }
 
 // errorBody is the shared JSON shape for both the HTTP handler's

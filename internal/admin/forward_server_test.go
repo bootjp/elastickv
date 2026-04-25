@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -285,4 +287,87 @@ func TestForwardServer_CreateTable_GenericErrorReturns500(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(http.StatusInternalServerError), resp.GetStatusCode())
 	require.NotContains(t, string(resp.GetPayload()), "ZQ-993")
+	// Error code parity with leader-direct path: must use
+	// dynamo_create_failed, not the previous generic "internal"
+	// (Codex P2 on PR #635).
+	require.Contains(t, string(resp.GetPayload()), `"error":"dynamo_create_failed"`)
+}
+
+// TestForwardServer_DeleteTable_GenericErrorUsesOperationSpecificCode
+// is the delete-side counterpart: 500 fallthrough must use
+// dynamo_delete_failed so client retry/branching logic that
+// already handles the leader-direct path works unchanged.
+func TestForwardServer_DeleteTable_GenericErrorUsesOperationSpecificCode(t *testing.T) {
+	src := &stubTablesSource{
+		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
+		deleteErr: errors.New("storage backing sentinel DEL-1"),
+	}
+	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+		Payload:   []byte(`{"name":"users"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusInternalServerError), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), `"error":"dynamo_delete_failed"`)
+	require.NotContains(t, string(resp.GetPayload()), "DEL-1")
+}
+
+// TestForwardServer_LogsUnexpectedSourceError confirms the leader
+// emits an error log line for non-sentinel source failures so
+// operators can investigate forwarded write 500s without
+// reverse-engineering the response body. The HTTP path's
+// writeTablesError already logs; without the symmetric emit on
+// the forward path, forwarded failures were operationally invisible
+// (Codex P2 on PR #635).
+func TestForwardServer_LogsUnexpectedSourceError(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+	src := &stubTablesSource{createErr: errors.New("storage sentinel SENT-42")}
+	srv := NewForwardServer(src, fullPrincipalRoleStore(), logger)
+
+	_, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal:     &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation:     pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:       mustJSON(t, CreateTableRequest{TableName: "u", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}}),
+		ForwardedFrom: "follower-9",
+	})
+	require.NoError(t, err)
+	logged := buf.String()
+	require.Contains(t, logged, "admin_forward_create_table_failed")
+	require.Contains(t, logged, "SENT-42")
+	require.Contains(t, logged, "follower-9")
+}
+
+// TestForwardServer_DoesNotLogStructuredSourceErrors confirms the
+// "expected" sentinels (forbidden, not-found, already-exists,
+// validation) do NOT emit error-level logs. They are routine
+// client-side outcomes, not server regressions, so logging them
+// at LevelError would drown the operational signal.
+func TestForwardServer_DoesNotLogStructuredSourceErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"forbidden", ErrTablesForbidden},
+		{"not_found", ErrTablesNotFound},
+		{"already_exists", ErrTablesAlreadyExists},
+		{"validation", &ValidationError{Message: "field foo invalid"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+			src := &stubTablesSource{createErr: tc.err}
+			srv := NewForwardServer(src, fullPrincipalRoleStore(), logger)
+			_, _ = srv.Forward(context.Background(), &pb.AdminForwardRequest{
+				Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+				Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+				Payload:   mustJSON(t, CreateTableRequest{TableName: "u", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}}),
+			})
+			require.NotContains(t, buf.String(), "admin_forward_create_table_failed",
+				"sentinel error %q must not produce an error log", tc.name)
+		})
+	}
 }
