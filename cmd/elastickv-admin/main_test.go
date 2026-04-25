@@ -214,6 +214,50 @@ func TestLoadTokenRejectsOversizedFile(t *testing.T) {
 	}
 }
 
+// TestMembersFromDedupesByNodeID asserts that when the seed address and the
+// responding node's self.grpc_address are different aliases for the same
+// node, fan-out only queries it once. Codex P2 on 896193ab: previously
+// dedup keyed on raw addr strings, so e.g. seed=localhost:50051 plus
+// self=127.0.0.1:50051 produced two entries pointing at the same node.
+func TestMembersFromDedupesByNodeID(t *testing.T) {
+	t.Parallel()
+	resp := &pb.GetClusterOverviewResponse{
+		Self: &pb.NodeIdentity{
+			NodeId:      "n1",
+			GrpcAddress: "127.0.0.1:50051", // alias of seed
+		},
+		Members: []*pb.NodeIdentity{
+			{NodeId: "n2", GrpcAddress: "10.0.0.2:50051"},
+			// Member also tries to repeat the responding node:
+			{NodeId: "n1", GrpcAddress: "alt-alias:50051"},
+		},
+	}
+	got := membersFrom("localhost:50051", resp)
+	if len(got) != 2 {
+		t.Fatalf("len = %d (%v), want 2 — n1 once + n2", len(got), got)
+	}
+	if got[0] != "localhost:50051" {
+		t.Fatalf("got[0] = %q, want seed localhost:50051 (operator-supplied)", got[0])
+	}
+	if got[1] != "10.0.0.2:50051" {
+		t.Fatalf("got[1] = %q, want n2 @ 10.0.0.2:50051", got[1])
+	}
+}
+
+// TestMembersFromLegacyNoSelfNodeID asserts that when the responding node is a
+// legacy build that doesn't set NodeId on resp.Self, we still add both the
+// seed and self.grpc_address (we have nothing to dedup against).
+func TestMembersFromLegacyNoSelfNodeID(t *testing.T) {
+	t.Parallel()
+	resp := &pb.GetClusterOverviewResponse{
+		Self: &pb.NodeIdentity{GrpcAddress: "10.0.0.1:50051"}, // no NodeId
+	}
+	got := membersFrom("localhost:50051", resp)
+	if len(got) != 2 {
+		t.Fatalf("len = %d (%v), want 2 — both addresses kept when NodeId is empty", len(got), got)
+	}
+}
+
 func TestMembersFromCapsAtMaxDiscoveredNodes(t *testing.T) {
 	t.Parallel()
 	resp := &pb.GetClusterOverviewResponse{

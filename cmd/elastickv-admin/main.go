@@ -703,36 +703,93 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 // still queried even if it omits itself from members. The result is capped at
 // maxDiscoveredNodes so a malicious or misconfigured peer cannot inflate the
 // fan-out.
+//
+// Deduplication keys on NodeID when available, falling back to the raw
+// grpc_address otherwise. This prevents a fan-out from querying the same
+// node twice when the seed address (e.g. "localhost:50051") and the node's
+// self-advertised address (e.g. "127.0.0.1:50051") are different aliases
+// for the same process — Codex flagged that the previous address-only
+// dedup distorted overview results in that case.
+//
+// Initial slice capacity is bounded by maxDiscoveredNodes (rather than
+// len(members)+1) so a misbehaving peer that returns 10× the cap does not
+// force a giant allocation just to truncate immediately afterward.
 func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(resp.GetMembers())+1)
-	truncated := false
-	add := func(addr string) {
-		addr = strings.TrimSpace(addr)
-		if addr == "" {
-			return
-		}
-		if _, dup := seen[addr]; dup {
-			return
-		}
-		if len(out) >= maxDiscoveredNodes {
-			truncated = true
-			return
-		}
-		seen[addr] = struct{}{}
-		out = append(out, addr)
+	acc := newDiscoveryAccumulator(len(resp.GetMembers()) + 1)
+
+	// Add the seed under the responding node's ID so a later entry for that
+	// same NodeID (most likely resp.Self.GrpcAddress, an alias of the seed)
+	// is deduped instead of producing a duplicate fan-out target.
+	self := resp.GetSelf()
+	var selfID string
+	if self != nil {
+		selfID = self.GetNodeId()
 	}
-	add(seed)
-	if self := resp.GetSelf(); self != nil {
-		add(self.GetGrpcAddress())
+	acc.add(selfID, seed)
+
+	// When the response advertises a different self.GrpcAddress, only add it
+	// when we have no NodeID to anchor the seed to (legacy nodes); otherwise
+	// the dedup above already covers it.
+	if self != nil && selfID == "" {
+		acc.add("", self.GetGrpcAddress())
 	}
+
 	for _, m := range resp.GetMembers() {
-		add(m.GetGrpcAddress())
+		acc.add(m.GetNodeId(), m.GetGrpcAddress())
 	}
-	if truncated {
+	if acc.truncated {
 		log.Printf("elastickv-admin: discovery response exceeded %d nodes; truncating (peer=%s)", maxDiscoveredNodes, seed)
 	}
-	return out
+	return acc.out
+}
+
+// discoveryAccumulator dedups (NodeID, address) pairs while building the
+// fan-out target list. Extracted from membersFrom so the surrounding loop
+// stays under the cyclop budget.
+type discoveryAccumulator struct {
+	out       []string
+	seenAddr  map[string]struct{}
+	seenID    map[string]struct{}
+	truncated bool
+}
+
+func newDiscoveryAccumulator(suggestedCap int) *discoveryAccumulator {
+	if suggestedCap > maxDiscoveredNodes {
+		suggestedCap = maxDiscoveredNodes
+	}
+	return &discoveryAccumulator{
+		out:      make([]string, 0, suggestedCap),
+		seenAddr: map[string]struct{}{},
+		seenID:   map[string]struct{}{},
+	}
+}
+
+// add records a fan-out target keyed by its NodeID (when known) and address.
+// Returns silently when the entry is empty, a duplicate, or would push the
+// list past maxDiscoveredNodes; the caller can read truncated to log a
+// truncation event once.
+func (a *discoveryAccumulator) add(id, addr string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return
+	}
+	if _, dup := a.seenAddr[addr]; dup {
+		return
+	}
+	if id != "" {
+		if _, dup := a.seenID[id]; dup {
+			return
+		}
+	}
+	if len(a.out) >= maxDiscoveredNodes {
+		a.truncated = true
+		return
+	}
+	a.seenAddr[addr] = struct{}{}
+	if id != "" {
+		a.seenID[id] = struct{}{}
+	}
+	a.out = append(a.out, addr)
 }
 
 // perNodeResult wraps a fan-out response from one node. Data is stored as
