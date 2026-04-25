@@ -300,7 +300,7 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 				"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true"))
 	}
 
-	resp, err := s.runFifoSendWithRetry(ctx, queueName, meta, asSingle, dedupID, delay)
+	resp, err := s.runFifoSendWithRetry(ctx, queueName, asSingle, dedupID, delay)
 	if err != nil {
 		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, err)
 	}
@@ -317,20 +317,35 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 // sendMessageFifoLoop. It exists separately so the batch path can
 // surface per-entry errors as Failed[] entries rather than as a
 // whole-call failure.
+//
+// Each attempt — including the first — re-loads queue metadata at the
+// same readTS used for the OCC dispatch. Without that re-load, attempt
+// 1 would pair a fresh readTS with a meta snapshot taken at a strictly
+// earlier wall-clock time, and a PurgeQueue / DeleteQueue /
+// SetQueueAttributes that committed in between would slip past
+// ReadKeys (which only fence writes that commit *after* StartTS) —
+// the dispatch could then commit under a stale generation and silently
+// produce an unreachable record. Reloading per attempt guarantees the
+// (meta, readTS) pair is coherent.
 func (s *SQSServer) runFifoSendWithRetry(
 	ctx context.Context,
 	queueName string,
-	meta *sqsQueueMeta,
 	in sqsSendMessageInput,
 	dedupID string,
 	delay int64,
 ) (map[string]string, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
-	readTS := s.nextTxnReadTS(ctx)
-	currentMeta := meta
 	for range transactRetryMaxAttempts {
-		resp, retry, err := s.sendFifoMessage(ctx, queueName, currentMeta, in, dedupID, delay, readTS)
+		readTS := s.nextTxnReadTS(ctx)
+		meta, exists, loadErr := s.loadQueueMetaAt(ctx, queueName, readTS)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if !exists {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		}
+		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
 		if err != nil {
 			return nil, err
 		}
@@ -341,15 +356,6 @@ func (s *SQSServer) runFifoSendWithRetry(
 			return nil, errors.WithStack(err)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
-		readTS = s.nextTxnReadTS(ctx)
-		fresh, exists, loadErr := s.loadQueueMetaAt(ctx, queueName, readTS)
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		if !exists {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		}
-		currentMeta = fresh
 	}
 	return nil, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "FIFO send retry attempts exhausted")
 }

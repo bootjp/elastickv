@@ -1,7 +1,9 @@
 package adapter
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -76,12 +78,61 @@ func sqsMsgByAgeKey(queueName string, gen uint64, sendTimestampMs int64, message
 	return buf
 }
 
-func sqsMsgByAgePrefixForQueue(queueName string, gen uint64) []byte {
+// sqsMsgByAgePrefixAllGenerations returns the prefix for every byage
+// entry under (queue, *) — i.e. across every queue generation, alive
+// and superseded. The reaper uses this to surface orphan records left
+// over by PurgeQueue / DeleteQueue, which bump the generation counter
+// instead of cleaning up old keys.
+func sqsMsgByAgePrefixAllGenerations(queueName string) []byte {
 	buf := make([]byte, 0, len(SqsMsgByAgePrefix)+sqsKeyCapSmall)
 	buf = append(buf, SqsMsgByAgePrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
-	buf = appendU64(buf, gen)
 	return buf
+}
+
+// sqsMsgByAgeRecord is the parsed shape of a byage key. Generation,
+// send timestamp, and message id all live in the key (the value is
+// just the message id again so a missing-data scan does not have to
+// open the data record). Returns ok=false when the key does not match
+// the expected shape, so the reaper can skip junk without looping.
+type sqsMsgByAgeRecord struct {
+	Generation      uint64
+	SendTimestampMs int64
+	MessageID       string
+}
+
+// sqsByAgeKeyHeaderLen is the byte length of the (gen, ts) prefix that
+// follows the queue segment in a byage key — two big-endian uint64s.
+const sqsByAgeKeyHeaderLen = 16
+
+func parseSqsMsgByAgeKey(key []byte, queueName string) (sqsMsgByAgeRecord, bool) {
+	expected := sqsMsgByAgePrefixAllGenerations(queueName)
+	if !bytes.HasPrefix(key, expected) {
+		return sqsMsgByAgeRecord{}, false
+	}
+	rest := key[len(expected):]
+	if len(rest) < sqsByAgeKeyHeaderLen {
+		return sqsMsgByAgeRecord{}, false
+	}
+	gen := binary.BigEndian.Uint64(rest[:8])
+	tsRaw := binary.BigEndian.Uint64(rest[8:sqsByAgeKeyHeaderLen])
+	msgIDEnc := string(rest[sqsByAgeKeyHeaderLen:])
+	msgID, err := decodeSQSSegment(msgIDEnc)
+	if err != nil {
+		return sqsMsgByAgeRecord{}, false
+	}
+	// Wall-clock millis fits in int63; the only way tsRaw exceeds
+	// math.MaxInt64 is if the caller wrote a key with a uint64 that
+	// the rest of the adapter would never produce. Treat that as
+	// malformed.
+	if tsRaw > 1<<63-1 {
+		return sqsMsgByAgeRecord{}, false
+	}
+	return sqsMsgByAgeRecord{
+		Generation:      gen,
+		SendTimestampMs: int64(tsRaw),
+		MessageID:       msgID,
+	}, true
 }
 
 // encodeSQSSegment emits a printable, byte-ordered-unique representation of a

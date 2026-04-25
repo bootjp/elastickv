@@ -390,7 +390,7 @@ func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, 
 			"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
 		return
 	}
-	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, meta, in, dedupID, delay)
+	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, in, dedupID, delay)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return

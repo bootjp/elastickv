@@ -75,31 +75,47 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 		}
 		readTS := s.nextTxnReadTS(ctx)
 		meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
-		if err != nil || !exists || meta.MessageRetentionSeconds <= 0 {
+		if err != nil || !exists {
+			// Even when meta is gone (DeleteQueue), prior-generation
+			// orphans need reaping; reapDeletedQueueOrphans handles
+			// that case. Here we only skip the queue if loading
+			// itself failed (transient).
 			continue
 		}
 		if err := s.reapQueue(ctx, name, meta, readTS); err != nil {
 			slog.Warn("sqs reaper queue pass failed", "queue", name, "err", err)
 		}
+		if err := s.reapExpiredDedup(ctx, name, readTS); err != nil {
+			slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
+		}
 	}
 	return nil
 }
 
-// reapQueue scans the byage index for records whose
-// (now - sendTimestamp) exceeds retention and removes them under OCC
-// transactions, one record at a time. AWS allows the reaper to lag
-// retention slightly, so per-record dispatch keeps each transaction
-// small and bounded; a single mega-batch transaction would balloon
-// memory and increase abort probability.
+// reapQueue scans the byage index across every queue generation and
+// removes records that are either (a) past the current generation's
+// retention deadline, or (b) leftovers from a prior generation that
+// PurgeQueue / DeleteQueue advanced past. Without case (b), each
+// purge would permanently leak data/vis/byage/group-lock state for
+// every message it left behind — those keys are unreachable via
+// normal routing once the generation bumps, so the reaper is the
+// only path that can free them.
+//
+// One OCC dispatch per record keeps each transaction small and
+// bounded; a mega-batch transaction would balloon memory and abort
+// more often.
 func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQueueMeta, readTS uint64) error {
 	now := time.Now().UnixMilli()
 	cutoff := now - meta.MessageRetentionSeconds*sqsMillisPerSecond
-	if cutoff <= 0 {
-		return nil
+	if meta.MessageRetentionSeconds <= 0 {
+		// Retention was set to a non-positive value: only orphan
+		// reaping (case b) makes sense. Keep cutoff at MaxInt64-ish
+		// for the live generation so we never delete live records.
+		cutoff = 0
 	}
-	prefix := sqsMsgByAgePrefixForQueue(queueName, meta.Generation)
+	prefix := sqsMsgByAgePrefixAllGenerations(queueName)
+	upper := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
-	upper := append(bytes.Clone(prefix), encodedU64(uint64MaxZero(cutoff)+1)...)
 
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
@@ -110,7 +126,7 @@ func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQu
 		if len(page) == 0 {
 			return nil
 		}
-		done, newProcessed, err := s.reapPage(ctx, queueName, meta.Generation, page, readTS, processed)
+		done, newProcessed, err := s.reapPage(ctx, queueName, meta.Generation, cutoff, page, readTS, processed)
 		if err != nil {
 			return err
 		}
@@ -127,14 +143,36 @@ func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQu
 }
 
 // reapPage walks one ScanAt page, dispatching a per-record reap
-// transaction. Returns done=true when the per-queue budget is hit or
-// the page was short (last page in the scan).
-func (s *SQSServer) reapPage(ctx context.Context, queueName string, gen uint64, page []*store.KVPair, readTS uint64, processed int) (bool, int, error) {
+// transaction. currentGen is the queue's *live* generation; entries
+// under any earlier generation are unconditionally reaped, while
+// entries on the live generation are gated by `cutoff`. Returns
+// done=true when the per-queue budget is hit or the page was short
+// (last page in the scan).
+func (s *SQSServer) reapPage(ctx context.Context, queueName string, currentGen uint64, cutoff int64, page []*store.KVPair, readTS uint64, processed int) (bool, int, error) {
 	for _, kvp := range page {
 		if err := ctx.Err(); err != nil {
 			return true, processed, errors.WithStack(err)
 		}
-		if err := s.reapOneRecord(ctx, queueName, gen, kvp.Key, string(kvp.Value), readTS); err != nil {
+		parsed, ok := parseSqsMsgByAgeKey(kvp.Key, queueName)
+		if !ok {
+			continue
+		}
+		// Live generation is gated by retention; older generations
+		// are unconditional orphans. Skipping a live record that is
+		// still inside the retention window keeps the reaper honest
+		// — the receive path expects to see it again until retention
+		// elapses.
+		if parsed.Generation == currentGen && parsed.SendTimestampMs > cutoff {
+			continue
+		}
+		if parsed.Generation > currentGen {
+			// Defensive: a key from a generation strictly newer than
+			// what the meta says would mean the byage index races
+			// the gen counter. Skip it; the next reaper pass will
+			// see meta caught up.
+			continue
+		}
+		if err := s.reapOneRecord(ctx, queueName, parsed.Generation, kvp.Key, parsed.MessageID, readTS); err != nil {
 			return true, processed, err
 		}
 		processed++
@@ -208,6 +246,91 @@ func (s *SQSServer) dispatchOrphanByAgeDrop(ctx context.Context, byAgeKey []byte
 		},
 	}
 	_, _ = s.coordinator.Dispatch(ctx, req)
+}
+
+// reapExpiredDedup walks every FIFO dedup record under the given
+// queue (across generations) and deletes the ones whose
+// ExpiresAtMillis has passed. Without this sweep, queues with mostly
+// unique MessageDeduplicationIds would accumulate permanent
+// dedup-row leaks because the send path treats expired records as
+// misses but never removes them.
+func (s *SQSServer) reapExpiredDedup(ctx context.Context, queueName string, readTS uint64) error {
+	prefix := []byte(SqsMsgDedupPrefix)
+	prefix = append(prefix, []byte(encodeSQSSegment(queueName))...)
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	now := time.Now().UnixMilli()
+
+	processed := 0
+	for processed < sqsReaperPerQueueBudget {
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		done, newProcessed, err := s.reapDedupPage(ctx, page, now, readTS, processed)
+		if err != nil {
+			return err
+		}
+		processed = newProcessed
+		if done {
+			return nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+		if bytes.Compare(start, upper) >= 0 {
+			return nil
+		}
+	}
+	return nil
+}
+
+// reapDedupPage walks one ScanAt page of dedup records and removes
+// any whose ExpiresAtMillis is in the past. Returns done=true when
+// the per-queue budget runs out or the page was short.
+func (s *SQSServer) reapDedupPage(ctx context.Context, page []*store.KVPair, now int64, readTS uint64, processed int) (bool, int, error) {
+	for _, kvp := range page {
+		if err := ctx.Err(); err != nil {
+			return true, processed, errors.WithStack(err)
+		}
+		rec, err := decodeFifoDedupRecord(kvp.Value)
+		if err != nil {
+			continue
+		}
+		if rec.ExpiresAtMillis <= 0 || rec.ExpiresAtMillis > now {
+			continue
+		}
+		if err := s.dispatchDedupDelete(ctx, kvp.Key, readTS); err != nil {
+			return true, processed, err
+		}
+		processed++
+		if processed >= sqsReaperPerQueueBudget {
+			return true, processed, nil
+		}
+	}
+	if len(page) < sqsReaperPageLimit {
+		return true, processed, nil
+	}
+	return false, processed, nil
+}
+
+func (s *SQSServer) dispatchDedupDelete(ctx context.Context, key []byte, readTS uint64) error {
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{key},
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: key},
+		},
+	}
+	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+		if isRetryableTransactWriteError(err) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, gen uint64, byAgeKey, dataKey []byte, parsed *sqsMessageRecord, readTS uint64) (*kv.OperationGroup[kv.OP], error) {

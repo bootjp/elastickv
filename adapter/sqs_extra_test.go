@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/bootjp/elastickv/kv"
 )
 
 func TestSQSServer_PurgeQueueRemovesMessagesAndRateLimits(t *testing.T) {
@@ -1079,6 +1081,133 @@ func TestSQSServer_RetentionReaperRemovesOldMessage(t *testing.T) {
 	attrs, _ := body["Attributes"].(map[string]any)
 	if attrs["ApproximateNumberOfMessages"] != "0" {
 		t.Fatalf("approx counter after reap = %v, want 0", attrs)
+	}
+}
+
+func TestSQSServer_RetentionReaperReclaimsPurgedGenerations(t *testing.T) {
+	t.Parallel()
+	// PurgeQueue advances the queue generation rather than walking the
+	// keyspace, so prior-generation data/vis/byage records become
+	// orphans that no normal request path can ever observe again. The
+	// reaper must walk every generation under the queue and delete
+	// those orphans, otherwise each purge leaks storage permanently.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "purge-orphans")
+
+	// Stamp three messages on the original generation, then purge.
+	for i := range 3 {
+		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":    queueURL,
+			"MessageBody": "g0-" + strconv.Itoa(i),
+		})
+	}
+	if status, body := callSQS(t, node, sqsPurgeQueueTarget, map[string]any{
+		"QueueUrl": queueURL,
+	}); status != http.StatusOK {
+		t.Fatalf("purge: %d %v", status, body)
+	}
+
+	// Confirm the byage prefix still has the orphan rows before
+	// reaping.
+	srv := node.sqsServer
+	ctx := t.Context()
+	prefix := sqsMsgByAgePrefixAllGenerations("purge-orphans")
+	end := prefixScanEnd(prefix)
+	before, err := srv.store.ScanAt(ctx, prefix, end, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("pre-reap scan: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatalf("expected pre-reap orphan rows, got none")
+	}
+
+	// Drive one reaper pass; the orphan generation must be cleaned.
+	if err := srv.reapAllQueues(ctx); err != nil {
+		t.Fatalf("reapAllQueues: %v", err)
+	}
+	assertNoPurgeOrphansLeft(t, srv, "purge-orphans", prefix, end)
+}
+
+// assertNoPurgeOrphansLeft scans the byage prefix after a reaper pass
+// and fails the test if any entry still references a generation older
+// than the queue's current generation.
+func assertNoPurgeOrphansLeft(t *testing.T, srv *SQSServer, queueName string, prefix, end []byte) {
+	t.Helper()
+	ctx := t.Context()
+	readTS := srv.nextTxnReadTS(ctx)
+	meta, _, metaErr := srv.loadQueueMetaAt(ctx, queueName, readTS)
+	if metaErr != nil {
+		t.Fatalf("meta load: %v", metaErr)
+	}
+	after, err := srv.store.ScanAt(ctx, prefix, end, 100, srv.nextTxnReadTS(ctx))
+	if err != nil {
+		t.Fatalf("post-reap scan: %v", err)
+	}
+	for _, kvp := range after {
+		parsed, ok := parseSqsMsgByAgeKey(kvp.Key, queueName)
+		if !ok {
+			continue
+		}
+		if parsed.Generation < meta.Generation {
+			t.Fatalf("orphan row from gen=%d still present after reap (current=%d)",
+				parsed.Generation, meta.Generation)
+		}
+	}
+}
+
+func TestSQSServer_RetentionReaperDropsExpiredFifoDedup(t *testing.T) {
+	t.Parallel()
+	// Expired dedup records must be reaped, otherwise queues with
+	// mostly-unique MessageDeduplicationIds accumulate permanent
+	// dedup rows. The send path already treats expired entries as
+	// misses; the reaper is the only path that frees the storage.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "fifo-dedup-reap.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	url, _ := out["QueueUrl"].(string)
+	_ = sendFifoMessage(t, node, url, "g", "d-1", "x")
+
+	srv := node.sqsServer
+	ctx := t.Context()
+	dedupKey := sqsMsgDedupKey("fifo-dedup-reap.fifo", 1, "d-1")
+	readTS := srv.nextTxnReadTS(ctx)
+	raw, err := srv.store.GetAt(ctx, dedupKey, readTS)
+	if err != nil {
+		t.Fatalf("read dedup: %v", err)
+	}
+	rec, err := decodeFifoDedupRecord(raw)
+	if err != nil {
+		t.Fatalf("decode dedup: %v", err)
+	}
+	rec.ExpiresAtMillis = time.Now().UnixMilli() - 1000
+	body, err := encodeFifoDedupRecord(rec)
+	if err != nil {
+		t.Fatalf("encode dedup: %v", err)
+	}
+	commitReq := &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: readTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: dedupKey, Value: body},
+		},
+	}
+	if _, err := srv.coordinator.Dispatch(ctx, commitReq); err != nil {
+		t.Fatalf("backdate dispatch: %v", err)
+	}
+
+	if err := srv.reapAllQueues(ctx); err != nil {
+		t.Fatalf("reapAllQueues: %v", err)
+	}
+
+	if _, err := srv.store.GetAt(ctx, dedupKey, srv.nextTxnReadTS(ctx)); err == nil {
+		t.Fatalf("expired dedup record still present after reap")
 	}
 }
 
