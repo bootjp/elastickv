@@ -21,8 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	internalutil "github.com/bootjp/elastickv/internal"
-	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
@@ -33,6 +31,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	internalutil "github.com/bootjp/elastickv/internal"
+	pb "github.com/bootjp/elastickv/proto"
 )
 
 const (
@@ -307,7 +308,7 @@ type membership struct {
 }
 
 type fanout struct {
-	seeds           []string
+	seeds []string
 	// seedSet is a pre-computed lookup over seeds for evictOneLocked's
 	// "skip seed entries" check. Seeds are immutable after construction so
 	// rebuilding the map on every cache-full eviction (under f.mu) is pure
