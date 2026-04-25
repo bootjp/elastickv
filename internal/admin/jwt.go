@@ -90,8 +90,9 @@ func (s *Signer) Sign(principal AuthPrincipal) (string, error) {
 // falls back to the optional previous key so operators can rotate keys
 // without logging everybody out at once.
 type Verifier struct {
-	keys  [][]byte
-	clock Clock
+	keys           [][]byte
+	clock          Clock
+	clockTolerance time.Duration
 }
 
 // NewVerifier builds a verifier from keys in priority order (primary first,
@@ -112,7 +113,21 @@ func NewVerifier(keys [][]byte, clock Clock) (*Verifier, error) {
 	if clock == nil {
 		clock = SystemClock
 	}
-	return &Verifier{keys: copied, clock: clock}, nil
+	return &Verifier{keys: copied, clock: clock, clockTolerance: defaultClockSkewTolerance}, nil
+}
+
+// WithClockSkewTolerance overrides the future-issuance grace window.
+// Operators in distributed environments where NTP synchronisation is
+// loose may want a larger value to avoid spurious 401s when the
+// signer's clock leads the verifier's by more than the default.
+// Negative or zero durations fall back to defaultClockSkewTolerance.
+func (v *Verifier) WithClockSkewTolerance(d time.Duration) *Verifier {
+	if d <= 0 {
+		v.clockTolerance = defaultClockSkewTolerance
+	} else {
+		v.clockTolerance = d
+	}
+	return v
 }
 
 // ErrInvalidToken is returned for any verification failure without leaking
@@ -138,10 +153,12 @@ func (v *Verifier) Verify(token string) (AuthPrincipal, error) {
 	return v.validateClaims(claims)
 }
 
-// clockSkewToleranceSeconds is the slack we allow on the "issued in the
-// future" check so that minor NTP drift between admin nodes does not
-// produce spurious 401s.
-const clockSkewToleranceSeconds = 30
+// defaultClockSkewTolerance is the slack we allow on the "issued in
+// the future" check so that minor NTP drift between admin nodes does
+// not produce spurious 401s. Operators in distributed environments
+// with looser clock synchronisation can override the per-verifier
+// value via Verifier.WithClockSkewTolerance.
+const defaultClockSkewTolerance = 30 * time.Second
 
 func splitSignedToken(token string) (signingInput, payloadSeg string, sig []byte, err error) {
 	parts := strings.Split(token, ".")
@@ -193,7 +210,7 @@ func (v *Verifier) validateClaims(claims jwtClaims) (AuthPrincipal, error) {
 	if claims.IAT == 0 {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "missing iat")
 	}
-	if now+clockSkewToleranceSeconds < claims.IAT {
+	if now+int64(v.clockTolerance.Seconds()) < claims.IAT {
 		return AuthPrincipal{}, errors.Wrap(ErrInvalidToken, "token issued in the future")
 	}
 	if claims.Sub == "" {

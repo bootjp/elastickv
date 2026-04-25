@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,17 +43,18 @@ func (m MapCredentialStore) LookupSecret(accessKey string) (string, bool) {
 // lookup, and per-IP rate limiter together. Construct it once at
 // startup and reuse across the admin listener's lifetime.
 type AuthService struct {
-	signer       *Signer
-	verifier     *Verifier
-	creds        CredentialStore
-	roles        map[string]Role
-	limiter      *rateLimiter
-	loginWindow  time.Duration
-	sessionTTL   time.Duration
-	secureCookie bool
-	cookieDomain string
-	clock        Clock
-	logger       *slog.Logger
+	signer         *Signer
+	verifier       *Verifier
+	creds          CredentialStore
+	roles          map[string]Role
+	limiter        *rateLimiter
+	loginWindow    time.Duration
+	sessionTTL     time.Duration
+	secureCookie   bool
+	cookieDomain   string
+	clock          Clock
+	logger         *slog.Logger
+	trustedProxies []*net.IPNet
 }
 
 // AuthServiceOpts covers the knobs a caller may want to vary in tests.
@@ -79,6 +81,13 @@ type AuthServiceOpts struct {
 	// Logger is the slog destination for admin_audit entries emitted
 	// by the login/logout handlers. nil falls back to slog.Default().
 	Logger *slog.Logger
+	// TrustedProxies is the set of *net.IPNets whose RemoteAddr is
+	// allowed to substitute X-Forwarded-For for rate limiting. Empty
+	// (the default) means the per-IP rate limiter always uses the
+	// peer address — safe when admin runs on loopback or directly
+	// behind users; necessary to override when a load balancer
+	// terminates connections.
+	TrustedProxies []*net.IPNet
 }
 
 // NewAuthService constructs an AuthService. The signer must be primary
@@ -101,17 +110,18 @@ func NewAuthService(signer *Signer, creds CredentialStore, roles map[string]Role
 		logger = slog.Default()
 	}
 	return &AuthService{
-		signer:       signer,
-		verifier:     opts.Verifier,
-		creds:        creds,
-		roles:        roles,
-		limiter:      newRateLimiter(limit, window, opts.Clock),
-		loginWindow:  window,
-		sessionTTL:   sessionTTL,
-		secureCookie: !opts.InsecureCookie,
-		cookieDomain: opts.CookieDomain,
-		clock:        opts.Clock,
-		logger:       logger,
+		signer:         signer,
+		verifier:       opts.Verifier,
+		creds:          creds,
+		roles:          roles,
+		limiter:        newRateLimiter(limit, window, opts.Clock),
+		loginWindow:    window,
+		sessionTTL:     sessionTTL,
+		secureCookie:   !opts.InsecureCookie,
+		cookieDomain:   opts.CookieDomain,
+		clock:          opts.Clock,
+		logger:         logger,
+		trustedProxies: opts.TrustedProxies,
 	}
 }
 
@@ -164,7 +174,7 @@ func (s *AuthService) preflightLogin(w http.ResponseWriter, r *http.Request) boo
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "login requires POST")
 		return false
 	}
-	if !s.limiter.allow(clientIP(r)) {
+	if !s.limiter.allow(clientIPWithTrust(r, s.trustedProxies)) {
 		// Retry-After must be derived from the actual rate-limit
 		// window so tests and callers that tune LoginWindow get an
 		// accurate hint; clamp to at least 1 second so we never
@@ -234,18 +244,10 @@ func readLoginRequest(w http.ResponseWriter, r *http.Request) (loginRequest, boo
 // expensive KDF would add latency to every login attempt without
 // changing the threat model.
 var (
-	secretCompareKey     []byte
-	secretCompareKeyOnce sync.Once
+	secretCompareKey            []byte
+	secretCompareKeyOnce        sync.Once
+	unknownKeySecretPlaceholder string
 )
-
-// unknownKeySecretPlaceholder is a deterministic dummy we hash when
-// the incoming access key is unknown. We hash it fresh on every call
-// (rather than precomputing the digest once) so the unknown-key
-// branch performs the same HMAC work as the known-key branch —
-// otherwise an attacker could enumerate valid access keys by
-// measuring login latency. It is NOT a credential: nothing grants
-// access to any resource, and grepping for it finds only this file.
-const unknownKeySecretPlaceholder = "admin-auth-unknown-key-placeholder" //nolint:gosec // intentional non-credential sentinel; see comment above.
 
 func initSecretCompareKey() {
 	secretCompareKey = make([]byte, sha256.Size)
@@ -255,6 +257,17 @@ func initSecretCompareKey() {
 		// cannot authenticate anyone anyway.
 		panic("admin: crypto/rand failure while initialising secret compare key: " + err.Error())
 	}
+	// Materialise the unknown-key dummy as random bytes per process.
+	// We still hash it fresh on every login so the unknown branch
+	// performs the same HMAC work as the known branch (otherwise an
+	// attacker could enumerate valid access keys by login latency);
+	// the random per-process value just denies any precomputation
+	// of the resulting digest.
+	dummy := make([]byte, sha256.Size)
+	if _, err := rand.Read(dummy); err != nil {
+		panic("admin: crypto/rand failure while initialising unknown-key placeholder: " + err.Error())
+	}
+	unknownKeySecretPlaceholder = string(dummy)
 }
 
 // digestForCompare returns HMAC-SHA256(secretCompareKey, s). Used only

@@ -78,6 +78,28 @@ func TestJWT_RejectsFutureIssued(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidToken))
 }
 
+// TestJWT_ClockSkewToleranceConfigurable proves WithClockSkewTolerance
+// widens the future-issuance grace window so a verifier whose clock
+// trails the signer by more than 30s can still accept its tokens.
+func TestJWT_ClockSkewToleranceConfigurable(t *testing.T) {
+	signClk := fixedClock(time.Unix(1_700_000_000+120, 0).UTC()) // 2 min ahead of verifier
+	verifyClk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
+	signer := newSignerForTest(t, 1, signClk)
+
+	// Default 30s tolerance: should reject (issued 120s in the future).
+	defaultVerifier := newVerifierForTest(t, []byte{1}, verifyClk)
+	token, err := signer.Sign(AuthPrincipal{AccessKey: "AKIA", Role: RoleFull})
+	require.NoError(t, err)
+	_, err = defaultVerifier.Verify(token)
+	require.Error(t, err)
+
+	// Loosen tolerance to 5 minutes: should accept.
+	relaxed := newVerifierForTest(t, []byte{1}, verifyClk).WithClockSkewTolerance(5 * time.Minute)
+	got, err := relaxed.Verify(token)
+	require.NoError(t, err)
+	require.Equal(t, "AKIA", got.AccessKey)
+}
+
 func TestJWT_RejectsWrongSignature(t *testing.T) {
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
