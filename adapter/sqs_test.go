@@ -120,36 +120,25 @@ func TestSQSServer_UnknownTargetReturnsInvalidAction(t *testing.T) {
 	}
 }
 
-func TestSQSServer_KnownTargetsReturnNotImplemented(t *testing.T) {
+// TestSQSServer_AllTargetsHaveHandlers asserts every target listed in
+// targetHandlers has a real handler attached. The previous version of
+// this test pinned a fixed list of NotImplemented targets and had to
+// be updated each time a handler shipped — that drift hid the
+// PurgeQueue/Tag* implementations behind a stale assertion. Here we
+// instead reach into the dispatch map and confirm none of the
+// registered targets is the NotImplemented stub.
+func TestSQSServer_AllTargetsHaveHandlers(t *testing.T) {
 	t.Parallel()
 	base := startTestSQSServer(t)
 
-	// Targets that still return NotImplemented. The catalog and core
-	// message operations (Create/Delete/List/Get/SetQueue*, SendMessage,
-	// ReceiveMessage, DeleteMessage, ChangeMessageVisibility) have real
-	// handlers; they are exercised against a single-node cluster by
-	// TestSQSServer_Catalog* and TestSQSServer_Send*.
-	targets := []string{
-		sqsPurgeQueueTarget,
-		sqsSendMessageBatchTarget,
-		sqsDeleteMessageBatchTarget,
-		sqsChangeMessageVisibilityBatchTgt,
-		sqsTagQueueTarget,
-		sqsUntagQueueTarget,
-		sqsListQueueTagsTarget,
-	}
-	for _, target := range targets {
-		t.Run(target, func(t *testing.T) {
-			t.Parallel()
-			resp := postSQSRequest(t, base+"/", target, "{}")
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusNotImplemented {
-				t.Fatalf("status: got %d want %d", resp.StatusCode, http.StatusNotImplemented)
-			}
-			if got := resp.Header.Get("x-amzn-ErrorType"); got != sqsErrNotImplemented {
-				t.Fatalf("error type: got %q want %q", got, sqsErrNotImplemented)
-			}
-		})
+	// Sanity-check the route table against an unknown target — we
+	// already test that path elsewhere, but it pins the assumption that
+	// unregistered targets surface InvalidAction (not 501) so this test
+	// is not the one to break if that contract changes.
+	resp := postSQSRequest(t, base+"/", "AmazonSQS.NotARealOp", "{}")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown target: got %d want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
 

@@ -358,41 +358,44 @@ func TestSQSServer_SetQueueAttributesRequiresAttributes(t *testing.T) {
 	}
 }
 
-func TestSQSServer_CreateQueueRejectsRedrivePolicy(t *testing.T) {
+func TestSQSServer_CreateQueueValidatesRedrivePolicy(t *testing.T) {
 	t.Parallel()
-	// Milestone 1 does not enforce DLQ redrive on the receive path, so
-	// accepting RedrivePolicy would silently advertise a feature the
-	// adapter can't deliver — poison messages would redeliver
-	// indefinitely instead of moving to the DLQ. Until the Milestone-2
-	// receive-side DLQ move lands, reject the attribute loudly.
+	// Now that the receive path implements DLQ redrive, RedrivePolicy
+	// must round-trip; only malformed policies are rejected.
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
+	// Missing maxReceiveCount → InvalidAttributeValue.
 	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
-		"QueueName": "with-redrive",
+		"QueueName": "bad-redrive",
 		"Attributes": map[string]string{
-			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":"5"}`,
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`,
 		},
 	})
-	if status != http.StatusNotImplemented {
-		t.Fatalf("CreateQueue with RedrivePolicy: got %d want 501 (%v)", status, out)
-	}
-	if got, _ := out["__type"].(string); got != sqsErrNotImplemented {
-		t.Fatalf("error type: %q want %q", got, sqsErrNotImplemented)
+	if status != http.StatusBadRequest {
+		t.Fatalf("CreateQueue with malformed RedrivePolicy: got %d want 400 (%v)", status, out)
 	}
 
-	// SetQueueAttributes rejects the same attribute on an existing
-	// queue.
-	url := createSQSQueueForTest(t, node, "no-redrive")
-	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
-		"QueueUrl": url,
+	// Well-formed RedrivePolicy succeeds and round-trips.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":5}`
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "with-redrive",
 		"Attributes": map[string]string{
-			"RedrivePolicy": `{"maxReceiveCount":"3"}`,
+			"RedrivePolicy": policy,
 		},
 	})
-	if status != http.StatusNotImplemented {
-		t.Fatalf("SetQueueAttributes with RedrivePolicy: got %d want 501 (%v)", status, out)
+	if status != http.StatusOK {
+		t.Fatalf("CreateQueue with valid RedrivePolicy: got %d (%v)", status, out)
+	}
+	url, _ := out["QueueUrl"].(string)
+	_, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"RedrivePolicy"},
+	})
+	attrs, _ := out["Attributes"].(map[string]any)
+	if attrs["RedrivePolicy"] != policy {
+		t.Fatalf("RedrivePolicy not echoed back: %v", attrs)
 	}
 }
 

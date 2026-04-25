@@ -52,7 +52,6 @@ const (
 // "Common Errors" page of the SQS API reference.
 const (
 	sqsErrInvalidAction      = "InvalidAction"
-	sqsErrNotImplemented     = "NotImplemented"
 	sqsErrInternalFailure    = "InternalFailure"
 	sqsErrServiceUnavailable = "ServiceUnavailable"
 	sqsErrMalformedRequest   = "MalformedQueryString"
@@ -69,6 +68,10 @@ type SQSServer struct {
 	leaderSQS      map[string]string
 	region         string
 	staticCreds    map[string]string
+	// reaperCancel terminates the retention sweeper goroutine. Run()
+	// starts the sweeper; Stop() cancels it. The cancel is nil before
+	// Run() executes so Stop() on an unstarted server is safe.
+	reaperCancel context.CancelFunc
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
@@ -96,17 +99,17 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 		sqsGetQueueUrlTarget:               s.getQueueUrl,
 		sqsGetQueueAttributesTarget:        s.getQueueAttributes,
 		sqsSetQueueAttributesTarget:        s.setQueueAttributes,
-		sqsPurgeQueueTarget:                s.notImplemented("PurgeQueue"),
+		sqsPurgeQueueTarget:                s.purgeQueue,
 		sqsSendMessageTarget:               s.sendMessage,
-		sqsSendMessageBatchTarget:          s.notImplemented("SendMessageBatch"),
+		sqsSendMessageBatchTarget:          s.sendMessageBatch,
 		sqsReceiveMessageTarget:            s.receiveMessage,
 		sqsDeleteMessageTarget:             s.deleteMessage,
-		sqsDeleteMessageBatchTarget:        s.notImplemented("DeleteMessageBatch"),
+		sqsDeleteMessageBatchTarget:        s.deleteMessageBatch,
 		sqsChangeMessageVisibilityTarget:   s.changeMessageVisibility,
-		sqsChangeMessageVisibilityBatchTgt: s.notImplemented("ChangeMessageVisibilityBatch"),
-		sqsTagQueueTarget:                  s.notImplemented("TagQueue"),
-		sqsUntagQueueTarget:                s.notImplemented("UntagQueue"),
-		sqsListQueueTagsTarget:             s.notImplemented("ListQueueTags"),
+		sqsChangeMessageVisibilityBatchTgt: s.changeMessageVisibilityBatch,
+		sqsTagQueueTarget:                  s.tagQueue,
+		sqsUntagQueueTarget:                s.untagQueue,
+		sqsListQueueTagsTarget:             s.listQueueTags,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
@@ -120,6 +123,9 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 }
 
 func (s *SQSServer) Run() error {
+	reaperCtx, cancel := context.WithCancel(context.Background())
+	s.reaperCancel = cancel
+	s.startReaper(reaperCtx)
 	if err := s.httpServer.Serve(s.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}
@@ -127,6 +133,9 @@ func (s *SQSServer) Run() error {
 }
 
 func (s *SQSServer) Stop() {
+	if s.reaperCancel != nil {
+		s.reaperCancel()
+	}
 	if s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
 	}
@@ -235,15 +244,6 @@ func (s *SQSServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
 
 func sqsLeaderProxyErrorWriter(w http.ResponseWriter, status int, message string) {
 	writeSQSError(w, status, sqsErrServiceUnavailable, message)
-}
-
-// notImplemented returns a handler that responds with a JSON-protocol
-// NotImplemented error so clients get a clean signal while the real handlers
-// are still being built out.
-func (s *SQSServer) notImplemented(op string) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		writeSQSError(w, http.StatusNotImplemented, sqsErrNotImplemented, op+" is not implemented yet")
-	}
 }
 
 // writeSQSError emits an SQS JSON-protocol error envelope. AWS returns:

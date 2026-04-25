@@ -40,6 +40,15 @@ const (
 	sqsListQueuesDefaultMaxResults      = 1000
 	sqsListQueuesHardMaxResults         = 1000
 	sqsQueueScanPageLimit               = 1024
+	// sqsPurgeRateLimitMillis is AWS's "one PurgeQueue per 60 seconds per
+	// queue" limit. PurgeInProgress is returned to callers that try
+	// again before the cooldown ends.
+	sqsPurgeRateLimitMillis = 60_000
+)
+
+// AWS error codes specific to PurgeQueue.
+const (
+	sqsErrPurgeInProgress = "AWS.SimpleQueueService.PurgeQueueInProgress"
 )
 
 // AWS error codes specific to the queue catalog.
@@ -70,6 +79,19 @@ type sqsQueueMeta struct {
 	MaximumMessageSize        int64             `json:"maximum_message_size"`
 	RedrivePolicy             string            `json:"redrive_policy,omitempty"`
 	Tags                      map[string]string `json:"tags,omitempty"`
+	// LastPurgedAtMillis is the wall-clock time of the last successful
+	// PurgeQueue. AWS rate-limits PurgeQueue to once per 60 seconds per
+	// queue; tracking it on the meta record means the limit survives
+	// leader failover (in-memory cooldowns would let the new leader
+	// accept a second purge a few seconds later).
+	LastPurgedAtMillis int64 `json:"last_purged_at_millis,omitempty"`
+	// CreatedAtMillis / LastModifiedAtMillis are wall-clock timestamps
+	// surfaced by GetQueueAttributes (AWS reports them in second
+	// granularity). HLC is unsuitable for this — it is a logical
+	// counter, not a wall clock — so we record the local Now() at
+	// commit time and trust HLC monotonicity to keep ordering sane.
+	CreatedAtMillis      int64 `json:"created_at_millis,omitempty"`
+	LastModifiedAtMillis int64 `json:"last_modified_at_millis,omitempty"`
 }
 
 var storedSQSMetaPrefix = []byte{0x00, 'S', 'Q', 0x01}
@@ -362,18 +384,17 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		m.ContentBasedDedup = b
 		return nil
 	},
-	"RedrivePolicy": func(_ *sqsQueueMeta, _ string) error {
-		// Milestone 1 does not enforce DLQ redrive at receive time,
-		// so silently accepting RedrivePolicy would advertise a
-		// feature clients rely on (poison messages moving to the
-		// DLQ after maxReceiveCount) that this adapter does not
-		// actually provide — receivers would see infinite
-		// redelivery instead. Reject the attribute until the
-		// Milestone-2 receive path that actually performs the DLQ
-		// move lands, so operators get a clear signal instead of
-		// a silently-broken queue.
-		return newSQSAPIError(http.StatusNotImplemented, sqsErrNotImplemented,
-			"RedrivePolicy is not yet supported; DLQ redrive is tracked for Milestone 2")
+	"RedrivePolicy": func(m *sqsQueueMeta, v string) error {
+		// Validate the policy at attribute-apply time so a malformed
+		// RedrivePolicy never makes it onto the queue meta record. The
+		// receive path re-parses on every check rather than caching
+		// the struct on meta, because DLQ existence has to be
+		// re-validated at the readTS anyway.
+		if _, err := parseRedrivePolicy(v); err != nil {
+			return err
+		}
+		m.RedrivePolicy = v
+		return nil
 	},
 }
 
@@ -539,6 +560,9 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	if clock := s.coordinator.Clock(); clock != nil {
 		requested.CreatedAtHLC = clock.Current()
 	}
+	now := time.Now().UnixMilli()
+	requested.CreatedAtMillis = now
+	requested.LastModifiedAtMillis = now
 	metaBytes, err := encodeSQSQueueMeta(requested)
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -777,7 +801,8 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, s.nextTxnReadTS(r.Context()))
+	readTS := s.nextTxnReadTS(r.Context())
+	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, readTS)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -787,8 +812,30 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selection := selectedAttributeNames(in.AttributeNames)
-	attrs := queueMetaToAttributes(meta, selection)
+	// Counter computation is the only path that touches per-message
+	// state, so skip the scan when the caller did not ask for any of
+	// the Approximate* attributes. AWS itself documents these as
+	// approximate; a snapshot read is correct enough.
+	var counters *sqsApproxCounters
+	if selectionWantsApproxCounters(selection) {
+		c, scanErr := s.scanApproxCounters(r.Context(), name, meta.Generation, readTS)
+		if scanErr != nil {
+			writeSQSErrorFromErr(w, scanErr)
+			return
+		}
+		counters = &c
+	}
+	attrs := queueMetaToAttributes(meta, selection, counters, s.queueArn(name))
 	writeSQSJSON(w, map[string]any{"Attributes": attrs})
+}
+
+// queueArn synthesises the AWS-shaped ARN clients expect to find on
+// GetQueueAttributes. Account id is fixed at "000000000000" — IAM is
+// out of scope, so emitting a sentinel placeholder gives SDKs a
+// well-formed string without inventing identity.
+func (s *SQSServer) queueArn(queueName string) string {
+	region := s.effectiveRegion()
+	return "arn:aws:sqs:" + region + ":000000000000:" + queueName
 }
 
 // sqsAttributeSelection is a tri-state result from selectedAttributeNames:
@@ -823,7 +870,37 @@ func selectedAttributeNames(req []string) sqsAttributeSelection {
 	return sqsAttributeSelection{names: selection}
 }
 
-func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection) map[string]string {
+// sqsApproxCounters bundles the three AWS-published "Approximate"
+// counters; nil means the caller did not request them and so the
+// per-message scan was skipped.
+type sqsApproxCounters struct {
+	Visible    int64
+	NotVisible int64
+	Delayed    int64
+}
+
+// approxCounterAttributeNames is every attribute that requires a
+// per-message scan. queueMetaToAttributes only invokes the scan when
+// the selection overlaps this set.
+var approxCounterAttributeNames = map[string]bool{
+	"ApproximateNumberOfMessages":           true,
+	"ApproximateNumberOfMessagesNotVisible": true,
+	"ApproximateNumberOfMessagesDelayed":    true,
+}
+
+func selectionWantsApproxCounters(selection sqsAttributeSelection) bool {
+	if selection.expandAll {
+		return true
+	}
+	for k := range selection.names {
+		if approxCounterAttributeNames[k] {
+			return true
+		}
+	}
+	return false
+}
+
+func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, counters *sqsApproxCounters, queueArn string) map[string]string {
 	// No AttributeNames supplied and no "All" → AWS returns nothing.
 	// The handler still emits "Attributes" as an empty map so the
 	// response shape is stable.
@@ -838,6 +915,19 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection) 
 		"MaximumMessageSize":            strconv.FormatInt(meta.MaximumMessageSize, 10),
 		"FifoQueue":                     strconv.FormatBool(meta.IsFIFO),
 		"ContentBasedDeduplication":     strconv.FormatBool(meta.ContentBasedDedup),
+		"QueueArn":                      queueArn,
+	}
+	if created := meta.CreatedAtMillis; created > 0 {
+		// AWS reports timestamps in unix seconds (string-encoded).
+		all["CreatedTimestamp"] = strconv.FormatInt(created/sqsMillisPerSecond, 10)
+	}
+	if mod := meta.LastModifiedAtMillis; mod > 0 {
+		all["LastModifiedTimestamp"] = strconv.FormatInt(mod/sqsMillisPerSecond, 10)
+	}
+	if counters != nil {
+		all["ApproximateNumberOfMessages"] = strconv.FormatInt(counters.Visible, 10)
+		all["ApproximateNumberOfMessagesNotVisible"] = strconv.FormatInt(counters.NotVisible, 10)
+		all["ApproximateNumberOfMessagesDelayed"] = strconv.FormatInt(counters.Delayed, 10)
 	}
 	if meta.RedrivePolicy != "" {
 		all["RedrivePolicy"] = meta.RedrivePolicy
@@ -921,6 +1011,7 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	if meta.ContentBasedDedup && !meta.IsFIFO {
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
+	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -941,4 +1032,81 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		return false, errors.WithStack(err)
 	}
 	return true, nil
+}
+
+// sqsApproxCounterScanLimit caps a single GetQueueAttributes scan. AWS
+// reports the counters as "approximate"; once the queue is past this
+// many records the per-bucket totals are best-effort. Picking 50_000
+// keeps the scan latency under ~100 ms on a warm Pebble cache.
+const sqsApproxCounterScanLimit = 50_000
+
+// scanApproxCounters walks every data record under (queue, generation)
+// and buckets it into visible / not-visible / delayed by the same
+// definitions GetQueueAttributes documents. The scan runs at the same
+// snapshot timestamp the meta read used so the returned numbers are a
+// coherent snapshot; concurrent sends or receives that commit after
+// readTS just show up on the next call.
+func (s *SQSServer) scanApproxCounters(ctx context.Context, queueName string, gen uint64, readTS uint64) (sqsApproxCounters, error) {
+	prefix := []byte(SqsMsgDataPrefix)
+	prefix = append(prefix, []byte(encodeSQSSegment(queueName))...)
+	prefix = appendU64(prefix, gen)
+	end := prefixScanEnd(prefix)
+
+	now := time.Now().UnixMilli()
+	var counters sqsApproxCounters
+	start := bytes.Clone(prefix)
+	for {
+		page, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
+		if err != nil {
+			return counters, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return counters, nil
+		}
+		bucketApproxCounterPage(page, now, &counters)
+		if exhausted(counters, page, end, &start) {
+			return counters, nil
+		}
+	}
+}
+
+// bucketApproxCounterPage walks one ScanAt page and bumps the right
+// counter for each record. Pulled out of scanApproxCounters so the
+// outer loop stays under the cyclomatic budget.
+func bucketApproxCounterPage(page []*store.KVPair, now int64, counters *sqsApproxCounters) {
+	for _, kvp := range page {
+		rec, err := decodeSQSMessageRecord(kvp.Value)
+		if err != nil {
+			// Malformed record means a programmer bug, not a
+			// counter bug — drop it from the totals rather than
+			// failing the whole call.
+			continue
+		}
+		if rec.VisibleAtMillis <= now {
+			counters.Visible++
+			continue
+		}
+		if rec.ReceiveCount == 0 {
+			counters.Delayed++
+		} else {
+			counters.NotVisible++
+		}
+	}
+}
+
+// exhausted reports whether the scan has reached its budget or the
+// end of the prefix range. Mutates `start` so the caller can resume.
+func exhausted(counters sqsApproxCounters, page []*store.KVPair, end []byte, start *[]byte) bool {
+	total := counters.Visible + counters.NotVisible + counters.Delayed
+	if total >= sqsApproxCounterScanLimit {
+		return true
+	}
+	if len(page) < sqsQueueScanPageLimit {
+		return true
+	}
+	*start = nextScanCursorAfter(page[len(page)-1].Key)
+	if end != nil && bytes.Compare(*start, end) >= 0 {
+		return true
+	}
+	return false
 }
