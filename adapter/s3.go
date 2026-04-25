@@ -2237,29 +2237,39 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 		pending = pending[:0]
 	}
 	for _, part := range manifest.Parts {
-		var ok bool
-		if pending, ok = s.appendPartBlobKeys(pending, bucket, generation, objectKey, manifest.UploadID, part, flush); !ok {
+		if !s.appendPartBlobKeys(&pending, bucket, generation, objectKey, manifest.UploadID, part, flush) {
 			return
 		}
 	}
 	flush()
 }
 
-func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) ([]*kv.Elem[kv.OP], bool) {
+// appendPartBlobKeys queues every blob-chunk Del for one manifest part
+// onto *pending and triggers flush whenever the batch reaches
+// s3MetaBatchOps. The slice is taken by pointer so that the caller's
+// `flush` closure (which captures pending from the enclosing
+// cleanupManifestBlobs scope) observes appends performed here. A
+// previous value-passing version silently no-op'd flush — flush saw
+// the outer `pending` whose header still pointed at length 0, and the
+// helper accumulated every chunk into one batch on return, defeating
+// the s3MetaBatchOps cap and re-opening the OOM / oversized-MsgApp
+// risk the cap was meant to bound. See TestS3CleanupManifestBlobs
+// _RespectsMetaBatchOps for the regression guard.
+func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) bool {
 	for chunkNo := range part.ChunkSizes {
 		chunkIndex, err := uint64FromInt(chunkNo)
 		if err != nil {
-			return pending, false
+			return false
 		}
-		pending = append(pending, &kv.Elem[kv.OP]{
+		*pending = append(*pending, &kv.Elem[kv.OP]{
 			Op:  kv.Del,
 			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
 		})
-		if len(pending) >= s3MetaBatchOps {
+		if len(*pending) >= s3MetaBatchOps {
 			flush()
 		}
 	}
-	return pending, true
+	return true
 }
 
 //nolint:cyclop // Proxying depends on root, bucket, and object-level leadership decisions.

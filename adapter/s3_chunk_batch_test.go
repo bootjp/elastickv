@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -136,4 +137,58 @@ func TestS3MetaBatchFitsInRaftMaxSize(t *testing.T) {
 		"S3 meta batch entry must fit under MaxSizePerMsg=%d; got %d (s3MetaBatchOps=%d, objectKey=%dB)",
 		raftMaxSizePerMsgPostPR593, totalEntrySize, s3MetaBatchOps, len(objectKey),
 	)
+}
+
+// TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps is the
+// regression guard for the slice-by-value bug Gemini caught: a
+// previous version of appendPartBlobKeys took `pending` by value, so
+// the flush closure (captured from cleanupManifestBlobs's enclosing
+// scope) saw the outer slice header at length 0 and never fired,
+// silently accumulating every chunk into one giant batch. This test
+// pins the contract that the helper drains via flush exactly every
+// s3MetaBatchOps appends, never building a slice longer than the cap.
+func TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps(t *testing.T) {
+	t.Parallel()
+
+	// Build a manifest part with chunkCount > 2× s3MetaBatchOps so the
+	// flush closure must fire at least twice, plus a tail flush from
+	// the caller's final flush() in cleanupManifestBlobs.
+	const chunkCount = 2*s3MetaBatchOps + 7
+	chunkSizes := make([]uint64, chunkCount)
+	for i := range chunkSizes {
+		chunkSizes[i] = 1
+	}
+	part := s3ObjectPart{
+		PartNo:      1,
+		PartVersion: 1,
+		ChunkSizes:  chunkSizes,
+	}
+
+	pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
+	flushCalls := 0
+	flushBatchSizes := make([]int, 0, 4)
+	flush := func() {
+		// Mirror cleanupManifestBlobs's flush: record the batch size
+		// and then truncate. If the helper's pointer plumbing is
+		// broken, len(pending) here would always be 0 and the
+		// recorded batch sizes would never match s3MetaBatchOps.
+		flushCalls++
+		flushBatchSizes = append(flushBatchSizes, len(pending))
+		pending = pending[:0]
+	}
+
+	srv := (*S3Server)(nil) // method body does not touch s
+	ok := srv.appendPartBlobKeys(&pending, "bucket", 1, "key", "upload", part, flush)
+	require.True(t, ok)
+
+	// Exactly two threshold-triggered flushes inside the helper:
+	// at append #s3MetaBatchOps and #2×s3MetaBatchOps. The 7-entry
+	// remainder is left in pending for the caller's tail flush().
+	require.Equal(t, 2, flushCalls,
+		"expected flush to fire twice (at append %d and %d); slice-by-value bug regressed?",
+		s3MetaBatchOps, 2*s3MetaBatchOps)
+	require.Equal(t, []int{s3MetaBatchOps, s3MetaBatchOps}, flushBatchSizes,
+		"each flush must drain exactly s3MetaBatchOps entries; pending must not silently overflow the cap")
+	require.Len(t, pending, 7,
+		"trailing 7 entries should remain for the caller's final flush()")
 }
