@@ -155,9 +155,12 @@ func (e *ValidationError) Error() string {
 }
 
 // DynamoHandler serves /admin/api/v1/dynamo/tables and
-// /admin/api/v1/dynamo/tables/{name}. Only GET is supported here —
-// table creation and deletion live behind the protected write chain
-// in a follow-up handler.
+// /admin/api/v1/dynamo/tables/{name}. The collection root accepts
+// GET (list) and POST (create); the per-table route accepts GET
+// (describe) and DELETE. Writes go through the same protected
+// chain as reads (BodyLimit -> SessionAuth -> Audit -> CSRF) plus
+// an in-handler RoleFull check so a read-only key cannot mutate
+// even with a valid CSRF token.
 type DynamoHandler struct {
 	source TablesSource
 	logger *slog.Logger
@@ -417,7 +420,16 @@ func decodeCreateTableRequest(body io.Reader) (CreateTableRequest, error) {
 // the project's cyclomatic-complexity ceiling and the decoder is
 // trivially auditable on its own.
 func validateCreateTableRequest(in *CreateTableRequest) error {
-	if strings.TrimSpace(in.TableName) == "" {
+	// Trim whitespace in place so the canonical name flows through
+	// the rest of the pipeline. Without this, a name like " foo "
+	// passes the empty-after-trim check, propagates to the adapter
+	// (whose own TrimSpace check on creation also passes), and
+	// gets stored verbatim — leaving a table that the URL-based
+	// describe/delete routes cannot address because they trim the
+	// segment literally. Claude's review on PR #634 flagged the
+	// drift; trimming once at this boundary fixes it.
+	in.TableName = strings.TrimSpace(in.TableName)
+	if in.TableName == "" {
 		return errors.New("table_name is required")
 	}
 	// Reject slash-bearing names symmetrically with handleDescribe

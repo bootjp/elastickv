@@ -381,6 +381,39 @@ func validCreateBody() string {
 	return `{"table_name":"users","partition_key":{"name":"id","type":"S"}}`
 }
 
+// TestDynamoHandler_CreateTable_TrimsWhitespaceFromTableName covers
+// the Claude-review finding on PR #634: a name like "  users  "
+// must be trimmed before reaching the source so that subsequent
+// describe/delete URL segments (which are matched literally)
+// resolve the same table.
+func TestDynamoHandler_CreateTable_TrimsWhitespaceFromTableName(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	body := `{"table_name":"  users  ","partition_key":{"name":"id","type":"S"}}`
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(body))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	require.Equal(t, "users", src.lastCreateInput.TableName,
+		"name reaching the source must be the trimmed canonical form")
+}
+
+// TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected ensures
+// that a name consisting solely of whitespace still fails after
+// the trim — i.e., trimming does not weaken the empty-name guard.
+func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	body := `{"table_name":"   ","partition_key":{"name":"id","type":"S"}}`
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(body))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "table_name is required")
+}
+
 func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
