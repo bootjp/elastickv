@@ -308,6 +308,11 @@ type membership struct {
 
 type fanout struct {
 	seeds           []string
+	// seedSet is a pre-computed lookup over seeds for evictOneLocked's
+	// "skip seed entries" check. Seeds are immutable after construction so
+	// rebuilding the map on every cache-full eviction (under f.mu) is pure
+	// waste — Gemini flagged the per-call allocation.
+	seedSet         map[string]struct{}
 	token           string
 	refreshInterval time.Duration
 	creds           credentials.TransportCredentials
@@ -348,8 +353,13 @@ func newFanout(
 	if creds == nil {
 		creds = insecure.NewCredentials()
 	}
+	seedSet := make(map[string]struct{}, len(seeds))
+	for _, s := range seeds {
+		seedSet[s] = struct{}{}
+	}
 	return &fanout{
 		seeds:           seeds,
+		seedSet:         seedSet,
 		token:           token,
 		refreshInterval: refreshInterval,
 		creds:           creds,
@@ -548,17 +558,13 @@ func (f *fanout) releaseFunc(c *nodeClient) func() {
 // closed) — caller must run Close() outside f.mu. Closing is deferred to
 // the last release (see releaseFunc) when leases are still held.
 func (f *fanout) evictOneLocked() *grpc.ClientConn {
-	seeds := make(map[string]struct{}, len(f.seeds))
-	for _, s := range f.seeds {
-		seeds[s] = struct{}{}
-	}
 	var fallback string
 	var fallbackClient *nodeClient
 	for victim, vc := range f.clients {
 		if fallback == "" {
 			fallback, fallbackClient = victim, vc
 		}
-		if _, keep := seeds[victim]; keep {
+		if _, keep := f.seedSet[victim]; keep {
 			continue
 		}
 		return f.retireLocked(victim, vc)
