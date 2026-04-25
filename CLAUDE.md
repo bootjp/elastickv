@@ -23,7 +23,13 @@ go test -run TestName ./store/...
 go test -race ./kv/...
 ```
 
-If `$GOCACHE` is sandbox-blocked (macOS), prefix with `GOCACHE=$(pwd)/.cache GOTMPDIR=$(pwd)/.cache/tmp`. The lint cache analog is `GOLANGCI_LINT_CACHE=$(pwd)/.golangci-cache`.
+If `$GOCACHE` is sandbox-blocked (macOS), create the cache dirs first (Go errors out if `GOTMPDIR` does not exist), then prefix the command:
+
+```bash
+mkdir -p "$(pwd)/.cache/tmp" "$(pwd)/.golangci-cache"
+GOCACHE=$(pwd)/.cache GOTMPDIR=$(pwd)/.cache/tmp go test ./...
+GOCACHE=$(pwd)/.cache GOLANGCI_LINT_CACHE=$(pwd)/.golangci-cache golangci-lint run
+```
 
 Single-node server (etcd/raft is the default backend):
 
