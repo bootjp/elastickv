@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -232,7 +233,7 @@ func TestMembersFromDedupesByNodeID(t *testing.T) {
 			{NodeId: "n1", GrpcAddress: "alt-alias:50051"},
 		},
 	}
-	got := membersFrom("localhost:50051", resp)
+	got := membersFrom("localhost:50051", resp, defaultMaxDiscoveredNodes)
 	if len(got) != 2 {
 		t.Fatalf("len = %d (%v), want 2 — n1 once + n2", len(got), got)
 	}
@@ -252,7 +253,7 @@ func TestMembersFromLegacyNoSelfNodeID(t *testing.T) {
 	resp := &pb.GetClusterOverviewResponse{
 		Self: &pb.NodeIdentity{GrpcAddress: "10.0.0.1:50051"}, // no NodeId
 	}
-	got := membersFrom("localhost:50051", resp)
+	got := membersFrom("localhost:50051", resp, defaultMaxDiscoveredNodes)
 	if len(got) != 2 {
 		t.Fatalf("len = %d (%v), want 2 — both addresses kept when NodeId is empty", len(got), got)
 	}
@@ -264,29 +265,17 @@ func TestMembersFromCapsAtMaxDiscoveredNodes(t *testing.T) {
 		Self: &pb.NodeIdentity{GrpcAddress: "self:1"},
 	}
 	// Return way more members than the cap allows.
-	for i := 0; i < maxDiscoveredNodes+50; i++ {
+	for i := 0; i < defaultMaxDiscoveredNodes+50; i++ {
 		resp.Members = append(resp.Members, &pb.NodeIdentity{
-			GrpcAddress: "node-" + strconvItoa(i) + ":1",
+			GrpcAddress: "node-" + strconv.Itoa(i) + ":1",
 		})
 	}
-	got := membersFrom("seed:1", resp)
-	if len(got) != maxDiscoveredNodes {
-		t.Fatalf("len = %d, want %d (cap)", len(got), maxDiscoveredNodes)
+	got := membersFrom("seed:1", resp, defaultMaxDiscoveredNodes)
+	if len(got) != defaultMaxDiscoveredNodes {
+		t.Fatalf("len = %d, want %d (cap)", len(got), defaultMaxDiscoveredNodes)
 	}
 }
 
-// small helper to avoid pulling strconv into the test file just for one call.
-func strconvItoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var digits []byte
-	for i > 0 {
-		digits = append([]byte{byte('0' + i%10)}, digits...)
-		i /= 10
-	}
-	return string(digits)
-}
 
 // TestFanoutClientForDeduplicatesConcurrentDials asserts that N goroutines
 // asking for the same fresh address run only one grpc.NewClient call between
@@ -297,7 +286,7 @@ func TestFanoutClientForDeduplicatesConcurrentDials(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	addr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	const concurrency = 32
@@ -355,7 +344,7 @@ func TestFanoutClientForOrphanedDialClosed(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	addr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	// First clientFor — installs into cache.
@@ -395,16 +384,16 @@ func TestFanoutClientForOrphanedDialClosed(t *testing.T) {
 }
 
 // TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds asserts that when
-// operators configure more seeds than maxCachedClients the cache still honors
+// operators configure more seeds than defaultMaxDiscoveredNodes the cache still honors
 // its cap — without the seed-fallback, the eviction loop would skip every
 // entry and the cache would grow past the documented bound.
 func TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds(t *testing.T) {
 	t.Parallel()
-	seeds := make([]string, 0, maxCachedClients+3)
-	for i := 0; i < maxCachedClients+3; i++ {
-		seeds = append(seeds, "seed-"+strconvItoa(i)+":1")
+	seeds := make([]string, 0, defaultMaxDiscoveredNodes+3)
+	for i := 0; i < defaultMaxDiscoveredNodes+3; i++ {
+		seeds = append(seeds, "seed-"+strconv.Itoa(i)+":1")
 	}
-	f := newFanout(seeds, "", time.Second, insecure.NewCredentials())
+	f := newFanout(seeds, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	for _, s := range seeds {
@@ -417,20 +406,20 @@ func TestFanoutClientCacheEvictsEvenWhenAllEntriesAreSeeds(t *testing.T) {
 	f.mu.Lock()
 	size := len(f.clients)
 	f.mu.Unlock()
-	if size > maxCachedClients {
-		t.Fatalf("cache size = %d, exceeds cap %d (seed-only path)", size, maxCachedClients)
+	if size > defaultMaxDiscoveredNodes {
+		t.Fatalf("cache size = %d, exceeds cap %d (seed-only path)", size, defaultMaxDiscoveredNodes)
 	}
 }
 
 func TestFanoutClientCacheEvictsWhenFull(t *testing.T) {
 	t.Parallel()
-	f := newFanout([]string{"seed:1"}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{"seed:1"}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	// Fill the cache past the cap. New dials should not error out and the
 	// map must stay bounded.
-	for i := 0; i < maxCachedClients+5; i++ {
-		_, release, err := f.clientFor("node-" + strconvItoa(i) + ":1")
+	for i := 0; i < defaultMaxDiscoveredNodes+5; i++ {
+		_, release, err := f.clientFor("node-" + strconv.Itoa(i) + ":1")
 		if err != nil {
 			t.Fatalf("clientFor[%d]: %v", i, err)
 		}
@@ -439,8 +428,8 @@ func TestFanoutClientCacheEvictsWhenFull(t *testing.T) {
 	f.mu.Lock()
 	size := len(f.clients)
 	f.mu.Unlock()
-	if size > maxCachedClients {
-		t.Fatalf("cache size = %d, exceeds cap %d", size, maxCachedClients)
+	if size > defaultMaxDiscoveredNodes {
+		t.Fatalf("cache size = %d, exceeds cap %d", size, defaultMaxDiscoveredNodes)
 	}
 }
 
@@ -450,7 +439,7 @@ func TestMembersFromDeduplicatesAndIncludesSeed(t *testing.T) {
 		Self:    &pb.NodeIdentity{GrpcAddress: "a:1"},
 		Members: []*pb.NodeIdentity{{GrpcAddress: "a:1"}, {GrpcAddress: "b:2"}, {GrpcAddress: " "}, {GrpcAddress: "c:3"}},
 	}
-	got := membersFrom("seed:1", resp)
+	got := membersFrom("seed:1", resp, defaultMaxDiscoveredNodes)
 	want := []string{"seed:1", "a:1", "b:2", "c:3"}
 	if len(got) != len(want) {
 		t.Fatalf("len = %d (%v), want %d", len(got), got, len(want))
@@ -514,7 +503,7 @@ func TestFanoutCurrentTargetsCachesAndRefreshes(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"peer-1:1", "peer-2:2"}}
 	seedAddr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials())
+	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -547,7 +536,7 @@ func TestFanoutCurrentTargetsFallsBackToSeeds(t *testing.T) {
 	peer := &fakeAdminServer{returnUn: true}
 	seedAddr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials())
+	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -567,7 +556,7 @@ func TestFanoutCurrentTargetsSingleflight(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"peer-1:1"}}
 	seedAddr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{seedAddr}, "", math.MaxInt64, insecure.NewCredentials())
+	f := newFanout([]string{seedAddr}, "", math.MaxInt64, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -607,7 +596,7 @@ func TestFanoutCurrentTargetsSingleflight(t *testing.T) {
 
 func TestHandleOverviewRejectsNonGET(t *testing.T) {
 	t.Parallel()
-	f := newFanout([]string{"127.0.0.1:0"}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{"127.0.0.1:0"}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/cluster/overview", strings.NewReader("{}"))
@@ -694,7 +683,7 @@ func TestFanoutEvictionDoesNotCloseInFlightConn(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	addr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	// Borrower 1 leases the client.
@@ -722,7 +711,7 @@ func TestFanoutEvictionDoesNotCloseInFlightConn(t *testing.T) {
 // shutdown-time race that otherwise hits a nil-map write in clientFor.
 func TestFanoutClientForAfterCloseIsSafe(t *testing.T) {
 	t.Parallel()
-	f := newFanout([]string{"127.0.0.1:1"}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{"127.0.0.1:1"}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	f.Close()
 
 	if _, _, err := f.clientFor("127.0.0.1:2"); err == nil {
@@ -741,7 +730,7 @@ func TestFanoutRefreshSurvivesFirstCallerCancel(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	seedAddr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials())
+	f := newFanout([]string{seedAddr}, "", 50*time.Millisecond, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	// First caller cancels before the refresh completes.
@@ -772,7 +761,7 @@ func TestHandleOverviewUsesProtojson(t *testing.T) {
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	seedAddr := startFakeAdmin(t, peer)
 
-	f := newFanout([]string{seedAddr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{seedAddr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/cluster/overview", nil)
@@ -800,7 +789,7 @@ func TestFanoutClientForRaceDeduplicates(t *testing.T) {
 	t.Parallel()
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	addr := startFakeAdmin(t, peer)
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
 	const racers = 32
@@ -853,7 +842,7 @@ func TestFanoutCloseDoesNotHoldLockDuringConnClose(t *testing.T) {
 	t.Parallel()
 	peer := &fakeAdminServer{members: []string{"m:1"}}
 	addr := startFakeAdmin(t, peer)
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials())
+	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 
 	if _, release, err := f.clientFor(addr); err != nil {
 		t.Fatal(err)

@@ -21,6 +21,8 @@ import (
 	"syscall"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
@@ -31,9 +33,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-
-	internalutil "github.com/bootjp/elastickv/internal"
-	pb "github.com/bootjp/elastickv/proto"
 )
 
 const (
@@ -61,19 +60,15 @@ const (
 	// pointing at a huge file (for example a log) cannot force the admin
 	// process to allocate arbitrary memory before the bearer-token check.
 	maxTokenFileBytes = 4 << 10
-	// maxDiscoveredNodes bounds the member list returned by a peer's
-	// GetClusterOverview so a malicious or misconfigured node cannot force
-	// the admin binary to spawn unbounded goroutines / gRPC calls. A single
-	// /api/cluster/overview fan-out dials every discovered node; the
-	// per-conn cache is sized to match so a healthy cluster-wide query
-	// reuses connections instead of thrashing the LRU.
-	maxDiscoveredNodes = 512
-	// maxCachedClients caps the fanout's cached gRPC connections so a
-	// cluster with high node churn or a malicious discovery response
-	// cannot leak file descriptors indefinitely. Equal to
-	// maxDiscoveredNodes so a single overview fan-out fits without
-	// eviction churn; still well below typical ulimits.
-	maxCachedClients = maxDiscoveredNodes
+	// defaultMaxDiscoveredNodes is the out-of-the-box cap on the member
+	// list returned by a peer's GetClusterOverview. The runtime value is
+	// the per-fanout maxDiscoveredNodes field, configurable via
+	// --maxDiscoveredNodes; this constant is just the default.
+	//
+	// A single /api/cluster/overview fan-out dials every discovered node
+	// up to this cap; the per-conn cache is sized to match so a healthy
+	// cluster-wide query reuses connections instead of thrashing the LRU.
+	defaultMaxDiscoveredNodes = 512
 )
 
 var (
@@ -90,6 +85,11 @@ var (
 	nodeTLSServerName = flag.String("nodeTLSServerName", "", "Expected TLS server name when connecting to nodes (overrides the address host); only honoured when TLS is enabled")
 	nodeTLSSkipVerify = flag.Bool("nodeTLSInsecureSkipVerify", false, "Dial nodes with TLS but skip certificate verification; development only. Implies TLS.")
 	allowRemoteBind   = flag.Bool("allowRemoteBind", false, "Allow --bindAddr to listen on a non-loopback interface. The admin UI has no browser-facing auth; set this only when the UI is fronted by an authenticating reverse proxy.")
+	// --maxDiscoveredNodes bounds both the discovery list returned by a
+	// peer's GetClusterOverview and the per-conn client cache. Operators
+	// running clusters larger than the default 512 nodes can raise this;
+	// values ≤0 fall back to the default to avoid disabling the bound.
+	maxDiscoveredNodesFlag = flag.Int("maxDiscoveredNodes", defaultMaxDiscoveredNodes, "Maximum number of cluster nodes the admin binary will fan out to (caps both discovery list size and the gRPC client-conn cache)")
 )
 
 func main() {
@@ -122,7 +122,7 @@ func initRun() (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
-	fan := newFanout(seeds, token, *nodesRefreshInterval, creds)
+	fan := newFanout(seeds, token, *nodesRefreshInterval, creds, *maxDiscoveredNodesFlag)
 	return runConfig{seeds: seeds, fan: fan}, nil
 }
 
@@ -314,6 +314,10 @@ type fanout struct {
 	// rebuilding the map on every cache-full eviction (under f.mu) is pure
 	// waste — Gemini flagged the per-call allocation.
 	seedSet         map[string]struct{}
+	// maxNodes bounds both the per-overview discovery list and the gRPC
+	// client cache. Configurable via --maxDiscoveredNodes; values ≤0 fall
+	// back to defaultMaxDiscoveredNodes so the bound is never disabled.
+	maxNodes        int
 	token           string
 	refreshInterval time.Duration
 	creds           credentials.TransportCredentials
@@ -347,12 +351,16 @@ func newFanout(
 	token string,
 	refreshInterval time.Duration,
 	creds credentials.TransportCredentials,
+	maxNodes int,
 ) *fanout {
 	if refreshInterval <= 0 {
 		refreshInterval = defaultNodesRefreshInterval
 	}
 	if creds == nil {
 		creds = insecure.NewCredentials()
+	}
+	if maxNodes <= 0 {
+		maxNodes = defaultMaxDiscoveredNodes
 	}
 	seedSet := make(map[string]struct{}, len(seeds))
 	for _, s := range seeds {
@@ -361,6 +369,7 @@ func newFanout(
 	return &fanout{
 		seeds:           seeds,
 		seedSet:         seedSet,
+		maxNodes:        maxNodes,
 		token:           token,
 		refreshInterval: refreshInterval,
 		creds:           creds,
@@ -508,7 +517,7 @@ func (f *fanout) installOrAttach(addr string, conn *grpc.ClientConn) (*nodeClien
 		return c, release, nil
 	}
 	var evicted *grpc.ClientConn
-	if len(f.clients) >= maxCachedClients {
+	if len(f.clients) >= f.maxNodes {
 		evicted = f.evictOneLocked()
 	}
 	c := &nodeClient{addr: addr, conn: conn, client: pb.NewAdminClient(conn), refcount: 1}
@@ -696,7 +705,7 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 			log.Printf("elastickv-admin: discover membership via %s: %v", seed, err)
 			continue
 		}
-		addrs := membersFrom(seed, resp)
+		addrs := membersFrom(seed, resp, f.maxNodes)
 		f.mu.Lock()
 		f.members = &membership{addrs: addrs, fetchedAt: time.Now()}
 		f.mu.Unlock()
@@ -723,8 +732,11 @@ func (f *fanout) refreshMembership(ctx context.Context) []string {
 // Initial slice capacity is bounded by maxDiscoveredNodes (rather than
 // len(members)+1) so a misbehaving peer that returns 10× the cap does not
 // force a giant allocation just to truncate immediately afterward.
-func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
-	acc := newDiscoveryAccumulator(len(resp.GetMembers()) + 1)
+func membersFrom(seed string, resp *pb.GetClusterOverviewResponse, maxNodes int) []string {
+	if maxNodes <= 0 {
+		maxNodes = defaultMaxDiscoveredNodes
+	}
+	acc := newDiscoveryAccumulator(len(resp.GetMembers())+1, maxNodes)
 
 	// Add the seed under the responding node's ID so a later entry for that
 	// same NodeID (most likely resp.Self.GrpcAddress, an alias of the seed)
@@ -747,36 +759,43 @@ func membersFrom(seed string, resp *pb.GetClusterOverviewResponse) []string {
 		acc.add(m.GetNodeId(), m.GetGrpcAddress())
 	}
 	if acc.truncated {
-		log.Printf("elastickv-admin: discovery response exceeded %d nodes; truncating (peer=%s)", maxDiscoveredNodes, seed)
+		log.Printf("elastickv-admin: discovery response exceeded %d nodes; truncating (peer=%s)", maxNodes, seed)
 	}
 	return acc.out
 }
 
 // discoveryAccumulator dedups (NodeID, address) pairs while building the
 // fan-out target list. Extracted from membersFrom so the surrounding loop
-// stays under the cyclop budget.
+// stays under the cyclop budget. The cap is per-instance (not a package
+// constant) so operators can raise it via --maxDiscoveredNodes for very
+// large clusters.
 type discoveryAccumulator struct {
 	out       []string
 	seenAddr  map[string]struct{}
 	seenID    map[string]struct{}
+	maxNodes  int
 	truncated bool
 }
 
-func newDiscoveryAccumulator(suggestedCap int) *discoveryAccumulator {
-	if suggestedCap > maxDiscoveredNodes {
-		suggestedCap = maxDiscoveredNodes
+func newDiscoveryAccumulator(suggestedCap, maxNodes int) *discoveryAccumulator {
+	if maxNodes <= 0 {
+		maxNodes = defaultMaxDiscoveredNodes
+	}
+	if suggestedCap > maxNodes {
+		suggestedCap = maxNodes
 	}
 	return &discoveryAccumulator{
 		out:      make([]string, 0, suggestedCap),
 		seenAddr: map[string]struct{}{},
 		seenID:   map[string]struct{}{},
+		maxNodes: maxNodes,
 	}
 }
 
 // add records a fan-out target keyed by its NodeID (when known) and address.
 // Returns silently when the entry is empty, a duplicate, or would push the
-// list past maxDiscoveredNodes; the caller can read truncated to log a
-// truncation event once.
+// list past maxNodes; the caller can read truncated to log a truncation
+// event once.
 func (a *discoveryAccumulator) add(id, addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -790,7 +809,7 @@ func (a *discoveryAccumulator) add(id, addr string) {
 			return
 		}
 	}
-	if len(a.out) >= maxDiscoveredNodes {
+	if len(a.out) >= a.maxNodes {
 		a.truncated = true
 		return
 	}
