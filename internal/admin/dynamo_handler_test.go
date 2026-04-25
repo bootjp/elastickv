@@ -414,6 +414,61 @@ func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "table_name is required")
 }
 
+// TestDynamoHandler_CreateTable_LiveRoleRevocation covers Codex P1
+// on PR #635: a session JWT with role=full from before a config
+// reload must NOT keep mutating after the access key is revoked
+// or downgraded. The handler re-validates against the live
+// RoleStore on every write.
+func TestDynamoHandler_CreateTable_LiveRoleRevocation(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	// Live role map says the access key is read-only — even though
+	// the JWT in withWritePrincipal carries role=full.
+	roles := MapRoleStore{"AKIA_FULL": RoleReadOnly}
+	h := NewDynamoHandler(src).WithRoleStore(roles)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code,
+		"a downgraded access key must be rejected even with a still-valid full-role JWT")
+	require.Empty(t, src.lastCreateInput.TableName,
+		"source must not be touched on revocation")
+}
+
+// TestDynamoHandler_CreateTable_LiveRoleAccessKeyRemoved covers
+// the harder case: the access key was deleted entirely from the
+// role index. Same 403, same defence-in-depth.
+func TestDynamoHandler_CreateTable_LiveRoleAccessKeyRemoved(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	roles := MapRoleStore{} // AKIA_FULL is absent
+	h := NewDynamoHandler(src).WithRoleStore(roles)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, src.lastCreateInput.TableName)
+}
+
+// TestDynamoHandler_DeleteTable_LiveRoleRevocation mirrors the
+// create-side coverage on the delete path.
+func TestDynamoHandler_DeleteTable_LiveRoleRevocation(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
+		"users": {Name: "users"},
+	}}
+	roles := MapRoleStore{"AKIA_FULL": RoleReadOnly}
+	h := NewDynamoHandler(src).WithRoleStore(roles)
+	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, src.lastDeleteName)
+}
+
 func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)

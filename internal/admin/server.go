@@ -101,7 +101,17 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	cluster := NewClusterHandler(deps.ClusterInfo).WithLogger(logger)
 	var dynamo http.Handler
 	if deps.Tables != nil {
-		dynamo = NewDynamoHandler(deps.Tables).WithLogger(logger)
+		// Re-evaluate the principal's role on every state-
+		// changing request against the live role map (Codex P1
+		// on PR #635). MapRoleStore wraps the same map the auth
+		// layer uses for login, so a config reload that updates
+		// deps.Roles does NOT automatically propagate here —
+		// operators must restart the listener for revocation to
+		// take effect, but the JWT no longer extends a revoked
+		// key past the next request.
+		dynamo = NewDynamoHandler(deps.Tables).
+			WithLogger(logger).
+			WithRoleStore(MapRoleStore(deps.Roles))
 	}
 	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, logger)
 	router := NewRouter(mux, deps.StaticFS)

@@ -161,13 +161,22 @@ func (e *ValidationError) Error() string {
 // chain as reads (BodyLimit -> SessionAuth -> Audit -> CSRF) plus
 // an in-handler RoleFull check so a read-only key cannot mutate
 // even with a valid CSRF token.
+//
+// Writes additionally re-resolve the principal's access key
+// against a live RoleStore (when configured) so that a downgraded
+// or revoked key cannot continue mutating with a still-valid JWT
+// — the JWT freezes the role at login time, and tokens last one
+// hour. Codex P1 on PR #635 flagged the gap on the HTTP path;
+// the forward server already does this re-evaluation on its side.
 type DynamoHandler struct {
 	source TablesSource
+	roles  RoleStore
 	logger *slog.Logger
 }
 
 // NewDynamoHandler binds the source and seeds logging with
-// slog.Default(). Use WithLogger to attach a tagged logger.
+// slog.Default(). Use WithLogger to attach a tagged logger and
+// WithRoleStore to plug in the live access-key role lookup.
 func NewDynamoHandler(source TablesSource) *DynamoHandler {
 	return &DynamoHandler{source: source, logger: slog.Default()}
 }
@@ -178,6 +187,17 @@ func (h *DynamoHandler) WithLogger(l *slog.Logger) *DynamoHandler {
 		return h
 	}
 	h.logger = l
+	return h
+}
+
+// WithRoleStore enables per-request role revalidation on write
+// endpoints. Without it, the handler trusts whatever role is
+// embedded in the session JWT — which is fine for single-tenant
+// deployments where the role config never changes, but
+// problematic when an operator revokes or downgrades a key. The
+// production wiring in main_admin.go always sets this.
+func (h *DynamoHandler) WithRoleStore(r RoleStore) *DynamoHandler {
+	h.roles = r
 	return h
 }
 
@@ -278,17 +298,8 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 // Success response is 201 Created with the freshly-stored table
 // summary in the body — same shape as a GET /tables/{name} call.
 func (h *DynamoHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
-	principal, ok := PrincipalFromContext(r.Context())
+	principal, ok := h.principalForWrite(w, r)
 	if !ok {
-		// Should be unreachable — SessionAuth runs before this
-		// handler and rejects any request without a principal — but
-		// failing closed here is the right defence-in-depth posture.
-		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
-		return
-	}
-	if !principal.Role.AllowsWrite() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this endpoint requires a full-access role")
 		return
 	}
 	body, err := decodeCreateTableRequest(r.Body)
@@ -316,14 +327,8 @@ func (h *DynamoHandler) handleDelete(w http.ResponseWriter, r *http.Request, nam
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 		return
 	}
-	principal, ok := PrincipalFromContext(r.Context())
+	principal, ok := h.principalForWrite(w, r)
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
-		return
-	}
-	if !principal.Role.AllowsWrite() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this endpoint requires a full-access role")
 		return
 	}
 	if err := h.source.AdminDeleteTable(r.Context(), principal, name); err != nil {
@@ -332,6 +337,57 @@ func (h *DynamoHandler) handleDelete(w http.ResponseWriter, r *http.Request, nam
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// principalForWrite is the centralised authorisation gate for
+// state-changing endpoints. It pulls the principal out of the
+// request context (failing closed if SessionAuth somehow did not
+// attach one), enforces RoleFull on the JWT-embedded role, and —
+// when a RoleStore is configured — re-validates the access key
+// against the live cluster role index so a downgraded or revoked
+// key cannot continue mutating with a still-valid JWT (Codex P1
+// on PR #635).
+//
+// On any rejection the helper writes the appropriate HTTP error
+// directly and returns ok=false so callers can early-exit with no
+// further work. The forward server applies the same re-validation
+// on its side, so leader-direct and forwarded write requests have
+// matching authorisation contracts.
+func (h *DynamoHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		// Should be unreachable — SessionAuth runs before this
+		// handler and rejects any request without a principal —
+		// but failing closed here is the right defence-in-depth
+		// posture for any future routing change that might bypass
+		// the middleware chain.
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
+		return AuthPrincipal{}, false
+	}
+	if !principal.Role.AllowsWrite() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+		return AuthPrincipal{}, false
+	}
+	// Live re-validation against the current role map. Skip when
+	// no RoleStore is configured (single-tenant deployments where
+	// the JWT-embedded role is authoritative); production wiring
+	// always sets one.
+	if h.roles != nil {
+		liveRole, exists := h.roles.LookupRole(principal.AccessKey)
+		if !exists || !liveRole.AllowsWrite() {
+			// Don't surface "your key was revoked" vs "your key
+			// was downgraded" — both are 403 forbidden, and the
+			// distinction is operator-visible only.
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this endpoint requires a full-access role")
+			return AuthPrincipal{}, false
+		}
+		// Use the live role downstream; the JWT may carry a
+		// stale value but the live one is authoritative.
+		principal.Role = liveRole
+	}
+	return principal, true
 }
 
 // writeTablesError translates a TablesSource error into the
