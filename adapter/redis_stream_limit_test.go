@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -138,5 +139,90 @@ func TestNextXAddID_Monotonic(t *testing.T) {
 	_, err = nextXAddID(true, ^uint64(0), ^uint64(0), "*")
 	if err == nil || !strings.Contains(err.Error(), "exhausted") {
 		t.Fatalf("both maxed: want exhausted error, got %v", err)
+	}
+}
+
+// TestParseXReadCountArg_Clamp guards Gemini's medium concern: a client
+// XREAD COUNT well above maxWideColumnItems must be silently clamped so
+// the server cannot pre-allocate a maxInt-sized []redisStreamEntry slice
+// or pull more entries than the equivalent uncapped scan.
+func TestParseXReadCountArg_Clamp(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		raw  string
+		want int
+		ok   bool
+	}{
+		{"valid small", "10", 10, true},
+		{"at cap", strconv.Itoa(maxWideColumnItems), maxWideColumnItems, true},
+		{"one above cap clamps", strconv.Itoa(maxWideColumnItems + 1), maxWideColumnItems, true},
+		{"MaxInt32 clamps", strconv.Itoa(math.MaxInt32), maxWideColumnItems, true},
+		// 0 / negative / non-numeric are still rejected.
+		{"zero rejected", "0", 0, false},
+		{"negative rejected", "-1", 0, false},
+		{"garbage rejected", "abc", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseXReadCountArg([][]byte{[]byte("COUNT"), []byte(tc.raw)}, 0)
+			if tc.ok && err != nil {
+				t.Fatalf("parseXReadCountArg(%q): unexpected error %v", tc.raw, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("parseXReadCountArg(%q): expected error, got count=%d", tc.raw, got)
+			}
+			if tc.ok && got != tc.want {
+				t.Fatalf("parseXReadCountArg(%q): want %d, got %d", tc.raw, tc.want, got)
+			}
+		})
+	}
+}
+
+// TestParseRangeStreamCount_Clamp guards the matching XRANGE / XREVRANGE
+// COUNT clamp. The negative -1 sentinel (no COUNT) must pass through
+// unchanged so rangeStreamNewLayout's unbounded path still trips its
+// maxWideColumnItems guard.
+func TestParseRangeStreamCount_Clamp(t *testing.T) {
+	t.Parallel()
+
+	noCount := [][]byte{[]byte("XRANGE"), []byte("k"), []byte("-"), []byte("+")}
+	got, err := parseRangeStreamCount(noCount)
+	if err != nil {
+		t.Fatalf("no COUNT: unexpected error %v", err)
+	}
+	if got != -1 {
+		t.Fatalf("no COUNT: want -1 sentinel, got %d", got)
+	}
+
+	cases := []struct {
+		name string
+		raw  string
+		want int
+		ok   bool
+	}{
+		{"valid small", "10", 10, true},
+		{"zero passes (not negative)", "0", 0, true},
+		{"at cap", strconv.Itoa(maxWideColumnItems), maxWideColumnItems, true},
+		{"one above cap clamps", strconv.Itoa(maxWideColumnItems + 1), maxWideColumnItems, true},
+		{"MaxInt32 clamps", strconv.Itoa(math.MaxInt32), maxWideColumnItems, true},
+		{"negative rejected", "-1", 0, false},
+		{"garbage rejected", "xx", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := [][]byte{[]byte("XRANGE"), []byte("k"), []byte("-"), []byte("+"), []byte("COUNT"), []byte(tc.raw)}
+			got, err := parseRangeStreamCount(args)
+			if tc.ok && err != nil {
+				t.Fatalf("parseRangeStreamCount(%q): unexpected error %v", tc.raw, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("parseRangeStreamCount(%q): expected error, got count=%d", tc.raw, got)
+			}
+			if tc.ok && got != tc.want {
+				t.Fatalf("parseRangeStreamCount(%q): want %d, got %d", tc.raw, tc.want, got)
+			}
+		})
 	}
 }

@@ -4196,6 +4196,14 @@ func parseXReadCountArg(args [][]byte, index int) (int, error) {
 	if err != nil || count <= 0 {
 		return 0, errors.New("ERR syntax error")
 	}
+	// Clamp client-supplied COUNT to the wide-column ceiling so a single
+	// XREAD cannot pre-allocate a maxInt-sized []redisStreamEntry slice or
+	// pull more entries than the store will return for the equivalent
+	// uncapped scan. Cap is silent (Redis-compatible): the client always
+	// sees at most maxWideColumnItems entries per stream per call.
+	if count > maxWideColumnItems {
+		count = maxWideColumnItems
+	}
 	return count, nil
 }
 
@@ -4626,6 +4634,13 @@ func parseRangeStreamCount(args [][]byte) (int, error) {
 			return 0, errors.New("ERR syntax error")
 		}
 		count = nextCount
+	}
+	// Clamp client-supplied COUNT for XRANGE / XREVRANGE the same way XREAD
+	// clamps it (parseXReadCountArg). The negative sentinel -1 (no COUNT)
+	// is preserved unchanged so the unbounded path still trips
+	// maxWideColumnItems guard inside rangeStreamNewLayout.
+	if count > maxWideColumnItems {
+		count = maxWideColumnItems
 	}
 	return count, nil
 }

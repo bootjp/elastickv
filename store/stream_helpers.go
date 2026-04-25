@@ -143,26 +143,34 @@ func IsStreamEntryKey(key []byte) bool {
 }
 
 // ExtractStreamUserKeyFromMeta extracts the logical user key from a stream meta key.
+//
+// The bounds check is done in uint64 so a corrupted length prefix near
+// math.MaxUint32 cannot wrap (uint32(wideColKeyLenSize)+ukLen) and pass a
+// false negative, which would then panic on the trimmed[lo:hi] slice below.
 func ExtractStreamUserKeyFromMeta(key []byte) []byte {
 	trimmed := bytes.TrimPrefix(key, streamMetaPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec
+	if uint64(wideColKeyLenSize)+uint64(ukLen) > uint64(len(trimmed)) {
 		return nil
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
 }
 
 // ExtractStreamUserKeyFromEntry extracts the logical user key from a stream entry key.
+//
+// See ExtractStreamUserKeyFromMeta for the rationale of the uint64 bounds
+// check; the entry variant additionally has to account for the trailing
+// StreamIDBytes (16 bytes) suffix.
 func ExtractStreamUserKeyFromEntry(key []byte) []byte {
 	trimmed := bytes.TrimPrefix(key, streamEntryPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize+StreamIDBytes {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(StreamIDBytes) { //nolint:gosec
+	if uint64(wideColKeyLenSize)+uint64(ukLen)+uint64(StreamIDBytes) > uint64(len(trimmed)) {
 		return nil
 	}
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]

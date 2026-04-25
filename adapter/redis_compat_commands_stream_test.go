@@ -590,3 +590,90 @@ func TestNextXAddID_RejectsZeroID(t *testing.T) {
 		})
 	}
 }
+
+// TestRedis_StreamXReadAndRangeCountClamp exercises the e2e behaviour of
+// the parse-time COUNT clamp added for Gemini's medium concern: a client
+// supplying COUNT well above maxWideColumnItems must not error out and
+// must still return the entries the caller would have seen with a
+// reasonable COUNT. The legitimacy check is on top of the parse-level
+// unit tests in TestParseXReadCountArg_Clamp / TestParseRangeStreamCount_Clamp.
+func TestRedis_StreamXReadAndRangeCountClamp(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	const total = 5
+	for i := range total {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: "stream-clamp",
+			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
+			Values: []string{"i", fmt.Sprint(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	// XREAD with COUNT far above maxWideColumnItems must succeed and
+	// return all 5 entries. (Pre-fix: succeeds; the clamp is a memory
+	// guard, not a behaviour change for legitimate clients.)
+	huge := int64(maxWideColumnItems) * 4
+	streams, err := rdb.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{"stream-clamp", "0"},
+		Count:   huge,
+	}).Result()
+	require.NoError(t, err)
+	require.Len(t, streams, 1)
+	require.Len(t, streams[0].Messages, total)
+
+	// XRANGE with the same overshoot.
+	msgs, err := rdb.XRangeN(ctx, "stream-clamp", "-", "+", huge).Result()
+	require.NoError(t, err)
+	require.Len(t, msgs, total)
+
+	// XREVRANGE with the same overshoot.
+	revMsgs, err := rdb.XRevRangeN(ctx, "stream-clamp", "+", "-", huge).Result()
+	require.NoError(t, err)
+	require.Len(t, revMsgs, total)
+}
+
+// TestRedis_StreamMultiExecDelHonoursDispatchTimeout regression-tests the
+// CodeRabbit "buildStreamDeletionElems on server-lifetime ctx" concern.
+// The ctx threaded through buildStreamDeletionElems is the same
+// redisDispatchTimeout-bounded ctx used for Dispatch, so the EXEC of a
+// MULTI/EXEC DEL on a stream key keeps the existing behaviour: the
+// deletion is observable on a fresh XLEN, and the EXEC does not hang
+// past the per-request budget. The test is a smoke-level guard; the
+// actual ctx-cancellation path is documented in commit().
+func TestRedis_StreamMultiExecDelHonoursDispatchTimeout(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	for i := range 4 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: "stream-del",
+			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
+			Values: []string{"i", fmt.Sprint(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	// MULTI / EXEC DEL inside a txn drives the streamDeletions path
+	// inside commit() — that is the path which now passes the
+	// redisDispatchTimeout-bounded ctx into buildStreamDeletionElems.
+	pipe := rdb.TxPipeline()
+	pipe.Del(ctx, "stream-del")
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+
+	xlen, err := rdb.XLen(ctx, "stream-del").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), xlen)
+}

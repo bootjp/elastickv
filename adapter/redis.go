@@ -2618,7 +2618,15 @@ func (t *txnContext) commit() error {
 	// non-string keys get a !redis|ttl| element written in the same transaction.
 	ttlElems := t.buildTTLElems()
 
-	streamElems, err := t.buildStreamDeletionElems()
+	// Derive a single redisDispatchTimeout-bounded context covering both the
+	// stream-deletion scans (paginated ScanAt/ExistsAt over StreamEntryScanPrefix)
+	// and the final Dispatch. Without this bound, buildStreamDeletionElems would
+	// run on the server-lifetime handlerContext, leaving its scans uncancellable
+	// from the request side on a slow disk or hot-key pathological commit.
+	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+
+	streamElems, err := t.buildStreamDeletionElems(ctx)
 	if err != nil {
 		return err
 	}
@@ -2642,8 +2650,6 @@ func (t *txnContext) commit() error {
 		CommitTS: commitTS,
 		ReadKeys: readKeys,
 	}
-	ctx, cancel := context.WithTimeout(t.server.handlerContext(), redisDispatchTimeout)
-	defer cancel()
 	if _, err := t.server.coordinator.Dispatch(ctx, group); err != nil {
 		return errors.WithStack(err)
 	}
@@ -2873,7 +2879,12 @@ func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64)
 // the store in a consistent state instead of only dropping the legacy blob.
 // Each scan runs at t.startTS so the delete honours the transaction's
 // snapshot view.
-func (t *txnContext) buildStreamDeletionElems() ([]*kv.Elem[kv.OP], error) {
+//
+// ctx is the redisDispatchTimeout-bounded context derived in commit(); it
+// caps the paginated ExistsAt + scanAllDeltaElems inside
+// deleteStreamWideColumnElems so a pathological staged-stream count cannot
+// hold the EXEC handler open past the per-request budget.
+func (t *txnContext) buildStreamDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
 	if len(t.streamDeletions) == 0 {
 		return nil, nil
 	}
@@ -2882,7 +2893,6 @@ func (t *txnContext) buildStreamDeletionElems() ([]*kv.Elem[kv.OP], error) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	ctx := t.server.handlerContext()
 	var elems []*kv.Elem[kv.OP]
 	for _, k := range keys {
 		userKey := t.streamDeletions[k]
