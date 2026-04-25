@@ -438,6 +438,8 @@ func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
 		`{"table_name":"u","partition_key":{"name":"id","type":"X"}}`,                                   // bad type
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"},"sort_key":{"name":"","type":"S"}}`, // bad sort key
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"},"unknown_field":1}`,                 // strict decode
+		`{"table_name":"u","partition_key":{"name":"id","type":"S"}}{"second":"object"}`,                // trailing JSON
+		`{"table_name":"u","partition_key":{"name":"id","type":"S"}} 42`,                                // trailing scalar
 	}
 	for _, body := range cases {
 		t.Run(body, func(t *testing.T) {

@@ -368,23 +368,42 @@ func decodeCreateTableRequest(body io.Reader) (CreateTableRequest, error) {
 		}
 		return CreateTableRequest{}, errors.New("request body is not valid JSON")
 	}
-	if strings.TrimSpace(out.TableName) == "" {
-		return CreateTableRequest{}, errors.New("table_name is required")
+	// Reject trailing JSON tokens — `{"table_name":"a", ...}{...}`
+	// must surface as 400, not silently accept the first object and
+	// drop the rest. dec.More() returns true when there is at least
+	// one more JSON value in the stream beyond the one we just
+	// decoded.
+	if dec.More() {
+		return CreateTableRequest{}, errors.New("request body has trailing data after the JSON object")
 	}
-	if err := validateAttribute(out.PartitionKey, "partition_key"); err != nil {
+	if err := validateCreateTableRequest(&out); err != nil {
 		return CreateTableRequest{}, err
 	}
-	if out.SortKey != nil {
-		if err := validateAttribute(*out.SortKey, "sort_key"); err != nil {
-			return CreateTableRequest{}, err
-		}
-	}
-	for i := range out.GSI {
-		if err := validateGSI(&out.GSI[i], i); err != nil {
-			return CreateTableRequest{}, err
-		}
-	}
 	return out, nil
+}
+
+// validateCreateTableRequest is the field-level validation pass
+// kept separate from the JSON decoding so each function stays under
+// the project's cyclomatic-complexity ceiling and the decoder is
+// trivially auditable on its own.
+func validateCreateTableRequest(in *CreateTableRequest) error {
+	if strings.TrimSpace(in.TableName) == "" {
+		return errors.New("table_name is required")
+	}
+	if err := validateAttribute(in.PartitionKey, "partition_key"); err != nil {
+		return err
+	}
+	if in.SortKey != nil {
+		if err := validateAttribute(*in.SortKey, "sort_key"); err != nil {
+			return err
+		}
+	}
+	for i := range in.GSI {
+		if err := validateGSI(&in.GSI[i], i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // validateAttribute enforces the "S | N | B" rule for primary-key

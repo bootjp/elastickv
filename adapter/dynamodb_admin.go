@@ -209,9 +209,8 @@ func (d *DynamoDBServer) AdminCreateTable(ctx context.Context, principal AdminPr
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(legacy.TableName) == "" {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "missing table name")
-	}
+	// buildLegacyCreateTableInput already rejects an empty table
+	// name; the previous duplicated check here was dead code.
 	unlock := d.lockTableOperations([]string{legacy.TableName})
 	defer unlock()
 	schema, err := buildCreateTableSchema(legacy)
