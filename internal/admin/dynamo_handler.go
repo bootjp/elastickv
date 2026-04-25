@@ -213,6 +213,12 @@ func (h *DynamoHandler) WithRoleStore(r RoleStore) *DynamoHandler {
 // to the standard 503 leader_unavailable response. Production
 // wires this to the gRPCForwardClient in main_admin.go; tests
 // inject a stub.
+//
+// Asymmetric vs WithLogger by design: WithLogger no-ops on nil to
+// preserve the slog.Default() seeded by NewDynamoHandler, but a
+// nil forwarder here is a meaningful "disable forwarding" state
+// (the gate in tryForwardCreate / tryForwardDelete checks for
+// nil and falls back to the leader-only 503 path).
 func (h *DynamoHandler) WithLeaderForwarder(f LeaderForwarder) *DynamoHandler {
 	h.forwarder = f
 	return h
@@ -468,6 +474,12 @@ func (h *DynamoHandler) tryForwardDelete(w http.ResponseWriter, r *http.Request,
 // leader-direct call from the SPA's point of view.
 func (h *DynamoHandler) writeForwardResult(w http.ResponseWriter, r *http.Request, res *ForwardResult) {
 	w.Header().Set("Content-Type", res.ContentType)
+	// Match writeAdminJSONStatus's hardening on the leader-direct
+	// path: forwarded responses must also carry nosniff so a SPA
+	// request that happened to traverse a follower does not
+	// silently lose the MIME-sniff protection. Claude review on
+	// PR #644 caught the parity gap.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	// 503 from the leader (e.g. it stepped down mid-request) must
 	// carry Retry-After so the client retries; preserve the

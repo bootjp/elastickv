@@ -160,6 +160,64 @@ func TestDynamoHandler_ForwarderTransportErrorReturns503(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "transport sentinel")
 }
 
+// TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError pins
+// the gate in tryForwardCreate / tryForwardDelete: the forward
+// path must run ONLY when the source returned ErrTablesNotLeader.
+// Other source errors (already-exists, validation, generic) must
+// fall through to writeTablesError and never reach the forwarder
+// — otherwise a leader-direct rejection like 409 Conflict would
+// be silently re-applied at the leader. Claude review on PR #644
+// noted the test gap; locking it down protects against a future
+// change accidentally removing the !errors.Is guard.
+func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+	}{
+		{"already_exists", ErrTablesAlreadyExists, http.StatusConflict},
+		{"validation", &ValidationError{Message: "bad input"}, http.StatusBadRequest},
+		{"generic", errors.New("opaque storage failure"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fwd := &stubLeaderForwarder{}
+			src := &stubTablesSource{createErr: tc.err}
+			h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
+			req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			require.Equal(t, tc.wantCode, rec.Code)
+			require.Empty(t, fwd.lastCreateInput.TableName,
+				"forwarder must not be invoked for source error: %s", tc.name)
+		})
+	}
+}
+
+// TestDynamoHandler_ForwarderForwardsLeaderResponseSetsNosniff
+// confirms the security parity Claude flagged: writeForwardResult
+// must emit X-Content-Type-Options: nosniff just like the leader-
+// direct path's writeAdminJSONStatus, otherwise a SPA hitting a
+// follower would silently lose MIME-sniff protection on
+// forwarded responses.
+func TestDynamoHandler_ForwarderForwardsLeaderResponseSetsNosniff(t *testing.T) {
+	fwd := &stubLeaderForwarder{createRes: &ForwardResult{
+		StatusCode:  http.StatusCreated,
+		Payload:     []byte(`{"name":"users"}`),
+		ContentType: "application/json; charset=utf-8",
+	}}
+	h := newFollowerHandler(t, fwd)
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+}
+
 func TestDynamoHandler_ForwarderForwardsLeaderConflictResponse(t *testing.T) {
 	// 409 Conflict from the leader (table already exists) must
 	// be relayed verbatim to the SPA, not re-classified as 503.

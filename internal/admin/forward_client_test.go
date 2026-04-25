@@ -9,6 +9,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 // stubForwardConn is the in-memory PBAdminForwardClient the
@@ -20,7 +21,7 @@ type stubForwardConn struct {
 	lastReq *pb.AdminForwardRequest
 }
 
-func (s *stubForwardConn) Forward(_ context.Context, in *pb.AdminForwardRequest, _ ...grpcCallOption) (*pb.AdminForwardResponse, error) {
+func (s *stubForwardConn) Forward(_ context.Context, in *pb.AdminForwardRequest, _ ...grpc.CallOption) (*pb.AdminForwardResponse, error) {
 	s.lastReq = in
 	if s.err != nil {
 		return nil, s.err

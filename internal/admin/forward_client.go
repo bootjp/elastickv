@@ -8,6 +8,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	pkgerrors "github.com/cockroachdb/errors"
 	"github.com/goccy/go-json"
+	"google.golang.org/grpc"
 )
 
 // LeaderForwarder is the contract the admin HTTP handler invokes
@@ -71,13 +72,16 @@ type GRPCConnFactory interface {
 // PBAdminForwardClient narrows pb.AdminForwardClient to just the
 // methods this package uses. The narrower interface keeps the test
 // stub implementation small.
+//
+// The opts parameter must use grpc.CallOption (not interface{}) so
+// the proto-generated *adminForwardClient satisfies this interface
+// directly — Go interface satisfaction requires exact method-
+// signature match, including variadic element types. Claude review
+// on PR #644 caught the mismatch before the bridge tried to assign
+// pb.NewAdminForwardClient(conn) and the build broke.
 type PBAdminForwardClient interface {
-	Forward(ctx context.Context, in *pb.AdminForwardRequest, opts ...grpcCallOption) (*pb.AdminForwardResponse, error)
+	Forward(ctx context.Context, in *pb.AdminForwardRequest, opts ...grpc.CallOption) (*pb.AdminForwardResponse, error)
 }
-
-// grpcCallOption is a re-export of google.golang.org/grpc.CallOption
-// kept private so callers do not import proto's grpc dep directly.
-type grpcCallOption = interface{}
 
 // gRPCForwardClient is the production LeaderForwarder. Construct
 // one with NewGRPCForwardClient. Two collaborators are required:
