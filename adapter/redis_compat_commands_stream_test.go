@@ -763,3 +763,65 @@ func TestRedis_UserKeyShadowingStreamPrefixSurvivesMultiExec(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "user-value", plain)
 }
+
+// TestRedis_StreamXReadShutdownShortCircuits guards Gemini's medium
+// concern: the XREAD busy-poll loop's per-iteration ctx must be rooted
+// in r.handlerContext() so that a server shutdown aborts the loop
+// promptly instead of running until the BLOCK deadline. A handlerCtx
+// cancellation also short-circuits the loop entry to a null reply, so
+// the client sees BLOCK timeout semantics rather than a hung
+// connection or a delayed -ERR.
+func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed one entry and then start an XREAD that will block waiting
+	// for *new* entries on top of "1-0". With a 5-second BLOCK budget,
+	// pre-fix this would happily run for the full 5 s after Close()
+	// because iterCtx was rooted in context.Background(). Post-fix the
+	// handlerCtx.Err() guard at the top of each loop iteration kicks
+	// in within ~one redisBusyPollBackoff (10 ms) and we reply null.
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-shutdown",
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.NoError(t, err)
+
+	type xreadOutcome struct {
+		streams []redis.XStream
+		err     error
+	}
+	xreadDone := make(chan xreadOutcome, 1)
+	go func() {
+		streams, err := rdb.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{"stream-shutdown", "1-0"},
+			Count:   1,
+			Block:   5 * time.Second,
+		}).Result()
+		xreadDone <- xreadOutcome{streams: streams, err: err}
+	}()
+
+	// Give the XREAD a moment to enter the busy-poll loop, then cancel
+	// the server's base context. The poll loop must observe the
+	// cancellation and reply null well before the 5 s BLOCK deadline.
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, nodes[0].redisServer.Close())
+
+	select {
+	case res := <-xreadDone:
+		// BLOCK timeout returns redis.Nil — the same wire-level reply
+		// the client would have seen if the BLOCK had expired
+		// naturally. The server must NOT surface the cancellation as a
+		// -ERR or hang the connection.
+		require.True(t, errors.Is(res.err, redis.Nil),
+			"BLOCK after shutdown must return redis.Nil, got err=%v streams=%v", res.err, res.streams)
+	case <-time.After(2 * time.Second):
+		t.Fatal("XREAD did not return within 2 s of server Close — busy-poll did not honour handlerContext cancel")
+	}
+}

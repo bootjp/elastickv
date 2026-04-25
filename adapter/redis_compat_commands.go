@@ -3703,7 +3703,7 @@ func nextXAddID(hasLast bool, lastMs, lastSeq uint64, requested string) (string,
 		return requested, nil
 	}
 
-	nowMs := uint64(time.Now().UnixMilli()) //nolint:gosec // always non-negative
+	nowMs := safeUnixMilliToUint64(time.Now().UnixMilli())
 	if !hasLast || nowMs > lastMs {
 		return strconv.FormatUint(nowMs, 10) + "-0", nil
 	}
@@ -3716,6 +3716,21 @@ func nextXAddID(hasLast bool, lastMs, lastSeq uint64, requested string) (string,
 		return "", err
 	}
 	return strconv.FormatUint(ms, 10) + "-" + strconv.FormatUint(seq, 10), nil
+}
+
+// safeUnixMilliToUint64 returns ms as uint64, clamping any negative value
+// (caused by a system clock set before the Unix epoch) to 0. Without this
+// clamp, a direct uint64 cast of a negative int64 would yield a value
+// near math.MaxUint64, which would then make nextXAddID's "future-ms"
+// branch chase that pathological value forever — effectively wedging
+// every subsequent XADD '*' on the stream until the clock recovers.
+// The lastMs/lastSeq monotonic guarantee carries the stream forward
+// from there via bumpStreamID.
+func safeUnixMilliToUint64(ms int64) uint64 {
+	if ms < 0 {
+		return 0
+	}
+	return uint64(ms) //nolint:gosec // negative values handled above
 }
 
 // bumpStreamID returns the strictly-greater successor of (ms, seq) within
@@ -4305,11 +4320,14 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 }
 
 // resolveXReadDollarID resolves the "$" after-ID for a single stream by
-// asking the store for the highest ID ever assigned. New-layout streams
-// answer from meta in one read; legacy blobs fall back to a full load.
-// Returns streamZeroID for non-existent and empty-never-written streams.
-// ctx threads through the caller's cancellation/deadline so the resolve
-// step doesn't survive past a BLOCK-window cancel.
+// asking the store for the highest ID ever assigned. The new-layout meta
+// answers in one read; when meta is absent the stream is treated as
+// empty — legacy single-blob data is intentionally ignored under the
+// "discard-on-read, delete-on-write" contract documented on
+// dollarIDFromState (and matching loadStreamAt). Returns streamZeroID
+// for non-existent and empty-never-written streams. ctx threads through
+// the caller's cancellation/deadline so the resolve step doesn't survive
+// past a BLOCK-window cancel.
 func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(ctx, key, readTS)
@@ -4567,7 +4585,12 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	// the resolve either succeeds quickly or fails cleanly, leaving
 	// the BLOCK-window timeout semantics (null on expiry) to the
 	// busy-poll below.
-	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	//
+	// Parent on r.handlerContext() (not context.Background()) so an
+	// in-flight resolve aborts promptly when the server is shutting
+	// down — otherwise the per-resolve ScanAt could survive past
+	// graceful-shutdown's drain window.
+	resolveCtx, resolveCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	err = r.resolveXReadAfterIDs(resolveCtx, &req)
 	resolveCancel()
 	if err != nil {
@@ -4581,7 +4604,19 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 // xreadBusyPoll runs the BLOCK-window busy-poll loop. Extracted from xread
 // so the parent function stays under the cyclop budget.
 func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline time.Time) {
+	handlerCtx := r.handlerContext()
 	for {
+		// Server-shutdown short-circuit: if the parent handlerContext
+		// has been cancelled, abandon the busy-poll immediately rather
+		// than spin until the BLOCK deadline. iterCtx below is rooted
+		// in handlerCtx, so it would cancel-on-call too — but routing
+		// through isXReadIterCtxError silently translates that into an
+		// empty iteration and the loop would burn CPU at
+		// redisBusyPollBackoff cadence until the deadline.
+		if handlerCtx.Err() != nil {
+			conn.WriteNull()
+			return
+		}
 		// BLOCK-expired before the loop body: respect the Redis contract
 		// that a BLOCK timeout returns null, not an error. If we fell
 		// through here without remaining time (very small BLOCK, or
@@ -4598,7 +4633,12 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		if iterTimeout > redisDispatchTimeout {
 			iterTimeout = redisDispatchTimeout
 		}
-		iterCtx, iterCancel := context.WithTimeout(context.Background(), iterTimeout)
+		// iterCtx is rooted in handlerCtx so its underlying storage
+		// scans abort promptly on server shutdown rather than running
+		// until iterTimeout fires. The handlerCtx.Err() guard at the
+		// top of each iteration prevents the loop from spinning once
+		// the parent ctx is cancelled.
+		iterCtx, iterCancel := context.WithTimeout(handlerCtx, iterTimeout)
 		results, err := r.xreadOnce(iterCtx, req)
 		iterCancel()
 		// Per-iteration ctx hitting its deadline (or being cancelled by

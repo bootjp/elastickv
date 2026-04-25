@@ -304,3 +304,37 @@ func TestIsKnownInternalKey_StreamPrefixNarrowed(t *testing.T) {
 		})
 	}
 }
+
+// TestSafeUnixMilliToUint64 guards Gemini's medium concern: a system
+// clock set before the Unix epoch makes time.Now().UnixMilli() return a
+// negative int64; a naive uint64 cast wraps to a value near
+// math.MaxUint64 that wedges every subsequent XADD '*' (the future-ms
+// branch in nextXAddID would chase that pathological value forever). The
+// helper must clamp at 0 so the lastMs/lastSeq monotonic carry takes
+// over.
+func TestSafeUnixMilliToUint64(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   int64
+		want uint64
+	}{
+		{"zero", 0, 0},
+		{"positive epoch ms", 1_777_000_000_000, 1_777_000_000_000},
+		{"max int64", math.MaxInt64, uint64(math.MaxInt64)},
+		// Negative values represent a clock set before the Unix epoch
+		// (1970-01-01). All must clamp at 0.
+		{"minus one", -1, 0},
+		{"large negative", -1_000_000_000_000, 0},
+		{"min int64", math.MinInt64, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := safeUnixMilliToUint64(tc.in); got != tc.want {
+				t.Fatalf("safeUnixMilliToUint64(%d): want %d, got %d", tc.in, tc.want, got)
+			}
+		})
+	}
+}
