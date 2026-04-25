@@ -217,10 +217,11 @@ func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
 	for _, tc := range deleteCases {
 		t.Run("delete/"+tc.name, func(t *testing.T) {
 			fwd := &stubLeaderForwarder{}
-			src := &stubTablesSource{
-				tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
-				deleteErr: tc.err,
-			}
+			// stubTablesSource.AdminDeleteTable returns early on
+			// deleteErr != nil before consulting the tables map, so
+			// the map is unreachable here — drop it for symmetry
+			// with the create-path cases above.
+			src := &stubTablesSource{deleteErr: tc.err}
 			h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
 			req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
 			req = withWritePrincipal(req)
