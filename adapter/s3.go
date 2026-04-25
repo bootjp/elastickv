@@ -36,20 +36,37 @@ const (
 	s3HealthMaxRequestBodyBytes = 1024
 	s3ChunkSize                 = 1 << 20
 	// s3ChunkBatchOps caps how many s3ChunkSize chunks fit in a single
-	// coordinator.Dispatch call. The Raft entry produced by Dispatch is
-	// roughly s3ChunkBatchOps × s3ChunkSize plus protobuf overhead, so
-	// 4 × 1 MiB = 4 MiB matches the post-PR-#593 default
-	// `MaxSizePerMsg = 4 MiB`. This alignment matters because
-	// etcd/raft sends a single entry that is *larger* than
-	// MaxSizePerMsg as a solo MsgApp (see util.go:limitSize), bypassing
-	// the documented `MaxInflight × MaxSizePerMsg` per-peer memory
-	// bound. With 16 × 1 MiB = 16 MiB entries the worst-case leader
-	// buffer was 1024 × 16 MiB = 16 GiB / peer; at 4 × 1 MiB the bound
-	// drops to 1024 × 4 MiB = 4 GiB / peer and matches the cap PR #593
-	// advertises. Per-PUT Raft commit count grows 4× (a 5 GiB PUT goes
-	// from 320 to 1280 entries) — absorbed by the WAL group commit
-	// landed in PR #600 and the smaller per-entry fsync.
-	s3ChunkBatchOps          = 4
+	// coordinator.Dispatch call on the data-write path
+	// (PutObject / UploadPart). Sized so the resulting Raft entry stays
+	// strictly under the post-PR-#593 default `MaxSizePerMsg = 4 MiB`
+	// even after protobuf framing overhead — each pb.Mutation carries
+	// the Op tag, Key tag + bytes, and Value length prefix; the
+	// pb.Request envelope wraps them; marshalRaftCommand prepends one
+	// byte. Empirically the per-Mutation overhead is ~60 B for normal
+	// keys and grows linearly with the bucket / objectKey length, so
+	// `4 × 1 MiB = 4 MiB` exactly is *over* MaxSizePerMsg in practice
+	// and falls into etcd/raft's util.go:limitSize oversized-first-
+	// entry path, bypassing the documented
+	// `MaxInflight × MaxSizePerMsg` per-peer memory bound. Capping at
+	// `3 × 1 MiB ≈ 3 MiB + few hundred bytes` leaves ~1 MiB of headroom
+	// even with kilobyte-scale object keys, so the entry rides the
+	// normal batched-MsgApp path and the bound holds. Per-PUT Raft
+	// commit count grows ~5× from the pre-PR-#636 baseline (a 5 GiB
+	// PUT goes from 320 → ~1707 entries) but each fsync is ~5×
+	// smaller; the WAL group commit landed in PR #600 absorbs the
+	// higher commit rate. See TestS3ChunkBatchFitsInRaftMaxSize
+	// for the encoded-size invariant.
+	s3ChunkBatchOps = 3
+	// s3MetaBatchOps batches key-only Del / scan ops on cleanup paths
+	// (cleanupPartBlobsAsync, deleteByPrefix, cleanupManifestBlobs).
+	// These ops carry no chunk payload, so the MaxSizePerMsg cap
+	// translates to a pure key-count budget: 64 BlobKey-shaped keys
+	// × ~100 B each ≈ 6 KiB per batch, three orders of magnitude
+	// under the 4 MiB limit. Keeping this batch large means a
+	// 5 GiB-object cleanup commits ~80 batches instead of ~1707, so
+	// orphaned-blob garbage collection finishes proportionally faster
+	// and does not amplify Raft load relative to the data-write path.
+	s3MetaBatchOps           = 64
 	s3XMLNamespace           = "http://s3.amazonaws.com/doc/2006-03-01/"
 	s3DefaultRegion          = "us-east-1"
 	s3MaxKeys                = 1000
@@ -1890,7 +1907,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 		defer func() { <-s.cleanupSem }()
 		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
 		defer cancel()
-		pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+		pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 		flush := func() {
 			if len(pending) == 0 {
 				return
@@ -1911,7 +1928,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 				Op:  kv.Del,
 				Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion),
 			})
-			if len(pending) >= s3ChunkBatchOps {
+			if len(pending) >= s3MetaBatchOps {
 				flush()
 			}
 		}
@@ -1944,7 +1961,7 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 	for {
 		readTS := s.readTS()
 		readPin := s.pinReadTS(readTS)
-		kvs, err := s.store.ScanAt(ctx, cursor, end, s3ChunkBatchOps, readTS)
+		kvs, err := s.store.ScanAt(ctx, cursor, end, s3MetaBatchOps, readTS)
 		readPin.Release()
 		if err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
@@ -2203,7 +2220,7 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 	if s == nil || manifest == nil || manifest.UploadID == "" || s.coordinator == nil {
 		return
 	}
-	pending := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
+	pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 	flush := func() {
 		if len(pending) == 0 {
 			return
@@ -2238,7 +2255,7 @@ func (s *S3Server) appendPartBlobKeys(pending []*kv.Elem[kv.OP], bucket string, 
 			Op:  kv.Del,
 			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
 		})
-		if len(pending) >= s3ChunkBatchOps {
+		if len(pending) >= s3MetaBatchOps {
 			flush()
 		}
 	}
