@@ -22,10 +22,11 @@
 //   - Flush drains the per-route counters with atomic.SwapUint64; no
 //     pointer retirement, so a late writer cannot race past the snapshot
 //     and lose counts.
-//   - Adding / removing routes (RegisterRoute, RemoveRoute, ApplySplit,
-//     ApplyMerge) builds a fresh routeTable copy under a non-hot-path
-//     mutex and publishes it with a single atomic.Pointer.Store. Routes
-//     mutated mid-step keep their counters in the new table by design.
+//   - Adding / removing routes (RegisterRoute, RemoveRoute today;
+//     ApplySplit / ApplyMerge in a future PR) builds a fresh
+//     routeTable copy under a non-hot-path mutex and publishes it
+//     with a single atomic.Pointer.Store. Routes mutated mid-step
+//     keep their counters in the new table by design.
 package keyviz
 
 import (
@@ -127,30 +128,49 @@ type MemSampler struct {
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
-// period. remaining counts down to zero across successive Flushes.
+// period. retiredAt is the wall-clock instant of removal; the entry
+// is drained on every Flush whose `now()` is within the configured
+// grace window of retiredAt, then dropped.
 type retiredSlot struct {
 	slot      *routeSlot
-	remaining int
+	retiredAt time.Time
 }
 
 // memberPrune tracks a deferred virtual-bucket member-route removal.
-// remaining counts down across Flushes; while it stays positive the
-// routeID is still advertised in bucket.MemberRoutes so the flushed
-// row's attribution matches the bucket counters that still include
-// pre-removal increments from this route.
+// retiredAt is the wall-clock instant of removal; while now() is
+// within the grace window, the routeID stays in bucket.MemberRoutes so
+// flushed rows continue attributing the bucket's mixed counters to all
+// members that contributed (including this one).
 type memberPrune struct {
 	bucket    *routeSlot
 	routeID   uint64
-	remaining int
+	retiredAt time.Time
 }
 
-// retainedFlushes is how many Flush cycles a retired slot (or pending
-// member-prune) stays in the queue after RemoveRoute. Two cycles is
-// enough in practice: any goroutine still holding a pre-RemoveRoute
-// table snapshot will have completed its single atomic.Add long
-// before the second flush tick (Step is at human timescales,
-// microseconds suffice).
-const retainedFlushes = 2
+// minGraceWindow is the wall-clock floor for late-writer grace. It
+// guards against Step being configured small enough (millisecond
+// scale) that a flush-count-based grace window would expire before a
+// preempted Observe goroutine resumes. Any goroutine still holding a
+// pre-RemoveRoute table snapshot must finish its single atomic.Add
+// before now-retiredAt exceeds this window.
+const minGraceWindow = 5 * time.Second
+
+// graceStepMultiplier is how many Step intervals we want the grace
+// window to cover by default — picked so retired slots are drained
+// at least twice before being dropped.
+const graceStepMultiplier = 2
+
+// graceWindow is the duration retired slots and pending member-prunes
+// stay drainable after RemoveRoute. It's tied to wall-clock time, not
+// Flush count, so a small Step doesn't shrink the grace below
+// minGraceWindow.
+func (s *MemSampler) graceWindow() time.Duration {
+	g := graceStepMultiplier * s.opts.Step
+	if g < minGraceWindow {
+		g = minGraceWindow
+	}
+	return g
+}
 
 // routeTable is the COW snapshot Observe operates on. Once published
 // via MemSampler.table.Store, fields are read-only.
@@ -241,7 +261,7 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	if opts.Step <= 0 {
 		opts.Step = DefaultStep
 	}
-	if opts.HistoryColumns == 0 {
+	if opts.HistoryColumns <= 0 {
 		opts.HistoryColumns = DefaultHistoryColumns
 	}
 	if opts.MaxTrackedRoutes == 0 {
@@ -403,16 +423,17 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 	delete(next.slots, routeID)
 	delete(next.virtualForRoute, routeID)
 
+	retiredAt := s.now()
 	switch {
 	case isIndividual:
 		// Pending counters in this slot must be harvested by upcoming
-		// Flush cycles. Drain across `retainedFlushes` cycles so an
-		// Observe call that loaded the prior table just before this
+		// Flush cycles. Drain across the grace window so an Observe
+		// call that loaded the prior table just before this
 		// atomic.Store can still complete its Add into the slot — that
-		// in-flight write is caught by the next drain rather than
+		// in-flight write is caught by a later drain rather than
 		// silently lost.
 		s.retiredMu.Lock()
-		s.retiredSlots = append(s.retiredSlots, retiredSlot{slot: individual, remaining: retainedFlushes})
+		s.retiredSlots = append(s.retiredSlots, retiredSlot{slot: individual, retiredAt: retiredAt})
 		s.retiredMu.Unlock()
 	case isVirtual:
 		// Defer pruning until after the bucket's pre-removal counters
@@ -422,17 +443,17 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 		// to them — including the route we are removing.
 		s.retiredMu.Lock()
 		s.pendingPrunes = append(s.pendingPrunes, memberPrune{
-			bucket: bucket, routeID: routeID, remaining: retainedFlushes,
+			bucket: bucket, routeID: routeID, retiredAt: retiredAt,
 		})
 		// If this delete left the bucket with no remaining
 		// virtualForRoute mapping, rebuildSorted will drop it from the
 		// live sortedSlots. Queue it as a retired slot so Flush keeps
-		// draining its counters across retainedFlushes — otherwise
+		// draining its counters across the grace window — otherwise
 		// pre-removal increments and any in-flight Observe writers
 		// hitting the prior table snapshot would be silently lost.
 		if !bucketStillReferenced(next.virtualForRoute, bucket) {
 			s.retiredSlots = append(s.retiredSlots, retiredSlot{
-				slot: bucket, remaining: retainedFlushes,
+				slot: bucket, retiredAt: retiredAt,
 			})
 		}
 		s.retiredMu.Unlock()
@@ -462,9 +483,10 @@ func (s *MemSampler) Flush() {
 		col.Rows = appendDrainedRow(col.Rows, slot)
 	}
 
+	grace := s.graceWindow()
 	s.retiredMu.Lock()
-	s.retiredSlots = drainRetiredSlots(s.retiredSlots, &col.Rows)
-	s.pendingPrunes = advancePendingPrunes(s.pendingPrunes)
+	s.retiredSlots = drainRetiredSlots(s.retiredSlots, &col.Rows, col.At, grace)
+	s.pendingPrunes = advancePendingPrunes(s.pendingPrunes, col.At, grace)
 	s.retiredMu.Unlock()
 
 	sort.SliceStable(col.Rows, func(i, j int) bool {
@@ -476,31 +498,30 @@ func (s *MemSampler) Flush() {
 	s.historyMu.Unlock()
 }
 
-// drainRetiredSlots emits a row for each retired slot, decrements the
-// per-entry grace counter, and returns the surviving entries (in the
-// original backing array). Rows are appended to *rows; the slice
-// header is updated through the pointer so the caller observes the
-// growth.
-func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow) []retiredSlot {
+// drainRetiredSlots emits a row for each retired slot and returns the
+// entries whose grace window has not yet elapsed. Rows are appended
+// to *rows so the caller sees the slice growth. Entries whose
+// elapsed time (now - retiredAt) has reached grace are dropped after
+// this final drain.
+func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow, now time.Time, grace time.Duration) []retiredSlot {
 	keep := retired[:0]
 	for _, r := range retired {
 		*rows = appendDrainedRow(*rows, r.slot)
-		r.remaining--
-		if r.remaining > 0 {
+		if now.Sub(r.retiredAt) < grace {
 			keep = append(keep, r)
 		}
 	}
 	return keep
 }
 
-// advancePendingPrunes decrements each entry's grace counter; entries
-// whose counter reaches zero have their routeID actually pruned from
-// the bucket's MemberRoutes. Returns the surviving entries.
-func advancePendingPrunes(pending []memberPrune) []memberPrune {
+// advancePendingPrunes lets each pending member-prune live until its
+// retiredAt+grace passes, then actually prunes the routeID from the
+// bucket's MemberRoutes. Returns the entries still inside the grace
+// window.
+func advancePendingPrunes(pending []memberPrune, now time.Time, grace time.Duration) []memberPrune {
 	keep := pending[:0]
 	for _, p := range pending {
-		p.remaining--
-		if p.remaining > 0 {
+		if now.Sub(p.retiredAt) < grace {
 			keep = append(keep, p)
 			continue
 		}
@@ -639,9 +660,12 @@ func rebuildSorted(tbl *routeTable) []*routeSlot {
 	return out
 }
 
-// findVirtualBucket returns the existing virtual bucket whose range
-// covers (or is closest to the right of) start. Returns nil when no
-// virtual bucket exists yet — caller creates one in that case.
+// findVirtualBucket returns the existing virtual bucket that covers
+// start, preferring an exact range match. If no bucket contains
+// start, returns the first aggregate in sortedSlots order so
+// over-budget routes collapse into a single global bucket rather than
+// fragmenting across many. Returns nil only when no virtual bucket
+// exists yet — caller creates one in that case.
 func findVirtualBucket(sorted []*routeSlot, start []byte) *routeSlot {
 	for _, s := range sorted {
 		if !s.Aggregate {

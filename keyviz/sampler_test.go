@@ -285,29 +285,29 @@ func TestRemoveRouteHarvestsPendingCounts(t *testing.T) {
 // TestRemoveVirtualMemberPrunesMemberRoutes pins Codex P2: when a
 // coarsened (virtual-bucket) RouteID is removed, the bucket's
 // MemberRoutes list must eventually drop that ID. Pruning is deferred
-// across retainedFlushes cycles so the row attribution stays correct
-// while the bucket counters still include the removed route's
+// across the wall-clock grace window so the row attribution stays
+// correct while the bucket counters still include the removed route's
 // pre-removal increments — TestRemoveVirtualMemberPruneDeferred pins
 // the grace-window half of this contract.
 func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 	t.Parallel()
-	s := setupVirtualBucketWithThreeMembers(t)
+	s, clk := setupVirtualBucketWithThreeMembers(t)
 	s.RemoveRoute(2)
-	for i := 0; i < retainedFlushes; i++ {
-		s.Observe(3, OpRead, 1, 0)
-		s.Flush()
-	}
-	// One more flush after the grace window to capture the post-prune
-	// MemberRoutes state in a row.
+	// Drain at least once within grace, then advance past grace so the
+	// next Flush actually executes the prune. One more Flush captures
+	// the post-prune MemberRoutes state in a row.
+	s.Observe(3, OpRead, 1, 0)
+	s.Flush()
+	clk.Advance(s.graceWindow() + time.Second)
+	s.Observe(3, OpRead, 1, 0)
+	s.Flush()
 	s.Observe(3, OpRead, 1, 0)
 	s.Flush()
 
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	agg := cols[len(cols)-1].Rows[0]
-	for _, m := range agg.MemberRoutes {
-		if m == 2 {
-			t.Fatalf("after grace, removed route 2 still in MemberRoutes: %v", agg.MemberRoutes)
-		}
+	if memberRoutesContain(agg.MemberRoutes, 2) {
+		t.Fatalf("after grace, removed route 2 still in MemberRoutes: %v", agg.MemberRoutes)
 	}
 	if len(agg.MemberRoutes) != 1 || agg.MemberRoutes[0] != 3 {
 		t.Fatalf("MemberRoutes = %v, want [3]", agg.MemberRoutes)
@@ -315,15 +315,17 @@ func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 }
 
 // TestRemoveVirtualMemberPruneDeferred pins the deferred-prune
-// contract: the removed routeID stays in MemberRoutes for the
-// retainedFlushes grace window so flushed rows whose counters still
-// include that route's pre-removal increments attribute the traffic
-// correctly.
+// contract: the removed routeID stays in MemberRoutes throughout the
+// wall-clock grace window so flushed rows whose counters still include
+// that route's pre-removal increments attribute the traffic correctly.
 func TestRemoveVirtualMemberPruneDeferred(t *testing.T) {
 	t.Parallel()
-	s := setupVirtualBucketWithThreeMembers(t)
+	s, _ := setupVirtualBucketWithThreeMembers(t)
 	s.RemoveRoute(2)
-	for i := 0; i < retainedFlushes; i++ {
+	// Two flushes inside the grace window — the clock is not advanced,
+	// so each Flush sees now-retiredAt == 0 < grace and keeps the
+	// prune entry.
+	for i := 0; i < 2; i++ {
 		s.Observe(3, OpRead, 1, 0)
 		s.Flush()
 		col := lastSnapshotColumn(t, s)
@@ -352,9 +354,9 @@ func memberRoutesContain(members []uint64, target uint64) bool {
 	return false
 }
 
-func setupVirtualBucketWithThreeMembers(t *testing.T) *MemSampler {
+func setupVirtualBucketWithThreeMembers(t *testing.T) (*MemSampler, *fakeClock) {
 	t.Helper()
-	s, _ := newTestSampler(t, MemSamplerOptions{
+	s, clk := newTestSampler(t, MemSamplerOptions{
 		Step:             time.Second,
 		HistoryColumns:   4,
 		MaxTrackedRoutes: 1,
@@ -368,7 +370,7 @@ func setupVirtualBucketWithThreeMembers(t *testing.T) *MemSampler {
 	if s.RegisterRoute(3, []byte("e"), []byte("g")) {
 		t.Fatal("route 3 should fold (over budget)")
 	}
-	return s
+	return s, clk
 }
 
 // TestRegisterDoesNotRaceFlushOnVirtualBucket pins Codex P1: folding
@@ -538,15 +540,15 @@ func TestFlushSortsMixedLiveAndRetiredRows(t *testing.T) {
 }
 
 // TestRetiredSlotGracePeriod asserts that a retired slot stays in the
-// drain queue for `retainedFlushes` cycles so an Observe goroutine
+// drain queue for the wall-clock grace window so an Observe goroutine
 // that loaded the pre-RemoveRoute table snapshot can complete its
 // atomic.Add into the slot and still have the increment harvested by
 // a subsequent Flush. We simulate the late writer by reaching into
-// the retired-slot queue directly and bumping the counter between the
-// two flushes.
+// the retired-slot queue directly and bumping the counter between
+// flushes inside the grace window.
 func TestRetiredSlotGracePeriod(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
+	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
 	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
@@ -554,15 +556,17 @@ func TestRetiredSlotGracePeriod(t *testing.T) {
 	s.RemoveRoute(1)
 
 	lateSlot := graceQueueSingleSlot(t, s)
-	s.Flush()
+	s.Flush() // drain inside grace
 	lateSlot.reads.Add(7)
-	s.Flush()
+	s.Flush() // drain inside grace, harvests the late-writer increment
 
 	total := totalReadsForRoute(s.Snapshot(time.Time{}, time.Time{}), 1)
 	if total != 1+7 {
 		t.Fatalf("expected reads 8 (pre-remove + late-writer), got %d", total)
 	}
 
+	clk.Advance(s.graceWindow() + time.Second)
+	s.Flush() // last drain, retiredAt+grace now passed → entry dropped
 	s.retiredMu.Lock()
 	leftover := len(s.retiredSlots)
 	s.retiredMu.Unlock()
@@ -680,5 +684,34 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	r := second[0].Rows[0]
 	if string(r.Start) != "aaaa" || string(r.End) != "bbbb" {
 		t.Fatalf("snapshot bounds aliased live state: start=%q end=%q", r.Start, r.End)
+	}
+}
+
+// BenchmarkObserveHit pins the hot-path properties claimed in the
+// package doc: a single atomic.Pointer.Load, a map lookup, and at
+// most two atomic.AddUint64 calls — no allocation, no mutex. Use
+// `go test -bench=BenchmarkObserveHit -benchmem ./keyviz/...` to
+// catch regressions before they reach the coordinator wiring PR.
+func BenchmarkObserveHit(b *testing.B) {
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+		b.Fatal("RegisterRoute(1) returned false")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Observe(1, OpRead, 16, 64)
+	}
+}
+
+// BenchmarkObserveMiss exercises the unknown-route path so a future
+// regression that grows allocations on misses (e.g. virtualForRoute
+// fallback path) is caught.
+func BenchmarkObserveMiss(b *testing.B) {
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Observe(99, OpRead, 16, 64)
 	}
 }
