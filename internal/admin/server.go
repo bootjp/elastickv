@@ -32,8 +32,9 @@ type ServerDeps struct {
 	// ClusterInfo describes the local node's Raft state.
 	ClusterInfo ClusterInfoSource
 
-	// Tables is the read-only DynamoDB admin source. Optional: a nil
-	// value disables /admin/api/v1/dynamo/tables{,/{name}} (the mux
+	// Tables is the DynamoDB admin source — covers list, describe,
+	// create, and delete via TablesSource. Optional: a nil value
+	// disables /admin/api/v1/dynamo/tables{,/{name}} (the mux
 	// answers them with 404). This lets a build that ships only the
 	// cluster page deploy without standing up the dynamo bridge.
 	Tables TablesSource
@@ -143,8 +144,10 @@ func (s *Server) APIHandler() http.Handler {
 //	POST   /admin/api/v1/auth/login                 (no auth, rate-limited)
 //	POST   /admin/api/v1/auth/logout                (auth required)
 //	GET    /admin/api/v1/cluster                    (auth required)
-//	GET    /admin/api/v1/dynamo/tables              (auth required, read-only)
-//	GET    /admin/api/v1/dynamo/tables/{name}       (auth required, read-only)
+//	GET    /admin/api/v1/dynamo/tables              (auth required)
+//	POST   /admin/api/v1/dynamo/tables              (auth required, full role)
+//	GET    /admin/api/v1/dynamo/tables/{name}       (auth required)
+//	DELETE /admin/api/v1/dynamo/tables/{name}       (auth required, full role)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to
 // write-capable protected endpoints; login and logout carry their own
@@ -204,11 +207,11 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	loginChain := publicAuth(loginHandler)
 	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
-	// Read-only endpoints share the protect chain so a missing
-	// session or CSRF token still 401s/403s the same way as a write.
-	// The Audit middleware is a no-op for GET (it only logs state-
-	// changing methods) so we get the consistent guards without the
-	// noise of an audit line per dashboard poll.
+	// Dynamo endpoints (reads and writes) share the protect chain
+	// so a missing session or CSRF token 401s/403s the same way
+	// regardless of method. The Audit middleware is a no-op for
+	// GET (it only logs state-changing methods) so dashboard polls
+	// don't flood the audit log, while POST/DELETE always do.
 	var dynamoChain http.Handler
 	if dynamoHandler != nil {
 		dynamoChain = protect(dynamoHandler)
