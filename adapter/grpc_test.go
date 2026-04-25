@@ -150,29 +150,36 @@ func Test_consistency_satisfy_write_after_read_for_parallel(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
 	c := rawKVClient(t, adders)
+	defer shutdown(nodes)
 
 	wg := sync.WaitGroup{}
-	wg.Add(1000)
-	for i := range 1000 {
+	const workers = 1000
+	wg.Add(workers)
+	for i := range workers {
 		go func(i int) {
+			defer wg.Done()
 			key := []byte("test-key-parallel" + strconv.Itoa(i))
 			want := []byte(strconv.Itoa(i))
 			_, err := c.RawPut(
 				context.Background(),
 				&pb.RawPutRequest{Key: key, Value: want},
 			)
-			assert.NoError(t, err, "Put RPC failed")
-			_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
-			assert.NoError(t, err, "Put RPC failed")
+			if !assert.NoError(t, err, "Put RPC failed") {
+				return
+			}
+			_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
+			if !assert.NoError(t, err, "Put RPC failed") {
+				return
+			}
 
-			resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-			assert.NoError(t, err, "Get RPC failed")
+			resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+			if !assert.NoError(t, err, "Get RPC failed") {
+				return
+			}
 			assert.Equal(t, want, resp.Value, "consistency check failed")
-			wg.Done()
 		}(i)
 	}
 	wg.Wait()
-	shutdown(nodes)
 }
 
 func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
@@ -189,13 +196,23 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			context.Background(),
 			&pb.RawPutRequest{Key: key, Value: want},
 		)
-		assert.NoError(t, err, "Put RPC failed")
+		// Stop at the first RPC failure instead of continuing: a
+		// genuine regression would otherwise cascade into 9998 more
+		// iterations, each reporting the same broken invariant, and
+		// drown the real cause in test-output noise.
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
 
-		_, err = c.RawPut(context.TODO(), &pb.RawPutRequest{Key: key, Value: want})
-		assert.NoError(t, err, "Put RPC failed")
+		_, err = c.RawPut(context.Background(), &pb.RawPutRequest{Key: key, Value: want})
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
 
-		resp, err := c.RawGet(context.TODO(), &pb.RawGetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		resp, err := c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
 
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 	}
@@ -215,16 +232,27 @@ func Test_grpc_transaction(t *testing.T) {
 			context.Background(),
 			&pb.PutRequest{Key: key, Value: want},
 		)
-		assert.NoError(t, err, "Put RPC failed")
-		resp, err := c.Get(context.TODO(), &pb.GetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		// See Test_consistency_satisfy_write_after_read_sequence:
+		// break on first RPC failure so a single broken invariant
+		// does not amplify into thousands of assertion lines.
+		if !assert.NoError(t, err, "Put RPC failed") {
+			break
+		}
+		resp, err := c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 
-		_, err = c.Delete(context.TODO(), &pb.DeleteRequest{Key: key})
-		assert.NoError(t, err, "Delete RPC failed")
+		_, err = c.Delete(context.Background(), &pb.DeleteRequest{Key: key})
+		if !assert.NoError(t, err, "Delete RPC failed") {
+			break
+		}
 
-		resp, err = c.Get(context.TODO(), &pb.GetRequest{Key: key})
-		assert.NoError(t, err, "Get RPC failed")
+		resp, err = c.Get(context.Background(), &pb.GetRequest{Key: key})
+		if !assert.NoError(t, err, "Get RPC failed") {
+			break
+		}
 		assert.Nil(t, resp.Value, "consistency check failed")
 	}
 }

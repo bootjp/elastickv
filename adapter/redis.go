@@ -52,6 +52,7 @@ const (
 	cmdHMGet            = "HMGET"
 	cmdHMSet            = "HMSET"
 	cmdHSet             = "HSET"
+	cmdHello            = "HELLO"
 	cmdInfo             = "INFO"
 	cmdIncr             = "INCR"
 	cmdKeys             = "KEYS"
@@ -189,6 +190,7 @@ var argsLen = map[string]int{
 	cmdHMGet:            -3,
 	cmdHMSet:            -4,
 	cmdHSet:             -4,
+	cmdHello:            -1,
 	cmdInfo:             -1,
 	cmdIncr:             2,
 	cmdKeys:             2,
@@ -294,6 +296,12 @@ type RedisServer struct {
 	// reads on hot keys faster than the regular compaction interval.
 	compactor *DeltaCompactor
 
+	// connIDSeq hands out monotonically increasing per-connection
+	// identifiers. The zero value is never returned (atomic.AddUint64
+	// returns 1 on first call) so clients can treat 0 as "unset".
+	// Exposed via HELLO / CLIENT ID.
+	connIDSeq atomic.Uint64
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -369,6 +377,16 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 type connState struct {
 	inTxn bool
 	queue []redcon.Command
+	// connID is a monotonically increasing per-server connection
+	// identifier assigned on first access via getConnState. Exposed via
+	// HELLO's `id` field and CLIENT ID / CLIENT INFO for parity with
+	// real Redis so that clients that rely on a stable numeric ID
+	// (e.g. go-redis connection pool tagging) do not break.
+	connID uint64
+	// clientName is the name set via HELLO SETNAME or CLIENT SETNAME,
+	// returned by CLIENT GETNAME. Empty string means no name set, which
+	// CLIENT GETNAME must report as a null bulk string.
+	clientName string
 }
 
 type resultType int
@@ -439,6 +457,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		cmdHMGet:            r.hmget,
 		cmdHMSet:            r.hmset,
 		cmdHSet:             r.hset,
+		cmdHello:            r.hello,
 		cmdInfo:             r.info,
 		cmdIncr:             r.incr,
 		cmdKeys:             r.keys,
@@ -515,6 +534,23 @@ func getConnState(conn redcon.Conn) *connState {
 	st := &connState{}
 	conn.SetContext(st)
 	return st
+}
+
+// ensureConnID assigns and returns a per-connection numeric ID for the
+// given state, allocating one lazily on first access. The ID comes from
+// r.connIDSeq; atomic.AddUint64 returns 1 on first call so zero is
+// reserved as "no id assigned yet" for external observers. IDs are not
+// reused when a connection closes — this matches real Redis semantics
+// and keeps the identifier usable as a debugging breadcrumb.
+func (r *RedisServer) ensureConnID(st *connState) uint64 {
+	if st == nil {
+		return 0
+	}
+	if st.connID != 0 {
+		return st.connID
+	}
+	st.connID = r.connIDSeq.Add(1)
+	return st.connID
 }
 
 func (r *RedisServer) readTS() uint64 {
@@ -606,7 +642,12 @@ func (r *RedisServer) Run() error {
 			if !ok {
 				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
 				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
-				r.observeRedisError(name, time.Since(start))
+				// Pass the RAW command bytes (not the already-uppercased `name`)
+				// so that the unsupported-command observer can detect invalid
+				// UTF-8 before strings.ToUpper silently rewrites the bytes to
+				// the U+FFFD replacement character. See observeUnsupportedCommand
+				// in monitoring/redis.go.
+				r.observeRedisUnsupported(string(cmd.Args[0]), time.Since(start))
 				return
 			}
 
@@ -866,6 +907,28 @@ func (r *RedisServer) observeRedisError(command string, dur time.Duration) {
 	})
 }
 
+// observeRedisUnsupported records a command that was rejected because
+// the adapter has no route for it. In addition to the usual error
+// counters (which bucket the name into "unknown"), this flags the
+// report so the monitoring layer can record the real command name in
+// its bounded-cardinality unsupported-commands counter.
+//
+// IMPORTANT: `command` must be the RAW bytes the client sent (not an
+// already-uppercased value). The monitoring layer relies on seeing the
+// raw bytes to detect invalid UTF-8 before strings.ToUpper silently
+// replaces invalid bytes with the Unicode replacement character.
+func (r *RedisServer) observeRedisUnsupported(command string, dur time.Duration) {
+	if r.requestObserver == nil {
+		return
+	}
+	r.requestObserver.ObserveRedisRequest(monitoring.RedisRequestReport{
+		Command:     command,
+		IsError:     true,
+		Duration:    dur,
+		Unsupported: true,
+	})
+}
+
 func (r *RedisServer) observeRedisSuccess(command string, dur time.Duration) {
 	if r.requestObserver == nil {
 		return
@@ -1085,7 +1148,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// ~17 pebble seeks (list meta + list delta + 3×wide-column probes
 	// each doing 3 seeks + hash/set/zset/stream/HLL/str/bare); that
 	// overhead dominated every GET on a hot cluster (see
-	// docs/lease_read_design.md). A live string key resolves in 1-2
+	// docs/design/2026_04_20_implemented_lease_read.md). A live string key resolves in 1-2
 	// seeks here, and we only fall back to keyTypeAt when the string
 	// path returns ErrKeyNotFound (meaning either missing, expired,
 	// or a non-string type is present under this user-key).

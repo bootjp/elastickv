@@ -1127,25 +1127,45 @@ func cleanupTSWithNow(startTS, now uint64) uint64 {
 // All mutations must belong to the same shard. Cross-shard mutation batches are
 // not supported.
 func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	if len(mutations) == 0 {
-		return nil
+	group, err := s.resolveSingleShardGroup(mutations)
+	if err != nil || group == nil {
+		return err
 	}
-	// Determine the shard group for the first mutation.
+	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
+}
+
+// ApplyMutationsRaft is the raft-apply variant; see store.MVCCStore for the
+// durability contract. Only the FSM may call this method.
+func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	group, err := s.resolveSingleShardGroup(mutations)
+	if err != nil || group == nil {
+		return err
+	}
+	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
+}
+
+// resolveSingleShardGroup returns the shard group that owns every
+// mutation in the batch, or an error if the batch is cross-shard or
+// references an unknown group. A nil group with nil error means "empty
+// batch — caller should no-op".
+func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) (*ShardGroup, error) {
+	if len(mutations) == 0 {
+		return nil, nil
+	}
 	firstGroup, ok := s.groupForKey(mutations[0].Key)
 	if !ok || firstGroup == nil || firstGroup.Store == nil {
-		return store.ErrNotSupported
+		return nil, store.ErrNotSupported
 	}
-	// Ensure that all mutations in the batch belong to the same shard.
 	for i := 1; i < len(mutations); i++ {
 		g, ok := s.groupForKey(mutations[i].Key)
 		if !ok || g == nil || g.Store == nil {
-			return store.ErrNotSupported
+			return nil, store.ErrNotSupported
 		}
 		if g != firstGroup {
-			return errors.WithStack(ErrCrossShardMutationBatchNotSupported)
+			return nil, errors.WithStack(ErrCrossShardMutationBatchNotSupported)
 		}
 	}
-	return errors.WithStack(firstGroup.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
+	return firstGroup, nil
 }
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
@@ -1155,6 +1175,19 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 			continue
 		}
 		if err := g.Store.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
+func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		if err := g.Store.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS); err != nil {
 			return errors.WithStack(err)
 		}
 	}

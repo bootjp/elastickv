@@ -191,7 +191,7 @@ Add integration tests for manual split and update operator docs.
 1. `kv/sharded_integration_test.go`
 2. `adapter/grpc_test.go` and/or dedicated split integration tests
 3. `README.md`
-4. `docs/hotspot_shard_split_design.md`
+4. `docs/design/2026_02_18_partial_hotspot_shard_split.md`
 
 ### Tasks
 

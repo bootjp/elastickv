@@ -24,12 +24,28 @@ const (
 	DynamoGSIPrefix = "!ddb|gsi|"
 )
 
+const (
+	// SqsRoutePrefix is the logical route prefix all SQS internal keys
+	// normalize to. The adapter stores queue metadata and per-queue
+	// message keys under several !sqs|... families; routing must map
+	// every one of them to a single stable prefix so the distribution
+	// engine colocates a queue's storage on one Raft group.
+	sqsRoutePrefix = "!sqs|route|"
+
+	// SqsInternalPrefix is the shared prefix of every SQS-owned key
+	// family (!sqs|queue|meta|, !sqs|msg|vis|, etc.). Used by
+	// sqsRouteKey to dispatch the routing decision.
+	sqsInternalPrefix = "!sqs|"
+)
+
 var (
 	dynamoRoutePrefixBytes           = []byte(dynamoRoutePrefix)
 	dynamoTableMetaPrefixBytes       = []byte(DynamoTableMetaPrefix)
 	dynamoTableGenerationPrefixBytes = []byte(DynamoTableGenerationPrefix)
 	dynamoItemPrefixBytes            = []byte(DynamoItemPrefix)
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
+	sqsRoutePrefixBytes              = []byte(sqsRoutePrefix)
+	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 )
 
 // routeKey normalizes internal keys (e.g., list metadata/items) to the logical
@@ -50,6 +66,9 @@ func normalizeRouteKey(key []byte) []byte {
 	}
 	if table := dynamoRouteKey(key); table != nil {
 		return table
+	}
+	if route := sqsRouteKey(key); route != nil {
+		return route
 	}
 	if user := s3keys.ExtractRouteKey(key); user != nil {
 		return user
@@ -102,5 +121,22 @@ func dynamoRouteTableKey(tableSegment []byte) []byte {
 	out := make([]byte, 0, len(dynamoRoutePrefixBytes)+len(tableSegment))
 	out = append(out, dynamoRoutePrefixBytes...)
 	out = append(out, tableSegment...)
+	return out
+}
+
+// sqsRouteKey maps any !sqs|... internal key to a stable route key so
+// multi-shard deployments that partition by user-key range still land
+// every SQS mutation on a configured group. Milestone 1 collapses all
+// SQS keys to a single !sqs|route|global route — this keeps the
+// catalog and every queue's message keyspace on the same group, which
+// is the minimum needed for FIFO group-lock semantics (landing later)
+// to work. When per-queue sharding is implemented it will live here.
+func sqsRouteKey(key []byte) []byte {
+	if !bytes.HasPrefix(key, sqsInternalPrefixBytes) {
+		return nil
+	}
+	out := make([]byte, 0, len(sqsRoutePrefixBytes)+len("global"))
+	out = append(out, sqsRoutePrefixBytes...)
+	out = append(out, []byte("global")...)
 	return out
 }

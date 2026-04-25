@@ -1,0 +1,71 @@
+# docker-compose.ha.yml -- high-availability redis-proxy topology.
+#
+# Two redis-proxy replicas sit behind an nginx TCP (stream module)
+# load balancer so operators can redeploy one replica at a time
+# without dropping client traffic. See docs/redis-proxy-deployment.md
+# for the rolling-deploy runbook.
+#
+# Client-facing endpoint: host :6379 -> nginx -> redis-proxy-{a,b}:6379.
+# The single-instance deploy in docs/redis-proxy-deployment.md still
+# works; this file is an additive HA option.
+
+services:
+  redis-proxy-a:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.redis-proxy
+    image: ghcr.io/bootjp/elastickv/redis-proxy:latest
+    container_name: redis-proxy-a
+    restart: unless-stopped
+    # No host port exposure -- only nginx is client-facing. Other
+    # replicas in the compose network reach this one by service name.
+    expose:
+      - "6379"
+      - "9191"
+    command:
+      - -listen=:6379
+      - -primary=${REDIS_PROXY_PRIMARY:-redis:6379}
+      - -secondary=${REDIS_PROXY_SECONDARY:-elastickv:6380}
+      - -mode=${REDIS_PROXY_MODE:-dual-write-shadow}
+      - -metrics=:9191
+    networks:
+      - redis-proxy-ha
+
+  redis-proxy-b:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.redis-proxy
+    image: ghcr.io/bootjp/elastickv/redis-proxy:latest
+    container_name: redis-proxy-b
+    restart: unless-stopped
+    expose:
+      - "6379"
+      - "9191"
+    command:
+      - -listen=:6379
+      - -primary=${REDIS_PROXY_PRIMARY:-redis:6379}
+      - -secondary=${REDIS_PROXY_SECONDARY:-elastickv:6380}
+      - -mode=${REDIS_PROXY_MODE:-dual-write-shadow}
+      - -metrics=:9191
+    networks:
+      - redis-proxy-ha
+
+  nginx:
+    image: nginx:1.30-alpine
+    container_name: redis-proxy-nginx
+    restart: unless-stopped
+    depends_on:
+      - redis-proxy-a
+      - redis-proxy-b
+    ports:
+      # Stable client-facing endpoint. Applications connect here and
+      # stay connected across rolling redis-proxy upgrades.
+      - "6379:6379"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - redis-proxy-ha
+
+networks:
+  redis-proxy-ha:
+    driver: bridge
