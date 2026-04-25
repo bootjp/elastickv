@@ -151,6 +151,43 @@ func TestForwardServer_DeleteTable_MissingReturns404(t *testing.T) {
 	require.Equal(t, int32(http.StatusNotFound), resp.GetStatusCode())
 }
 
+// TestForwardServer_DeleteTable_RejectsNULBytePayload exercises
+// the same Codex P2 vector that the create-table path covers:
+// goccy/go-json treats raw NUL as end-of-input, so a body like
+// `{"name":"users"}\x00{"extra":1}` would otherwise pass dec.More()
+// undetected. The handler now scans for NUL before decoding.
+func TestForwardServer_DeleteTable_RejectsNULBytePayload(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{"users": {Name: "users"}}}
+	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+		Payload:   []byte("{\"name\":\"users\"}\x00{\"extra\":1}"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "NUL byte")
+	// Source must not be reached — the table still exists in the
+	// stub map after the rejection.
+	require.Contains(t, src.tables, "users")
+}
+
+// TestForwardServer_DeleteTable_RejectsSlashInName mirrors the
+// HTTP path's slash rejection on forwarded delete requests so the
+// two surfaces cannot diverge (Codex P2).
+func TestForwardServer_DeleteTable_RejectsSlashInName(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+		Payload:   []byte(`{"name":"foo/bar"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "must not contain")
+}
+
 func TestForwardServer_UnknownOperationRejected(t *testing.T) {
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{

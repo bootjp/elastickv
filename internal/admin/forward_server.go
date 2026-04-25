@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/goccy/go-json"
@@ -171,6 +172,14 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
 			"forwarded payload exceeds the 64 KiB admin limit")
 	}
+	// Mirror decodeCreateTableRequest's NUL-byte guard: goccy/go-json
+	// treats raw NUL as end-of-input so dec.More() would otherwise
+	// miss `{"name":"users"}\x00{"extra":1}` payloads. Codex P2 on
+	// PR #635 flagged this as the same smuggling vector that the
+	// HTTP create path already covers.
+	if bytes.IndexByte(payload, 0) >= 0 {
+		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload contains a NUL byte")
+	}
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
 	var body struct {
@@ -184,6 +193,14 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 	}
 	if body.Name == "" {
 		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload missing name")
+	}
+	// Reject slash-bearing names symmetrically with the HTTP
+	// handleDelete and handleDescribe paths. Without this, a
+	// forwarded call could act on `foo/bar` while a leader-direct
+	// call would 404 — divergent behaviour Codex P2 flagged on
+	// PR #635.
+	if strings.ContainsRune(body.Name, '/') {
+		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload name must not contain '/'")
 	}
 	if err := s.source.AdminDeleteTable(ctx, principal, body.Name); err != nil {
 		return forwardErrorResponse(err), nil
