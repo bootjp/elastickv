@@ -101,8 +101,29 @@ var (
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 	raftSqsMap           = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
-	adminTokenFile       = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
-	adminInsecureNoAuth  = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	// Admin gRPC service flags (this PR — wired into the per-group raft
+	// listeners; consumed by cmd/elastickv-admin via the bearer-token
+	// gateway). These are independent of the admin HTTP listener flags
+	// below — both can be enabled simultaneously, and operators can pick
+	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
+	// SigV4 access keys).
+	adminTokenFile      = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
+	adminInsecureNoAuth = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+
+	// Admin HTTP listener flags (PR #545's parallel work merged into
+	// main; serves the cookie/SigV4-authenticated admin dashboard).
+	adminEnabled                       = flag.Bool("adminEnabled", false, "Enable the admin HTTP listener")
+	adminListen                        = flag.String("adminListen", "127.0.0.1:8080", "host:port for the admin HTTP listener (loopback by default)")
+	adminTLSCertFile                   = flag.String("adminTLSCertFile", "", "PEM-encoded TLS certificate for the admin listener")
+	adminTLSKeyFile                    = flag.String("adminTLSKeyFile", "", "PEM-encoded TLS private key for the admin listener")
+	adminAllowPlaintextNonLoopback     = flag.Bool("adminAllowPlaintextNonLoopback", false, "Allow the admin listener to bind a non-loopback address without TLS (strongly discouraged)")
+	adminAllowInsecureDevCookie        = flag.Bool("adminAllowInsecureDevCookie", false, "Mint admin cookies without the Secure attribute (local plaintext dev only)")
+	adminSessionSigningKey             = flag.String("adminSessionSigningKey", "", "Cluster-shared base64 HS256 key (64 bytes decoded); prefer -adminSessionSigningKeyFile / ELASTICKV_ADMIN_SESSION_SIGNING_KEY so the value does not appear in /proc/<pid>/cmdline")
+	adminSessionSigningKeyFile         = flag.String("adminSessionSigningKeyFile", "", "Path to a file containing the base64-encoded primary admin HS256 key; avoids leaking the secret via argv")
+	adminSessionSigningKeyPrevious     = flag.String("adminSessionSigningKeyPrevious", "", "Optional previous admin HS256 key accepted only for verification during rotation; prefer -adminSessionSigningKeyPreviousFile")
+	adminSessionSigningKeyPreviousFile = flag.String("adminSessionSigningKeyPreviousFile", "", "Path to a file containing the base64-encoded previous admin HS256 key used for rotation")
+	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
+	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 )
 
 const adminTokenMaxBytes = 4 << 10
@@ -287,44 +308,13 @@ func run() error {
 		return nil
 	})
 
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, runtimes, bootstrapServers)
-	if err != nil {
-		return err
-	}
-
-	runner := runtimeServerRunner{
-		ctx:             runCtx,
-		lc:              &lc,
-		eg:              eg,
-		cancel:          cancel,
-		runtimes:        runtimes,
-		shardStore:      shardStore,
-		coordinate:      coordinate,
-		distServer:      distServer,
-		adminServer:     adminServer,
-		adminGRPCOpts:   adminGRPCOpts,
-		redisAddress:    *redisAddr,
-		leaderRedis:     cfg.leaderRedis,
-		pubsubRelay:     adapter.NewRedisPubSubRelay(),
-		readTracker:     readTracker,
-		dynamoAddress:   *dynamoAddr,
-		leaderDynamo:    cfg.leaderDynamo,
-		s3Address:       *s3Addr,
-		leaderS3:        cfg.leaderS3,
-		s3Region:        *s3Region,
-		s3CredsFile:     *s3CredsFile,
-		s3PathStyleOnly: *s3PathStyleOnly,
-		sqsAddress:      *sqsAddr,
-		leaderSQS:       cfg.leaderSQS,
-		sqsRegion:       *sqsRegion,
-		sqsCredsFile:    *sqsCredsFile,
-		metricsAddress:  *metricsAddr,
-		metricsToken:    *metricsToken,
-		pprofAddress:    *pprofAddr,
-		pprofToken:      *pprofToken,
-		metricsRegistry: metricsRegistry,
-	}
-	if err := runner.start(); err != nil {
+	if err := startServers(serversInput{
+		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
+		runtimes: runtimes, bootstrapServers: bootstrapServers,
+		shardStore: shardStore, coordinate: coordinate,
+		distServer: distServer, readTracker: readTracker,
+		metricsRegistry: metricsRegistry, cfg: cfg,
+	}); err != nil {
 		return err
 	}
 
@@ -638,6 +628,72 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 // cyclomatic-complexity budget. Members are seeded from the bootstrap
 // configuration so GetClusterOverview advertises peer node addresses to the
 // admin binary's fan-out discovery path.
+// serversInput bundles the values run() passes to startServers so the
+// signature stays compact and run() stays under the cyclop budget.
+type serversInput struct {
+	ctx              context.Context
+	eg               *errgroup.Group
+	cancel           context.CancelFunc
+	lc               *net.ListenConfig
+	runtimes         []*raftGroupRuntime
+	bootstrapServers []raftengine.Server
+	shardStore       *kv.ShardStore
+	coordinate       kv.Coordinator
+	distServer       *adapter.DistributionServer
+	readTracker      *kv.ActiveTimestampTracker
+	metricsRegistry  *monitoring.Registry
+	cfg              runtimeConfig
+}
+
+// startServers wires up the AdminServer, builds the runtime runner, and
+// kicks off both the per-group raft listeners and the admin HTTP listener.
+// Extracted from run() to keep cyclomatic complexity within budget.
+func startServers(in serversInput) error {
+	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers)
+	if err != nil {
+		return err
+	}
+	runner := runtimeServerRunner{
+		ctx:             in.ctx,
+		lc:              in.lc,
+		eg:              in.eg,
+		cancel:          in.cancel,
+		runtimes:        in.runtimes,
+		shardStore:      in.shardStore,
+		coordinate:      in.coordinate,
+		distServer:      in.distServer,
+		adminServer:     adminServer,
+		adminGRPCOpts:   adminGRPCOpts,
+		redisAddress:    *redisAddr,
+		leaderRedis:     in.cfg.leaderRedis,
+		pubsubRelay:     adapter.NewRedisPubSubRelay(),
+		readTracker:     in.readTracker,
+		dynamoAddress:   *dynamoAddr,
+		leaderDynamo:    in.cfg.leaderDynamo,
+		s3Address:       *s3Addr,
+		leaderS3:        in.cfg.leaderS3,
+		s3Region:        *s3Region,
+		s3CredsFile:     *s3CredsFile,
+		s3PathStyleOnly: *s3PathStyleOnly,
+		sqsAddress:      *sqsAddr,
+		leaderSQS:       in.cfg.leaderSQS,
+		sqsRegion:       *sqsRegion,
+		sqsCredsFile:    *sqsCredsFile,
+		metricsAddress:  *metricsAddr,
+		metricsToken:    *metricsToken,
+		pprofAddress:    *pprofAddr,
+		pprofToken:      *pprofToken,
+		metricsRegistry: in.metricsRegistry,
+	}
+	if err := runner.start(); err != nil {
+		return err
+	}
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes); err != nil {
+		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+	}
+	return nil
+}
+
 func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,

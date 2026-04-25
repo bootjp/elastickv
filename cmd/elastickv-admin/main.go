@@ -60,15 +60,19 @@ const (
 	// pointing at a huge file (for example a log) cannot force the admin
 	// process to allocate arbitrary memory before the bearer-token check.
 	maxTokenFileBytes = 4 << 10
-	// maxCachedClients caps the fanout's cached gRPC connections so a cluster
-	// with high node churn or a malicious discovery response cannot leak file
-	// descriptors indefinitely. Sized to cover tested cluster sizes while
-	// staying well below typical ulimits.
-	maxCachedClients = 256
 	// maxDiscoveredNodes bounds the member list returned by a peer's
 	// GetClusterOverview so a malicious or misconfigured node cannot force
-	// the admin binary to spawn unbounded goroutines / gRPC calls.
+	// the admin binary to spawn unbounded goroutines / gRPC calls. A single
+	// /api/cluster/overview fan-out dials every discovered node; the
+	// per-conn cache is sized to match so a healthy cluster-wide query
+	// reuses connections instead of thrashing the LRU.
 	maxDiscoveredNodes = 512
+	// maxCachedClients caps the fanout's cached gRPC connections so a
+	// cluster with high node churn or a malicious discovery response
+	// cannot leak file descriptors indefinitely. Equal to
+	// maxDiscoveredNodes so a single overview fan-out fits without
+	// eviction churn; still well below typical ulimits.
+	maxCachedClients = maxDiscoveredNodes
 )
 
 var (
@@ -413,20 +417,38 @@ func (f *fanout) Close() {
 // global mutex for that wall-clock time would serialize concurrent
 // clientFor calls for distinct addrs.
 func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
+	if c, release, err, ok := f.cacheLookup(addr); ok {
+		return c, release, err
+	}
+	conn, err := f.dialDeduped(addr)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return f.installOrAttach(addr, conn)
+}
+
+// cacheLookup returns (client, release, err, true) when either the cache hit
+// or the fanout-closed branch fires; the caller can short-circuit. Returns
+// (_,_,_,false) when the caller still needs to dial.
+func (f *fanout) cacheLookup(addr string) (*nodeClient, func(), error, bool) {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
-		return nil, func() {}, errFanoutClosed
+		return nil, func() {}, errFanoutClosed, true
 	}
 	if c, ok := f.clients[addr]; ok {
 		c.refcount++
 		release := f.releaseFunc(c)
 		f.mu.Unlock()
-		return c, release, nil
+		return c, release, nil, true
 	}
 	f.mu.Unlock()
+	return nil, nil, nil, false
+}
 
-	// Collapse concurrent first-time dials for the same addr.
+// dialDeduped runs grpc.NewClient inside the dialGroup singleflight so
+// concurrent first-time dials for addr collapse to one conn.
+func (f *fanout) dialDeduped(addr string) (*grpc.ClientConn, error) {
 	v, err, _ := f.dialGroup.Do(addr, func() (any, error) {
 		return grpc.NewClient(
 			addr,
@@ -435,26 +457,41 @@ func (f *fanout) clientFor(addr string) (*nodeClient, func(), error) {
 		)
 	})
 	if err != nil {
-		return nil, func() {}, errors.Wrapf(err, "dial %s", addr)
+		return nil, errors.Wrapf(err, "dial %s", addr)
 	}
 	conn, ok := v.(*grpc.ClientConn)
 	if !ok {
-		return nil, func() {}, fmt.Errorf("dial %s: unexpected singleflight value type %T", addr, v)
+		return nil, fmt.Errorf("dial %s: unexpected singleflight value type %T", addr, v)
 	}
+	return conn, nil
+}
 
+// installOrAttach installs the just-dialed conn into the cache or, if a
+// concurrent waiter beat us to it, takes a lease on the existing entry and
+// closes the orphaned conn (when its pointer differs from the cached entry).
+func (f *fanout) installOrAttach(addr string, conn *grpc.ClientConn) (*nodeClient, func(), error) {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		_ = conn.Close()
 		return nil, func() {}, errFanoutClosed
 	}
-	// If another waiter on the same singleflight already installed the cache
-	// entry, take a lease on it. (Singleflight returns the same conn to all
-	// waiters, but only the first one runs the install path below.)
+	// If another waiter already installed a cache entry, take a lease on it.
+	// Two cases: (a) singleflight collapsed concurrent dials so the cached
+	// entry's conn IS this conn (same pointer) — must NOT Close it because
+	// the cache holds the only reference; (b) a non-concurrent earlier dial
+	// installed a different conn before our Do call — our just-dialed conn
+	// is orphaned and must be closed to avoid leaking fds/goroutines.
 	if c, ok := f.clients[addr]; ok {
 		c.refcount++
 		release := f.releaseFunc(c)
+		shouldClose := c.conn != conn
 		f.mu.Unlock()
+		if shouldClose {
+			if err := conn.Close(); err != nil {
+				log.Printf("elastickv-admin: close orphaned dial for %s: %v", addr, err)
+			}
+		}
 		return c, release, nil
 	}
 	var evicted *grpc.ClientConn
@@ -776,12 +813,18 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": results})
 }
 
-// maxResponseBodyBytes caps writeJSON's encode buffer. With fan-out across at
-// most maxDiscoveredNodes=512 nodes returning a small GetClusterOverview proto
-// each, real responses sit in the low MiBs; this cap (16 MiB) leaves plenty
-// of headroom while preventing a misbehaving node from forcing unbounded
-// memory growth in the admin process.
-const maxResponseBodyBytes = 16 << 20
+// maxResponseBodyBytes caps writeJSON's encode buffer. Worst-case sizing:
+// fan-out hits at most maxDiscoveredNodes (=512) nodes, each returning a
+// GetClusterOverview proto. The proto is dominated by the members list
+// (≤maxDiscoveredNodes entries × ~few-hundred bytes each) plus the group
+// leaders map (one entry per Raft group; clusters carry tens, not hundreds),
+// so the per-node JSON is bounded around ~150 KiB and the aggregated body is
+// bounded around 75 MiB even before deduplication. The 32 MiB cap below
+// covers the typical response and still rejects a clearly oversized one;
+// operators running clusters where the overview legitimately exceeds this
+// can raise the constant. Keep this aligned with handleOverview's fan-out
+// cap so a misbehaving node cannot force unbounded memory growth.
+const maxResponseBodyBytes = 32 << 20
 
 // writeJSONBufferPool reuses encode buffers across requests so a steady stream
 // of /api/* calls doesn't churn the heap with per-request allocations. The

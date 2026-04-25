@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	storedRedisHashProtoPrefix   = []byte{0x00, 'R', 'H', 0x01}
-	storedRedisSetProtoPrefix    = []byte{0x00, 'R', 'S', 0x01}
-	storedRedisZSetProtoPrefix   = []byte{0x00, 'R', 'Z', 0x01}
-	storedRedisStreamProtoPrefix = []byte{0x00, 'R', 'X', 0x01}
-	storedRedisMarshalOptions    = gproto.MarshalOptions{Deterministic: true}
+	storedRedisHashProtoPrefix        = []byte{0x00, 'R', 'H', 0x01}
+	storedRedisSetProtoPrefix         = []byte{0x00, 'R', 'S', 0x01}
+	storedRedisZSetProtoPrefix        = []byte{0x00, 'R', 'Z', 0x01}
+	storedRedisStreamProtoPrefix      = []byte{0x00, 'R', 'X', 0x01}
+	storedRedisStreamEntryProtoPrefix = []byte{0x00, 'R', 'X', 'E', 0x01}
+	storedRedisMarshalOptions         = gproto.MarshalOptions{Deterministic: true}
 
 	errStoredRedisMessageTooLarge    = errors.New("stored redis message too large")
 	errUnrecognizedStoredRedisFormat = errors.New("unrecognized stored redis format")
@@ -99,6 +100,36 @@ func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
 		return redisStreamValue{}, errors.WithStack(err)
 	}
 	return redisStreamValueFromProto(msg), nil
+}
+
+// marshalStreamEntry encodes a single stream entry for the entry-per-key
+// layout. The per-entry ID is authoritatively encoded in the storage key;
+// we also serialize it into the value so unmarshalStreamEntry can return
+// a fully-formed entry without having to parse the key back. Fields are
+// serialized into the value as well. The ID duplication costs ~16 bytes
+// per entry and is worth the absence of key-parsing plumbing at every
+// caller (XREAD, XRANGE, XREVRANGE, Lua streamState).
+func marshalStreamEntry(entry redisStreamEntry) ([]byte, error) {
+	return marshalStoredRedisMessage(storedRedisStreamEntryProtoPrefix, &pb.RedisStreamEntry{
+		Id:     entry.ID,
+		Fields: cloneStringSlice(entry.Fields),
+	})
+}
+
+// unmarshalStreamEntry is the inverse of marshalStreamEntry. The caller
+// supplies the raw value bytes loaded from an entry key.
+func unmarshalStreamEntry(raw []byte) (redisStreamEntry, error) {
+	if len(raw) == 0 {
+		return redisStreamEntry{}, errUnrecognizedStoredRedisFormat
+	}
+	if !hasStoredRedisPrefix(raw, storedRedisStreamEntryProtoPrefix) {
+		return redisStreamEntry{}, errUnrecognizedStoredRedisFormat
+	}
+	msg := &pb.RedisStreamEntry{}
+	if err := gproto.Unmarshal(raw[len(storedRedisStreamEntryProtoPrefix):], msg); err != nil {
+		return redisStreamEntry{}, errors.WithStack(err)
+	}
+	return newRedisStreamEntry(msg.GetId(), cloneStringSlice(msg.GetFields())), nil
 }
 
 func marshalStoredRedisMessage(prefix []byte, msg gproto.Message) ([]byte, error) {

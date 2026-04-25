@@ -92,6 +92,13 @@ var redisInternalPrefixes = []string{
 	redisHLLPrefix,
 	redisZSetPrefix,
 	redisStreamPrefix,
+	// New entry-per-key stream layout. The meta prefix is included so
+	// bounded pattern scans (KEYS foo*) can locate migrated streams via
+	// their meta records; the entry prefix is *not* listed here because
+	// every meta maps to one logical key, whereas a single stream can
+	// have millions of entries — we expose each stream once, via its
+	// meta, to avoid exploding the KEYS output.
+	store.StreamMetaPrefix,
 }
 
 const (
@@ -170,6 +177,12 @@ func redisZSetKey(userKey []byte) []byte {
 	return append([]byte(redisZSetPrefix), userKey...)
 }
 
+// redisStreamKey is the legacy single-blob stream key. New writes use the
+// entry-per-key layout under store.StreamMetaKey / store.StreamEntryKey.
+// This helper survives only to keep the dual-read migration path working.
+//
+// Deprecated: remove once elastickv_stream_legacy_format_reads_total stays
+// at zero for long enough to guarantee no in-flight legacy streams exist.
 func redisStreamKey(userKey []byte) []byte {
 	return append([]byte(redisStreamPrefix), userKey...)
 }
@@ -196,6 +209,13 @@ func isRedisTTLKey(key []byte) bool {
 // knownInternalPrefixes lists all key namespace prefixes used by internal
 // subsystems. Keys matching any of these prefixes are never legacy Redis
 // string keys and must be preserved by migration operations.
+//
+// The stream namespace lists its two concrete prefixes (!stream|meta| and
+// !stream|entry|) rather than the !stream| umbrella, because a user key
+// like "!stream|foo" — entirely legitimate from a Redis-protocol standpoint
+// — is NOT internal and must continue to flow through redisStrKey() in
+// txnContext.load. A blanket !stream| prefix would misclassify such keys
+// and either return missing data or write into the internal namespace.
 var knownInternalPrefixes = [][]byte{
 	[]byte("!redis|"),
 	[]byte("!lst|"),
@@ -206,6 +226,8 @@ var knownInternalPrefixes = [][]byte{
 	[]byte("!zs|"),
 	[]byte("!hs|"),
 	[]byte("!st|"),
+	[]byte(store.StreamMetaPrefix),
+	[]byte(store.StreamEntryPrefix),
 }
 
 func isKnownInternalKey(key []byte) bool {
@@ -220,21 +242,53 @@ func isKnownInternalKey(key []byte) bool {
 	return false
 }
 
+// redisInternalTrimPrefixes is the fixed ordered list of plain-prefix
+// internal namespaces whose logical user key is just the bytes after the
+// prefix. It's used by extractRedisInternalUserKey to keep the cyclomatic
+// complexity below the package cap; the extra table indirection costs
+// nothing because every entry is a string constant.
+var redisInternalTrimPrefixes = []string{
+	redisStrPrefix,
+	redisHashPrefix,
+	redisSetPrefix,
+	redisZSetPrefix,
+	redisHLLPrefix,
+	redisStreamPrefix,
+}
+
+// redisInternalTrimPrefixBytes is a pre-allocated [][]byte mirror of
+// redisInternalTrimPrefixes so extractRedisInternalUserKey does not
+// allocate a new []byte on every call.
+var redisInternalTrimPrefixBytes = func() [][]byte {
+	out := make([][]byte, len(redisInternalTrimPrefixes))
+	for i, s := range redisInternalTrimPrefixes {
+		out[i] = []byte(s)
+	}
+	return out
+}()
+
+// redisTTLPrefixBytes is the pre-allocated []byte form of redisTTLPrefix.
+var redisTTLPrefixBytes = []byte(redisTTLPrefix)
+
 func extractRedisInternalUserKey(key []byte) []byte {
+	for _, prefix := range redisInternalTrimPrefixBytes {
+		if bytes.HasPrefix(key, prefix) {
+			return bytes.TrimPrefix(key, prefix)
+		}
+	}
+	// Post-migration streams: both meta and entry keys reverse-map to the
+	// logical user key so coordinator routing (doGetAt) and retryable-error
+	// normalization (normalizeRetryableRedisTxnKey) resolve to the correct
+	// stream. KEYS/SCAN visibility is separately gated by
+	// streamWideColumnVisibleUserKey which returns (nil, true) for entry
+	// keys, so this path is never reached from the key-enumeration code.
+	// redisTTLPrefix is internal-only.
 	switch {
-	case bytes.HasPrefix(key, []byte(redisStrPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisStrPrefix))
-	case bytes.HasPrefix(key, []byte(redisHashPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisHashPrefix))
-	case bytes.HasPrefix(key, []byte(redisSetPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisSetPrefix))
-	case bytes.HasPrefix(key, []byte(redisZSetPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisZSetPrefix))
-	case bytes.HasPrefix(key, []byte(redisHLLPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisHLLPrefix))
-	case bytes.HasPrefix(key, []byte(redisStreamPrefix)):
-		return bytes.TrimPrefix(key, []byte(redisStreamPrefix))
-	case bytes.HasPrefix(key, []byte(redisTTLPrefix)):
+	case store.IsStreamMetaKey(key):
+		return store.ExtractStreamUserKeyFromMeta(key)
+	case store.IsStreamEntryKey(key):
+		return store.ExtractStreamUserKeyFromEntry(key)
+	case bytes.HasPrefix(key, redisTTLPrefixBytes):
 		return nil
 	default:
 		return nil
