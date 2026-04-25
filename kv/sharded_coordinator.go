@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -135,6 +136,12 @@ type ShardedCoordinator struct {
 	// leaseObserver records lease-read hit/miss for every shard the
 	// coordinator owns. Nil-safe; see Coordinate.leaseObserver.
 	leaseObserver LeaseReadObserver
+	// sampler counts requests per RouteID for the key visualizer
+	// heatmap. Nil-safe at the call site; the implementation
+	// (keyviz.MemSampler) also tolerates a typed-nil receiver, so a
+	// disabled keyviz wires through to a no-op without branching on
+	// the hot path.
+	sampler keyviz.Sampler
 }
 
 // WithLeaseReadObserver wires a LeaseReadObserver onto a
@@ -145,6 +152,22 @@ type ShardedCoordinator struct {
 // rationale.
 func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
 	c.leaseObserver = normalizeLeaseObserver(observer)
+	return c
+}
+
+// WithSampler wires a keyviz.Sampler onto a ShardedCoordinator. The
+// coordinator calls sampler.Observe at dispatch entry — once per
+// resolved (RouteID, mutation key) pair — to feed the key visualizer
+// heatmap (design doc §5.1). Applied after construction for the same
+// reason as WithLeaseReadObserver: NewShardedCoordinator is already
+// heavily overloaded.
+//
+// Passing a nil interface value is supported and disables sampling
+// (the call site guards against it). Passing a typed-nil
+// *keyviz.MemSampler also works because Observe is nil-safe by
+// contract.
+func (c *ShardedCoordinator) WithSampler(s keyviz.Sampler) *ShardedCoordinator {
+	c.sampler = s
 	return c
 }
 
@@ -952,6 +975,20 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }
 
+// observeMutation records a single dispatched mutation with the
+// keyviz sampler, if one is wired. All operations reaching this
+// point are writes (Put, Del); reads are served outside Dispatch via
+// the lease-read / linearizable-read paths.
+//
+// Nil-safe: a nil-interface c.sampler skips with a single branch,
+// keeping the dispatch loop allocation-free when keyviz is disabled.
+func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
+	if c.sampler == nil {
+		return
+	}
+	c.sampler.Observe(routeID, keyviz.OpWrite, len(mut.Key), len(mut.Value))
+}
+
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
 	grouped := make(map[uint64][]*pb.Mutation)
 	for _, req := range reqs {
@@ -963,6 +1000,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
+		c.observeMutation(route.RouteID, mut)
 		grouped[route.GroupID] = append(grouped[route.GroupID], mut)
 	}
 	gids := make([]uint64, 0, len(grouped))
