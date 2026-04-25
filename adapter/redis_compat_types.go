@@ -209,6 +209,13 @@ func isRedisTTLKey(key []byte) bool {
 // knownInternalPrefixes lists all key namespace prefixes used by internal
 // subsystems. Keys matching any of these prefixes are never legacy Redis
 // string keys and must be preserved by migration operations.
+//
+// The stream namespace lists its two concrete prefixes (!stream|meta| and
+// !stream|entry|) rather than the !stream| umbrella, because a user key
+// like "!stream|foo" — entirely legitimate from a Redis-protocol standpoint
+// — is NOT internal and must continue to flow through redisStrKey() in
+// txnContext.load. A blanket !stream| prefix would misclassify such keys
+// and either return missing data or write into the internal namespace.
 var knownInternalPrefixes = [][]byte{
 	[]byte("!redis|"),
 	[]byte("!lst|"),
@@ -219,7 +226,8 @@ var knownInternalPrefixes = [][]byte{
 	[]byte("!zs|"),
 	[]byte("!hs|"),
 	[]byte("!st|"),
-	[]byte("!stream|"),
+	[]byte(store.StreamMetaPrefix),
+	[]byte(store.StreamEntryPrefix),
 }
 
 func isKnownInternalKey(key []byte) bool {

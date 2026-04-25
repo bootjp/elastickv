@@ -725,3 +725,41 @@ func TestRedis_StreamMultiExecDelHonoursDispatchTimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(0), xlen)
 }
+
+// TestRedis_UserKeyShadowingStreamPrefixSurvivesMultiExec exercises the
+// Codex P2 fix: a user key like "!stream|foo" is *not* in the internal
+// stream namespace (only !stream|meta| / !stream|entry| are). Before
+// the fix, the `!stream|` umbrella in knownInternalPrefixes made
+// txnContext.load skip the redisStrKey() wrapper and reach for the bare
+// !stream|foo key — causing MULTI/EXEC SET to write into the internal
+// namespace and the subsequent GET to either miss the data or surface
+// internal bytes. After the fix, SET/GET roundtrip cleanly.
+func TestRedis_UserKeyShadowingStreamPrefixSurvivesMultiExec(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	const shadowKey = "!stream|foo"
+	pipe := rdb.TxPipeline()
+	pipe.Set(ctx, shadowKey, "user-value", 0)
+	pipe.Get(ctx, shadowKey)
+	cmds, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Len(t, cmds, 2)
+
+	getCmd, ok := cmds[1].(*redis.StringCmd)
+	require.True(t, ok, "second command should be *redis.StringCmd, got %T", cmds[1])
+	got, err := getCmd.Result()
+	require.NoError(t, err)
+	require.Equal(t, "user-value", got)
+
+	// Outside MULTI/EXEC the same key must continue to behave as a
+	// normal user string key.
+	plain, err := rdb.Get(ctx, shadowKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, "user-value", plain)
+}

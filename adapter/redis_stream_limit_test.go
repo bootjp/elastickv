@@ -267,3 +267,40 @@ func TestIsXReadIterCtxError(t *testing.T) {
 		})
 	}
 }
+
+// TestIsKnownInternalKey_StreamPrefixNarrowed guards Codex P2: the stream
+// internal namespace must list its two concrete prefixes (!stream|meta|
+// and !stream|entry|) rather than the !stream| umbrella, so a user key
+// such as "!stream|foo" continues to flow through redisStrKey() in
+// txnContext.load instead of being misclassified as an internal key.
+func TestIsKnownInternalKey_StreamPrefixNarrowed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		key  []byte
+		want bool
+	}{
+		// True internal stream keys: classified as internal.
+		{"stream meta key is internal", []byte("!stream|meta|\x00\x00\x00\x03foo"), true},
+		{"stream entry key is internal", []byte("!stream|entry|\x00\x00\x00\x03foo\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00"), true},
+		// User keys that happen to start with "!stream|" must NOT be
+		// classified as internal — they need redisStrKey() namespacing.
+		{"user key !stream|foo is NOT internal", []byte("!stream|foo"), false},
+		{"user key !stream|metadata is NOT internal", []byte("!stream|metadata"), false},
+		{"user key !stream|entryless is NOT internal", []byte("!stream|entryless"), false},
+		// Sanity: other internal namespaces still classify correctly.
+		{"!redis| is internal", []byte("!redis|str|foo"), true},
+		{"!hs| is internal", []byte("!hs|fld|foo"), true},
+		// And bare user keys are not internal.
+		{"plain user key", []byte("hello"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isKnownInternalKey(tc.key); got != tc.want {
+				t.Fatalf("isKnownInternalKey(%q) = %v, want %v", tc.key, got, tc.want)
+			}
+		})
+	}
+}
