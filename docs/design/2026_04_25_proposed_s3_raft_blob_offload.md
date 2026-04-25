@@ -133,7 +133,8 @@ client ─► HTTP PUT body
         ─► chunk loop (s3ChunkSize):
              1. compute SHA-256 of chunk
              2. write chunk to LOCAL Pebble at !s3|chunkblob|<SHA>
-             3. queue ChunkRef into pendingBatch
+             3. *** synchronously replicate to ≥ chunkBlobMinReplicas peers ***
+             4. queue ChunkRef into pendingBatch
         ─► flushBatch:
              coordinator.Dispatch(OperationGroup{
                  Elems: [ chunkref Puts ... + manifest Put ],
@@ -141,17 +142,47 @@ client ─► HTTP PUT body
         ─► HTTP 200 OK once Dispatch acks
 ```
 
-The order matters: the chunk *must* be persisted in local Pebble
-before its `chunkref` is committed through Raft, otherwise a
-follower that applies the `chunkref` and immediately re-fetches
-might race the leader's local write. Pebble's WAL fsync gives the
-ordering guarantee; the chunk write returns only after the data is
-durable.
+Step 3 — synchronous chunkblob replication before the chunkref
+commit — is the difference between "Raft-equivalent durability"
+and "leader-only durability." Without it, a leader crash between
+the chunkref commit and the eventual async fetch would leave a
+committed manifest pointing at a chunkblob nobody else has — Raft's
+quorum guarantees the chunkref but tells you nothing about the
+blob payload. We close that gap by treating the chunkblob like a
+mini-Raft entry of its own with **semi-synchronous quorum**:
+
+1. Leader writes the chunkblob to local Pebble (fsync).
+2. Leader pushes the chunkblob to `chunkBlobMinReplicas - 1`
+   followers via the `S3BlobFetch.PushChunkBlob` RPC and waits for
+   each follower's "fsync ack." (`PushChunkBlob` is the leader-
+   initiated counterpart to the follower-initiated `FetchChunkBlob`
+   defined in §3.6.)
+3. Only after the chunkblob is durable on a quorum of nodes does
+   the leader propose the chunkref through Raft.
+
+`chunkBlobMinReplicas` defaults to **2** on a 3-node cluster (= a
+quorum of 2 includes the leader and one follower). For larger
+clusters the floor is `(N/2)+1` to match Raft's quorum size; the
+operator can opt into N for stronger-than-Raft durability. A
+follower that crashes after acking the push but before the chunkref
+commits is fine — the chunkref will be retried by the leader on the
+next attempt because it has not yet entered the Raft log.
+
+The trade-off is PUT latency: a PUT now blocks on
+`chunkBlobMinReplicas - 1` follower fsyncs in addition to the Raft
+quorum write of the chunkref. Empirically the chunkblob fsync is
+the dominant cost (1 MiB write, ~5–10 ms on consumer SSD), so PUT
+p99 is roughly equivalent to today's "every byte through Raft"
+latency — we are paying the same fsync cost, just to a different
+keyspace.
 
 The `chunkref` keys are < 100 B each. A 1 GiB PUT generates 1024
 of them = ~100 KiB of Raft log payload. Compared with today's
 1 GiB through Raft, that is a **10⁴× reduction** in Raft log
-write amplification.
+write amplification — even with semi-synchronous chunkblob
+replication, the Raft log itself is unaffected by chunk size, so
+log replay time, snapshot transfer, and follower catch-up still
+collapse to O(manifest count).
 
 ### 3.3 Follower apply path
 
@@ -218,13 +249,24 @@ at the same conclusion.
 
 ### 3.6 Fetch protocol
 
-A new gRPC method on the existing internal raft transport service:
+Two RPCs on the existing internal raft transport service — one
+follower-initiated (lazy fetch on miss), one leader-initiated
+(synchronous replication before chunkref commit, see §3.2 step 3):
 
 ```protobuf
 service S3BlobFetch {
   // FetchChunkBlob returns the bytes of a chunkblob this peer holds
-  // locally. Caller must verify SHA-256.
+  // locally. Caller must verify SHA-256. Used by followers on the
+  // proxy-on-miss GET path (§3.3) and during snapshot catch-up.
   rpc FetchChunkBlob(FetchChunkBlobRequest) returns (stream FetchChunkBlobResponse);
+
+  // PushChunkBlob streams a chunkblob from the leader to a follower
+  // and acks once the bytes are durable in the receiver's Pebble.
+  // Used by §3.2 step 3 to make chunkblob writes survive a leader
+  // crash without depending on the async fetch path catching up.
+  // The receiver SHOULD verify SHA-256 against the request header
+  // before fsync; mismatch fails the RPC and the leader retries.
+  rpc PushChunkBlob(stream PushChunkBlobRequest) returns (PushChunkBlobResponse);
 }
 
 message FetchChunkBlobRequest {
@@ -234,6 +276,16 @@ message FetchChunkBlobRequest {
 message FetchChunkBlobResponse {
   bytes  payload = 1;
   bool   eof     = 2;
+}
+
+message PushChunkBlobRequest {
+  bytes  content_sha256 = 1; // sent in the first frame only
+  bytes  payload        = 2;
+  bool   eof            = 3;
+}
+
+message PushChunkBlobResponse {
+  bool   durable        = 1; // true == fsynced
 }
 ```
 
@@ -250,15 +302,68 @@ handles large payloads.
 The legacy `BlobKey` path remains available. New PUTs use the
 offload path when `ELASTICKV_S3_BLOB_OFFLOAD=true`; existing data
 keeps reading through the legacy `BlobKey` path until a background
-migrator (separate proposal) rewrites it. Mixed clusters work
-because both keyspaces are namespaced.
+migrator (separate proposal) rewrites it. Mixed keyspace coexistence
+works because `!s3|chunkblob|*` and the legacy
+`!s3|blob|<bucket>|<gen>|...` namespaces are disjoint.
 
 The opt-in flag stays for at least one full release cycle so we can
 revert by flipping a single env var if any of the following surface:
 
 - a SHA-256 collision (~zero probability but a hard kill criterion),
 - a follower fetch storm overwhelming peer-to-peer bandwidth,
-- a GC bug that leaks reachable blobs.
+- a GC bug that leaks reachable blobs,
+- semi-synchronous `PushChunkBlob` latency exceeding the legacy
+  PUT p99 by an unacceptable margin (the soak-test acceptance
+  criterion in §5).
+
+### 3.8 Mixed-version cluster behaviour
+
+Until *every* node in the cluster speaks the offload protocol, PUTs
+on the offload path cannot proceed safely: a node that does not
+implement `PushChunkBlob` cannot ack a quorum write, and a follower
+that does not implement `FetchChunkBlob` cannot resolve a chunkref
+on apply. We therefore gate the offload path on cluster-level
+feature negotiation rather than a single env var:
+
+- A node advertises offload capability by setting
+  `feature_s3_blob_offload=true` in the `AdminServer.GetClusterOverview`
+  response (alongside the existing role / version metadata).
+- The leader inspects every peer's advertised capabilities at PUT
+  admission time. If any peer is missing the capability, the PUT
+  falls back to the legacy `BlobKey` path for that request — even
+  if the leader has the env var enabled.
+- During an upgrade window the leader continues to emit legacy
+  writes; once the last peer rolls and re-advertises, subsequent
+  PUTs flip to offload automatically. A roll-back works the same
+  way in reverse: the first downgraded peer drops its capability
+  flag and the leader resumes legacy emission within the next
+  capability-refresh interval (default 30 s).
+- Reads always succeed regardless of mixed state, because both
+  keyspaces are namespaced and the GET path checks legacy then
+  offload (or vice-versa) and serves whichever resolves.
+
+This gives operators a **strict two-step rolling upgrade** with no
+PUT data path that depends on a half-upgraded cluster:
+
+1. Roll out the new binary with `ELASTICKV_S3_BLOB_OFFLOAD=false`
+   on every node. PUTs continue on the legacy path. Validate
+   stability for a soak window (24 h on the canary cluster in
+   §5's M0 acceptance criteria).
+2. Flip `ELASTICKV_S3_BLOB_OFFLOAD=true` on the leader, then on
+   followers. Once every node advertises capability, PUTs switch
+   to the offload path.
+
+Roll-back: flip the env var to `false` on any node; the leader's
+capability check sees the disagreement and falls back to legacy
+within ≤ refresh interval. The migrator (M4) is independently
+gated and never runs during a roll-back window.
+
+A node with `ELASTICKV_S3_BLOB_OFFLOAD=true` running against a
+cluster where offload is disabled (e.g. a stuck rollout) is safe
+— it advertises capability but the leader's per-PUT capability
+check sees other peers missing it and routes through legacy. No
+data is written into the offload keyspace until a quorum of
+capability-advertising peers exists.
 
 ## 4. Interaction with related subsystems
 
@@ -316,12 +421,17 @@ Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=
 - **SHA-256 collision.** Operationally improbable; shipped with a
   metric (`s3_chunkblob_sha_mismatch_total`) and a hard-fail option
   for paranoid operators.
-- **Local-blob-only on a single node.** If only one node has a
-  given chunkblob and that node fails before peers fetch it, data
-  is lost. Mitigation: PUT path replicates the chunkblob to *N*
-  peers asynchronously before returning 200 (e.g. quorum write
-  outside of Raft). N defaults to 2 (one extra copy = parity with
-  Raft's quorum durability).
+- **Leader-only durability before chunkref commit.** Without
+  intervention, a leader crash between writing the chunkblob to its
+  own Pebble and the eventual async fetch on followers would leave
+  a Raft-committed chunkref pointing at a chunkblob no surviving
+  node has. Mitigation: §3.2 step 3 — synchronous semi-quorum
+  replication via `PushChunkBlob` before the chunkref enters Raft.
+  `chunkBlobMinReplicas` defaults to a Raft-quorum-equivalent
+  floor; operators who want N-way durability bump it explicitly.
+  This restores end-to-end durability parity with the legacy
+  "every byte through Raft" path at the cost of one extra fsync
+  per chunkblob on the followers in the quorum.
 - **Cross-tenant blob fetch via SHA-256 guessing.** Because
   `chunkblob` keys are SHA-256-addressed, *if* a malicious tenant
   could (a) guess a victim tenant's chunk SHA and (b) bypass

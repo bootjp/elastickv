@@ -182,12 +182,54 @@ func (a *putAdmission) reserve(ctx context.Context, bytes int64) (func(), error)
    both the "request is in flight" and "this batch is buffered for
    Raft" phases.
 
-For aws-chunked transfers (`Content-Length == -1`), the request-entry
-charge falls back to a conservative `s3MaxObjectSizeBytes` (5 GiB)
-reservation. The downside is that one chunked PUT can monopolise the
-budget; the upside is correctness without re-reading headers.
-We will instrument a metric to find out empirically how large that
-hit actually is before optimising.
+### 3.3.1 aws-chunked transfers (`Content-Length: -1`)
+
+A naïve "reserve `s3MaxObjectSizeBytes` (5 GiB) up front" is rejected:
+on default tunables (`s3PutAdmissionMaxInflightBytes = 256 MiB`) a
+single chunked PUT would consume **20×** the entire budget at request
+admission time, head-of-line-blocking every other PUT until the
+chunked stream finishes — exactly the failure mode admission control
+exists to prevent. We therefore split chunked admission across two
+mechanisms instead of pre-charging:
+
+1. **Bootstrap reservation = `s3RaftEntryByteBudget` (4 MiB)** at
+   request entry. This is enough to admit the request and let the
+   awsChunkedReader produce its first decoded window. Chunked PUTs
+   are not "free" — they still must beat the same admission queue
+   as fixed-length PUTs at the per-batch level.
+2. **Pay-as-you-decode** thereafter, charged via an
+   `awsChunkedReader` progress callback. Each decoded chunk frame
+   (typically up to 64 KiB on the wire after framing overhead)
+   acquires a slot equal to the bytes about to flow into Pebble; the
+   slot is released once the corresponding `coordinator.Dispatch`
+   acks. This is the same path admission B uses for fixed-length
+   PUTs — chunked traffic just hooks into it incrementally instead of
+   pre-charging the worst case.
+
+Failure modes:
+
+- If the awsChunkedReader produces frames faster than Raft drains, the
+  per-batch acquire blocks (capped by `dispatchAdmissionTimeout`).
+  Beyond that timeout, mid-stream 503 closes the connection. The
+  legacy "reserve 5 GiB" approach would have surfaced as 503 *at
+  request entry* for unrelated PUTs; this approach surfaces as
+  mid-stream 503 for the chunked PUT itself, which is the right
+  blame attribution.
+- If the awsChunkedReader frame size ever exceeds
+  `s3RaftEntryByteBudget` (a malformed client), the per-batch acquire
+  asks for more than the cap allows and we 503 immediately — same
+  as a fixed-length PUT whose `Content-Length` exceeds the global
+  cap.
+
+This change moves chunked admission from M4 (originally "deferred
+optimisation") into M1 (the first shippable milestone). M1 ships
+with the progress-callback wired *unconditionally* for all chunked
+PUTs; an env-var switch falls back to "bootstrap-only" charging
+without the per-decode credit if a corner case requires it
+(`ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`, default
+`true`). The fallback path keeps the 5 GiB-reservation hazard
+behind an explicit operator decision rather than letting it
+materialise by default.
 
 ### 3.4 Failure mode
 
@@ -239,10 +281,37 @@ suggests bumping the cap or scaling out (more nodes spreads PUT load).
 
 | Milestone | Scope | Risk |
 |---|---|---|
-| M1 | Add `putAdmission` type + per-node singleton + `Content-Length` admission. Wire `prepareStreamingPutBody` to acquire / release. Metric scaffolding only (gauge + counter). | Low. No mid-stream cancellation yet. |
-| M2 | Per-batch admission B inside `flushBatch`. Add `dispatchAdmissionTimeout`. Mid-stream 503 with cleanup. | Medium. Cleanup path on partial failure. |
+| M1 | Add `putAdmission` type + per-node singleton + fixed-length `Content-Length` admission. Wire `prepareStreamingPutBody` to acquire / release. **aws-chunked progress-callback admission** (§3.3.1) ships in this milestone too — the conservative 5 GiB pre-charge fallback only sits behind `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`. Metric scaffolding (gauge + counter). | Medium. Chunked progress callback needs `awsChunkedReader` to expose a hook. |
+| M2 | Per-batch admission B inside `flushBatch` for fixed-length PUTs. Add `dispatchAdmissionTimeout`. Mid-stream 503 with cleanup. (Chunked PUTs already use this path through their incremental charging.) | Medium. Cleanup path on partial failure. |
 | M3 | Env-var tunables. Histogram metric. Grafana panel. | Low. |
-| M4 | aws-chunked path: emit a warn log when the conservative 5 GiB reservation kicks in, and add a follower-up to charge the actually-decoded byte count incrementally. | Medium. Needs `awsChunkedReader` to expose a progress callback. |
+| M4 | Per-tenant / per-bucket admission classes (handed off to the workload-isolation rollout). | Medium. Out-of-scope for the v1 cap. |
+
+### Rolling upgrade
+
+Admission is purely additive on the request entry path: a node
+without the cap behaves identically to a node with the cap set
+infinitely high. A mixed cluster (some nodes M1, some still on
+`main`) is therefore safe — clients hitting the upgraded node see
+admission, clients hitting an old node see no admission, but
+neither path corrupts state. The default cap is intentionally
+generous enough that even single-node M1 traffic falls below the
+threshold under typical load, so the rollout signature is
+"503 SlowDown rate goes from 0 to negligible" rather than a step
+function. Operators can pin
+`ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES=$((1<<63))` to
+disable the cap on M1 nodes during the burn-in window if desired.
+
+The aws-chunked progress-callback path is the only behaviour
+change visible to clients: a chunked PUT that would have succeeded
+under the old "no admission" code can now 503 mid-stream when Raft
+drain falls behind. This is by design — that is the failure mode
+admission control exists to surface — but operators should expect
+to see chunked-upload 503s where there were none before. The
+`stage="perbatch", protocol="chunked"` rejection-counter label
+isolates this signal; bumping the cap or
+`ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false` (with the
+HoL hazard re-introduced as a known trade-off) restores legacy
+behaviour during incident response.
 
 Acceptance criteria:
 
