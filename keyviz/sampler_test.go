@@ -686,6 +686,75 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+// TestVirtualBucketRouteIDIsSynthetic pins Codex round-11 P2: a
+// virtual bucket must not stamp itself with a real route ID, or that
+// real ID could later show up on TWO rows in the same column —
+// once aggregate, once individual — when the original folded route
+// is later re-registered as an individual slot.
+func TestVirtualBucketRouteIDIsSynthetic(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 1,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 should fold into a fresh virtual bucket")
+	}
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+
+	rows := lastSnapshotColumn(t, s).Rows
+	agg := findAggregateRow(t, rows)
+	if agg.RouteID == 2 {
+		t.Fatalf("aggregate bucket reused real RouteID 2 — synthetic ID space required: %v", agg)
+	}
+	for _, r := range rows {
+		if !r.Aggregate && r.RouteID == agg.RouteID {
+			t.Fatalf("real RouteID %d collided with aggregate row %v", r.RouteID, agg)
+		}
+	}
+}
+
+// TestRejoinAsIndividualLetsBucketPruneFire pins Codex round-11 P2:
+// when a removed virtual member rejoins as an individual slot (capacity
+// freed up), the deferred member-prune for the old bucket must still
+// execute — otherwise the bucket's MemberRoutes keeps a route that no
+// longer contributes traffic to it.
+func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 2,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	mustRegister(t, s, 2, "m", "n")
+	if s.RegisterRoute(3, []byte("y"), []byte("z")) {
+		t.Fatal("route 3 over budget should fold")
+	}
+	// Free capacity: remove route 2 (now slots have room) AND remove 3
+	// (queued in pendingPrunes). Re-register 3 — it now fits as an
+	// individual slot, so the old bucket should still get pruned.
+	s.RemoveRoute(3)
+	s.RemoveRoute(2)
+	if !s.RegisterRoute(3, []byte("y"), []byte("z")) {
+		t.Fatal("route 3 should now fit as individual slot")
+	}
+
+	clk.Advance(s.graceWindow() + time.Second)
+	s.Observe(3, OpRead, 0, 0)
+	s.Flush()
+
+	rows := lastSnapshotColumn(t, s).Rows
+	for _, r := range rows {
+		if r.Aggregate && memberRoutesContain(r.MemberRoutes, 3) {
+			t.Fatalf("after rejoin-as-individual + grace, bucket still lists route 3: %+v", r)
+		}
+	}
+}
+
 // TestReRegisterDuringPruneGraceCancelsPrune pins Codex round-9 P2:
 // a virtual-member route that gets removed and re-registered inside
 // the prune grace window must not have its routeID stripped from

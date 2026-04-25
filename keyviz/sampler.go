@@ -135,6 +135,14 @@ type MemSampler struct {
 	retiredMu     sync.Mutex
 	retiredSlots  []retiredSlot
 	pendingPrunes []memberPrune
+
+	// virtualIDCounter hands out synthetic RouteIDs for new virtual
+	// buckets, starting at MaxUint64 and decrementing. The synthetic
+	// space cannot collide with real route IDs (which the coordinator
+	// assigns from the low end), so a real RouteID can never appear
+	// twice in the same column — once as an aggregate row, once as
+	// an individual row — even under register/remove churn.
+	virtualIDCounter atomic.Uint64
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
@@ -317,23 +325,23 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 			return
 		}
 	}
-	bytes := uint64(0)
+	byteCount := uint64(0)
 	if keyLen > 0 {
-		bytes += uint64(keyLen)
+		byteCount += uint64(keyLen)
 	}
 	if valueLen > 0 {
-		bytes += uint64(valueLen)
+		byteCount += uint64(valueLen)
 	}
 	switch op {
 	case OpRead:
 		slot.reads.Add(1)
-		if bytes > 0 {
-			slot.readBytes.Add(bytes)
+		if byteCount > 0 {
+			slot.readBytes.Add(byteCount)
 		}
 	case OpWrite:
 		slot.writes.Add(1)
-		if bytes > 0 {
-			slot.writeBytes.Add(bytes)
+		if byteCount > 0 {
+			slot.writeBytes.Add(byteCount)
 		}
 	}
 }
@@ -345,19 +353,18 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 // RouteID is a no-op (the original slot stays in place).
 //
 // If a previous RemoveRoute(routeID) queued a deferred member-prune
-// for this same RouteID and the grace window has not elapsed yet,
-// that prune is cancelled here — otherwise re-registering during
-// route churn would still see the routeID disappear from
-// bucket.MemberRoutes once grace expires, despite Observe attributing
-// fresh traffic to that ID.
+// and the route is now re-registered into the SAME bucket inside the
+// grace window, that prune is cancelled — otherwise the routeID
+// would disappear from bucket.MemberRoutes despite Observe still
+// attributing fresh traffic to it. Prunes for different buckets (or
+// when the route rejoins as an individual slot) are left alone so
+// the old bucket's MemberRoutes is correctly cleaned up.
 func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 	if s == nil {
 		return false
 	}
 	s.routesMu.Lock()
 	defer s.routesMu.Unlock()
-
-	s.cancelPendingPrune(routeID)
 
 	cur := s.table.Load()
 	if _, ok := cur.slots[routeID]; ok {
@@ -388,7 +395,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 	bucket := findVirtualBucket(next.sortedSlots, start)
 	if bucket == nil {
 		bucket = &routeSlot{
-			RouteID:      routeID,
+			RouteID:      s.nextVirtualBucketID(),
 			Start:        cloneBytes(start),
 			End:          cloneBytes(end),
 			Aggregate:    true,
@@ -398,6 +405,11 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 	} else {
 		s.foldIntoBucket(next, bucket, routeID, start, end)
 	}
+	// The route is rejoining `bucket`; cancel any deferred prune for
+	// this same routeID against this same bucket so it stays in
+	// MemberRoutes. Prunes against other buckets are intentionally
+	// left in place.
+	s.cancelPendingPruneFor(bucket, routeID)
 	next.virtualForRoute[routeID] = bucket
 	s.table.Store(next)
 	return false
@@ -567,23 +579,41 @@ func advancePendingPrunes(pending []memberPrune, now time.Time, grace time.Durat
 	return keep
 }
 
-// cancelPendingPrune drops any pendingPrune entries matching routeID,
-// stopping a deferred prune from executing after the route has been
-// re-registered inside the grace window. Holds retiredMu briefly off
-// the hot path; callers must already hold routesMu so the
-// cancellation pairs atomically with the route-table mutation.
-func (s *MemSampler) cancelPendingPrune(routeID uint64) {
+// cancelPendingPruneFor drops any pendingPrune entry whose routeID
+// AND bucket pointer both match — i.e. the same routeID is rejoining
+// the same bucket it was just removed from. This stops a deferred
+// prune from removing the routeID from MemberRoutes despite Observe
+// still attributing traffic to it. Prunes against other buckets (or
+// where the route rejoins as an individual slot) are left in place
+// so the old bucket's MemberRoutes is correctly cleaned up.
+//
+// Holds retiredMu briefly off the hot path; callers must already
+// hold routesMu so the cancellation pairs atomically with the
+// route-table mutation.
+func (s *MemSampler) cancelPendingPruneFor(bucket *routeSlot, routeID uint64) {
 	s.retiredMu.Lock()
 	defer s.retiredMu.Unlock()
 	keep := s.pendingPrunes[:0]
 	for _, p := range s.pendingPrunes {
-		if p.routeID == routeID {
+		if p.routeID == routeID && p.bucket == bucket {
 			continue
 		}
 		keep = append(keep, p)
 	}
 	clearPruneTail(s.pendingPrunes, len(keep))
 	s.pendingPrunes = keep
+}
+
+// nextVirtualBucketID returns a synthetic RouteID for a brand-new
+// virtual bucket. Synthetic IDs come from the high end of uint64 and
+// decrement, so they cannot collide with real route IDs (which are
+// assigned from the low end by the coordinator). Without this,
+// stamping the bucket with the first folded real RouteID would mean
+// that ID could later show up on TWO rows in the same column — one
+// aggregate, one individual — if the original route is later
+// re-registered as an individual slot.
+func (s *MemSampler) nextVirtualBucketID() uint64 {
+	return s.virtualIDCounter.Add(^uint64(0)) // subtract 1; counter starts at MaxUint64+1
 }
 
 // memberRoutesContains reports whether routeID is already listed in
