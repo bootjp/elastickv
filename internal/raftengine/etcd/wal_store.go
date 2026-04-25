@@ -19,6 +19,7 @@ import (
 const (
 	walDirName  = "wal"
 	snapDirName = "snap"
+	walFileExt  = ".wal"
 )
 
 type diskState struct {

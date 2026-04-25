@@ -137,7 +137,7 @@ func collectWALNames(entries []os.DirEntry) []string {
 		if e.IsDir() {
 			continue
 		}
-		if filepath.Ext(e.Name()) != ".wal" {
+		if filepath.Ext(e.Name()) != walFileExt {
 			continue
 		}
 		names = append(names, e.Name())
