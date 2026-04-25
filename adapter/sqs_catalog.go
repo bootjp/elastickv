@@ -390,8 +390,17 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		// receive path re-parses on every check rather than caching
 		// the struct on meta, because DLQ existence has to be
 		// re-validated at the readTS anyway.
-		if _, err := parseRedrivePolicy(v); err != nil {
+		policy, err := parseRedrivePolicy(v)
+		if err != nil {
 			return err
+		}
+		// AWS rejects self-referential DLQ targets. Without this gate
+		// a redrive transaction would delete the source record and
+		// rewrite it to the same queue with a fresh receipt token,
+		// looping the poison message forever.
+		if policy.DLQName == m.Name {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
 		}
 		m.RedrivePolicy = v
 		return nil

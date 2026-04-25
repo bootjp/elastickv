@@ -121,6 +121,16 @@ func (s *SQSServer) redriveCandidateToDLQ(
 	srcArn string,
 	readTS uint64,
 ) (bool, error) {
+	// Self-referential RedrivePolicy is rejected at attribute-apply
+	// time, but a defense-in-depth check here keeps the receive path
+	// safe even against records committed before the validator
+	// existed (or under a future relaxation of the validator).
+	// Without this, redrive would delete and rewrite the same record
+	// in place, looping the poison message forever.
+	if policy.DLQName == srcQueueName {
+		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
+	}
 	dlqMeta, exists, err := s.loadQueueMetaAt(ctx, policy.DLQName, readTS)
 	if err != nil {
 		return false, errors.WithStack(err)

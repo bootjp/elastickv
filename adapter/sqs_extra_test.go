@@ -1317,6 +1317,76 @@ func TestSQSServer_SendMessageBatchRejectsInvalidEntryId(t *testing.T) {
 	}
 }
 
+func TestSQSServer_SendMessageBatchAttributesContributeToSizeCap(t *testing.T) {
+	t.Parallel()
+	// Body size alone is not the AWS request cap — MessageAttribute
+	// names + DataTypes + StringValues + BinaryValues all count.
+	// Without that, a client can ship tiny bodies and a few-MiB
+	// BinaryValue per entry and bypass the 256 KiB request cap.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "attr-size-cap")
+
+	huge := bytes.Repeat([]byte{0xff}, 200_000) // 200 KiB
+	entries := []map[string]any{
+		{
+			"Id":          "a",
+			"MessageBody": "tiny",
+			"MessageAttributes": map[string]any{
+				"big": map[string]any{"DataType": "Binary", "BinaryValue": huge},
+			},
+		},
+		{
+			"Id":          "b",
+			"MessageBody": "tiny",
+			"MessageAttributes": map[string]any{
+				"big": map[string]any{"DataType": "Binary", "BinaryValue": huge},
+			},
+		},
+	}
+	status, body := callSQS(t, node, sqsSendMessageBatchTarget, map[string]any{
+		"QueueUrl": url,
+		"Entries":  entries,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("oversize batch with attr bytes: got %d want 400 (%v)", status, body)
+	}
+	if got, _ := body["__type"].(string); got != sqsErrBatchRequestTooLong {
+		t.Fatalf("error type = %q, want %q", got, sqsErrBatchRequestTooLong)
+	}
+}
+
+func TestSQSServer_RedrivePolicyRejectsSelfReference(t *testing.T) {
+	t.Parallel()
+	// A self-referential RedrivePolicy would let DLQ redrive loop
+	// poison messages forever inside the same queue with reset
+	// counters. The validator must reject it at attribute-apply time.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	// CreateQueue with self-pointing RedrivePolicy is rejected.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:loopy","maxReceiveCount":3}`
+	status, body := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "loopy",
+		"Attributes": map[string]string{"RedrivePolicy": policy},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("self-ref RedrivePolicy on Create: got %d want 400 (%v)", status, body)
+	}
+
+	// SetQueueAttributes likewise rejects.
+	url := createSQSQueueForTest(t, node, "loopy")
+	status, body = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
+		"QueueUrl":   url,
+		"Attributes": map[string]string{"RedrivePolicy": policy},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("self-ref RedrivePolicy on SetAttrs: got %d want 400 (%v)", status, body)
+	}
+}
+
 func TestSQSServer_TagQueueRequiresTags(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)

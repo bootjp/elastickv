@@ -86,11 +86,10 @@ func (s *SQSServer) sendMessageBatch(w http.ResponseWriter, r *http.Request) {
 	// Total-payload-size gate is request-level, not per-entry: silently
 	// accepting an oversized batch would let one producer push tens of
 	// MiB through a single call and DoS the leader's Raft pipeline.
-	total := 0
-	for _, e := range in.Entries {
-		total += len(e.MessageBody)
-	}
-	if total > sqsBatchMaxTotalPayloadBytes {
+	// MessageAttributes contribute to the size — without them in the
+	// total a client could ship tiny bodies plus a few-MiB BinaryValue
+	// per entry and bypass the cap.
+	if total := totalBatchPayloadBytes(in.Entries); total > sqsBatchMaxTotalPayloadBytes {
 		writeSQSError(w, http.StatusBadRequest, sqsErrBatchRequestTooLong,
 			"total batch payload exceeds 262144 bytes")
 		return
@@ -271,11 +270,20 @@ func (s *SQSServer) sendBatchFifoEntries(
 func (s *SQSServer) sendOneFifoBatchEntry(
 	ctx context.Context,
 	queueName string,
-	meta *sqsQueueMeta,
+	_ *sqsQueueMeta,
 	entry sqsSendMessageBatchEntryInput,
 ) (bool, sqsSendMessageBatchResultEntry, sqsBatchResultErrorEntry) {
+	// Only meta-independent shape checks live here. Anything that
+	// reads queue metadata (MaximumMessageSize, FIFO flag, content-
+	// based dedup) is re-evaluated inside runFifoSendWithRetry per
+	// attempt, so a SetQueueAttributes commit racing this batch
+	// cannot fail an entry that the per-attempt path would accept.
 	if apiErr := validateMessageAttributes(entry.MessageAttributes); apiErr != nil {
 		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, apiErr)
+	}
+	if len(entry.MessageBody) == 0 {
+		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id,
+			newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required"))
 	}
 	asSingle := sqsSendMessageInput{
 		MessageBody:            entry.MessageBody,
@@ -283,21 +291,6 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 		MessageAttributes:      entry.MessageAttributes,
 		MessageGroupId:         entry.MessageGroupId,
 		MessageDeduplicationId: entry.MessageDeduplicationId,
-	}
-	// Pre-flight checks against the most recent meta we have. The
-	// retry loop re-validates against fresh meta on each attempt, but
-	// running the cheap shape checks here first gives the caller a
-	// per-entry error response without paying for a Dispatch.
-	if len(entry.MessageBody) == 0 {
-		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id,
-			newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required"))
-	}
-	if int64(len(entry.MessageBody)) > meta.MaximumMessageSize {
-		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id,
-			newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize"))
-	}
-	if err := validateSendFIFOParams(meta, asSingle); err != nil {
-		return false, sqsSendMessageBatchResultEntry{}, batchErrorEntryFromAPIErr(entry.Id, err)
 	}
 
 	resp, err := s.runFifoSendWithRetry(ctx, queueName, asSingle)
@@ -336,21 +329,9 @@ func (s *SQSServer) runFifoSendWithRetry(
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
 		readTS := s.nextTxnReadTS(ctx)
-		meta, exists, loadErr := s.loadQueueMetaAt(ctx, queueName, readTS)
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		if !exists {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		}
-		dedupID := resolveFifoDedupID(meta, in)
-		if dedupID == "" {
-			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter,
-				"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
-		}
-		delay, delayErr := resolveSendDelay(meta, in.DelaySeconds)
-		if delayErr != nil {
-			return nil, delayErr
+		meta, dedupID, delay, err := s.resolveFreshFifoSnapshot(ctx, queueName, in, readTS)
+		if err != nil {
+			return nil, err
 		}
 		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
 		if err != nil {
@@ -365,6 +346,36 @@ func (s *SQSServer) runFifoSendWithRetry(
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return nil, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "FIFO send retry attempts exhausted")
+}
+
+// resolveFreshFifoSnapshot loads queue meta at readTS and re-derives
+// every meta-dependent value (size cap, FIFO params, dedup id,
+// effective delay). Pulled out of runFifoSendWithRetry so the retry
+// loop stays under the cyclomatic budget.
+func (s *SQSServer) resolveFreshFifoSnapshot(ctx context.Context, queueName string, in sqsSendMessageInput, readTS uint64) (*sqsQueueMeta, string, int64, error) {
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if !exists {
+		return nil, "", 0, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if int64(len(in.MessageBody)) > meta.MaximumMessageSize {
+		return nil, "", 0, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
+	}
+	if err := validateSendFIFOParams(meta, in); err != nil {
+		return nil, "", 0, err
+	}
+	dedupID := resolveFifoDedupID(meta, in)
+	if dedupID == "" {
+		return nil, "", 0, newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter,
+			"FIFO send requires MessageDeduplicationId or ContentBasedDeduplication=true")
+	}
+	delay, err := resolveSendDelay(meta, in.DelaySeconds)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	return meta, dedupID, delay, nil
 }
 
 // buildBatchSendRecord runs every per-entry validation a single
@@ -594,6 +605,22 @@ func batchEntryIDs(entries []sqsSendMessageBatchEntryInput) []string {
 		out = append(out, e.Id)
 	}
 	return out
+}
+
+// totalBatchPayloadBytes sums the message-body length and every
+// MessageAttribute (name + DataType + value) length across a batch.
+// Both fields count toward AWS's 256 KiB request cap; counting only
+// MessageBody would let a client stuff several MiB into a single
+// BinaryValue while passing the size gate.
+func totalBatchPayloadBytes(entries []sqsSendMessageBatchEntryInput) int {
+	total := 0
+	for _, e := range entries {
+		total += len(e.MessageBody)
+		for name, v := range e.MessageAttributes {
+			total += len(name) + len(v.DataType) + len(v.StringValue) + len(v.BinaryValue)
+		}
+	}
+	return total
 }
 
 func batchErrorEntryFromAPIErr(id string, err error) sqsBatchResultErrorEntry {
