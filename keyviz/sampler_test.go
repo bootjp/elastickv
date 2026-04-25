@@ -687,6 +687,73 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+// TestMemberRoutesCappedAtConfiguredCap pins Codex round-7 P2: per-
+// bucket MemberRoutes growth is bounded by MaxMemberRoutesPerSlot, so
+// flushed columns don't scale with total folded routes when the
+// deployment route count vastly exceeds MaxTrackedRoutes.
+func TestMemberRoutesCappedAtConfiguredCap(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:                   time.Second,
+		HistoryColumns:         4,
+		MaxTrackedRoutes:       1,
+		MaxMemberRoutesPerSlot: 3,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	for i := uint64(2); i < 10; i++ {
+		key := []byte{byte('a' + i)}
+		if s.RegisterRoute(i, key, append(key, 'z')) {
+			t.Fatalf("route %d should fold (over budget)", i)
+		}
+		s.Observe(i, OpRead, 1, 0)
+	}
+	s.Flush()
+	rows := lastSnapshotColumn(t, s).Rows
+	agg := findAggregateRow(t, rows)
+	if len(agg.MemberRoutes) > 3 {
+		t.Fatalf("MemberRoutes exceeds cap=3: %v", agg.MemberRoutes)
+	}
+	// All 8 over-budget routes still drove the bucket counters even
+	// though only the first 3 are recorded as members.
+	if agg.Reads != 8 {
+		t.Fatalf("bucket Reads = %d, want 8 (counters must absorb traffic past cap)", agg.Reads)
+	}
+}
+
+// TestRetiredTailClearedAfterDrop pins Codex round-7 P2: after a
+// retired slot's grace expires and drainRetiredSlots drops the entry,
+// the *routeSlot pointer in the dropped tail of the backing array
+// must be zeroed so it doesn't keep the slot GC-reachable through
+// the reused capacity.
+func TestRetiredTailClearedAfterDrop(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	mustRegister(t, s, 1, "a", "b")
+	s.Observe(1, OpRead, 1, 1)
+	s.RemoveRoute(1)
+
+	s.retiredMu.Lock()
+	if len(s.retiredSlots) != 1 {
+		s.retiredMu.Unlock()
+		t.Fatalf("expected 1 retired slot pre-flush, got %d", len(s.retiredSlots))
+	}
+	orig := s.retiredSlots[:1:1] // slice header pinning index 0 of the backing array
+	s.retiredMu.Unlock()
+
+	clk.Advance(s.graceWindow() + time.Second)
+	s.Flush()
+
+	s.retiredMu.Lock()
+	leftover := len(s.retiredSlots)
+	s.retiredMu.Unlock()
+	if leftover != 0 {
+		t.Fatalf("expected drain to drop entry, len=%d", leftover)
+	}
+	if orig[0].slot != nil {
+		t.Fatal("dropped retiredSlot.slot pointer not zeroed in backing array — GC retention leak")
+	}
+}
+
 // BenchmarkObserveHit pins the hot-path properties claimed in the
 // package doc: a single atomic.Pointer.Load, a map lookup, and at
 // most two atomic.AddUint64 calls — no allocation, no mutex. Use

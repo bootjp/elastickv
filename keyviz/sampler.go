@@ -67,9 +67,10 @@ type Sampler interface {
 
 // Defaults for MemSamplerOptions when fields are left zero.
 const (
-	DefaultStep             = 60 * time.Second
-	DefaultHistoryColumns   = 1440 // 24 hours at 60s steps.
-	DefaultMaxTrackedRoutes = 10_000
+	DefaultStep                   = 60 * time.Second
+	DefaultHistoryColumns         = 1440 // 24 hours at 60s steps.
+	DefaultMaxTrackedRoutes       = 10_000
+	DefaultMaxMemberRoutesPerSlot = 256
 )
 
 // MemSamplerOptions configures NewMemSampler. Zero values fall back to
@@ -86,6 +87,14 @@ type MemSamplerOptions struct {
 	// returns false past this cap, the route ID maps into a virtual
 	// bucket, and Snapshot reports it with Aggregate=true.
 	MaxTrackedRoutes int
+	// MaxMemberRoutesPerSlot caps how many distinct RouteIDs a single
+	// virtual bucket records in MemberRoutes. Beyond this cap the
+	// route still folds into the bucket counters (so traffic is not
+	// dropped) but the routeID is not appended — keeping per-column
+	// payload size bounded when total routes far exceed
+	// MaxTrackedRoutes. Snapshot consumers should treat the list as
+	// "first N members" rather than authoritative attribution.
+	MaxMemberRoutesPerSlot int
 	// Now overrides time.Now for tests; nil falls back to time.Now.
 	Now func() time.Time
 }
@@ -267,6 +276,9 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	if opts.MaxTrackedRoutes == 0 {
 		opts.MaxTrackedRoutes = DefaultMaxTrackedRoutes
 	}
+	if opts.MaxMemberRoutesPerSlot <= 0 {
+		opts.MaxMemberRoutesPerSlot = DefaultMaxMemberRoutesPerSlot
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -371,7 +383,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		}
 		next.sortedSlots = appendSorted(next.sortedSlots, bucket)
 	} else {
-		foldIntoBucket(next, bucket, routeID, start, end)
+		s.foldIntoBucket(next, bucket, routeID, start, end)
 	}
 	next.virtualForRoute[routeID] = bucket
 	s.table.Store(next)
@@ -385,9 +397,15 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 // Counters live next to the metadata but are protected by their own
 // atomic ops, not metaMu. If Start is lowered, sortedSlots is rebuilt
 // to preserve Flush's key-order contract.
-func foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
+//
+// MemberRoutes growth is capped by MaxMemberRoutesPerSlot — beyond
+// that cap the bucket counters still absorb the route's traffic, but
+// the routeID is not added to the visible member list.
+func (s *MemSampler) foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
 	bucket.metaMu.Lock()
-	bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+	if len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
+		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+	}
 	if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
 		bucket.End = cloneBytes(end)
 	}
@@ -502,7 +520,9 @@ func (s *MemSampler) Flush() {
 // entries whose grace window has not yet elapsed. Rows are appended
 // to *rows so the caller sees the slice growth. Entries whose
 // elapsed time (now - retiredAt) has reached grace are dropped after
-// this final drain.
+// this final drain. The dropped tail of the backing array is zeroed
+// so released *routeSlot pointers do not stay GC-reachable through
+// the reused capacity.
 func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow, now time.Time, grace time.Duration) []retiredSlot {
 	keep := retired[:0]
 	for _, r := range retired {
@@ -511,13 +531,15 @@ func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow, now time.Time, 
 			keep = append(keep, r)
 		}
 	}
+	clearTail(retired, len(keep))
 	return keep
 }
 
 // advancePendingPrunes lets each pending member-prune live until its
 // retiredAt+grace passes, then actually prunes the routeID from the
 // bucket's MemberRoutes. Returns the entries still inside the grace
-// window.
+// window. Like drainRetiredSlots, the dropped tail is zeroed so
+// released bucket pointers don't linger via the reused capacity.
 func advancePendingPrunes(pending []memberPrune, now time.Time, grace time.Duration) []memberPrune {
 	keep := pending[:0]
 	for _, p := range pending {
@@ -527,7 +549,24 @@ func advancePendingPrunes(pending []memberPrune, now time.Time, grace time.Durat
 		}
 		pruneMemberRoute(p.bucket, p.routeID)
 	}
+	clearPruneTail(pending, len(keep))
 	return keep
+}
+
+// clearTail zeroes the [keepLen, len(s)) range of s so dropped entries
+// don't keep their *routeSlot pointers GC-reachable through the
+// reused backing array.
+func clearTail(s []retiredSlot, keepLen int) {
+	for i := keepLen; i < len(s); i++ {
+		s[i] = retiredSlot{}
+	}
+}
+
+// clearPruneTail is clearTail for the pendingPrunes queue.
+func clearPruneTail(s []memberPrune, keepLen int) {
+	for i := keepLen; i < len(s); i++ {
+		s[i] = memberPrune{}
+	}
 }
 
 // bucketStillReferenced reports whether any RouteID in
