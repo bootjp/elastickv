@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -106,8 +107,18 @@ func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, f
 }
 
 func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine) (*diskState, error) {
+	// Scope the repair retry tightly to WAL-only reads: both
+	// loadPersistedSnapshot (scans WAL via wal.ValidSnapshotEntries)
+	// and openAndReadWAL's ReadAll can surface io.ErrUnexpectedEOF
+	// when the kernel OOM-killer SIGKILLed the process mid-WAL-write.
+	// wal.Repair truncates the partial trailing record once and is
+	// idempotent. FSM snapshot restore is kept out of this retry —
+	// a truncated .fsm payload surfacing ErrUnexpectedEOF is a
+	// different failure mode (the FSM snapshotter has its own
+	// on-disk CRC footer) and wal.Repair does not address it;
+	// running repair in that case would dirty a perfectly-good WAL.
 	snapshotter := snap.New(logger, snapDir)
-	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
+	snapshot, err := loadPersistedSnapshotWithRepair(logger, walDir, snapshotter)
 	if err != nil {
 		return nil, err
 	}
@@ -115,15 +126,9 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		return nil, err
 	}
 
-	w, err := wal.Open(logger, walDir, walSnapshotFor(snapshot))
+	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot))
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	_, hardState, entries, err := w.ReadAll()
-	if err != nil {
-		_ = w.Close()
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
 	storage, err := newMemoryStorage(persistedState{
@@ -132,7 +137,12 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		Entries:   entries,
 	})
 	if err != nil {
-		_ = w.Close()
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after storage init error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
 		return nil, err
 	}
 
@@ -141,6 +151,72 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		Persist:   etcdstorage.NewStorage(logger, w, snapshotter),
 		LocalSnap: snapshot,
 	}, nil
+}
+
+// loadPersistedSnapshotWithRepair wraps loadPersistedSnapshot with one
+// wal.Repair attempt on io.ErrUnexpectedEOF. The caller passes in a
+// shared snapshotter so loadWalState does not instantiate snap.New
+// twice per open.
+func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
+	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		return snapshot, err
+	}
+	logger.Warn("WAL tail truncated during snapshot scan, repairing",
+		zap.String("dir", walDir),
+		zap.Error(err),
+	)
+	if !wal.Repair(logger, walDir) {
+		return raftpb.Snapshot{}, errors.Wrap(err, "WAL unrepairable")
+	}
+	snapshot, err = loadPersistedSnapshot(logger, walDir, snapshotter)
+	if err != nil {
+		return raftpb.Snapshot{}, errors.Wrap(err, "WAL unrepairable after repair")
+	}
+	return snapshot, nil
+}
+
+// openAndReadWALWithRepair wraps openAndReadWAL with one wal.Repair
+// attempt on io.ErrUnexpectedEOF.
+func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	w, hs, ents, err := openAndReadWAL(logger, walDir, walSnap)
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		return w, hs, ents, err
+	}
+	logger.Warn("WAL tail truncated during ReadAll, repairing",
+		zap.String("dir", walDir),
+		zap.Error(err),
+	)
+	if !wal.Repair(logger, walDir) {
+		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable")
+	}
+	w, hs, ents, err = openAndReadWAL(logger, walDir, walSnap)
+	if err != nil {
+		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable after repair")
+	}
+	return w, hs, ents, nil
+}
+
+// openAndReadWAL opens the WAL at walDir and runs ReadAll. io.ErrUnexpectedEOF
+// and other errors propagate upward; the retry/repair is handled once at
+// loadWalState so ValidSnapshotEntries and ReadAll share a single repair
+// pass and the "WAL tail truncated" log is emitted at most once.
+func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	w, err := wal.Open(logger, walDir, walSnap)
+	if err != nil {
+		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+	}
+	_, hardState, entries, err := w.ReadAll()
+	if err != nil {
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after ReadAll error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
+		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+	}
+	return w, hardState, entries, nil
 }
 
 func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {

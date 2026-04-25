@@ -340,7 +340,7 @@ func startBootstrapE2ENode(
 	bootstrapMembers string,
 	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
-	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "")
+	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "")
 	if err != nil {
 		return nil, err
 	}
