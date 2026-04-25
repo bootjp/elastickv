@@ -445,8 +445,20 @@ func validateGSI(gsi *CreateTableGSI, index int) error {
 			return err
 		}
 	}
-	switch strings.TrimSpace(strings.ToUpper(gsi.Projection.Type)) {
+	// Canonicalise the projection type in-place. The handler
+	// accepts case-insensitive input ("include" / "ALL") for SPA
+	// ergonomics, but the adapter's buildCreateTableProjection
+	// only matches exact uppercase. Normalising once at the
+	// boundary keeps that mismatch from surfacing as a confusing
+	// post-validation 500 — the bridge and the AdminForward server
+	// both forward whatever ends up in this field, so writing back
+	// the canonical form here means every downstream consumer sees
+	// the same shape. The empty string keeps its meaning ("default
+	// to ALL") on both sides.
+	canonical := strings.TrimSpace(strings.ToUpper(gsi.Projection.Type))
+	switch canonical {
 	case "", "ALL", "KEYS_ONLY", "INCLUDE":
+		gsi.Projection.Type = canonical
 		return nil
 	default:
 		return errors.New(prefix + `.projection.type must be one of "ALL", "KEYS_ONLY", "INCLUDE"`)

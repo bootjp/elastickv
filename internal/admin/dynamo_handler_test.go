@@ -398,6 +398,67 @@ func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
 	require.Equal(t, "id", got.PartitionKey)
 }
 
+// TestDynamoHandler_CreateTable_CanonicalisesProjectionType makes
+// sure validateGSI normalises a lowercase "include" value back to
+// the uppercase form the adapter expects. Without normalisation
+// the request would pass handler validation only to fail at the
+// adapter as ValidationException ("invalid projection") — exactly
+// the boundary mismatch Codex P2 flagged on PR #635.
+func TestDynamoHandler_CreateTable_CanonicalisesProjectionType(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	body := `{
+		"table_name":"t",
+		"partition_key":{"name":"id","type":"S"},
+		"gsi":[{
+			"name":"by-status",
+			"partition_key":{"name":"status","type":"S"},
+			"projection":{"type":"include","non_key_attributes":["author"]}
+		}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(body))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	require.Len(t, src.lastCreateInput.GSI, 1)
+	require.Equal(t, "INCLUDE", src.lastCreateInput.GSI[0].Projection.Type,
+		"projection type must reach the source canonicalised so the adapter does not re-reject it")
+}
+
+// TestDynamoHandler_CreateTable_AcceptsMixedCaseProjection covers
+// the same canonicalisation for KEYS_ONLY / Keys_Only / keys_only.
+func TestDynamoHandler_CreateTable_AcceptsMixedCaseProjection(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"all", "ALL"},
+		{"All", "ALL"},
+		{"KEYS_ONLY", "KEYS_ONLY"},
+		{"keys_only", "KEYS_ONLY"},
+		{"Include", "INCLUDE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+			h := newDynamoHandlerForTest(src)
+			body := `{
+				"table_name":"t",
+				"partition_key":{"name":"id","type":"S"},
+				"gsi":[{
+					"name":"i",
+					"partition_key":{"name":"k","type":"S"},
+					"projection":{"type":"` + tc.in + `"}
+				}]
+			}`
+			req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(body))
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+			require.Equal(t, tc.want, src.lastCreateInput.GSI[0].Projection.Type)
+		})
+	}
+}
+
 func TestDynamoHandler_CreateTable_RejectsReadOnlyPrincipal(t *testing.T) {
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
