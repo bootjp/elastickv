@@ -243,6 +243,51 @@ func TestGetClusterOverviewDropsRemovedSeedAfterScaleIn(t *testing.T) {
 	}
 }
 
+// TestGetClusterOverviewKeepsSeedOnPartialConfigFailure asserts that a
+// bootstrap seed is NOT pruned when one group's Configuration succeeds and
+// another errors — a node visible only in the failing group would otherwise
+// disappear from fan-out for transient reasons. Codex flagged this on
+// 94851380: the round-24 fix flipped authoritative on any single success,
+// which incorrectly pruned peers under partial failure. The current contract
+// requires every queried group to succeed before pruning.
+func TestGetClusterOverviewKeepsSeedOnPartialConfigFailure(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1"},
+		[]NodeIdentity{
+			{NodeID: "n2", GRPCAddress: "10.0.0.12:50051"},
+			// n3 is only known via the seed list; the failing group below
+			// is the one that would have reported it.
+			{NodeID: "n3", GRPCAddress: "10.0.0.13:50051"},
+		},
+	)
+	srv.RegisterGroup(1, fakeGroup{
+		leaderID: "n1", term: 1,
+		servers: []raftengine.Server{
+			{ID: "n1", Address: "10.0.0.11:50051"},
+			{ID: "n2", Address: "10.0.0.12:50051"},
+			// n3 absent from this group.
+		},
+	})
+	// Group 7 errors — n3 happens to live in this group's config.
+	srv.RegisterGroup(7, fakeGroup{leaderID: "n1", cfgErr: context.DeadlineExceeded})
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, m := range resp.Members {
+		ids[m.NodeId] = true
+	}
+	if !ids["n2"] {
+		t.Fatalf("n2 missing from members %v — live group reported it", resp.Members)
+	}
+	if !ids["n3"] {
+		t.Fatalf("n3 dropped under partial failure: members %v — seeds must fall through when any group errors", resp.Members)
+	}
+}
+
 // TestGetClusterOverviewLiveConfigWinsOverStaleSeed asserts that when a node
 // is readdressed (same NodeID, new GRPCAddress), the live Raft Configuration
 // wins over the stale bootstrap seed so fan-out dials the current endpoint.

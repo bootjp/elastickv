@@ -225,9 +225,11 @@ func fanoutConfigurationCalls(ctx context.Context, groups []groupEntry) []config
 // addrByID lists the usable (non-blank) addresses, seenID is every NodeID any
 // group reported (even with blank address) so seed backfill can distinguish
 // "node still exists with bad metadata" from "node was removed", and
-// authoritative is true when at least one Configuration succeeded — meaning
-// the live config can be trusted to enumerate cluster membership and seeds
-// should not re-add removed nodes.
+// authoritative is true only when EVERY group's Configuration succeeded
+// (and at least one ran). A single group erroring or missing means the
+// merged view is incomplete: a node only present in the failed group
+// would otherwise be incorrectly treated as removed and dropped, so seed
+// pruning must wait until live membership is proven across all groups.
 type liveMembers struct {
 	addrByID      map[string]string
 	seenID        map[string]struct{}
@@ -252,11 +254,12 @@ func collectLiveMembers(
 		seenID:   map[string]struct{}{},
 		order:    []string{},
 	}
+	successes := 0
 	for _, res := range got {
 		if res.err != nil {
 			continue
 		}
-		live.authoritative = true
+		successes++
 		for _, srv := range res.cfg.Servers {
 			if srv.ID == "" || srv.ID == selfID {
 				continue
@@ -273,6 +276,12 @@ func collectLiveMembers(
 			live.order = append(live.order, srv.ID)
 		}
 	}
+	// Authoritative only when every queried group reported successfully
+	// AND at least one group ran. If even a single Configuration call
+	// errored or the fanout returned early on ctx cancellation, we cannot
+	// distinguish "removed from cluster" from "the group that knew about
+	// this node was unreachable", so seeds must be allowed to fall through.
+	live.authoritative = successes > 0 && successes == len(groups) && len(got) == len(groups)
 	return live
 }
 
@@ -281,15 +290,18 @@ func collectLiveMembers(
 //   - If the NodeID was seen in some live config but with a blank address,
 //     the seed supplies the address (handles the etcd convergence transient).
 //   - If the NodeID was not seen at all and the live result is authoritative
-//     (≥1 Configuration succeeded), the seed is a removed node — drop it
-//     instead of re-advertising it forever.
-//   - If the NodeID was not seen and the live result is non-authoritative
-//     (cold start or every Configuration errored), fall back to the seed so
-//     the admin binary still has someone to fan-out to.
+//     (every queried group's Configuration succeeded), the seed is a removed
+//     node — drop it instead of re-advertising it forever.
+//   - Otherwise (cold start, partial failure, ctx cancellation, or every
+//     Configuration errored), fall back to the seed: a node only known to
+//     the failed group must not be silently dropped.
 //
-// Codex P2 on 14698e8d: previously seeds were re-added unconditionally for
-// any NodeID missing from live config, so a removed node stayed in the
-// overview forever and the admin fan-out kept dialing it.
+// Codex flagged two regressions in iterations of this function:
+// (a) the original version re-added every removed seed, never converging on
+// scale-in; (b) the round-24 fix flipped to drop on any single success,
+// which dropped peers visible only in a partially-failing group. The
+// current contract requires *every* group to report cleanly before the
+// pruning path kicks in.
 func mergeSeedMembers(seeds []NodeIdentity, selfID string, live *liveMembers) {
 	for _, m := range seeds {
 		if m.NodeID == "" || m.NodeID == selfID {
