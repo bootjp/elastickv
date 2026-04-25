@@ -50,6 +50,7 @@ const (
 var redisCommandSet = map[string]struct{}{
 	"BZPOPMIN":         {},
 	"CLIENT":           {},
+	"COMMAND":          {},
 	"DBSIZE":           {},
 	"DEL":              {},
 	"DISCARD":          {},
