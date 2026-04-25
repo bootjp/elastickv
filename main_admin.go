@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -223,7 +224,16 @@ func translateAdminTablesError(err error) error {
 		return nil
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrTablesForbidden
-	case errors.Is(err, adapter.ErrAdminNotLeader):
+	case errors.Is(err, adapter.ErrAdminNotLeader),
+		isLeaderChurnError(err):
+		// Cover both the up-front isVerifiedDynamoLeader check
+		// and leader-churn during Dispatch — the kv coordinator
+		// can drop leadership between AdminCreateTable's initial
+		// guard and its createTableWithRetry call, returning
+		// transient leader errors that should still surface as
+		// 503 leader_unavailable + Retry-After: 1 (Codex P2 on
+		// PR #634). Without this, churn shows up as a generic
+		// 500 and the retry contract for write paths is broken.
 		return admin.ErrTablesNotLeader
 	case adapter.IsAdminTableAlreadyExists(err):
 		return admin.ErrTablesAlreadyExists
@@ -238,6 +248,35 @@ func translateAdminTablesError(err error) error {
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
+}
+
+// isLeaderChurnError reports whether err looks like one of the
+// transient leader sentinels the kv coordinator and adapter
+// internals emit during a leadership change. The set mirrors the
+// closed list in kv.leaderErrorPhrases — keep them in sync if a
+// new sentinel is added on the kv side.
+//
+// Checking against the typed sentinels (kv.ErrLeaderNotFound and
+// adapter.ErrNotLeader / adapter.ErrLeaderNotFound) covers the
+// in-process path; the wire-string fallback catches the same
+// errors when they have crossed a gRPC boundary and lost their
+// type. A focused match — substring on the canonical phrases
+// rather than any "leader" mention — keeps unrelated errors that
+// happen to mention leadership out of the 503 path.
+func isLeaderChurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, adapter.ErrNotLeader) ||
+		errors.Is(err, adapter.ErrLeaderNotFound) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not leader") ||
+		strings.Contains(msg, "leader not found") ||
+		strings.Contains(msg, "leadership lost") ||
+		strings.Contains(msg, "leadership transfer in progress")
 }
 
 func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {

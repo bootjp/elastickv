@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -362,4 +364,43 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 	require.NoError(t, pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}))
 	require.NoError(t, keyOut.Close())
 	return certPath, keyPath
+}
+
+// TestTranslateAdminTablesError_LeaderChurn verifies that the
+// bridge maps transient leader-churn errors from the kv coordinator
+// (which AdminCreateTable/AdminDeleteTable can return after their
+// initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
+// rather than the generic 500 fallthrough. Codex P2 on PR #634.
+func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+	}{
+		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
+		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
+		{"wrapped not leader", errors.New("dispatch failed: not leader")},
+		{"wrapped leader not found", errors.New("dispatch: leader not found")},
+		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
+		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := translateAdminTablesError(tc.in)
+			require.ErrorIs(t, out, admin.ErrTablesNotLeader,
+				"input %q must map to ErrTablesNotLeader", tc.in)
+		})
+	}
+}
+
+// TestTranslateAdminTablesError_UnrelatedErrorPassesThrough confirms
+// the leader-churn detector does not swallow unrelated errors that
+// happen to mention the word "leader" outside the canonical phrases.
+func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
+	in := errors.New("team leader misconfigured")
+	out := translateAdminTablesError(in)
+	// Falls through to default — same error returned, NOT
+	// ErrTablesNotLeader.
+	require.NotErrorIs(t, out, admin.ErrTablesNotLeader)
+	require.Equal(t, in, out)
 }
