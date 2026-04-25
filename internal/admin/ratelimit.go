@@ -184,8 +184,18 @@ func ParseTrustedProxies(specs []string) ([]*net.IPNet, error) {
 		if ip == nil {
 			return nil, errors.WithStack(errors.Newf("trusted proxy %q is not a valid IP or CIDR", trim))
 		}
-		mask := net.CIDRMask(ipv4PrefixBits, ipv4PrefixBits)
-		if ip.To4() == nil {
+		// net.IPNet requires IP and Mask to share a byte length:
+		// net.ParseIP always returns the 16-byte form, but
+		// CIDRMask(32, 32) is 4 bytes, so building an IPNet from
+		// those two as-is would leave behaviour at the mercy of
+		// each consumer's normalisation. Force the 4-byte form
+		// for IPv4 so Contains can match without depending on
+		// internal cooperation.
+		var mask net.IPMask
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+			mask = net.CIDRMask(ipv4PrefixBits, ipv4PrefixBits)
+		} else {
 			mask = net.CIDRMask(ipv6PrefixBits, ipv6PrefixBits)
 		}
 		out = append(out, &net.IPNet{IP: ip, Mask: mask})

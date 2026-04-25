@@ -101,8 +101,14 @@ func NewServer(deps ServerDeps) (*Server, error) {
 }
 
 // Handler returns an http.Handler that serves the full admin surface.
+// We wrap the router in BodyLimit at the top level so every endpoint
+// — including /admin/healthz and the static asset / SPA paths — is
+// protected from oversized request bodies. The login / logout / API
+// chains apply BodyLimit again internally; both layers cap to the
+// same default, so the effective limit stays at defaultBodyLimit and
+// the redundant wrap is a no-op rather than a smaller cap.
 func (s *Server) Handler() http.Handler {
-	return s.router
+	return BodyLimit(defaultBodyLimit)(s.router)
 }
 
 // APIHandler returns just the /admin/api/v1/* subtree. Tests that want
