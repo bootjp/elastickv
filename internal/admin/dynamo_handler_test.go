@@ -487,6 +487,34 @@ func TestDynamoHandler_CreateTable_RejectsMissingPrincipal(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
+// TestDynamoHandler_CreateTable_OversizedBodyReturns413 confirms a
+// body that trips BodyLimit's MaxBytesReader surfaces as 413
+// payload_too_large rather than the generic 400 invalid_body
+// (Codex P2 on PR #634). The middleware contract in
+// internal/admin/middleware.go is that oversized bodies map to
+// 413; the previous wholesale "decode failure → 400" path
+// silently broke that for this endpoint.
+func TestDynamoHandler_CreateTable_OversizedBodyReturns413(t *testing.T) {
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	h := newDynamoHandlerForTest(src)
+	// Build a body just over the limit. Padding a real-shape
+	// JSON object with whitespace keeps the structure valid up
+	// to the cap so the test isolates the size-rejection path.
+	oversize := `{"table_name":"u","partition_key":{"name":"id","type":"S"}` +
+		strings.Repeat(" ", int(defaultBodyLimit)+1) + "}"
+	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(oversize))
+	req = withWritePrincipal(req)
+	// The router applies BodyLimit at the outer wrap; emulate
+	// that here so MaxBytesReader is in play during ReadAll.
+	req.Body = http.MaxBytesReader(httptest.NewRecorder(), req.Body, defaultBodyLimit)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.Contains(t, rec.Body.String(), "payload_too_large")
+	require.Empty(t, src.lastCreateInput.TableName, "source must not be touched on oversized body")
+}
+
 func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)

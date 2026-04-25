@@ -133,6 +133,15 @@ var (
 	ErrTablesAlreadyExists = errors.New("admin tables: table already exists")
 )
 
+// errCreateBodyTooLarge is returned by decodeCreateTableRequest
+// when the request body trips the BodyLimit middleware's
+// MaxBytesReader. The handler matches this sentinel to map the
+// failure to 413 payload_too_large rather than the generic 400
+// invalid_body — the BodyLimit/middleware contract documented in
+// internal/admin/middleware.go (Codex P2 on PR #634 flagged the
+// previous always-400 behaviour as a regression).
+var errCreateBodyTooLarge = errors.New("request body exceeds the 64 KiB admin limit")
+
 // ValidationError is what the source returns when the input fails
 // adapter-side validation. Surfaces a sanitised message back to the
 // SPA — adapter-internal err.Error() output is never sent verbatim.
@@ -281,6 +290,10 @@ func (h *DynamoHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := decodeCreateTableRequest(r.Body)
 	if err != nil {
+		if errors.Is(err, errCreateBodyTooLarge) {
+			WriteMaxBytesError(w)
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
@@ -363,7 +376,9 @@ func decodeCreateTableRequest(body io.Reader) (CreateTableRequest, error) {
 	raw, err := io.ReadAll(body)
 	if err != nil {
 		if IsMaxBytesError(err) {
-			return CreateTableRequest{}, errors.New("request body exceeds the 64 KiB admin limit")
+			// Sentinel so handleCreate can map to 413 rather than
+			// the generic 400 invalid_body.
+			return CreateTableRequest{}, errCreateBodyTooLarge
 		}
 		return CreateTableRequest{}, errors.New("request body could not be read")
 	}
