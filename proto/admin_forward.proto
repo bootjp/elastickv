@@ -74,4 +74,14 @@ message AdminForwardResponse {
   // practice always "application/json; charset=utf-8" but echoed
   // explicitly so the follower does not have to guess.
   string content_type = 3;
+  // retry_after_seconds carries a Retry-After hint the follower's
+  // bridge translates back into an HTTP Retry-After header. The
+  // direct HTTP path sets Retry-After: 1 on 503 leader_unavailable
+  // (mid-dispatch leadership churn); without this field the same
+  // response shape would lose its retry timing once forwarded —
+  // clients would see 503 with no Retry-After and fall back to
+  // their default backoff. Codex P2 on PR #635 flagged the gap.
+  // Zero means "no Retry-After header"; the field is only meaningful
+  // for status codes that traditionally carry one (typically 503).
+  int32 retry_after_seconds = 4;
 }

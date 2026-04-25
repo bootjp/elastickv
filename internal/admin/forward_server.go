@@ -42,30 +42,6 @@ type ForwardServer struct {
 	logger *slog.Logger
 }
 
-// RoleStore is the access-key → role lookup the leader uses to
-// re-validate the inbound principal. Implementations should mirror
-// the admin server's `Roles` map; production passes a typed wrapper
-// around that map so tests can swap in an in-memory stub.
-type RoleStore interface {
-	// LookupRole returns the role for an access key as understood
-	// by the leader's view of cluster configuration. The bool is
-	// false when the access key is not in the admin role index — a
-	// follower that forwarded the principal should not be able to
-	// "make up" an admin identity.
-	LookupRole(accessKey string) (Role, bool)
-}
-
-// MapRoleStore is the trivial in-memory implementation, sufficient
-// for tests and for the production wiring (which already keeps the
-// role map in memory).
-type MapRoleStore map[string]Role
-
-// LookupRole implements RoleStore.
-func (m MapRoleStore) LookupRole(accessKey string) (Role, bool) {
-	r, ok := m[accessKey]
-	return r, ok
-}
-
 // NewForwardServer wires a TablesSource and a RoleStore behind the
 // gRPC AdminForward service. logger may be nil; defaults to
 // slog.Default().
@@ -237,7 +213,14 @@ func forwardErrorResponse(op string, err error) *pb.AdminForwardResponse {
 		// Should never happen on the leader path — the leader
 		// just verified itself — but if a leadership transfer
 		// races with the dispatch, surface it consistently.
-		return mustForwardJSON(http.StatusServiceUnavailable, errorBody{Error: "leader_unavailable", Message: "leader stepped down mid-request"})
+		// Carry retry_after_seconds=1 so the follower's bridge
+		// translates it back into the same HTTP Retry-After
+		// header the leader-direct path emits (Codex P2 on
+		// PR #635 — without this the forwarded 503 would lose
+		// its retry timing).
+		resp := mustForwardJSON(http.StatusServiceUnavailable, errorBody{Error: "leader_unavailable", Message: "leader stepped down mid-request"})
+		resp.RetryAfterSeconds = 1
+		return resp
 	case errors.Is(err, ErrTablesNotFound):
 		return mustForwardJSON(http.StatusNotFound, errorBody{Error: "not_found", Message: "table does not exist"})
 	case errors.Is(err, ErrTablesAlreadyExists):

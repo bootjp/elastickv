@@ -218,9 +218,19 @@ type AdminForwardResponse struct {
 	// content_type is the response content type the leader chose; in
 	// practice always "application/json; charset=utf-8" but echoed
 	// explicitly so the follower does not have to guess.
-	ContentType   string `protobuf:"bytes,3,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ContentType string `protobuf:"bytes,3,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
+	// retry_after_seconds carries a Retry-After hint the follower's
+	// bridge translates back into an HTTP Retry-After header. The
+	// direct HTTP path sets Retry-After: 1 on 503 leader_unavailable
+	// (mid-dispatch leadership churn); without this field the same
+	// response shape would lose its retry timing once forwarded —
+	// clients would see 503 with no Retry-After and fall back to
+	// their default backoff. Codex P2 on PR #635 flagged the gap.
+	// Zero means "no Retry-After header"; the field is only meaningful
+	// for status codes that traditionally carry one (typically 503).
+	RetryAfterSeconds int32 `protobuf:"varint,4,opt,name=retry_after_seconds,json=retryAfterSeconds,proto3" json:"retry_after_seconds,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *AdminForwardResponse) Reset() {
@@ -274,6 +284,13 @@ func (x *AdminForwardResponse) GetContentType() string {
 	return ""
 }
 
+func (x *AdminForwardResponse) GetRetryAfterSeconds() int32 {
+	if x != nil {
+		return x.RetryAfterSeconds
+	}
+	return 0
+}
+
 var File_admin_forward_proto protoreflect.FileDescriptor
 
 const file_admin_forward_proto_rawDesc = "" +
@@ -287,12 +304,13 @@ const file_admin_forward_proto_rawDesc = "" +
 	"\tprincipal\x18\x01 \x01(\v2\x0f.AdminPrincipalR\tprincipal\x12-\n" +
 	"\toperation\x18\x02 \x01(\x0e2\x0f.AdminOperationR\toperation\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12%\n" +
-	"\x0eforwarded_from\x18\x04 \x01(\tR\rforwardedFrom\"t\n" +
+	"\x0eforwarded_from\x18\x04 \x01(\tR\rforwardedFrom\"\xa4\x01\n" +
 	"\x14AdminForwardResponse\x12\x1f\n" +
 	"\vstatus_code\x18\x01 \x01(\x05R\n" +
 	"statusCode\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12!\n" +
-	"\fcontent_type\x18\x03 \x01(\tR\vcontentType*`\n" +
+	"\fcontent_type\x18\x03 \x01(\tR\vcontentType\x12.\n" +
+	"\x13retry_after_seconds\x18\x04 \x01(\x05R\x11retryAfterSeconds*`\n" +
 	"\x0eAdminOperation\x12\x18\n" +
 	"\x14ADMIN_OP_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15ADMIN_OP_CREATE_TABLE\x10\x01\x12\x19\n" +

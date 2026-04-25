@@ -334,6 +334,12 @@ func TestForwardServer_CreateTable_LeaderSteppedDownReturns503(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(http.StatusServiceUnavailable), resp.GetStatusCode())
 	require.Contains(t, string(resp.GetPayload()), "leader_unavailable")
+	// Codex P2 on PR #635: the leader's 503 must carry the
+	// retry-after hint over the wire so the follower's bridge can
+	// rebuild the same HTTP Retry-After header a leader-direct
+	// 503 would have produced. Without this the forwarded 503
+	// silently strips the retry timing.
+	require.Equal(t, int32(1), resp.GetRetryAfterSeconds())
 }
 
 // TestForwardServer_DeleteTable_LeaderSteppedDownReturns503 mirrors
