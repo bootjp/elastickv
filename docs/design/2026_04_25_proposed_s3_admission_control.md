@@ -132,6 +132,18 @@ const (
     // per PR #617) — leaving headroom for Lua, scan buffers, and Pebble
     // memtables.
     s3PutAdmissionMaxInflightBytes = 256 << 20 // 256 MiB
+    // s3RaftEntryByteBudget is the per-batch unit acquired and
+    // released against the semaphore. It must equal the byte
+    // budget of one Raft entry produced by PutObject /
+    // UploadPart's flush loop (PR #636: s3ChunkSize ×
+    // s3ChunkBatchOps = 1 MiB × 4 = 4 MiB minus protobuf framing
+    // overhead — kept abstract here so the admission contract
+    // does not lock the entry-size choice). The semaphore's
+    // capacity is `s3PutAdmissionMaxInflightBytes /
+    // s3ChunkSize` 1 MiB-units; per-batch acquire takes
+    // `s3RaftEntryByteBudget / s3ChunkSize` units at a time
+    // (= 4 units on the default tunables).
+    s3RaftEntryByteBudget = s3ChunkSize * s3ChunkBatchOps
     // dispatchAdmissionTimeout is how long a per-batch flush will wait
     // for a slot before giving up. The 256 MiB cap drains in ~2 s at
     // 1 Gbps under steady-state Raft throughput (256 MiB / 125 MB/s),
@@ -225,34 +237,58 @@ chunked stream finishes — exactly the failure mode admission control
 exists to prevent. We therefore split chunked admission across two
 mechanisms instead of pre-charging:
 
-1. **Bootstrap reservation = `s3RaftEntryByteBudget` (4 MiB)** at
-   request entry. This is enough to admit the request and let the
-   awsChunkedReader produce its first decoded window. Chunked PUTs
-   are not "free" — they still must beat the same admission queue
-   as fixed-length PUTs at the per-batch level.
+1. **Bootstrap headroom check** at request entry. Calls
+   `peekHeadroom(s3RaftEntryByteBudget)` — exactly the admission-A
+   contract: a fast-fail check that 4 MiB *would have fit* at the
+   moment we asked. **No slot is acquired.** This is intentionally
+   racy with concurrent PUTs (same as fixed-length admission A);
+   its job is to fail at request entry rather than partway
+   through the first decoded frame. Chunked PUTs are not "free"
+   — they still must beat the same admission queue as fixed-length
+   PUTs at the per-frame level.
 2. **Pay-as-you-decode** thereafter, charged via an
-   `awsChunkedReader` progress callback. Each decoded chunk frame
-   (typically up to 64 KiB on the wire after framing overhead)
-   acquires a slot equal to the bytes about to flow into Pebble; the
-   slot is released once the corresponding `coordinator.Dispatch`
-   acks. This is the same path admission B uses for fixed-length
-   PUTs — chunked traffic just hooks into it incrementally instead of
-   pre-charging the worst case.
+   `awsChunkedReader` progress callback. The callback **buffers
+   decoded bytes until a full slot unit (`s3ChunkSize = 1 MiB`) is
+   accumulated**, then calls `acquire(s3ChunkSize)` on the
+   semaphore (same path as fixed-length admission B). This keeps
+   the slot unit coherent: the semaphore's capacity is
+   `s3PutAdmissionMaxInflightBytes / s3ChunkSize` 1 MiB-units, so
+   acquiring at sub-MiB granularity is not representable. The
+   slot is released once the corresponding
+   `coordinator.Dispatch` acks the chunk. The buffer never holds
+   more than `s3ChunkSize - 1` decoded bytes, so the worst-case
+   memory overhead beyond the semaphore-tracked bytes is bounded
+   by 1 MiB per concurrent chunked PUT.
 
 Failure modes:
 
-- If the awsChunkedReader produces frames faster than Raft drains, the
-  per-batch acquire blocks (capped by `dispatchAdmissionTimeout`).
-  Beyond that timeout, mid-stream 503 closes the connection. The
-  legacy "reserve 5 GiB" approach would have surfaced as 503 *at
-  request entry* for unrelated PUTs; this approach surfaces as
-  mid-stream 503 for the chunked PUT itself, which is the right
-  blame attribution.
+- If the awsChunkedReader produces decoded bytes faster than Raft
+  drains, the next 1 MiB acquire blocks (capped by
+  `dispatchAdmissionTimeout`). Beyond that timeout, mid-stream 503
+  closes the connection. The legacy "reserve 5 GiB" approach
+  would have surfaced as 503 *at request entry* for unrelated
+  PUTs; this approach surfaces as mid-stream 503 for the chunked
+  PUT itself, which is the right blame attribution.
+- The bootstrap check at step 1 is racy: another PUT can consume
+  the headroom between the check and the first per-frame acquire.
+  When that happens the first acquire blocks (or 503s on
+  timeout) — the same path the fixed-length admission B handles
+  for the contending case. The race is intentional: making the
+  check a real reservation would multiply per-request slot hold
+  by `concurrent_chunked_PUTs × 4 MiB` of bootstrap-only credit
+  with no corresponding payload, reintroducing a head-of-line
+  hazard.
+- If the awsChunkedReader produces a single frame whose decoded
+  size never accumulates to a full `s3ChunkSize`, the buffer
+  flushes on stream EOF: a final `acquire(actual_buffered_bytes)`
+  rounded up to one slot is taken (semaphore charges in 1-slot
+  units regardless of actual byte count), so the bound holds.
 - If the awsChunkedReader frame size ever exceeds
-  `s3RaftEntryByteBudget` (a malformed client), the per-batch acquire
-  asks for more than the cap allows and we 503 immediately — same
-  as a fixed-length PUT whose `Content-Length` exceeds the global
-  cap.
+  `s3RaftEntryByteBudget` (a malformed client whose decoded
+  cumulative output between framing acks already exceeds 4 MiB),
+  the first per-frame acquire asks for more than the cap allows
+  and we 503 immediately — same as a fixed-length PUT whose
+  `Content-Length` exceeds the global cap.
 
 This change moves chunked admission from M4 (originally "deferred
 optimisation") into M1 (the first shippable milestone). M1 ships

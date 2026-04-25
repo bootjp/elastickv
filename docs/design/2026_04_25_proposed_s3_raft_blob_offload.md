@@ -197,6 +197,29 @@ configuration. Tuning `chunkBlobMinReplicas` higher trades PUT
 availability for stronger durability; tuning lower than 2 is
 rejected at config-load.
 
+**Important durability note for N > 3 clusters.** On a 3-node
+cluster the degraded floor of 2 chunkblob copies happens to match
+Raft's quorum-of-2, so a single node failure is tolerated by both
+the chunkref *and* the chunkblob. For N > 3 this is no longer
+true: a 5-node cluster has Raft quorum 3 and tolerates 2
+simultaneous failures for the chunkref, but the degraded
+chunkblob path (leader + 1 follower) tolerates only 1. If the
+leader and the chunkblob-holding follower both fail during the
+degraded window, the surviving Raft quorum elects a new leader,
+finds a committed chunkref, and discovers that no surviving node
+holds the chunkblob — the chunkref is durable but the object data
+is lost. This is **weaker than the legacy "every byte through
+Raft" path**, which loses data only when Raft itself loses quorum
+(3 simultaneous failures on N=5). Operators on N > 3 clusters who
+need the legacy "blob durability == Raft durability" guarantee
+should configure `chunkBlobMinReplicas = N` (full replication;
+trades some PUT availability — any single peer outage stalls
+PUTs — for the strongest durability the cluster can offer).
+The default `(N/2)+1` is sized for "match Raft quorum," not "match
+Raft fault tolerance"; this distinction is invisible at N=3 but
+material at N≥5 and is what makes this configuration knob
+operationally meaningful.
+
 The trade-off is PUT latency: a PUT now blocks on
 `chunkBlobMinReplicas - 1` follower fsyncs in addition to the Raft
 quorum write of the chunkref. Empirically the chunkblob fsync is
@@ -331,13 +354,28 @@ sweeper needs to know not just *that* the RC reached zero but
       `!s3|chunkblob-gc-queue|…` is Raft-replicated. The phases
       MUST run in this order:
 
-      i. **Raft phase first.** Delete the queue entry through a
-         Raft txn. Concurrent sweepers serialise here on
-         write-write-conflict; only the winner proceeds to the
-         local phase. This makes the queue the global "we are
-         GC-ing this SHA" lock.
+      i. **Raft phase first — conditional delete.** Delete the
+         queue entry through a Raft txn that is **conditional on
+         the queue entry existing AND the RC counter still being
+         0 at the txn's read timestamp**. The conditional form is
+         load-bearing: if a re-reference txn has committed
+         between the sweeper's queue scan and this txn (driving
+         RC back to 1 and atomically removing the queue entry —
+         see §3.1's atomic invariant), the conditional delete
+         fails and the sweeper aborts before reaching the local
+         phase. An *unconditional* delete would silently succeed
+         on the now-absent queue entry and let the sweeper
+         proceed to local-delete a chunkblob that is currently
+         live (RC=1) — a **correctness bug, not just a space
+         leak**. Concurrent sweepers also serialise on this txn
+         (write-write-conflict on the queue key); only the winner
+         proceeds.
       ii. **Local phase second.** Delete the local
           `!s3|chunkblob|<SHA>` from Pebble. No Raft round-trip.
+          Reaching this phase implies (i) succeeded, which
+          implies the RC was 0 at the txn read timestamp and
+          remained 0 throughout the txn's commit window — i.e.
+          the blob is genuinely unreachable.
 
       The phase ordering is the load-bearing detail. If we did
       local-first then Raft, a crash between the two phases would
