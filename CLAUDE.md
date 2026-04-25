@@ -89,6 +89,12 @@ After every code change, run **five independent review passes** — one lens at 
 
 ## Design Documents
 
-`docs/design/` is dated proposals and as-implemented records (`*_proposed_*.md` / `*_implemented_*.md`). Check it before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, etc.). `docs/design/README.md` indexes them.
+`docs/design/` is dated proposals and as-implemented records. Filenames carry one of three lifecycle markers:
 
-**Design-doc-first workflow.** For any change that goes beyond a single-file edit — new feature, new adapter, new control-plane RPC, schema/wire-format change, or any modification touching replication / MVCC / OCC / HLC / routing — **write a `*_proposed_*.md` design doc first and land it before the implementation**. Do not start implementation until the proposal has been reviewed and accepted. The PR may carry both the doc and the implementation (in that order: doc commit first, implementation commits after) as long as the doc is reviewable on its own. Once shipped, rename / supersede the doc to `*_implemented_*.md` so the as-built record is preserved (see existing `*_implemented_*.md` examples for the format).
+- `*_proposed_*.md` — Design accepted, no implementation yet (or implementation just started).
+- `*_partial_*.md` — Some milestones / phases of the design have shipped, but the full proposal is not yet complete. The doc tracks which milestones have landed and what remains. Example: `2026_02_18_partial_hotspot_shard_split.md` (Milestone 1 of the hotspot-split design has shipped; later milestones are still open).
+- `*_implemented_*.md` — All milestones of the proposal have shipped; the doc is preserved as the as-built record.
+
+Check this directory before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, hotspot shard split, etc.). `docs/design/README.md` indexes them.
+
+**Design-doc-first workflow.** For any change that goes beyond a single-file edit — new feature, new adapter, new control-plane RPC, schema/wire-format change, or any modification touching replication / MVCC / OCC / HLC / routing — **write a `*_proposed_*.md` design doc first and land it before the implementation**. Do not start implementation until the proposal has been reviewed and accepted. The PR may carry both the doc and the implementation (in that order: doc commit first, implementation commits after) as long as the doc is reviewable on its own. Lifecycle transitions: rename `*_proposed_*.md` → `*_partial_*.md` once the first milestone ships (and update the doc to record what landed and what is still open); rename `*_partial_*.md` → `*_implemented_*.md` once the final milestone ships. Use `git mv` so the history follows the rename.
