@@ -528,9 +528,10 @@ func (h *DynamoHandler) writeTablesError(w http.ResponseWriter, r *http.Request,
 		writeJSONError(w, http.StatusForbidden, "forbidden",
 			"this endpoint requires a full-access role")
 	case errors.Is(err, ErrTablesNotLeader):
-		// The follower→leader forwarding RPC (design 3.3) will
-		// catch this case in a follow-up PR. Until then, surface
-		// 503 + Retry-After: 1 so the SPA / curl can re-issue.
+		// Reached only when no LeaderForwarder is configured (single-
+		// node or leader-only deployments). When a forwarder is wired,
+		// tryForwardCreate / tryForwardDelete intercept ErrTablesNotLeader
+		// before writeTablesError is called.
 		w.Header().Set("Retry-After", "1")
 		writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
 			"this admin node is not the raft leader")

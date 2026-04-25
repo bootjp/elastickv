@@ -156,6 +156,7 @@ func TestDynamoHandler_ForwarderTransportErrorReturns503(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
 	require.NotContains(t, rec.Body.String(), "TX-1")
 	require.NotContains(t, rec.Body.String(), "transport sentinel")
 }
@@ -238,9 +239,10 @@ func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
 // catches it and routes through writeForwardFailure.
 func TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete(t *testing.T) {
 	fwd := &stubLeaderForwarder{deleteErr: ErrLeaderUnavailable}
-	src := &notLeaderSource{stubTablesSource: stubTablesSource{
-		tables: map[string]*DynamoTableSummary{"users": {Name: "users"}},
-	}}
+	// notLeaderSource.AdminDeleteTable unconditionally returns
+	// ErrTablesNotLeader, so the embedded stubTablesSource.tables
+	// map is never consulted — keep the construction minimal.
+	src := &notLeaderSource{}
 	h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
 	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
 	req = withWritePrincipal(req)
@@ -261,9 +263,7 @@ func TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete(t *testing.T)
 // strictly on the wire shape.
 func TestDynamoHandler_ForwarderTransportErrorReturns503_Delete(t *testing.T) {
 	fwd := &stubLeaderForwarder{deleteErr: errors.New("gRPC transport sentinel DEL-TX-1")}
-	src := &notLeaderSource{stubTablesSource: stubTablesSource{
-		tables: map[string]*DynamoTableSummary{"users": {Name: "users"}},
-	}}
+	src := &notLeaderSource{}
 	h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
 	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/users", nil)
 	req = withWritePrincipal(req)
