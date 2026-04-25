@@ -188,6 +188,11 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	c := rawKVClient(t, adders)
 	defer shutdown(nodes)
 
+	// Use t.Context() so a test-level cancel (timeout, parent test
+	// stopping) propagates into every RPC and the retry loop alike,
+	// rather than leaking work via context.Background() once the test
+	// goroutine returns.
+	ctx := t.Context()
 	key := []byte("test-key-sequence")
 
 	// Each RPC is wrapped in retryNotLeader so an in-flight Raft
@@ -199,9 +204,8 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	// subsequent Get must return the same value, otherwise we fail.
 	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
-		err := retryNotLeader(context.Background(), func() error {
-			_, perr := c.RawPut(context.Background(),
-				&pb.RawPutRequest{Key: key, Value: want})
+		err := retryNotLeader(ctx, func() error {
+			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
 			return perr
 		})
 		// Stop at the first non-leader-churn RPC failure instead of
@@ -212,9 +216,8 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			break
 		}
 
-		err = retryNotLeader(context.Background(), func() error {
-			_, perr := c.RawPut(context.Background(),
-				&pb.RawPutRequest{Key: key, Value: want})
+		err = retryNotLeader(ctx, func() error {
+			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
 			return perr
 		})
 		if !assert.NoError(t, err, "Put RPC failed") {
@@ -222,9 +225,9 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 		}
 
 		var resp *pb.RawGetResponse
-		err = retryNotLeader(context.Background(), func() error {
+		err = retryNotLeader(ctx, func() error {
 			var gerr error
-			resp, gerr = c.RawGet(context.Background(), &pb.RawGetRequest{Key: key})
+			resp, gerr = c.RawGet(ctx, &pb.RawGetRequest{Key: key})
 			return gerr
 		})
 		if !assert.NoError(t, err, "Get RPC failed") {
@@ -245,6 +248,9 @@ func Test_grpc_transaction(t *testing.T) {
 	c := transactionalKVClient(t, adders)
 	defer shutdown(nodes)
 
+	// See Test_consistency_satisfy_write_after_read_sequence for why
+	// we use t.Context() and retryNotLeader together.
+	ctx := t.Context()
 	key := []byte("test-key-sequence")
 
 	// Same retryNotLeader wrap as Test_consistency_satisfy_write_after_read
@@ -253,8 +259,8 @@ func Test_grpc_transaction(t *testing.T) {
 	// invariants strict.
 	for i := range 9999 {
 		want := []byte("sequence" + strconv.Itoa(i))
-		err := retryNotLeader(context.Background(), func() error {
-			_, perr := c.Put(context.Background(), &pb.PutRequest{Key: key, Value: want})
+		err := retryNotLeader(ctx, func() error {
+			_, perr := c.Put(ctx, &pb.PutRequest{Key: key, Value: want})
 			return perr
 		})
 		// See Test_consistency_satisfy_write_after_read_sequence:
@@ -264,9 +270,9 @@ func Test_grpc_transaction(t *testing.T) {
 			break
 		}
 		var resp *pb.GetResponse
-		err = retryNotLeader(context.Background(), func() error {
+		err = retryNotLeader(ctx, func() error {
 			var gerr error
-			resp, gerr = c.Get(context.Background(), &pb.GetRequest{Key: key})
+			resp, gerr = c.Get(ctx, &pb.GetRequest{Key: key})
 			return gerr
 		})
 		if !assert.NoError(t, err, "Get RPC failed") {
@@ -274,17 +280,17 @@ func Test_grpc_transaction(t *testing.T) {
 		}
 		assert.Equal(t, want, resp.Value, "consistency check failed")
 
-		err = retryNotLeader(context.Background(), func() error {
-			_, derr := c.Delete(context.Background(), &pb.DeleteRequest{Key: key})
+		err = retryNotLeader(ctx, func() error {
+			_, derr := c.Delete(ctx, &pb.DeleteRequest{Key: key})
 			return derr
 		})
 		if !assert.NoError(t, err, "Delete RPC failed") {
 			break
 		}
 
-		err = retryNotLeader(context.Background(), func() error {
+		err = retryNotLeader(ctx, func() error {
 			var gerr error
-			resp, gerr = c.Get(context.Background(), &pb.GetRequest{Key: key})
+			resp, gerr = c.Get(ctx, &pb.GetRequest{Key: key})
 			return gerr
 		})
 		if !assert.NoError(t, err, "Get RPC failed") {
