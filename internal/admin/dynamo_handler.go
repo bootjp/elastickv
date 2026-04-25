@@ -163,11 +163,12 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	if next != "" {
 		resp.NextToken = encodeDynamoNextToken(next)
 	}
-	// Tables is an array contract; mint an empty slice rather than
-	// emitting JSON `null` when the cluster has no tables yet.
-	if resp.Tables == nil {
-		resp.Tables = []string{}
-	}
+	// paginateDynamoTableNames is total over its input — it always
+	// returns a non-nil slice (an empty []string{} on the
+	// "cursor past end" branch, a real sub-slice otherwise) so the
+	// JSON shape is always `"tables": []` rather than `null` even
+	// without an explicit nil-check here. The Tables array
+	// contract is enforced at the producer.
 	writeAdminJSON(w, r.Context(), h.logger, resp)
 }
 
@@ -288,6 +289,13 @@ func writeAdminJSON(w http.ResponseWriter, ctx context.Context, logger *slog.Log
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Defence-in-depth: tell the browser not to MIME-sniff the
+	// response body. The admin surface is JSON-only, so a sniffed
+	// "this might be HTML" guess is never useful and could enable
+	// XSS-via-sniffing on a hostile payload that somehow reached
+	// here. Cookie-gated admin endpoints + a single static
+	// Content-Type make this cheap and standard.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if _, werr := w.Write(payload); werr != nil {
