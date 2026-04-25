@@ -101,7 +101,17 @@ var (
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 	raftSqsMap           = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
+	// Admin gRPC service flags (this PR — wired into the per-group raft
+	// listeners; consumed by cmd/elastickv-admin via the bearer-token
+	// gateway). These are independent of the admin HTTP listener flags
+	// below — both can be enabled simultaneously, and operators can pick
+	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
+	// SigV4 access keys).
+	adminTokenFile      = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
+	adminInsecureNoAuth = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
 
+	// Admin HTTP listener flags (PR #545's parallel work merged into
+	// main; serves the cookie/SigV4-authenticated admin dashboard).
 	adminEnabled                       = flag.Bool("adminEnabled", false, "Enable the admin HTTP listener")
 	adminListen                        = flag.String("adminListen", "127.0.0.1:8080", "host:port for the admin HTTP listener (loopback by default)")
 	adminTLSCertFile                   = flag.String("adminTLSCertFile", "", "PEM-encoded TLS certificate for the admin listener")
@@ -115,6 +125,8 @@ var (
 	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
 	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 )
+
+const adminTokenMaxBytes = 4 << 10
 
 // memoryPressureExit is set to true by the memwatch OnExceed callback to
 // signal that the subsequent graceful shutdown was triggered by user-space
@@ -296,42 +308,14 @@ func run() error {
 		return nil
 	})
 
-	runner := runtimeServerRunner{
-		ctx:             runCtx,
-		lc:              &lc,
-		eg:              eg,
-		cancel:          cancel,
-		runtimes:        runtimes,
-		shardStore:      shardStore,
-		coordinate:      coordinate,
-		distServer:      distServer,
-		redisAddress:    *redisAddr,
-		leaderRedis:     cfg.leaderRedis,
-		pubsubRelay:     adapter.NewRedisPubSubRelay(),
-		readTracker:     readTracker,
-		dynamoAddress:   *dynamoAddr,
-		leaderDynamo:    cfg.leaderDynamo,
-		s3Address:       *s3Addr,
-		leaderS3:        cfg.leaderS3,
-		s3Region:        *s3Region,
-		s3CredsFile:     *s3CredsFile,
-		s3PathStyleOnly: *s3PathStyleOnly,
-		sqsAddress:      *sqsAddr,
-		leaderSQS:       cfg.leaderSQS,
-		sqsRegion:       *sqsRegion,
-		sqsCredsFile:    *sqsCredsFile,
-		metricsAddress:  *metricsAddr,
-		metricsToken:    *metricsToken,
-		pprofAddress:    *pprofAddr,
-		pprofToken:      *pprofToken,
-		metricsRegistry: metricsRegistry,
-	}
-	if err := runner.start(); err != nil {
+	if err := startServers(serversInput{
+		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
+		runtimes: runtimes, bootstrapServers: bootstrapServers,
+		shardStore: shardStore, coordinate: coordinate,
+		distServer: distServer, readTracker: readTracker,
+		metricsRegistry: metricsRegistry, cfg: cfg,
+	}); err != nil {
 		return err
-	}
-
-	if err := startAdminFromFlags(runCtx, &lc, eg, runtimes); err != nil {
-		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -638,6 +622,222 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 	return out
 }
 
+// setupAdminService is a thin wrapper around configureAdminService that also
+// binds each Raft runtime to the server and logs an operator warning when
+// running without authentication. Keeping this out of run() preserves run's
+// cyclomatic-complexity budget. Members are seeded from the bootstrap
+// configuration so GetClusterOverview advertises peer node addresses to the
+// admin binary's fan-out discovery path.
+// serversInput bundles the values run() passes to startServers so the
+// signature stays compact and run() stays under the cyclop budget.
+type serversInput struct {
+	ctx              context.Context
+	eg               *errgroup.Group
+	cancel           context.CancelFunc
+	lc               *net.ListenConfig
+	runtimes         []*raftGroupRuntime
+	bootstrapServers []raftengine.Server
+	shardStore       *kv.ShardStore
+	coordinate       kv.Coordinator
+	distServer       *adapter.DistributionServer
+	readTracker      *kv.ActiveTimestampTracker
+	metricsRegistry  *monitoring.Registry
+	cfg              runtimeConfig
+}
+
+// startServers wires up the AdminServer, builds the runtime runner, and
+// kicks off both the per-group raft listeners and the admin HTTP listener.
+// Extracted from run() to keep cyclomatic complexity within budget.
+func startServers(in serversInput) error {
+	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers)
+	if err != nil {
+		return err
+	}
+	runner := runtimeServerRunner{
+		ctx:             in.ctx,
+		lc:              in.lc,
+		eg:              in.eg,
+		cancel:          in.cancel,
+		runtimes:        in.runtimes,
+		shardStore:      in.shardStore,
+		coordinate:      in.coordinate,
+		distServer:      in.distServer,
+		adminServer:     adminServer,
+		adminGRPCOpts:   adminGRPCOpts,
+		redisAddress:    *redisAddr,
+		leaderRedis:     in.cfg.leaderRedis,
+		pubsubRelay:     adapter.NewRedisPubSubRelay(),
+		readTracker:     in.readTracker,
+		dynamoAddress:   *dynamoAddr,
+		leaderDynamo:    in.cfg.leaderDynamo,
+		s3Address:       *s3Addr,
+		leaderS3:        in.cfg.leaderS3,
+		s3Region:        *s3Region,
+		s3CredsFile:     *s3CredsFile,
+		s3PathStyleOnly: *s3PathStyleOnly,
+		sqsAddress:      *sqsAddr,
+		leaderSQS:       in.cfg.leaderSQS,
+		sqsRegion:       *sqsRegion,
+		sqsCredsFile:    *sqsCredsFile,
+		metricsAddress:  *metricsAddr,
+		metricsToken:    *metricsToken,
+		pprofAddress:    *pprofAddr,
+		pprofToken:      *pprofToken,
+		metricsRegistry: in.metricsRegistry,
+	}
+	if err := runner.start(); err != nil {
+		return err
+	}
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes); err != nil {
+		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+	}
+	return nil
+}
+
+func setupAdminService(
+	nodeID, grpcAddress string,
+	runtimes []*raftGroupRuntime,
+	bootstrapServers []raftengine.Server,
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
+	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
+	// In multi-group mode the process does not listen on *myAddr — each group
+	// has its own rt.spec.address. Use the lowest-group-ID listener as the
+	// canonical self address so GetClusterOverview.Self advertises an
+	// endpoint the fan-out can actually dial. Falls back to the flag value
+	// when no runtimes are registered (single-node dev runs).
+	selfAddr := canonicalSelfAddress(grpcAddress, runtimes)
+	srv, icept, err := configureAdminService(
+		*adminTokenFile,
+		*adminInsecureNoAuth,
+		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
+		members,
+	)
+	if err != nil {
+		return nil, adminGRPCInterceptors{}, err
+	}
+	if srv == nil {
+		return nil, adminGRPCInterceptors{}, nil
+	}
+	for _, rt := range runtimes {
+		srv.RegisterGroup(rt.spec.id, rt.engine)
+	}
+	if *adminInsecureNoAuth {
+		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
+	}
+	return srv, icept, nil
+}
+
+// canonicalSelfAddress picks the listener address AdminServer should advertise
+// as Self.GRPCAddress. The Admin gRPC service is registered on every Raft
+// group's listener in startRaftServers, so any runtime's address is reachable;
+// we pick the lowest group ID to make the choice deterministic across
+// restarts. Returns the supplied fallback when no runtimes exist (e.g., a
+// single-node dev invocation without --raftGroups).
+func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string {
+	var (
+		bestID   uint64
+		bestAddr string
+		found    bool
+	)
+	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
+		if !found || rt.spec.id < bestID {
+			bestID, bestAddr, found = rt.spec.id, rt.spec.address, true
+		}
+	}
+	if !found {
+		return fallback
+	}
+	return bestAddr
+}
+
+// adminMembersFromBootstrap extracts the peer list (everyone except self) from
+// the Raft bootstrap configuration so GetClusterOverview returns a populated
+// members list. Without this the admin binary's membersFrom cache collapses to
+// only the responding seed and stops fanning out across the cluster.
+func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []adapter.NodeIdentity {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([]adapter.NodeIdentity, 0, len(servers))
+	for _, s := range servers {
+		if s.ID == selfID {
+			continue
+		}
+		out = append(out, adapter.NodeIdentity{
+			NodeID:      s.ID,
+			GRPCAddress: s.Address,
+		})
+	}
+	return out
+}
+
+// adminGRPCInterceptors bundles the unary+stream interceptors that enforce the
+// Admin bearer token. Returning the raw interceptor functions (rather than
+// pre-wrapped grpc.ServerOption values via grpc.ChainUnaryInterceptor) lets
+// the registration site combine them with any other interceptors in a single
+// ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
+// silent overwrites (gRPC-Go: last option of the same type wins).
+type adminGRPCInterceptors struct {
+	unary  []grpc.UnaryServerInterceptor
+	stream []grpc.StreamServerInterceptor
+}
+
+func (a adminGRPCInterceptors) empty() bool {
+	return len(a.unary) == 0 && len(a.stream) == 0
+}
+
+// configureAdminService builds the node-side AdminServer plus the interceptor
+// set that enforces its bearer token, or returns (nil, {}, nil) when the
+// service is intentionally disabled. It is mutually exclusive with
+// --adminInsecureNoAuth so operators have to opt into the unauthenticated
+// mode explicitly.
+func configureAdminService(
+	tokenPath string,
+	insecureNoAuth bool,
+	self adapter.NodeIdentity,
+	members []adapter.NodeIdentity,
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
+	if tokenPath == "" && !insecureNoAuth {
+		return nil, adminGRPCInterceptors{}, nil
+	}
+	if tokenPath != "" && insecureNoAuth {
+		return nil, adminGRPCInterceptors{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
+	}
+	token := ""
+	if tokenPath != "" {
+		loaded, err := loadAdminTokenFile(tokenPath)
+		if err != nil {
+			return nil, adminGRPCInterceptors{}, err
+		}
+		token = loaded
+	}
+	srv := adapter.NewAdminServer(self, members)
+	unary, stream := adapter.AdminTokenAuth(token)
+	var icept adminGRPCInterceptors
+	if unary != nil {
+		icept.unary = append(icept.unary, unary)
+	}
+	if stream != nil {
+		icept.stream = append(icept.stream, stream)
+	}
+	return srv, icept, nil
+}
+
+// loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
+// so a misconfigured path (for example a log file) cannot force an arbitrary
+// allocation before the bearer-token check. Delegates to the shared helper in
+// internal/ so the admin binary and the node process read tokens identically.
+func loadAdminTokenFile(path string) (string, error) {
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
+	if err != nil {
+		return "", errors.Wrap(err, "load admin token")
+	}
+	return tok, nil
+}
+
 // startMemoryWatchdog optionally starts the memwatch goroutine. The
 // watcher is off by default; it is enabled only when the operator sets
 // ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
@@ -733,15 +933,38 @@ func startRaftServers(
 	distServer *adapter.DistributionServer,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
+	adminServer *adapter.AdminServer,
+	adminGRPCOpts adminGRPCInterceptors,
 ) error {
+	// extraOptsCap reserves slots for the unary + stream admin interceptor
+	// options appended below. Sized as a constant so the magic-number
+	// linter does not complain.
+	const extraOptsCap = 2
 	for _, rt := range runtimes {
-		gs := grpc.NewServer(internalutil.GRPCServerOptions()...)
+		baseOpts := internalutil.GRPCServerOptions()
+		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
+		opts = append(opts, baseOpts...)
+		// Collapse all interceptors into a single ChainUnaryInterceptor /
+		// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
+		// (single-interceptor) option added anywhere in this chain cannot
+		// silently overwrite the admin auth gate — gRPC-Go keeps only the
+		// last option of the same type.
+		if len(adminGRPCOpts.unary) > 0 {
+			opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
+		}
+		if len(adminGRPCOpts.stream) > 0 {
+			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+		}
+		gs := grpc.NewServer(opts...)
 		trx := kv.NewTransactionWithProposer(rt.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
 		pb.RegisterDistributionServer(gs, distServer)
+		if adminServer != nil {
+			pb.RegisterAdminServer(gs, adminServer)
+		}
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 		reflection.Register(gs)
@@ -962,6 +1185,8 @@ type runtimeServerRunner struct {
 	shardStore      *kv.ShardStore
 	coordinate      kv.Coordinator
 	distServer      *adapter.DistributionServer
+	adminServer     *adapter.AdminServer
+	adminGRPCOpts   adminGRPCInterceptors
 	redisAddress    string
 	leaderRedis     map[string]string
 	pubsubRelay     *adapter.RedisPubSubRelay
@@ -1000,6 +1225,8 @@ func (r runtimeServerRunner) start() error {
 		func(groupID uint64) kv.ProposalObserver {
 			return r.metricsRegistry.RaftProposalObserver(groupID)
 		},
+		r.adminServer,
+		r.adminGRPCOpts,
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
