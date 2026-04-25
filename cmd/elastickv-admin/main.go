@@ -686,15 +686,48 @@ func (f *fanout) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": results})
 }
 
-// writeJSON marshals body into a buffer first, so an encoding failure can
-// still surface as a 500 instead of a truncated body under a committed 2xx
-// header. The admin API response bodies are small (bounded by rows/routes
-// caps in later phases), so buffering is safe.
+// maxResponseBodyBytes caps writeJSON's encode buffer. With fan-out across at
+// most maxDiscoveredNodes=512 nodes returning a small GetClusterOverview proto
+// each, real responses sit in the low MiBs; this cap (16 MiB) leaves plenty
+// of headroom while preventing a misbehaving node from forcing unbounded
+// memory growth in the admin process.
+const maxResponseBodyBytes = 16 << 20
+
+// writeJSONBufferPool reuses encode buffers across requests so a steady stream
+// of /api/* calls doesn't churn the heap with per-request allocations. The
+// pool stores *bytes.Buffer; each user resets and bounds the buffer.
+var writeJSONBufferPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// writeJSON marshals body into a pooled, size-capped buffer first, so an
+// encoding failure can still surface as a 500 instead of a truncated body
+// under a committed 2xx header. The cap (maxResponseBodyBytes) bounds memory
+// even if a misbehaving downstream returns an oversized payload.
 func writeJSON(w http.ResponseWriter, code int, body any) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	if err := enc.Encode(body); err != nil {
-		log.Printf("elastickv-admin: encode JSON response: %v", err)
+	buf, ok := writeJSONBufferPool.Get().(*bytes.Buffer)
+	if !ok {
+		buf = new(bytes.Buffer)
+	}
+	defer func() {
+		// Drop very large buffers rather than retaining them in the pool —
+		// keeps steady-state memory close to the typical response size.
+		const maxRetainBytes = 1 << 20
+		if buf.Cap() > maxRetainBytes {
+			return
+		}
+		buf.Reset()
+		writeJSONBufferPool.Put(buf)
+	}()
+	buf.Reset()
+
+	limited := &cappedWriter{w: buf, max: maxResponseBodyBytes}
+	if err := json.NewEncoder(limited).Encode(body); err != nil || limited.exceeded {
+		if limited.exceeded {
+			log.Printf("elastickv-admin: response exceeded %d-byte cap; returning 500", maxResponseBodyBytes)
+		} else {
+			log.Printf("elastickv-admin: encode JSON response: %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		const fallback = `{"code":500,"message":"internal server error"}` + "\n"
@@ -708,6 +741,33 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 	if _, err := w.Write(buf.Bytes()); err != nil {
 		log.Printf("elastickv-admin: write JSON response: %v", err)
 	}
+}
+
+// cappedWriter wraps an io.Writer and refuses writes once `written` would
+// exceed `max`. Used by writeJSON so json.Encoder stops streaming bytes into
+// the buffer past the cap; the encoder reports the short-write and writeJSON
+// returns a 500 instead of an oversized body.
+type cappedWriter struct {
+	w        *bytes.Buffer
+	max      int
+	written  int
+	exceeded bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.exceeded {
+		return 0, errors.New("response body cap exceeded")
+	}
+	if c.written+len(p) > c.max {
+		c.exceeded = true
+		return 0, fmt.Errorf("response body would exceed %d bytes", c.max)
+	}
+	n, err := c.w.Write(p)
+	c.written += n
+	if err != nil {
+		return n, errors.Wrap(err, "buffer write")
+	}
+	return n, nil
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {

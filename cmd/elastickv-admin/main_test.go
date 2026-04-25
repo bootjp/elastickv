@@ -478,6 +478,30 @@ func TestHandleOverviewRejectsNonGET(t *testing.T) {
 	}
 }
 
+// TestWriteJSONCapsResponseBody asserts that an oversized body is rejected
+// with 500 instead of streaming MiBs of bytes into the response. Caps memory
+// usage in the admin process when fan-out hits a misbehaving downstream that
+// returns an enormous payload.
+func TestWriteJSONCapsResponseBody(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	// 17 MiB ASCII payload (each entry is a 16-byte string + 3 bytes JSON
+	// punctuation × 1<<20 entries ≈ 19 MiB encoded), well past
+	// maxResponseBodyBytes=16 MiB.
+	const elems = 1 << 20
+	huge := make([]string, elems)
+	for i := range huge {
+		huge[i] = "0123456789abcdef"
+	}
+	writeJSON(rec, http.StatusOK, huge)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want %d (cap exceeded)", rec.Code, http.StatusInternalServerError)
+	}
+	if !strings.Contains(rec.Body.String(), "internal server error") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
 func TestWriteJSONSurfacesEncodeFailure(t *testing.T) {
 	t.Parallel()
 	rec := httptest.NewRecorder()
