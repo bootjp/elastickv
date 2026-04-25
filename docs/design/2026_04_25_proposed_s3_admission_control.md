@@ -283,9 +283,22 @@ materialise by default.
 
 ```
 elastickv_s3_put_admission_inflight_bytes        gauge
-elastickv_s3_put_admission_rejections_total      counter (label: stage="prereserve" | "perbatch")
-elastickv_s3_put_admission_wait_seconds          histogram (label: stage)
+elastickv_s3_put_admission_rejections_total      counter (labels:
+                                                    stage    = "prereserve" | "perbatch",
+                                                    protocol = "fixed-length" | "chunked")
+elastickv_s3_put_admission_wait_seconds          histogram (labels: stage, protocol)
 ```
+
+The `protocol` label distinguishes fixed-length PUTs (those with a
+declared `Content-Length`, hitting admission A's `peekHeadroom`)
+from aws-chunked PUTs (admission via §3.3.1's pay-as-you-decode).
+This split is what makes the chunked-PUT 503 surface (§6) and the
+rolling-upgrade alerting story actionable: a spike on
+`stage="perbatch", protocol="chunked"` points at "chunked clients
+beat Raft drain"; a spike on `stage="prereserve",
+protocol="fixed-length"` points at "client concurrency exceeds
+the per-node aggregate cap." Without the dimension the two
+failure modes are indistinguishable in a single counter.
 
 Grafana panel: inflight gauge with the cap as a horizontal line so
 the operator sees how often the system saturates. Rejection rate
@@ -316,13 +329,19 @@ suggests bumping the cap or scaling out (more nodes spreads PUT load).
   pendingBatch slice for the entire retry window, so the budget
   must reflect them; a release-between-retries scheme would let a
   second PUT proceed while the first is still memory-resident,
-  breaking the bound. The total wall-clock cost of holding through
-  one full retry chain is bounded by
-  `s3TxnRetryMaxAttempts × (redisDispatchTimeout + s3TxnRetryMaxBackoff)`;
-  if that ever exceeds `dispatchAdmissionTimeout` the per-batch
-  acquire on the *next* batch surfaces as 503, which is the right
-  failure mode (chronic dispatch failure → caller learns instead of
-  silently consuming the budget).
+  breaking the bound. The S3 PUT path uses the inbound
+  `*http.Request` context for `coordinator.Dispatch` (no
+  S3-specific Dispatch timeout — the HTTP server's
+  `writeTimeout` / client-side cancellation is the upper bound on
+  one Dispatch attempt), so the wall-clock cost of holding the
+  slot through one full retry chain is bounded by
+  `s3TxnRetryMaxAttempts × (single_dispatch_budget + s3TxnRetryMaxBackoff)`
+  where `single_dispatch_budget` is whatever the request context
+  permits at that moment. If the retry chain duration ever
+  exceeds `dispatchAdmissionTimeout` the per-batch acquire on the
+  *next* batch surfaces as 503 — the right failure mode
+  (chronic dispatch failure → caller learns instead of silently
+  consuming the budget).
 
 ## 5. Implementation plan
 

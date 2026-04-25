@@ -323,22 +323,48 @@ sweeper needs to know not just *that* the RC reached zero but
    a. scans the queue range `[!s3|chunkblob-gc-queue|, !s3|chunkblob-gc-queue|<now-gracePeriod>|)`
       for entries whose grace window has elapsed,
    b. for each `<SHA>` returned, re-checks the RC counter at the
-      sweeper's read timestamp; if the RC is still 0, deletes the
-      local `!s3|chunkblob|<SHA>` AND deletes the queue entry —
-      both as a single Raft txn so the queue stays consistent with
-      the keyspace,
+      sweeper's read timestamp.
+
+      *The deletion is two-phase across two storage layers and is
+      NOT a single transaction* — `!s3|chunkblob|<SHA>` is local
+      Pebble (per §3.1, never written through Raft), while
+      `!s3|chunkblob-gc-queue|…` is Raft-replicated. The phases
+      MUST run in this order:
+
+      i. **Raft phase first.** Delete the queue entry through a
+         Raft txn. Concurrent sweepers serialise here on
+         write-write-conflict; only the winner proceeds to the
+         local phase. This makes the queue the global "we are
+         GC-ing this SHA" lock.
+      ii. **Local phase second.** Delete the local
+          `!s3|chunkblob|<SHA>` from Pebble. No Raft round-trip.
+
+      The phase ordering is the load-bearing detail. If we did
+      local-first then Raft, a crash between the two phases would
+      leave the chunkblob gone locally but the queue entry still
+      present — every subsequent sweep would re-attempt the local
+      delete (no-op) and the queue entry would never get removed
+      until manual intervention. The Raft-first ordering trades
+      that for the inverse failure mode: a crash between the two
+      phases leaves the queue entry deleted but the local
+      chunkblob still on disk — a **bounded local space leak,
+      not a correctness bug**. A periodic "orphan scan" (chunkblob
+      keys whose SHA has RC=0 *and* no queue entry) reclaims
+      these without urgency. The orphan scan runs at low priority
+      out of band from the sweeper.
    c. if the RC has bounced above 0 in the meantime, the queue
       entry is stale (a re-reference txn forgot to remove it, or
       the sweeper raced) and the sweeper deletes only the queue
-      entry, leaving the chunkblob in place.
+      entry through a Raft txn, leaving the chunkblob in place.
 
 The queue is the authoritative "blob is GC-eligible since T"
-signal; the RC is the authoritative "is reachable" signal. Both
-are Raft-replicated, so every node arrives at the same set of
-sweepable SHAs and the same eligibility window. Different nodes
-running sweepers concurrently is safe because step (3b) commits
-through Raft and the txn fails with a write-write conflict on the
-second sweeper, leaving the first sweeper's deletion authoritative.
+signal *and* the global "we are GC-ing this SHA" lock — its
+Raft-replicated single-writer-per-key property is what makes
+concurrent sweepers safe across nodes. The RC is the
+authoritative "is reachable" signal, also Raft-replicated. Local
+chunkblob deletes are deliberately *not* replicated: each node
+deletes its own copy independently after the queue-entry txn
+commits, because that's the whole point of the architecture.
 
 `chunkBlobGCGracePeriod` defaults to 1 hour. The grace window
 absorbs in-flight reads (a peer that has already started fetching
