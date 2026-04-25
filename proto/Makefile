@@ -1,39 +1,63 @@
-PROTOC_VERSION := libprotoc 29.3
-PROTOC_GEN_GO_VERSION := protoc-gen-go v1.36.11
-PROTOC_GEN_GO_GRPC_VERSION := protoc-gen-go-grpc 1.6.1
+BUF_VERSION := 1.55.1
+PROTOC_GEN_GO_VERSION := 1.36.11
+PROTOC_GEN_GO_GRPC_VERSION := 1.6.1
 
-.PHONY: all gen check-tools
+BUF ?= buf
+# BREAKING_AGAINST lets callers override the auto-detected baseline.
+BREAKING_AGAINST ?=
+
+.PHONY: all gen check-tools breaking
 
 all: gen
 
 check-tools:
-	@if [ "$$(protoc --version)" != "$(PROTOC_VERSION)" ]; then \
-		echo "expected $(PROTOC_VERSION), got $$(protoc --version)"; \
+	@command -v $(BUF) >/dev/null 2>&1 || { \
+		echo "buf not found; install with:"; \
+		echo "  go install github.com/bufbuild/buf/cmd/buf@v$(BUF_VERSION)"; \
+		exit 1; \
+	}
+	@installed=$$($(BUF) --version 2>/dev/null); \
+	if [ "$$installed" != "$(BUF_VERSION)" ]; then \
+		echo "buf version mismatch: expected $(BUF_VERSION), got $$installed"; \
+		echo "install with: go install github.com/bufbuild/buf/cmd/buf@v$(BUF_VERSION)"; \
 		exit 1; \
 	fi
-	@if [ "$$(protoc-gen-go --version)" != "$(PROTOC_GEN_GO_VERSION)" ]; then \
-		echo "expected $(PROTOC_GEN_GO_VERSION), got $$(protoc-gen-go --version)"; \
+	@command -v protoc-gen-go >/dev/null 2>&1 || { \
+		echo "protoc-gen-go not found; install with:"; \
+		echo "  go install google.golang.org/protobuf/cmd/protoc-gen-go@v$(PROTOC_GEN_GO_VERSION)"; \
+		exit 1; \
+	}
+	@installed=$$(protoc-gen-go --version 2>/dev/null); \
+	if [ "$$installed" != "protoc-gen-go v$(PROTOC_GEN_GO_VERSION)" ]; then \
+		echo "protoc-gen-go version mismatch: expected v$(PROTOC_GEN_GO_VERSION), got $$installed"; \
+		echo "install with: go install google.golang.org/protobuf/cmd/protoc-gen-go@v$(PROTOC_GEN_GO_VERSION)"; \
 		exit 1; \
 	fi
-	@if [ "$$(protoc-gen-go-grpc --version)" != "$(PROTOC_GEN_GO_GRPC_VERSION)" ]; then \
-		echo "expected $(PROTOC_GEN_GO_GRPC_VERSION), got $$(protoc-gen-go-grpc --version)"; \
+	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || { \
+		echo "protoc-gen-go-grpc not found; install with:"; \
+		echo "  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)"; \
+		exit 1; \
+	}
+	@installed=$$(protoc-gen-go-grpc --version 2>/dev/null); \
+	if [ "$$installed" != "protoc-gen-go-grpc $(PROTOC_GEN_GO_GRPC_VERSION)" ]; then \
+		echo "protoc-gen-go-grpc version mismatch: expected $(PROTOC_GEN_GO_GRPC_VERSION), got $$installed"; \
+		echo "install with: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)"; \
 		exit 1; \
 	fi
 
-gen: check-tools
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    service.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    distribution.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    dynamodb_internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    redis_internal.proto
-	protoc --go_out=. --go_opt=paths=source_relative \
-	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	    etcd_raft.proto
+breaking: check-tools
+	@baseline=''; \
+	if git -C .. rev-parse --verify main >/dev/null 2>&1; then \
+		baseline='../.git#subdir=proto,branch=main'; \
+	elif git -C .. rev-parse --verify origin/main >/dev/null 2>&1; then \
+		baseline='../.git#subdir=proto,ref=refs/remotes/origin/main'; \
+	else \
+		echo "no breaking baseline found: neither 'main' nor 'origin/main' is reachable"; \
+		echo "fetch main first (git fetch origin main) or override with BREAKING_AGAINST=..."; \
+		exit 1; \
+	fi; \
+	if [ -n "$(BREAKING_AGAINST)" ]; then baseline='$(BREAKING_AGAINST)'; fi; \
+	$(BUF) breaking --against "$$baseline"
+
+gen: check-tools breaking
+	$(BUF) generate
