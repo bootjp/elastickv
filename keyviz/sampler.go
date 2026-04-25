@@ -107,6 +107,13 @@ type MemSampler struct {
 	// (Flush) acquire it; Observe never touches it.
 	historyMu sync.Mutex
 	history   *ringBuffer
+
+	// retiredSlots holds slots that RemoveRoute removed from the live
+	// table since the last Flush. Flush drains and clears the list so
+	// counts accumulated between (last flush, RemoveRoute) are not
+	// silently dropped during route churn.
+	retiredMu    sync.Mutex
+	retiredSlots []*routeSlot
 }
 
 // routeTable is the COW snapshot Observe operates on. Once published
@@ -126,9 +133,18 @@ type routeTable struct {
 
 // routeSlot owns the atomic counters for a tracked route or virtual
 // bucket. Counter fields are touched by Observe (atomic.AddUint64) and
-// Flush (atomic.SwapUint64); the metadata (RouteID, Start, End) is
-// immutable after the slot is published.
+// Flush (atomic.SwapUint64); the metadata (RouteID, Start, End,
+// Aggregate, MemberRoutes) for an individual route slot is immutable
+// after the slot is published.
+//
+// Virtual buckets are the exception: when a new RouteID over the
+// MaxTrackedRoutes cap folds into an existing bucket, RegisterRoute
+// extends MemberRoutes and may grow Start/End. metaMu serialises
+// those updates against Flush's read-side iteration so a concurrent
+// Flush cannot observe a half-extended slice. Observe never reads
+// these fields, so the hot path remains lockless.
 type routeSlot struct {
+	metaMu  sync.RWMutex
 	RouteID uint64
 	Start   []byte
 	End     []byte
@@ -141,6 +157,22 @@ type routeSlot struct {
 	writes     atomic.Uint64
 	readBytes  atomic.Uint64
 	writeBytes atomic.Uint64
+}
+
+// snapshotMeta returns a defensive copy of the slot's metadata under
+// the read lock. Used by Flush so the row it emits doesn't share
+// MemberRoutes with the live slot (which a later RegisterRoute may
+// extend).
+func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64) {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	start = s.Start
+	end = s.End
+	aggregate = s.Aggregate
+	if len(s.MemberRoutes) > 0 {
+		members = append([]uint64(nil), s.MemberRoutes...)
+	}
+	return
 }
 
 // MatrixColumn is one slice of the heatmap at a single flush time.
@@ -281,14 +313,21 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		}
 		next.sortedSlots = appendSorted(next.sortedSlots, bucket)
 	} else {
+		// Mutate the existing bucket under its metaMu so a concurrent
+		// Flush iterating the previous table's snapshot doesn't observe
+		// a half-extended MemberRoutes slice or a partially-updated
+		// Start/End. Counters stay in place — they live next to the
+		// metadata fields but are protected by the atomic ops, not the
+		// mutex.
+		bucket.metaMu.Lock()
 		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
-		// Extend bucket end if the new route reaches further right.
 		if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
 			bucket.End = cloneBytes(end)
 		}
 		if bytesLT(start, bucket.Start) {
 			bucket.Start = cloneBytes(start)
 		}
+		bucket.metaMu.Unlock()
 	}
 	next.virtualForRoute[routeID] = bucket
 	s.table.Store(next)
@@ -296,9 +335,10 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 }
 
 // RemoveRoute drops a RouteID from tracking. Counts accumulated since
-// the last flush stay in the slot until the next Flush picks them up
-// from the retired routeTable; subsequent Observe(routeID, …) calls
-// are silent no-ops. Idempotent.
+// the last flush are NOT lost: the retired slot (or, for virtual-bucket
+// members, just the membership entry) is queued for one final drain by
+// the next Flush. Subsequent Observe(routeID, …) calls are silent
+// no-ops. Idempotent.
 func (s *MemSampler) RemoveRoute(routeID uint64) {
 	if s == nil {
 		return
@@ -306,50 +346,93 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 	s.routesMu.Lock()
 	defer s.routesMu.Unlock()
 	cur := s.table.Load()
-	if _, ok := cur.slots[routeID]; !ok {
-		if _, ok := cur.virtualForRoute[routeID]; !ok {
-			return
-		}
+	individual, isIndividual := cur.slots[routeID]
+	bucket, isVirtual := cur.virtualForRoute[routeID]
+	if !isIndividual && !isVirtual {
+		return
 	}
+
 	next := copyRouteTable(cur)
 	delete(next.slots, routeID)
 	delete(next.virtualForRoute, routeID)
+
+	switch {
+	case isIndividual:
+		// Pending counters in this slot must be harvested by the next
+		// Flush; queue the slot rather than letting GC eat the counts.
+		s.retiredMu.Lock()
+		s.retiredSlots = append(s.retiredSlots, individual)
+		s.retiredMu.Unlock()
+	case isVirtual:
+		// Prune the removed RouteID from the bucket's MemberRoutes so
+		// later Snapshot rows do not advertise a stale member.
+		bucket.metaMu.Lock()
+		filtered := bucket.MemberRoutes[:0]
+		for _, m := range bucket.MemberRoutes {
+			if m != routeID {
+				filtered = append(filtered, m)
+			}
+		}
+		bucket.MemberRoutes = filtered
+		bucket.metaMu.Unlock()
+	}
+
 	next.sortedSlots = rebuildSorted(next)
 	s.table.Store(next)
 }
 
 // Flush drains every slot's counters with atomic.SwapUint64 and
 // appends one MatrixColumn to the ring buffer. Idle slots (all
-// counters zero) are skipped to keep the column compact.
+// counters zero) are skipped to keep the column compact. Slots that
+// RemoveRoute retired since the previous Flush are drained alongside
+// the live table, so route churn does not silently lose counts.
 func (s *MemSampler) Flush() {
 	if s == nil {
 		return
 	}
-	tbl := s.table.Load()
 	col := MatrixColumn{At: s.now()}
+	tbl := s.table.Load()
 	for _, slot := range tbl.sortedSlots {
-		reads := slot.reads.Swap(0)
-		writes := slot.writes.Swap(0)
-		readBytes := slot.readBytes.Swap(0)
-		writeBytes := slot.writeBytes.Swap(0)
-		if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
-			continue
-		}
-		col.Rows = append(col.Rows, MatrixRow{
-			RouteID:      slot.RouteID,
-			Start:        slot.Start,
-			End:          slot.End,
-			Aggregate:    slot.Aggregate,
-			MemberRoutes: append([]uint64(nil), slot.MemberRoutes...),
-			Reads:        reads,
-			Writes:       writes,
-			ReadBytes:    readBytes,
-			WriteBytes:   writeBytes,
-		})
+		col.Rows = appendDrainedRow(col.Rows, slot)
 	}
+
+	s.retiredMu.Lock()
+	retired := s.retiredSlots
+	s.retiredSlots = nil
+	s.retiredMu.Unlock()
+	for _, slot := range retired {
+		col.Rows = appendDrainedRow(col.Rows, slot)
+	}
+
 	s.historyMu.Lock()
 	s.history.Push(col)
 	s.historyMu.Unlock()
+}
+
+// appendDrainedRow swaps the slot's counters to zero and appends a
+// MatrixRow when any counter was non-zero. Idle slots are skipped.
+// Metadata is read under the slot's metaMu so a concurrent
+// RegisterRoute fold cannot race with the row materialisation.
+func appendDrainedRow(rows []MatrixRow, slot *routeSlot) []MatrixRow {
+	reads := slot.reads.Swap(0)
+	writes := slot.writes.Swap(0)
+	readBytes := slot.readBytes.Swap(0)
+	writeBytes := slot.writeBytes.Swap(0)
+	if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
+		return rows
+	}
+	start, end, aggregate, members := slot.snapshotMeta()
+	return append(rows, MatrixRow{
+		RouteID:      slot.RouteID,
+		Start:        start,
+		End:          end,
+		Aggregate:    aggregate,
+		MemberRoutes: members,
+		Reads:        reads,
+		Writes:       writes,
+		ReadBytes:    readBytes,
+		WriteBytes:   writeBytes,
+	})
 }
 
 // Snapshot returns the matrix columns in the supplied [from, to)
