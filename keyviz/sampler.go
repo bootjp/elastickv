@@ -376,10 +376,25 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 
 	next := copyRouteTable(cur)
 	if len(next.slots) < s.opts.MaxTrackedRoutes {
-		slot := &routeSlot{
-			RouteID: routeID,
-			Start:   cloneBytes(start),
-			End:     cloneBytes(end),
+		slot := s.reclaimRetiredSlot(routeID)
+		if slot == nil {
+			slot = &routeSlot{
+				RouteID: routeID,
+				Start:   cloneBytes(start),
+				End:     cloneBytes(end),
+			}
+		} else {
+			// Re-registering the same routeID inside the grace window:
+			// reuse the retired slot so any in-flight Observe writers
+			// hitting the prior table snapshot land on the same slot
+			// the new traffic uses, and Flush emits a single row per
+			// RouteID instead of two (one live + one retired) with
+			// counts split across them. Refresh the metadata fields to
+			// match the new registration; counters are preserved.
+			slot.metaMu.Lock()
+			slot.Start = cloneBytes(start)
+			slot.End = cloneBytes(end)
+			slot.metaMu.Unlock()
 		}
 		next.slots[routeID] = slot
 		next.sortedSlots = appendSorted(next.sortedSlots, slot)
@@ -613,7 +628,36 @@ func (s *MemSampler) cancelPendingPruneFor(bucket *routeSlot, routeID uint64) {
 // aggregate, one individual — if the original route is later
 // re-registered as an individual slot.
 func (s *MemSampler) nextVirtualBucketID() uint64 {
-	return s.virtualIDCounter.Add(^uint64(0)) // subtract 1; counter starts at MaxUint64+1
+	// atomic.Uint64 starts at 0; adding ^uint64(0) wraps to MaxUint64
+	// on the first call, MaxUint64-1 on the second, etc.
+	return s.virtualIDCounter.Add(^uint64(0))
+}
+
+// reclaimRetiredSlot looks for a non-aggregate retired slot whose
+// RouteID matches the supplied routeID and, if found, removes it
+// from retiredSlots and returns it for reuse. This guarantees a
+// route removed and re-registered inside the grace window is
+// represented by a single *routeSlot — Flush would otherwise emit
+// two rows with the same RouteID (one from the new live slot, one
+// from the still-draining retired slot) and split counts across
+// them. Aggregate (orphaned virtual bucket) entries are left in
+// place because their RouteID lives in the synthetic namespace and
+// a real-ID match against an aggregate would be coincidental.
+func (s *MemSampler) reclaimRetiredSlot(routeID uint64) *routeSlot {
+	s.retiredMu.Lock()
+	defer s.retiredMu.Unlock()
+	var reclaimed *routeSlot
+	keep := s.retiredSlots[:0]
+	for _, r := range s.retiredSlots {
+		if reclaimed == nil && !r.slot.Aggregate && r.slot.RouteID == routeID {
+			reclaimed = r.slot
+			continue
+		}
+		keep = append(keep, r)
+	}
+	clearTail(s.retiredSlots, len(keep))
+	s.retiredSlots = keep
+	return reclaimed
 }
 
 // memberRoutesContains reports whether routeID is already listed in

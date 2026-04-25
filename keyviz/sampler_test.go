@@ -718,40 +718,87 @@ func TestVirtualBucketRouteIDIsSynthetic(t *testing.T) {
 }
 
 // TestRejoinAsIndividualLetsBucketPruneFire pins Codex round-11 P2:
-// when a removed virtual member rejoins as an individual slot (capacity
-// freed up), the deferred member-prune for the old bucket must still
-// execute — otherwise the bucket's MemberRoutes keeps a route that no
-// longer contributes traffic to it.
+// when a removed virtual member rejoins as an individual slot, the
+// deferred member-prune for the old bucket must still execute —
+// otherwise the bucket's MemberRoutes keeps a route that no longer
+// contributes traffic to it. Set up the bucket with two members so
+// removing one leaves the bucket alive (not orphaned), and traffic
+// continues to be drained across the grace boundary; the post-grace
+// row must show the prune actually happened.
 func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{
 		Step:             time.Second,
-		HistoryColumns:   4,
-		MaxTrackedRoutes: 2,
+		HistoryColumns:   8,
+		MaxTrackedRoutes: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	mustRegister(t, s, 2, "m", "n")
-	if s.RegisterRoute(3, []byte("y"), []byte("z")) {
-		t.Fatal("route 3 over budget should fold")
+	if s.RegisterRoute(2, []byte("m"), []byte("n")) {
+		t.Fatal("route 2 should fold")
 	}
-	// Free capacity: remove route 2 (now slots have room) AND remove 3
-	// (queued in pendingPrunes). Re-register 3 — it now fits as an
-	// individual slot, so the old bucket should still get pruned.
+	if s.RegisterRoute(3, []byte("y"), []byte("z")) {
+		t.Fatal("route 3 should fold (same bucket)")
+	}
+	s.Observe(2, OpRead, 0, 0)
+	s.Observe(3, OpRead, 0, 0)
+	// Free capacity (route 1) and remove the virtual member (route 3),
+	// which queues a prune against the bucket. Route 2 still keeps the
+	// bucket alive in virtualForRoute.
+	s.RemoveRoute(1)
 	s.RemoveRoute(3)
-	s.RemoveRoute(2)
 	if !s.RegisterRoute(3, []byte("y"), []byte("z")) {
-		t.Fatal("route 3 should now fit as individual slot")
+		t.Fatal("route 3 should fit individually now")
 	}
 
+	// Two flushes after grace: the first executes the prune, the
+	// second emits a row with the post-prune MemberRoutes.
 	clk.Advance(s.graceWindow() + time.Second)
-	s.Observe(3, OpRead, 0, 0)
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+	s.Observe(2, OpRead, 0, 0)
 	s.Flush()
 
 	rows := lastSnapshotColumn(t, s).Rows
+	agg := findAggregateRow(t, rows)
+	if memberRoutesContain(agg.MemberRoutes, 3) {
+		t.Fatalf("bucket still lists pruned route 3: %v", agg.MemberRoutes)
+	}
+	if !memberRoutesContain(agg.MemberRoutes, 2) {
+		t.Fatalf("bucket dropped still-active route 2: %v", agg.MemberRoutes)
+	}
+}
+
+// TestReRegisterIndividualReusesRetiredSlot pins Codex round-12 P2:
+// re-registering the same RouteID inside the grace window must reuse
+// the retired slot. Otherwise Flush emits two rows for the same
+// RouteID in one column (live + retired drain), splitting counts.
+func TestReRegisterIndividualReusesRetiredSlot(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:           time.Second,
+		HistoryColumns: 4,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	s.Observe(1, OpRead, 0, 0)
+	s.RemoveRoute(1)
+	mustRegister(t, s, 1, "a", "b")
+	s.Observe(1, OpRead, 0, 0)
+	s.Flush()
+
+	rows := lastSnapshotColumn(t, s).Rows
+	count := 0
+	var total uint64
 	for _, r := range rows {
-		if r.Aggregate && memberRoutesContain(r.MemberRoutes, 3) {
-			t.Fatalf("after rejoin-as-individual + grace, bucket still lists route 3: %+v", r)
+		if r.RouteID == 1 {
+			count++
+			total += r.Reads
 		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d rows for RouteID 1 in one column; expected 1 — retired slot was not reclaimed", count)
+	}
+	if total != 2 {
+		t.Fatalf("total Reads for RouteID 1 = %d, want 2 (1 pre-remove + 1 post-rejoin)", total)
 	}
 }
 
