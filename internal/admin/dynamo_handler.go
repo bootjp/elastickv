@@ -131,6 +131,17 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AdminListTables materialises the full table-name list before
+	// paginate-and-slice. The adapter's listTableNames already
+	// scans the entire metadata prefix in one shot for the SigV4
+	// listTables path, so streaming here would not change the
+	// adapter's memory profile; the dashboard's bounded `limit`
+	// (default 100, hard max 1000) and the lex-sorted name list
+	// keep the per-request slice small enough that this is the
+	// pragmatic shape rather than the limiting factor. If a future
+	// admin-cluster scale ever changes that calculus, the fix is to
+	// teach the adapter to stream, then plumb that through here —
+	// not to add a streaming layer on top of the materialised list.
 	names, err := h.source.AdminListTables(r.Context())
 	if err != nil {
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo list tables failed",
@@ -250,19 +261,37 @@ func paginateDynamoTableNames(names []string, startAfter string, limit int) ([]s
 	return page, ""
 }
 
-// writeAdminJSON is the shared 200-OK JSON writer. Encoder errors
-// are logged but cannot be reported to the client because the 200
-// header has already been flushed.
+// writeAdminJSON marshals `body` to a buffer first, *then* writes
+// status + body — never streaming an encoder directly to the
+// ResponseWriter. The streaming form would commit a 200 header and
+// then truncate mid-body if json.Marshal failed on a value deep in
+// the struct (an unsupported type, a Marshaler returning an error,
+// etc.), leaving a malformed JSON object on the wire that the SPA
+// has no way to recover from. Marshalling first lets us upgrade the
+// encode failure to a 500 with a well-formed error envelope.
 func writeAdminJSON(w http.ResponseWriter, ctx context.Context, logger *slog.Logger, body any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
+	payload, err := json.Marshal(body)
+	if err != nil {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.LogAttrs(ctx, slog.LevelWarn, "admin response encode failed",
+		logger.LogAttrs(ctx, slog.LevelError, "admin response marshal failed",
 			slog.String("error", err.Error()),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to encode response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if _, werr := w.Write(payload); werr != nil {
+		// Status is already on the wire, so we can only log. Write
+		// failures here usually mean the client closed the connection.
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.LogAttrs(ctx, slog.LevelWarn, "admin response write failed",
+			slog.String("error", werr.Error()),
 		)
 	}
 }
