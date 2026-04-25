@@ -517,6 +517,14 @@ func (s *SQSServer) createQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if len(in.Tags) > sqsMaxTagsPerQueue {
+		// AWS caps tags per queue at 50. CreateQueue must reject
+		// over-cap tag bundles up front; a silent slice-and-store
+		// would let queues land with more tags than TagQueue would
+		// ever accept on the same queue.
+		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAttributeValue, "queue tag count exceeds 50")
+		return
+	}
 	requested.Tags = in.Tags
 
 	if err := s.createQueueWithRetry(r.Context(), requested); err != nil {

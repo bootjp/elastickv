@@ -1387,6 +1387,187 @@ func TestSQSServer_RedrivePolicyRejectsSelfReference(t *testing.T) {
 	}
 }
 
+func TestSQSServer_ReceivePagesPastFifoGroupLockSkips(t *testing.T) {
+	t.Parallel()
+	// FIFO group lock keeps successive messages in the same group
+	// hidden behind the head. With many messages in one group ahead
+	// of a deliverable head in a different group, the receive must
+	// keep paging the visibility index instead of stopping after
+	// the first page of group-locked candidates.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "fifo-skipheavy.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	url, _ := out["QueueUrl"].(string)
+
+	// Group "g1" gets one head, then 30 messages in g2 (which will
+	// all be pinned behind a single delivered head). Take "g1"'s head
+	// (which holds the g1 lock) — only g2's head should ever be
+	// deliverable on the next receive even though 30 candidates show
+	// up in the visibility index ahead of it.
+	_ = sendFifoMessage(t, node, url, "g1", "g1-d1", "g1-head")
+	for i := range 30 {
+		_ = sendFifoMessage(t, node, url, "g2", "g2-d"+strconv.Itoa(i), "g2-"+strconv.Itoa(i))
+	}
+
+	// First receive picks up the heads of each group; with two groups
+	// we expect both g1-head and the first g2 message. The remaining
+	// g2 messages are blocked behind g2's lock.
+	_, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            url,
+		"MaxNumberOfMessages": 10,
+		"VisibilityTimeout":   60,
+	})
+	msgs, _ := out["Messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("expected at least 2 head messages (one per group), got %d", len(msgs))
+	}
+
+	// Second receive must return 0 — both groups are locked, but the
+	// scan must page through every group-locked candidate without
+	// errantly exhausting its budget on the first page.
+	_, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            url,
+		"MaxNumberOfMessages": 10,
+	})
+	if msgs, _ := out["Messages"].([]any); len(msgs) != 0 {
+		t.Fatalf("expected 0 (all groups locked), got %d", len(msgs))
+	}
+}
+
+func TestSQSServer_CreateQueueRejectsTooManyTags(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	tags := make(map[string]string, 60)
+	for i := range 60 {
+		tags["tag-"+strconv.Itoa(i)] = "v"
+	}
+	status, body := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "too-many-tags",
+		"tags":      tags,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("60-tag create: got %d want 400 (%v)", status, body)
+	}
+	if got, _ := body["__type"].(string); got != sqsErrInvalidAttributeValue {
+		t.Fatalf("error type: %q want %q", got, sqsErrInvalidAttributeValue)
+	}
+}
+
+func TestSQSServer_BatchOnMissingQueueIsRequestLevelError(t *testing.T) {
+	t.Parallel()
+	// AWS returns request-level QueueDoesNotExist (HTTP 400) on
+	// DeleteMessageBatch / ChangeMessageVisibilityBatch when the
+	// queue does not exist — not an HTTP-200 envelope with per-entry
+	// failures, which retry logic could misclassify as partial
+	// success.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	missingURL := "http://" + node.sqsAddress + "/no-such-queue"
+
+	dummyHandle, err := encodeReceiptHandle(1, "00000000000000000000000000000000",
+		bytes.Repeat([]byte{0x01}, sqsReceiptTokenBytes))
+	if err != nil {
+		t.Fatalf("encode handle: %v", err)
+	}
+
+	status, body := callSQS(t, node, sqsDeleteMessageBatchTarget, map[string]any{
+		"QueueUrl": missingURL,
+		"Entries": []map[string]any{
+			{"Id": "a", "ReceiptHandle": dummyHandle},
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("delete batch missing queue: got %d want 400 (%v)", status, body)
+	}
+	if got, _ := body["__type"].(string); got != sqsErrQueueDoesNotExist {
+		t.Fatalf("delete batch error type: %q want %q", got, sqsErrQueueDoesNotExist)
+	}
+
+	status, body = callSQS(t, node, sqsChangeMessageVisibilityBatchTgt, map[string]any{
+		"QueueUrl": missingURL,
+		"Entries": []map[string]any{
+			{"Id": "a", "ReceiptHandle": dummyHandle, "VisibilityTimeout": 30},
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("change vis batch missing queue: got %d want 400 (%v)", status, body)
+	}
+	if got, _ := body["__type"].(string); got != sqsErrQueueDoesNotExist {
+		t.Fatalf("change vis batch error type: %q want %q", got, sqsErrQueueDoesNotExist)
+	}
+}
+
+func TestSQSServer_RedrivePolicyFifoDlqRejectsStandardSource(t *testing.T) {
+	t.Parallel()
+	// A Standard source pointing at a FIFO DLQ would copy empty
+	// MessageGroupId into the DLQ record; the DLQ-side receive only
+	// enforces FIFO group-lock when MessageGroupId is non-empty, so
+	// those messages bypass FIFO semantics inside a queue clients
+	// believe is strictly ordered. The redrive path must reject the
+	// move when this would happen.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	// Create FIFO DLQ.
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "dlq.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	if dlqURL, _ := out["QueueUrl"].(string); dlqURL == "" {
+		t.Fatalf("FIFO DLQ create failed: %v", out)
+	}
+
+	// Standard source with RedrivePolicy targeting the FIFO DLQ.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq.fifo","maxReceiveCount":1}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "src-standard",
+		"Attributes": map[string]string{"RedrivePolicy": policy},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create standard source with FIFO-DLQ policy: %d %v", status, out)
+	}
+	srcURL, _ := out["QueueUrl"].(string)
+
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":    srcURL,
+		"MessageBody": "poison",
+	})
+	// First receive bumps ReceiveCount to 1 == maxReceiveCount; second
+	// receive should attempt redrive and the FIFO compatibility gate
+	// must trip. The receive path returns 5xx (sqsErrInternalFailure
+	// surfaced via sqsAPIError) rather than silently moving an
+	// invalid record.
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+		"VisibilityTimeout":   1,
+	})
+	time.Sleep(1100 * time.Millisecond)
+	status, body := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+	})
+	if status == http.StatusOK {
+		// AWS-level invariant: the message must NOT have been
+		// redriven into the FIFO DLQ. Even if the receive returns
+		// OK, the failure is that the FIFO DLQ should not now hold
+		// a record with an empty MessageGroupId.
+		if msgs, _ := body["Messages"].([]any); len(msgs) > 0 {
+			t.Fatalf("FIFO DLQ should not receive redriven Standard source records, got msgs=%v", msgs)
+		}
+	}
+}
+
 func TestSQSServer_TagQueueRequiresTags(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)

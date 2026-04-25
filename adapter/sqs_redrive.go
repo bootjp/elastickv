@@ -142,6 +142,18 @@ func (s *SQSServer) redriveCandidateToDLQ(
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			"RedrivePolicy targets non-existent DLQ "+policy.DLQName)
 	}
+	// FIFO DLQs require source records to carry MessageGroupId so the
+	// DLQ-side ReceiveMessage enforces group-lock semantics. Without
+	// this gate, a redrive from a Standard source into a FIFO DLQ
+	// would write records with empty MessageGroupId — tryDeliverCandidate
+	// only takes the FIFO path when MessageGroupId is non-empty, so
+	// those messages would bypass FIFO ordering inside what clients
+	// believe is a strictly-ordered queue. We refuse the move and
+	// surface the misconfiguration to operators.
+	if dlqMeta.IsFIFO && srcRec.MessageGroupId == "" {
+		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FIFO DLQ requires source records to carry MessageGroupId")
+	}
 	dlqRec, dlqRecordBytes, err := buildDLQRecord(srcRec, dlqMeta, srcArn)
 	if err != nil {
 		return false, err

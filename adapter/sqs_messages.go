@@ -637,13 +637,21 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, opts 
 	}
 }
 
-// scanAndDeliverOnce is the single-pass scan+rotate the long-poll loop
+// scanAndDeliverOnce is the scan+rotate pass the long-poll loop
 // re-runs. Each pass takes its own snapshot so the OCC StartTS tracks
 // the most recent visible_at for the candidates it picked, AND each
 // pass re-reads queue metadata so a concurrent DeleteQueue /
 // PurgeQueue that bumps the generation is observed immediately. If
 // the queue has been deleted the method returns QueueDoesNotExist;
 // scan errors and other non-retryable failures propagate.
+//
+// Scan and rotation are interleaved: a single scan page can be
+// consumed entirely by FIFO group-lock skips or DLQ redrive, leaving
+// the receive caller below opts.Max with deliverable messages still
+// further along in the visibility index. Looping until either
+// opts.Max is reached, the index is drained, or the wall-clock budget
+// elapses prevents false-empty returns under poison-message backlogs
+// or hot-FIFO-group fan-in.
 func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, opts sqsReceiveOptions) ([]map[string]any, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
@@ -653,11 +661,41 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	if !exists {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
-	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, meta.Generation, opts.Max*sqsReceiveScanOverfetchFactor, readTS)
-	if err != nil {
-		return nil, err
+	now := time.Now().UnixMilli()
+	start, end := sqsMsgVisScanBounds(queueName, meta.Generation, now)
+	pageSize := opts.Max * sqsReceiveScanOverfetchFactor
+	if pageSize > sqsVisScanPageLimit {
+		pageSize = sqsVisScanPageLimit
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, meta, candidates, readTS, opts)
+	deadline := time.Now().Add(sqsVisScanWallClockBudget)
+	delivered := make([]map[string]any, 0, opts.Max)
+	for len(delivered) < opts.Max {
+		if time.Now().After(deadline) {
+			return delivered, nil
+		}
+		page, next, done, scanErr := s.scanOneVisibleMessagePage(ctx, start, end, pageSize, readTS)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if len(page) == 0 {
+			return delivered, nil
+		}
+		fresh, err := s.rotateMessagesForDelivery(ctx, queueName, meta, page, readTS, sqsReceiveOptions{
+			Max:                   opts.Max - len(delivered),
+			VisibilityTimeout:     opts.VisibilityTimeout,
+			WaitSeconds:           opts.WaitSeconds,
+			MessageAttributeNames: opts.MessageAttributeNames,
+		})
+		if err != nil {
+			return delivered, err
+		}
+		delivered = append(delivered, fresh...)
+		if done {
+			return delivered, nil
+		}
+		start = next
+	}
+	return delivered, nil
 }
 
 // resolveReceiveMaxMessages validates MaxNumberOfMessages against the
@@ -686,25 +724,38 @@ type sqsMsgCandidate struct {
 	messageID string
 }
 
-func (s *SQSServer) scanVisibleMessageCandidates(ctx context.Context, queueName string, gen uint64, limit int, readTS uint64) ([]sqsMsgCandidate, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	now := time.Now().UnixMilli()
-	start, end := sqsMsgVisScanBounds(queueName, gen, now)
-	page := limit
-	if page > sqsVisScanPageLimit {
-		page = sqsVisScanPageLimit
-	}
-	kvs, err := s.store.ScanAt(ctx, start, end, page, readTS)
+// sqsVisScanWallClockBudget caps how long the scan + deliver loop may
+// spend paging the visibility index. The receive path filters
+// candidates after each scan page (FIFO group lock, retention expiry,
+// DLQ redrive); without a wall-clock cap a queue with thousands of
+// group-locked or poisoned messages ahead of one deliverable could
+// pin the leader for many milliseconds.
+const sqsVisScanWallClockBudget = 100 * time.Millisecond
+
+// scanOneVisibleMessagePage reads a single page of the visibility
+// index starting at `start`, returning the parsed candidates plus the
+// cursor for the next page. `done=true` means the scan range is
+// drained and the caller should stop paging.
+func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]sqsMsgCandidate, []byte, bool, error) {
+	kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, start, true, errors.WithStack(err)
+	}
+	if len(kvs) == 0 {
+		return nil, start, true, nil
 	}
 	out := make([]sqsMsgCandidate, 0, len(kvs))
 	for _, kvp := range kvs {
 		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value)})
 	}
-	return out, nil
+	if len(kvs) < pageSize {
+		return out, start, true, nil
+	}
+	next := nextScanCursorAfter(kvs[len(kvs)-1].Key)
+	if end != nil && bytes.Compare(next, end) >= 0 {
+		return out, next, true, nil
+	}
+	return out, next, false, nil
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to

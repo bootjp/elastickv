@@ -444,6 +444,15 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if err := s.requireQueueExists(r.Context(), queueName); err != nil {
+		// AWS classes a missing queue as a request-level error
+		// (HTTP 400 QueueDoesNotExist) on batch APIs, not a per-
+		// entry failure inside an HTTP-200 envelope. Returning per-
+		// entry would let SDK retry logic mistake a hard queue-level
+		// failure for a partial-success batch and keep retrying.
+		writeSQSErrorFromErr(w, err)
+		return
+	}
 
 	successful := make([]sqsBatchResultEntry, 0, len(in.Entries))
 	failed := make([]sqsBatchResultErrorEntry, 0)
@@ -503,6 +512,10 @@ func (s *SQSServer) changeMessageVisibilityBatch(w http.ResponseWriter, r *http.
 		ids = append(ids, e.Id)
 	}
 	if err := validateBatchEntryShape(len(in.Entries), ids); err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
+	if err := s.requireQueueExists(r.Context(), queueName); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
@@ -605,6 +618,22 @@ func batchEntryIDs(entries []sqsSendMessageBatchEntryInput) []string {
 		out = append(out, e.Id)
 	}
 	return out
+}
+
+// requireQueueExists returns a request-level QueueDoesNotExist error
+// when the queue's meta record is gone. Batch DeleteMessage /
+// ChangeMessageVisibility use this as an upfront gate so callers see
+// the documented top-level error, not per-entry failures inside a
+// 200-envelope that retry logic can misclassify.
+func (s *SQSServer) requireQueueExists(ctx context.Context, queueName string) error {
+	_, exists, err := s.loadQueueMetaAt(ctx, queueName, s.nextTxnReadTS(ctx))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !exists {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	return nil
 }
 
 // totalBatchPayloadBytes sums the message-body length and every
