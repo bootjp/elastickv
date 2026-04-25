@@ -390,6 +390,16 @@ func validateCreateTableRequest(in *CreateTableRequest) error {
 	if strings.TrimSpace(in.TableName) == "" {
 		return errors.New("table_name is required")
 	}
+	// Reject slash-bearing names symmetrically with handleDescribe
+	// and handleDelete, which already 404 on `/`. Without this
+	// guard a user could create `foo/bar` and then never be able
+	// to describe or delete it through the same admin surface —
+	// the orphaned table would be reachable only through the SigV4
+	// path. Blocking the asymmetric edge case at create time is
+	// strictly better than discovering it later.
+	if strings.ContainsRune(in.TableName, '/') {
+		return errors.New("table_name must not contain '/'")
+	}
 	if err := validateAttribute(in.PartitionKey, "partition_key"); err != nil {
 		return err
 	}

@@ -93,7 +93,6 @@ func (s *stubTablesSource) AdminDeleteTable(_ context.Context, principal AuthPri
 	return nil
 }
 
-
 func newDynamoHandlerForTest(src TablesSource) *DynamoHandler {
 	return NewDynamoHandler(src)
 }
@@ -440,6 +439,8 @@ func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"},"unknown_field":1}`,                 // strict decode
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"}}{"second":"object"}`,                // trailing JSON
 		`{"table_name":"u","partition_key":{"name":"id","type":"S"}} 42`,                                // trailing scalar
+		`{"table_name":"foo/bar","partition_key":{"name":"id","type":"S"}}`,                             // slash in name
+		`{"table_name":"a/b/c","partition_key":{"name":"id","type":"S"}}`,                               // multiple slashes
 	}
 	for _, body := range cases {
 		t.Run(body, func(t *testing.T) {
