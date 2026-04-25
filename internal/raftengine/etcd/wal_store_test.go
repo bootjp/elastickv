@@ -197,7 +197,7 @@ func lastWALFile(t *testing.T, walDir string) string {
 	require.NoError(t, err)
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".wal" {
+		if filepath.Ext(e.Name()) == walFileExt {
 			names = append(names, e.Name())
 		}
 	}
