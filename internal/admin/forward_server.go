@@ -62,6 +62,16 @@ func (s *ForwardServer) Forward(ctx context.Context, req *pb.AdminForwardRequest
 	if req == nil || req.GetPrincipal() == nil {
 		return rejectForward(http.StatusBadRequest, "invalid_request", "missing principal")
 	}
+	// Sanitise forwarded_from before it ever reaches a slog
+	// handler. With JSON output the encoder escapes newlines on
+	// our behalf, but with a text-format handler an attacker who
+	// controlled the follower side could embed `\n` in the value
+	// and split a single audit line into two — defeating
+	// log-aggregation parsing or spoofing a synthetic entry.
+	// Replacing CR/LF with spaces at the entry point keeps every
+	// downstream call site on the leader trivially safe (Claude
+	// review on PR #635).
+	forwardedFrom := sanitiseForwardedFrom(req.GetForwardedFrom())
 	principal, ok := s.validatePrincipal(req.GetPrincipal())
 	if !ok {
 		// Don't leak why the principal failed — the follower may
@@ -69,7 +79,7 @@ func (s *ForwardServer) Forward(ctx context.Context, req *pb.AdminForwardRequest
 		// we want operators to investigate from the audit log on
 		// the leader, not the follower's response body.
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "admin_forward_principal_rejected",
-			slog.String("forwarded_from", req.GetForwardedFrom()),
+			slog.String("forwarded_from", forwardedFrom),
 			slog.String("claimed_access_key", req.GetPrincipal().GetAccessKey()),
 			slog.String("claimed_role", req.GetPrincipal().GetRole()),
 		)
@@ -78,9 +88,9 @@ func (s *ForwardServer) Forward(ctx context.Context, req *pb.AdminForwardRequest
 	}
 	switch req.GetOperation() {
 	case pb.AdminOperation_ADMIN_OP_CREATE_TABLE:
-		return s.handleCreate(ctx, principal, req)
+		return s.handleCreate(ctx, principal, forwardedFrom, req)
 	case pb.AdminOperation_ADMIN_OP_DELETE_TABLE:
-		return s.handleDelete(ctx, principal, req)
+		return s.handleDelete(ctx, principal, forwardedFrom, req)
 	case pb.AdminOperation_ADMIN_OP_UNSPECIFIED:
 		return rejectForward(http.StatusBadRequest, "invalid_request", "unknown admin operation")
 	default:
@@ -108,7 +118,7 @@ func (s *ForwardServer) validatePrincipal(p *pb.AdminPrincipal) (AuthPrincipal, 
 	return AuthPrincipal{AccessKey: accessKey, Role: role}, true
 }
 
-func (s *ForwardServer) handleCreate(ctx context.Context, principal AuthPrincipal, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
+func (s *ForwardServer) handleCreate(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
 	payload := req.GetPayload()
 	if len(payload) > adminForwardPayloadLimit {
 		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
@@ -126,20 +136,20 @@ func (s *ForwardServer) handleCreate(ctx context.Context, principal AuthPrincipa
 	}
 	summary, err := s.source.AdminCreateTable(ctx, principal, body)
 	if err != nil {
-		s.logUnexpectedSourceError(ctx, "create_table", body.TableName, req.GetForwardedFrom(), err)
+		s.logUnexpectedSourceError(ctx, "create_table", body.TableName, forwardedFrom, err)
 		return forwardErrorResponse("create", err), nil
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
 		slog.String("actor", principal.AccessKey),
 		slog.String("role", string(principal.Role)),
-		slog.String("forwarded_from", req.GetForwardedFrom()),
+		slog.String("forwarded_from", forwardedFrom),
 		slog.String("operation", "create_table"),
 		slog.String("table", body.TableName),
 	)
 	return jsonForwardResponse(http.StatusCreated, summary)
 }
 
-func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipal, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
+func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
 	// Delete carries the table name in the payload as JSON so the
 	// proto stays operation-agnostic — there is no operation-specific
 	// field in AdminForwardRequest, by design (adding one per op
@@ -180,17 +190,33 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload name must not contain '/'")
 	}
 	if err := s.source.AdminDeleteTable(ctx, principal, body.Name); err != nil {
-		s.logUnexpectedSourceError(ctx, "delete_table", body.Name, req.GetForwardedFrom(), err)
+		s.logUnexpectedSourceError(ctx, "delete_table", body.Name, forwardedFrom, err)
 		return forwardErrorResponse("delete", err), nil
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
 		slog.String("actor", principal.AccessKey),
 		slog.String("role", string(principal.Role)),
-		slog.String("forwarded_from", req.GetForwardedFrom()),
+		slog.String("forwarded_from", forwardedFrom),
 		slog.String("operation", "delete_table"),
 		slog.String("table", body.Name),
 	)
 	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
+}
+
+// sanitiseForwardedFrom strips CR/LF from a follower-supplied
+// node id so a malicious value cannot split a single audit log
+// line into two when slog is using a text-format handler. JSON
+// handlers escape these characters automatically; this is a
+// defence-in-depth pass for handler-format-agnostic safety.
+// Other control characters are deliberately preserved — only the
+// line-splitting characters matter for log spoofing.
+func sanitiseForwardedFrom(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // forwardErrorResponse re-encodes a TablesSource error in the
@@ -208,7 +234,7 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 func forwardErrorResponse(op string, err error) *pb.AdminForwardResponse {
 	switch {
 	case errors.Is(err, ErrTablesForbidden):
-		return mustForwardJSON(http.StatusForbidden, errorBody{Error: "forbidden", Message: "this endpoint requires a full-access role"})
+		return mustForwardJSON(http.StatusForbidden, errorResponse{Error: "forbidden", Message: "this endpoint requires a full-access role"})
 	case errors.Is(err, ErrTablesNotLeader):
 		// Should never happen on the leader path — the leader
 		// just verified itself — but if a leadership transfer
@@ -218,19 +244,19 @@ func forwardErrorResponse(op string, err error) *pb.AdminForwardResponse {
 		// header the leader-direct path emits (Codex P2 on
 		// PR #635 — without this the forwarded 503 would lose
 		// its retry timing).
-		resp := mustForwardJSON(http.StatusServiceUnavailable, errorBody{Error: "leader_unavailable", Message: "leader stepped down mid-request"})
+		resp := mustForwardJSON(http.StatusServiceUnavailable, errorResponse{Error: "leader_unavailable", Message: "leader stepped down mid-request"})
 		resp.RetryAfterSeconds = 1
 		return resp
 	case errors.Is(err, ErrTablesNotFound):
-		return mustForwardJSON(http.StatusNotFound, errorBody{Error: "not_found", Message: "table does not exist"})
+		return mustForwardJSON(http.StatusNotFound, errorResponse{Error: "not_found", Message: "table does not exist"})
 	case errors.Is(err, ErrTablesAlreadyExists):
-		return mustForwardJSON(http.StatusConflict, errorBody{Error: "already_exists", Message: "table already exists"})
+		return mustForwardJSON(http.StatusConflict, errorResponse{Error: "already_exists", Message: "table already exists"})
 	}
 	var verr *ValidationError
 	if errors.As(err, &verr) {
-		return mustForwardJSON(http.StatusBadRequest, errorBody{Error: "invalid_request", Message: verr.Error()})
+		return mustForwardJSON(http.StatusBadRequest, errorResponse{Error: "invalid_request", Message: verr.Error()})
 	}
-	return mustForwardJSON(http.StatusInternalServerError, errorBody{
+	return mustForwardJSON(http.StatusInternalServerError, errorResponse{
 		Error:   "dynamo_" + op + "_failed",
 		Message: "failed to " + op + " table; see leader logs",
 	})
@@ -271,15 +297,8 @@ func isStructuredSourceError(err error) bool {
 	return errors.As(err, &verr)
 }
 
-// errorBody is the shared JSON shape for both the HTTP handler's
-// writeJSONError and the forward server's encoded responses.
-type errorBody struct {
-	Error   string `json:"error"`
-	Message string `json:"message,omitempty"`
-}
-
 func rejectForward(status int, code, msg string) (*pb.AdminForwardResponse, error) {
-	return mustForwardJSON(status, errorBody{Error: code, Message: msg}), nil
+	return mustForwardJSON(status, errorResponse{Error: code, Message: msg}), nil
 }
 
 func mustForwardJSON(status int, body any) *pb.AdminForwardResponse {

@@ -360,6 +360,34 @@ func TestForwardServer_DeleteTable_LeaderSteppedDownReturns503(t *testing.T) {
 	require.Contains(t, string(resp.GetPayload()), "leader_unavailable")
 }
 
+// TestForwardServer_SanitisesForwardedFromInLog confirms the
+// CR/LF stripping pass at the RPC entry point: a malicious
+// follower-supplied node id with embedded newlines must not be
+// able to split a single audit/error line into two when slog is
+// using a text-format handler. Claude review on PR #635.
+func TestForwardServer_SanitisesForwardedFromInLog(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+	srv := NewForwardServer(src, fullPrincipalRoleStore(), logger)
+
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal:     &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation:     pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+		Payload:       mustJSON(t, CreateTableRequest{TableName: "users", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}}),
+		ForwardedFrom: "follower\nfake_actor=evil\nrole=full",
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusCreated), resp.GetStatusCode())
+	logged := buf.String()
+	// Sanitised value (newlines replaced with spaces) must be
+	// present.
+	require.Contains(t, logged, "follower fake_actor=evil role=full")
+	// Raw newline-bearing value must NOT be in the log — that
+	// would mean the sanitisation did not run.
+	require.NotContains(t, logged, "follower\nfake_actor=evil")
+}
+
 // TestForwardServer_LogsUnexpectedSourceError confirms the leader
 // emits an error log line for non-sentinel source failures so
 // operators can investigate forwarded write 500s without
