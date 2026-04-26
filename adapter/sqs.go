@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -55,6 +56,11 @@ const (
 	sqsErrInternalFailure    = "InternalFailure"
 	sqsErrServiceUnavailable = "ServiceUnavailable"
 	sqsErrMalformedRequest   = "MalformedQueryString"
+	// sqsErrThrottling is the per-queue rate-limit rejection code.
+	// Returned with HTTP 400 and a Retry-After header derived from the
+	// bucket's refillRate + the request's charge count (see
+	// computeRetryAfter in sqs_throttle.go for the formula).
+	sqsErrThrottling = "Throttling"
 )
 
 type SQSServerOption func(*SQSServer)
@@ -76,6 +82,11 @@ type SQSServer struct {
 	// goroutines without ordering between them.
 	reaperCtx    context.Context
 	reaperCancel context.CancelFunc
+	// throttle is the per-queue rate-limit bucket store. Always
+	// non-nil; charge() short-circuits when the queue's meta has no
+	// throttle config so unconfigured queues pay one nil-check per
+	// request and nothing else (see sqs_throttle.go).
+	throttle *bucketStore
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
@@ -98,6 +109,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 		coordinator:  coordinate,
 		reaperCtx:    reaperCtx,
 		reaperCancel: reaperCancel,
+		throttle:     newBucketStoreDefault(),
 	}
 	s.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		sqsCreateQueueTarget:               s.createQueue,
@@ -266,4 +278,20 @@ func writeSQSError(w http.ResponseWriter, status int, code string, message strin
 	w.Header().Set("Content-Type", sqsContentTypeJSON)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeSQSThrottlingError emits the rate-limit rejection envelope: 400
+// + the AWS-shaped JSON error body + a Retry-After header carrying
+// the integer-second wait derived from the bucket's refill rate and
+// the request's charge count. The action argument is the bucket-action
+// vocabulary ("Send" | "Receive" | "*") so the operator-visible
+// message names the bucket that ran out, not just the queue.
+func writeSQSThrottlingError(w http.ResponseWriter, queue, action string, retryAfter time.Duration) {
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	secs := int(retryAfter / time.Second)
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeSQSError(w, http.StatusBadRequest, sqsErrThrottling,
+		"Rate exceeded for queue '"+queue+"' action '"+action+"'")
 }

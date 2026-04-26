@@ -94,6 +94,9 @@ func (s *SQSServer) sendMessageBatch(w http.ResponseWriter, r *http.Request) {
 			"total batch payload exceeds 262144 bytes")
 		return
 	}
+	if !s.chargeQueue(w, r, queueName, bucketActionSend, throttleChargeCount(len(in.Entries))) {
+		return
+	}
 
 	successful, failed, err := s.sendMessageBatchWithRetry(r.Context(), queueName, in.Entries)
 	if err != nil {
@@ -453,6 +456,9 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, throttleChargeCount(len(in.Entries))) {
+		return
+	}
 
 	successful := make([]sqsBatchResultEntry, 0, len(in.Entries))
 	failed := make([]sqsBatchResultErrorEntry, 0)
@@ -517,6 +523,9 @@ func (s *SQSServer) changeMessageVisibilityBatch(w http.ResponseWriter, r *http.
 	}
 	if err := s.requireQueueExists(r.Context(), queueName); err != nil {
 		writeSQSErrorFromErr(w, err)
+		return
+	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, throttleChargeCount(len(in.Entries))) {
 		return
 	}
 

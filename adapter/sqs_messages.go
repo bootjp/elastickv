@@ -294,33 +294,59 @@ type sqsChangeVisibilityInput struct {
 
 // ------------------------ handlers ------------------------
 
-func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
+// prepareSendMessage decodes the SendMessage payload, resolves the
+// queue name, and runs the throttle charge. Returning early on any
+// failure keeps sendMessage under the cyclop ceiling — without this
+// extraction the throttle branch pushes the function over the limit.
+func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (sqsSendMessageInput, string, bool) {
 	var in sqsSendMessageInput
 	if err := decodeSQSJSONInput(r, &in); err != nil {
 		writeSQSErrorFromErr(w, err)
-		return
+		return in, "", false
 	}
 	queueName, err := queueNameFromURL(in.QueueUrl)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
-		return
+		return in, "", false
 	}
+	if !s.chargeQueue(w, r, queueName, bucketActionSend, 1) {
+		return in, queueName, false
+	}
+	return in, queueName, true
+}
+
+// validateSend loads queue meta, validates message attributes / FIFO
+// params, and resolves the delay. Returns ok=false if any validation
+// step has already written the error response.
+func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
 	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
 	}
 	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
 	}
 	delay, apiErr := resolveSendDelay(meta, in.DelaySeconds)
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
+		return nil, 0, 0, false
+	}
+	return meta, readTS, delay, true
+}
+
+func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
+	in, queueName, ok := s.prepareSendMessage(w, r)
+	if !ok {
+		return
+	}
+	meta, readTS, delay, ok := s.validateSend(w, r, queueName, in)
+	if !ok {
 		return
 	}
 	if meta.IsFIFO {
@@ -507,6 +533,9 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	queueName, err := queueNameFromURL(in.QueueUrl)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
+		return
+	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
 		return
 	}
 	ctx := r.Context()
@@ -1106,6 +1135,9 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
+		return
+	}
 	if err := s.deleteMessageWithRetry(r.Context(), queueName, handle); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -1256,6 +1288,9 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 	queueName, handle, err := s.parseQueueAndReceipt(in.QueueUrl, in.ReceiptHandle)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
+		return
+	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
 		return
 	}
 	if err := s.changeVisibilityWithRetry(r.Context(), queueName, handle, timeout); err != nil {
