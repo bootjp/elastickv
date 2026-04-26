@@ -330,9 +330,15 @@ This is out of scope here.
    - Touching a *mutable* attribute alongside (e.g. `VisibilityTimeout` plus an attempted `PartitionCount` change) still rejects — no partial commit of the mutable changes when an immutable one is invalid.
    - Same-value "no-op": `SetQueueAttributes` with `PartitionCount = 4` (matching the stored meta) succeeds; only differing values are rejected.
 
-5. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+5. **`WaitTimeSeconds` shared-deadline bound** (`adapter/sqs_partitioned_long_poll_timing_test.go`): pins the §4.2 step 3 contract that the total wall-clock wait is bounded by the original `WaitTimeSeconds`, not `PartitionCount × WaitTimeSeconds`.
+   - Create a partitioned queue with `PartitionCount = 4`. Send no messages.
+   - Call `ReceiveMessage(WaitTimeSeconds = 2)` and time the call.
+   - Assert it returns in **≤ 3 s** (2 s budget + reasonable overhead), not in 4 × 2 = 8 s. A naive implementation that drops the `remainingWait` threading and passes the original `WaitTimeSeconds` to every sub-call will time out at 8 s and the test will fail.
+   - Companion variant: send no messages, call `ReceiveMessage(WaitTimeSeconds = 0)` — the loop must still iterate every partition with a non-blocking point-read (per §4.2 step 4a) and return promptly with empty.
 
-6. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
+6. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+
+7. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
 
 ---
 
