@@ -138,9 +138,7 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 // LastModifiedAtMillis and operators need it for change-tracking;
 // there is no dedicated typed field for it). QueueArn is included so
 // the SPA can show the AWS-shaped identifier without recomputing it
-// client-side. Claude P1 on PR #670 caught both gaps — the prior
-// docstring claimed parity with queueMetaToAttributes("All") but
-// QueueArn and LastModifiedTimestamp were absent.
+// client-side.
 func metaAttributesForAdmin(meta *sqsQueueMeta, queueArn string) map[string]string {
 	out := map[string]string{
 		"QueueArn":                      queueArn,

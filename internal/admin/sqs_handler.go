@@ -160,10 +160,9 @@ func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Force the empty-result case to render as `{"queues": []}` rather
-	// than `{"queues": null}` (Gemini medium on PR #670). The SPA
-	// iterates the array directly and would crash on null. AdminListQueues
-	// returns nil when no queues exist, so the normalisation has to
-	// happen here before encoding.
+	// than `{"queues": null}`. The SPA iterates the array directly and
+	// would crash on null. AdminListQueues returns nil when no queues
+	// exist, so the normalisation has to happen here before encoding.
 	if names == nil {
 		names = []string{}
 	}
@@ -223,11 +222,11 @@ func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name s
 // configured), gates the request, and returns the principal with the
 // **live** role overridden in place — so the role that flows downstream
 // to the adapter is the one the operator currently has, not whatever
-// the JWT happens to remember. Mirrors DynamoHandler.principalForWrite
-// (Codex P2 + Claude P1 on PR #670 caught the bug: without the role
-// override, a JWT-read_only / store-full promoted key passed the
-// handler-side check but the adapter rejected with ErrAdminForbidden,
-// so the user had to log out and back in for a delete to work).
+// the JWT happens to remember. Mirrors DynamoHandler.principalForWrite.
+// Without the role override, a JWT-read_only / store-full promoted key
+// passes the handler-side check but the adapter rejects with
+// ErrAdminForbidden, forcing the user to log out and back in for a
+// delete to work.
 //
 // Failure paths write the response and return ok=false; callers
 // short-circuit on the bool. Logged-out / wrong-role callers never

@@ -221,10 +221,8 @@ func translateAdminQueuesError(err error) error {
 		// "not leader" / "leader not found" suffix), and the
 		// retry loop's isRetryableTransactWriteError does not catch
 		// them. Without this arm the error falls to default and the
-		// admin handler renders a generic 500 — Codex P2 + Claude
-		// P1 on PR #670 confirmed the gap. Mirrors the same arm in
-		// translateAdminTablesError that fixed this for Dynamo on
-		// PR #634.
+		// admin handler renders a generic 500. Mirrors the same arm
+		// in translateAdminTablesError on the Dynamo side.
 		return admin.ErrQueuesNotLeader
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
