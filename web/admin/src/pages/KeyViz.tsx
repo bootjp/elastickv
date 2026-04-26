@@ -118,11 +118,10 @@ function Heatmap({ matrix }: HeatmapProps) {
     ctx.clearRect(0, 0, width, height);
     if (matrix.rows.length === 0 || matrix.column_unix_ms.length === 0) return;
 
-    // putImageData over the full canvas keeps render under the
-    // §10 budget at 1024 × 500. We build the buffer column-major and
-    // expand each cell into a cellW × cellH block via fillRect; this
-    // avoids per-pixel iteration on the larger axis while still
-    // letting the colour ramp run once per cell.
+    // One fillRect per cell keeps render under the §10 budget at
+    // 1024 × 500: the colour ramp runs once per cell rather than per
+    // pixel, and zero-value cells are skipped so the only work on a
+    // quiet matrix is the initial clearRect.
     for (let i = 0; i < matrix.rows.length; i++) {
       const row = matrix.rows[i];
       for (let j = 0; j < row.values.length; j++) {
@@ -182,9 +181,23 @@ interface TimeAxisProps {
   cellW: number;
 }
 
+// timeAxisLabelMinPxGap is a conservative lower bound for the rendered
+// width of an `HH:mm:ss` label at the 10px font size used by the axis
+// (including a small inter-label gap). Using it as a minimum keeps
+// labels from overlapping when cellW is small — without it, a 2px
+// cell width with the previous "every column_count/10" stride would
+// pack labels so tightly they would visually merge.
+const timeAxisLabelMinPxGap = 56;
+
 function TimeAxis({ columnUnixMs, cellW }: TimeAxisProps) {
   if (columnUnixMs.length === 0) return null;
-  const stride = Math.max(1, Math.ceil(columnUnixMs.length / 10));
+  const minStrideForLabels =
+    cellW > 0 ? Math.ceil(timeAxisLabelMinPxGap / cellW) : 1;
+  const stride = Math.max(
+    1,
+    minStrideForLabels,
+    Math.ceil(columnUnixMs.length / 10),
+  );
   const ticks: { idx: number; label: string }[] = [];
   for (let i = 0; i < columnUnixMs.length; i += stride) {
     const d = new Date(columnUnixMs[i]);
@@ -313,6 +326,28 @@ interface RowsInputProps {
 }
 
 function RowsInput({ value, onChange }: RowsInputProps) {
+  // The committed row budget is held by the parent so the heatmap
+  // refetches only when a valid value is committed. The `<input>`
+  // value is a local string so the field can be cleared mid-edit
+  // without forcing the parent to round-trip through 0/1 placeholder
+  // values; we commit on blur and on Enter, and revert to the parent
+  // value if the field ends up empty or invalid.
+  const [draft, setDraft] = useState<string>(String(value));
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const n = Number.parseInt(draft, 10);
+    if (Number.isFinite(n) && n > 0) {
+      const clamped = Math.min(n, rowsCap);
+      if (clamped !== value) onChange(clamped);
+      setDraft(String(clamped));
+    } else {
+      setDraft(String(value));
+    }
+  };
+
   return (
     <label className="flex items-center gap-1">
       <span className="text-xs text-muted">Rows</span>
@@ -322,10 +357,14 @@ function RowsInput({ value, onChange }: RowsInputProps) {
         max={rowsCap}
         step={1}
         className="input text-sm w-24"
-        value={value}
-        onChange={(e) => {
-          const n = Number.parseInt(e.target.value, 10);
-          if (Number.isFinite(n) && n > 0) onChange(Math.min(n, rowsCap));
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            commit();
+            (e.target as HTMLInputElement).blur();
+          }
         }}
       />
     </label>
