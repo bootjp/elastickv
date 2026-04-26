@@ -7,7 +7,7 @@ import { formatApiError, useApiQuery } from "../lib/useApi";
 
 export function S3ListPage() {
   const { session } = useAuth();
-  const buckets = useApiQuery((_signal) => api.listBuckets(), []);
+  const buckets = useApiQuery((signal) => api.listBuckets(undefined, signal), []);
   const [open, setOpen] = useState(false);
   const writeAllowed = session?.role === "full";
 

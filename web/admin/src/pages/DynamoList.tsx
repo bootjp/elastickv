@@ -7,7 +7,7 @@ import { formatApiError, useApiQuery } from "../lib/useApi";
 
 export function DynamoListPage() {
   const { session } = useAuth();
-  const tables = useApiQuery((_signal) => api.listTables(undefined), []);
+  const tables = useApiQuery((signal) => api.listTables(undefined, signal), []);
   const [open, setOpen] = useState(false);
   const writeAllowed = session?.role === "full";
 

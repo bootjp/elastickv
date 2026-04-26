@@ -1,10 +1,11 @@
-import { ApiError, api } from "../api/client";
+import type { ApiError } from "../api/client";
+import { api } from "../api/client";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
 export function DashboardPage() {
   const cluster = useApiQuery((signal) => api.cluster(signal), []);
-  const tables = useApiQuery((signal) => safe(() => api.listTables(), signal), []);
-  const buckets = useApiQuery((signal) => safe(() => api.listBuckets(), signal), []);
+  const tables = useApiQuery((signal) => api.listTables(undefined, signal), []);
+  const buckets = useApiQuery((signal) => api.listBuckets(undefined, signal), []);
 
   return (
     <div className="space-y-6">
@@ -125,9 +126,3 @@ function SummaryCard({ label, value, loading, error, pendingMessage }: SummaryCa
   );
 }
 
-// safe wraps a promise so a 404 from a not-yet-wired backend route
-// does not cancel the dashboard render. Other errors propagate.
-function safe<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (signal?.aborted) return Promise.reject(new ApiError(0, "aborted", ""));
-  return fn();
-}
