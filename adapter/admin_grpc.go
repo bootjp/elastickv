@@ -535,7 +535,24 @@ func (s *AdminServer) GetKeyVizMatrix(
 	to := unixMsToTime(req.GetToUnixMs())
 	cols := sampler.Snapshot(from, to)
 	pickValue := matrixSeriesPicker(req.GetSeries())
-	return matrixToProto(cols, pickValue, int(req.GetRows())), nil
+	return matrixToProto(cols, pickValue, clampRowBudget(int(req.GetRows()))), nil
+}
+
+// keyVizRowBudgetCap is the upper bound on the per-request rows
+// budget — design doc §4.1 caps rows at 1024 to bound server work
+// (sort + payload) for adversarial / over-large requests.
+const keyVizRowBudgetCap = 1024
+
+// clampRowBudget enforces design §4.1's upper bound. A request of 0
+// (or negative) means "no cap" and is preserved; anything past the
+// cap is silently clamped — clients asking for more rows than the
+// server is willing to render get the most rows the server will
+// render, not an error.
+func clampRowBudget(requested int) int {
+	if requested > keyVizRowBudgetCap {
+		return keyVizRowBudgetCap
+	}
+	return requested
 }
 
 // unixMsToTime converts a Unix-millisecond timestamp into a time.Time,
@@ -549,21 +566,22 @@ func unixMsToTime(ms int64) time.Time {
 }
 
 // matrixSeriesPicker returns a callback that extracts the requested
-// counter from a MatrixRow. KEYVIZ_SERIES_UNSPECIFIED (and READS)
-// fall through to Reads so a default-valued request still returns
-// something useful.
+// counter from a MatrixRow. KEYVIZ_SERIES_UNSPECIFIED falls through
+// to Writes per design doc §4.1 — write traffic is the primary
+// signal the heatmap is built around, and the read path is wired in
+// a follow-up phase.
 func matrixSeriesPicker(series pb.KeyVizSeries) func(keyviz.MatrixRow) uint64 {
 	switch series {
-	case pb.KeyVizSeries_KEYVIZ_SERIES_WRITES:
-		return func(r keyviz.MatrixRow) uint64 { return r.Writes }
+	case pb.KeyVizSeries_KEYVIZ_SERIES_READS:
+		return func(r keyviz.MatrixRow) uint64 { return r.Reads }
 	case pb.KeyVizSeries_KEYVIZ_SERIES_READ_BYTES:
 		return func(r keyviz.MatrixRow) uint64 { return r.ReadBytes }
 	case pb.KeyVizSeries_KEYVIZ_SERIES_WRITE_BYTES:
 		return func(r keyviz.MatrixRow) uint64 { return r.WriteBytes }
-	case pb.KeyVizSeries_KEYVIZ_SERIES_UNSPECIFIED, pb.KeyVizSeries_KEYVIZ_SERIES_READS:
-		return func(r keyviz.MatrixRow) uint64 { return r.Reads }
+	case pb.KeyVizSeries_KEYVIZ_SERIES_UNSPECIFIED, pb.KeyVizSeries_KEYVIZ_SERIES_WRITES:
+		return func(r keyviz.MatrixRow) uint64 { return r.Writes }
 	default:
-		return func(r keyviz.MatrixRow) uint64 { return r.Reads }
+		return func(r keyviz.MatrixRow) uint64 { return r.Writes }
 	}
 }
 
@@ -608,6 +626,14 @@ func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint6
 // applyKeyVizRowBudget caps rows to budget by total activity per row
 // (sum of per-column values), preserving the top-N rows. budget <= 0
 // means "no cap."
+//
+// NOTE: design doc §5.5 specifies a "lexicographic walk + greedy
+// merge of low-activity adjacent ranges" algorithm — we simplify to
+// activity-descending truncation for Phase 1 because it covers the
+// common UI need (highlight hotspots) without needing the synthetic
+// virtual-bucket plumbing the merge requires. Phase 2 should swap
+// this for the spec'd merge so low-activity ranges become coarse
+// aggregates instead of being silently dropped.
 func applyKeyVizRowBudget(rows []*pb.KeyVizRow, budget int) []*pb.KeyVizRow {
 	if budget <= 0 || len(rows) <= budget {
 		return rows
