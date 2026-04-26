@@ -976,7 +976,10 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 }
 
 // observeMutation: reads never reach this path; the early return
-// keeps the disabled-keyviz hot path allocation-free.
+// keeps the disabled-keyviz hot path allocation-free. Counted
+// pre-commit, so a mutation that subsequently fails its Raft
+// proposal is still recorded — the heatmap reflects offered load,
+// not just committed writes (intentional for traffic visualisation).
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	if c.sampler == nil {
 		return
