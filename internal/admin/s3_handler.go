@@ -1,12 +1,16 @@
 package admin
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 // Pagination knobs for the read-only S3 bucket list endpoint.
@@ -30,8 +34,14 @@ const (
 // import kv to read the field.
 const hlcPhysicalShift = 16
 
+// pathSuffixACL is the trailing segment of /s3/buckets/{name}/acl.
+// Pulled out as a constant so the route switch matches a typed
+// suffix rather than an inline literal — drop the helper if the
+// per-bucket sub-resources ever grow beyond this single member.
+const pathSuffixACL = "/acl"
+
 // S3Handler serves /admin/api/v1/s3/buckets and the
-// /admin/api/v1/s3/buckets/{name} sub-tree. Construct via
+// /admin/api/v1/s3/buckets/{name}{,/acl} sub-tree. Construct via
 // NewS3Handler and hand to the admin router.
 //
 // The handler depends on a BucketsSource for in-process dispatch.
@@ -39,12 +49,15 @@ const hlcPhysicalShift = 16
 // well-known "S3 admin disabled" signal the router keys off of
 // (the routes fall through to the unknown-endpoint 404).
 //
-// Slice 1 ships only the read-only paths (list + describe). The
-// next slice will add a RoleStore for live role re-validation on
-// the write endpoints (mirrors DynamoHandler.WithRoleStore).
+// Writes (POST / PUT / DELETE) re-validate the principal against a
+// live RoleStore on every request — the JWT freezes the role at
+// login but a downgraded or revoked key must not be allowed to
+// continue mutating until the token expires (Codex P1 on PR #635
+// applied the same fix on the Dynamo side).
 type S3Handler struct {
 	source BucketsSource
 	logger *slog.Logger
+	roles  RoleStore
 }
 
 // NewS3Handler wires a BucketsSource into the HTTP handler. Returns
@@ -61,7 +74,7 @@ func NewS3Handler(source BucketsSource) *S3Handler {
 
 // WithLogger swaps the slog destination. Returns the receiver so
 // option calls chain at construction sites
-// (NewS3Handler(...).WithLogger(...)).
+// (NewS3Handler(...).WithLogger(...).WithRoleStore(...)).
 func (h *S3Handler) WithLogger(logger *slog.Logger) *S3Handler {
 	if logger != nil {
 		h.logger = logger
@@ -69,41 +82,82 @@ func (h *S3Handler) WithLogger(logger *slog.Logger) *S3Handler {
 	return h
 }
 
-// ServeHTTP routes /buckets and /buckets/{name}. The next slice
-// wires POST/PUT/DELETE; for now those return 405 so the SPA can
-// distinguish "endpoint not configured" (404) from "method not
-// implemented yet" (405).
+// WithRoleStore wires the live access-key → role lookup. Required
+// for the write endpoints' role re-validation; safe to omit on
+// builds that disable writes (NewServer ensures it is always set
+// when ServerDeps.Buckets is wired).
+func (h *S3Handler) WithRoleStore(roles RoleStore) *S3Handler {
+	h.roles = roles
+	return h
+}
+
+// ServeHTTP routes /buckets, /buckets/{name}, and /buckets/{name}/acl.
 func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == pathS3Buckets:
-		switch r.Method {
-		case http.MethodGet:
-			h.handleList(w, r)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is implemented for /s3/buckets in this build")
-		}
+		h.serveCollection(w, r)
 	case strings.HasPrefix(r.URL.Path, pathPrefixS3Buckets):
-		name := strings.TrimPrefix(r.URL.Path, pathPrefixS3Buckets)
-		// /buckets/{name}/acl is reserved for the next slice. Reject
-		// any sub-path with 404 here so a SPA bug that calls PUT /acl
-		// on this build sees a sensible error instead of mistakenly
-		// hitting the describe path with a "{name}/acl" string. The
-		// pinned test is TestS3Handler_DescribeBucket_SubpathReturns404
-		// (CodeRabbit minor on PR #658 caught the previous comment
-		// referring to 405).
-		if strings.Contains(name, "/") {
+		h.servePerBucket(w, r)
+	default:
+		writeJSONError(w, http.StatusNotFound, "not_found", "")
+	}
+}
+
+func (h *S3Handler) serveCollection(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handleList(w, r)
+	case http.MethodPost:
+		h.handleCreate(w, r)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			"only GET or POST is allowed on /s3/buckets")
+	}
+}
+
+// servePerBucket dispatches /s3/buckets/{name} and the single
+// sub-resource /s3/buckets/{name}/acl. Any other sub-path 404s so a
+// SPA bug pointed at a hypothetical /buckets/{name}/policy or
+// similar sees an unambiguous "no handler" rather than mistakenly
+// hitting the describe path with a "{name}/policy" string. The
+// pinned test is TestS3Handler_DescribeBucket_SubpathReturns404
+// (CodeRabbit minor on PR #658 caught a prior version of this
+// comment that mistakenly said "405").
+func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request) {
+	tail := strings.TrimPrefix(r.URL.Path, pathPrefixS3Buckets)
+	if tail == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_bucket_name",
+			"bucket name is empty")
+		return
+	}
+	if strings.HasSuffix(tail, pathSuffixACL) {
+		name := strings.TrimSuffix(tail, pathSuffixACL)
+		if name == "" || strings.Contains(name, "/") {
 			writeJSONError(w, http.StatusNotFound, "not_found",
 				"no admin S3 handler is registered for this path")
 			return
 		}
-		switch r.Method {
-		case http.MethodGet:
-			h.handleDescribe(w, r, name)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET is implemented for /s3/buckets/{name} in this build")
+		if r.Method != http.MethodPut {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+				"only PUT is allowed on /s3/buckets/{name}/acl")
+			return
 		}
+		h.handlePutACL(w, r, name)
+		return
+	}
+	if strings.Contains(tail, "/") {
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			"no admin S3 handler is registered for this path")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h.handleDescribe(w, r, tail)
+	case http.MethodDelete:
+		h.handleDelete(w, r, tail)
 	default:
-		writeJSONError(w, http.StatusNotFound, "not_found", "")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			"only GET or DELETE is allowed on /s3/buckets/{name}")
 	}
 }
 
@@ -189,6 +243,235 @@ func FormatBucketCreatedAt(hlc uint64) string {
 	}
 	ms := int64(hlc >> hlcPhysicalShift) //nolint:gosec // 48-bit physical half always fits in int64.
 	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+}
+
+// adminS3CreateBodyLimit is the per-request body cap for POST
+// /s3/buckets and PUT /s3/buckets/{name}/acl. Matches design 4.4
+// (64 KiB hard cap on every admin POST/PUT). The wrapping BodyLimit
+// middleware also enforces a 64 KiB cap; this constant is the
+// in-handler MaxBytesReader limit so an oversized body produces
+// errCreateBodyTooLarge before json.Decode bails on the truncation.
+const adminS3CreateBodyLimit = 64 << 10
+
+// errAdminS3BodyTooLarge is the sentinel decodeAdminS3JSONBody
+// returns when the request body trips MaxBytesReader. The handler
+// matches it to write 413 + the standard payload_too_large code,
+// distinct from the generic 400 invalid_body that other decode
+// failures produce.
+var errAdminS3BodyTooLarge = errors.New("request body exceeds the 64 KiB admin limit")
+
+func (h *S3Handler) handleCreate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.principalForWrite(w, r)
+	if !ok {
+		return
+	}
+	body, err := decodeAdminS3JSONBody[CreateBucketRequest](r.Body)
+	if err != nil {
+		if errors.Is(err, errAdminS3BodyTooLarge) {
+			WriteMaxBytesError(w)
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	if err := validateCreateBucketRequest(body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	summary, err := h.source.AdminCreateBucket(r.Context(), principal, body)
+	if err != nil {
+		h.writeBucketsError(w, r, "create", err)
+		return
+	}
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("operation", "create_bucket"),
+		slog.String("bucket", body.BucketName),
+	)
+	writeAdminJSONStatus(w, r.Context(), h.logger, http.StatusCreated, summary)
+}
+
+func (h *S3Handler) handlePutACL(w http.ResponseWriter, r *http.Request, name string) {
+	principal, ok := h.principalForWrite(w, r)
+	if !ok {
+		return
+	}
+	body, err := decodeAdminS3JSONBody[PutBucketACLRequest](r.Body)
+	if err != nil {
+		if errors.Is(err, errAdminS3BodyTooLarge) {
+			WriteMaxBytesError(w)
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	if strings.TrimSpace(body.ACL) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_body", "acl is required")
+		return
+	}
+	if err := h.source.AdminPutBucketAcl(r.Context(), principal, name, body.ACL); err != nil {
+		h.writeBucketsError(w, r, "put_acl", err)
+		return
+	}
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("operation", "put_bucket_acl"),
+		slog.String("bucket", name),
+		slog.String("acl", body.ACL),
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *S3Handler) handleDelete(w http.ResponseWriter, r *http.Request, name string) {
+	principal, ok := h.principalForWrite(w, r)
+	if !ok {
+		return
+	}
+	if err := h.source.AdminDeleteBucket(r.Context(), principal, name); err != nil {
+		h.writeBucketsError(w, r, "delete", err)
+		return
+	}
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("operation", "delete_bucket"),
+		slog.String("bucket", name),
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// principalForWrite mirrors DynamoHandler.principalForWrite: pull
+// the JWT principal out of the request context, re-resolve the role
+// against the live RoleStore, and reject anything below Full. Even
+// a still-valid JWT with role=full does not get a free pass —
+// operators who revoke an access key get the change picked up on
+// the next admin write rather than waiting for the JWT to expire.
+func (h *S3Handler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated",
+			"no session principal")
+		return AuthPrincipal{}, false
+	}
+	if h.roles == nil {
+		// Production wiring always sets a RoleStore; nil is a test
+		// fallthrough we accept so single-handler unit tests can
+		// reach the source without standing up the auth chain.
+		if !principal.Role.AllowsWrite() {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this endpoint requires a full-access role")
+			return AuthPrincipal{}, false
+		}
+		return principal, true
+	}
+	role, found := h.roles.LookupRole(principal.AccessKey)
+	if !found || !role.AllowsWrite() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+		return AuthPrincipal{}, false
+	}
+	return AuthPrincipal{AccessKey: principal.AccessKey, Role: role}, true
+}
+
+// writeBucketsError translates a BucketsSource error into the
+// appropriate HTTP response. Internal-server-error fallthrough logs
+// the raw err.Error() but never sends it to the client, matching
+// the Dynamo side's writeTablesError policy.
+func (h *S3Handler) writeBucketsError(w http.ResponseWriter, r *http.Request, op string, err error) {
+	switch {
+	case errors.Is(err, ErrBucketsForbidden):
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
+	case errors.Is(err, ErrBucketsNotLeader):
+		// Reached only when no LeaderForwarder is configured (single-
+		// node or leader-only deployments). When the next slice's
+		// AdminForward integration ships, the forwarder will catch
+		// this before writeBucketsError is called.
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+			"this admin node is not the raft leader")
+	case errors.Is(err, ErrBucketsNotFound):
+		writeJSONError(w, http.StatusNotFound, "not_found", "bucket does not exist")
+	case errors.Is(err, ErrBucketsAlreadyExists):
+		writeJSONError(w, http.StatusConflict, "already_exists", "bucket already exists")
+	case errors.Is(err, ErrBucketsNotEmpty):
+		writeJSONError(w, http.StatusConflict, "bucket_not_empty",
+			"bucket still has objects; remove them and retry")
+	default:
+		var verr *ValidationError
+		if errors.As(err, &verr) {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request", verr.Error())
+			return
+		}
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" bucket failed",
+			slog.String("error", err.Error()),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "s3_"+op+"_failed",
+			"failed to "+op+" bucket; see server logs")
+	}
+}
+
+// validateCreateBucketRequest applies the lightweight client-side
+// guard rails. Bucket-name format checks happen in the adapter
+// (validateS3BucketName) — we only catch the obvious mistakes
+// here so the SPA gets a typed 400 with a clear message rather
+// than the more generic adapter-level wrapping.
+func validateCreateBucketRequest(in CreateBucketRequest) error {
+	if strings.TrimSpace(in.BucketName) == "" {
+		return errors.New("bucket_name is required")
+	}
+	if in.BucketName != strings.TrimSpace(in.BucketName) {
+		return errors.New("bucket_name must not have leading or trailing whitespace")
+	}
+	return nil
+}
+
+// decodeAdminS3JSONBody is the shared decoder for POST /s3/buckets
+// and PUT /s3/buckets/{name}/acl. Strict (DisallowUnknownFields,
+// trailing-token rejection, NUL-byte rejection) so a future
+// schema change does not silently accept extra keys.
+func decodeAdminS3JSONBody[T any](body io.Reader) (T, error) {
+	var zero T
+	if body == nil {
+		return zero, errors.New("request body is empty")
+	}
+	limited := http.MaxBytesReader(nil, io.NopCloser(body), adminS3CreateBodyLimit)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		var me *http.MaxBytesError
+		if errors.As(err, &me) {
+			return zero, errAdminS3BodyTooLarge
+		}
+		return zero, errors.New("failed to read request body")
+	}
+	if len(raw) == 0 {
+		// httptest passes http.NoBody for a nil-body request, which
+		// reads as an empty byte slice rather than an error. The
+		// caller's contract is "missing body → 400 invalid_body /
+		// 'empty'", so surface that explicitly here rather than
+		// letting the JSON decoder bubble up a generic
+		// "not valid JSON" error.
+		return zero, errors.New("request body is empty")
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		// goccy/go-json treats raw NUL as end-of-input; reject so a
+		// payload like `{"acl":"private"}\x00{"x":1}` cannot smuggle
+		// a second JSON object past dec.More(). Codex P2 on PR #635
+		// caught the same vector on the leader-side decoder.
+		return zero, errors.New("request body contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var out T
+	if err := dec.Decode(&out); err != nil {
+		return zero, errors.New("request body is not valid JSON")
+	}
+	if dec.More() {
+		return zero, errors.New("request body has trailing data after the first JSON value")
+	}
+	return out, nil
 }
 
 // paginateBuckets slices `buckets` (already lex-sorted by the

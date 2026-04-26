@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"strings"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -174,4 +176,242 @@ func summaryFromBucketMeta(name string, meta *s3BucketMeta) AdminBucketSummary {
 		Region:       meta.Region,
 		Owner:        meta.Owner,
 	}
+}
+
+// Sentinel errors the admin write methods return so the bridge in
+// main_admin.go can translate them into admin-package vocabulary
+// without sniffing strings. Named separately from
+// ErrAdminTableAlreadyExists / ErrAdminTableNotFound on the Dynamo
+// side so a future per-resource role / status divergence does not
+// require renaming both packages' callers.
+var (
+	// ErrAdminBucketAlreadyExists signals that AdminCreateBucket
+	// targeted a name already in use. Maps to 409 Conflict.
+	ErrAdminBucketAlreadyExists = errors.New("s3 admin: bucket already exists")
+	// ErrAdminBucketNotFound signals that AdminDeleteBucket /
+	// AdminPutBucketAcl targeted a missing bucket. Maps to 404.
+	ErrAdminBucketNotFound = errors.New("s3 admin: bucket not found")
+	// ErrAdminBucketNotEmpty signals that AdminDeleteBucket targeted
+	// a bucket that still has objects. Maps to 409 Conflict to match
+	// the SigV4 path's BucketNotEmpty response (the dashboard cannot
+	// force a recursive delete; the operator must clean up first).
+	ErrAdminBucketNotEmpty = errors.New("s3 admin: bucket is not empty")
+	// ErrAdminInvalidBucketName signals that AdminCreateBucket got
+	// a name that does not satisfy validateS3BucketName. Maps to 400.
+	ErrAdminInvalidBucketName = errors.New("s3 admin: invalid bucket name")
+	// ErrAdminInvalidACL signals that the ACL string did not pass
+	// validateS3CannedAcl. Maps to 400 (the SigV4 path returns 501
+	// NotImplemented for unsupported canned ACLs, but the admin API
+	// is documented as private/public-read only and rejecting other
+	// values as invalid input is a more useful contract for the
+	// dashboard).
+	ErrAdminInvalidACL = errors.New("s3 admin: invalid ACL")
+)
+
+// AdminCreateBucket creates a bucket on behalf of the admin
+// dashboard. The principal MUST be re-validated by the caller (the
+// admin HTTP handler does this against the live RoleStore); this
+// method enforces the authorisation invariant a second time so a
+// follower-forwarded call cannot smuggle a read-only principal past
+// the check on the leader side (Section 3.2 "認可の真実は常に
+// adapter 側").
+//
+// The transaction is atomic: bucket meta + generation + ACL all land
+// in a single OperationGroup, mirroring the SigV4 createBucket path.
+// On success returns the freshly-stored summary; on conflict returns
+// ErrAdminBucketAlreadyExists; on a non-leader / non-full-role / bad
+// input returns the corresponding sentinel.
+func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
+	if !principal.Role.canWrite() {
+		return nil, ErrAdminForbidden
+	}
+	if !s.isVerifiedS3Leader() {
+		return nil, ErrAdminNotLeader
+	}
+	if err := validateS3BucketName(name); err != nil {
+		return nil, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
+	}
+	acl = adminCanonicalACL(acl)
+	if err := validateS3CannedAcl(acl); err != nil {
+		return nil, errors.Wrapf(ErrAdminInvalidACL, "%s", err.Error())
+	}
+
+	var summary *AdminBucketSummary
+	err := s.retryS3Mutation(ctx, func() error {
+		out, err := s.adminCreateBucketTxn(ctx, principal, name, acl)
+		if err != nil {
+			return err
+		}
+		summary = out
+		return nil
+	})
+	if err != nil {
+		return nil, err //nolint:wrapcheck // sentinel errors propagate as-is; structured errors are already wrapped above.
+	}
+	return summary, nil
+}
+
+// adminCreateBucketTxn is the per-attempt body retryS3Mutation
+// invokes. Pulled out so AdminCreateBucket stays under the
+// cyclomatic ceiling without hiding the bucket-existence /
+// generation / commit-ts dance — every step has a meaningful
+// error path that the wrapping retry harness needs to see.
+func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
+	readTS := s.readTS()
+	startTS := s.txnStartTS(readTS)
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	existing, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if exists && existing != nil {
+		return nil, ErrAdminBucketAlreadyExists
+	}
+	nextGeneration, err := s.nextBucketGenerationAt(ctx, name, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	commitTS, err := s.nextTxnCommitTS(startTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	meta := &s3BucketMeta{
+		BucketName:   name,
+		Generation:   nextGeneration,
+		CreatedAtHLC: commitTS,
+		Region:       s.effectiveRegion(),
+		Owner:        principal.AccessKey,
+		Acl:          acl,
+	}
+	body, err := encodeS3BucketMeta(meta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: s3keys.BucketMetaKey(name), Value: body},
+			{Op: kv.Put, Key: s3keys.BucketGenerationKey(name), Value: encodeS3Generation(nextGeneration)},
+		},
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	out := summaryFromBucketMeta(name, meta)
+	return &out, nil
+}
+
+// AdminPutBucketAcl swaps the canned ACL on an existing bucket.
+// Same authorisation contract as AdminCreateBucket. Mutates only
+// the meta.Acl field; generation is preserved so existing object
+// references stay valid.
+func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincipal, name, acl string) error {
+	if !principal.Role.canWrite() {
+		return ErrAdminForbidden
+	}
+	if !s.isVerifiedS3Leader() {
+		return ErrAdminNotLeader
+	}
+	acl = adminCanonicalACL(acl)
+	if err := validateS3CannedAcl(acl); err != nil {
+		return errors.Wrapf(ErrAdminInvalidACL, "%s", err.Error())
+	}
+
+	err := s.retryS3Mutation(ctx, func() error {
+		readTS := s.readTS()
+		startTS := s.txnStartTS(readTS)
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !exists || meta == nil {
+			return ErrAdminBucketNotFound
+		}
+		meta.Acl = acl
+		body, err := encodeS3BucketMeta(meta)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:   true,
+			StartTS: startTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Put, Key: s3keys.BucketMetaKey(name), Value: body},
+			},
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
+		return err //nolint:wrapcheck // sentinel errors propagate as-is.
+	}
+	return nil
+}
+
+// AdminDeleteBucket removes a bucket if it is empty. Same
+// authorisation contract as the other admin write methods. The
+// bucket-must-be-empty rule mirrors the SigV4 deleteBucket path —
+// the dashboard cannot force a recursive delete, by design.
+func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincipal, name string) error {
+	if !principal.Role.canWrite() {
+		return ErrAdminForbidden
+	}
+	if !s.isVerifiedS3Leader() {
+		return ErrAdminNotLeader
+	}
+
+	err := s.retryS3Mutation(ctx, func() error {
+		readTS := s.readTS()
+		startTS := s.txnStartTS(readTS)
+		readPin := s.pinReadTS(readTS)
+		defer readPin.Release()
+
+		meta, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !exists || meta == nil {
+			return ErrAdminBucketNotFound
+		}
+		start := s3keys.ObjectManifestPrefixForBucket(name, meta.Generation)
+		kvs, err := s.store.ScanAt(ctx, start, prefixScanEnd(start), 1, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if len(kvs) > 0 {
+			return ErrAdminBucketNotEmpty
+		}
+		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:   true,
+			StartTS: startTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Del, Key: s3keys.BucketMetaKey(name)},
+			},
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
+		return err //nolint:wrapcheck // sentinel errors propagate as-is.
+	}
+	return nil
+}
+
+// adminCanonicalACL normalises an empty input to the canned
+// "private" default. The SigV4 createBucket / putBucketAcl paths
+// apply the same default after trimming the x-amz-acl header.
+// Pulled out so the admin write methods do not silently accept a
+// blank string and create / mutate with whatever validateS3CannedAcl
+// happens to allow on its empty branch.
+func adminCanonicalACL(acl string) string {
+	trimmed := strings.TrimSpace(acl)
+	if trimmed == "" {
+		return s3AclPrivate
+	}
+	return trimmed
 }
