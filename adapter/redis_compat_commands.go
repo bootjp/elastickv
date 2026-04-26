@@ -28,27 +28,19 @@ const (
 	pubsubPatternArgMin  = 3
 	pubsubFirstChannel   = 2
 	redisBusyPollBackoff = 10 * time.Millisecond
-	// redisStreamWaitFallback is the safety-net poll interval that fires
-	// in xreadBusyPoll when no XADD signal arrives. The signal path covers
-	// all in-process XADDs on the same node; the fallback only matters
-	// when the entry was applied via a path that does not call Signal
-	// (e.g. follower-side FSM apply, future direct mutation paths).
+	// redisBlockWaitFallback is the safety-net poll interval that fires
+	// in blocking-command wait loops (XREAD BLOCK, BZPOPMIN — and the
+	// future BLPOP / BRPOP / BLMOVE) when no in-process write signal
+	// arrives. The signal path covers all in-process XADD / ZADD /
+	// ZINCRBY on the same node; the fallback covers paths that bypass
+	// Signal (Lua flush, follower-applied entries — both addressed by
+	// the FSM ApplyObserver follow-up tracked in
+	// docs/design/2026_04_26_proposed_fsm_apply_observer.md).
 	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
 	// busy-poll, while bounding stale-poll latency to a value clients
 	// already tolerate from network round-trips.
-	redisStreamWaitFallback = 100 * time.Millisecond
-	// redisKeyWaitFallback is the safety-net poll interval that fires
-	// in blocking command wait loops (BZPOPMIN today; BLPOP / BRPOP /
-	// BLMOVE in follow-ups) when no in-process write signal arrives.
-	// The signal path covers all in-process ZADD / ZINCRBY on the
-	// same node; the fallback covers paths that bypass Signal (Lua
-	// flush, follower-applied entries — both addressed by the FSM
-	// ApplyObserver follow-up tracked in
-	// docs/design/2026_04_26_proposed_fsm_apply_observer.md).
-	// Same shape and value as redisStreamWaitFallback; kept distinct
-	// so the two blocking-command families can tune independently.
-	redisKeyWaitFallback = 100 * time.Millisecond
-	redisKeywordCount    = "COUNT"
+	redisBlockWaitFallback = 100 * time.Millisecond
+	redisKeywordCount      = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set
 	// wide-column mutation slice beyond the per-member elements: one for the
@@ -3784,7 +3776,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		waitForKeyUpdate(handlerCtx, w.C, deadline)
+		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
 	}
 }
 
@@ -3810,21 +3802,29 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte) bool {
 	return false
 }
 
-// waitForKeyUpdate blocks until one of: a write signal arrives, the
-// fallback poll tick fires, the parent handlerCtx is cancelled, or
-// the BLOCK deadline elapses — whichever happens first. The fallback
-// bounds latency for write paths that do not signal (Lua flush,
-// follower-applied entries); it cannot exceed the remaining BLOCK
-// window so the deadline branch in the caller's loop top always
-// gets a chance to fire when the BLOCK expires.
-func waitForKeyUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
-	fallback := redisKeyWaitFallback
+// waitForBlockedCommandUpdate blocks until one of: a write signal
+// arrives, the fallback poll tick fires, the parent handlerCtx is
+// cancelled, or the BLOCK deadline elapses — whichever happens first.
+// The fallback bounds latency for write paths that do not signal (Lua
+// flush, follower-applied entries); it cannot exceed the remaining
+// BLOCK window so the deadline branch in the caller's loop top always
+// gets a chance to fire when the BLOCK expires. Shared by every
+// blocking-command wait loop (XREAD BLOCK, BZPOPMIN today; BLPOP /
+// BRPOP / BLMOVE in follow-ups) — the keyWaiterRegistry that produces
+// waiterC is per-domain (streamWaiters vs zsetWaiters), but the
+// timer-and-select shape is identical.
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
+	fallback := redisBlockWaitFallback
 	if remaining := time.Until(deadline); remaining < fallback {
 		fallback = remaining
 	}
 	timer := time.NewTimer(fallback)
 	defer func() {
 		if !timer.Stop() {
+			// The timer either fired (its case won and the channel
+			// was drained inline by select) or is still buffering
+			// the tick (waiter / handlerCtx won the race); drain
+			// the channel non-blocking so timer GC is clean.
 			select {
 			case <-timer.C:
 			default:
@@ -4959,7 +4959,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// in handlerCtx, so it would cancel-on-call too — but routing
 		// through isXReadIterCtxError silently translates that into an
 		// empty iteration and the loop would otherwise wait at
-		// redisStreamWaitFallback cadence until the deadline.
+		// redisBlockWaitFallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
@@ -5011,44 +5011,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 			conn.WriteNull()
 			return
 		}
-		waitForStreamUpdate(handlerCtx, w.C, deadline)
-	}
-}
-
-// waitForStreamUpdate blocks until one of: an XADD signal arrives,
-// the fallback poll tick fires, the parent handlerCtx is cancelled,
-// or the BLOCK deadline elapses — whichever happens first. The
-// fallback bounds latency for write paths that do not signal (Lua
-// flush, follower-applied entries); it cannot exceed the remaining
-// BLOCK window so the deadline branch in the caller's loop top
-// always gets a chance to fire when the BLOCK expires.
-//
-// Extracted to keep xreadBusyPoll under the cyclop budget — the
-// timer cleanup pattern (Stop + drain on miss) is awkward inline
-// and the helper lets the caller stay focused on the poll-result
-// branch.
-func waitForStreamUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
-	fallback := redisStreamWaitFallback
-	if remaining := time.Until(deadline); remaining < fallback {
-		fallback = remaining
-	}
-	timer := time.NewTimer(fallback)
-	defer func() {
-		if !timer.Stop() {
-			// The timer either fired (its case won and the channel
-			// was drained inline by select) or is still buffering
-			// the tick (waiter / handlerCtx won the race); drain
-			// the channel non-blocking so timer GC is clean.
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}()
-	select {
-	case <-waiterC:
-	case <-timer.C:
-	case <-handlerCtx.Done():
+		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
 	}
 }
 

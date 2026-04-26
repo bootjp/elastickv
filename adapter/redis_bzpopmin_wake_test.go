@@ -117,7 +117,7 @@ func TestRedis_BZPopMinWakesOnZIncrBy(t *testing.T) {
 // contract: when no ZADD arrives within the BLOCK window, BZPOPMIN
 // returns redis.Nil rather than a protocol error. This guards a
 // regression in the wait-loop refactor where the new
-// waitForKeyUpdate timer or context-cancel branch could otherwise
+// waitForBlockedCommandUpdate timer or context-cancel branch could otherwise
 // leak a -ERR reply.
 func TestRedis_BZPopMinTimesOutOnEmptyKey(t *testing.T) {
 	t.Parallel()
