@@ -9,8 +9,8 @@
 
 | Phase | Status | Landed via |
 |---|---|---|
-| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–6) | ✅ shipped | #634, #635, #644, #648 |
-| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1), #669 (write paths slice 2a), #673 (AdminForward integration slice 2b) |
+| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see outstanding items) | ✅ shipped | #634, #635, #644, #648 |
+| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | 🟡 partial — read-only slice 1 landed in #658; write paths (slice 2a, #669) and AdminForward integration (slice 2b, #673) are still in flight |
 | **P3** — React SPA + embed | ✅ shipped | #649, #650 |
 | **P4** — TLS, read-only role, CSRF, `docs/admin.md` | 🟡 mostly shipped — TLS / role / CSRF are live in P1, operator doc in #674 |
 
