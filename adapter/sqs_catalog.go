@@ -508,30 +508,41 @@ func (s *SQSServer) createQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if err := validateQueueName(in.QueueName); err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	requested, err := parseAttributesIntoMeta(in.QueueName, in.Attributes)
+	queueName, err := s.createQueueCore(r.Context(), &in)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
+	}
+	writeSQSJSON(w, map[string]string{"QueueUrl": s.queueURL(r, queueName)})
+}
+
+// createQueueCore is the wire-format-free worker shared by the JSON
+// handler above and the query-protocol handler in
+// sqs_query_protocol.go (Phase 3.B). Returns the canonical queue
+// name on success so each wire wrapper can build its own QueueUrl
+// shape (the URL host comes from the request, which is a wire-layer
+// concern). Errors keep their typed sqsAPIError so both the JSON and
+// XML error envelopes reuse the existing classification path.
+func (s *SQSServer) createQueueCore(ctx context.Context, in *sqsCreateQueueInput) (string, error) {
+	if err := validateQueueName(in.QueueName); err != nil {
+		return "", err
+	}
+	requested, err := parseAttributesIntoMeta(in.QueueName, in.Attributes)
+	if err != nil {
+		return "", err
 	}
 	if len(in.Tags) > sqsMaxTagsPerQueue {
 		// AWS caps tags per queue at 50. CreateQueue must reject
 		// over-cap tag bundles up front; a silent slice-and-store
 		// would let queues land with more tags than TagQueue would
 		// ever accept on the same queue.
-		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAttributeValue, "queue tag count exceeds 50")
-		return
+		return "", newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "queue tag count exceeds 50")
 	}
 	requested.Tags = in.Tags
-
-	if err := s.createQueueWithRetry(r.Context(), requested); err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
+	if err := s.createQueueWithRetry(ctx, requested); err != nil {
+		return "", err
 	}
-	writeSQSJSON(w, map[string]string{"QueueUrl": s.queueURL(r, in.QueueName)})
+	return in.QueueName, nil
 }
 
 func (s *SQSServer) createQueueWithRetry(ctx context.Context, requested *sqsQueueMeta) error {
@@ -684,33 +695,46 @@ func (s *SQSServer) listQueues(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	maxResults := clampListQueuesMaxResults(in.MaxResults)
-
-	names, err := s.scanQueueNames(r.Context())
+	page, nextToken, err := s.listQueuesCore(r.Context(), &in)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	urls := make([]string, 0, len(page))
+	for _, n := range page {
+		urls = append(urls, s.queueURL(r, n))
+	}
+	resp := map[string]any{"QueueUrls": urls}
+	if nextToken != "" {
+		resp["NextToken"] = nextToken
+	}
+	writeSQSJSON(w, resp)
+}
+
+// listQueuesCore is the wire-format-free worker shared by the JSON
+// handler and the query-protocol handler. Returns the page of queue
+// *names* plus the next-page token (empty when not truncated); URL
+// construction is a wire-layer concern handled by each wrapper.
+func (s *SQSServer) listQueuesCore(ctx context.Context, in *sqsListQueuesInput) ([]string, string, error) {
+	maxResults := clampListQueuesMaxResults(in.MaxResults)
+	names, err := s.scanQueueNames(ctx)
+	if err != nil {
+		return nil, "", err
+	}
 	sort.Strings(names)
 	filtered := filterByPrefix(names, in.QueueNamePrefix)
 	start := resolveListQueuesStart(filtered, in.NextToken)
-
 	end := start + maxResults
 	truncated := end < len(filtered)
 	if !truncated {
 		end = len(filtered)
 	}
 	page := filtered[start:end]
-
-	urls := make([]string, 0, len(page))
-	for _, n := range page {
-		urls = append(urls, s.queueURL(r, n))
-	}
-	resp := map[string]any{"QueueUrls": urls}
+	var nextToken string
 	if truncated && len(page) > 0 {
-		resp["NextToken"] = encodeSQSSegment(page[len(page)-1])
+		nextToken = encodeSQSSegment(page[len(page)-1])
 	}
-	writeSQSJSON(w, resp)
+	return page, nextToken, nil
 }
 
 func clampListQueuesMaxResults(requested int) int {
@@ -796,20 +820,29 @@ func (s *SQSServer) getQueueUrl(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if err := validateQueueName(in.QueueName); err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	_, exists, err := s.loadQueueMetaAt(r.Context(), in.QueueName, s.nextTxnReadTS(r.Context()))
+	queueName, err := s.getQueueUrlCore(r.Context(), &in)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if !exists {
-		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		return
+	writeSQSJSON(w, map[string]string{"QueueUrl": s.queueURL(r, queueName)})
+}
+
+// getQueueUrlCore is the wire-format-free worker shared by the JSON
+// handler and the query-protocol handler. Returns the validated
+// queue name on success; URL construction is a wire-layer concern.
+func (s *SQSServer) getQueueUrlCore(ctx context.Context, in *sqsGetQueueUrlInput) (string, error) {
+	if err := validateQueueName(in.QueueName); err != nil {
+		return "", err
 	}
-	writeSQSJSON(w, map[string]string{"QueueUrl": s.queueURL(r, in.QueueName)})
+	_, exists, err := s.loadQueueMetaAt(ctx, in.QueueName, s.nextTxnReadTS(ctx))
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	return in.QueueName, nil
 }
 
 func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
