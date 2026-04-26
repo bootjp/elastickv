@@ -313,14 +313,14 @@ func TestKeyVizHandlerOmittedRowsAppliesDefaultCap(t *testing.T) {
 	}})
 	defer srv.Close()
 
-	for _, query := range []string{"", "?rows=0"} {
+	for _, query := range []string{"", "?rows=0", "?rows=-1"} {
 		resp := keyVizGet(t, srv.URL+query)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		var matrix KeyVizMatrix
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
-		resp.Body.Close()
+		require.NoError(t, resp.Body.Close())
 		require.Len(t, matrix.Rows, keyVizRowBudgetCap,
-			"omitted/0 rows must apply the default cap (query=%q)", query)
+			"omitted/0/negative rows must apply the default cap (query=%q)", query)
 	}
 }
 

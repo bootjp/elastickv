@@ -220,12 +220,13 @@ func setKeyVizRowsParam(dst *int, raw string) error {
 		return nil
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return errors.New("rows must be a non-negative integer")
+	if err != nil {
+		return errors.New("rows must be an integer")
 	}
-	if n == 0 || n > keyVizRowBudgetCap {
-		// Explicit 0 collapses to the cap (same as omitting the
-		// param) so callers can't disable the budget by passing 0.
+	if n <= 0 || n > keyVizRowBudgetCap {
+		// Explicit 0 / negative / above-cap all collapse to the cap
+		// (same as omitting the param) so callers can't disable the
+		// budget by passing pathological values.
 		n = keyVizRowBudgetCap
 	}
 	*dst = n
