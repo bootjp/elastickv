@@ -254,12 +254,29 @@ flagged as a structural prerequisite.
      (matching the existing pattern, which depends on the
      well-established voter ordering invariant: `persistConfigState`
      writes voters in `ConfState.Voters` order and `normalizePeers`
-     preserves it). The **learner check is set-based**:
-     `len(conf.Learners) != filteredLearnerCount && allLearnersPresent(conf.Learners, learnerSet)`.
+     preserves it). The **learner check is set-based**. As an error
+     condition (return `errClusterMismatch` when true):
+
+     ```go
+     len(conf.Learners) != filteredLearnerCount ||
+         !allLearnersPresent(conf.Learners, learnerSet)
+     ```
+
+     Equivalently, the valid condition:
+
+     ```go
+     len(conf.Learners) == filteredLearnerCount &&
+         allLearnersPresent(conf.Learners, learnerSet)
+     ```
+
      A set comparison avoids pinning a new ordering contract on the
      v2 writer for learners — there is no prior convention since
      learners have never been persisted before, and the set form is
-     strictly more robust against future writer reordering.
+     strictly more robust against future writer reordering. Use `||`
+     (not `&&`) so that **same-count member divergence** (e.g.
+     `conf.Learners = [A, B]` vs peers `[A, C]`) and **conf-learner
+     missing from peers** are both rejected; an `&&` would silently
+     accept them.
    - **(b) Add a sibling helper.** Introduce
      `confStateWithLearners(peers []Peer) raftpb.ConfState` used only
      by `validateConfState`; leave `confStateForPeers` voters-only as
@@ -298,10 +315,32 @@ flagged as a structural prerequisite.
    in the apply loop already capture the return value of
    `rawNode.ApplyConfChange(...)`, so wiring the parameter is a
    one-line change at each call site (no new mutex, no new state).
-   Inside the body, suffrage-aware updates run **after** the existing
-   per-peer cleanup helpers (`upsertPeer` / `removePeer`) so address
-   cache mutations and voter-count rebuilds happen in a deterministic
-   order on the single-threaded apply loop (cf. §5.2 ordering note).
+
+   The two suffrage-aware updates inside the body have **different
+   ordering relative to the per-peer cleanup helpers**:
+
+   1. **`e.voterCount` and `e.isLearnerNode` are updated *before*
+      `upsertPeer` / `removePeer`.** This is what §4.6 and §5.2
+      require: `removePeer` reads `e.voterCount` to compute the
+      post-removal ack-tracker threshold, so it must see the
+      post-change count, not the pre-change count.
+   2. **`e.config.Servers` is rebuilt *after* `upsertPeer` /
+      `removePeer`** via `configurationFromConfState(e.peers, confState)`.
+      This rebuild reads the address cache `e.peers`, so it has to
+      observe the post-cleanup map.
+
+   The full sequence inside `applyConfigChange` /
+   `applyConfigChangeV2` is therefore:
+
+   ```text
+   1. recompute e.voterCount, e.isLearnerNode from confState
+   2. upsertPeer / removePeer  (mutates e.peers, may read e.voterCount)
+   3. rebuild e.config.Servers via configurationFromConfState(e.peers, confState)
+   4. resolveConfigChange / configIndex bookkeeping (existing)
+   ```
+
+   All four steps run on the single-threaded apply loop, so no extra
+   synchronization is needed.
 
 `nextPeersAfterConfigChange` already routes `ConfChangeAddLearnerNode`
 via `applyAddedPeerToMap`, so the snapshot/restart code path is correct
