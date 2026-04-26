@@ -517,6 +517,46 @@ func TestForwardServer_BucketOps_NoBucketsSourceReturns501(t *testing.T) {
 	}
 }
 
+func TestForwardServer_DynamoOps_NoTablesSourceReturns501(t *testing.T) {
+	// S3-only deployments construct ForwardServer with a nil
+	// TablesSource so leaders can still register the gRPC service
+	// for follower-forwarded bucket writes. Dynamo operations must
+	// then reject cleanly with 501 instead of dereferencing the nil
+	// source and panicking. Symmetric with
+	// TestForwardServer_BucketOps_NoBucketsSourceReturns501 for the
+	// inverse Dynamo-only build (Codex P1 on PR #673).
+	cases := []struct {
+		name    string
+		op      pb.AdminOperation
+		payload []byte
+	}{
+		{
+			name:    "create_table",
+			op:      pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
+			payload: mustJSON(t, CreateTableRequest{TableName: "orders"}),
+		},
+		{
+			name:    "delete_table",
+			op:      pb.AdminOperation_ADMIN_OP_DELETE_TABLE,
+			payload: []byte(`{"name":"orders"}`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewForwardServer(nil, fullPrincipalRoleStore(), nil).
+				WithBucketsSource(&stubBucketsSource{})
+			resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+				Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+				Operation: tc.op,
+				Payload:   tc.payload,
+			})
+			require.NoError(t, err)
+			require.Equal(t, int32(http.StatusNotImplemented), resp.GetStatusCode())
+			require.Contains(t, string(resp.GetPayload()), "not_implemented")
+		})
+	}
+}
+
 func TestForwardServer_CreateBucket_RejectsWhitespacePaddedName(t *testing.T) {
 	// Validation parity with the HTTP path's
 	// validateCreateBucketRequest: a name like " bucket " must

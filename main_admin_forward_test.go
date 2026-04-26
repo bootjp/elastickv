@@ -110,18 +110,40 @@ func TestRoleStoreFromFlags(t *testing.T) {
 
 func TestAdminForwardServerDeps_ReadyForRegistration(t *testing.T) {
 	// The bundle's readyForRegistration gate decides whether
-	// startRaftServers wires the gRPC ForwardServer at all. A nil
-	// TablesSource (cluster-only build) or nil RoleStore (admin
-	// auth disabled) means a registered service would 500 every
-	// forwarded call — silently skipping registration is the
-	// preferred behaviour.
-	require.False(t, adminForwardServerDeps{}.readyForRegistration())
-	require.False(t, adminForwardServerDeps{tables: dummyTablesSource{}}.readyForRegistration())
-	require.False(t, adminForwardServerDeps{roles: admin.MapRoleStore{}}.readyForRegistration())
+	// startRaftServers wires the gRPC ForwardServer at all.
+	// RoleStore is always required (admin auth disabled means the
+	// principal re-evaluation step has nothing to compare against).
+	// At least one of TablesSource / BucketsSource must be present;
+	// registering with neither would 501 every operation, which is
+	// indistinguishable from not registering at all.
+	//
+	// The S3-only case (Codex P1 on PR #673) used to fail this gate
+	// because the predicate required tables != nil — a cluster
+	// started with --dynamoAddr empty but S3 enabled never
+	// registered AdminForward, and follower-side S3 writes hit
+	// gRPC Unimplemented / 503 instead of reaching the leader. The
+	// "buckets only" assertion below pins the fix.
+	require.False(t, adminForwardServerDeps{}.readyForRegistration(),
+		"empty bundle must not register")
+	require.False(t, adminForwardServerDeps{tables: dummyTablesSource{}}.readyForRegistration(),
+		"missing roles must not register")
+	require.False(t, adminForwardServerDeps{buckets: dummyBucketsSource{}}.readyForRegistration(),
+		"missing roles must not register (S3-only)")
+	require.False(t, adminForwardServerDeps{roles: admin.MapRoleStore{}}.readyForRegistration(),
+		"roles without any source must not register")
 	require.True(t, adminForwardServerDeps{
 		tables: dummyTablesSource{},
 		roles:  admin.MapRoleStore{},
-	}.readyForRegistration())
+	}.readyForRegistration(), "Dynamo-only deployment must register")
+	require.True(t, adminForwardServerDeps{
+		buckets: dummyBucketsSource{},
+		roles:   admin.MapRoleStore{},
+	}.readyForRegistration(), "S3-only deployment must register")
+	require.True(t, adminForwardServerDeps{
+		tables:  dummyTablesSource{},
+		buckets: dummyBucketsSource{},
+		roles:   admin.MapRoleStore{},
+	}.readyForRegistration(), "full bundle must register")
 }
 
 func TestBuildAdminLeaderForwarder_NilGateReturnsNoForwarder(t *testing.T) {
@@ -222,4 +244,32 @@ func (dummyTablesSource) AdminCreateTable(_ context.Context, _ admin.AuthPrincip
 
 func (dummyTablesSource) AdminDeleteTable(_ context.Context, _ admin.AuthPrincipal, _ string) error {
 	panic("dummyTablesSource.AdminDeleteTable should not be invoked")
+}
+
+// dummyBucketsSource is the smallest concrete admin.BucketsSource
+// for the readyForRegistration gate test — symmetric with
+// dummyTablesSource. The S3-only branch of the gate (Codex P1 on
+// PR #673) needs a non-nil BucketsSource value to assert; using a
+// real adapter source would pull S3 wiring into a main_admin test
+// that is only checking the registration predicate.
+type dummyBucketsSource struct{}
+
+func (dummyBucketsSource) AdminListBuckets(_ context.Context) ([]admin.BucketSummary, error) {
+	panic("dummyBucketsSource.AdminListBuckets should not be invoked")
+}
+
+func (dummyBucketsSource) AdminDescribeBucket(_ context.Context, _ string) (*admin.BucketSummary, bool, error) {
+	panic("dummyBucketsSource.AdminDescribeBucket should not be invoked")
+}
+
+func (dummyBucketsSource) AdminCreateBucket(_ context.Context, _ admin.AuthPrincipal, _ admin.CreateBucketRequest) (*admin.BucketSummary, error) {
+	panic("dummyBucketsSource.AdminCreateBucket should not be invoked")
+}
+
+func (dummyBucketsSource) AdminPutBucketAcl(_ context.Context, _ admin.AuthPrincipal, _, _ string) error {
+	panic("dummyBucketsSource.AdminPutBucketAcl should not be invoked")
+}
+
+func (dummyBucketsSource) AdminDeleteBucket(_ context.Context, _ admin.AuthPrincipal, _ string) error {
+	panic("dummyBucketsSource.AdminDeleteBucket should not be invoked")
 }

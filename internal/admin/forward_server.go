@@ -107,8 +107,20 @@ func (s *ForwardServer) Forward(ctx context.Context, req *pb.AdminForwardRequest
 // handler. Pulled out so Forward stays under the cyclomatic ceiling
 // as the operation enum grows; the principal-validation +
 // forwarded_from sanitisation logic stays in Forward where it belongs.
+//
+// Source-availability checks live in checkOpAvailability rather than
+// in each handler: a Dynamo-only build has s.source != nil but
+// s.buckets == nil, and an S3-only build (Codex P1 on PR #673) has
+// the inverse. Centralising the check means every operation gets a
+// consistent 501 error shape and a future op cannot ship without the
+// operator-visible "not configured" message that the existing ops
+// promise.
 func (s *ForwardServer) dispatchForward(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
-	switch req.GetOperation() {
+	op := req.GetOperation()
+	if resp, err, ok := s.checkOpAvailability(op); !ok {
+		return resp, err
+	}
+	switch op {
 	case pb.AdminOperation_ADMIN_OP_CREATE_TABLE:
 		return s.handleCreate(ctx, principal, forwardedFrom, req)
 	case pb.AdminOperation_ADMIN_OP_DELETE_TABLE:
@@ -124,6 +136,43 @@ func (s *ForwardServer) dispatchForward(ctx context.Context, principal AuthPrinc
 	default:
 		return rejectForward(http.StatusBadRequest, "invalid_request", "unknown admin operation")
 	}
+}
+
+// checkOpAvailability returns (resp, err, true) when dispatchForward
+// should continue to the per-op handler, or (resp, err, false) when
+// the leader's build does not include the source the requested
+// operation needs (S3-only deployment served a Dynamo op, or vice
+// versa). Pulling the per-op switch out keeps dispatchForward's
+// cyclomatic count under the linter ceiling as the enum grows.
+func (s *ForwardServer) checkOpAvailability(op pb.AdminOperation) (*pb.AdminForwardResponse, error, bool) {
+	switch op {
+	case pb.AdminOperation_ADMIN_OP_CREATE_TABLE, pb.AdminOperation_ADMIN_OP_DELETE_TABLE:
+		if s.source == nil {
+			resp, err := notImplementedForwardResponse("DynamoDB")
+			return resp, err, false
+		}
+	case pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+		pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL:
+		if s.buckets == nil {
+			resp, err := notImplementedForwardResponse("S3")
+			return resp, err, false
+		}
+	case pb.AdminOperation_ADMIN_OP_UNSPECIFIED:
+		// Unknown-op rejection is dispatchForward's responsibility,
+		// not this gate's. Falling through to ok=true lets the main
+		// switch's default branch produce the canonical 400 message.
+	}
+	return nil, nil, true
+}
+
+// notImplementedForwardResponse produces the 501 response a follower
+// receives when the leader is built without the source for this
+// operation's surface. surface is the human-facing label that ends
+// up in the error message ("DynamoDB" or "S3").
+func notImplementedForwardResponse(surface string) (*pb.AdminForwardResponse, error) {
+	return rejectForward(http.StatusNotImplemented, "not_implemented",
+		surface+" admin forwarding is not configured on this leader")
 }
 
 func (s *ForwardServer) validatePrincipal(p *pb.AdminPrincipal) (AuthPrincipal, bool) {
@@ -182,65 +231,24 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 	// proto stays operation-agnostic — there is no operation-specific
 	// field in AdminForwardRequest, by design (adding one per op
 	// would couple every new admin endpoint to the proto schema).
-	payload := req.GetPayload()
-	if len(payload) > adminForwardPayloadLimit {
-		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
-			"forwarded payload exceeds the 64 KiB admin limit")
+	name, rejection, err := decodeNamedPayload(req.GetPayload(), "delete")
+	if rejection != nil || err != nil {
+		return rejection, err
 	}
-	// Mirror decodeCreateTableRequest's NUL-byte guard: goccy/go-json
-	// treats raw NUL as end-of-input so dec.More() would otherwise
-	// miss `{"name":"users"}\x00{"extra":1}` payloads. Codex P2 on
-	// PR #635 flagged this as the same smuggling vector that the
-	// HTTP create path already covers.
-	if bytes.IndexByte(payload, 0) >= 0 {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload contains a NUL byte")
-	}
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	var body struct {
-		Name string `json:"name"`
-	}
-	if err := dec.Decode(&body); err != nil {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload is not valid JSON")
-	}
-	if dec.More() {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload has trailing data")
-	}
-	if body.Name == "" {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload missing name")
-	}
-	// Reject slash-bearing names symmetrically with the HTTP
-	// handleDelete and handleDescribe paths. Without this, a
-	// forwarded call could act on `foo/bar` while a leader-direct
-	// call would 404 — divergent behaviour Codex P2 flagged on
-	// PR #635.
-	if strings.ContainsRune(body.Name, '/') {
-		return rejectForward(http.StatusBadRequest, "invalid_body", "delete payload name must not contain '/'")
-	}
-	if err := s.source.AdminDeleteTable(ctx, principal, body.Name); err != nil {
-		s.logUnexpectedSourceError(ctx, "delete_table", body.Name, forwardedFrom, err)
+	if err := s.source.AdminDeleteTable(ctx, principal, name); err != nil {
+		s.logUnexpectedSourceError(ctx, "delete_table", name, forwardedFrom, err)
 		return forwardErrorResponse("delete", err), nil
 	}
-	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
-		slog.String("actor", principal.AccessKey),
-		slog.String("role", string(principal.Role)),
-		slog.String("forwarded_from", forwardedFrom),
-		slog.String("operation", "delete_table"),
-		slog.String("table", body.Name),
-	)
+	s.auditDeleteSuccess(ctx, principal, forwardedFrom, "delete_table", "table", name)
 	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
 }
 
 // handleCreateBucket dispatches a forwarded POST /s3/buckets call.
 // Mirrors handleCreate (Dynamo) but decodes a CreateBucketRequest
-// and routes through BucketsSource. Returns 501 NotImplemented when
-// no BucketsSource is wired so a follower whose S3 surface was
-// disabled gets a deterministic error instead of a generic 500.
+// and routes through BucketsSource. dispatchForward gates this on
+// s.buckets != nil so callers reach here only when S3 forwarding is
+// configured.
 func (s *ForwardServer) handleCreateBucket(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
-	if s.buckets == nil {
-		return rejectForward(http.StatusNotImplemented, "not_implemented",
-			"S3 admin forwarding is not configured on this leader")
-	}
 	payload := req.GetPayload()
 	if len(payload) > adminForwardPayloadLimit {
 		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
@@ -291,52 +299,33 @@ func (s *ForwardServer) handleCreateBucket(ctx context.Context, principal AuthPr
 // a JSON object with a single "name" field, which the bridge
 // generates from the URL path.
 func (s *ForwardServer) handleDeleteBucket(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
-	if s.buckets == nil {
-		return rejectForward(http.StatusNotImplemented, "not_implemented",
-			"S3 admin forwarding is not configured on this leader")
+	name, rejection, err := decodeNamedPayload(req.GetPayload(), "delete-bucket")
+	if rejection != nil || err != nil {
+		return rejection, err
 	}
-	payload := req.GetPayload()
-	if len(payload) > adminForwardPayloadLimit {
-		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
-			"forwarded payload exceeds the 64 KiB admin limit")
-	}
-	if bytes.IndexByte(payload, 0) >= 0 {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"delete-bucket payload contains a NUL byte")
-	}
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	var body struct {
-		Name string `json:"name"`
-	}
-	if err := dec.Decode(&body); err != nil {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"delete-bucket payload is not valid JSON")
-	}
-	if dec.More() {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"delete-bucket payload has trailing data")
-	}
-	if body.Name == "" {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"delete-bucket payload missing name")
-	}
-	if strings.ContainsRune(body.Name, '/') {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"delete-bucket payload name must not contain '/'")
-	}
-	if err := s.buckets.AdminDeleteBucket(ctx, principal, body.Name); err != nil {
-		s.logUnexpectedSourceError(ctx, "delete_bucket", body.Name, forwardedFrom, err)
+	if err := s.buckets.AdminDeleteBucket(ctx, principal, name); err != nil {
+		s.logUnexpectedSourceError(ctx, "delete_bucket", name, forwardedFrom, err)
 		return forwardBucketsErrorResponse("delete", err), nil
 	}
+	s.auditDeleteSuccess(ctx, principal, forwardedFrom, "delete_bucket", "bucket", name)
+	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
+}
+
+// auditDeleteSuccess emits the admin_audit slog line both Dynamo and
+// S3 forwarded delete handlers need. Centralised so handleDelete and
+// handleDeleteBucket do not diverge on the field set, and so a future
+// handler that mirrors the same delete shape (e.g. delete-namespace)
+// keeps the audit-log contract by reusing this helper rather than
+// re-emitting a hand-rolled subset. resourceField is "table" or
+// "bucket"; opLabel is the audit "operation" value.
+func (s *ForwardServer) auditDeleteSuccess(ctx context.Context, principal AuthPrincipal, forwardedFrom, opLabel, resourceField, name string) {
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
 		slog.String("actor", principal.AccessKey),
 		slog.String("role", string(principal.Role)),
 		slog.String("forwarded_from", forwardedFrom),
-		slog.String("operation", "delete_bucket"),
-		slog.String("bucket", body.Name),
+		slog.String("operation", opLabel),
+		slog.String(resourceField, name),
 	)
-	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
 }
 
 // handlePutBucketAcl dispatches a forwarded PUT
@@ -345,10 +334,6 @@ func (s *ForwardServer) handleDeleteBucket(ctx context.Context, principal AuthPr
 // operation-agnostic — same approach handleDeleteBucket takes for
 // the bucket name.
 func (s *ForwardServer) handlePutBucketAcl(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
-	if s.buckets == nil {
-		return rejectForward(http.StatusNotImplemented, "not_implemented",
-			"S3 admin forwarding is not configured on this leader")
-	}
 	payload := req.GetPayload()
 	if len(payload) > adminForwardPayloadLimit {
 		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
@@ -456,6 +441,64 @@ func sanitiseForwardedFrom(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// decodeNamedPayload validates and decodes the {"name": "..."} JSON
+// shape both the Dynamo and S3 delete forwarders accept. Returns the
+// decoded name on success, or a populated rejection response (and
+// nil name) on a 400 / 413. opLabel is the human-facing prefix that
+// goes into the rejection messages ("delete" for Dynamo,
+// "delete-bucket" for S3) so the response identifies which path
+// rejected — and so a future op (e.g. "describe-bucket") that
+// reuses this helper still produces an actionable error.
+//
+// All four guards mirror the leader-direct HTTP path:
+//   - 64 KiB payload cap (matches adminForwardPayloadLimit elsewhere)
+//   - NUL-byte rejection (goccy/go-json treats raw NUL as end-of-
+//     input; without this guard `{"name":"x"}\x00{"extra":1}`
+//     payloads slip past dec.More(); Codex P2 on PR #635)
+//   - DisallowUnknownFields + dec.More() trailing-token rejection
+//   - empty + slash-bearing name rejection (the HTTP handlers
+//     already 404 slash-bearing names; the forwarded path has to
+//     reject symmetrically or a hostile follower could act on
+//     `foo/bar` while a leader-direct call would not).
+func decodeNamedPayload(payload []byte, opLabel string) (string, *pb.AdminForwardResponse, error) {
+	if len(payload) > adminForwardPayloadLimit {
+		resp, err := rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+		return "", resp, err
+	}
+	if bytes.IndexByte(payload, 0) >= 0 {
+		resp, err := rejectForward(http.StatusBadRequest, "invalid_body",
+			opLabel+" payload contains a NUL byte")
+		return "", resp, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := dec.Decode(&body); err != nil {
+		resp, rerr := rejectForward(http.StatusBadRequest, "invalid_body",
+			opLabel+" payload is not valid JSON")
+		return "", resp, rerr
+	}
+	if dec.More() {
+		resp, err := rejectForward(http.StatusBadRequest, "invalid_body",
+			opLabel+" payload has trailing data")
+		return "", resp, err
+	}
+	if body.Name == "" {
+		resp, err := rejectForward(http.StatusBadRequest, "invalid_body",
+			opLabel+" payload missing name")
+		return "", resp, err
+	}
+	if strings.ContainsRune(body.Name, '/') {
+		resp, err := rejectForward(http.StatusBadRequest, "invalid_body",
+			opLabel+" payload name must not contain '/'")
+		return "", resp, err
+	}
+	return body.Name, nil, nil
 }
 
 // forwardErrorResponse re-encodes a TablesSource error in the
