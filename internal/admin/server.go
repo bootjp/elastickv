@@ -39,6 +39,14 @@ type ServerDeps struct {
 	// cluster page deploy without standing up the dynamo bridge.
 	Tables TablesSource
 
+	// Queues is the SQS admin source — covers list, describe, and
+	// delete via QueuesSource. Optional: a nil value disables
+	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them with
+	// 404). Same opt-in shape as Tables; deployments that don't run
+	// the SQS adapter omit this without breaking the rest of the
+	// admin surface.
+	Queues QueuesSource
+
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
 	// /admin/assets/* and the SPA fallback in that case.
@@ -114,7 +122,14 @@ func NewServer(deps ServerDeps) (*Server, error) {
 			WithLogger(logger).
 			WithRoleStore(MapRoleStore(deps.Roles))
 	}
-	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, logger)
+	var sqs http.Handler
+	if deps.Queues != nil {
+		// Same role-revalidation reasoning as dynamo above.
+		sqs = NewSqsHandler(deps.Queues).
+			WithLogger(logger).
+			WithRoleStore(MapRoleStore(deps.Roles))
+	}
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, sqs, logger)
 	router := NewRouter(mux, deps.StaticFS)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -154,10 +169,10 @@ func (s *Server) APIHandler() http.Handler {
 // audit path inside AuthService because the generic Audit middleware
 // cannot see the claimed actor at that point in the chain.
 //
-// dynamoHandler may be nil; in that case the dynamo paths fall through
-// to the unknown-endpoint 404, matching the behaviour of any other
-// unregistered admin path.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler http.Handler, logger *slog.Logger) http.Handler {
+// dynamoHandler / sqsHandler may be nil; in that case the
+// corresponding paths fall through to the unknown-endpoint 404,
+// matching the behaviour of any other unregistered admin path.
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, sqsHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -216,23 +231,65 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	if dynamoHandler != nil {
 		dynamoChain = protect(dynamoHandler)
 	}
+	var sqsChain http.Handler
+	if sqsHandler != nil {
+		sqsChain = protect(sqsHandler)
+	}
 
+	routes := apiRoutes{
+		login:   loginChain,
+		logout:  logoutChain,
+		cluster: clusterChain,
+		dynamo:  dynamoChain,
+		sqs:     sqsChain,
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/admin/api/v1/auth/login":
-			loginChain.ServeHTTP(w, r)
-		case r.URL.Path == "/admin/api/v1/auth/logout":
-			logoutChain.ServeHTTP(w, r)
-		case r.URL.Path == "/admin/api/v1/cluster":
-			clusterChain.ServeHTTP(w, r)
-		case dynamoChain != nil && (r.URL.Path == pathDynamoTables ||
-			strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables)):
-			dynamoChain.ServeHTTP(w, r)
-		default:
-			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
-				"no admin API handler is registered for this path")
-		}
+		routes.dispatch(w, r)
 	})
+}
+
+// apiRoutes is the per-startup chain bundle the request router walks
+// in priority order. Split out of buildAPIMux so the request-time
+// dispatch loop stays under the cyclop budget — every additional
+// optional handler (Tables, Queues, …) would otherwise add a branch
+// to the same closure and push it past the limit.
+type apiRoutes struct {
+	login   http.Handler
+	logout  http.Handler
+	cluster http.Handler
+	dynamo  http.Handler
+	sqs     http.Handler
+}
+
+func (r apiRoutes) dispatch(w http.ResponseWriter, req *http.Request) {
+	switch req.URL.Path {
+	case "/admin/api/v1/auth/login":
+		r.login.ServeHTTP(w, req)
+		return
+	case "/admin/api/v1/auth/logout":
+		r.logout.ServeHTTP(w, req)
+		return
+	case "/admin/api/v1/cluster":
+		r.cluster.ServeHTTP(w, req)
+		return
+	}
+	if r.dynamo != nil && hasResourcePrefix(req.URL.Path, pathDynamoTables, pathPrefixDynamoTables) {
+		r.dynamo.ServeHTTP(w, req)
+		return
+	}
+	if r.sqs != nil && hasResourcePrefix(req.URL.Path, pathSqsQueues, pathPrefixSqsQueues) {
+		r.sqs.ServeHTTP(w, req)
+		return
+	}
+	writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+		"no admin API handler is registered for this path")
+}
+
+// hasResourcePrefix reports whether p is exactly the collection root
+// or sits under the per-resource prefix. Pulled out so both the
+// dynamo and sqs branches in apiRoutes.dispatch read the same way.
+func hasResourcePrefix(p, root, prefix string) bool {
+	return p == root || strings.HasPrefix(p, prefix)
 }
 
 func errMissing(field string) error {

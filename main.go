@@ -693,7 +693,7 @@ func startServers(in serversInput) error {
 	// Passing nil here would leave the admin dashboard with no
 	// access to table metadata; the admin handler answers
 	// /admin/api/v1/dynamo/* with 404 in that case.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer); err != nil {
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.sqsServer); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1220,6 +1220,12 @@ type runtimeServerRunner struct {
 	// field is unexported on purpose — it is package-private state,
 	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
+
+	// sqsServer plays the same role as dynamoServer for the SQS
+	// admin entrypoints (adapter/sqs_admin.go). Nil when --sqsAddress
+	// is empty; the admin listener then leaves /admin/api/v1/sqs/*
+	// off the wire (the mux 404s those paths).
+	sqsServer *adapter.SQSServer
 }
 
 func (r *runtimeServerRunner) start() error {
@@ -1251,9 +1257,11 @@ func (r *runtimeServerRunner) start() error {
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
+	r.sqsServer = sqsServer
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

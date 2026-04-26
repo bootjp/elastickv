@@ -193,6 +193,33 @@ export interface CreateBucketRequest {
   acl?: "private" | "public-read";
 }
 
+// SQS queue admin DTOs (Section 16.2 of the SQS design doc).
+// `attributes` mirrors the AWS GetQueueAttributes "All" set with
+// snake_case keys; `counters` is the typed projection of the three
+// Approximate* counters added in Phase 3.A. `counters_truncated`
+// signals that the visibility-index scan hit its per-call budget
+// and the values are a lower bound (matches AWS's "approximate"
+// contract).
+export interface SqsQueueCounters {
+  visible: number;
+  not_visible: number;
+  delayed: number;
+}
+
+export interface SqsQueueSummary {
+  name: string;
+  is_fifo: boolean;
+  generation: number;
+  created_at?: string;
+  attributes?: Record<string, string>;
+  counters: SqsQueueCounters;
+  counters_truncated?: boolean;
+}
+
+export interface SqsQueueList {
+  queues: string[];
+}
+
 export const api = {
   login: (access_key: string, secret_key: string) =>
     apiFetch<LoginResponse>("/auth/login", {
@@ -223,4 +250,10 @@ export const api = {
     }),
   deleteBucket: (name: string) =>
     apiFetch<void>(`/s3/buckets/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  listQueues: (signal?: AbortSignal) =>
+    apiFetch<SqsQueueList>("/sqs/queues", { signal }),
+  describeQueue: (name: string, signal?: AbortSignal) =>
+    apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
+  deleteQueue: (name: string) =>
+    apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
 };

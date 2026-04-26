@@ -777,7 +777,8 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, s.nextTxnReadTS(r.Context()))
+	readTS := s.nextTxnReadTS(r.Context())
+	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, readTS)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -787,8 +788,48 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selection := selectedAttributeNames(in.AttributeNames)
-	attrs := queueMetaToAttributes(meta, selection)
+	// Compute the approximate counters only when the caller is
+	// asking for them. AWS lists them on the "All" set so an
+	// AttributeNames=All caller pays the scan; an explicit-name
+	// caller only pays it if they listed at least one of the three.
+	// This keeps GetQueueAttributes O(1) for the common config-only
+	// callers while still serving operator dashboards that ask for
+	// the counters on every poll.
+	var counters *sqsApproxCounters
+	if approxCountersRequested(selection) {
+		c, cerr := s.computeApproxCounters(r.Context(), name, meta.Generation, readTS)
+		if cerr != nil {
+			writeSQSErrorFromErr(w, cerr)
+			return
+		}
+		counters = &c
+	}
+	attrs := queueMetaToAttributes(meta, selection, counters)
 	writeSQSJSON(w, map[string]any{"Attributes": attrs})
+}
+
+// approxCountersRequested reports whether the caller asked for any of
+// the three Approximate* counters (or for "All", which implies them).
+func approxCountersRequested(sel sqsAttributeSelection) bool {
+	if sel.expandAll {
+		return true
+	}
+	for _, name := range approxCounterAttributeNames {
+		if sel.names[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// approxCounterAttributeNames is the set of GetQueueAttributes names
+// that trigger the visibility-index scan in computeApproxCounters.
+// Kept as a package-level constant slice so approxCountersRequested
+// stays cheap and the names are listed in one place.
+var approxCounterAttributeNames = [...]string{
+	"ApproximateNumberOfMessages",
+	"ApproximateNumberOfMessagesNotVisible",
+	"ApproximateNumberOfMessagesDelayed",
 }
 
 // sqsAttributeSelection is a tri-state result from selectedAttributeNames:
@@ -823,7 +864,7 @@ func selectedAttributeNames(req []string) sqsAttributeSelection {
 	return sqsAttributeSelection{names: selection}
 }
 
-func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection) map[string]string {
+func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, counters *sqsApproxCounters) map[string]string {
 	// No AttributeNames supplied and no "All" → AWS returns nothing.
 	// The handler still emits "Attributes" as an empty map so the
 	// response shape is stable.
@@ -841,6 +882,15 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection) 
 	}
 	if meta.RedrivePolicy != "" {
 		all["RedrivePolicy"] = meta.RedrivePolicy
+	}
+	// The three counters are populated only when the caller asked
+	// for them (or for "All"). When counters is nil the keys stay
+	// out of `all`, so the explicit-name selection branch below
+	// will not return zero strings for unrequested counters.
+	if counters != nil {
+		all["ApproximateNumberOfMessages"] = strconv.Itoa(counters.Visible)
+		all["ApproximateNumberOfMessagesNotVisible"] = strconv.Itoa(counters.NotVisible)
+		all["ApproximateNumberOfMessagesDelayed"] = strconv.Itoa(counters.Delayed)
 	}
 	if selection.expandAll {
 		return all

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -328,6 +329,108 @@ func TestSQSServer_GetQueueAttributesOmittedReturnsEmpty(t *testing.T) {
 	attrs, _ = out["Attributes"].(map[string]any)
 	if attrs["VisibilityTimeout"] == nil {
 		t.Fatalf("All should include VisibilityTimeout; got %v", attrs)
+	}
+}
+
+func TestSQSServer_GetQueueAttributesApproxCounters(t *testing.T) {
+	t.Parallel()
+	// AWS exposes three Approximate* counters on GetQueueAttributes:
+	// - ApproximateNumberOfMessages (visible right now)
+	// - ApproximateNumberOfMessagesNotVisible (in-flight after receive)
+	// - ApproximateNumberOfMessagesDelayed (sent with DelaySeconds, not yet eligible)
+	// Pre-Phase-3.A the adapter returned none of them. This test pins
+	// (a) that they appear under the All selector, (b) that they
+	// classify the three states correctly, and (c) that they appear
+	// only when explicitly requested or via All.
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "approx-counters")
+
+	// Send 3 ready messages and one delayed message.
+	for i := range 3 {
+		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":    url,
+			"MessageBody": "ready-" + strconv.Itoa(i),
+		})
+	}
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":     url,
+		"MessageBody":  "delayed",
+		"DelaySeconds": 60,
+	})
+
+	// Receive 1 → in-flight.
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            url,
+		"MaxNumberOfMessages": 1,
+		"VisibilityTimeout":   60,
+	})
+
+	status, out := callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"All"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("getAttrs All: %d %v", status, out)
+	}
+	attrs, _ := out["Attributes"].(map[string]any)
+	if got := attrs["ApproximateNumberOfMessages"]; got != "2" {
+		t.Errorf("ApproximateNumberOfMessages = %v, want 2 (3 sent - 1 in-flight)", got)
+	}
+	if got := attrs["ApproximateNumberOfMessagesNotVisible"]; got != "1" {
+		t.Errorf("ApproximateNumberOfMessagesNotVisible = %v, want 1", got)
+	}
+	if got := attrs["ApproximateNumberOfMessagesDelayed"]; got != "1" {
+		t.Errorf("ApproximateNumberOfMessagesDelayed = %v, want 1", got)
+	}
+}
+
+func TestSQSServer_GetQueueAttributesApproxCountersOnlyWhenSelected(t *testing.T) {
+	t.Parallel()
+	// The Approximate* counters trigger a visibility-index scan, so
+	// they must NOT be returned for callers that asked for unrelated
+	// attributes — both for cost and for AWS-shape parity (an
+	// explicit-name request only returns the listed names).
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "approx-isolation")
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":    url,
+		"MessageBody": "x",
+	})
+
+	// Only VisibilityTimeout: counters must be absent.
+	status, out := callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"VisibilityTimeout"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("getAttrs VisibilityTimeout: %d %v", status, out)
+	}
+	attrs, _ := out["Attributes"].(map[string]any)
+	if _, present := attrs["ApproximateNumberOfMessages"]; present {
+		t.Errorf("counters leaked into VisibilityTimeout-only request: %v", attrs)
+	}
+	if got := attrs["VisibilityTimeout"]; got == nil {
+		t.Errorf("VisibilityTimeout missing: %v", attrs)
+	}
+
+	// Only ApproximateNumberOfMessages: counter present, nothing else.
+	status, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"ApproximateNumberOfMessages"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("getAttrs ApproximateNumberOfMessages: %d %v", status, out)
+	}
+	attrs, _ = out["Attributes"].(map[string]any)
+	if got := attrs["ApproximateNumberOfMessages"]; got != "1" {
+		t.Errorf("ApproximateNumberOfMessages = %v, want 1", got)
+	}
+	if _, present := attrs["VisibilityTimeout"]; present {
+		t.Errorf("VisibilityTimeout leaked into counter-only request: %v", attrs)
 	}
 }
 

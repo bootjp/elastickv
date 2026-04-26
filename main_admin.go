@@ -68,7 +68,7 @@ type adminListenerConfig struct {
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, dynamoServer *adapter.DynamoDBServer) error {
+func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, dynamoServer *adapter.DynamoDBServer, sqsServer *adapter.SQSServer) error {
 	if !*adminEnabled {
 		return nil
 	}
@@ -109,8 +109,100 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
 	tablesSrc := newDynamoTablesSource(dynamoServer)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, buildVersion())
+	queuesSrc := newSqsQueuesSource(sqsServer)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, queuesSrc, buildVersion())
 	return err
+}
+
+// newSqsQueuesSource adapts *adapter.SQSServer to the
+// admin.QueuesSource interface. Same architectural reasoning as
+// newDynamoTablesSource: the bridge stays in this file (rather than
+// internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree.
+//
+// Returns nil when sqsServer is nil; admin.NewServer leaves the
+// /admin/api/v1/sqs/* paths off the wire in that case.
+func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
+	if sqsServer == nil {
+		return nil
+	}
+	return &sqsQueuesBridge{server: sqsServer}
+}
+
+// sqsQueuesBridge is the thin adapter that re-shapes
+// adapter.AdminQueueSummary into admin.QueueSummary. The two structs
+// are deliberately isomorphic so this translation does no allocation
+// more than necessary; if a future field is added on one side, the
+// build breaks here, which is exactly the drift signal we want.
+type sqsQueuesBridge struct {
+	server *adapter.SQSServer
+}
+
+func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error) {
+	return b.server.AdminListQueues(ctx) //nolint:wrapcheck // pure pass-through; adapter owns the error context.
+}
+
+func (b *sqsQueuesBridge) AdminDescribeQueue(ctx context.Context, name string) (*admin.QueueSummary, bool, error) {
+	summary, exists, err := b.server.AdminDescribeQueue(ctx, name)
+	if err != nil {
+		return nil, false, translateAdminQueuesError(err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminQueueSummary(summary), true, nil
+}
+
+func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteQueue(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
+// convertAdminQueueSummary mirrors adapter.AdminQueueSummary into
+// admin.QueueSummary. The role / counter fields are intentionally
+// 1:1; if either side grows a new field, this function should be
+// extended in the same commit so a compile error catches the drift.
+func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary {
+	if in == nil {
+		return nil
+	}
+	out := &admin.QueueSummary{
+		Name:              in.Name,
+		IsFIFO:            in.IsFIFO,
+		Generation:        in.Generation,
+		CreatedAt:         in.CreatedAt,
+		Attributes:        in.Attributes,
+		CountersTruncated: in.CountersTruncated,
+		Counters: admin.QueueCounters{
+			Visible:    in.Counters.Visible,
+			NotVisible: in.Counters.NotVisible,
+			Delayed:    in.Counters.Delayed,
+		},
+	}
+	return out
+}
+
+// translateAdminQueuesError maps the adapter's queue error vocabulary
+// onto the admin-package sentinels the SQS handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, matching the dynamo bridge's behaviour.
+func translateAdminQueuesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrQueuesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrQueuesNotLeader
+	case errors.Is(err, adapter.ErrAdminSQSNotFound):
+		return admin.ErrQueuesNotFound
+	case errors.Is(err, adapter.ErrAdminSQSValidation):
+		return admin.ErrQueuesValidation
+	default:
+		return err
+	}
 }
 
 // newDynamoTablesSource adapts *adapter.DynamoDBServer to the
@@ -346,6 +438,7 @@ func startAdminServer(
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
 	tables admin.TablesSource,
+	queues admin.QueuesSource,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -353,7 +446,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, queues)
 	if err != nil {
 		return "", err
 	}
@@ -393,7 +486,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, queues admin.QueuesSource) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -417,6 +510,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
 		Tables:      tables,
+		Queues:      queues,
 		StaticFS:    staticFS,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,

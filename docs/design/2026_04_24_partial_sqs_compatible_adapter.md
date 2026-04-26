@@ -1,8 +1,31 @@
 # SQS-Compatible Adapter Design for Elastickv
 
-Status: Proposed
+Status: Partial — Phase 1 + 2 landed, Phase 3 in progress
 Author: bootjp
 Date: 2026-04-24
+Last Updated: 2026-04-26
+
+---
+
+## Implementation Status (2026-04-26)
+
+| Phase | Scope | Status | Reference |
+|---|---|---|---|
+| Phase 1 | Catalog, standard send/receive/delete, long polling, SigV4, leader proxy, metrics | **Landed** | merged across earlier PRs |
+| Phase 2 | FIFO (single-partition), batch APIs, DLQ redrive, tag APIs, retention reaper | **Landed** | PR #638 (Milestone 1 finish) |
+| **Phase 3 — partial** | See breakdown below | **In progress** | this commit + follow-ups |
+
+### Phase 3 breakdown
+
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 3.A | `ApproximateNumberOfMessages*` accuracy (visible / not-visible / delayed) | **Landed in this commit** | See §16.1 |
+| 3.B | XML query protocol full fidelity (older AWS SDKs) | **TODO** | Additive; SigV4 path stays JSON. See §16.4 |
+| 3.C | Per-queue throttling and tenant fairness | **TODO** | New component; needs separate design doc before implementation. See §16.5 |
+| 3.D | Split-queue FIFO (very hot queues across shards while preserving FIFO) | **TODO** | Touches replication / routing; needs separate design doc. See §16.6 |
+| 3.E | Console UI (operator GUI for queues) | **Re-scoped to admin SPA in this commit** | See §16.2 — Section 13 (separate console listener) is **superseded** |
+
+The original Section 13 Console UI design (separate `--consoleAddress` listener with bearer-token auth + dedicated go:embed bundle) has been **superseded** by §16.2 below: queues UI is added as additional pages on the existing admin dashboard SPA (`internal/admin/dist`, served from the admin listener). This avoids a second listener / second auth surface and reuses the JWT cookie + CSRF + role model the admin dashboard already enforces. The original §13 text is preserved for historical context but its conclusions no longer apply.
 
 ---
 
@@ -709,3 +732,117 @@ The two repository-level prerequisites are:
 2. A leader-local long-poll notifier subscribed to the FSM commit stream.
 
 With those in place, SQS compatibility can be added without changing the underlying storage, consensus, or HLC design.
+
+---
+
+## 16. Phase 3 detailed designs
+
+This section was added 2026-04-26 to record the as-built design for Phase 3 items that have either landed in this commit or are queued as TODOs.
+
+### 16.1 Approximate counters (3.A — landed in this commit)
+
+`GetQueueAttributes` previously omitted every `ApproximateNumberOfMessages*` attribute (`adapter/sqs_catalog.go:queueMetaToAttributes` only returned configuration fields). This commit adds three counters:
+
+| Attribute | Definition (this implementation) |
+|---|---|
+| `ApproximateNumberOfMessages` | Records whose `available_at <= now` and `visible_at <= now` — i.e. ready to be received by the next `ReceiveMessage`. |
+| `ApproximateNumberOfMessagesNotVisible` | Records whose `available_at <= now` but `visible_at > now` — already delivered, currently in flight, not yet deleted. |
+| `ApproximateNumberOfMessagesDelayed` | Records whose `available_at > now` — sent with a non-zero `DelaySeconds` (or queue-level `DelaySeconds`) and not yet eligible for delivery. |
+
+#### Computation path
+
+The visibility index (`!sqs|msg|byage|<queue>|<gen>|<by_age_id>`) is keyed by `available_at`, so it already orders records by the eligibility frontier we care about. The implementation:
+
+1. Loads the queue meta at `readTS = nextTxnReadTS(ctx)` (same TS as the rest of `getQueueAttributes`).
+2. Walks the visibility index for the *current* `meta.Generation` only (orphans from prior generations are out of scope; the retention reaper handles them).
+3. Loads each candidate's data record once and classifies by (`available_at`, `visible_at`) at a single `now = time.Now().UnixMilli()`.
+4. Returns the three counters as strings, matching AWS's response shape.
+
+Bound: the scan stops at the per-queue budget already used by the reaper (`sqsReaperPerQueueBudget`) so a pathologically large queue cannot turn `GetQueueAttributes` into an O(stream) scan. When the budget is hit, the counters are reported as a *lower bound* (AWS already documents them as approximate), and a `truncated=true` marker is logged for operator awareness.
+
+#### Why scan instead of incremental counters
+
+A maintained counter (incremented on `SendMessage`, decremented on `DeleteMessage`) would be cheaper but requires:
+
+- Per-state counters (visible/in-flight/delayed) updated on every state transition, including the implicit transitions when a visibility timeout expires, when a delayed message becomes available, when redrive moves a record, and when a FIFO group lock releases the head.
+- Four extra Raft writes per message lifecycle, defeating the cost saving.
+
+The scan-at-snapshot approach matches AWS's "approximate" contract, has zero write-path overhead, and aligns with how the reaper already walks the same prefix.
+
+#### Tests
+
+- `adapter/sqs_extra_test.go: TestSQSServer_GetQueueAttributesApproxCounters` — sends N messages, receives K (so K go into in-flight), sends one with `DelaySeconds`, asserts each counter.
+- `adapter/sqs_extra_test.go: TestSQSServer_GetQueueAttributesApproxCountersOnlyWhenSelected` — pins that the counters are only returned when the caller explicitly asks for them or for `All` (per AWS GetQueueAttributes semantics).
+
+### 16.2 Operator UI: SQS pages on the existing admin SPA (3.E — landed in this commit)
+
+The original §13 console design (separate listener, bearer token, dedicated go:embed bundle) is **superseded**. Rationale:
+
+1. The admin dashboard SPA (`internal/admin/dist`, PR #649) already ships with: JWT cookie session auth, CSRF double-submit, `read_only_access_keys` / `full_access_keys` role model, embedded React + TS + Tailwind frontend, and a leader-aware HTTP backend. Building a second console with its own listener would duplicate every one of those.
+2. The admin listener is already loopback-by-default with TLS-enforced non-loopback exposure (per `docs/design/2026_04_24_partial_admin_dashboard.md` §7.1) — the *exact* operational posture §13 wanted for the console.
+3. A separate `--consoleAddress` listener forces operators to manage two TLS configs, two firewall rules, and two token rotations; adding pages to the admin SPA does not.
+
+#### Backend: admin gRPC bridge — `internal/admin/sqs_handler.go`
+
+Adds four endpoints under `/admin/api/v1/sqs/queues`:
+
+| Method | Path | Auth | Body |
+|---|---|---|---|
+| `GET`    | `/admin/api/v1/sqs/queues` | session | — |
+| `GET`    | `/admin/api/v1/sqs/queues/{name}` | session | — |
+| `POST`   | `/admin/api/v1/sqs/queues/{name}/purge` | session + full role + CSRF | `{}` |
+| `DELETE` | `/admin/api/v1/sqs/queues/{name}` | session + full role + CSRF | — |
+
+These are SigV4-bypass internal entrypoints exposed as `(*adapter.SQSServer).AdminListQueues` / `AdminDescribeQueue` / `AdminPurgeQueue` / `AdminDeleteQueue`, mirroring the DynamoDB `Admin*` pattern (`adapter/dynamodb_admin.go`). The bridge wiring in `main_admin.go` (`sqsQueuesBridge`) keeps `internal/admin` free of the heavy adapter dependency tree, the same architectural separation the dynamo bridge uses. Authorization is re-evaluated on the adapter side (the SigV4 path stays untouched).
+
+#### Frontend: `web/admin/src/pages/SqsList.tsx`, `SqsDetail.tsx`
+
+- `/sqs` — queue list + Purge / Delete (full role only). Refresh button; empty-state messaging consistent with the Dynamo / S3 pages.
+- `/sqs/:name` — queue detail showing every attribute returned by `GetQueueAttributes`, including the new approx counters from §16.1, plus Purge and Delete affordances behind `RequireFullAccess`.
+
+The navigation in `Layout.tsx` is extended with an `SQS` tab between `DynamoDB` and `S3`. The API client (`web/admin/src/api/client.ts`) gets `listQueues` / `describeQueue` / `purgeQueue` / `deleteQueue` methods, mirroring the AbortSignal plumbing established for `cluster` / `listTables` / `describeTable`.
+
+#### Out of scope for this commit (admin SPA, follow-ups)
+
+These were considered but deferred to keep the PR focused. Each is small enough to land independently:
+
+- **Send a test message** from the SPA — needs an admin RPC that bypasses SigV4 and accepts `(MessageBody, MessageGroupId?, MessageDeduplicationId?, DelaySeconds?)`. Modest backend addition; UX touches the existing Modal.
+- **Peek without consuming** — needs a new adapter method that scans the visibility index and returns N records *without* bumping `ReceiveCount` or rotating receipt tokens. This is genuinely new functionality (the SQS API has no peek primitive) and merits its own design discussion.
+- **Create queue from the SPA** — needs `AdminCreateQueue` plus a Modal form covering FIFO / RedrivePolicy / DelaySeconds / MessageRetentionPeriod. Useful but not blocking for operator visibility, which is the value the SPA delivers in this commit.
+
+### 16.3 Section 13 — historical
+
+The text in Section 13 (Console UI) describes an alternate architecture that was on the table but **not** built. It is preserved unedited for context; readers should treat §16.2 as the as-built design and ignore §13's concrete decisions (separate listener, bearer token, etc.). Section 13 is kept rather than deleted so the rationale for the Phase 1/2 sketch remains discoverable in `git blame`.
+
+### 16.4 XML query protocol fidelity (3.B — TODO)
+
+AWS still ships an older "query" protocol (form-encoded request, XML response) used by `aws-sdk-java` v1, older `boto`, and a long tail of in-house clients. The current implementation only handles the JSON protocol (`X-Amz-Target` header + JSON body, response is JSON). Adding query-protocol support is *additive* — it does not change the JSON path — but it requires:
+
+1. Detecting the protocol from request shape (`Content-Type: application/x-www-form-urlencoded` + `Action=…` query parameter).
+2. Generating the matching XML response envelopes (`<SendMessageResponse>...<RequestId>...`) per the [AWS SQS QueryProtocol reference](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/CommonErrors.html).
+3. Sharing every internal handler (the existing `s.sendMessage(ctx, in, principal)` etc.) — only the wire codec changes.
+
+**Risk**: low. **Effort**: medium (mostly XML serialization). **Recommended next step**: own design doc proposal (`*_proposed_*`) before implementation, even though there is no consistency / replication impact, because the wire format work has its own surface area.
+
+### 16.5 Per-queue throttling and tenant fairness (3.C — TODO)
+
+Multiple tenants sharing one elastickv cluster need per-queue rate limits so a single noisy queue cannot starve everyone else. The expected shape:
+
+- Token-bucket per (queue, action) limited at the SQS adapter (not the storage layer — token replenishment rate must be local to the leader for the throttled queue, and the action context is gone by the time a request reaches the coordinator).
+- Limits configured per-queue in queue meta (`maxRequestsPerSecond`, optionally per action).
+- Throttled requests return AWS's `Throttling.Sender` error (HTTP 400, `Throttling` code) with `Retry-After`, *not* a hard 429, so AWS SDKs' built-in retry/backoff logic engages naturally.
+
+**Risk**: medium-high (a wrong default can produce client-visible 4xx storms). **Effort**: large. **Recommended next step**: `*_proposed_*` design doc that covers the limit storage model, the algorithm, follower forwarding semantics (whether throttle decisions ride the leader proxy or are evaluated per-node), and how Jepsen workloads should be adjusted.
+
+### 16.6 Split-queue FIFO (3.D — TODO)
+
+A single FIFO queue's per-second throughput is bounded by the per-shard write rate. AWS supports virtually-unlimited FIFO throughput via *partitioned* FIFO queues where ordering is preserved within each `MessageGroupId` but parallelized across groups. To mirror this in elastickv, a single hot queue would be split across multiple raft groups, with `MessageGroupId` deterministically routed to a partition.
+
+This is **the** large item in Phase 3. It touches:
+
+- Routing (`kv/shard_router.go`) — group-aware queue routing.
+- Replication topology — splitting an existing queue without dropping messages requires the cross-shard transaction primitive that does not exist yet for SQS.
+- FIFO group-lock semantics — the lock now needs to live on the partition that owns the group, not the queue.
+- Reaper / metrics / counters — every Phase 1/2 component that scans a queue's keyspace must learn to scan all of its partitions.
+
+**Risk**: high (consistency-critical, irreversible if mis-designed). **Effort**: very large (multiple PRs). **Recommended next step**: separate `*_proposed_*` design doc that proposes the partition assignment scheme, the migration path for existing single-partition queues, and the rollback story; do not start implementation until that doc is reviewed and accepted.
