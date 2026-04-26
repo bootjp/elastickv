@@ -1093,3 +1093,192 @@ func BenchmarkObserveMiss(b *testing.B) {
 		s.Observe(99, OpRead, 16, 64)
 	}
 }
+
+// BenchmarkObserveParallel pins the contention profile of the hot
+// path. Each goroutine hits a distinct slot so the only shared work
+// is the atomic.Pointer load of the route table; per-slot atomic
+// adds do not contend across goroutines. A regression that adds a
+// shared mutex (or a global counter) on the hot path will show up
+// as a sharp drop in ns/op as the parallelism rises.
+func BenchmarkObserveParallel(b *testing.B) {
+	const numRoutes = 64
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: numRoutes})
+	for r := uint64(1); r <= numRoutes; r++ {
+		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}) {
+			b.Fatalf("RegisterRoute(%d) returned false", r)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var i uint64
+		for pb.Next() {
+			i++
+			s.Observe((i%numRoutes)+1, OpWrite, 16, 64)
+		}
+	})
+}
+
+// BenchmarkRegisterRoute pins the route-mutation path: each call
+// takes routesMu, deep-copies the immutable routeTable, mutates, and
+// republishes via atomic.Store. The b.N route IDs grow monotonically
+// so each iteration sees the previous Register's larger table — the
+// shape that exercises the COW cost. A regression that switches to
+// a shared mutable map shows up as a flat ns/op (no growth with N).
+func BenchmarkRegisterRoute(b *testing.B) {
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: b.N + 1})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := uint64(i + 1) //nolint:gosec // i bounded by b.N
+		if !s.RegisterRoute(id, []byte{byte(id)}, []byte{byte(id) + 1}) {
+			b.Fatalf("RegisterRoute(%d) returned false at i=%d", id, i)
+		}
+	}
+}
+
+// BenchmarkFlush pins the per-step drain cost. Flush walks every
+// live slot, atomic.SwapUint64s its four counters, and pushes a new
+// MatrixColumn into the ring buffer. The hot path Observe must not
+// race with this drain (atomic-only for both sides), but Flush itself
+// scales with the live route count — pin its cost so we notice if
+// a future change adds e.g. an O(N²) slot scan.
+func BenchmarkFlush(b *testing.B) {
+	const numRoutes = 1024
+	clk := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	s := NewMemSampler(MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   16,
+		MaxTrackedRoutes: numRoutes,
+		Now:              clk.Now,
+	})
+	for r := uint64(1); r <= numRoutes; r++ {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+			b.Fatalf("RegisterRoute(%d) returned false", r)
+		}
+		// Pre-seed every slot with traffic so Flush has work to swap.
+		s.Observe(r, OpWrite, 16, 64)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Flush()
+		clk.Advance(time.Second)
+		// Reseed so the next Flush still has counters to drain.
+		for r := uint64(1); r <= numRoutes; r++ {
+			s.Observe(r, OpWrite, 16, 64)
+		}
+	}
+}
+
+// BenchmarkSnapshot pins the read-side pivot cost. Snapshot copies
+// every column in the requested window into freshly allocated
+// MatrixRows so the caller can freely mutate the result. With
+// numRoutes×numColumns cells the pivot is O(N×C) and its cost is the
+// dominant term in the admin handler's response latency.
+func BenchmarkSnapshot(b *testing.B) {
+	const (
+		numRoutes  = 1024
+		numColumns = 64
+	)
+	clk := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	s := NewMemSampler(MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   numColumns,
+		MaxTrackedRoutes: numRoutes,
+		Now:              clk.Now,
+	})
+	for r := uint64(1); r <= numRoutes; r++ {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+			b.Fatalf("RegisterRoute(%d) returned false", r)
+		}
+	}
+	for c := 0; c < numColumns; c++ {
+		for r := uint64(1); r <= numRoutes; r++ {
+			s.Observe(r, OpWrite, 16, 64)
+		}
+		s.Flush()
+		clk.Advance(time.Second)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Snapshot(time.Time{}, time.Time{})
+	}
+}
+
+// TestObserveExactCountUnderConcurrentBurst pins the Phase 2-A
+// "no counts lost" invariant under the kind of workload §5.2 calls
+// out as the SLO target: many goroutines hammering many routes
+// simultaneously. With sub-sampling not yet implemented (sampleRate
+// = 1 always), every Observe must be reflected exactly in the
+// post-Flush Snapshot. When sub-sampling lands and this invariant
+// no longer holds, this test must be updated alongside the new
+// estimator-based ±5% / 95%-CI assertion described in §5.2.
+func TestObserveExactCountUnderConcurrentBurst(t *testing.T) {
+	t.Parallel()
+	const (
+		numRoutes       = 32
+		writersPerRoute = 8
+		opsPerWriter    = 4_000
+		keyLen          = 16
+		valueLen        = 64
+	)
+	s, clk := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   8,
+		MaxTrackedRoutes: numRoutes,
+	})
+	for r := uint64(1); r <= numRoutes; r++ {
+		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}) {
+			t.Fatalf("RegisterRoute(%d) returned false", r)
+		}
+	}
+
+	runConcurrentBurst(s, numRoutes, writersPerRoute, opsPerWriter, keyLen, valueLen)
+	clk.Advance(time.Second)
+	s.Flush()
+
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 1 {
+		t.Fatalf("expected 1 column after a single Flush, got %d", len(cols))
+	}
+	const expectedPerRoute = uint64(writersPerRoute * opsPerWriter)
+	const expectedBytesPerRoute = expectedPerRoute * uint64(keyLen+valueLen)
+	for _, row := range cols[0].Rows {
+		if row.Writes != expectedPerRoute {
+			t.Errorf("route %d: writes = %d, want exactly %d (no counts must be lost under concurrent burst)",
+				row.RouteID, row.Writes, expectedPerRoute)
+		}
+		if row.WriteBytes != expectedBytesPerRoute {
+			t.Errorf("route %d: writeBytes = %d, want exactly %d",
+				row.RouteID, row.WriteBytes, expectedBytesPerRoute)
+		}
+	}
+}
+
+// runConcurrentBurst spawns numRoutes×writersPerRoute goroutines and
+// releases them simultaneously so every route sees genuinely
+// concurrent Observe traffic. Returns once every writer has finished.
+func runConcurrentBurst(s *MemSampler, numRoutes, writersPerRoute, opsPerWriter, keyLen, valueLen int) {
+	var ready, start, done sync.WaitGroup
+	ready.Add(numRoutes * writersPerRoute)
+	done.Add(numRoutes * writersPerRoute)
+	start.Add(1)
+	for r := 1; r <= numRoutes; r++ {
+		routeID := uint64(r) //nolint:gosec // r bounded by numRoutes
+		for w := 0; w < writersPerRoute; w++ {
+			go func() {
+				defer done.Done()
+				ready.Done()
+				start.Wait()
+				for op := 0; op < opsPerWriter; op++ {
+					s.Observe(routeID, OpWrite, keyLen, valueLen)
+				}
+			}()
+		}
+	}
+	ready.Wait()
+	start.Done()
+	done.Wait()
+}
