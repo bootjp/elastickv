@@ -101,6 +101,55 @@ func TestRedis_StreamXReadShortBlockReturnsNullNotError(t *testing.T) {
 	}
 }
 
+// TestRedis_StreamCommandsRejectWrongType locks down the wrongType
+// detection on the stream fast path: keyTypeAtExpect short-circuits to
+// the slow path when the expected (stream) prefixes return empty, so
+// the actual key type is reported and XADD/XREAD/XLEN/XRANGE all
+// surface WRONGTYPE rather than treating the key as missing.
+func TestRedis_StreamCommandsRejectWrongType(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed the key as a plain string.
+	require.NoError(t, rdb.Set(ctx, "stream-wrongtype", "I am a string", 0).Err())
+
+	// XADD must reject with WRONGTYPE — the fast-path stream probe
+	// returns empty (the key has no stream-meta or legacy-stream
+	// row), so we fall through to the full keyTypeAt slow path which
+	// detects the string and the caller raises WRONGTYPE.
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wrongtype",
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.Error(t, err, "XADD on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XLEN: same fall-through path — string key surfaces WRONGTYPE.
+	_, err = rdb.XLen(ctx, "stream-wrongtype").Result()
+	require.Error(t, err, "XLEN on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XRANGE: same expectation.
+	_, err = rdb.XRange(ctx, "stream-wrongtype", "-", "+").Result()
+	require.Error(t, err, "XRANGE on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XREAD with a missing stream returns nil (the legacy "no rows"
+	// path). XREAD with a wrongType key, however, must surface the
+	// error so the BLOCK loop does not spin forever on a string.
+	_, err = rdb.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{"stream-wrongtype", "0"},
+	}).Result()
+	require.Error(t, err, "XREAD on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+}
+
 func TestRedis_StreamXAddXReadRoundTrip(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
