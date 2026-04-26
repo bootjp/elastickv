@@ -68,7 +68,7 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 	if err != nil {
 		return nil, false, err
 	}
-	return adminQueueSummary(name, meta, counters), true, nil
+	return adminQueueSummary(name, meta, counters, s.queueArn(name)), true, nil
 }
 
 // adminQueueSummary projects a queue meta + counters into the
@@ -77,9 +77,12 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 // comment calls "unsuitable for wall-clock display"); a zero millis
 // value yields a zero time.Time so the JSON omitempty drops the field
 // and the SPA renders "—" instead of an HLC-derived 1970 epoch.
+// queueArn is threaded in by the caller (AdminDescribeQueue) because
+// the server's region lives on *SQSServer and the helper itself is
+// kept method-free for unit-testability without a coordinator.
 // Pulled into a helper so the conversion is unit-testable without
 // standing up a full coordinator.
-func adminQueueSummary(name string, meta *sqsQueueMeta, counters sqsApproxCounters) *AdminQueueSummary {
+func adminQueueSummary(name string, meta *sqsQueueMeta, counters sqsApproxCounters, queueArn string) *AdminQueueSummary {
 	var createdAt time.Time
 	if meta.CreatedAtMillis > 0 {
 		createdAt = time.UnixMilli(meta.CreatedAtMillis).UTC()
@@ -89,7 +92,7 @@ func adminQueueSummary(name string, meta *sqsQueueMeta, counters sqsApproxCounte
 		IsFIFO:     meta.IsFIFO,
 		Generation: meta.Generation,
 		CreatedAt:  createdAt,
-		Attributes: metaAttributesForAdmin(meta),
+		Attributes: metaAttributesForAdmin(meta, queueArn),
 		Counters:   AdminQueueCounters(counters),
 	}
 }
@@ -121,13 +124,26 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 	return nil
 }
 
-// metaAttributesForAdmin renders the queue meta into the same shape
-// queueMetaToAttributes("All") would, minus the counters (the admin
-// summary surfaces them as a typed struct alongside, not as strings).
-// Kept as a small dedicated helper so the SigV4 path's selection
-// machinery stays untouched.
-func metaAttributesForAdmin(meta *sqsQueueMeta) map[string]string {
+// metaAttributesForAdmin renders the non-counter queue config
+// attributes. Mirrors queueMetaToAttributes("All") (sqs_catalog.go)
+// except for two deliberate omissions:
+//
+//   - The Approximate* counters — the admin summary surfaces them as
+//     the typed AdminQueueCounters struct alongside this map, so the
+//     SPA can render them without round-tripping strings.
+//   - CreatedTimestamp — surfaced as the typed AdminQueueSummary.CreatedAt
+//     field for the same reason.
+//
+// LastModifiedTimestamp stays in the map (SetQueueAttributes updates
+// LastModifiedAtMillis and operators need it for change-tracking;
+// there is no dedicated typed field for it). QueueArn is included so
+// the SPA can show the AWS-shaped identifier without recomputing it
+// client-side. Claude P1 on PR #670 caught both gaps — the prior
+// docstring claimed parity with queueMetaToAttributes("All") but
+// QueueArn and LastModifiedTimestamp were absent.
+func metaAttributesForAdmin(meta *sqsQueueMeta, queueArn string) map[string]string {
 	out := map[string]string{
+		"QueueArn":                      queueArn,
 		"VisibilityTimeout":             strconv.FormatInt(meta.VisibilityTimeoutSeconds, 10),
 		"MessageRetentionPeriod":        strconv.FormatInt(meta.MessageRetentionSeconds, 10),
 		"DelaySeconds":                  strconv.FormatInt(meta.DelaySeconds, 10),
@@ -135,6 +151,9 @@ func metaAttributesForAdmin(meta *sqsQueueMeta) map[string]string {
 		"MaximumMessageSize":            strconv.FormatInt(meta.MaximumMessageSize, 10),
 		"FifoQueue":                     strconv.FormatBool(meta.IsFIFO),
 		"ContentBasedDeduplication":     strconv.FormatBool(meta.ContentBasedDedup),
+	}
+	if mod := meta.LastModifiedAtMillis; mod > 0 {
+		out["LastModifiedTimestamp"] = strconv.FormatInt(mod/sqsMillisPerSecond, 10)
 	}
 	if meta.RedrivePolicy != "" {
 		out["RedrivePolicy"] = meta.RedrivePolicy
