@@ -256,3 +256,34 @@ func TestKeyVizHandlerEncodesAggregateBucket(t *testing.T) {
 	require.True(t, r.RouteIDsTruncated)
 	require.Equal(t, []uint64{2, 3}, r.RouteIDs)
 }
+
+// TestKeyVizHandlerRowsBudgetTieBreakDeterministic pins Gemini round-1
+// nit: when two rows tie on activity total, the rows-budget truncation
+// must pick the same set every refresh. Tie-break is BucketID
+// ascending so a re-poll on identical data yields identical rows.
+func TestKeyVizHandlerRowsBudgetTieBreakDeterministic(t *testing.T) {
+	t.Parallel()
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{
+			At: time.Unix(1_700_000_000, 0),
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 3, Start: []byte("c"), End: []byte("d"), Writes: 10},
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 10},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Writes: 10},
+			},
+		},
+	}})
+	defer srv.Close()
+
+	for i := 0; i < 3; i++ {
+		resp := keyVizGet(t, srv.URL+"?rows=2")
+		var matrix KeyVizMatrix
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+		resp.Body.Close()
+		require.Len(t, matrix.Rows, 2, "iteration %d", i)
+		// BucketID tie-break: route:1, route:2 win over route:3.
+		// After the budget cap they sort by Start, giving "a" then "b".
+		require.Equal(t, "route:1", matrix.Rows[0].BucketID, "iteration %d", i)
+		require.Equal(t, "route:2", matrix.Rows[1].BucketID, "iteration %d", i)
+	}
+}

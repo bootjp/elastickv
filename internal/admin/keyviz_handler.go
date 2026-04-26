@@ -73,6 +73,11 @@ type KeyVizRow struct {
 	RouteIDsTruncated bool     `json:"route_ids_truncated,omitempty"`
 	RouteCount        uint64   `json:"route_count"`
 	Values            []uint64 `json:"values"`
+	// total accumulates the sum of Values during pivot so the
+	// rowBudget sort is O(N log N) on a precomputed key rather
+	// than O(N log N × M) recomputing the sum per comparison.
+	// Not on the wire — clients read activity off Values directly.
+	total uint64
 }
 
 // KeyVizHandler serves GET /admin/api/v1/keyviz/matrix.
@@ -262,7 +267,9 @@ func pivotKeyVizColumns(cols []keyviz.MatrixColumn, series KeyVizSeries, rowBudg
 				rowsByID[mr.RouteID] = row
 				order = append(order, mr.RouteID)
 			}
-			row.Values[j] = pick(mr)
+			v := pick(mr)
+			row.Values[j] = v
+			row.total += v
 		}
 	}
 	matrix.Rows = make([]KeyVizRow, len(order))
@@ -320,22 +327,22 @@ func bucketIDFor(mr keyviz.MatrixRow) string {
 // activity-descending truncation rather than design §5.5's lexicographic
 // merge. Future work should swap in the spec'd merge once the
 // virtual-bucket plumbing supports synthesis at the response layer.
+//
+// Sort uses the precomputed row.total (accumulated during pivot) so
+// the comparator is O(1), not O(M). BucketID breaks activity ties
+// deterministically — the SPA refresh on the same data must yield the
+// same row set.
 func applyKeyVizRowBudget(rows []KeyVizRow, budget int) []KeyVizRow {
 	if budget <= 0 || len(rows) <= budget {
 		return rows
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		return rowActivityTotal(rows[i]) > rowActivityTotal(rows[j])
+		if rows[i].total != rows[j].total {
+			return rows[i].total > rows[j].total
+		}
+		return rows[i].BucketID < rows[j].BucketID
 	})
 	return rows[:budget]
-}
-
-func rowActivityTotal(r KeyVizRow) uint64 {
-	var sum uint64
-	for _, v := range r.Values {
-		sum += v
-	}
-	return sum
 }
 
 func sortKeyVizRowsByStart(rows []KeyVizRow) {
