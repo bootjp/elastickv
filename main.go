@@ -19,6 +19,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -680,6 +681,40 @@ func startServers(in serversInput) error {
 	if err != nil {
 		return err
 	}
+	// roleStore + connCache are gated on *adminEnabled. With admin
+	// disabled, building either is wasted work AND a security
+	// regression risk: a non-empty -adminFullAccessKeys flag would
+	// otherwise still flip forwardDeps.readyForRegistration() to
+	// true, registering the leader-side gRPC AdminForward service
+	// and re-exposing the table-write surface a follower-direct
+	// admin call could reach (Codex P1, CodeRabbit Major on #648).
+	// The HTTP admin listener already short-circuits in
+	// startAdminFromFlags when *adminEnabled is false; the gRPC path
+	// must do the same.
+	var (
+		roleStore admin.RoleStore
+		connCache *kv.GRPCConnCache
+	)
+	if *adminEnabled {
+		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
+		// connCache is shared between the follower-side LeaderForwarder
+		// (built inside startAdminFromFlags) and any future bridge that
+		// dials the leader's gRPC ports. Keeping a single instance per
+		// process means the two paths re-use TLS / HTTP/2 connections
+		// rather than each maintaining a parallel pool. The shutdown
+		// goroutine drains the cache on context cancellation so the
+		// accumulated HTTP/2 connections are not leaked when the
+		// process exits gracefully (Claude review on #648).
+		connCache = &kv.GRPCConnCache{}
+		cache := connCache
+		in.eg.Go(func() error {
+			<-in.ctx.Done()
+			if err := cache.Close(); err != nil {
+				return errors.Wrap(err, "close admin gRPC connection cache")
+			}
+			return nil
+		})
+	}
 	runner := runtimeServerRunner{
 		ctx:             in.ctx,
 		lc:              in.lc,
@@ -711,6 +746,7 @@ func startServers(in serversInput) error {
 		pprofAddress:    *pprofAddr,
 		pprofToken:      *pprofToken,
 		metricsRegistry: in.metricsRegistry,
+		roleStore:       roleStore,
 	}
 	if err := runner.start(); err != nil {
 		return err
@@ -720,7 +756,14 @@ func startServers(in serversInput) error {
 	// Passing nil here would leave the admin dashboard with no
 	// access to table metadata; the admin handler answers
 	// /admin/api/v1/dynamo/* with 404 in that case.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer); err != nil {
+	//
+	// in.coordinate + connCache are forwarded so the admin HTTP
+	// dynamo handler can construct its production LeaderForwarder
+	// (Phase 3 of design 3.3): when the local node is a follower,
+	// the handler hands ErrTablesNotLeader writes to the forwarder
+	// which dials the leader over the cached gRPC pool. Without these
+	// the handler falls back to 503 + Retry-After:1.
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, in.coordinate, connCache); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -975,7 +1018,9 @@ func startRaftServers(
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
 	adminGRPCOpts adminGRPCInterceptors,
+	forwardDeps adminForwardServerDeps,
 ) error {
+	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
 	// options appended below. Sized as a constant so the magic-number
 	// linter does not complain.
@@ -1005,6 +1050,7 @@ func startRaftServers(
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
 		}
+		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 		reflection.Register(gs)
@@ -1255,11 +1301,36 @@ type runtimeServerRunner struct {
 	// field is unexported on purpose — it is package-private state,
 	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
+
+	// roleStore is the access-key → role index the leader-side
+	// gRPC AdminForward service uses to re-validate the principal
+	// on every forwarded write. Mirrors what admin.Config.RoleIndex
+	// produces inside startAdminFromFlags; built up-front in
+	// startServers so registerAdminForwardServer in startRaftServers
+	// does not need to wait for the (later) admin-config parse.
+	// Nil when no admin access keys are configured.
+	roleStore admin.RoleStore
 }
 
 func (r *runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	// startDynamoDBServer must run BEFORE startRaftServers so the
+	// resulting DynamoDBServer is available to the leader-side gRPC
+	// AdminForward registration in startRaftServers (design 3.3).
+	// Both servers listen on different addresses; the dynamo HTTP
+	// listener accepting traffic before raft TCP listeners are up
+	// is no different from the existing startup-race semantics — a
+	// hit in that window already returned 503 before this reorder.
+	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	if err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	r.dynamoServer = dynamoServer
+	forwardDeps := adminForwardServerDeps{
+		tables: newDynamoTablesSource(r.dynamoServer),
+		roles:  r.roleStore,
 	}
 	if err := startRaftServers(
 		r.ctx,
@@ -1275,14 +1346,10 @@ func (r *runtimeServerRunner) start() error {
 		},
 		r.adminServer,
 		r.adminGRPCOpts,
+		forwardDeps,
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	r.dynamoServer = dynamoServer
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

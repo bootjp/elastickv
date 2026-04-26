@@ -68,7 +68,15 @@ type adminListenerConfig struct {
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime, dynamoServer *adapter.DynamoDBServer) error {
+func startAdminFromFlags(
+	ctx context.Context,
+	lc *net.ListenConfig,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	dynamoServer *adapter.DynamoDBServer,
+	coordinate kv.Coordinator,
+	connCache *kv.GRPCConnCache,
+) error {
 	if !*adminEnabled {
 		return nil
 	}
@@ -109,8 +117,38 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
 	tablesSrc := newDynamoTablesSource(dynamoServer)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, buildVersion())
+	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
+	if err != nil {
+		return errors.Wrap(err, "build admin leader forwarder")
+	}
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, forwarder, buildVersion())
 	return err
+}
+
+// buildAdminLeaderForwarder constructs the production LeaderForwarder
+// for the dynamo HTTP handler when the wiring is complete enough to
+// reach a remote leader. The bridge tolerates a nil connCache (and a
+// nil coordinate) so single-node / leader-only builds — where the
+// dashboard always hits a leader — can ship without paying the
+// forwarder's wiring cost. tablesSrc itself can be nil for cluster-
+// only builds; that's handled higher up by ServerDeps.Tables == nil.
+func buildAdminLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConnCache, nodeID string) (admin.LeaderForwarder, error) {
+	if coordinate == nil || connCache == nil {
+		// Returning (nil, nil) is the explicit "no forwarder" signal
+		// — the handler falls back to 503 + Retry-After:1 on
+		// ErrTablesNotLeader. The function-level doc comment above
+		// describes this contract; the nilnil linter is not enabled
+		// in .golangci.yaml so no suppression directive is needed
+		// (Claude review on #648).
+		return nil, nil
+	}
+	if nodeID == "" {
+		// admin.NewGRPCForwardClient enforces this too; surfacing
+		// it here keeps the misconfiguration message in the wiring
+		// layer rather than buried under a Wrap chain.
+		return nil, errors.New("admin forward bridge: --raftId is required")
+	}
+	return buildLeaderForwarder(coordinate, connCache, nodeID)
 }
 
 // newDynamoTablesSource adapts *adapter.DynamoDBServer to the
@@ -346,6 +384,7 @@ func startAdminServer(
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
 	tables admin.TablesSource,
+	forwarder admin.LeaderForwarder,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -353,7 +392,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, forwarder)
 	if err != nil {
 		return "", err
 	}
@@ -393,7 +432,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, forwarder admin.LeaderForwarder) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -413,6 +452,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
 		Tables:      tables,
+		Forwarder:   forwarder,
 		StaticFS:    nil,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
