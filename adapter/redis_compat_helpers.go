@@ -363,6 +363,44 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 	return r.applyTTLFilter(ctx, key, readTS, expected)
 }
 
+// keyTypeAtExpectFast is the signal-driven-wake variant of
+// keyTypeAtExpect. On a fast-probe miss it returns redisTypeNone
+// directly (no rawKeyTypeAt slow-path fallback, no
+// hasHigherPriorityStringEncoding guard). Callers MUST have an
+// invariant that the only mutation since the last full check could
+// have produced a row visible to probeExpectedType — typically a
+// blocking-command wait loop after a Signal-driven wake, where the
+// only writes that fire keyWaiterRegistry.Signal are
+// expected-type-creating writes (ZADD/ZINCRBY for zsets,
+// XADD-and-friends for streams). A wrongType-introducing write
+// (HSET, SET, etc.) does NOT signal, so a non-zset key that
+// appeared between iterations is invisible to this fast path; the
+// blocking command's fallback-timer wake (which uses the slow
+// keyTypeAtExpect) is the safety net that detects it within
+// ~redisBlockWaitFallback (100ms).
+//
+// Compared to keyTypeAtExpect on the empty-key case
+// (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19
+// seeks), the fast variant returns after the 3-seek probe. For a
+// BZPOPMIN waiting on an empty zset and being woken by Signal at
+// the ZADD rate, this turns each wake from "19 seeks just to
+// confirm still-empty" into "0 seeks because the probe found the
+// new ZADD's row" or "3 seeks to confirm the ZADD raced and the
+// queue is empty again".
+func (r *RedisServer) keyTypeAtExpectFast(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
+	if expected == redisTypeNone {
+		return redisTypeNone, nil
+	}
+	found, err := r.probeExpectedType(ctx, key, readTS, expected)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if !found {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, expected)
+}
+
 // probeExpectedType issues only the prefix probes for the given type.
 // It is intentionally conservative: returning false here means "no row
 // of the expected type was visible at readTS", not "the key does not
