@@ -80,6 +80,15 @@ func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
 	// xreadOnce, so the registration race is benign — but waiting also
 	// gates out a different source of flake where the goroutine has not
 	// yet dialed redis.
+	//
+	// TODO: replace the time.Sleep with explicit synchronization (e.g.
+	// poll streamWaiterRegistry until the test's stream key shows up,
+	// or expose a hook from RedisServer that fires when registration
+	// completes). Under -race on a slow CI runner the 50 ms pause may
+	// be insufficient — the test then exercises the
+	// "entry-already-visible" slow path instead of the signal-driven
+	// wake path. The end-to-end assertion still passes either way, so
+	// this is a coverage-quality issue, not a flake.
 	time.Sleep(50 * time.Millisecond)
 
 	_, err = rdbWriter.XAdd(ctx, &redis.XAddArgs{

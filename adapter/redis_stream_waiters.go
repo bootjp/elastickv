@@ -41,10 +41,13 @@ func newStreamWaiterRegistry() *streamWaiterRegistry {
 // and a release fn the caller MUST defer; the release fn is safe to invoke
 // multiple times. Nil-safe: returns a never-fires waiter and a no-op
 // release if the registry is nil (the caller's select still gets a
-// well-typed channel and the fallback timer drives the loop).
+// well-typed channel and the fallback timer drives the loop). The nil
+// path uses a buffered-1 channel for consistency with the non-nil path
+// so any code that reaches Signal on a nil-registry waiter (test stubs
+// only, in practice) coalesces the same way.
 func (reg *streamWaiterRegistry) Register(keys [][]byte) (*streamWaiter, func()) {
 	if reg == nil {
-		return &streamWaiter{C: make(chan struct{})}, func() {}
+		return &streamWaiter{C: make(chan struct{}, 1)}, func() {}
 	}
 	w := &streamWaiter{
 		C:    make(chan struct{}, 1),
@@ -87,6 +90,21 @@ func (reg *streamWaiterRegistry) unregister(w *streamWaiter) {
 // guaranteed to see it. Nil-safe: test stubs that construct a
 // RedisServer literal directly may leave streamWaiters unset, in
 // which case Signal is a no-op.
+//
+// Cost shape: O(N) work per Signal where N is the waiter count for
+// the key — collects the waiter snapshot under the lock, then
+// non-blocking-sends outside the lock. With R XADDs/sec on a stream
+// shared by N BLOCK waiters, total wake-up cost is O(N*R)
+// xreadOnce calls/sec across the leader. For the production
+// operating point that motivated this change (small N — typically
+// one consumer per stream — moderate R), this is strictly better
+// than the old N*100 polls/sec. A pathological fan-out scenario
+// (many BLOCK waiters watching one hot stream, or one waiter with
+// an unsatisfiable far-future afterID being woken on every XADD)
+// can exceed the old busy-poll cost. The 100 ms fallback timer
+// bounds the worst-case CPU under such patterns. AfterID-aware
+// filtering at Signal time is a follow-up — see
+// docs/design/2026_04_26_proposed_fsm_apply_observer.md.
 func (reg *streamWaiterRegistry) Signal(key []byte) {
 	if reg == nil {
 		return

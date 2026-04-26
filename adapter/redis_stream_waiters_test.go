@@ -150,6 +150,37 @@ func TestStreamWaiterRegistry_SignalWithNoWaiterIsNoOp(t *testing.T) {
 	reg.Signal([]byte("nobody-here"))
 }
 
+func TestStreamWaiterRegistry_NilRegistry(t *testing.T) {
+	t.Parallel()
+	var reg *streamWaiterRegistry
+	w, release := reg.Register([][]byte{[]byte("k")})
+	defer release()
+	if w == nil {
+		t.Fatal("nil registry must return a usable waiter")
+	}
+	if w.C == nil {
+		t.Fatal("nil registry waiter must have a non-nil channel")
+	}
+	// Buffered-1 invariant: a non-blocking direct send must succeed
+	// without deadlocking. (In production, Signal is a no-op for nil
+	// registries; this only matters for test stubs that hand-write
+	// into w.C — but the contract is documented as buffered-1 either
+	// way, and an unbuffered channel would deadlock here.)
+	select {
+	case w.C <- struct{}{}:
+	default:
+		t.Fatal("nil-registry waiter channel must be buffered (size 1)")
+	}
+	// And it must drain.
+	select {
+	case <-w.C:
+	default:
+		t.Fatal("nil-registry waiter channel did not deliver the manual send")
+	}
+	// Signal on nil registry is a no-op.
+	reg.Signal([]byte("k"))
+}
+
 func TestStreamWaiterRegistry_ManyWaitersFanOut(t *testing.T) {
 	t.Parallel()
 	reg := newStreamWaiterRegistry()
