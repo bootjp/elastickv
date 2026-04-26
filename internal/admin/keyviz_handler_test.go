@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -156,6 +157,8 @@ func TestKeyVizHandlerSeriesParam(t *testing.T) {
 		{"write_bytes", 4444},
 	} {
 		t.Run(tc.series, func(t *testing.T) {
+			// Sequential: the parent's `defer srv.Close()` would fire
+			// before parallel subtests get to dial.
 			resp := keyVizGet(t, srv.URL+"?series="+tc.series)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -286,4 +289,101 @@ func TestKeyVizHandlerRowsBudgetTieBreakDeterministic(t *testing.T) {
 		require.Equal(t, "route:1", matrix.Rows[0].BucketID, "iteration %d", i)
 		require.Equal(t, "route:2", matrix.Rows[1].BucketID, "iteration %d", i)
 	}
+}
+
+// TestKeyVizHandlerTimeBoundsParam exercises the from_unix_ms /
+// to_unix_ms query parameters: a non-zero pair filters columns to the
+// requested half-open window, while 0 means "unbounded on that side"
+// (NOT the Unix epoch). The fakeKeyVizSource here does not actually
+// honour the bounds (its Snapshot ignores them) — what we're pinning
+// is the parse/dispatch contract: a parsable pair must yield 200,
+// 0 must reach the source as the zero Time, and a non-numeric value
+// must surface as 400 invalid_query.
+func TestKeyVizHandlerTimeBoundsParam(t *testing.T) {
+	t.Parallel()
+	captured := &capturingKeyVizSource{}
+	h := NewKeyVizHandler(captured).WithClock(func() time.Time {
+		return time.Unix(1_700_000_000, 0).UTC()
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	from := time.Unix(1_699_000_000, 0)
+	to := time.Unix(1_700_500_000, 0)
+	u := srv.URL + "?from_unix_ms=" + strconv.FormatInt(from.UnixMilli(), 10) +
+		"&to_unix_ms=" + strconv.FormatInt(to.UnixMilli(), 10)
+	resp := keyVizGet(t, u)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.True(t, captured.from.Equal(from.UTC()), "from = %v, want %v", captured.from, from.UTC())
+	require.True(t, captured.to.Equal(to.UTC()), "to = %v, want %v", captured.to, to.UTC())
+
+	// 0 → unbounded (zero Time), not Unix epoch.
+	captured.reset()
+	resp = keyVizGet(t, srv.URL+"?from_unix_ms=0&to_unix_ms=0")
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.True(t, captured.from.IsZero(), "from = %v, want zero", captured.from)
+	require.True(t, captured.to.IsZero(), "to = %v, want zero", captured.to)
+
+	// Non-numeric → 400 invalid_query.
+	resp = keyVizGet(t, srv.URL+"?from_unix_ms=notanumber")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "invalid_query", body["error"])
+}
+
+// capturingKeyVizSource records the from/to bounds the handler
+// forwarded so tests can assert on the parse step without rendering
+// any matrix data.
+type capturingKeyVizSource struct {
+	from time.Time
+	to   time.Time
+}
+
+func (c *capturingKeyVizSource) Snapshot(from, to time.Time) []keyviz.MatrixColumn {
+	c.from = from
+	c.to = to
+	return nil
+}
+
+func (c *capturingKeyVizSource) reset() {
+	c.from = time.Time{}
+	c.to = time.Time{}
+}
+
+// TestKeyVizHandlerAggregateFallbackWhenTotalZero pins the defensive
+// fallback for the unlikely case where the sampler emits an aggregate
+// row with MemberRoutesTotal == 0: the handler must not serialise
+// route_count = 0 (which the SPA would render as "0 routes" — nonsense
+// for a virtual bucket). Instead it falls back to len(MemberRoutes).
+func TestKeyVizHandlerAggregateFallbackWhenTotalZero(t *testing.T) {
+	t.Parallel()
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{
+			At: time.Unix(1_700_000_000, 0),
+			Rows: []keyviz.MatrixRow{
+				{
+					RouteID:           ^uint64(0),
+					Start:             []byte("c"),
+					End:               []byte("d"),
+					Aggregate:         true,
+					MemberRoutes:      []uint64{2, 3},
+					MemberRoutesTotal: 0, // pathological zero
+					Writes:            5,
+				},
+			},
+		},
+	}})
+	defer srv.Close()
+
+	resp := keyVizGet(t, srv.URL)
+	defer resp.Body.Close()
+	var matrix KeyVizMatrix
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+	require.Len(t, matrix.Rows, 1)
+	require.True(t, matrix.Rows[0].Aggregate)
+	require.Equal(t, uint64(2), matrix.Rows[0].RouteCount, "fallback to len(MemberRoutes)")
 }

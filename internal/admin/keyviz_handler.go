@@ -85,8 +85,9 @@ type KeyVizRow struct {
 // Query parameters (all optional):
 //
 //	series      - reads | writes | read_bytes | write_bytes (default: writes)
-//	from_unix_ms - lower bound in unix ms (default: unbounded)
-//	to_unix_ms   - upper bound in unix ms (default: unbounded)
+//	from_unix_ms - lower bound in unix ms; 0 or omitted means unbounded
+//	               on that side (NOT the Unix epoch)
+//	to_unix_ms   - upper bound in unix ms; same 0 = unbounded contract
 //	rows         - row budget; 0 means no cap, capped at 1024 (default: 0)
 //
 // Returns 503 codes.Unavailable when no sampler is configured so the
@@ -298,8 +299,19 @@ func keyVizSeriesPicker(series KeyVizSeries) func(keyviz.MatrixRow) uint64 {
 
 func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 	total := mr.MemberRoutesTotal
-	if !mr.Aggregate && total == 0 {
+	switch {
+	case !mr.Aggregate && total == 0:
+		// Individual slots with the field zero-initialised — every
+		// real route contributes exactly one member to itself.
 		total = 1
+	case mr.Aggregate && total == 0:
+		// Defensive fallback: a virtual bucket should always carry a
+		// non-zero MemberRoutesTotal once foldIntoBucket has run, but
+		// if a sampler ever serialises a just-coalesced bucket before
+		// the count is set the SPA would render "0 routes" — which is
+		// nonsense for an aggregate row. Fall back to the visible
+		// MemberRoutes length so route_count stays meaningful.
+		total = uint64(len(mr.MemberRoutes))
 	}
 	row := &KeyVizRow{
 		BucketID:          bucketIDFor(mr),
