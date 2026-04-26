@@ -24,6 +24,8 @@ type fakeEngine struct {
 	serving bool
 
 	addVoterCalls       []fakeAddVoterCall
+	addLearnerCalls     []fakeAddVoterCall
+	promoteLearnerCalls []fakePromoteLearnerCall
 	removeServerCalls   []fakeRemoveServerCall
 	transferCalls       int
 	targetTransferCalls []fakeTransferCall
@@ -33,6 +35,12 @@ type fakeAddVoterCall struct {
 	id        string
 	address   string
 	prevIndex uint64
+}
+
+type fakePromoteLearnerCall struct {
+	id              string
+	prevIndex       uint64
+	minAppliedIndex uint64
 }
 
 type fakeRemoveServerCall struct {
@@ -93,6 +101,20 @@ func (f *fakeEngine) AddVoter(_ context.Context, id string, address string, prev
 	defer f.mu.Unlock()
 	f.addVoterCalls = append(f.addVoterCalls, fakeAddVoterCall{id: id, address: address, prevIndex: prevIndex})
 	return 11, nil
+}
+
+func (f *fakeEngine) AddLearner(_ context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addLearnerCalls = append(f.addLearnerCalls, fakeAddVoterCall{id: id, address: address, prevIndex: prevIndex})
+	return 33, nil
+}
+
+func (f *fakeEngine) PromoteLearner(_ context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promoteLearnerCalls = append(f.promoteLearnerCalls, fakePromoteLearnerCall{id: id, prevIndex: prevIndex, minAppliedIndex: minAppliedIndex})
+	return 44, nil
 }
 
 func (f *fakeEngine) RemoveServer(_ context.Context, id string, prevIndex uint64) (uint64, error) {
