@@ -203,21 +203,8 @@ func (h *SqsHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name
 }
 
 func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := PrincipalFromContext(r.Context())
+	principal, ok := h.principalForWrite(w, r)
 	if !ok {
-		// SessionAuth runs before this handler, so a missing
-		// principal is a wiring bug. 500 rather than 401 since
-		// 401 would be misleading — the request was authenticated.
-		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
-		return
-	}
-	// Re-evaluate the role against the live store so a downgraded
-	// key cannot keep deleting with a still-valid JWT. The check is
-	// before the leader check so a forbidden read-only caller never
-	// learns the leader's identity by indirection.
-	if !h.principalCanWrite(principal) {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to delete queues")
 		return
 	}
 	if strings.TrimSpace(name) == "" {
@@ -232,23 +219,57 @@ func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name s
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// principalCanWrite re-resolves the access key against the live
-// RoleStore (when configured) so a downgrade or revoke applies to
-// the next request, not just to new logins. Falls back to the JWT's
-// embedded role when no role store is wired (single-tenant default).
-func (h *SqsHandler) principalCanWrite(p AuthPrincipal) bool {
-	role := p.Role
+// principalForWrite resolves the live role from the RoleStore (when
+// configured), gates the request, and returns the principal with the
+// **live** role overridden in place — so the role that flows downstream
+// to the adapter is the one the operator currently has, not whatever
+// the JWT happens to remember. Mirrors DynamoHandler.principalForWrite
+// (Codex P2 + Claude P1 on PR #670 caught the bug: without the role
+// override, a JWT-read_only / store-full promoted key passed the
+// handler-side check but the adapter rejected with ErrAdminForbidden,
+// so the user had to log out and back in for a delete to work).
+//
+// Failure paths write the response and return ok=false; callers
+// short-circuit on the bool. Logged-out / wrong-role callers never
+// reach the source layer, so the leader's identity is not leaked
+// by indirection (forbidden response is the same shape regardless
+// of leadership state).
+func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		// SessionAuth runs before this handler, so a missing
+		// principal is a wiring bug. 500 rather than 401 since
+		// 401 would be misleading — the request was authenticated.
+		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
+		return AuthPrincipal{}, false
+	}
 	if h.roles != nil {
-		if live, ok := h.roles.LookupRole(p.AccessKey); ok {
-			role = live
-		} else {
+		live, exists := h.roles.LookupRole(principal.AccessKey)
+		if !exists {
 			// Key has been removed from the role config since
 			// login. Treat it as no-access regardless of what
 			// the JWT claimed.
-			return false
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this access key is not authorised to delete queues")
+			return AuthPrincipal{}, false
 		}
+		if !live.AllowsWrite() {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this access key is not authorised to delete queues")
+			return AuthPrincipal{}, false
+		}
+		// Forward the live role downstream so the adapter
+		// re-check sees the same role the handler gated on.
+		// Without this, a key promoted from read_only → full
+		// after login still hits the adapter with the JWT's
+		// stale read_only and gets a confusing 403.
+		principal.Role = live
+	} else if !principal.Role.AllowsWrite() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this access key is not authorised to delete queues")
+		return AuthPrincipal{}, false
 	}
-	return role.AllowsWrite()
+	return principal, true
 }
 
 // writeQueuesError translates a QueuesSource error onto an HTTP
