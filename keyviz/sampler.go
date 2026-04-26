@@ -58,11 +58,19 @@ const (
 // Sampler is the narrow interface the coordinator depends on. The
 // nil-safe contract is documented per-method so a coordinator wired
 // without a sampler compiles to a no-op call.
+//
+// Implementations MUST be nil-receiver-safe: a typed-nil
+// implementation passed through this interface (e.g.
+// `var s Sampler = (*MemSampler)(nil)`) must not panic when its
+// methods are called. The coordinator stores the interface value as
+// supplied and dispatches through it on the hot path; a guard at the
+// call site only checks for an interface-nil, not a typed-nil.
 type Sampler interface {
 	// Observe records a single request against a route. Op identifies
 	// the counter family. keyLen and valueLen are summed into the
 	// matching *Bytes counter; pass 0 for read-only ops where the
-	// payload size is irrelevant.
+	// payload size is irrelevant. Implementations must no-op (not
+	// panic) when invoked on a typed-nil receiver.
 	Observe(routeID uint64, op Op, keyLen, valueLen int)
 }
 
