@@ -250,8 +250,16 @@ flagged as a structural prerequisite.
 
    - **(a) Filter at the comparison.** `validateConfState` builds its
      own `expected` voter set from `peers` filtered by
-     `Suffrage != "learner"`, and compares both `Voters` and
-     `Learners` element-wise against the snapshot's `ConfState`.
+     `Suffrage != "learner"`. The voter check stays element-wise
+     (matching the existing pattern, which depends on the
+     well-established voter ordering invariant: `persistConfigState`
+     writes voters in `ConfState.Voters` order and `normalizePeers`
+     preserves it). The **learner check is set-based**:
+     `len(conf.Learners) != filteredLearnerCount && allLearnersPresent(conf.Learners, learnerSet)`.
+     A set comparison avoids pinning a new ordering contract on the
+     v2 writer for learners — there is no prior convention since
+     learners have never been persisted before, and the set form is
+     strictly more robust against future writer reordering.
    - **(b) Add a sibling helper.** Introduce
      `confStateWithLearners(peers []Peer) raftpb.ConfState` used only
      by `validateConfState`; leave `confStateForPeers` voters-only as
@@ -265,15 +273,35 @@ flagged as a structural prerequisite.
    `raftengine.Server{Suffrage: "voter"}` into `e.config.Servers`. Once
    learners exist, the second job is wrong — `upsertPeer` has no
    `ConfState` at call time, so it cannot decide the correct suffrage.
-   The fix: `upsertPeer` keeps `e.peers` only. `e.config.Servers` is
-   recomputed from the post-change `ConfState` by a single call to
-   `configurationFromConfState` inside `applyConfigChange` /
-   `applyConfigChangeV2`. That function already runs on the
-   single-threaded apply loop and already sees the new `ConfState` from
-   `rawNode.ApplyConfChange(...)`, so there is no extra synchronization
-   cost. Symmetric change in `removePeer`: it stops splicing
-   `e.config.Servers` directly and lets the apply loop rebuild it from
-   `ConfState`.
+   The fix: `upsertPeer` keeps `e.peers` only. `e.config.Servers`,
+   `e.voterCount`, and `e.isLearnerNode` are all recomputed from the
+   post-change `ConfState` inside `applyConfigChange` /
+   `applyConfigChangeV2`. Symmetric change in `removePeer`: it stops
+   splicing `e.config.Servers` directly.
+
+   To make the post-change `ConfState` reachable from those functions,
+   **extend their signatures** to accept `confState raftpb.ConfState`:
+
+   ```go
+   func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType,
+                                       nodeID uint64, context []byte,
+                                       index uint64,
+                                       confState raftpb.ConfState)
+
+   func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2,
+                                         index uint64,
+                                         confState raftpb.ConfState)
+   ```
+
+   This mirrors `nextPeersAfterConfigChange(_, _, _, conf raftpb.ConfState)`
+   which already takes `ConfState` for the same reason. The call sites
+   in the apply loop already capture the return value of
+   `rawNode.ApplyConfChange(...)`, so wiring the parameter is a
+   one-line change at each call site (no new mutex, no new state).
+   Inside the body, suffrage-aware updates run **after** the existing
+   per-peer cleanup helpers (`upsertPeer` / `removePeer`) so address
+   cache mutations and voter-count rebuilds happen in a deterministic
+   order on the single-threaded apply loop (cf. §5.2 ordering note).
 
 `nextPeersAfterConfigChange` already routes `ConfChangeAddLearnerNode`
 via `applyAddedPeerToMap`, so the snapshot/restart code path is correct
@@ -848,13 +876,13 @@ After Milestone 3, rename
    `bool skip_min_applied_check` field with a default of `false`,
    forcing operators to opt in explicitly. Tracked here so it is not
    discovered post-implementation.
-3. Do we want a `--raftBootstrapMembers` syntax extension to mark
+4. Do we want a `--raftBootstrapMembers` syntax extension to mark
    bootstrap members as learners? Current proposal: **no**. Cold
    bootstrap is voter-only; learners enter exclusively via
    `AddLearner` against an existing leader. This keeps the bootstrap
    path narrow and avoids a footgun where someone bootstraps a
    learner-majority cluster.
-4. Future work: should `LinearizableRead` on a learner be served
+5. Future work: should `LinearizableRead` on a learner be served
    locally with `ReadIndex` + apply-wait, instead of forwarded? That
    is the follower-served-reads question and explicitly out of scope
    here.
