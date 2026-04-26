@@ -754,6 +754,7 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
+	c.observeReadKey(key)
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
@@ -775,6 +776,7 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
+	c.observeReadKey(key)
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
@@ -975,23 +977,42 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }
 
-// observeMutation: reads never reach this path; the early return
-// keeps the disabled-keyviz hot path allocation-free. Counted
-// pre-commit, so a mutation that subsequently fails its Raft
-// proposal is still recorded — the heatmap reflects offered load,
-// not just committed writes (intentional for traffic visualisation).
-//
-// TODO(keyviz Phase 2): the design (§5.1, §10) calls for read
-// sampling on the node that serves the read (LeaseRead /
-// LinearizableRead / follower reads). Until that wiring lands the
-// matrix's Reads / ReadBytes series stay zero. Tracked as a Phase-2
-// milestone in docs/admin_ui_key_visualizer_design.md — not a
-// regression for the writes-first slice this method covers.
+// observeMutation: counted pre-commit, so a mutation that subsequently
+// fails its Raft proposal is still recorded — the heatmap reflects
+// offered load, not just committed writes (intentional for traffic
+// visualisation). The early return keeps the disabled-keyviz hot
+// path allocation-free. Reads have their own observeReadKey helper
+// (LinearizableReadForKey / LeaseReadForKey).
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	if c.sampler == nil {
 		return
 	}
 	c.sampler.Observe(routeID, keyviz.OpWrite, len(mut.Key), len(mut.Value))
+}
+
+// observeReadKey records a single linearizable / lease read against
+// the route that owns key. valueLen is always 0 here — the consistency
+// check at this layer doesn't fetch data; the actual GetAt on the
+// store happens further down the stack and isn't observed yet.
+//
+// Caller must have already passed groupForKey(key) so the GetRoute
+// lookup almost always hits in the table — keeping it inside this
+// helper keeps observeReadKey nil-safe at the lookup level too:
+// keyviz disabled → single branch, no map lookup.
+//
+// Adapter-direct read paths (Redis / DynamoDB / S3 hitting
+// MVCCStore.GetAt without going through the coordinator) still
+// bypass keyviz; sampling those is task B in the design's Phase 2
+// follow-up.
+func (c *ShardedCoordinator) observeReadKey(key []byte) {
+	if c.sampler == nil {
+		return
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	if !ok {
+		return
+	}
+	c.sampler.Observe(route.RouteID, keyviz.OpRead, len(key), 0)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {

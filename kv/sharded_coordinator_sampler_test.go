@@ -151,3 +151,73 @@ func TestShardedCoordinatorWithoutSamplerStaysSafe(t *testing.T) {
 		})
 	}
 }
+
+// TestShardedCoordinatorObservesLeaseAndLinearizableReads pins the
+// read-side wiring: LeaseReadForKey and LinearizableReadForKey each
+// produce one Observe(routeID, OpRead, len(key), 0) call. valueLen
+// is always zero at this layer because the consistency check doesn't
+// fetch data — the actual GetAt happens further down the stack and
+// is sampled separately (Phase 2 follow-up for adapter direct reads).
+func TestShardedCoordinatorObservesLeaseAndLinearizableReads(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+
+	s1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "kv-sampler-read", NewKvFSMWithHLC(s1, NewHLC()))
+	t.Cleanup(stop1)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: r1, Store: s1, Txn: NewLeaderProxyWithEngine(r1)},
+	}
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups)).WithSampler(rec)
+
+	key := []byte("hot-key")
+	_, err := coord.LinearizableReadForKey(ctx, key)
+	require.NoError(t, err)
+	_, err = coord.LeaseReadForKey(ctx, key)
+	require.NoError(t, err)
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2, "expected one Observe per read entry")
+	route, ok := engine.GetRoute(routeKey(key))
+	require.True(t, ok)
+	want := sampleCall{
+		routeID:  route.RouteID,
+		op:       keyviz.OpRead,
+		keyLen:   len(key),
+		valueLen: 0,
+	}
+	require.Equal(t, want, calls[0])
+	require.Equal(t, want, calls[1])
+}
+
+// TestShardedCoordinatorSkipsObserveForLeadershipChecks pins the
+// negative contract: leadership-only entries (IsLeaderForKey,
+// VerifyLeaderForKey, RaftLeaderForKey) MUST NOT produce read
+// observations — they don't represent user-facing data reads, just
+// internal routing checks.
+func TestShardedCoordinatorSkipsObserveForLeadershipChecks(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+
+	s1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "kv-sampler-leadership", NewKvFSMWithHLC(s1, NewHLC()))
+	t.Cleanup(stop1)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: r1, Store: s1, Txn: NewLeaderProxyWithEngine(r1)},
+	}
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups)).WithSampler(rec)
+
+	key := []byte("k")
+	_ = coord.IsLeaderForKey(key)
+	_ = coord.VerifyLeaderForKey(key)
+	_ = coord.RaftLeaderForKey(key)
+
+	require.Empty(t, rec.snapshot(), "leadership checks must not produce read samples")
+}
