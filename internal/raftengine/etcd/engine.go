@@ -122,6 +122,9 @@ var (
 	errLeadershipTransferNotLeader  = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
 	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
 	errTooManyPendingConfigs        = errors.New("etcd raft engine has too many pending config changes")
+	errPromoteLearnerNotLearner     = errors.New("etcd raft promote-learner target is not a learner")
+	errPromoteLearnerNoProgress     = errors.New("etcd raft promote-learner target has no leader-side progress entry")
+	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
 )
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
@@ -317,15 +320,21 @@ const (
 	adminActionAddVoter adminAction = iota + 1
 	adminActionRemoveServer
 	adminActionTransferLeadership
+	adminActionAddLearner
+	adminActionPromoteLearner
 )
 
 type adminRequest struct {
-	ctx       context.Context
-	id        uint64
-	action    adminAction
-	peer      Peer
-	prevIndex uint64
-	done      chan adminResult
+	ctx context.Context
+	id  uint64
+	// minAppliedIndex is the PromoteLearner precondition: the learner's
+	// Progress.Match on the leader must reach this index before the
+	// promotion proposal is submitted. Zero means skip the check.
+	minAppliedIndex uint64
+	action          adminAction
+	peer            Peer
+	prevIndex       uint64
+	done            chan adminResult
 }
 
 type adminResult struct {
@@ -1018,6 +1027,44 @@ func (e *Engine) AddVoter(ctx context.Context, id string, address string, prevIn
 	return result.index, nil
 }
 
+// AddLearner attaches a non-voting replica. The learner is added via
+// V1 ConfChangeAddLearnerNode and starts receiving log entries
+// immediately, but does not contribute to the voter quorum until
+// promoted with PromoteLearner.
+func (e *Engine) AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	peer, err := e.resolveAdminPeer(id, address)
+	if err != nil {
+		return 0, err
+	}
+	result, err := e.submitAdmin(ctx, adminActionAddLearner, peer, prevIndex)
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
+// PromoteLearner promotes an existing learner to voter via V1
+// ConfChangeAddNode. The minAppliedIndex precondition (when non-zero)
+// rejects the call if the learner's leader-side Progress.Match has
+// not reached that index yet, so an operator who promotes too eagerly
+// gets a clean FailedPrecondition error instead of a silent quorum
+// stall.
+func (e *Engine) PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error) {
+	if id == "" {
+		return 0, errors.WithStack(errPeerIDRequired)
+	}
+	result, err := e.submitAdminEx(ctx, adminRequest{
+		action:          adminActionPromoteLearner,
+		peer:            Peer{ID: id},
+		prevIndex:       prevIndex,
+		minAppliedIndex: minAppliedIndex,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
 func (e *Engine) RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error) {
 	result, err := e.submitAdmin(ctx, adminActionRemoveServer, Peer{ID: id}, prevIndex)
 	if err != nil {
@@ -1043,20 +1090,28 @@ func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, addr
 }
 
 func (e *Engine) submitAdmin(ctx context.Context, action adminAction, peer Peer, prevIndex uint64) (adminResult, error) {
+	return e.submitAdminEx(ctx, adminRequest{
+		action:    action,
+		peer:      peer,
+		prevIndex: prevIndex,
+	})
+}
+
+// submitAdminEx is the underlying admin submit path. The caller
+// populates action, peer, prevIndex, and (for PromoteLearner)
+// minAppliedIndex; ctx, id, and done are filled in here so the
+// request integrates with the engine event loop the same way the
+// existing AddVoter / RemoveServer paths do.
+func (e *Engine) submitAdminEx(ctx context.Context, req adminRequest) (adminResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return adminResult{}, err
 	}
 	if e == nil {
 		return adminResult{}, errors.WithStack(errNilEngine)
 	}
-	req := adminRequest{
-		ctx:       ctx,
-		id:        e.nextID(),
-		action:    action,
-		peer:      peer,
-		prevIndex: prevIndex,
-		done:      make(chan adminResult, 1),
-	}
+	req.ctx = ctx
+	req.id = e.nextID()
+	req.done = make(chan adminResult, 1)
 
 	select {
 	case <-ctx.Done():
@@ -1317,9 +1372,17 @@ func (e *Engine) handleAdmin(req adminRequest) {
 		return
 	}
 
+	e.dispatchAdminAction(req)
+}
+
+func (e *Engine) dispatchAdminAction(req adminRequest) {
 	switch req.action {
 	case adminActionAddVoter:
 		e.handleAddVoter(req)
+	case adminActionAddLearner:
+		e.handleAddLearner(req)
+	case adminActionPromoteLearner:
+		e.handlePromoteLearner(req)
 	case adminActionRemoveServer:
 		e.handleRemoveServer(req)
 	case adminActionTransferLeadership:
@@ -1330,14 +1393,67 @@ func (e *Engine) handleAdmin(req adminRequest) {
 }
 
 func (e *Engine) handleAddVoter(req adminRequest) {
-	contextBytes, err := encodeConfChangeContext(req.id, req.peer)
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, req.peer)
+}
+
+// handleAddLearner submits a ConfChangeAddLearnerNode for a fresh
+// non-voting peer. It runs on the single-threaded admin loop.
+func (e *Engine) handleAddLearner(req adminRequest) {
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddLearnerNode, req.peer)
+}
+
+// handlePromoteLearner promotes an existing learner to voter via
+// ConfChangeAddNode. The two preconditions both run synchronously
+// here, before the propose, so a failed precondition does not enter
+// the log:
+//  1. the peer must currently be a learner (in ConfState.Learners,
+//     not in ConfState.Voters);
+//  2. when minAppliedIndex is non-zero, the leader-side
+//     Progress[nodeID].Match must already be >= minAppliedIndex.
+func (e *Engine) handlePromoteLearner(req adminRequest) {
+	peer, ok := e.peerForID(req.peer.ID)
+	if !ok {
+		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
+		return
+	}
+	e.mu.RLock()
+	isLearner := e.isLearnerNode[peer.NodeID]
+	e.mu.RUnlock()
+	if !isLearner {
+		req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotLearner, "id=%q", req.peer.ID)}
+		return
+	}
+	if req.minAppliedIndex != 0 {
+		// rawNode.Status() is safe here: handlePromoteLearner runs on
+		// the same goroutine that owns rawNode, so no clone or lock
+		// is required.
+		status := e.rawNode.Status()
+		progress, ok := status.Progress[peer.NodeID]
+		if !ok {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNoProgress, "id=%q node=%d", peer.ID, peer.NodeID)}
+			return
+		}
+		if progress.Match < req.minAppliedIndex {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotCaughtUp, "id=%q match=%d want>=%d", peer.ID, progress.Match, req.minAppliedIndex)}
+			return
+		}
+	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, peer)
+}
+
+// proposeMembershipChange wraps the encode + storePendingConfig +
+// ProposeConfChange dance shared by AddVoter / AddLearner /
+// PromoteLearner. The caller has already validated the leader and
+// prevIndex preconditions in handleAdmin.
+func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}
 		return
 	}
 	cc := raftpb.ConfChange{
-		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  req.peer.NodeID,
+		Type:    changeType,
+		NodeID:  peer.NodeID,
 		Context: contextBytes,
 	}
 	if err := e.storePendingConfig(req); err != nil {
@@ -3221,9 +3337,7 @@ func (e *Engine) removePeer(nodeID uint64) {
 	}
 
 	e.mu.Lock()
-	if _, ok := e.peers[nodeID]; ok {
-		delete(e.peers, nodeID)
-	}
+	delete(e.peers, nodeID)
 	// e.voterCount has already been refreshed for the post-change
 	// ConfState by refreshVoterCache earlier in the apply iteration
 	// (see applyConfigChange / applyConfigChangeV2). The ack tracker
