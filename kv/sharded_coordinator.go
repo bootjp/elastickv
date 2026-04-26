@@ -750,11 +750,11 @@ func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 }
 
 func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	g, ok := c.groupForKey(key)
+	routeID, g, ok := c.routeAndGroupForKey(key)
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeReadKey(key)
+	c.observeRead(routeID, len(key))
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
@@ -772,11 +772,11 @@ func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 // Each group maintains its own lease since each group has independent
 // leadership and term.
 func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	g, ok := c.groupForKey(key)
+	routeID, g, ok := c.routeAndGroupForKey(key)
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeReadKey(key)
+	c.observeRead(routeID, len(key))
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
@@ -836,6 +836,24 @@ func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 	}
 	g, ok := c.groups[route.GroupID]
 	return g, ok
+}
+
+// routeAndGroupForKey is groupForKey + the resolved RouteID. Read
+// entry points that observe into keyviz call this so the GetRoute
+// lookup runs once instead of twice (Gemini round-1 nit on PR #661).
+// Leadership-only callers (IsLeaderForKey / VerifyLeaderForKey /
+// RaftLeaderForKey) keep using groupForKey because they don't need
+// the route ID.
+func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
+	route, ok := c.engine.GetRoute(routeKey(key))
+	if !ok {
+		return 0, nil, false
+	}
+	g, ok := c.groups[route.GroupID]
+	if !ok {
+		return 0, nil, false
+	}
+	return route.RouteID, g, true
 }
 
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
@@ -990,29 +1008,26 @@ func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	c.sampler.Observe(routeID, keyviz.OpWrite, len(mut.Key), len(mut.Value))
 }
 
-// observeReadKey records a single linearizable / lease read against
-// the route that owns key. valueLen is always 0 here — the consistency
-// check at this layer doesn't fetch data; the actual GetAt on the
-// store happens further down the stack and isn't observed yet.
+// observeRead records a single linearizable / lease read against the
+// route. valueLen is always 0 here — the consistency check at this
+// layer doesn't fetch data; the actual GetAt on the store happens
+// further down the stack and isn't observed yet.
 //
-// Caller must have already passed groupForKey(key) so the GetRoute
-// lookup almost always hits in the table — keeping it inside this
-// helper keeps observeReadKey nil-safe at the lookup level too:
-// keyviz disabled → single branch, no map lookup.
+// Callers MUST pass an already-resolved routeID (via
+// routeAndGroupForKey) so the GetRoute lookup runs once across the
+// dispatch path — repeating it here just to compute routeID would
+// double the per-read overhead when sampling is enabled
+// (Gemini round-1 nit on PR #661).
 //
 // Adapter-direct read paths (Redis / DynamoDB / S3 hitting
 // MVCCStore.GetAt without going through the coordinator) still
 // bypass keyviz; sampling those is task B in the design's Phase 2
 // follow-up.
-func (c *ShardedCoordinator) observeReadKey(key []byte) {
+func (c *ShardedCoordinator) observeRead(routeID uint64, keyLen int) {
 	if c.sampler == nil {
 		return
 	}
-	route, ok := c.engine.GetRoute(routeKey(key))
-	if !ok {
-		return
-	}
-	c.sampler.Observe(route.RouteID, keyviz.OpRead, len(key), 0)
+	c.sampler.Observe(routeID, keyviz.OpRead, keyLen, 0)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
