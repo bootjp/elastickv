@@ -11,9 +11,8 @@ export function SqsListPage() {
         <div>
           <h1 className="text-xl font-semibold">SQS queues</h1>
           <p className="text-xs text-muted">
-            Backed by the SigV4-bypass admin entrypoints in
-            <code className="font-mono ml-1">adapter/sqs_admin.go</code>.
-            Detail pages show the new approximate counters from Phase 3.A.
+            List, describe, and delete SQS queues. Detail pages also surface
+            the approximate visible / in-flight / delayed message counts.
           </p>
         </div>
         <button type="button" className="btn-secondary" onClick={queues.reload}>

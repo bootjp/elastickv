@@ -213,8 +213,21 @@ func translateAdminQueuesError(err error) error {
 		return admin.ErrQueuesNotFound
 	case errors.Is(err, adapter.ErrAdminSQSValidation):
 		return admin.ErrQueuesValidation
+	case isLeaderChurnError(err):
+		// Leadership can be lost between AdminDeleteQueue's upfront
+		// isVerifiedSQSLeader check and the coordinator dispatch
+		// inside deleteQueueWithRetry. The kv coordinator surfaces
+		// that as ErrLeaderNotFound / ErrNotLeader (or a wrapped
+		// "not leader" / "leader not found" suffix), and the
+		// retry loop's isRetryableTransactWriteError does not catch
+		// them. Without this arm the error falls to default and the
+		// admin handler renders a generic 500 — Codex P2 + Claude
+		// P1 on PR #670 confirmed the gap. Mirrors the same arm in
+		// translateAdminTablesError that fixed this for Dynamo on
+		// PR #634.
+		return admin.ErrQueuesNotLeader
 	default:
-		return err
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
 }
 
