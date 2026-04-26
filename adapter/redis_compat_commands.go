@@ -23,12 +23,23 @@ import (
 )
 
 const (
-	redisPairWidth       = 2
-	redisTripletWidth    = 3
-	pubsubPatternArgMin  = 3
-	pubsubFirstChannel   = 2
-	redisBusyPollBackoff = 10 * time.Millisecond
-	redisKeywordCount    = "COUNT"
+	redisPairWidth      = 2
+	redisTripletWidth   = 3
+	pubsubPatternArgMin = 3
+	pubsubFirstChannel  = 2
+	// redisBlockWaitFallback is the safety-net poll interval that fires
+	// in blocking-command wait loops (XREAD BLOCK, BZPOPMIN — and the
+	// future BLPOP / BRPOP / BLMOVE) when no in-process write signal
+	// arrives. The signal path covers all in-process XADD / ZADD /
+	// ZINCRBY on the same node; the fallback covers paths that bypass
+	// Signal (Lua flush, follower-applied entries — both addressed by
+	// the FSM ApplyObserver follow-up tracked in
+	// docs/design/2026_04_26_proposed_fsm_apply_observer.md).
+	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
+	// busy-poll, while bounding stale-poll latency to a value clients
+	// already tolerate from network round-trips.
+	redisBlockWaitFallback = 100 * time.Millisecond
+	redisKeywordCount      = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set
 	// wide-column mutation slice beyond the per-member elements: one for the
@@ -2042,7 +2053,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 		if err != nil {
 			return err
 		}
@@ -2497,7 +2508,7 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 		// return hit=true with an empty result -- that is the correct
 		// Redis answer and saves the slow-path round-trip. Otherwise
 		// fall back so the slow path can produce WRONGTYPE.
-		typ, typErr := r.keyTypeAt(ctx, key, readTS)
+		typ, typErr := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 		if typErr != nil {
 			return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(typErr)
 		}
@@ -2524,7 +2535,7 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 // hgetSlow falls back to the type-probing path when hashFieldFastLookup
 // misses. Handles legacy-blob hashes and nil / WRONGTYPE disambiguation.
 func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2555,7 +2566,7 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2669,7 +2680,7 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -2792,7 +2803,7 @@ func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte
 }
 
 func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2822,7 +2833,7 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2941,7 +2952,7 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -3040,7 +3051,7 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -3262,7 +3273,7 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3319,20 +3330,41 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key)
+}
+
+// dispatchAndSignalZSet dispatches the elems through the coordinator
+// and, on success, wakes any BZPOPMIN waiter on the same node.
+// coordinator.Dispatch blocks until the FSM applies locally, so by
+// the time Signal fires the new members are visible at the readTS
+// the woken waiter will pick on its next iteration. Pulled out of
+// zaddTxn / zincrbyTxn so the parents stay under the cyclop budget
+// — the signal step would otherwise add an extra branch on the
+// dispatch error path.
+func (r *RedisServer) dispatchAndSignalZSet(
+	ctx context.Context,
+	readTS, commitTS uint64,
+	elems []*kv.Elem[kv.OP],
+	zsetKey []byte,
+) error {
+	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
-	return added, cockerrors.WithStack(dispatchErr)
+	if err != nil {
+		return cockerrors.WithStack(err)
+	}
+	r.zsetWaiters.Signal(zsetKey)
+	return nil
 }
 
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3377,13 +3409,10 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 			Value: deltaVal,
 		})
 	}
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
-		CommitTS: commitTS,
-		Elems:    elems,
-	})
-	return newScore, cockerrors.WithStack(dispatchErr)
+	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key); err != nil {
+		return 0, err
+	}
+	return newScore, nil
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
@@ -3502,7 +3531,7 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, opts zrangeOptions) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -3542,7 +3571,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3590,7 +3619,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3627,7 +3656,7 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3718,29 +3747,93 @@ func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSeconds * float64(time.Second)))
 
-	for {
-		for _, key := range cmd.Args[1 : len(cmd.Args)-1] {
-			result, err := r.tryBZPopMin(key)
-			if err != nil {
-				conn.WriteError(err.Error())
-				return
-			}
-			if result == nil {
-				continue
-			}
+	keys := cmd.Args[1 : len(cmd.Args)-1]
+	r.bzpopminWaitLoop(conn, keys, deadline)
+}
 
-			conn.WriteArray(redisTripletWidth)
-			conn.WriteBulk(result.key)
-			conn.WriteBulkString(result.entry.Member)
-			conn.WriteBulkString(formatRedisFloat(result.entry.Score))
+// bzpopminWaitLoop runs the BLOCK-window wait loop. Extracted from
+// bzpopmin so the parent function stays under the cyclop budget.
+// Uses an event-driven signal from the in-process ZADD / ZINCRBY
+// path with a fallback timer for paths that bypass the signal.
+//
+// Registration happens BEFORE the first tryBZPopMin so a signal that
+// fires between the check and the wait cannot be lost: the buffered
+// channel holds it, and the next select wakes immediately.
+func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline time.Time) {
+	handlerCtx := r.handlerContext()
+	w, release := r.zsetWaiters.Register(keys)
+	defer release()
+	for {
+		if handlerCtx.Err() != nil {
+			conn.WriteNull()
 			return
 		}
-
+		if r.bzpopminTryAllKeys(conn, keys) {
+			return
+		}
 		if !time.Now().Before(deadline) {
 			conn.WriteNull()
 			return
 		}
-		time.Sleep(redisBusyPollBackoff)
+		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
+	}
+}
+
+// bzpopminTryAllKeys runs one tryBZPopMin pass across keys. Returns
+// true when a result was written (success or terminal error) and the
+// caller should stop the loop, false to continue waiting.
+func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte) bool {
+	for _, key := range keys {
+		result, err := r.tryBZPopMin(key)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return true
+		}
+		if result == nil {
+			continue
+		}
+		conn.WriteArray(redisTripletWidth)
+		conn.WriteBulk(result.key)
+		conn.WriteBulkString(result.entry.Member)
+		conn.WriteBulkString(formatRedisFloat(result.entry.Score))
+		return true
+	}
+	return false
+}
+
+// waitForBlockedCommandUpdate blocks until one of: a write signal
+// arrives, the fallback poll tick fires, the parent handlerCtx is
+// cancelled, or the BLOCK deadline elapses — whichever happens first.
+// The fallback bounds latency for write paths that do not signal (Lua
+// flush, follower-applied entries); it cannot exceed the remaining
+// BLOCK window so the deadline branch in the caller's loop top always
+// gets a chance to fire when the BLOCK expires. Shared by every
+// blocking-command wait loop (XREAD BLOCK, BZPOPMIN today; BLPOP /
+// BRPOP / BLMOVE in follow-ups) — the keyWaiterRegistry that produces
+// waiterC is per-domain (streamWaiters vs zsetWaiters), but the
+// timer-and-select shape is identical.
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
+	fallback := redisBlockWaitFallback
+	if remaining := time.Until(deadline); remaining < fallback {
+		fallback = remaining
+	}
+	timer := time.NewTimer(fallback)
+	defer func() {
+		if !timer.Stop() {
+			// The timer either fired (its case won and the channel
+			// was drained inline by select) or is still buffering
+			// the tick (waiter / handlerCtx won the race); drain
+			// the channel non-blocking so timer GC is clean.
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+	select {
+	case <-waiterC:
+	case <-timer.C:
+	case <-handlerCtx.Done():
 	}
 }
 
@@ -4013,7 +4106,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return "", err
 	}
@@ -4071,7 +4164,28 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
-	return id, r.dispatchElems(ctx, true, readTS, elems)
+	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+}
+
+// dispatchAndSignalStream dispatches the elems through the coordinator
+// and, on success, wakes any XREAD BLOCK waiter on the same node.
+// dispatchElems blocks until the FSM applies locally, so by the time
+// Signal fires the new entries are visible at the readTS the woken
+// waiter will pick on its next iteration. Pulled out of xaddTxn so the
+// parent function stays under the cyclop budget — the signal step
+// would otherwise add an extra branch on the dispatch error path.
+func (r *RedisServer) dispatchAndSignalStream(
+	ctx context.Context,
+	isTxn bool,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	streamKey []byte,
+) error {
+	if err := r.dispatchElems(ctx, isTxn, startTS, elems); err != nil {
+		return err
+	}
+	r.streamWaiters.Signal(streamKey)
+	return nil
 }
 
 // appendMaxLenZeroSelfDel handles the MAXLEN 0 edge case. The trim loop
@@ -4328,7 +4442,7 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 // store errors. Extracted from xtrimTxn so the outer function stays
 // within the cyclop budget.
 func (r *RedisServer) streamTypeForWrite(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return false, err
 	}
@@ -4554,7 +4668,7 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 // past a BLOCK-window cancel.
 func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return "", err
 	}
@@ -4606,7 +4720,7 @@ func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadR
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(ctx, key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {
 			return nil, err
 		}
@@ -4825,18 +4939,26 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	r.xreadBusyPoll(conn, req, deadline)
 }
 
-// xreadBusyPoll runs the BLOCK-window busy-poll loop. Extracted from xread
-// so the parent function stays under the cyclop budget.
+// xreadBusyPoll runs the BLOCK-window wait loop. Extracted from xread so
+// the parent function stays under the cyclop budget. Uses an event-driven
+// signal from the in-process XADD path with a fallback timer for paths
+// that bypass the signal (Lua flush, follower-side FSM apply).
+//
+// Registration happens BEFORE the first xreadOnce so a signal that fires
+// between the check and the wait cannot be lost: the buffered channel
+// holds it, and the next select wakes immediately.
 func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline time.Time) {
 	handlerCtx := r.handlerContext()
+	w, release := r.streamWaiters.Register(req.keys)
+	defer release()
 	for {
 		// Server-shutdown short-circuit: if the parent handlerContext
-		// has been cancelled, abandon the busy-poll immediately rather
-		// than spin until the BLOCK deadline. iterCtx below is rooted
+		// has been cancelled, abandon the wait loop immediately rather
+		// than block until the BLOCK deadline. iterCtx below is rooted
 		// in handlerCtx, so it would cancel-on-call too — but routing
 		// through isXReadIterCtxError silently translates that into an
-		// empty iteration and the loop would burn CPU at
-		// redisBusyPollBackoff cadence until the deadline.
+		// empty iteration and the loop would otherwise wait at
+		// redisBlockWaitFallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
@@ -4888,7 +5010,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 			conn.WriteNull()
 			return
 		}
-		time.Sleep(redisBusyPollBackoff)
+		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
 	}
 }
 
@@ -4897,7 +5019,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -5001,7 +5123,7 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 	}
 
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return

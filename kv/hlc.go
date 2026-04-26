@@ -9,6 +9,15 @@ import (
 const hlcLogicalBits = 16
 const hlcLogicalMask uint64 = (1 << hlcLogicalBits) - 1
 
+// HLCLogicalBits is the number of low bits in an HLC timestamp
+// reserved for the in-memory logical counter (vs the upper bits
+// which encode the Raft-agreed wall-clock millis). Exported so
+// downstream tools — admin dashboard ISO-8601 formatting being the
+// motivating case — can recover the physical half without
+// hard-coding a magic number that silently drifts when the layout
+// changes (Claude Issue 4 on PR #658).
+const HLCLogicalBits = hlcLogicalBits
+
 // HLC implements a hybrid logical clock where the physical part is agreed upon
 // via Raft consensus and the logical counter is managed purely in memory.
 //

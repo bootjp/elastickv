@@ -314,6 +314,101 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 	return r.applyTTLFilter(ctx, key, readTS, typ)
 }
 
+// keyTypeAtExpect is a fast-path replacement for keyTypeAt callers that
+// know the type they expect to find. The slow path probes ~19 Pebble
+// seeks across every collection family before returning. The fast path:
+//
+//  1. Probe only the prefixes for `expected` (typically 2-3 seeks).
+//  2. On hit, run the same string-priority guard the wide-column
+//     fast-path callers use (hashFieldFastLookup, zsetMemberFastScore,
+//     setMemberFastExists, hashFieldFastExists). When a redisStrKey
+//     row also exists at the same user key, fall back to the slow
+//     path so the rawKeyTypeAt "string wins" tiebreaker fires and
+//     the caller gets WRONGTYPE / nil instead of the
+//     collection-specific answer. The guard is the narrow form (see
+//     hasHigherPriorityStringEncoding's doc comment): only redisStrKey
+//     is checked, the rarer HLL / legacy-bare-key dual-encoding cases
+//     remain a known residual risk shared with the other fast-path
+//     callers.
+//  3. On miss, fall back to the full keyTypeAt slow path so that
+//     wrongType collisions (the key exists under a different type)
+//     still surface as the correct redisValueType.
+//
+// Steady-state production: most XADD/XREAD/HSET/etc. calls are on a key
+// of the expected type, so step 1 hits and the slow-path 19 seeks shrink
+// to 2-3 (plus the priority-guard ExistsAt). The slow path stays in
+// place for first-write and wrongType cases, which keep their existing
+// semantics — wrongTypeError detection is preserved by the
+// fall-through.
+func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
+	if expected == redisTypeNone {
+		return r.keyTypeAt(ctx, key, readTS)
+	}
+	found, err := r.probeExpectedType(ctx, key, readTS, expected)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if !found {
+		return r.keyTypeAt(ctx, key, readTS)
+	}
+	if expected != redisTypeString {
+		higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS)
+		if hErr != nil {
+			return redisTypeNone, hErr
+		}
+		if higher {
+			return r.keyTypeAt(ctx, key, readTS)
+		}
+	}
+	return r.applyTTLFilter(ctx, key, readTS, expected)
+}
+
+// probeExpectedType issues only the prefix probes for the given type.
+// It is intentionally conservative: returning false here means "no row
+// of the expected type was visible at readTS", not "the key does not
+// exist". Callers that need strict "does any value type exist for this
+// key" semantics must take the keyTypeAt slow path; keyTypeAtExpect
+// composes both.
+func (r *RedisServer) probeExpectedType(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (bool, error) {
+	switch expected {
+	case redisTypeString:
+		_, found, err := r.probeStringTypes(ctx, key, readTS)
+		return found, err
+	case redisTypeList:
+		_, found, err := r.probeListType(ctx, key, readTS)
+		return found, err
+	case redisTypeHash:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix)
+	case redisTypeSet:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix)
+	case redisTypeZSet:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix)
+	case redisTypeStream:
+		return r.probeStreamExists(ctx, key, readTS)
+	case redisTypeNone:
+		// Caller already short-circuited.
+		return false, nil
+	}
+	return false, nil
+}
+
+// probeStreamExists checks whether a stream is present at readTS in
+// either the new entry-per-key meta layout or the legacy single-blob
+// encoding. Two ExistsAt seeks worst-case; one when the new layout is
+// present (the common case post-#620 migration).
+func (r *RedisServer) probeStreamExists(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	if exists, err := r.store.ExistsAt(ctx, store.StreamMetaKey(key), readTS); err != nil {
+		return false, errors.WithStack(err)
+	} else if exists {
+		return true, nil
+	}
+	exists, err := r.store.ExistsAt(ctx, redisStreamKey(key), readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
+}
+
 // applyTTLFilter takes a raw (TTL-unaware) type and returns the
 // TTL-filtered equivalent. Callers that need BOTH the raw and filtered
 // types (SET NX/XX/GET against a possibly-expired key) can reuse a

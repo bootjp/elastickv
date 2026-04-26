@@ -154,6 +154,20 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// pickSqsProtocol decides between the JSON path (X-Amz-Target +
+	// JSON body, the existing default) and the query path (form-
+	// encoded body, XML response) on a per-request basis. See
+	// docs/design/2026_04_26_proposed_sqs_query_protocol.md for the
+	// detection rules.
+	if pickSqsProtocol(r) == sqsProtocolQuery {
+		s.handleQueryProtocol(w, r)
+		return
+	}
+	// JSON / Unknown both fall through to the JSON path: the JSON-
+	// style 400 is the most informative error for a client that
+	// has not picked a codec yet (§3 of the design doc). The
+	// dispatch table below stays the single decision point.
+
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeSQSError(w, http.StatusMethodNotAllowed, sqsErrMalformedRequest, "SQS JSON protocol requires POST")
@@ -172,6 +186,27 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	handler(w, r)
+}
+
+// handleQueryProtocol owns the query-protocol leg of handle(): method
+// gating, SigV4 authorisation against the form body, and dispatch
+// into per-verb handlers. Pulled out of handle() so the dispatcher
+// stays under cyclop=10 even as more wire formats are added.
+func (s *SQSServer) handleQueryProtocol(w http.ResponseWriter, r *http.Request) {
+	// GET is legal for query (some legacy ListQueues callers).
+	// POST is the common case. Anything else (PUT/DELETE) is
+	// outside the SQS surface entirely.
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		writeSQSQueryError(w, newSQSAPIError(http.StatusMethodNotAllowed, sqsErrMalformedRequest,
+			"SQS query protocol requires GET or POST"))
+		return
+	}
+	if authErr := s.authorizeSQSRequest(r); authErr != nil {
+		writeSQSQueryError(w, newSQSAPIError(authErr.Status, authErr.Code, authErr.Message))
+		return
+	}
+	s.handleQuery(w, r)
 }
 
 func (s *SQSServer) serveHealthz(w http.ResponseWriter, r *http.Request) bool {

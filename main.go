@@ -135,6 +135,7 @@ var (
 	keyvizStep                   = flag.Duration("keyvizStep", keyviz.DefaultStep, "Flush interval / matrix-column resolution for the keyviz sampler")
 	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
+	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 )
 
 const adminTokenMaxBytes = 4 << 10
@@ -763,7 +764,7 @@ func startServers(in serversInput) error {
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, in.coordinate, connCache); err != nil {
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1302,6 +1303,18 @@ type runtimeServerRunner struct {
 	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
 
+	// s3Server is the parallel field for the S3 admin endpoints
+	// (read-only in this slice). Nil when --s3Address is empty,
+	// in which case the admin handler answers /s3/buckets* with
+	// 404, mirroring the dynamoServer == nil contract.
+	s3Server *adapter.S3Server
+
+	// sqsServer plays the same role for the SQS admin entrypoints
+	// (adapter/sqs_admin.go). Nil when --sqsAddress is empty; the
+	// admin listener then leaves /admin/api/v1/sqs/* off the wire
+	// (the mux 404s those paths).
+	sqsServer *adapter.SQSServer
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1350,12 +1363,16 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
+	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
+	r.s3Server = s3Server
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
+	r.sqsServer = sqsServer
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
@@ -1376,6 +1393,7 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 	}
 	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
 		Step:                   *keyvizStep,
+		HistoryColumns:         *keyvizHistoryColumns,
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 	})
@@ -1411,9 +1429,13 @@ func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 // startKeyVizFlusher launches RunFlusher in the supplied errgroup
 // and harvests the in-progress step with a final Flush after the
 // goroutine returns, so a graceful shutdown does not lose the most
-// recent partial column. Nil-safe: a disabled sampler reduces the
-// goroutine to ctx-wait + a no-op Flush.
+// recent partial column. Skip the goroutine entirely when the
+// sampler is disabled — RunFlusher would just park on ctx.Done with
+// no work to do, which is a free goroutine but adds no signal.
 func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
+	if s == nil {
+		return
+	}
 	eg.Go(func() error {
 		keyviz.RunFlusher(ctx, s, s.Step())
 		s.Flush()

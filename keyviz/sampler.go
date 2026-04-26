@@ -82,6 +82,15 @@ const (
 	DefaultMaxMemberRoutesPerSlot = 256
 )
 
+// MaxHistoryColumns is the upper bound on opts.HistoryColumns. The
+// ring buffer pre-allocates a slice of capacity HistoryColumns at
+// construction; misconfiguration (e.g. an operator typo of
+// 100_000_000) would otherwise reserve gigabytes up front. 100 000
+// columns at the default 60s Step is ~70 days of history — longer
+// retention is the Phase 3 persistence path's job, not the in-memory
+// ring's.
+const MaxHistoryColumns = 100_000
+
 // MemSamplerOptions configures NewMemSampler. Zero values fall back to
 // the Default* constants above; passing a struct literal with only the
 // fields you care about is the expected call style.
@@ -234,11 +243,16 @@ type routeSlot struct {
 	// routes together (Snapshot surfaces this in MatrixRow).
 	Aggregate    bool
 	MemberRoutes []uint64
-	// MemberRoutesTotal counts every distinct routeID that has folded
-	// into this bucket, including ones beyond MaxMemberRoutesPerSlot
-	// (which still contribute to the counters but are not appended to
-	// MemberRoutes). Always equals len(MemberRoutes) for individual
-	// (non-Aggregate) slots.
+	// hiddenMembers stores routeIDs folded past
+	// MaxMemberRoutesPerSlot. Used to dedup re-folds (so
+	// MemberRoutesTotal doesn't drift on remove+re-register churn for
+	// past-cap routes) and to drive accurate decrements in
+	// pruneMemberRoute. nil for individual slots.
+	hiddenMembers map[uint64]struct{}
+	// MemberRoutesTotal is len(MemberRoutes) + len(hiddenMembers) — the
+	// authoritative count of distinct routes folded into this bucket.
+	// Always equals len(MemberRoutes) for individual (non-Aggregate)
+	// slots.
 	MemberRoutesTotal uint64
 
 	reads      atomic.Uint64
@@ -302,6 +316,9 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	}
 	if opts.HistoryColumns <= 0 {
 		opts.HistoryColumns = DefaultHistoryColumns
+	}
+	if opts.HistoryColumns > MaxHistoryColumns {
+		opts.HistoryColumns = MaxHistoryColumns
 	}
 	if opts.MaxTrackedRoutes <= 0 {
 		opts.MaxTrackedRoutes = DefaultMaxTrackedRoutes
@@ -463,16 +480,12 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 // to preserve Flush's key-order contract.
 //
 // MemberRoutes growth is capped by MaxMemberRoutesPerSlot — beyond
-// that cap the bucket counters still absorb the route's traffic, but
-// the routeID is not added to the visible member list.
+// that cap the bucket counters still absorb the route's traffic and
+// the routeID is recorded in hiddenMembers (so dedup is correct on
+// rejoin) but not appended to the visible MemberRoutes list.
 func (s *MemSampler) foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
 	bucket.metaMu.Lock()
-	if !memberRoutesContains(bucket.MemberRoutes, routeID) {
-		bucket.MemberRoutesTotal++
-		if len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
-			bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
-		}
-	}
+	addMemberToBucket(bucket, routeID, s.opts.MaxMemberRoutesPerSlot)
 	if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
 		bucket.End = cloneBytes(end)
 	}
@@ -484,6 +497,31 @@ func (s *MemSampler) foldIntoBucket(next *routeTable, bucket *routeSlot, routeID
 	if startLowered {
 		next.sortedSlots = rebuildSorted(next)
 	}
+}
+
+// addMemberToBucket records routeID against bucket, choosing the
+// visible MemberRoutes list when there's room and falling back to
+// the hiddenMembers set past the cap. Both lists are deduped so a
+// rejoin during the prune grace doesn't inflate MemberRoutesTotal.
+// Caller holds bucket.metaMu.
+func addMemberToBucket(bucket *routeSlot, routeID uint64, visibleCap int) {
+	if memberRoutesContains(bucket.MemberRoutes, routeID) {
+		return
+	}
+	if bucket.hiddenMembers != nil {
+		if _, ok := bucket.hiddenMembers[routeID]; ok {
+			return
+		}
+	}
+	if len(bucket.MemberRoutes) < visibleCap {
+		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+	} else {
+		if bucket.hiddenMembers == nil {
+			bucket.hiddenMembers = make(map[uint64]struct{})
+		}
+		bucket.hiddenMembers[routeID] = struct{}{}
+	}
+	bucket.MemberRoutesTotal++
 }
 
 // RemoveRoute drops a RouteID from tracking. Counts accumulated since
@@ -727,12 +765,13 @@ func bucketStillReferenced(virtualForRoute map[uint64]*routeSlot, bucket *routeS
 	return false
 }
 
-// pruneMemberRoute removes routeID from bucket.MemberRoutes under the
-// bucket's metaMu so a concurrent snapshotMeta reader sees a
-// consistent view. MemberRoutesTotal is decremented when the routeID
-// was visible in MemberRoutes (the only case we can confidently
-// account for) — routes pruned past the visible cap stay in the
-// total because we don't track individual past-cap members.
+// pruneMemberRoute removes routeID from bucket.MemberRoutes (or
+// hiddenMembers) under the bucket's metaMu so a concurrent
+// snapshotMeta reader sees a consistent view. MemberRoutesTotal is
+// decremented whenever the routeID was actually present in either
+// list — including past-cap members in hiddenMembers — so the
+// reported route_count stays truthful across remove/re-register
+// churn.
 func pruneMemberRoute(bucket *routeSlot, routeID uint64) {
 	bucket.metaMu.Lock()
 	defer bucket.metaMu.Unlock()
@@ -746,6 +785,15 @@ func pruneMemberRoute(bucket *routeSlot, routeID uint64) {
 		filtered = append(filtered, m)
 	}
 	bucket.MemberRoutes = filtered
+	if !removed && bucket.hiddenMembers != nil {
+		if _, ok := bucket.hiddenMembers[routeID]; ok {
+			delete(bucket.hiddenMembers, routeID)
+			if len(bucket.hiddenMembers) == 0 {
+				bucket.hiddenMembers = nil
+			}
+			removed = true
+		}
+	}
 	if removed && bucket.MemberRoutesTotal > 0 {
 		bucket.MemberRoutesTotal--
 	}
@@ -760,6 +808,17 @@ func (s *MemSampler) Step() time.Duration {
 		return DefaultStep
 	}
 	return s.opts.Step
+}
+
+// HistoryColumns returns the configured ring-buffer length after
+// applying defaults and the MaxHistoryColumns clamp. Wiring tests use
+// this to verify --keyvizHistoryColumns is forwarded end-to-end
+// without exposing the internal opts struct.
+func (s *MemSampler) HistoryColumns() int {
+	if s == nil {
+		return DefaultHistoryColumns
+	}
+	return s.opts.HistoryColumns
 }
 
 // appendDrainedRow swaps the slot's counters to zero and appends a

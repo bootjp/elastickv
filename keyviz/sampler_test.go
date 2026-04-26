@@ -869,6 +869,31 @@ func TestNonPositiveOptionsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+// TestHistoryColumnsClampedAboveMax pins the upper bound on
+// HistoryColumns. The ring buffer pre-allocates a slice of capacity
+// HistoryColumns at construction; an operator typo (e.g.
+// 100_000_000) would otherwise reserve gigabytes up front. Confirm
+// that values above MaxHistoryColumns are silently clamped to
+// MaxHistoryColumns instead of trusted as-is.
+func TestHistoryColumnsClampedAboveMax(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:           time.Second,
+		HistoryColumns: MaxHistoryColumns * 10,
+	})
+	if s.opts.HistoryColumns != MaxHistoryColumns {
+		t.Fatalf("HistoryColumns clamp = %d, want %d", s.opts.HistoryColumns, MaxHistoryColumns)
+	}
+	// At the cap exactly: preserved.
+	s2, _ := newTestSampler(t, MemSamplerOptions{
+		Step:           time.Second,
+		HistoryColumns: MaxHistoryColumns,
+	})
+	if s2.opts.HistoryColumns != MaxHistoryColumns {
+		t.Fatalf("HistoryColumns at cap = %d, want %d", s2.opts.HistoryColumns, MaxHistoryColumns)
+	}
+}
+
 // TestStepAccessor pins the Step() accessor contract: returns the
 // configured Step (after defaulting) for a constructed sampler, and
 // returns DefaultStep for a typed nil so callers wiring RunFlusher
@@ -916,6 +941,94 @@ func TestMemberRoutesCappedAtConfiguredCap(t *testing.T) {
 	if agg.Reads != 8 {
 		t.Fatalf("bucket Reads = %d, want 8 (counters must absorb traffic past cap)", agg.Reads)
 	}
+	if agg.MemberRoutesTotal != 8 {
+		t.Fatalf("MemberRoutesTotal = %d, want 8 (true count of contributors past cap)", agg.MemberRoutesTotal)
+	}
+}
+
+// TestPastCapMemberRejoinDoesNotInflateTotal pins Codex round-2 P2
+// on PR #646: re-registering a hidden (past-cap) routeID inside the
+// prune grace must not double-count MemberRoutesTotal. The hidden
+// member set serves as dedup so route_count stays truthful across
+// remove/re-register churn for routes the visible MemberRoutes list
+// never carried.
+func TestPastCapMemberRejoinDoesNotInflateTotal(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:                   time.Second,
+		HistoryColumns:         4,
+		MaxTrackedRoutes:       1,
+		MaxMemberRoutesPerSlot: 1, // visible cap=1; routes 3+4 land in hidden set
+	})
+	mustRegister(t, s, 1, "a", "b")
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 should fold (visible)")
+	}
+	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+		t.Fatal("route 3 should fold (hidden — past cap)")
+	}
+	if s.RegisterRoute(4, []byte("g"), []byte("h")) {
+		t.Fatal("route 4 should fold (hidden — past cap)")
+	}
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+	beforeTotal := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
+	if beforeTotal != 3 {
+		t.Fatalf("baseline MemberRoutesTotal = %d, want 3", beforeTotal)
+	}
+	// Remove the past-cap route 3 and re-register it inside the prune
+	// grace. Without the hidden-member dedup foldIntoBucket would
+	// increment MemberRoutesTotal again, drifting route_count up.
+	s.RemoveRoute(3)
+	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+		t.Fatal("route 3 should fold again")
+	}
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+	afterTotal := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
+	if afterTotal != 3 {
+		t.Fatalf("after remove+re-register, MemberRoutesTotal = %d, want 3 (no drift)", afterTotal)
+	}
+}
+
+// TestPastCapMemberPruneDecrementsTotal pins the other half of Codex
+// round-2 P2: when grace expires for a hidden (past-cap) member, the
+// prune must decrement MemberRoutesTotal — otherwise route_count
+// stays inflated even after the route is fully retired.
+func TestPastCapMemberPruneDecrementsTotal(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{
+		Step:                   time.Second,
+		HistoryColumns:         8,
+		MaxTrackedRoutes:       1,
+		MaxMemberRoutesPerSlot: 1,
+	})
+	mustRegister(t, s, 1, "a", "b")
+	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+		t.Fatal("route 2 should fold (visible)")
+	}
+	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+		t.Fatal("route 3 should fold (hidden — past cap)")
+	}
+	s.Observe(2, OpRead, 0, 0)
+	s.Flush()
+	require := func(want uint64, ctx string) {
+		t.Helper()
+		s.Observe(2, OpRead, 0, 0)
+		s.Flush()
+		got := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
+		if got != want {
+			t.Fatalf("%s: MemberRoutesTotal = %d, want %d", ctx, got, want)
+		}
+	}
+	require(2, "baseline")
+	s.RemoveRoute(3) // hidden member — pendingPrune queued
+	clk.Advance(s.graceWindow() + time.Second)
+	// First flush past grace: drains the bucket (snapshot still
+	// shows Total=2) THEN fires the pending prune. The next flush is
+	// the first one whose drain reflects the post-prune state.
+	require(2, "drain runs before prune fires")
+	require(1, "after past-cap prune fires")
 }
 
 // TestRetiredTailClearedAfterDrop pins Codex round-7 P2: after a

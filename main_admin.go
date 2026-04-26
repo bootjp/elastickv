@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -74,8 +75,11 @@ func startAdminFromFlags(
 	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
+	s3Server *adapter.S3Server,
+	sqsServer *adapter.SQSServer,
 	coordinate kv.Coordinator,
 	connCache *kv.GRPCConnCache,
+	keyvizSampler *keyviz.MemSampler,
 ) error {
 	if !*adminEnabled {
 		return nil
@@ -117,12 +121,123 @@ func startAdminFromFlags(
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
 	tablesSrc := newDynamoTablesSource(dynamoServer)
+	bucketsSrc := newBucketsSource(s3Server)
+	queuesSrc := newSqsQueuesSource(sqsServer)
 	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, forwarder, buildVersion())
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, keyvizSampler, buildVersion())
 	return err
+}
+
+// newSqsQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
+// Same architectural reasoning as newDynamoTablesSource and
+// newBucketsSource: the bridge stays in this file (rather than
+// internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree. Returns nil when sqsServer is nil
+// so admin.NewServer leaves /admin/api/v1/sqs/* off the wire.
+func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
+	if sqsServer == nil {
+		return nil
+	}
+	return &sqsQueuesBridge{server: sqsServer}
+}
+
+// sqsQueuesBridge re-shapes adapter.AdminQueueSummary into
+// admin.QueueSummary. The two structs are deliberately isomorphic so
+// this translation does no allocation more than necessary; if a
+// future field is added on one side, the build breaks here, which
+// is the drift signal we want.
+type sqsQueuesBridge struct {
+	server *adapter.SQSServer
+}
+
+func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error) {
+	return b.server.AdminListQueues(ctx) //nolint:wrapcheck // pure pass-through; adapter owns the error context.
+}
+
+func (b *sqsQueuesBridge) AdminDescribeQueue(ctx context.Context, name string) (*admin.QueueSummary, bool, error) {
+	summary, exists, err := b.server.AdminDescribeQueue(ctx, name)
+	if err != nil {
+		return nil, false, translateAdminQueuesError(err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminQueueSummary(summary), true, nil
+}
+
+func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteQueue(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
+// convertAdminQueueSummary mirrors adapter.AdminQueueSummary into
+// admin.QueueSummary. Counter fields are int64 on both sides; if
+// either side grows a field, this function should be extended in the
+// same commit so a compile error catches the drift.
+//
+// CreatedAt collapses a zero time.Time on the adapter side (queues
+// stored before CreatedAtMillis was populated, or never populated)
+// to a nil pointer on the admin side so omitempty actually drops the
+// field at the wire layer. Without this collapse the SPA would see
+// "0001-01-01T00:00:00Z" and render an ancient date.
+func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary {
+	if in == nil {
+		return nil
+	}
+	var createdAt *time.Time
+	if !in.CreatedAt.IsZero() {
+		t := in.CreatedAt
+		createdAt = &t
+	}
+	return &admin.QueueSummary{
+		Name:       in.Name,
+		IsFIFO:     in.IsFIFO,
+		Generation: in.Generation,
+		CreatedAt:  createdAt,
+		Attributes: in.Attributes,
+		Counters: admin.QueueCounters{
+			Visible:    in.Counters.Visible,
+			NotVisible: in.Counters.NotVisible,
+			Delayed:    in.Counters.Delayed,
+		},
+	}
+}
+
+// translateAdminQueuesError maps the adapter's SQS error vocabulary
+// onto the admin-package sentinels the SQS handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, matching the dynamo / s3 bridges' behaviour.
+func translateAdminQueuesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrQueuesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrQueuesNotLeader
+	case errors.Is(err, adapter.ErrAdminSQSNotFound):
+		return admin.ErrQueuesNotFound
+	case errors.Is(err, adapter.ErrAdminSQSValidation):
+		return admin.ErrQueuesValidation
+	case isLeaderChurnError(err):
+		// Leadership can be lost between AdminDeleteQueue's upfront
+		// isVerifiedSQSLeader check and the coordinator dispatch
+		// inside deleteQueueWithRetry. The kv coordinator surfaces
+		// that as ErrLeaderNotFound / ErrNotLeader (or a wrapped
+		// "not leader" / "leader not found" suffix), and the
+		// retry loop's isRetryableTransactWriteError does not catch
+		// them. Without this arm the error falls to default and the
+		// admin handler renders a generic 500. Mirrors the same arm
+		// in translateAdminTablesError on the Dynamo side.
+		return admin.ErrQueuesNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
 }
 
 // buildAdminLeaderForwarder constructs the production LeaderForwarder
@@ -165,6 +280,67 @@ func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSou
 		return nil
 	}
 	return &dynamoTablesBridge{server: dynamoServer}
+}
+
+// newBucketsSource is the S3 counterpart of newDynamoTablesSource.
+// Returns nil when s3Server is nil so a build that ships without the
+// S3 adapter (--s3Address empty) silently disables the
+// /admin/api/v1/s3/buckets routes.
+func newBucketsSource(s3Server *adapter.S3Server) admin.BucketsSource {
+	if s3Server == nil {
+		return nil
+	}
+	return &bucketsBridge{server: s3Server}
+}
+
+// bucketsBridge re-shapes the adapter's AdminBucketSummary DTO into
+// the admin package's BucketSummary, threading through the
+// (result, present, error) tuple semantics for the describe path.
+// CreatedAtHLC is formatted into the SPA's expected ISO-8601 string
+// here rather than in the adapter — formatting is a UI concern, not
+// a storage one.
+type bucketsBridge struct {
+	server *adapter.S3Server
+}
+
+func (b *bucketsBridge) AdminListBuckets(ctx context.Context) ([]admin.BucketSummary, error) {
+	rows, err := b.server.AdminListBuckets(ctx)
+	if err != nil {
+		// Wrap with the bridge frame so an operator debugging a 500
+		// from /admin/api/v1/s3/buckets sees the bridge in the error
+		// chain (Claude Issue 5 on PR #658). cockroachdb/errors
+		// already preserves the adapter's stack trace; this just
+		// adds the call-site context.
+		return nil, errors.Wrap(err, "admin buckets bridge: list")
+	}
+	out := make([]admin.BucketSummary, len(rows))
+	for i, r := range rows {
+		out[i] = bucketSummaryFromAdapter(r)
+	}
+	return out, nil
+}
+
+func (b *bucketsBridge) AdminDescribeBucket(ctx context.Context, name string) (*admin.BucketSummary, bool, error) {
+	row, exists, err := b.server.AdminDescribeBucket(ctx, name)
+	if err != nil {
+		return nil, false, errors.Wrapf(err, "admin buckets bridge: describe %q", name)
+	}
+	if !exists || row == nil {
+		return nil, false, nil
+	}
+	summary := bucketSummaryFromAdapter(*row)
+	return &summary, true, nil
+}
+
+func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {
+	return admin.BucketSummary{
+		Name:       in.Name,
+		ACL:        in.ACL,
+		CreatedAt:  admin.FormatBucketCreatedAt(in.CreatedAtHLC),
+		Generation: in.Generation,
+		Region:     in.Region,
+		Owner:      in.Owner,
+	}
 }
 
 // dynamoTablesBridge is the thin adapter that re-shapes the adapter's
@@ -384,7 +560,10 @@ func startAdminServer(
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
 	tables admin.TablesSource,
+	buckets admin.BucketsSource,
+	queues admin.QueuesSource,
 	forwarder admin.LeaderForwarder,
+	keyvizSampler *keyviz.MemSampler,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -392,7 +571,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, forwarder)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, keyvizSampler)
 	if err != nil {
 		return "", err
 	}
@@ -432,7 +611,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, forwarder admin.LeaderForwarder) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -456,7 +635,10 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
 		Tables:      tables,
+		Buckets:     buckets,
+		Queues:      queues,
 		Forwarder:   forwarder,
+		KeyViz:      keyvizSourceFromSampler(keyvizSampler),
 		StaticFS:    staticFS,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
@@ -574,6 +756,20 @@ func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
 		return v, nil
 	}
 	return strings.TrimSpace(flagValue), nil
+}
+
+// keyvizSourceFromSampler boxes a *keyviz.MemSampler into the
+// admin.KeyVizSource interface understood by ServerDeps. Returning a
+// nil interface (not a typed-nil) when the sampler is disabled is
+// load-bearing: the admin handler's "keyviz disabled → 503" branch
+// only fires on an interface-nil; a typed-nil *MemSampler stored as
+// a non-nil interface would silently return an empty matrix instead
+// of the explicit "feature off" signal the SPA expects.
+func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
+	if s == nil {
+		return nil
+	}
+	return s
 }
 
 // parseCSV splits a flag value like "a,b,c" into a slice with empty and

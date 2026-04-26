@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useId, useRef } from "react";
 import type { ReactNode } from "react";
 
 interface ModalProps {
@@ -15,11 +15,80 @@ interface ModalProps {
 // Lightweight modal: no portal, no animation library. shadcn/ui's
 // Dialog primitive would pull in @radix-ui/react-dialog (~10KB gzip)
 // and we only need a single confirmation/edit surface per page.
+//
+// Accessibility (per the WAI-ARIA Authoring Practices for dialogs):
+//   - role="dialog" + aria-modal="true" so AT announce the dialog
+//     and treat the rest of the page as inert.
+//   - aria-labelledby on the title <div> so the dialog is named.
+//   - Focus is moved into the dialog on open and restored to the
+//     previously-focused element on close.
+//   - Tab and Shift+Tab are wrapped to keep focus inside the dialog
+//     until it closes, so keyboard users cannot accidentally tab to
+//     the page underneath.
 export function Modal({ title, open, onClose, children, busy }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+  const titleId = useId();
+
+  // Focus capture / restore is tied to `open` ONLY. Folding `busy`
+  // into the same effect as the previous version did caused the
+  // cleanup to fire on every busy toggle (e.g. the user clicks Save
+  // and the parent flips busy=true): focus would briefly leave the
+  // dialog, previouslyFocusedRef would get clobbered with the
+  // trigger button, then the next run would snap focus back. Real
+  // bug for screen-reader users — the dialog became "exited" mid-
+  // operation. Splitting the effects keeps each invariant tied to
+  // its own state slice (Claude review on #650).
+  useEffect(() => {
+    if (!open) return;
+    previouslyFocusedRef.current = (document.activeElement as HTMLElement | null) ?? null;
+    // queueMicrotask defers focus until after sibling useEffect
+    // hooks (notably any autofocus on form fields inside the
+    // dialog children) have settled, so we focus the truly-first
+    // tab stop rather than racing with autofocus.
+    queueMicrotask(() => focusFirstFocusable(dialogRef.current));
+    return () => {
+      // Restore focus to whoever opened the dialog. Guard against
+      // the trigger being unmounted (e.g. the dialog deleted the
+      // row whose button opened it) by checking isConnected.
+      const restore = previouslyFocusedRef.current;
+      previouslyFocusedRef.current = null;
+      if (restore && restore.isConnected) {
+        restore.focus();
+      }
+    };
+  }, [open]);
+
+  // Keyboard handler legitimately needs `busy` (Esc gates on it) and
+  // `onClose`, so it re-binds when either changes. Re-binding is
+  // cheap — one window listener swap per change — and unlike the
+  // focus effect it has no observable side effect on the user.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onClose();
+      if (e.key === "Escape" && !busy) {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const root = dialogRef.current;
+      if (!root) return;
+      const focusables = focusableElements(root);
+      if (focusables.length === 0) {
+        // Empty dialog: keep Tab from leaving via the page.
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -33,9 +102,15 @@ export function Modal({ title, open, onClose, children, busy }: ModalProps) {
         if (e.target === e.currentTarget && !busy) onClose();
       }}
     >
-      <div className="w-full max-w-md rounded-lg border border-border bg-surface shadow-xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="w-full max-w-md rounded-lg border border-border bg-surface shadow-xl"
+      >
         <div className="border-b border-border px-4 py-3 flex items-center">
-          <div className="font-semibold text-sm">{title}</div>
+          <div id={titleId} className="font-semibold text-sm">{title}</div>
           <button
             type="button"
             onClick={onClose}
@@ -50,4 +125,36 @@ export function Modal({ title, open, onClose, children, busy }: ModalProps) {
       </div>
     </div>
   );
+}
+
+// focusableSelector targets the elements an end user can tab to.
+// Excludes [tabindex="-1"] (programmatic-only focus targets) and
+// disabled / hidden inputs. Kept narrow on purpose: the modal only
+// hosts buttons / form fields / links, not embedded media or
+// content-editable surfaces.
+const focusableSelector = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function focusableElements(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(focusableSelector));
+}
+
+function focusFirstFocusable(root: HTMLElement | null): void {
+  if (!root) return;
+  const focusables = focusableElements(root);
+  if (focusables.length > 0) {
+    focusables[0].focus();
+    return;
+  }
+  // Fallback: focus the dialog container itself so screen readers
+  // still announce it. Add tabindex=-1 dynamically so the browser
+  // accepts the focus call without making the dialog tab-stop bait.
+  root.setAttribute("tabindex", "-1");
+  root.focus();
 }
