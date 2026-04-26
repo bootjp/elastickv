@@ -83,9 +83,10 @@ type sqsQueueMeta struct {
 
     // PartitionCount is the number of FIFO partitions for this queue.
     // 1 (or 0, treated as 1) means the existing single-partition
-    // layout — no schema change. >1 enables HT-FIFO. Set at create
-    // time; immutable after first SendMessage commits. Power-of-two
-    // values only (validator rejects others).
+    // layout — no schema change. >1 enables HT-FIFO. Set at
+    // CreateQueue time and immutable thereafter (see §3.2 below for
+    // the enforcement rule and the reason for the create-time gate).
+    // Power-of-two values only (validator rejects others).
     PartitionCount uint32 `json:"partition_count,omitempty"`
 
     // DeduplicationScope mirrors the AWS attribute. "messageGroup"
@@ -103,13 +104,15 @@ type sqsQueueMeta struct {
 }
 ```
 
-`PartitionCount`, `FifoThroughputLimit`, and `DeduplicationScope` are **all immutable after first SendMessage** (Codex P1 on PR #664 sixth-round Codex review). The validator on `SetQueueAttributes` rejects any change to any of the three; operators who want different values create a new queue. Why all three:
+`PartitionCount`, `FifoThroughputLimit`, and `DeduplicationScope` are **all immutable from `CreateQueue` onward** (Codex P1 on PR #664 sixth-round Codex review; gate boundary refined to AWS-aligned create-time per Claude P1 on PR #664 seventh-round Claude review). The validator on `SetQueueAttributes` rejects any change to any of the three; operators who want different values create a new queue. Why all three:
 
 - **`PartitionCount`** — changing it would require re-hashing every existing message into a new partition, which (a) breaks ordering for in-flight messages of every group whose hash bucket changed, and (b) is a multi-second / multi-minute operation that cannot be expressed as one OCC transaction.
 - **`FifoThroughputLimit`** — a flip from `perMessageGroupId` → `perQueue` activates the §3.3 short-circuit that collapses every group ID to partition 0. In-flight messages from groups previously routed to partitions 1…N-1 stay where they are; new messages for those same groups land on partition 0; consumers see the group split across partitions and within-group FIFO ordering is silently violated. The reverse flip has the symmetric problem.
 - **`DeduplicationScope`** — affects how the dedup key is scoped (`(queue, dedupId)` vs. `(queue, partitionId, dedupId)` vs. `(queue, MessageGroupId, dedupId)` depending on the value). Changing it live can either resurrect duplicates the previous scope had de-duped (when narrowing scope) or suppress a legitimately new send (when widening scope and the new key collides with a still-cached entry from the prior scope).
 
 The pattern is the same: each attribute participates in a routing or dedup decision whose correctness depends on every existing message having been written under a single, consistent value. Live mutation creates a "before" set and an "after" set with incompatible invariants that the runtime cannot reconcile without a full drain.
+
+**Enforcement (gate is `CreateQueue`, not first send)**: when `SetQueueAttributes` is called, the validator loads the current `sqsQueueMeta` (one Raft-consistent point read against the catalog — already required for the OCC compare-and-set) and rejects with `InvalidAttributeValue` if any of the three attributes in the request differs from the value already on the meta. No range scan over the message keyspace is required; no `firstSendAt` timestamp needs to be added; no concurrent-send race exists, because the meta value is set once at `CreateQueue` commit and never changes thereafter. This matches AWS's published behaviour ("you can't change the queue type after you create it" extends to `FifoThroughputLimit` and `DeduplicationScope` in HT-FIFO queues), so SDK clients see the same rejection envelope on the same request as on AWS proper. Picking the create-time gate over a first-send gate is also defensible from a correctness lens: the corner case "operator creates a queue with `PartitionCount=8` and changes their mind to `PartitionCount=4` before any producer connects" is rare and can be solved by `DeleteQueue`+`CreateQueue` (which the operator can also do post-first-send for any other reason). The simplicity of a stateless validator is worth more than the vanishingly small set of operators who would benefit from a brief mutability window.
 
 ### 3.3 Routing
 
@@ -144,7 +147,7 @@ The choice of FNV-1a is deliberate: it is fast (no SIMD setup), has no key, and 
 
 ### 3.4 Cross-shard placement
 
-Partitions live in **separate Raft groups** when the queue's shard config maps each partition to a different group. The *router infrastructure* (`kv/shard_router.go`) already supports multi-group routing keyed by an arbitrary byte string today, and each `(queueName, partition)` pair becomes its own routing key — no router changes are needed. The *configuration surface*, however, requires a new flag: the partition-to-Raft-group assignment is declared via `--sqsFifoPartitionMap` (see §5), **not** via the existing `--raftSqsMap` (which maps `raftAddr=sqsAddr` for `proxyToLeader` endpoint resolution and is unchanged by this design). Conflating the two flags would parse partition assignments as endpoint pairs and route to the wrong leader; keeping them separate is the reason §5 introduces a dedicated flag rather than overloading the existing one.
+Partitions live in **separate Raft groups** when the queue's shard config maps each partition to a different group. The router's *dispatch algorithm* (`kv/shard_router.go`) does not change — it already routes by an arbitrary byte string today, and each `(queueName, partition)` pair becomes its own routing key with no algorithmic work. PR 4 in §11 *does* still touch `shard_router.go`, but only to wire in the `(queueName, partition)` composite key format and to load per-partition shard assignments from the new `--sqsFifoPartitionMap` flag (see §5); the byte-key dispatch core stays the way it is. The *configuration surface* for partition-to-Raft-group assignment is the new `--sqsFifoPartitionMap` flag, **not** the existing `--raftSqsMap` (which maps `raftAddr=sqsAddr` for `proxyToLeader` endpoint resolution and is unchanged by this design). Conflating the two flags would parse partition assignments as endpoint pairs and route to the wrong leader; keeping them separate is the reason §5 introduces a dedicated flag rather than overloading the existing one.
 
 For deployments that don't want one Raft group per partition (e.g. a small cluster with limited shard capacity), partitions can co-locate on the same group. The choice is operator-driven via `--sqsFifoPartitionMap`; it does not affect correctness, only throughput scaling.
 
