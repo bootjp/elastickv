@@ -175,14 +175,17 @@ On rejection:
 | JSON | HTTP 400, body `{"__type":"Throttling","message":"Rate exceeded for queue '<name>' action '<action>'"}`, header `x-amzn-ErrorType: Throttling`, header `Retry-After: <seconds>` (computed per below) |
 | Query | HTTP 400, body `<ErrorResponse><Error><Type>Sender</Type><Code>Throttling</Code><Message>...</Message></Error><RequestId>...</RequestId></ErrorResponse>`, headers as above |
 
-`Retry-After` is computed from the *actual* refill rate so a slow-refill queue does not cause a busy-loop of premature retries (Claude review on PR #664 caught the prior `Retry-After: 1` constant — it lies for queues configured with sub-1-RPS refill, e.g. `SendRefillPerSecond = 0.1` would need 10 s for the next token, so the SDK would burn 9 unnecessary 400s before getting through):
+`Retry-After` is computed from the *actual* refill rate AND the *requested* token count so neither slow refill nor large batches cause a busy-loop of premature retries (two consecutive Claude reviews on PR #664 caught both: first the `Retry-After: 1` constant lying for sub-1-RPS refill — `SendRefillPerSecond = 0.1` needs 10 s for the next token; then the formula's hardcoded numerator `1.0` lying for batch verbs that charge >1 token — a `SendMessageBatch` of 10 against `refillRate = 1.0` and 0 tokens needs 10 s, not 1):
 
 ```text
-secondsToNextToken := math.Ceil((1.0 - currentTokens) / refillRate)
-retryAfter := max(1, int(secondsToNextToken))   // never less than 1
+needed              := float64(requestedCount) - currentTokens
+secondsToNextRefill := math.Ceil(needed / refillRate)
+retryAfter          := max(1, int(secondsToNextRefill))   // never less than 1
 ```
 
-The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1 §10.2.3) and means a queue with `refillRate >= 1.0 RPS` always sees `Retry-After: 1`, preserving the existing fast-refill behaviour. A queue with `refillRate = 0.1` correctly sees `Retry-After: 10`. The validator (§3.2) keeps `refillRate > 0` so the divide-by-zero guard is unnecessary in the formula above.
+`requestedCount` is the same value the charge step uses: `1` for single-message verbs, `len(Entries)` for batch verbs (§3.3). A `SendMessageBatch` of 10 against a bucket with `refillRate = 1.0` and 0 tokens correctly returns `Retry-After: 10`; a single `SendMessage` against `refillRate = 0.1` and 0 tokens correctly returns `Retry-After: 10`; the common case (single op, fast refill) keeps the floor of 1.
+
+The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1 §10.2.3). The validator (§3.2) keeps `refillRate > 0`, so the divide-by-zero guard is unnecessary in the formula above.
 
 ---
 

@@ -110,9 +110,16 @@ type sqsQueueMeta struct {
 `partitionFor(meta, messageGroupId) uint32`:
 
 ```go
-// Single-partition path: cheap fast path. Standard queues + N=1
-// FIFOs hit this branch and write to partition 0 forever.
-if meta.PartitionCount <= 1 {
+// Single-partition path: cheap fast path. Three cases collapse here:
+//   1. Standard queues + N=1 FIFOs (PartitionCount <= 1).
+//   2. FIFOs explicitly configured with FifoThroughputLimit=perQueue,
+//      which §3.2 documents as "reduces routing to a single partition
+//      regardless of PartitionCount." A queue created with
+//      PartitionCount=8 + perQueue MUST land every group on partition 0;
+//      hashing across all 8 would directly contradict the documented
+//      semantics that operators selected when they picked perQueue.
+//      (Codex P2 + Claude on PR #664 caught this.)
+if meta.PartitionCount <= 1 || meta.FifoThroughputLimit == "perQueue" {
     return 0
 }
 if messageGroupId == "" {
@@ -147,10 +154,18 @@ For deployments that don't want one Raft group per partition (e.g. a small clust
 3. partitionIndex := partitionFor(meta, in.MessageGroupId).
 4. Resolve the leader for (queue, partitionIndex) via shard_router.
    - Today's queue-per-shard router becomes (queue, partition)-per-shard.
-5. Build the OCC OperationGroup with partition-aware keys:
-     dataKey  = sqsMsgDataKey(queue, partitionIndex, gen, msgID)
-     visKey   = sqsMsgVisKey(queue, partitionIndex, gen, ...)
-     groupKey = sqsMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
+5. Build the OCC OperationGroup with the right keyspace
+   constructor for this queue's PartitionCount (named constructors
+   per §3.1; no variadic):
+     if meta.PartitionCount > 1 {
+       dataKey  = partitionedMsgDataKey(queue, partitionIndex, gen, msgID)
+       visKey   = partitionedMsgVisKey(queue, partitionIndex, gen, ...)
+       groupKey = partitionedMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
+     } else {
+       dataKey  = legacyMsgDataKey(queue, gen, msgID)
+       visKey   = legacyMsgVisKey(queue, gen, ...)
+       groupKey = legacyMsgGroupKey(queue, gen, MessageGroupId)
+     }
 6. Dispatch through the leader of the resolved partition (existing
    leader-proxy path, unchanged).
 ```
