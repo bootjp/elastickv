@@ -226,7 +226,7 @@ present on the node that received the HTTP request — which may be
 a follower if the request was then forwarded:
 
 ```
-admin_audit actor=AKIA_ADMIN role=full method=POST path=/admin/api/v1/buckets status=201 remote=10.0.0.7:51234 duration=8.2ms
+admin_audit actor=AKIA_ADMIN role=full method=POST path=/admin/api/v1/s3/buckets status=201 remote=10.0.0.7:51234 duration=8.2ms
 ```
 
 **`S3Handler` operation line** — emitted on the leader after a
