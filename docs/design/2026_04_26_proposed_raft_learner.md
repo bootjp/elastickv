@@ -124,25 +124,42 @@ Neither operation enters joint consensus.
 
 ### 3.2 Today's behaviour in the elastickv etcd backend
 
-The engine *partially* handles learners and *fully* refuses to expose them:
+The engine *partially* handles learners and *fully* refuses to expose them.
+Line numbers below reflect `main` at the propose date and will drift; the
+function names and the small excerpts are the stable references.
 
-| File                                              | Behaviour                                                                                                                                                                                |
-|---------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `internal/raftengine/engine.go`                    | `Admin` interface has no `AddLearner` or `PromoteLearner`. `Server.Suffrage` field exists but no caller produces `"learner"`.                                                            |
-| `internal/raftengine/etcd/engine.go:1817-1830`     | Live `applyConfigPeerChange` ignores `ConfChangeAddLearnerNode`. Comment: "Phase 3 only exposes voter membership changes."                                                               |
-| `internal/raftengine/etcd/engine.go:1869-1884`     | Map-form `applyConfigPeerChangeToMap` does keep learner peer metadata in the in-memory snapshot — necessary for log replay round-trip — but the live engine's `peers` map does not. |
-| `internal/raftengine/etcd/engine.go:2644-2667`     | `configurationFromConfState` only walks `ConfState.Voters`; it never emits a server with `Suffrage: "learner"`.                                                                          |
-| `internal/raftengine/etcd/engine.go:3080-3106`     | `upsertPeer` hard-codes `Suffrage: "voter"`.                                                                                                                                              |
-| `internal/raftengine/etcd/wal_store.go:419-421`    | `validateConfState` rejects any `ConfState` with non-empty `Learners` / `LearnersNext` / `VotersOutgoing` as "joint consensus state is not supported".                                  |
-| `internal/raftengine/etcd/peers.go:216-222`        | `confStateForPeers` only emits `Voters`. There is no per-peer suffrage on the `Peer` struct.                                                                                              |
-| `internal/raftengine/etcd/peer_metadata.go`        | Persisted peers file (`etcd-raft-peers.bin`, version 1) stores `(NodeID, ID, Address)`. No suffrage byte.                                                                                  |
-| `proto/service.proto`                              | `RaftAdmin` exposes `AddVoter`, `RemoveServer`, `TransferLeadership`. No `AddLearner` or `PromoteLearner`. `RaftAdminMember.suffrage` exists in the response message.                    |
-| `cmd/raftadmin/main.go`                            | Subcommands: `add_voter`, `remove_server`, `leadership_transfer`, `leadership_transfer_to_server`. No learner subcommands.                                                                |
+| Location                                               | Behaviour                                                                                                                                                                              |
+|--------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `raftengine.Admin` (`internal/raftengine/engine.go`)   | No `AddLearner` or `PromoteLearner`. `Server.Suffrage` exists but no caller produces `"learner"`.                                                                                       |
+| `Engine.applyConfigPeerChange` (etcd backend)          | Live path ignores `ConfChangeAddLearnerNode`. Comment: "Phase 3 only exposes voter membership changes."                                                                                  |
+| `applyConfigPeerChangeToMap` (etcd backend)            | Map-form path *does* keep learner peer metadata for log-replay round-trip; live engine map does not.                                                                                     |
+| `configurationFromConfState` (etcd backend)            | Only walks `ConfState.Voters`; never emits a server with `Suffrage: "learner"`.                                                                                                          |
+| `Engine.upsertPeer` (etcd backend)                     | Hard-codes `raftengine.Server{..., Suffrage: "voter"}` for `e.config.Servers`.                                                                                                            |
+| `validateConfState` (`wal_store.go`)                   | Rejects any `ConfState` with non-empty `Learners` / `LearnersNext` / `VotersOutgoing` as "joint consensus state is not supported".                                                       |
+| `confStateForPeers` (`peers.go`)                       | Emits every `Peer` as a voter; no per-peer suffrage on the `Peer` struct.                                                                                                                 |
+| `peer_metadata.go`                                     | Persisted peers file (`etcd-raft-peers.bin`, version 1) stores `(NodeID, ID, Address)`. No suffrage byte.                                                                                  |
+| `proto/service.proto`                                  | `RaftAdmin` exposes `AddVoter`, `RemoveServer`, `TransferLeadership`. No `AddLearner` or `PromoteLearner`. `RaftAdminMember.suffrage` exists.                                            |
+| `cmd/raftadmin/main.go`                                | Subcommands: `add_voter`, `remove_server`, `leadership_transfer`, `leadership_transfer_to_server`.                                                                                       |
 
 The dormant pieces (`applyConfigPeerChangeToMap`, the `Suffrage` field on
-`Server`, the `suffrage` field on `RaftAdminMember`, the regression test for
-preserved learner metadata) all suggest the original etcd-migration design
-expected this exact follow-up.
+`Server`, the `suffrage` field on `RaftAdminMember`, the regression test
+`TestNextPeersAfterConfigChangeKeepsLearnerMetadata`) all suggest the original
+etcd-migration design expected this exact follow-up.
+
+### 3.3 `len(e.peers)` is overloaded as "voter count"
+
+A grep of the etcd backend reveals four hot-path call sites where
+`len(e.peers)` is currently used as a proxy for the voter denominator. Each
+breaks the moment a learner is added to `e.peers`:
+
+| Call site                            | What `len(e.peers)` means today                          | What it should mean post-learner |
+|--------------------------------------|----------------------------------------------------------|-----------------------------------|
+| `recordQuorumAck`                    | Total cluster size (incl. self) for `followerQuorumForClusterSize`. | Number of **voters** (incl. self). |
+| `refreshStatus` single-node fast path | `clusterSize <= 1` → leader-of-1 → instant lease ack.   | Voter-count `<= 1` → leader-of-1-voter → instant lease ack. |
+| `removePeer` post-removal cluster size | Used to recompute `followerQuorum` after a removal.    | Post-removal voter count.         |
+| `nextPeersAfterConfigChange*` sizing | Address-cache fan-out only — already correct, included for completeness. | Unchanged. |
+
+§4.6 enumerates the fix and §5.2 audits each site for races.
 
 ## 4. Design
 
@@ -174,42 +191,69 @@ Notes on the new methods:
   voter path already uses (`encodeConfChangeContext`). Address resolution
   uses the same `resolveAdminPeer` helper.
 - `PromoteLearner` proposes a V1 `ConfChangeAddNode` for an existing
-  learner. The engine asserts on the leader, on the single-threaded admin
-  loop, that:
+  learner. Both preconditions below run on the leader, on the
+  single-threaded admin loop (`handleAdmin`), **before** calling
+  `rawNode.ProposeConfChange`. The check intentionally cannot be lazy:
+  if the propose is queued first and the precondition then fails, the
+  conf-change entry has already entered the log and a `RemoveServer`
+  rollback would be required. So:
   1. The peer exists in `ConfState.Learners` (not in `Voters`). Otherwise
      return a `FailedPrecondition` so callers do not silently no-op.
   2. The leader's `Progress[nodeID].Match >= minAppliedIndex`. The leader
      is the authority on follower progress; an operator who reads
      `Status.AppliedIndex` from the learner itself sees a slightly stale
      view, so the engine re-checks against the leader's tracker before
-     proposing. `minAppliedIndex == 0` skips the precondition (matches the
-     existing "0 means don't care" convention used by `prevIndex`).
+     proposing. The `Progress` map is read directly from `rawNode.Status()`
+     inside the admin handler — same goroutine that owns the rawNode —
+     so no lock or clone is required.
+  3. `minAppliedIndex == 0` is **discouraged**: it skips the
+     precondition. We accept the convention to stay consistent with the
+     existing `prevIndex` ("0 means don't check the config index") on
+     the same RPC family, but the runbook calls it out as a footgun and
+     §8 lists "should we use a separate `skip_min_applied_check` boolean
+     instead" as an open question.
 - `RemoveServer` is unchanged. etcd/raft handles `ConfChangeRemoveNode` for
   a learner correctly, and the existing path already calls `peerForID` /
   `removePeer`.
 
 ### 4.2 etcd backend internals
 
-Three concrete edits, each tightly scoped:
+Four concrete edits, each tightly scoped. Edits 1–3 are the "turn on
+learner support" core; edit 4 is the ownership cleanup the reviewer
+flagged as a structural prerequisite.
 
-1. `applyConfigPeerChange` (engine.go:1817) stops dropping
-   `ConfChangeAddLearnerNode`. The handler routes to `applyAddedPeer`
-   (same as `ConfChangeAddNode`), and the *suffrage* of the peer is no
-   longer carried in the engine's `peers` map but inferred at read time
-   from `ConfState`. The `peers` map remains a (nodeID → addr) cache
-   keyed by node identity. Promotion does not change the peer entry —
-   only `ConfState.Voters` / `ConfState.Learners` changes.
+1. `applyConfigPeerChange` stops dropping `ConfChangeAddLearnerNode`.
+   The handler routes to `applyAddedPeer` (same as `ConfChangeAddNode`),
+   and the *suffrage* of the peer is no longer carried in the engine's
+   `peers` map but inferred at read time from `ConfState`. The `peers`
+   map remains a (nodeID → addr) address cache keyed by node identity.
+   Promotion does not change the peer entry — only `ConfState.Voters` /
+   `ConfState.Learners` changes.
 2. `configurationFromConfState` walks both `conf.Voters` and
    `conf.Learners` and emits the right `Suffrage` string for each. This
-   becomes the single source of truth for suffrage; `upsertPeer` stops
-   stamping a hard-coded `Suffrage: "voter"`.
-3. `validateConfState` (wal_store.go:406) accepts learner-only entries:
-   `len(conf.Learners) > 0` is no longer rejected. Joint-consensus markers
-   (`VotersOutgoing`, `LearnersNext`, `AutoLeave`) stay rejected — learner
-   add/promote uses the simple V1 path which never sets them.
+   becomes the single source of truth for suffrage that gets surfaced
+   to callers (`Configuration()`, monitoring labels).
+3. `validateConfState` (`wal_store.go`) accepts learner-only entries:
+   `len(conf.Learners) > 0` is no longer rejected. Joint-consensus
+   markers (`VotersOutgoing`, `LearnersNext`, `AutoLeave`) stay rejected
+   — learner add/promote uses the simple V1 path which never sets them.
+4. **`upsertPeer` stops owning `e.config.Servers`.** Today it does two
+   jobs: refresh the address cache `e.peers`, and stamp a
+   `raftengine.Server{Suffrage: "voter"}` into `e.config.Servers`. Once
+   learners exist, the second job is wrong — `upsertPeer` has no
+   `ConfState` at call time, so it cannot decide the correct suffrage.
+   The fix: `upsertPeer` keeps `e.peers` only. `e.config.Servers` is
+   recomputed from the post-change `ConfState` by a single call to
+   `configurationFromConfState` inside `applyConfigChange` /
+   `applyConfigChangeV2`. That function already runs on the
+   single-threaded apply loop and already sees the new `ConfState` from
+   `rawNode.ApplyConfChange(...)`, so there is no extra synchronization
+   cost. Symmetric change in `removePeer`: it stops splicing
+   `e.config.Servers` directly and lets the apply loop rebuild it from
+   `ConfState`.
 
-`nextPeersAfterConfigChange` already routes `ConfChangeAddLearnerNode` via
-`applyAddedPeerToMap`, so the snapshot/restart code path is correct
+`nextPeersAfterConfigChange` already routes `ConfChangeAddLearnerNode`
+via `applyAddedPeerToMap`, so the snapshot/restart code path is correct
 once the live `applyConfigPeerChange` matches it.
 
 ### 4.3 Persisted peers file
@@ -256,10 +300,79 @@ Compatibility:
   acceptable because we already require explicit offline migration tooling
   for engine downgrades (Phase 5 of the etcd-migration doc).
 
-The `ConfState` carried inside the local raft snapshot remains the
-*authoritative* source of suffrage. The peers file is a cache plus an
-operator-readable summary; on conflict, the snapshot's `ConfState` wins,
-and `persistConfigState` overwrites the peers file accordingly.
+#### Authoritative source of suffrage during recovery
+
+The `ConfState` carried inside the local raft snapshot, plus any
+`ConfChange` entries replayed from the WAL on top of that snapshot, is
+the **authoritative** source of suffrage. The peers file is an address
+cache plus an operator-readable summary, with one important asymmetry:
+`validateOpenPeers` already short-circuits when
+`persisted.Index > snapshot.Metadata.Index` because the persisted file
+can be more current than the local snapshot. That asymmetry is fine for
+addresses but not for suffrage, because between the snapshot and the
+persisted-peers index there may be `ConfChangeAddLearnerNode` and
+`ConfChangeAddNode`-as-promote entries that change a peer's role.
+
+Recovery is therefore explicitly two-phase:
+
+1. **Open phase** — load addresses from the v2 peers file (or the v1
+   file, treated as all-voter). The engine boots with that as the
+   address cache. The suffrage byte from the file is used only for the
+   bootstrap-time `confStateForPeers` call (see next bullet).
+2. **WAL-replay phase** — after `rawNode.Ready()` drains the snapshot
+   and replays log entries up to the persisted commit index, the engine
+   re-derives the peer-set view from the resulting `ConfState`:
+   `e.config.Servers` is rebuilt by `configurationFromConfState`
+   (edit 4 of §4.2). The peers-file suffrage byte is **not** read
+   again after this point. The next `persistConfigState` call writes
+   the post-replay state back to the v2 file.
+
+Concretely: after open, the rule is "snapshot+log wins, the peers file
+catches up". The reviewer's concern that an in-flight learner-add could
+look inconsistent during the gap between snapshot read and WAL replay
+is addressed by never *acting* on the peers-file suffrage during that
+gap — `validateConfState` runs against the snapshot's `ConfState`
+(which always represents a consistent committed state), and the
+in-memory `e.config.Servers` is the post-replay view, not the
+post-open-phase view.
+
+#### `confStateForPeers` and the `Peer.Suffrage` field
+
+`confStateForPeers` is called only on cold bootstrap, before any
+`ConfState` exists, to mint the very first conf state from the operator's
+`--raftBootstrapMembers` list. Cold bootstrap is voters-only (§4.5), so
+the simplest correct implementation is:
+
+```go
+func confStateForPeers(peers []Peer) raftpb.ConfState {
+    voters := make([]uint64, 0, len(peers))
+    for _, peer := range peers {
+        voters = append(voters, peer.NodeID)
+    }
+    return raftpb.ConfState{Voters: voters}
+}
+```
+
+— i.e., unchanged. Cold bootstrap with a learner is rejected upstream in
+`prepareOpenState` with a typed error (§4.5 / risk #5).
+
+For the **persisted-peers v2 read** path, we still add a
+`Peer.Suffrage` field to the in-memory struct so v2 payloads round-trip
+cleanly through tests and through the operator-visible
+`raftadmin configuration` output during the open phase. But that
+field is *not* consulted by `confStateForPeers`. The two writers stay
+distinct:
+
+- `confStateForPeers(peers []Peer) raftpb.ConfState` — cold bootstrap,
+  voters only, ignores `Peer.Suffrage`.
+- `configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration` —
+  hot path, reads suffrage from `conf.Voters` / `conf.Learners`,
+  ignores `Peer.Suffrage`.
+
+`Peer.Suffrage` is therefore a v2-file artifact only. This keeps the
+`ConfState` as the single source of suffrage truth and avoids the
+"peers file says learner, ConfState says voter" divergence the reviewer
+flagged.
 
 ### 4.4 RPC and CLI surface
 
@@ -314,11 +427,29 @@ Cold bootstrap (`--raftBootstrap` plus optionally `--raftBootstrapMembers`):
 
 Joining an existing cluster as a learner:
 
-- New CLI flag (per group): `--raftJoinAsLearner` (default `false`). When
-  set, the local node refuses to self-bootstrap and refuses to be added
-  with `AddVoter` from outside; it expects an operator to call
-  `AddLearner` against the existing leader before it appears in
-  `ConfState`.
+- New CLI flag (per group): `--raftJoinAsLearner` (default `false`).
+- **Enforcement is local and post-apply, not pre-propose.** The flag
+  does *not* attempt to block the leader from issuing a
+  `ConfChangeAddNode` for this node. Doing so would either require a
+  network-level vetoing protocol (no such mechanism exists in the
+  codebase) or rejecting an `Apply` mid-stream (catastrophic — diverges
+  the log). Instead, after each conf-change `Apply`, the joining node
+  inspects the resulting `ConfState`:
+  1. If `--raftJoinAsLearner=true` and the local node ID appears in
+     `ConfState.Voters` (and not in `ConfState.Learners`), the engine
+     emits an ERROR-level structured log
+     (`elastickv_raft_join_role_violation_total`) **and the node
+     continues running** as a voter. We do not shut down: by the time
+     the conf change has applied, the local node already counts toward
+     quorum, and an unilateral shutdown would shrink fault tolerance.
+     The operator is responsible for either (a) calling
+     `RemoveServer` against the leader followed by re-adding via
+     `AddLearner`, or (b) acknowledging the deviation and clearing the
+     flag.
+  2. If `--raftJoinAsLearner=true` and the local node ID is in
+     `ConfState.Learners`, normal operation continues.
+  3. The flag is therefore primarily an **operator alarm**, not a
+     consensus-level enforcement. The runbook makes this explicit.
 - Operationally:
   1. Operator brings up the joiner with `--raftJoinAsLearner` and the
      peer list it knows about (existing voters; the joiner's own
@@ -339,21 +470,67 @@ Joining an existing cluster as a learner:
 
 The lease-read fast path
 (`LeaseProvider` / `LastQuorumAck` / `quorumAckTracker`) must not require
-acknowledgement from learners. Specifically:
+acknowledgement from learners. This is the **highest-risk** area of the
+proposal — the wrong fix silently regresses lease-read latency the
+moment any cluster has a single learner attached.
 
-- `followerQuorumForClusterSize` currently takes the total *cluster size*
-  (`len(e.peers)`) to compute a follower-quorum denominator. After this
-  change, that count includes learners, which would inflate the
-  denominator and stall lease reads whenever a learner is slow.
-- The engine must compute the lease-read denominator from
-  `len(ConfState.Voters)` (excluding self if leader), not `len(e.peers)`.
-  `recordQuorumAck` already gates on `isLeader`; we additionally drop
-  responses from peers whose `nodeID` is in `ConfState.Learners` so a
-  learner heartbeat ack cannot count toward voter majority.
+#### Voter-count cache
 
-This is the **highest-risk** area of this proposal and gets its own
-behaviour test (see §5.2). The wrong fix here would silently regress
-lease-read latency the moment any cluster has a single learner attached.
+Introduce a single event-loop-owned field `e.voterCount int` (and a
+companion `e.isLearnerNode map[uint64]bool` keyed by node ID). Both are
+**only written from the apply loop** in `applyConfigChange` /
+`applyConfigChangeV2`, **after** `rawNode.ApplyConfChange(...)` returns
+the new `ConfState`. They are derived directly from
+`conf.Voters` / `conf.Learners`. This piggybacks on the existing
+single-writer invariant for the apply loop: no extra mutex needed, no
+type-assertion contortion. Readers on the lease hot path read these
+fields under the same `e.mu` they already take for `e.peers`, so the
+critical section grows by one int load.
+
+#### Call-site fixes (all four `len(e.peers)` overloads)
+
+1. **`recordQuorumAck`** (event-loop goroutine, single writer):
+   - Replace `clusterSize := len(e.peers)` with
+     `clusterSize := e.voterCount`.
+   - Reject the ack early when `e.isLearnerNode[msg.From]` is true.
+     This is in addition to the existing `e.peers[msg.From]` membership
+     check; a learner peer is in `e.peers` but must not contribute to
+     the voter ack tracker.
+   - The early `clusterSize <= 1` short-circuit stays — it now
+     correctly means "no other voter to ack from" rather than "no
+     other peer at all".
+
+2. **`refreshStatus` single-node fast path**:
+   - Replace `clusterSize := len(e.peers)` with the cached
+     `e.voterCount`. The leader-of-1 fast path
+     (`singleNodeLeaderAckMonoNs`) now triggers when the leader is the
+     **only voter** regardless of how many learners are attached. This
+     is the single critical fix for the 1-voter+1-learner stall the
+     reviewer flagged.
+
+3. **`removePeer` post-removal cluster size**:
+   - Today it computes `postRemovalClusterSize := len(e.peers)` after
+     deleting the peer and feeds that into
+     `followerQuorumForClusterSize`. After the fix, the apply loop
+     updates `e.voterCount` from the post-change `ConfState` *before*
+     `removePeer` is called for any address-cache cleanup, so
+     `removePeer` simply reads `e.voterCount`. (Removing a learner
+     does not change `e.voterCount`; removing a voter decrements it
+     by one.)
+
+4. **`nextPeersAfterConfigChange*`** — already correct (it walks
+   addresses, not voters). Listed only to confirm we audited it.
+
+#### Why an event-loop-owned cache instead of "read `ConfState` on each call"
+
+The lease-read fast path is intentionally lock-free up to a single
+`e.mu` acquisition. Re-deriving voter count from `rawNode.Status()` on
+each ack would either (a) require acquiring the rawNode-internal mutex
+on a hot path, or (b) clone the `Progress` map per call. Caching the
+scalar voter count and the per-peer learner bitset keeps both hot paths
+(`recordQuorumAck`, `refreshStatus`) at O(1) cost and ties the cache
+update to the natural sequencing point — the apply loop, where the new
+`ConfState` is unambiguously known.
 
 ### 4.7 What does *not* change
 
@@ -413,9 +590,15 @@ because each of these passes informs the milestone breakdown.
   this is the desired behaviour, not a bug.
 - Quorum-ack tracker race: `recordQuorumAck` is gated by `isLeader`; the
   step-down path (`leaderLossCbs`) already invalidates the tracker. The
-  new gate ("drop responses from learner peers") reads `ConfState`
-  through the same lock as the existing `peers` map, so it does not
-  introduce a new race.
+  new gate ("drop responses from learner peers") reads
+  `e.isLearnerNode` (§4.6 voter-count cache), which is written only on
+  the single-threaded apply loop and read under the same `e.mu` already
+  held for the `e.peers` membership check. No new race.
+- `e.voterCount` ordering: the apply loop updates `e.voterCount` and
+  `e.isLearnerNode` *before* invoking the per-peer cleanup helpers
+  (`upsertPeer`, `removePeer`), so any subsequent `recordQuorumAck` on
+  the same loop iteration sees the post-change view. `refreshStatus`
+  runs after `drainReady` and likewise sees the post-change view.
 - Removing a learner mid-promote: etcd/raft processes conf changes
   serially — the second proposal stays in the log behind the first and
   is applied or rejected deterministically. `pendingConfigs` already
@@ -479,8 +662,16 @@ because each of these passes informs the milestone breakdown.
   learners and `"voter"` for voters, including after restart.
 - Persisted peers v1→v2 round-trip test.
 - `quorumAckTracker` regression test: lease reads must not block on
-  learner ack.
+  learner ack. Specific cases: (a) 1-voter + 1-learner cluster lease
+  reads stay on the single-node fast path; (b) 3-voter + 1-learner
+  cluster lease reads use a 3-voter denominator, not 4.
 - `WAL purge` test with a learner mid-catch-up (data-loss pass §5.1).
+- Snapshot-during-learner-catch-up test: trigger a new FSM snapshot
+  while a learner is still receiving the previous snapshot. Verifies
+  `snapshot_spool.go`'s dedup/cancel logic does the right thing for a
+  slow learner — the catch-up replica is exactly the slow consumer the
+  spool was designed to handle, and it is the most likely place for a
+  regression to land.
 - Behaviour test: `LinearizableRead` on a learner forwards to leader's
   `ReadIndex` and returns once local apply catches up.
 - Property test for the conf-change context codec is unchanged
@@ -496,19 +687,37 @@ parameterised cluster harness in the existing Jepsen workloads.
 ### Milestone 1 — Engine-level learner support (no operator surface yet)
 
 - `Admin` interface: add `AddLearner`, `PromoteLearner`.
-- etcd backend: live `applyConfigPeerChange` accepts
-  `ConfChangeAddLearnerNode`; `configurationFromConfState` reports
-  `"learner"`; `upsertPeer` stops hard-coding `"voter"`.
-- `validateConfState` accepts learner-only entries (joint-consensus
-  markers stay rejected).
-- `quorumAckTracker` denominator + admission audit (§4.6).
-- Persisted peers file v2.
-- Unit + conformance tests (§5.5 first three bullets).
+- etcd backend:
+  - Live `applyConfigPeerChange` accepts `ConfChangeAddLearnerNode`.
+  - `configurationFromConfState` reports `"learner"`.
+  - `upsertPeer` no longer writes to `e.config.Servers`; the apply
+    loop rebuilds `e.config.Servers` from the post-change `ConfState`
+    (§4.2 edit 4).
+  - `validateConfState` accepts learner-only entries (joint-consensus
+    markers stay rejected).
+- **All four `len(e.peers)` overloads from §4.6 fixed in one PR**
+  (`recordQuorumAck`, `refreshStatus`, `removePeer`, plus the audit
+  pass on `nextPeersAfterConfigChange*`). Voter-count cache
+  (`e.voterCount`, `e.isLearnerNode`) wired through the apply loop.
+- Persisted peers file v2 with the `Peer.Suffrage` field; v1 reader
+  preserved for upgrades. `confStateForPeers` stays voters-only;
+  `Peer.Suffrage` is a v2-file artifact only (§4.3).
+- Two-phase recovery documented in code comments matching §4.3:
+  open-phase reads addresses from peers file; WAL-replay phase
+  rebuilds `e.config.Servers` and `e.voterCount` from `ConfState`.
+- Unit + conformance tests (§5.5 first four bullets, including both
+  lease-read regression cases — 1-voter+1-learner and 3-voter+1-learner).
 - No proto / CLI / flag changes yet. Promote / add are reachable via
   the engine API and engine tests only.
 
-Exit criteria: a unit test that adds a learner to a 3-node cluster,
-sees suffrage reported correctly across restarts, and promotes it.
+Exit criteria:
+1. Unit test that adds a learner to a 3-node cluster, sees suffrage
+   reported correctly across restarts, and promotes it.
+2. Lease-read regression test passes: a 1-voter+1-learner cluster
+   serves lease reads at the same latency as a 1-voter cluster
+   (the single-node fast path is retained).
+3. Lease-read regression test passes: a 3-voter+1-learner cluster
+   does not stall lease reads when the learner is partitioned.
 
 ### Milestone 2 — Operator surface
 
@@ -582,6 +791,15 @@ After Milestone 3, rename
    absolute form is simpler to validate; the tolerance form is easier
    for an operator to choose. Current proposal: absolute, with a
    helper in the runbook that computes "current leader commit minus N".
+2a. **`min_applied_index = 0` footgun.** The proposal accepts `0` as
+   "skip the precondition" to stay symmetric with `prevIndex` on the
+   same RPC family. But `prevIndex == 0` is a common no-op skip
+   pattern, while `min_applied_index == 0` semantically *removes the
+   primary safety check* of the promote operation. If a future
+   reviewer wants the safer ergonomics, the alternative is a separate
+   `bool skip_min_applied_check` field with a default of `false`,
+   forcing operators to opt in explicitly. Tracked here so it is not
+   discovered post-implementation.
 3. Do we want a `--raftBootstrapMembers` syntax extension to mark
    bootstrap members as learners? Current proposal: **no**. Cold
    bootstrap is voter-only; learners enter exclusively via
