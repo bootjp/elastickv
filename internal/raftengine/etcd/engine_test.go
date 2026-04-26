@@ -328,7 +328,11 @@ func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
 	persisted, ok, err := LoadPersistedPeers(dir)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Equal(t, peers, persisted)
+	expected := append([]Peer(nil), peers...)
+	for i := range expected {
+		expected[i].Suffrage = SuffrageVoter
+	}
+	require.Equal(t, expected, persisted)
 
 	restarted, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,

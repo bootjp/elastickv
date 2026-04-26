@@ -13,9 +13,17 @@ import (
 
 const (
 	peersFileName       = "etcd-raft-peers.bin"
-	peersFileVersion    = uint32(1)
+	peersFileVersionV1  = uint32(1)
+	peersFileVersionV2  = uint32(2) // adds per-peer suffrage byte
+	peersFileVersion    = peersFileVersionV2
 	maxPersistedPeers   = uint32(1 << 10)
 	maxPersistedPeerStr = uint32(1 << 20)
+)
+
+// Per-peer suffrage byte values used in v2 of the peers file.
+const (
+	persistedSuffrageVoter   uint8 = 0
+	persistedSuffrageLearner uint8 = 1
 )
 
 var peersFileMagic = [4]byte{'E', 'K', 'V', 'P'}
@@ -100,7 +108,8 @@ func readPersistedPeersFile(path string) (persistedPeers, error) {
 	}()
 
 	reader := bufio.NewReader(file)
-	if err := readVersionedHeader(reader, fileFormat{magic: peersFileMagic, version: peersFileVersion}, "etcd raft peers"); err != nil {
+	version, err := readPeersFileHeader(reader)
+	if err != nil {
 		return persistedPeers{}, err
 	}
 
@@ -118,7 +127,7 @@ func readPersistedPeersFile(path string) (persistedPeers, error) {
 
 	peers := make([]Peer, 0, count)
 	for range count {
-		peer, err := readPersistedPeer(reader)
+		peer, err := readPersistedPeer(reader, version)
 		if err != nil {
 			return persistedPeers{}, err
 		}
@@ -127,10 +136,51 @@ func readPersistedPeersFile(path string) (persistedPeers, error) {
 	return persistedPeers{Index: index, Peers: peers}, nil
 }
 
-func readPersistedPeer(reader io.Reader) (Peer, error) {
+// readPeersFileHeader validates the magic and returns the file's
+// version. v1 (legacy: no per-peer suffrage byte; all peers are voters)
+// and v2 (current: per-peer suffrage byte) are accepted; any other
+// value is rejected. The split from the shared readVersionedHeader
+// helper is intentional — that helper accepts a single hardcoded
+// version and we need to dispatch.
+func readPeersFileHeader(r io.Reader) (uint32, error) {
+	var actual [4]byte
+	if _, err := io.ReadFull(r, actual[:]); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if actual != peersFileMagic {
+		return 0, errors.WithStack(errors.New("invalid etcd raft peers magic"))
+	}
+	version, err := readU32(r)
+	if err != nil {
+		return 0, err
+	}
+	switch version {
+	case peersFileVersionV1, peersFileVersionV2:
+		return version, nil
+	default:
+		return 0, errors.WithStack(errors.Newf("unsupported etcd raft peers version %d", version))
+	}
+}
+
+func readPersistedPeer(reader io.Reader, version uint32) (Peer, error) {
 	nodeID, err := readU64(reader)
 	if err != nil {
 		return Peer{}, err
+	}
+	suffrage := SuffrageVoter
+	if version >= peersFileVersionV2 {
+		raw, err := readU8(reader)
+		if err != nil {
+			return Peer{}, err
+		}
+		switch raw {
+		case persistedSuffrageVoter:
+			suffrage = SuffrageVoter
+		case persistedSuffrageLearner:
+			suffrage = SuffrageLearner
+		default:
+			return Peer{}, errors.WithStack(errors.Newf("unknown peer suffrage byte %d", raw))
+		}
 	}
 	id, err := readString(reader, maxPersistedPeerStr, "peer id")
 	if err != nil {
@@ -140,11 +190,16 @@ func readPersistedPeer(reader io.Reader) (Peer, error) {
 	if err != nil {
 		return Peer{}, err
 	}
-	return normalizePersistedPeer(Peer{
+	peer, err := normalizePersistedPeer(Peer{
 		NodeID:  nodeID,
 		ID:      id,
 		Address: address,
 	})
+	if err != nil {
+		return Peer{}, err
+	}
+	peer.Suffrage = suffrage
+	return peer, nil
 }
 
 func writePersistedPeersFile(path string, state persistedPeers) error {
@@ -164,13 +219,7 @@ func writePersistedPeersFile(path string, state persistedPeers) error {
 			return err
 		}
 		for _, peer := range state.Peers {
-			if err := writeU64(writer, peer.NodeID); err != nil {
-				return err
-			}
-			if err := writeString(writer, peer.ID); err != nil {
-				return err
-			}
-			if err := writeString(writer, peer.Address); err != nil {
+			if err := writePersistedPeerEntry(writer, peer); err != nil {
 				return err
 			}
 		}
@@ -179,6 +228,26 @@ func writePersistedPeersFile(path string, state persistedPeers) error {
 		}
 		return nil
 	})
+}
+
+func writePersistedPeerEntry(w io.Writer, peer Peer) error {
+	if err := writeU64(w, peer.NodeID); err != nil {
+		return err
+	}
+	if err := writeU8(w, persistedSuffrageByte(peer.Suffrage)); err != nil {
+		return err
+	}
+	if err := writeString(w, peer.ID); err != nil {
+		return err
+	}
+	return writeString(w, peer.Address)
+}
+
+func persistedSuffrageByte(suffrage string) uint8 {
+	if suffrage == SuffrageLearner {
+		return persistedSuffrageLearner
+	}
+	return persistedSuffrageVoter
 }
 
 func readString(r io.Reader, maxSize uint32, kind string) (string, error) {
