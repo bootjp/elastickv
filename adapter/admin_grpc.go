@@ -535,7 +535,7 @@ func (s *AdminServer) GetKeyVizMatrix(
 	to := unixMsToTime(req.GetToUnixMs())
 	cols := sampler.Snapshot(from, to)
 	pickValue := matrixSeriesPicker(req.GetSeries())
-	return matrixToProto(cols, pickValue), nil
+	return matrixToProto(cols, pickValue, int(req.GetRows())), nil
 }
 
 // unixMsToTime converts a Unix-millisecond timestamp into a time.Time,
@@ -572,7 +572,13 @@ func matrixSeriesPicker(series pb.KeyVizSeries) func(keyviz.MatrixRow) uint64 {
 // values slice aligned to the column_unix_ms parallel slice. Idle
 // routes (zero in every column) are not emitted by the sampler, so
 // the row set already reflects observed activity in [from, to).
-func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint64) *pb.GetKeyVizMatrixResponse {
+//
+// rowBudget caps how many rows the response carries — passing
+// 0 means "no cap." When the budget would be exceeded, rows are
+// sorted by total activity across the requested series and the
+// top-N retained, so callers asking for a compact matrix do not
+// receive a payload that scales with the route count.
+func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint64, rowBudget int) *pb.GetKeyVizMatrixResponse {
 	resp := &pb.GetKeyVizMatrixResponse{
 		ColumnUnixMs: make([]int64, len(cols)),
 	}
@@ -594,21 +600,56 @@ func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint6
 	for i, id := range order {
 		resp.Rows[i] = rowsByID[id]
 	}
+	resp.Rows = applyKeyVizRowBudget(resp.Rows, rowBudget)
 	sortKeyVizRowsByStart(resp.Rows)
 	return resp
+}
+
+// applyKeyVizRowBudget caps rows to budget by total activity per row
+// (sum of per-column values), preserving the top-N rows. budget <= 0
+// means "no cap."
+func applyKeyVizRowBudget(rows []*pb.KeyVizRow, budget int) []*pb.KeyVizRow {
+	if budget <= 0 || len(rows) <= budget {
+		return rows
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rowActivityTotal(rows[i]) > rowActivityTotal(rows[j])
+	})
+	return rows[:budget]
+}
+
+func rowActivityTotal(r *pb.KeyVizRow) uint64 {
+	var sum uint64
+	for _, v := range r.Values {
+		sum += v
+	}
+	return sum
 }
 
 // newKeyVizRowFrom seeds a proto row from the first MatrixRow seen
 // for a given RouteID. Values is allocated with len == numCols so
 // every column gets a deterministic slot (zero-valued by default).
+//
+// route_count surfaces MemberRoutesTotal (the true number of routes
+// folded into the bucket) — not just len(MemberRoutes), which the
+// sampler caps at MaxMemberRoutesPerSlot. When the visible list is
+// shorter than the total, route_ids_truncated lets consumers know
+// to trust route_count for drill-down decisions.
 func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *pb.KeyVizRow {
+	total := mr.MemberRoutesTotal
+	if !mr.Aggregate && total == 0 {
+		// Individual slots fall through to RouteCount=1 when the
+		// sampler predates MemberRoutesTotal or never set it.
+		total = 1
+	}
 	row := &pb.KeyVizRow{
-		BucketId:   bucketIDFor(mr),
-		Start:      append([]byte(nil), mr.Start...),
-		End:        append([]byte(nil), mr.End...),
-		Aggregate:  mr.Aggregate,
-		RouteCount: uint64(len(mr.MemberRoutes)),
-		Values:     make([]uint64, numCols),
+		BucketId:          bucketIDFor(mr),
+		Start:             append([]byte(nil), mr.Start...),
+		End:               append([]byte(nil), mr.End...),
+		Aggregate:         mr.Aggregate,
+		RouteCount:        total,
+		RouteIdsTruncated: mr.Aggregate && total > uint64(len(mr.MemberRoutes)),
+		Values:            make([]uint64, numCols),
 	}
 	if mr.Aggregate {
 		row.RouteIds = append([]uint64(nil), mr.MemberRoutes...)

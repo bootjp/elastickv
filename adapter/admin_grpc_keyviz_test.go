@@ -143,7 +143,10 @@ func TestGetKeyVizMatrixSeriesSelection(t *testing.T) {
 
 // TestGetKeyVizMatrixEncodesAggregateBucket pins the proto layout
 // for virtual buckets: bucket_id prefixed "virtual:", aggregate=true,
-// route_ids carries the MemberRoutes list, and route_count matches.
+// route_ids carries the visible MemberRoutes list, and route_count
+// reports the TRUE total (MemberRoutesTotal) — including past-cap
+// folded routes — so consumers always know how many routes
+// contributed.
 func TestGetKeyVizMatrixEncodesAggregateBucket(t *testing.T) {
 	t.Parallel()
 	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{
@@ -151,12 +154,13 @@ func TestGetKeyVizMatrixEncodesAggregateBucket(t *testing.T) {
 			At: time.Unix(1_700_000_000, 0),
 			Rows: []keyviz.MatrixRow{
 				{
-					RouteID:      ^uint64(0), // synthetic virtual-bucket ID
-					Start:        []byte("c"),
-					End:          []byte("d"),
-					Aggregate:    true,
-					MemberRoutes: []uint64{2, 3, 4},
-					Reads:        50,
+					RouteID:           ^uint64(0), // synthetic virtual-bucket ID
+					Start:             []byte("c"),
+					End:               []byte("d"),
+					Aggregate:         true,
+					MemberRoutes:      []uint64{2, 3, 4},
+					MemberRoutesTotal: 3,
+					Reads:             50,
 				},
 			},
 		},
@@ -171,5 +175,72 @@ func TestGetKeyVizMatrixEncodesAggregateBucket(t *testing.T) {
 	require.True(t, r.Aggregate)
 	require.Equal(t, "virtual:18446744073709551615", r.BucketId)
 	require.Equal(t, uint64(3), r.RouteCount)
+	require.False(t, r.RouteIdsTruncated)
 	require.Equal(t, []uint64{2, 3, 4}, r.RouteIds)
+}
+
+// TestGetKeyVizMatrixSurfacesRouteCountTruncation pins Codex round-1
+// P2 on PR #646: when the sampler caps MemberRoutes at
+// MaxMemberRoutesPerSlot, route_count must still report the TRUE
+// total (MemberRoutesTotal) and route_ids_truncated must flip true so
+// consumers know the visible list is a prefix.
+func TestGetKeyVizMatrixSurfacesRouteCountTruncation(t *testing.T) {
+	t.Parallel()
+	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{
+		{
+			At: time.Unix(1_700_000_000, 0),
+			Rows: []keyviz.MatrixRow{
+				{
+					RouteID:           ^uint64(0),
+					Start:             []byte("c"),
+					End:               []byte("d"),
+					Aggregate:         true,
+					MemberRoutes:      []uint64{2, 3}, // visible cap=2
+					MemberRoutesTotal: 9,              // 7 more folded past the cap
+					Reads:             100,
+				},
+			},
+		},
+	})
+
+	resp, err := srv.GetKeyVizMatrix(context.Background(), &pb.GetKeyVizMatrixRequest{
+		Series: pb.KeyVizSeries_KEYVIZ_SERIES_READS,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Rows, 1)
+	r := resp.Rows[0]
+	require.Equal(t, uint64(9), r.RouteCount, "route_count must reflect MemberRoutesTotal")
+	require.True(t, r.RouteIdsTruncated, "route_ids_truncated must signal capped membership")
+	require.Equal(t, []uint64{2, 3}, r.RouteIds)
+}
+
+// TestGetKeyVizMatrixHonorsRowsBudget pins Codex round-1 P1 on
+// PR #646: a request with rows=N must return at most N rows. We
+// stage 4 routes with distinct activity totals and request rows=2;
+// the response must contain only the two highest-activity routes,
+// sorted by Start.
+func TestGetKeyVizMatrixHonorsRowsBudget(t *testing.T) {
+	t.Parallel()
+	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{
+		{
+			At: time.Unix(1_700_000_000, 0),
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Reads: 1},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Reads: 100},
+				{RouteID: 3, Start: []byte("c"), End: []byte("d"), Reads: 5},
+				{RouteID: 4, Start: []byte("d"), End: []byte("e"), Reads: 50},
+			},
+		},
+	})
+
+	resp, err := srv.GetKeyVizMatrix(context.Background(), &pb.GetKeyVizMatrixRequest{
+		Series: pb.KeyVizSeries_KEYVIZ_SERIES_READS,
+		Rows:   2,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Rows, 2, "rows budget must cap response size")
+	// Top 2 by activity = routes 2 (100) and 4 (50); sorted by Start
+	// gives "b" then "d".
+	require.Equal(t, "route:2", resp.Rows[0].BucketId)
+	require.Equal(t, "route:4", resp.Rows[1].BucketId)
 }

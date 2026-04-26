@@ -226,6 +226,12 @@ type routeSlot struct {
 	// routes together (Snapshot surfaces this in MatrixRow).
 	Aggregate    bool
 	MemberRoutes []uint64
+	// MemberRoutesTotal counts every distinct routeID that has folded
+	// into this bucket, including ones beyond MaxMemberRoutesPerSlot
+	// (which still contribute to the counters but are not appended to
+	// MemberRoutes). Always equals len(MemberRoutes) for individual
+	// (non-Aggregate) slots.
+	MemberRoutesTotal uint64
 
 	reads      atomic.Uint64
 	writes     atomic.Uint64
@@ -238,7 +244,7 @@ type routeSlot struct {
 // Start/End/MemberRoutes with the live slot (which a later
 // RegisterRoute may extend, and which the snapshot API exports to
 // external consumers that may mutate the bounds).
-func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64) {
+func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64, membersTotal uint64) {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	start = cloneBytes(s.Start)
@@ -247,6 +253,7 @@ func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members [
 	if len(s.MemberRoutes) > 0 {
 		members = append([]uint64(nil), s.MemberRoutes...)
 	}
+	membersTotal = s.MemberRoutesTotal
 	return
 }
 
@@ -263,6 +270,12 @@ type MatrixRow struct {
 	Start, End   []byte
 	Aggregate    bool
 	MemberRoutes []uint64
+	// MemberRoutesTotal is how many distinct route IDs contributed to
+	// this row's counters, including ones that exceeded
+	// MaxMemberRoutesPerSlot and so are NOT listed in MemberRoutes.
+	// Snapshot consumers should treat MemberRoutes as the visible
+	// prefix of this list when MemberRoutesTotal > len(MemberRoutes).
+	MemberRoutesTotal uint64
 
 	Reads      uint64
 	Writes     uint64
@@ -379,9 +392,10 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		slot := s.reclaimRetiredSlot(routeID)
 		if slot == nil {
 			slot = &routeSlot{
-				RouteID: routeID,
-				Start:   cloneBytes(start),
-				End:     cloneBytes(end),
+				RouteID:           routeID,
+				Start:             cloneBytes(start),
+				End:               cloneBytes(end),
+				MemberRoutesTotal: 1,
 			}
 		} else {
 			// Re-registering the same routeID inside the grace window:
@@ -394,6 +408,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 			slot.metaMu.Lock()
 			slot.Start = cloneBytes(start)
 			slot.End = cloneBytes(end)
+			slot.MemberRoutesTotal = 1
 			slot.metaMu.Unlock()
 		}
 		next.slots[routeID] = slot
@@ -410,11 +425,12 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 	bucket := findVirtualBucket(next.sortedSlots, start)
 	if bucket == nil {
 		bucket = &routeSlot{
-			RouteID:      s.nextVirtualBucketID(),
-			Start:        cloneBytes(start),
-			End:          cloneBytes(end),
-			Aggregate:    true,
-			MemberRoutes: []uint64{routeID},
+			RouteID:           s.nextVirtualBucketID(),
+			Start:             cloneBytes(start),
+			End:               cloneBytes(end),
+			Aggregate:         true,
+			MemberRoutes:      []uint64{routeID},
+			MemberRoutesTotal: 1,
 		}
 		next.sortedSlots = appendSorted(next.sortedSlots, bucket)
 	} else {
@@ -443,9 +459,11 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 // the routeID is not added to the visible member list.
 func (s *MemSampler) foldIntoBucket(next *routeTable, bucket *routeSlot, routeID uint64, start, end []byte) {
 	bucket.metaMu.Lock()
-	if !memberRoutesContains(bucket.MemberRoutes, routeID) &&
-		len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
-		bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+	if !memberRoutesContains(bucket.MemberRoutes, routeID) {
+		bucket.MemberRoutesTotal++
+		if len(bucket.MemberRoutes) < s.opts.MaxMemberRoutesPerSlot {
+			bucket.MemberRoutes = append(bucket.MemberRoutes, routeID)
+		}
 	}
 	if len(end) == 0 || (len(bucket.End) != 0 && bytesGT(end, bucket.End)) {
 		bucket.End = cloneBytes(end)
@@ -703,17 +721,26 @@ func bucketStillReferenced(virtualForRoute map[uint64]*routeSlot, bucket *routeS
 
 // pruneMemberRoute removes routeID from bucket.MemberRoutes under the
 // bucket's metaMu so a concurrent snapshotMeta reader sees a
-// consistent view.
+// consistent view. MemberRoutesTotal is decremented when the routeID
+// was visible in MemberRoutes (the only case we can confidently
+// account for) — routes pruned past the visible cap stay in the
+// total because we don't track individual past-cap members.
 func pruneMemberRoute(bucket *routeSlot, routeID uint64) {
 	bucket.metaMu.Lock()
 	defer bucket.metaMu.Unlock()
 	filtered := bucket.MemberRoutes[:0]
+	removed := false
 	for _, m := range bucket.MemberRoutes {
-		if m != routeID {
-			filtered = append(filtered, m)
+		if m == routeID {
+			removed = true
+			continue
 		}
+		filtered = append(filtered, m)
 	}
 	bucket.MemberRoutes = filtered
+	if removed && bucket.MemberRoutesTotal > 0 {
+		bucket.MemberRoutesTotal--
+	}
 }
 
 // Step returns the configured flush interval after applying default
@@ -739,17 +766,18 @@ func appendDrainedRow(rows []MatrixRow, slot *routeSlot) []MatrixRow {
 	if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
 		return rows
 	}
-	start, end, aggregate, members := slot.snapshotMeta()
+	start, end, aggregate, members, membersTotal := slot.snapshotMeta()
 	return append(rows, MatrixRow{
-		RouteID:      slot.RouteID,
-		Start:        start,
-		End:          end,
-		Aggregate:    aggregate,
-		MemberRoutes: members,
-		Reads:        reads,
-		Writes:       writes,
-		ReadBytes:    readBytes,
-		WriteBytes:   writeBytes,
+		RouteID:           slot.RouteID,
+		Start:             start,
+		End:               end,
+		Aggregate:         aggregate,
+		MemberRoutes:      members,
+		MemberRoutesTotal: membersTotal,
+		Reads:             reads,
+		Writes:            writes,
+		ReadBytes:         readBytes,
+		WriteBytes:        writeBytes,
 	})
 }
 
