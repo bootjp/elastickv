@@ -74,6 +74,7 @@ func startAdminFromFlags(
 	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
+	s3Server *adapter.S3Server,
 	coordinate kv.Coordinator,
 	connCache *kv.GRPCConnCache,
 ) error {
@@ -117,11 +118,12 @@ func startAdminFromFlags(
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
 	tablesSrc := newDynamoTablesSource(dynamoServer)
+	bucketsSrc := newBucketsSource(s3Server)
 	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, forwarder, buildVersion())
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, forwarder, buildVersion())
 	return err
 }
 
@@ -165,6 +167,62 @@ func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSou
 		return nil
 	}
 	return &dynamoTablesBridge{server: dynamoServer}
+}
+
+// newBucketsSource is the S3 counterpart of newDynamoTablesSource.
+// Returns nil when s3Server is nil so a build that ships without the
+// S3 adapter (--s3Address empty) silently disables the
+// /admin/api/v1/s3/buckets routes.
+func newBucketsSource(s3Server *adapter.S3Server) admin.BucketsSource {
+	if s3Server == nil {
+		return nil
+	}
+	return &bucketsBridge{server: s3Server}
+}
+
+// bucketsBridge re-shapes the adapter's AdminBucketSummary DTO into
+// the admin package's BucketSummary, threading through the
+// (result, present, error) tuple semantics for the describe path.
+// CreatedAtHLC is formatted into the SPA's expected ISO-8601 string
+// here rather than in the adapter — formatting is a UI concern, not
+// a storage one.
+type bucketsBridge struct {
+	server *adapter.S3Server
+}
+
+func (b *bucketsBridge) AdminListBuckets(ctx context.Context) ([]admin.BucketSummary, error) {
+	rows, err := b.server.AdminListBuckets(ctx)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // adapter wraps internally with cockroachdb/errors.
+	}
+	out := make([]admin.BucketSummary, len(rows))
+	for i, r := range rows {
+		out[i] = bucketSummaryFromAdapter(r)
+	}
+	return out, nil
+}
+
+func (b *bucketsBridge) AdminDescribeBucket(ctx context.Context, name string) (*admin.BucketSummary, bool, error) {
+	row, exists, err := b.server.AdminDescribeBucket(ctx, name)
+	if err != nil {
+		return nil, false, err //nolint:wrapcheck // adapter wraps internally.
+	}
+	if !exists || row == nil {
+		return nil, false, nil
+	}
+	summary := bucketSummaryFromAdapter(*row)
+	return &summary, true, nil
+}
+
+func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {
+	return admin.BucketSummary{
+		Name:       in.Name,
+		ACL:        in.ACL,
+		CreatedAt:  admin.FormatBucketCreatedAt(in.CreatedAtHLC),
+		Generation: in.Generation,
+		Region:     in.Region,
+		Owner:      in.Owner,
+	}
 }
 
 // dynamoTablesBridge is the thin adapter that re-shapes the adapter's
@@ -384,6 +442,7 @@ func startAdminServer(
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
 	tables admin.TablesSource,
+	buckets admin.BucketsSource,
 	forwarder admin.LeaderForwarder,
 	version string,
 ) (string, error) {
@@ -392,7 +451,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, forwarder)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, forwarder)
 	if err != nil {
 		return "", err
 	}
@@ -432,7 +491,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, forwarder admin.LeaderForwarder) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, forwarder admin.LeaderForwarder) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -452,6 +511,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Roles:       adminCfg.RoleIndex(),
 		ClusterInfo: cluster,
 		Tables:      tables,
+		Buckets:     buckets,
 		Forwarder:   forwarder,
 		StaticFS:    nil,
 		AuthOpts: admin.AuthServiceOpts{
