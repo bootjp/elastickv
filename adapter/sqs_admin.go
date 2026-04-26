@@ -68,15 +68,30 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 	if err != nil {
 		return nil, false, err
 	}
-	summary := &AdminQueueSummary{
+	return adminQueueSummary(name, meta, counters), true, nil
+}
+
+// adminQueueSummary projects a queue meta + counters into the
+// SPA-facing AdminQueueSummary. CreatedAt comes from the canonical
+// wall-clock CreatedAtMillis (not CreatedAtHLC, which the meta's own
+// comment calls "unsuitable for wall-clock display"); a zero millis
+// value yields a zero time.Time so the JSON omitempty drops the field
+// and the SPA renders "—" instead of an HLC-derived 1970 epoch.
+// Pulled into a helper so the conversion is unit-testable without
+// standing up a full coordinator.
+func adminQueueSummary(name string, meta *sqsQueueMeta, counters sqsApproxCounters) *AdminQueueSummary {
+	var createdAt time.Time
+	if meta.CreatedAtMillis > 0 {
+		createdAt = time.UnixMilli(meta.CreatedAtMillis).UTC()
+	}
+	return &AdminQueueSummary{
 		Name:       name,
 		IsFIFO:     meta.IsFIFO,
 		Generation: meta.Generation,
-		CreatedAt:  hlcToTime(meta.CreatedAtHLC),
+		CreatedAt:  createdAt,
 		Attributes: metaAttributesForAdmin(meta),
 		Counters:   AdminQueueCounters(counters),
 	}
-	return summary, true, nil
 }
 
 // AdminDeleteQueue is the SigV4-bypass counterpart to deleteQueue.
