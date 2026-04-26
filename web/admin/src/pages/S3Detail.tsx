@@ -8,7 +8,7 @@ import { formatApiError, useApiQuery } from "../lib/useApi";
 export function S3DetailPage() {
   const { name = "" } = useParams<{ name: string }>();
   const { session } = useAuth();
-  const detail = useApiQuery((_signal) => api.describeBucket(name), [name]);
+  const detail = useApiQuery((signal) => api.describeBucket(name, signal), [name]);
   const [aclBusy, setAclBusy] = useState(false);
   const [aclError, setAclError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);

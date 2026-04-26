@@ -8,7 +8,7 @@ import { formatApiError, useApiQuery } from "../lib/useApi";
 export function DynamoDetailPage() {
   const { name = "" } = useParams<{ name: string }>();
   const { session } = useAuth();
-  const detail = useApiQuery((_signal) => api.describeTable(name), [name]);
+  const detail = useApiQuery((signal) => api.describeTable(name, signal), [name]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);

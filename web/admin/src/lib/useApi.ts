@@ -23,6 +23,13 @@ export function useApiQuery<T>(
   const [tick, setTick] = useState(0);
   const loaderRef = useRef(loader);
   loaderRef.current = loader;
+  // markUnauthorizedRef mirrors loaderRef for the same reason: keep the
+  // 401 reaction out of the effect's dep list so a transient identity
+  // change in AuthProvider (e.g. React Fast Refresh in dev, or a future
+  // wrapping change) doesn't invalidate every active query and trigger
+  // a fresh network round-trip on every page.
+  const markUnauthorizedRef = useRef(markUnauthorized);
+  markUnauthorizedRef.current = markUnauthorized;
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -40,7 +47,7 @@ export function useApiQuery<T>(
         if (cancelled) return;
         if (ctrl.signal.aborted) return;
         if (err instanceof ApiError) {
-          if (err.status === 401) markUnauthorized();
+          if (err.status === 401) markUnauthorizedRef.current();
           setError(err);
         } else {
           setError(new ApiError(0, "network_error", String(err)));
@@ -54,8 +61,10 @@ export function useApiQuery<T>(
     // The loader itself is intentionally NOT in the dep list: callers
     // pass an inline arrow and the explicit deps array models the real
     // input set. Also include `tick` so reload() forces a refetch.
+    // markUnauthorized is read through markUnauthorizedRef so it does
+    // not need to be a dep either.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, tick, markUnauthorized]);
+  }, [...deps, tick]);
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
   return { data, error, loading, reload };

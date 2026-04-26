@@ -202,18 +202,18 @@ export const api = {
   logout: () => apiFetch<void>("/auth/logout", { method: "POST" }),
   cluster: (signal?: AbortSignal) =>
     apiFetch<ClusterInfo>("/cluster", { signal }),
-  listTables: (next_token?: string) =>
-    apiFetch<DynamoTableList>("/dynamo/tables", { query: { next_token } }),
-  describeTable: (name: string) =>
-    apiFetch<DynamoTable>(`/dynamo/tables/${encodeURIComponent(name)}`),
+  listTables: (next_token?: string, signal?: AbortSignal) =>
+    apiFetch<DynamoTableList>("/dynamo/tables", { query: { next_token }, signal }),
+  describeTable: (name: string, signal?: AbortSignal) =>
+    apiFetch<DynamoTable>(`/dynamo/tables/${encodeURIComponent(name)}`, { signal }),
   createTable: (req: CreateTableRequest) =>
     apiFetch<DynamoTable>("/dynamo/tables", { method: "POST", body: req as unknown as Json }),
   deleteTable: (name: string) =>
     apiFetch<void>(`/dynamo/tables/${encodeURIComponent(name)}`, { method: "DELETE" }),
-  listBuckets: (next_token?: string) =>
-    apiFetch<S3BucketList>("/s3/buckets", { query: { next_token } }),
-  describeBucket: (name: string) =>
-    apiFetch<S3Bucket>(`/s3/buckets/${encodeURIComponent(name)}`),
+  listBuckets: (next_token?: string, signal?: AbortSignal) =>
+    apiFetch<S3BucketList>("/s3/buckets", { query: { next_token }, signal }),
+  describeBucket: (name: string, signal?: AbortSignal) =>
+    apiFetch<S3Bucket>(`/s3/buckets/${encodeURIComponent(name)}`, { signal }),
   createBucket: (req: CreateBucketRequest) =>
     apiFetch<S3Bucket>("/s3/buckets", { method: "POST", body: req as unknown as Json }),
   putBucketAcl: (name: string, acl: "private" | "public-read") =>

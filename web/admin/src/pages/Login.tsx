@@ -25,7 +25,10 @@ export function LoginPage() {
     e.preventDefault();
     setError(null);
     try {
-      await login(accessKey.trim(), secretKey);
+      // Trim both sides: SigV4 secret keys never contain whitespace, so
+      // trimming is safe and saves an operator who pasted a key with
+      // trailing newline from a cryptic 401.
+      await login(accessKey.trim(), secretKey.trim());
       const from = (location.state as LocationState | null)?.from ?? "/";
       navigate(from, { replace: true });
     } catch (err) {
