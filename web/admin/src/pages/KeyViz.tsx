@@ -122,12 +122,15 @@ function Heatmap({ matrix }: HeatmapProps) {
     // 1024 × 500: the colour ramp runs once per cell rather than per
     // pixel, and zero-value cells are skipped so the only work on a
     // quiet matrix is the initial clearRect.
+    // The `v === 0` short-circuit guarantees `maxValue > 0` by the
+    // time we reach the divide, so an explicit zero-divide guard is
+    // unreachable: every row that would trip it has already continued.
     for (let i = 0; i < matrix.rows.length; i++) {
       const row = matrix.rows[i];
       for (let j = 0; j < row.values.length; j++) {
         const v = row.values[j];
         if (v === 0) continue;
-        const t = maxValue === 0 ? 0 : v / maxValue;
+        const t = v / maxValue;
         const [r, g, b, a] = ramp(t);
         ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
         ctx.fillRect(j * cellW, i * cellH, cellW, cellH);
@@ -163,6 +166,11 @@ function Heatmap({ matrix }: HeatmapProps) {
           No tracked routes — drive some traffic and refresh.
         </div>
       ) : (
+        // TimeAxis lives inside the scroll container so its labels —
+        // which are absolutely positioned at `idx * cellW` — track the
+        // canvas as the user scrolls horizontally. Putting it outside
+        // would freeze the labels under the left edge whenever the
+        // canvas overflows.
         <div className="overflow-auto border border-border rounded">
           <canvas
             ref={canvasRef}
@@ -170,9 +178,9 @@ function Heatmap({ matrix }: HeatmapProps) {
             onMouseLeave={onLeave}
             style={{ display: "block", width, height }}
           />
+          <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
         </div>
       )}
-      <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
       {hoverRow !== null && matrix.rows[hoverRow] && (
         <RowDetail row={matrix.rows[hoverRow]} index={hoverRow} />
       )}

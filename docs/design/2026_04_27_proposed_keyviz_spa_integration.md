@@ -167,8 +167,11 @@ ceil(56 px / cellW))` so adjacent labels never overlap at small cell
 widths — at `cellW = 2 px` a naive every-tenth stride would pack
 ~54 px of monospace label into 2 px of horizontal space.
 
-Route axis labels: `bucket_id` truncated to 12 chars with a tooltip
-on hover. The full row data is available in the row-detail flyout.
+No inline labels are drawn on the route (Y) axis. At `cellH = 2 px`
+text would not fit, and at `cellH = 4 px` it would crowd into the
+heatmap. Instead, hovering over a row reveals the full `bucket_id`,
+key range, route count, and route IDs in a row-detail flyout below
+the canvas — the flyout supersedes the inline label idea.
 
 ### 4.3 Performance budget
 
@@ -223,8 +226,9 @@ Per `CLAUDE.md`, recorded for completeness even on a frontend change:
 2. **Concurrency / distributed failures** — n/a; a single browser tab
    polls a single handler instance. The handler itself is already
    tested for concurrent observers.
-3. **Performance** — Phase 2 §10 budget honoured by canvas + single
-   `putImageData`. No new dependency. Polling defaults to off.
+3. **Performance** — Phase 2 §10 budget honoured by canvas +
+   `fillRect` per non-zero cell (see §4.3 for why we deliberately
+   avoid `putImageData`). No new dependency. Polling defaults to off.
 4. **Data consistency** — The SPA renders whatever the handler
    returns; consistency guarantees come from the existing sampler
    (in-memory, leader-issued counters per Phase 2 design §5.1).
