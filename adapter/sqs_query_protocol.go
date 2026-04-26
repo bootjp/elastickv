@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -41,6 +42,13 @@ const (
 	// the wrong one for "compat" reasons silently breaks unmarshalling
 	// in aws-sdk-java v1.
 	sqsQueryNamespace = "http://queue.amazonaws.com/doc/2012-11-05/"
+
+	// sqsQueryRequestIDLen is the AWS-shape RequestId length: 22
+	// base32 chars. Base32 emits 1 char per 5 input bits, so 22 chars
+	// require ceil(22*5/8)=14 random bytes (110 bits — comfortably
+	// more entropy than UUID-v4). The constant is used both to size
+	// the random source and to trim the encoded output.
+	sqsQueryRequestIDLen = 22
 )
 
 // sqsProtocol enumerates the two wire formats the SQS listener now
@@ -138,10 +146,11 @@ func readQueryForm(r *http.Request) (url.Values, error) {
 	if r.URL == nil {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMalformedRequest, "missing request URL")
 	}
-	values := url.Values{}
-	for k, vs := range r.URL.Query() {
-		values[k] = append(values[k], vs...)
-	}
+	// r.URL.Query() returns a fresh map on each call so we can adopt
+	// it directly as the base instead of copying entries one-by-one
+	// (Gemini high-priority on PR #662). On GET we are done; on POST
+	// the body's form values are merged into the same map.
+	values := r.URL.Query()
 	if r.Method == http.MethodGet {
 		return values, nil
 	}
@@ -218,10 +227,13 @@ func parseQueryCreateQueue(form url.Values) (*sqsCreateQueueInput, error) {
 	if in.QueueName == "" {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "QueueName is required")
 	}
-	in.Attributes = collectIndexedKVPairs(form, "Attribute")
-	// Tags follow the same indexed-pair shape as Attributes but with
-	// a different prefix per the AWS CreateQueue reference.
-	in.Tags = collectIndexedKVPairs(form, "Tag")
+	in.Attributes = collectIndexedKVPairs(form, "Attribute", "Name")
+	// Tags use Tag.N.Key / Tag.N.Value (NOT Tag.N.Name). The AWS
+	// SQS query reference is explicit on this and CodexP1 / Gemini
+	// both flagged the previous .Name-only parser as a silent
+	// tag-loss bug. Pass the suffix in so each caller picks the AWS
+	// vocabulary for that resource.
+	in.Tags = collectIndexedKVPairs(form, "Tag", "Key")
 	return in, nil
 }
 
@@ -250,45 +262,100 @@ func parseQueryGetQueueUrl(form url.Values) *sqsGetQueueUrlInput {
 
 // collectIndexedKVPairs reads AWS-style indexed pairs of the form
 //
-//	<prefix>.1.Name = key1
-//	<prefix>.1.Value = value1
-//	<prefix>.2.Name = key2
-//	<prefix>.2.Value = value2
+//	<prefix>.1.<keyField> = key1
+//	<prefix>.1.Value      = value1
+//	<prefix>.2.<keyField> = key2
+//	<prefix>.2.Value      = value2
 //
-// and returns them as a map. Pairs missing either side are dropped
-// silently (AWS does the same — the validation that follows in the
-// core handler reports the actual problem). Keys are sorted by
-// their integer suffix so a caller that emits pairs out of order
-// gets a deterministic map; map iteration order in Go is randomised
-// so we don't actually depend on input order, but the sort is cheap
-// and keeps the function easy to test by inspection.
-func collectIndexedKVPairs(form url.Values, prefix string) map[string]string {
+// and returns them as a map. The keyField suffix is "Name" for
+// Attributes and "Key" for Tags per the AWS SQS query reference;
+// callers pass the right one. Pairs missing either side are dropped
+// silently (AWS does the same — the validator in the core handler
+// reports the actual problem).
+//
+// Iteration order: pairs are processed in ascending integer index
+// order (so two clients sending the same parameters in different
+// HTTP body orders see identical maps). When two distinct entries
+// resolve to the *same* key (e.g. both Attribute.1.Name and
+// Attribute.2.Name set to "VisibilityTimeout"), the lower index
+// wins — AWS rejects this case as InvalidParameterValue, but our
+// validator at the next layer is the right place for that, not
+// this codec; deterministic last-write-wins-by-index is enough to
+// make tests stable. (CodexP2 + Gemini high.)
+func collectIndexedKVPairs(form url.Values, prefix, keyField string) map[string]string {
 	if len(form) == 0 {
 		return nil
 	}
-	const nameSuffix = ".Name"
-	wantPrefix := prefix + "."
-	out := map[string]string{}
-	for k, vs := range form {
-		if !strings.HasPrefix(k, wantPrefix) || !strings.HasSuffix(k, nameSuffix) {
-			continue
+	pairs := gatherIndexedKVPairs(form, prefix+".", "."+keyField)
+	if len(pairs) == 0 {
+		return nil
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].idx < pairs[j].idx })
+	out := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		// Lower-index wins on duplicates so iteration order does not
+		// affect the result; map insertion overwrite would otherwise
+		// resurface the original non-determinism.
+		if _, taken := out[p.mapKey]; !taken {
+			out[p.mapKey] = p.mapVal
 		}
-		if len(vs) == 0 || vs[0] == "" {
-			continue
-		}
-		// k looks like "Attribute.1.Name"; the matching value key is
-		// "Attribute.1.Value".
-		valueKey := strings.TrimSuffix(k, nameSuffix) + ".Value"
-		valueVs, ok := form[valueKey]
-		if !ok || len(valueVs) == 0 {
-			continue
-		}
-		out[vs[0]] = valueVs[0]
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// indexedKVPair is an intermediate (idx, key, value) triple used to
+// sort the form's indexed entries before flattening into the final
+// map. Kept as a private struct so collectIndexedKVPairs and the
+// gather helper share the exact same shape.
+type indexedKVPair struct {
+	idx    int
+	mapKey string
+	mapVal string
+}
+
+// gatherIndexedKVPairs walks the form once and emits every well-formed
+// (idx, key, value) triple matching the wantPrefix / keySuffix shape.
+// Pulled out of collectIndexedKVPairs to keep that function under
+// cyclop=10 — the inner loop has too many guards to share a single
+// scope. Returns the slice in the order Go's map iteration produced;
+// the caller sorts.
+func gatherIndexedKVPairs(form url.Values, wantPrefix, keySuffix string) []indexedKVPair {
+	pairs := make([]indexedKVPair, 0)
+	for k, vs := range form {
+		idx, ok := indexedPairKeyToIdx(k, wantPrefix, keySuffix)
+		if !ok {
+			continue
+		}
+		if len(vs) == 0 || vs[0] == "" {
+			continue
+		}
+		valueKey := strings.TrimSuffix(k, keySuffix) + ".Value"
+		valueVs, found := form[valueKey]
+		if !found || len(valueVs) == 0 {
+			continue
+		}
+		pairs = append(pairs, indexedKVPair{idx: idx, mapKey: vs[0], mapVal: valueVs[0]})
+	}
+	return pairs
+}
+
+// indexedPairKeyToIdx parses "<wantPrefix><N><keySuffix>" and returns
+// (N, true). Non-matching shapes return (_, false). Non-integer
+// "<N>" segments (e.g. "Attribute.foo.Name") fall outside the AWS
+// contract and return false rather than guess.
+func indexedPairKeyToIdx(key, wantPrefix, keySuffix string) (int, bool) {
+	if !strings.HasPrefix(key, wantPrefix) || !strings.HasSuffix(key, keySuffix) {
+		return 0, false
+	}
+	idxStr := strings.TrimSuffix(strings.TrimPrefix(key, wantPrefix), keySuffix)
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
 }
 
 // ----------- response shapes -----------
@@ -437,17 +504,27 @@ func errorTypeForStatus(status int) string {
 	return "Receiver"
 }
 
-// newQueryRequestID returns a fresh per-response identifier. AWS
-// itself uses 22-character base32 of 16 random bytes; matching the
-// shape keeps client logs / support workflows predictable.
+// newQueryRequestID returns a fresh per-response identifier shaped
+// like the AWS RequestId: 22 chars of base32 (no padding). Base32
+// emits 1 char per 5 input bits, so 22 chars require ceil(22*5/8)=14
+// random bytes (110 bits, comfortably more entropy than a UUID-v4).
+// Gemini medium on PR #662 flagged the prior 16-byte source — that
+// produces a 26-char ID, not 22, and the comment was a lie.
 func newQueryRequestID() string {
-	var raw [16]byte
+	var raw [14]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		// crypto/rand.Read does not fail on supported platforms;
 		// returning a constant on the unreachable error keeps the
 		// signature error-free without hiding the symptom (operators
 		// will notice every RequestId being identical).
-		return "00000000000000000000000000"
+		return strings.Repeat("0", sqsQueryRequestIDLen)
 	}
-	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:])
+	// Base32 of 14 bytes is 23 raw chars in the no-padding form.
+	// Trim to the documented sqsQueryRequestIDLen so the ID is the
+	// exact AWS shape.
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:])
+	if len(encoded) > sqsQueryRequestIDLen {
+		encoded = encoded[:sqsQueryRequestIDLen]
+	}
+	return encoded
 }

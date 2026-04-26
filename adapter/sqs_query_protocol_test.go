@@ -70,7 +70,7 @@ func TestCollectIndexedKVPairs(t *testing.T) {
 		// noise that should not interfere
 		"NotAnAttribute": []string{"hi"},
 	}
-	got := collectIndexedKVPairs(form, "Attribute")
+	got := collectIndexedKVPairs(form, "Attribute", "Name")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 pairs, got %d (%v)", len(got), got)
 	}
@@ -85,16 +85,78 @@ func TestCollectIndexedKVPairs(t *testing.T) {
 	}
 }
 
+// TestCollectIndexedKVPairs_TagSuffix pins that the keyField argument
+// distinguishes Attribute (.Name) from Tag (.Key) shapes per the AWS
+// SQS query reference. CodexP1 + Gemini both flagged the prior
+// hardcoded .Name path as a silent tag-loss bug.
+func TestCollectIndexedKVPairs_TagSuffix(t *testing.T) {
+	t.Parallel()
+	form := url.Values{
+		"Tag.1.Key":   []string{"env"},
+		"Tag.1.Value": []string{"prod"},
+		"Tag.2.Key":   []string{"team"},
+		"Tag.2.Value": []string{"sre"},
+		// Wrong shape for tags: must NOT be picked up.
+		"Tag.3.Name":  []string{"shouldNotAppear"},
+		"Tag.3.Value": []string{"nope"},
+	}
+	got := collectIndexedKVPairs(form, "Tag", "Key")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 tag pairs, got %d (%v)", len(got), got)
+	}
+	if got["env"] != "prod" || got["team"] != "sre" {
+		t.Errorf("tag map = %v, want env=prod team=sre", got)
+	}
+	if _, present := got["shouldNotAppear"]; present {
+		t.Errorf("Tag.N.Name was incorrectly accepted as a tag key: %v", got)
+	}
+}
+
+// TestCollectIndexedKVPairs_DeterministicOnDuplicates pins that two
+// entries resolving to the same logical key resolve deterministically
+// (lower index wins). CodexP2 flagged the previous map iteration as
+// non-deterministic because Go map order is randomised.
+func TestCollectIndexedKVPairs_DeterministicOnDuplicates(t *testing.T) {
+	t.Parallel()
+	form := url.Values{
+		"Attribute.5.Name":  []string{"VisibilityTimeout"},
+		"Attribute.5.Value": []string{"50"},
+		"Attribute.2.Name":  []string{"VisibilityTimeout"},
+		"Attribute.2.Value": []string{"20"},
+	}
+	// Run many times to make sure map-iteration randomness does not
+	// leak through. Lower index (2) must win every iteration.
+	for i := 0; i < 64; i++ {
+		got := collectIndexedKVPairs(form, "Attribute", "Name")
+		if got["VisibilityTimeout"] != "20" {
+			t.Fatalf("iter %d: lower-index value lost; got=%v", i, got)
+		}
+	}
+}
+
 func TestCollectIndexedKVPairs_Empty(t *testing.T) {
 	t.Parallel()
-	if got := collectIndexedKVPairs(nil, "Attribute"); got != nil {
+	if got := collectIndexedKVPairs(nil, "Attribute", "Name"); got != nil {
 		t.Fatalf("nil form: got %v, want nil", got)
 	}
-	if got := collectIndexedKVPairs(url.Values{}, "Attribute"); got != nil {
+	if got := collectIndexedKVPairs(url.Values{}, "Attribute", "Name"); got != nil {
 		t.Fatalf("empty form: got %v, want nil", got)
 	}
-	if got := collectIndexedKVPairs(url.Values{"Other.1.Name": []string{"x"}, "Other.1.Value": []string{"y"}}, "Attribute"); got != nil {
+	if got := collectIndexedKVPairs(url.Values{"Other.1.Name": []string{"x"}, "Other.1.Value": []string{"y"}}, "Attribute", "Name"); got != nil {
 		t.Fatalf("unrelated form: got %v, want nil", got)
+	}
+}
+
+// TestNewQueryRequestID_Length pins the AWS shape: 22 base32 chars.
+// Gemini medium on PR #662 caught the prior 26-char output that
+// contradicted the function's own doc comment.
+func TestNewQueryRequestID_Length(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 64; i++ {
+		id := newQueryRequestID()
+		if len(id) != 22 {
+			t.Fatalf("RequestId length = %d, want 22; id=%q", len(id), id)
+		}
 	}
 }
 
