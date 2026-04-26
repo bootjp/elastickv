@@ -289,7 +289,6 @@ func run() error {
 	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
 	cleanup.Add(func() { lockResolver.Close() })
 	sampler := buildKeyVizSampler()
-	seedKeyVizRoutes(sampler, cfg.engine)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler))
@@ -297,6 +296,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(sampler, cfg.engine)
 	eg, runCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
