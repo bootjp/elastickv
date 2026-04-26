@@ -1,10 +1,13 @@
 package main
 
 import (
+	"log/slog"
+
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
 )
 
 // adminForwardConnFactory bridges kv.GRPCConnCache to the
@@ -74,6 +77,19 @@ type adminForwardServerDeps struct {
 // every forwarded call, so we silently skip registration instead.
 func (d adminForwardServerDeps) readyForRegistration() bool {
 	return d.tables != nil && d.roles != nil
+}
+
+// registerAdminForwardServer attaches the leader-side gRPC
+// AdminForward service to gs when the bundle is ready (TablesSource +
+// RoleStore both present). Centralising the call here keeps the
+// proto-level Register* import out of main.go's startRaftServers and
+// lets the readyForRegistration gate decide silently whether this
+// build serves forwarded admin writes at all.
+func registerAdminForwardServer(gs *grpc.Server, deps adminForwardServerDeps, logger *slog.Logger) {
+	if !deps.readyForRegistration() {
+		return
+	}
+	pb.RegisterAdminForwardServer(gs, admin.NewForwardServer(deps.tables, deps.roles, logger))
 }
 
 // roleStoreFromFlags builds the same access-key → role map that
