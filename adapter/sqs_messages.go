@@ -63,24 +63,46 @@ const (
 	sqsErrMessageNotInflight   = "MessageNotInflight"
 )
 
+// sqsMessageAttributeValue is the AWS-shaped MessageAttribute payload.
+// We accept the same JSON shape AWS SDKs send: DataType (required),
+// plus exactly one of StringValue or BinaryValue depending on the
+// declared type. BinaryValue is base64 on the wire and []byte in
+// memory; Go's json package handles the base64 conversion.
+type sqsMessageAttributeValue struct {
+	DataType    string `json:"DataType"`
+	StringValue string `json:"StringValue,omitempty"`
+	BinaryValue []byte `json:"BinaryValue,omitempty"`
+}
+
 // sqsMessageRecord mirrors !sqs|msg|data|... on disk. Visibility state
 // (VisibleAtMillis, CurrentReceiptToken, ReceiveCount) lives here rather
 // than in a side-record so a single OCC transaction can rotate it.
 type sqsMessageRecord struct {
-	MessageID              string            `json:"message_id"`
-	Body                   []byte            `json:"body"`
-	MD5OfBody              string            `json:"md5_of_body"`
-	MessageAttributes      map[string]string `json:"message_attributes,omitempty"`
-	SenderID               string            `json:"sender_id,omitempty"`
-	SendTimestampMillis    int64             `json:"send_timestamp_millis"`
-	AvailableAtMillis      int64             `json:"available_at_millis"`
-	VisibleAtMillis        int64             `json:"visible_at_millis"`
-	ReceiveCount           int64             `json:"receive_count"`
-	FirstReceiveMillis     int64             `json:"first_receive_millis,omitempty"`
-	CurrentReceiptToken    []byte            `json:"current_receipt_token"`
-	QueueGeneration        uint64            `json:"queue_generation"`
-	MessageGroupId         string            `json:"message_group_id,omitempty"`
-	MessageDeduplicationId string            `json:"message_deduplication_id,omitempty"`
+	MessageID              string                              `json:"message_id"`
+	Body                   []byte                              `json:"body"`
+	MD5OfBody              string                              `json:"md5_of_body"`
+	MD5OfMessageAttributes string                              `json:"md5_of_message_attributes,omitempty"`
+	MessageAttributes      map[string]sqsMessageAttributeValue `json:"message_attributes,omitempty"`
+	SenderID               string                              `json:"sender_id,omitempty"`
+	SendTimestampMillis    int64                               `json:"send_timestamp_millis"`
+	AvailableAtMillis      int64                               `json:"available_at_millis"`
+	VisibleAtMillis        int64                               `json:"visible_at_millis"`
+	ReceiveCount           int64                               `json:"receive_count"`
+	FirstReceiveMillis     int64                               `json:"first_receive_millis,omitempty"`
+	CurrentReceiptToken    []byte                              `json:"current_receipt_token"`
+	QueueGeneration        uint64                              `json:"queue_generation"`
+	MessageGroupId         string                              `json:"message_group_id,omitempty"`
+	MessageDeduplicationId string                              `json:"message_deduplication_id,omitempty"`
+	// SequenceNumber is the per-queue strict-order counter assigned at
+	// FIFO send time. AWS surfaces it on the SendMessage response and on
+	// every ReceiveMessage; ordering across messages with different
+	// MessageGroupId is undefined, but within a group the consumer sees
+	// monotonically increasing sequence numbers.
+	SequenceNumber uint64 `json:"sequence_number,omitempty"`
+	// DeadLetterSourceArn is set on records that arrived in this queue
+	// via DLQ redrive. AWS surfaces it on the DLQ-side ReceiveMessage so
+	// consumers can correlate moved messages back to their origin.
+	DeadLetterSourceArn string `json:"dead_letter_source_arn,omitempty"`
 }
 
 var storedSQSMsgPrefix = []byte{0x00, 'S', 'M', 0x01}
@@ -243,19 +265,20 @@ func decodeReceiptHandle(raw string) (*decodedReceiptHandle, error) {
 // ------------------------ input decoding ------------------------
 
 type sqsSendMessageInput struct {
-	QueueUrl               string            `json:"QueueUrl"`
-	MessageBody            string            `json:"MessageBody"`
-	DelaySeconds           *int64            `json:"DelaySeconds,omitempty"`
-	MessageAttributes      map[string]string `json:"MessageAttributes,omitempty"`
-	MessageGroupId         string            `json:"MessageGroupId,omitempty"`
-	MessageDeduplicationId string            `json:"MessageDeduplicationId,omitempty"`
+	QueueUrl               string                              `json:"QueueUrl"`
+	MessageBody            string                              `json:"MessageBody"`
+	DelaySeconds           *int64                              `json:"DelaySeconds,omitempty"`
+	MessageAttributes      map[string]sqsMessageAttributeValue `json:"MessageAttributes,omitempty"`
+	MessageGroupId         string                              `json:"MessageGroupId,omitempty"`
+	MessageDeduplicationId string                              `json:"MessageDeduplicationId,omitempty"`
 }
 
 type sqsReceiveMessageInput struct {
-	QueueUrl            string `json:"QueueUrl"`
-	MaxNumberOfMessages *int   `json:"MaxNumberOfMessages,omitempty"`
-	VisibilityTimeout   *int64 `json:"VisibilityTimeout,omitempty"`
-	WaitTimeSeconds     *int64 `json:"WaitTimeSeconds,omitempty"`
+	QueueUrl              string   `json:"QueueUrl"`
+	MaxNumberOfMessages   *int     `json:"MaxNumberOfMessages,omitempty"`
+	VisibilityTimeout     *int64   `json:"VisibilityTimeout,omitempty"`
+	WaitTimeSeconds       *int64   `json:"WaitTimeSeconds,omitempty"`
+	MessageAttributeNames []string `json:"MessageAttributeNames,omitempty"`
 }
 
 type sqsDeleteMessageInput struct {
@@ -287,17 +310,8 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, apiErr)
 		return
 	}
-	// AWS SDKs verify MD5OfMessageAttributes against the canonical
-	// binary encoding (sorted, length-prefixed, with transport type
-	// byte). The Milestone-1 adapter does not yet implement that
-	// canonical hash, and a non-matching value would make every SDK
-	// SendMessage call fail with MessageAttributeMD5Mismatch. Until
-	// Milestone 2 ships the canonical encoder, reject sends that
-	// actually carry MessageAttributes so clients fail clearly at
-	// the caller instead of mysteriously in the SDK.
-	if len(in.MessageAttributes) > 0 {
-		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"MessageAttributes are not yet supported; omit the field until canonical MD5 lands")
+	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
+		writeSQSErrorFromErr(w, apiErr)
 		return
 	}
 	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
@@ -309,6 +323,11 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, apiErr)
 		return
 	}
+	if meta.IsFIFO {
+		s.sendMessageFifoLoop(w, r, queueName, meta, in, delay, readTS)
+		return
+	}
+
 	rec, recordBytes, apiErr := buildSendRecord(meta, in, delay)
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
@@ -317,6 +336,7 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 	dataKey := sqsMsgDataKey(queueName, meta.Generation, rec.MessageID)
 	visKey := sqsMsgVisKey(queueName, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKey(queueName, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
 	metaKey := sqsQueueMetaKey(queueName)
 	genKey := sqsQueueGenKey(queueName)
 	// StartTS + ReadKeys fence against a concurrent DeleteQueue /
@@ -334,6 +354,7 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: dataKey, Value: recordBytes},
 			{Op: kv.Put, Key: visKey, Value: []byte(rec.MessageID)},
+			{Op: kv.Put, Key: byAgeKey, Value: []byte(rec.MessageID)},
 		},
 	}
 	if _, err := s.coordinator.Dispatch(r.Context(), req); err != nil {
@@ -346,6 +367,21 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		"MD5OfMessageBody":       rec.MD5OfBody,
 		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
 	})
+}
+
+// sendMessageFifoLoop runs the dedup-aware OCC send for FIFO queues
+// under the standard retry budget. Stamping the dedup record + new
+// sequence number happens inside one transaction so a concurrent send
+// either observes the dedup hit or loses the OCC race. The actual
+// retry loop and per-attempt meta / dedup / delay re-derivation live
+// in runFifoSendWithRetry.
+func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, queueName string, _ *sqsQueueMeta, in sqsSendMessageInput, _ int64, _ uint64) {
+	resp, err := s.runFifoSendWithRetry(r.Context(), queueName, in)
+	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
+	writeSQSJSON(w, resp)
 }
 
 // loadQueueMetaForSend reads the queue metadata and body-size-gates the
@@ -444,6 +480,7 @@ func buildSendRecord(meta *sqsQueueMeta, in sqsSendMessageInput, delay int64) (*
 		MessageID:              messageID,
 		Body:                   body,
 		MD5OfBody:              sqsMD5Hex(body),
+		MD5OfMessageAttributes: md5OfAttributesHex(in.MessageAttributes),
 		MessageAttributes:      in.MessageAttributes,
 		SendTimestampMillis:    now,
 		AvailableAtMillis:      availableAt,
@@ -512,12 +549,30 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	delivered, err := s.longPollReceive(ctx, queueName, max, visibilityTimeout, waitSeconds)
+	opts := sqsReceiveOptions{
+		Max:                   max,
+		VisibilityTimeout:     visibilityTimeout,
+		WaitSeconds:           waitSeconds,
+		MessageAttributeNames: in.MessageAttributeNames,
+	}
+	delivered, err := s.longPollReceive(ctx, queueName, opts)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
+}
+
+// sqsReceiveOptions bundles the per-request settings that ride down
+// the receive call chain. Threading individual params through
+// longPollReceive → scanAndDeliverOnce → rotateMessagesForDelivery →
+// tryDeliverCandidate → commitReceiveRotation gets unwieldy fast,
+// especially as new optional fields like MessageAttributeNames land.
+type sqsReceiveOptions struct {
+	Max                   int
+	VisibilityTimeout     int64
+	WaitSeconds           int64
+	MessageAttributeNames []string
 }
 
 // resolveReceiveWaitSeconds picks the effective long-poll duration: the
@@ -552,15 +607,15 @@ func resolveReceiveWaitSeconds(requested *int64, queueDefault int64) (int64, err
 // a DeleteQueue / PurgeQueue that commits during a long wait is
 // observed on the very next scan — otherwise we'd keep scanning
 // orphan keys under the old generation.
-func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, max int, visibilityTimeout, waitSeconds int64) ([]map[string]any, error) {
-	delivered, err := s.scanAndDeliverOnce(ctx, queueName, max, visibilityTimeout)
+func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, opts sqsReceiveOptions) ([]map[string]any, error) {
+	delivered, err := s.scanAndDeliverOnce(ctx, queueName, opts)
 	if err != nil {
 		return nil, err
 	}
-	if len(delivered) > 0 || waitSeconds <= 0 {
+	if len(delivered) > 0 || opts.WaitSeconds <= 0 {
 		return delivered, nil
 	}
-	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	deadline := time.Now().Add(time.Duration(opts.WaitSeconds) * time.Second)
 	ticker := time.NewTicker(sqsLongPollInterval)
 	defer ticker.Stop()
 	for {
@@ -572,7 +627,7 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, max i
 		if time.Now().After(deadline) {
 			return delivered, nil
 		}
-		delivered, err = s.scanAndDeliverOnce(ctx, queueName, max, visibilityTimeout)
+		delivered, err = s.scanAndDeliverOnce(ctx, queueName, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -582,14 +637,22 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, max i
 	}
 }
 
-// scanAndDeliverOnce is the single-pass scan+rotate the long-poll loop
+// scanAndDeliverOnce is the scan+rotate pass the long-poll loop
 // re-runs. Each pass takes its own snapshot so the OCC StartTS tracks
 // the most recent visible_at for the candidates it picked, AND each
 // pass re-reads queue metadata so a concurrent DeleteQueue /
 // PurgeQueue that bumps the generation is observed immediately. If
 // the queue has been deleted the method returns QueueDoesNotExist;
 // scan errors and other non-retryable failures propagate.
-func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, max int, visibilityTimeout int64) ([]map[string]any, error) {
+//
+// Scan and rotation are interleaved: a single scan page can be
+// consumed entirely by FIFO group-lock skips or DLQ redrive, leaving
+// the receive caller below opts.Max with deliverable messages still
+// further along in the visibility index. Looping until either
+// opts.Max is reached, the index is drained, or the wall-clock budget
+// elapses prevents false-empty returns under poison-message backlogs
+// or hot-FIFO-group fan-in.
+func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, opts sqsReceiveOptions) ([]map[string]any, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
@@ -598,11 +661,41 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, ma
 	if !exists {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
-	candidates, err := s.scanVisibleMessageCandidates(ctx, queueName, meta.Generation, max*sqsReceiveScanOverfetchFactor, readTS)
-	if err != nil {
-		return nil, err
+	now := time.Now().UnixMilli()
+	start, end := sqsMsgVisScanBounds(queueName, meta.Generation, now)
+	pageSize := opts.Max * sqsReceiveScanOverfetchFactor
+	if pageSize > sqsVisScanPageLimit {
+		pageSize = sqsVisScanPageLimit
 	}
-	return s.rotateMessagesForDelivery(ctx, queueName, meta.Generation, candidates, visibilityTimeout, meta.MessageRetentionSeconds, max, readTS)
+	deadline := time.Now().Add(sqsVisScanWallClockBudget)
+	delivered := make([]map[string]any, 0, opts.Max)
+	for len(delivered) < opts.Max {
+		if time.Now().After(deadline) {
+			return delivered, nil
+		}
+		page, next, done, scanErr := s.scanOneVisibleMessagePage(ctx, start, end, pageSize, readTS)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if len(page) == 0 {
+			return delivered, nil
+		}
+		fresh, err := s.rotateMessagesForDelivery(ctx, queueName, meta, page, readTS, sqsReceiveOptions{
+			Max:                   opts.Max - len(delivered),
+			VisibilityTimeout:     opts.VisibilityTimeout,
+			WaitSeconds:           opts.WaitSeconds,
+			MessageAttributeNames: opts.MessageAttributeNames,
+		})
+		if err != nil {
+			return delivered, err
+		}
+		delivered = append(delivered, fresh...)
+		if done {
+			return delivered, nil
+		}
+		start = next
+	}
+	return delivered, nil
 }
 
 // resolveReceiveMaxMessages validates MaxNumberOfMessages against the
@@ -631,25 +724,38 @@ type sqsMsgCandidate struct {
 	messageID string
 }
 
-func (s *SQSServer) scanVisibleMessageCandidates(ctx context.Context, queueName string, gen uint64, limit int, readTS uint64) ([]sqsMsgCandidate, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	now := time.Now().UnixMilli()
-	start, end := sqsMsgVisScanBounds(queueName, gen, now)
-	page := limit
-	if page > sqsVisScanPageLimit {
-		page = sqsVisScanPageLimit
-	}
-	kvs, err := s.store.ScanAt(ctx, start, end, page, readTS)
+// sqsVisScanWallClockBudget caps how long the scan + deliver loop may
+// spend paging the visibility index. The receive path filters
+// candidates after each scan page (FIFO group lock, retention expiry,
+// DLQ redrive); without a wall-clock cap a queue with thousands of
+// group-locked or poisoned messages ahead of one deliverable could
+// pin the leader for many milliseconds.
+const sqsVisScanWallClockBudget = 100 * time.Millisecond
+
+// scanOneVisibleMessagePage reads a single page of the visibility
+// index starting at `start`, returning the parsed candidates plus the
+// cursor for the next page. `done=true` means the scan range is
+// drained and the caller should stop paging.
+func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]sqsMsgCandidate, []byte, bool, error) {
+	kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, start, true, errors.WithStack(err)
+	}
+	if len(kvs) == 0 {
+		return nil, start, true, nil
 	}
 	out := make([]sqsMsgCandidate, 0, len(kvs))
 	for _, kvp := range kvs {
 		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value)})
 	}
-	return out, nil
+	if len(kvs) < pageSize {
+		return out, start, true, nil
+	}
+	next := nextScanCursorAfter(kvs[len(kvs)-1].Key)
+	if end != nil && bytes.Compare(next, end) >= 0 {
+		return out, next, true, nil
+	}
+	return out, next, false, nil
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to
@@ -683,22 +789,40 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, g
 	return rec, dataKey, false, nil
 }
 
-// expireMessage removes a retention-expired record and its current
-// visibility index entry in a single OCC transaction. On
-// ErrWriteConflict (another worker raced us to delete or rotate
-// this same message) we treat it as success: the message is no
-// longer our responsibility either way. Any other error propagates
+// expireMessage removes a retention-expired record, its current
+// visibility index entry, and the byage index entry in a single OCC
+// transaction. On ErrWriteConflict (another worker raced us to delete
+// or rotate this same message) we treat it as success: the message is
+// no longer our responsibility either way. Any other error propagates
 // so a coordinator / storage failure does not silently fall through
 // to "delivered empty", matching the receive-error policy.
-func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uint64, visKey, dataKey []byte, readTS uint64) error {
+func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uint64, visKey, dataKey []byte, rec *sqsMessageRecord, readTS uint64) error {
+	byAgeKey := sqsMsgByAgeKey(queueName, gen, rec.SendTimestampMillis, rec.MessageID)
+	readKeys := [][]byte{visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: visKey},
+		{Op: kv.Del, Key: dataKey},
+		{Op: kv.Del, Key: byAgeKey},
+	}
+	// FIFO retention expiry must release the group lock so a successor
+	// in the same group can become deliverable. This mirrors the delete
+	// and redrive paths.
+	if rec.MessageGroupId != "" {
+		lockKey := sqsMsgGroupKey(queueName, gen, rec.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, gen, rec.MessageGroupId, readTS)
+		if err != nil {
+			return err
+		}
+		if lock != nil && lock.MessageID == rec.MessageID {
+			readKeys = append(readKeys, lockKey)
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: lockKey})
+		}
+	}
 	req := &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  readTS,
-		ReadKeys: [][]byte{visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: visKey},
-			{Op: kv.Del, Key: dataKey},
-		},
+		ReadKeys: readKeys,
+		Elems:    elems,
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		if isRetryableTransactWriteError(err) {
@@ -706,26 +830,32 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uin
 		}
 		return errors.WithStack(err)
 	}
-	_ = gen // reserved for future per-queue expiry metrics
 	return nil
 }
 
 func (s *SQSServer) rotateMessagesForDelivery(
 	ctx context.Context,
 	queueName string,
-	gen uint64,
+	meta *sqsQueueMeta,
 	candidates []sqsMsgCandidate,
-	visibilityTimeout int64,
-	retentionSeconds int64,
-	max int,
 	readTS uint64,
+	opts sqsReceiveOptions,
 ) ([]map[string]any, error) {
-	delivered := make([]map[string]any, 0, max)
+	// Parse RedrivePolicy once per receive call rather than per
+	// candidate. The struct only changes via SetQueueAttributes /
+	// CreateQueue, so cross-candidate caching is safe.
+	var redrive *parsedRedrivePolicy
+	if meta.RedrivePolicy != "" {
+		if p, err := parseRedrivePolicy(meta.RedrivePolicy); err == nil {
+			redrive = p
+		}
+	}
+	delivered := make([]map[string]any, 0, opts.Max)
 	for _, cand := range candidates {
-		if len(delivered) >= max {
+		if len(delivered) >= opts.Max {
 			break
 		}
-		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, gen, cand, visibilityTimeout, retentionSeconds, readTS)
+		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, meta.Generation, cand, meta.MessageRetentionSeconds, readTS, opts, redrive)
 		if err != nil {
 			return delivered, err
 		}
@@ -753,9 +883,10 @@ func (s *SQSServer) tryDeliverCandidate(
 	queueName string,
 	gen uint64,
 	cand sqsMsgCandidate,
-	visibilityTimeout int64,
 	retentionSeconds int64,
 	readTS uint64,
+	opts sqsReceiveOptions,
+	redrive *parsedRedrivePolicy,
 ) (map[string]any, bool, error) {
 	rec, dataKey, skip, err := s.loadCandidateRecord(ctx, queueName, gen, cand, readTS)
 	if skip || err != nil {
@@ -764,7 +895,35 @@ func (s *SQSServer) tryDeliverCandidate(
 	if expired, err := s.handleRetentionExpiry(ctx, queueName, gen, cand, dataKey, rec, retentionSeconds, readTS); expired || err != nil {
 		return nil, expired, err
 	}
-	return s.commitReceiveRotation(ctx, queueName, gen, cand, dataKey, rec, visibilityTimeout, readTS)
+	if shouldRedrive(rec, redrive) {
+		// The candidate has hit maxReceiveCount; move it to the DLQ
+		// inside its own OCC transaction and skip past it. The
+		// receive response intentionally omits redriven messages —
+		// AWS does the same and consumers polling the source queue
+		// must not observe a poison message past the limit.
+		moved, err := s.redriveCandidateToDLQ(ctx, queueName, gen, cand, dataKey, rec, redrive, s.queueArn(queueName), readTS)
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, moved, nil
+	}
+	// FIFO group lock filter: skip candidates whose group is held by
+	// another in-flight message. Standard queues short-circuit because
+	// MessageGroupId is empty.
+	lockState := fifoLockAcquire
+	var lockKey []byte
+	if rec.MessageGroupId != "" {
+		state, key, err := s.classifyFifoGroupLock(ctx, queueName, gen, rec, readTS)
+		if err != nil {
+			return nil, false, err
+		}
+		if state == fifoLockSkip {
+			return nil, true, nil
+		}
+		lockState = state
+		lockKey = key
+	}
+	return s.commitReceiveRotation(ctx, queueName, gen, cand, dataKey, rec, readTS, opts, lockKey, lockState)
 }
 
 // handleRetentionExpiry deletes the candidate inline when its
@@ -780,21 +939,24 @@ func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string,
 	if now-rec.SendTimestampMillis <= retentionSeconds*sqsMillisPerSecond {
 		return false, nil
 	}
-	if err := s.expireMessage(ctx, queueName, gen, cand.visKey, dataKey, readTS); err != nil {
+	if err := s.expireMessage(ctx, queueName, gen, cand.visKey, dataKey, rec, readTS); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 // commitReceiveRotation runs the final OCC dispatch that rotates
-// receipt token + visibility index for a non-expired candidate.
-func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, visibilityTimeout int64, readTS uint64) (map[string]any, bool, error) {
+// receipt token + visibility index for a non-expired candidate. When
+// the candidate carries a MessageGroupId the transaction also
+// installs (or refreshes) the per-group lock so a later message in
+// the same group cannot overtake it on the next receive.
+func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, readTS uint64, opts sqsReceiveOptions, lockKey []byte, lockState fifoCandidateLockState) (map[string]any, bool, error) {
 	newToken, err := newReceiptToken()
 	if err != nil {
 		return nil, false, err
 	}
 	now := time.Now().UnixMilli()
-	newVisibleAt := now + visibilityTimeout*sqsMillisPerSecond
+	newVisibleAt := now + opts.VisibilityTimeout*sqsMillisPerSecond
 	rec.VisibleAtMillis = newVisibleAt
 	rec.CurrentReceiptToken = newToken
 	rec.ReceiveCount++
@@ -806,20 +968,9 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		return nil, false, err
 	}
 	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
-	// StartTS pins the OCC read snapshot to the timestamp we actually
-	// loaded the record at. ReadKeys cover: cand.visKey + dataKey so a
-	// concurrent rotation → conflict; sqsQueueMetaKey / sqsQueueGenKey
-	// so a concurrent DeleteQueue / PurgeQueue → conflict (DeleteQueue
-	// only mutates meta + generation and would otherwise slip through).
-	req := &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  readTS,
-		ReadKeys: [][]byte{cand.visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: cand.visKey},
-			{Op: kv.Put, Key: newVisKey, Value: []byte(cand.messageID)},
-			{Op: kv.Put, Key: dataKey, Value: recordBytes},
-		},
+	req, err := buildReceiveRotationOps(queueName, cand, dataKey, recordBytes, newVisKey, lockKey, lockState, newVisibleAt, readTS)
+	if err != nil {
+		return nil, false, err
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		if isRetryableTransactWriteError(err) {
@@ -832,17 +983,116 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 	if err != nil {
 		return nil, false, err
 	}
-	return map[string]any{
+	sysAttrs := buildReceiveSysAttributes(rec)
+	resp := map[string]any{
 		"MessageId":     cand.messageID,
 		"ReceiptHandle": handle,
 		"Body":          string(rec.Body),
 		"MD5OfBody":     rec.MD5OfBody,
-		"Attributes": map[string]string{
-			"ApproximateReceiveCount":          strconv.FormatInt(rec.ReceiveCount, 10),
-			"SentTimestamp":                    strconv.FormatInt(rec.SendTimestampMillis, 10),
-			"ApproximateFirstReceiveTimestamp": strconv.FormatInt(rec.FirstReceiveMillis, 10),
-		},
-	}, false, nil
+		"Attributes":    sysAttrs,
+	}
+	if filtered := selectMessageAttributes(rec.MessageAttributes, opts.MessageAttributeNames); len(filtered) > 0 {
+		resp["MessageAttributes"] = filtered
+		resp["MD5OfMessageAttributes"] = md5OfAttributesHex(filtered)
+	}
+	return resp, false, nil
+}
+
+// buildReceiveRotationOps assembles the OCC OperationGroup for a
+// successful receive rotation. The FIFO group lock branch is split out
+// here so commitReceiveRotation stays under the cyclomatic budget.
+func buildReceiveRotationOps(
+	queueName string,
+	cand sqsMsgCandidate,
+	dataKey []byte,
+	recordBytes []byte,
+	newVisKey []byte,
+	lockKey []byte,
+	lockState fifoCandidateLockState,
+	newVisibleAt int64,
+	readTS uint64,
+) (*kv.OperationGroup[kv.OP], error) {
+	readKeys := [][]byte{cand.visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: cand.visKey},
+		{Op: kv.Put, Key: newVisKey, Value: []byte(cand.messageID)},
+		{Op: kv.Put, Key: dataKey, Value: recordBytes},
+	}
+	if lockKey != nil {
+		_ = lockState // both fifoLockOwn and fifoLockAcquire write the same shape; documented for clarity
+		readKeys = append(readKeys, lockKey)
+		mut, err := fifoLockMutationsForReceive(lockKey, cand.messageID, newVisibleAt)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		elems = append(elems, mut...)
+	}
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: readKeys,
+		Elems:    elems,
+	}, nil
+}
+
+// buildReceiveSysAttributes flattens the message record's system
+// attributes into the AWS-shaped string map. Splitting it out keeps
+// commitReceiveRotation under the cyclomatic budget.
+func buildReceiveSysAttributes(rec *sqsMessageRecord) map[string]string {
+	sysAttrs := map[string]string{
+		"ApproximateReceiveCount":          strconv.FormatInt(rec.ReceiveCount, 10),
+		"SentTimestamp":                    strconv.FormatInt(rec.SendTimestampMillis, 10),
+		"ApproximateFirstReceiveTimestamp": strconv.FormatInt(rec.FirstReceiveMillis, 10),
+	}
+	if rec.MessageGroupId != "" {
+		sysAttrs["MessageGroupId"] = rec.MessageGroupId
+	}
+	if rec.MessageDeduplicationId != "" {
+		sysAttrs["MessageDeduplicationId"] = rec.MessageDeduplicationId
+	}
+	if rec.SequenceNumber > 0 {
+		sysAttrs["SequenceNumber"] = strconv.FormatUint(rec.SequenceNumber, 10)
+	}
+	if rec.DeadLetterSourceArn != "" {
+		sysAttrs["DeadLetterQueueSourceArn"] = rec.DeadLetterSourceArn
+	}
+	return sysAttrs
+}
+
+// selectMessageAttributes filters the stored MessageAttributes by the
+// names the caller asked for. AWS supports:
+//
+//   - omission / empty list  → return no attributes.
+//   - "All" or ".*"          → return everything.
+//   - explicit list          → return only those exact names.
+//
+// Returning a non-empty filter means the response also carries an
+// MD5OfMessageAttributes computed over the *filtered* set so SDKs that
+// re-verify the digest do not see a hash over attributes they did not
+// receive.
+func selectMessageAttributes(attrs map[string]sqsMessageAttributeValue, names []string) map[string]sqsMessageAttributeValue {
+	if len(attrs) == 0 || len(names) == 0 {
+		return nil
+	}
+	all := false
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n == "All" || n == ".*" {
+			all = true
+			break
+		}
+		want[n] = true
+	}
+	if all {
+		return attrs
+	}
+	out := make(map[string]sqsMessageAttributeValue, len(want))
+	for name, v := range attrs {
+		if want[name] {
+			out[name] = v
+		}
+	}
+	return out
 }
 
 func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
@@ -880,28 +1130,12 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 		if err != nil {
 			return err
 		}
-		switch outcome {
-		case sqsDeleteNoOp:
+		if outcome == sqsDeleteNoOp {
 			return nil
-		case sqsDeleteProceed:
-			// fall through to commit below
 		}
-		visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-		// StartTS pins OCC to the snapshot we loaded the record at, so a
-		// concurrent rotation that commits after our load but before a
-		// coordinator-assigned StartTS cannot slip past ReadKeys.
-		// ReadKeys also include the queue meta + generation keys so a
-		// concurrent DeleteQueue (which only touches those two keys)
-		// forces this delete to abort with ErrWriteConflict rather
-		// than committing against an orphan record.
-		req := &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			StartTS:  readTS,
-			ReadKeys: [][]byte{dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: dataKey},
-				{Op: kv.Del, Key: visKey},
-			},
+		req, err := s.buildDeleteOps(ctx, queueName, handle, rec, dataKey, readTS)
+		if err != nil {
+			return err
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
 			return nil
@@ -914,6 +1148,37 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "delete message retry attempts exhausted")
+}
+
+// buildDeleteOps assembles the OCC OperationGroup for a DeleteMessage
+// commit. The FIFO group-lock release branch lives here so the
+// retry-loop wrapper stays readable and within the cyclomatic budget.
+func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, handle *decodedReceiptHandle, rec *sqsMessageRecord, dataKey []byte, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
+	visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKey(queueName, handle.QueueGeneration, rec.SendTimestampMillis, rec.MessageID)
+	readKeys := [][]byte{dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: dataKey},
+		{Op: kv.Del, Key: visKey},
+		{Op: kv.Del, Key: byAgeKey},
+	}
+	if rec.MessageGroupId != "" {
+		lockKey := sqsMsgGroupKey(queueName, handle.QueueGeneration, rec.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, handle.QueueGeneration, rec.MessageGroupId, readTS)
+		if err != nil {
+			return nil, err
+		}
+		if lock != nil && lock.MessageID == rec.MessageID {
+			readKeys = append(readKeys, lockKey)
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: lockKey})
+		}
+	}
+	return &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: readKeys,
+		Elems:    elems,
+	}, nil
 }
 
 // sqsDeleteOutcome is a ternary tag returned by loadMessageForDelete so
@@ -1115,26 +1380,174 @@ func sqsMD5Hex(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// md5OfAttributesHex computes AWS's MD5 of a MessageAttributes map. The
-// real AWS format canonicalizes names and types; this adapter only
-// returns "" on an empty map and a simple concatenated hash otherwise
-// (full canonicalization lives in a follow-up PR along with typed
-// attribute values).
-func md5OfAttributesHex(attrs map[string]string) string {
+// md5OfAttributesHex computes the AWS-canonical MD5 over a
+// MessageAttributes map.
+//
+// Wire format (binary, hashed in this exact order):
+//
+//	for each name in sorted(names):
+//	  uint32be(len(name))         + name
+//	  uint32be(len(dataType))     + dataType
+//	  byte(0x01) for String/Number, byte(0x02) for Binary
+//	  for String/Number: uint32be(len(stringValue)) + stringValue
+//	  for Binary       : uint32be(len(binaryValue)) + binaryValue
+//
+// AWS SDKs (and `aws sqs` since CLI v2) verify this hash on
+// SendMessage / SendMessageBatch responses; a non-matching value makes
+// every send call fail with MessageAttributeMD5Mismatch, so the
+// algorithm is part of the wire contract, not an implementation
+// detail.
+// AWS canonical-MD5 wire format constants.
+const (
+	// sqsAttributeBaseTypeBinary is the canonical name AWS expects for
+	// the Binary base type; suffix-extended forms ("Binary.gzipped")
+	// share the same type byte.
+	sqsAttributeBaseTypeBinary = "Binary"
+	// sqsAttributeTransportByteString applies to String and Number;
+	// sqsAttributeTransportByteBinary applies to Binary.
+	sqsAttributeTransportByteString = byte(0x01)
+	sqsAttributeTransportByteBinary = byte(0x02)
+)
+
+func md5OfAttributesHex(attrs map[string]sqsMessageAttributeValue) string {
 	if len(attrs) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(attrs))
+	names := make([]string, 0, len(attrs))
 	for k := range attrs {
-		keys = append(keys, k)
+		names = append(names, k)
 	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(attrs[k])
-		b.WriteString(";")
+	sort.Strings(names)
+	var buf bytes.Buffer
+	for _, name := range names {
+		v := attrs[name]
+		writeMD5Length(&buf, name)
+		buf.WriteString(name)
+		writeMD5Length(&buf, v.DataType)
+		buf.WriteString(v.DataType)
+		if attributeTypeIsBinary(v.DataType) {
+			buf.WriteByte(sqsAttributeTransportByteBinary)
+			writeMD5LengthBytes(&buf, v.BinaryValue)
+			buf.Write(v.BinaryValue)
+		} else {
+			buf.WriteByte(sqsAttributeTransportByteString)
+			writeMD5Length(&buf, v.StringValue)
+			buf.WriteString(v.StringValue)
+		}
 	}
-	return sqsMD5Hex([]byte(b.String()))
+	return sqsMD5Hex(buf.Bytes())
+}
+
+func writeMD5Length(b *bytes.Buffer, s string) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], safeUint32Len(len(s)))
+	b.Write(lenBuf[:])
+}
+
+func writeMD5LengthBytes(b *bytes.Buffer, p []byte) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], safeUint32Len(len(p)))
+	b.Write(lenBuf[:])
+}
+
+// safeUint32Len narrows an int length into a uint32 with an explicit
+// gate. AWS's canonical MD5 spec uses a 4-byte length prefix, so any
+// payload over 4 GiB is malformed by definition; wrapping the cast
+// silently would corrupt the hash, so we clamp to the max value.
+func safeUint32Len(n int) uint32 {
+	if n < 0 {
+		return 0
+	}
+	const max = int(^uint32(0))
+	if n > max {
+		return ^uint32(0)
+	}
+	return uint32(n)
+}
+
+// attributeTypeIsBinary returns true when the AWS DataType (which may
+// carry a custom suffix after a `.`) declares a Binary payload.
+func attributeTypeIsBinary(dataType string) bool {
+	base := dataType
+	if i := strings.Index(dataType, "."); i >= 0 {
+		base = dataType[:i]
+	}
+	return base == sqsAttributeBaseTypeBinary
+}
+
+// validateMessageAttributes enforces the AWS rules a client expects to
+// see:
+//
+//   - DataType must start with String, Number, or Binary; a custom
+//     suffix `<Base>.<custom>` is allowed.
+//   - String / Number attributes carry a non-empty StringValue; Binary
+//     attributes carry a non-empty BinaryValue.
+//   - At most 10 message attributes per send call.
+//
+// Returning the AWS error shape early lets the SDK MD5 verification
+// path stay clean: by the time we hash the map we know every entry is
+// well-formed.
+func validateMessageAttributes(attrs map[string]sqsMessageAttributeValue) error {
+	const maxAttrs = 10
+	if len(attrs) > maxAttrs {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"MessageAttributes is limited to 10 entries per call")
+	}
+	for name, v := range attrs {
+		if err := validateOneMessageAttribute(name, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOneMessageAttribute(name string, v sqsMessageAttributeValue) error {
+	if name == "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"MessageAttribute name must be non-empty")
+	}
+	if v.DataType == "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"MessageAttribute "+name+" missing DataType")
+	}
+	base := v.DataType
+	if i := strings.Index(v.DataType, "."); i >= 0 {
+		base = v.DataType[:i]
+	}
+	return validateMessageAttributeValuePair(name, base, v)
+}
+
+// validateMessageAttributeValuePair enforces "exactly one value field
+// populated, matching the DataType" on a MessageAttributeValue. AWS
+// rejects an attribute that carries both StringValue and BinaryValue
+// (or that carries the wrong one for its DataType); without these
+// guards a malformed client could persist bytes into the record that
+// then round-trip on ReceiveMessage, producing mismatched MD5 hashes
+// downstream. Pulled out of validateOneMessageAttribute so that
+// function stays under the cyclop budget.
+func validateMessageAttributeValuePair(name, base string, v sqsMessageAttributeValue) error {
+	switch base {
+	case "String", "Number":
+		if v.StringValue == "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" requires StringValue")
+		}
+		if len(v.BinaryValue) > 0 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" must not include BinaryValue for "+base+" type")
+		}
+	case sqsAttributeBaseTypeBinary:
+		if len(v.BinaryValue) == 0 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" requires BinaryValue")
+		}
+		if v.StringValue != "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" must not include StringValue for Binary type")
+		}
+	default:
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"MessageAttribute "+name+" has unsupported DataType "+v.DataType)
+	}
+	return nil
 }
