@@ -111,6 +111,8 @@ The `charge` operation:
 
 No global lock is held during step 3; concurrent traffic on different queues runs in parallel.
 
+**Cache invalidation on `SetQueueAttributes`**: when an operator updates the throttle config via `SetQueueAttributes`, the handler — *after* the Raft commit that persists the new `sqsQueueThrottle` — calls `buckets.Delete(key)` for every `bucketKey` belonging to the updated queue (`Send`, `Recv`, `Default`). Without this step the in-memory bucket would keep enforcing the old limits until the idle-eviction sweep removes the stale entry (default 1 h window), defeating the operator's intent to throttle a noisy tenant in real time. The `LoadOrStore` race with the `Delete` call is benign: the next request rebuilds from the freshly-committed meta, and the rebuilt bucket starts at full capacity (same semantics as the failover case documented below). Claude P1 on PR #664 caught the gap.
+
 The bucket map is per-process. On leader failover, a fresh bucket starts at full capacity on the new leader — there is no Raft replication of bucket state. **Why this is correct**: the worst-case behaviour of "fresh bucket on failover" is that a noisy queue gets one extra burst worth of bandwidth right after a leader change. Replicating bucket state would cost a Raft commit per token decrement, which would defeat the entire point of the token bucket. AWS's own rate limiter has the same property at region failover boundaries.
 
 Buckets are created lazily on first request. They self-evict after a configurable idle window (default 1h) so a queue that goes silent does not keep its bucket entry forever.
@@ -211,7 +213,7 @@ Throttling sits *outside* the OCC transaction — a rejected request never touch
 
 Each queue is owned by exactly one shard (queue-per-shard routing in `kv/shard_router.go`). The leader of that shard owns the bucket. A request that lands on a follower is forwarded by `proxyToLeader` *before* the bucket check, so the bucket is always evaluated by the leader that is also doing the OCC dispatch — no risk of a follower checking against a stale bucket and the leader committing without checking.
 
-Once Phase 3.D (split-queue FIFO) lands, a single queue may span multiple shards. At that point each *partition* gets its own bucket, sharded by `MessageGroupId`. The throttle proposal is forward-compatible: the bucket lookup key changes from `queueName` to `(queueName, partitionID)`. Documented in §11.
+Once Phase 3.D (split-queue FIFO) lands, a single queue may span multiple shards. At that point each *partition* gets its own bucket, **keyed by `(queueName, partitionID)`** — not by `MessageGroupId`. `MessageGroupId` is the *input* to `partitionFor`; using it directly as the bucket key would create one bucket per unique group value (unbounded, attacker-amplifiable map size, and hot groups would never share a budget). `partitionID` is bounded by `PartitionCount` so the worst-case bucket count per queue is tiny. The throttle proposal is forward-compatible: the bucket lookup key changes from `queueName` to `(queueName, partitionID)`, and the `bucketKey` struct in §3.1 grows a `partition uint32` field. Documented in §11. (Claude P1 on PR #664 caught the misnomer.)
 
 ---
 

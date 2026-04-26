@@ -214,15 +214,15 @@ These take a `ReceiptHandle` which already encodes the partition index (the rece
 
 ## 5. Routing Layer Changes
 
-`kv/shard_router.go` today routes by queue name. With partitions, the routing key becomes `(queueName, partitionIndex)`. The existing `--raftSqsMap` flag accepts entries keyed by queue name; the syntax extends to accept a partition suffix:
+`kv/shard_router.go` today routes by queue name. With partitions, the routing key becomes `(queueName, partitionIndex)`. The partition-to-Raft-group assignment lands on a **new dedicated flag** rather than overloading the existing `--raftSqsMap` (Claude P1 on PR #664 caught the original proposal to extend `--raftSqsMap` syntax — that flag already maps `raftAddr=sqsAddr` for `proxyToLeader`'s endpoint resolution, and overloading the same parser with partition assignments creates a parsing ambiguity that could silently produce the wrong proxy target in §4.2's fanout):
 
 ```
---raftSqsMap "orders.fifo:8=group-7,group-8,group-9,group-10,group-11,group-12,group-13,group-14"
+--sqsFifoPartitionMap "orders.fifo:8=group-7,group-8,group-9,group-10,group-11,group-12,group-13,group-14"
 ```
 
-Reads as: queue `orders.fifo` has `8` partitions, mapped to Raft groups `group-7` through `group-14` in partition order. Backward compatibility: queues without an explicit partition suffix keep the single-partition layout.
+Reads as: queue `orders.fifo` has `8` partitions, mapped to Raft groups `group-7` through `group-14` in partition order. The existing `--raftSqsMap` keeps doing what it does today — endpoint mapping for `proxyToLeader` — and is unchanged by this design.
 
-A queue whose `PartitionCount` in meta does not match the shard map's partition count is a configuration error. The CreateQueue handler resolves the count from the `Attributes` first, then verifies the shard map agrees; mismatch returns 400 `InvalidParameterValue`.
+Backward compatibility: queues without an entry in `--sqsFifoPartitionMap` keep the single-partition layout. A queue whose `PartitionCount` in meta does not match the partition-map's entry count is a configuration error: the CreateQueue handler resolves the count from the `Attributes` first, then verifies the partition map agrees; mismatch returns 400 `InvalidParameterValue`. A queue with `PartitionCount > 1` and no entry in `--sqsFifoPartitionMap` is also rejected (the routing layer has no Raft-group mapping to use).
 
 ---
 
@@ -283,6 +283,7 @@ This is out of scope here.
    - `partitionFor` determinism: same group ID always returns same partition across runs / process restarts.
    - Edge: `PartitionCount = 0` and `1` route to partition 0 unconditionally.
    - Edge: empty `MessageGroupId` routes to partition 0 (defensive).
+   - Edge: `FifoThroughputLimit = "perQueue"` with `PartitionCount = 8` routes every group ID to partition 0 — the §3.3 short-circuit guard. Locks the fix down against regression; the perQueue branch is a one-line guard that could easily be dropped during a refactor.
 
 2. **End-to-end** (`adapter/sqs_partitioned_fifo_test.go`):
    - Create a queue with `PartitionCount = 4`, send 1000 messages with random group IDs, confirm ordered delivery within each group, parallel delivery across groups.
@@ -323,7 +324,7 @@ This is out of scope here.
 | 1 | This proposal doc lands. Operators have time to flag concerns. | Yes |
 | 2 | Schema: `sqsQueueMeta.PartitionCount`, `DeduplicationScope`, `FifoThroughputLimit`. Routing function `partitionFor`. CreateQueue / SetQueueAttributes validation. **No** keyspace changes yet — feature is dormant. | Yes (catalog only) |
 | 3 | Keyspace: thread `partitionIndex` through every `sqsMsg*Key` constructor, defaulting to 0 so existing queues stay byte-identical. | Yes (mechanical) |
-| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. `--raftSqsMap` syntax extension. Mixed-version gate. | Yes (operator-config) |
+| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. New `--sqsFifoPartitionMap` flag (separate from the existing `--raftSqsMap` endpoint-mapping flag). Mixed-version gate. | Yes (operator-config) |
 | 5 | Send / Receive partition fanout. Receipt-handle v2 codec. | Yes (data-plane) |
 | 6 | PurgeQueue / DeleteQueue partition iteration. Tombstone schema update. Reaper update. | Yes (control-plane) |
 | 7 | Jepsen HT-FIFO workload. Metrics. | Yes (testing) |
