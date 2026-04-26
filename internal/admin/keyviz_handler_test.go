@@ -291,6 +291,39 @@ func TestKeyVizHandlerRowsBudgetTieBreakDeterministic(t *testing.T) {
 	}
 }
 
+// TestKeyVizHandlerOmittedRowsAppliesDefaultCap pins Codex round-3 P1
+// on PR #660: when the SPA polls without ?rows=, the handler must
+// still apply the keyVizRowBudgetCap default — leaving p.rows at
+// zero would let applyKeyVizRowBudget fall through to "no cap" and
+// return every tracked route in one payload.
+func TestKeyVizHandlerOmittedRowsAppliesDefaultCap(t *testing.T) {
+	t.Parallel()
+	rows := make([]keyviz.MatrixRow, keyVizRowBudgetCap+5)
+	for i := range rows {
+		idx := uint64(i + 1) //nolint:gosec // bounded by keyVizRowBudgetCap+5
+		rows[i] = keyviz.MatrixRow{
+			RouteID: idx,
+			Start:   []byte{byte(i / 256), byte(i % 256)},
+			End:     []byte{byte((i + 1) / 256), byte((i + 1) % 256)},
+			Writes:  idx,
+		}
+	}
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{At: time.Unix(1_700_000_000, 0), Rows: rows},
+	}})
+	defer srv.Close()
+
+	for _, query := range []string{"", "?rows=0"} {
+		resp := keyVizGet(t, srv.URL+query)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var matrix KeyVizMatrix
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+		resp.Body.Close()
+		require.Len(t, matrix.Rows, keyVizRowBudgetCap,
+			"omitted/0 rows must apply the default cap (query=%q)", query)
+	}
+}
+
 // TestKeyVizHandlerTimeBoundsParam exercises the from_unix_ms /
 // to_unix_ms query parameters: a non-zero pair filters columns to the
 // requested half-open window, while 0 means "unbounded on that side"
