@@ -103,7 +103,13 @@ type sqsQueueMeta struct {
 }
 ```
 
-`PartitionCount` is **immutable after first SendMessage**. The validator on `SetQueueAttributes` rejects any change; operators who want a different partition count create a new queue. Why immutable: changing it would require re-hashing every existing message into a new partition, which (a) breaks ordering for in-flight messages of every group whose hash bucket changed, and (b) is a multi-second / multi-minute operation that cannot be expressed as one OCC transaction.
+`PartitionCount`, `FifoThroughputLimit`, and `DeduplicationScope` are **all immutable after first SendMessage** (Codex P1 on PR #664 sixth-round Codex review). The validator on `SetQueueAttributes` rejects any change to any of the three; operators who want different values create a new queue. Why all three:
+
+- **`PartitionCount`** — changing it would require re-hashing every existing message into a new partition, which (a) breaks ordering for in-flight messages of every group whose hash bucket changed, and (b) is a multi-second / multi-minute operation that cannot be expressed as one OCC transaction.
+- **`FifoThroughputLimit`** — a flip from `perMessageGroupId` → `perQueue` activates the §3.3 short-circuit that collapses every group ID to partition 0. In-flight messages from groups previously routed to partitions 1…N-1 stay where they are; new messages for those same groups land on partition 0; consumers see the group split across partitions and within-group FIFO ordering is silently violated. The reverse flip has the symmetric problem.
+- **`DeduplicationScope`** — affects how the dedup key is scoped (`(queue, dedupId)` vs. `(queue, partitionId, dedupId)` vs. `(queue, MessageGroupId, dedupId)` depending on the value). Changing it live can either resurrect duplicates the previous scope had de-duped (when narrowing scope) or suppress a legitimately new send (when widening scope and the new key collides with a still-cached entry from the prior scope).
+
+The pattern is the same: each attribute participates in a routing or dedup decision whose correctness depends on every existing message having been written under a single, consistent value. Live mutation creates a "before" set and an "after" set with incompatible invariants that the runtime cannot reconcile without a full drain.
 
 ### 3.3 Routing
 
