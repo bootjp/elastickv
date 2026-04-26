@@ -2051,7 +2051,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 		if err != nil {
 			return err
 		}
@@ -2506,7 +2506,7 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 		// return hit=true with an empty result -- that is the correct
 		// Redis answer and saves the slow-path round-trip. Otherwise
 		// fall back so the slow path can produce WRONGTYPE.
-		typ, typErr := r.keyTypeAt(ctx, key, readTS)
+		typ, typErr := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 		if typErr != nil {
 			return false, monitoring.LuaFastPathFallbackOther, cockerrors.WithStack(typErr)
 		}
@@ -2533,7 +2533,7 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 // hgetSlow falls back to the type-probing path when hashFieldFastLookup
 // misses. Handles legacy-blob hashes and nil / WRONGTYPE disambiguation.
 func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2564,7 +2564,7 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2678,7 +2678,7 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -2801,7 +2801,7 @@ func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte
 }
 
 func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2831,7 +2831,7 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -2950,7 +2950,7 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -3049,7 +3049,7 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -3271,7 +3271,7 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3341,7 +3341,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3511,7 +3511,7 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, opts zrangeOptions) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -3551,7 +3551,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3599,7 +3599,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3636,7 +3636,7 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -4022,7 +4022,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return "", err
 	}
@@ -4358,7 +4358,7 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 // store errors. Extracted from xtrimTxn so the outer function stays
 // within the cyclop budget.
 func (r *RedisServer) streamTypeForWrite(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return false, err
 	}
@@ -4584,7 +4584,7 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 // past a BLOCK-window cancel.
 func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(ctx, key, readTS)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 	if err != nil {
 		return "", err
 	}
@@ -4636,7 +4636,7 @@ func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadR
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(ctx, key, readTS)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {
 			return nil, err
 		}
@@ -4972,7 +4972,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
@@ -5076,7 +5076,7 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 	}
 
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		conn.WriteError(err.Error())
 		return
