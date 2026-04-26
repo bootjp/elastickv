@@ -1329,21 +1329,28 @@ func (r *runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	// startDynamoDBServer must run BEFORE startRaftServers so the
-	// resulting DynamoDBServer is available to the leader-side gRPC
-	// AdminForward registration in startRaftServers (design 3.3).
-	// Both servers listen on different addresses; the dynamo HTTP
-	// listener accepting traffic before raft TCP listeners are up
-	// is no different from the existing startup-race semantics — a
-	// hit in that window already returned 503 before this reorder.
+	// startDynamoDBServer + startS3Server must run BEFORE
+	// startRaftServers so the resulting *DynamoDBServer / *S3Server
+	// are available to the leader-side gRPC AdminForward registration
+	// in startRaftServers (design 3.3, P2 slice 2b). Each server
+	// listens on its own address; them accepting traffic before the
+	// raft TCP listeners are up is no different from the existing
+	// startup-race semantics — a hit in that window already returned
+	// 503 before this reorder.
 	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	r.dynamoServer = dynamoServer
+	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	if err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	r.s3Server = s3Server
 	forwardDeps := adminForwardServerDeps{
-		tables: newDynamoTablesSource(r.dynamoServer),
-		roles:  r.roleStore,
+		tables:  newDynamoTablesSource(r.dynamoServer),
+		buckets: newBucketsSource(r.s3Server),
+		roles:   r.roleStore,
 	}
 	if err := startRaftServers(
 		r.ctx,
@@ -1363,11 +1370,6 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	r.s3Server = s3Server
 	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)

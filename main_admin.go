@@ -332,6 +332,36 @@ func (b *bucketsBridge) AdminDescribeBucket(ctx context.Context, name string) (*
 	return &summary, true, nil
 }
 
+func (b *bucketsBridge) AdminCreateBucket(ctx context.Context, principal admin.AuthPrincipal, in admin.CreateBucketRequest) (*admin.BucketSummary, error) {
+	row, err := b.server.AdminCreateBucket(ctx, convertAdminPrincipal(principal), in.BucketName, in.ACL)
+	if err != nil {
+		return nil, translateAdminBucketsError(err)
+	}
+	if row == nil {
+		// AdminCreateBucket guarantees a non-nil summary on success;
+		// nil here would be an adapter regression. Surface as a typed
+		// error so the handler logs it as 500 rather than panicking
+		// on the de-reference at the call site.
+		return nil, errors.New("admin buckets bridge: adapter returned nil summary on create success")
+	}
+	summary := bucketSummaryFromAdapter(*row)
+	return &summary, nil
+}
+
+func (b *bucketsBridge) AdminPutBucketAcl(ctx context.Context, principal admin.AuthPrincipal, name, acl string) error {
+	if err := b.server.AdminPutBucketAcl(ctx, convertAdminPrincipal(principal), name, acl); err != nil {
+		return translateAdminBucketsError(err)
+	}
+	return nil
+}
+
+func (b *bucketsBridge) AdminDeleteBucket(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteBucket(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminBucketsError(err)
+	}
+	return nil
+}
+
 func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {
 	return admin.BucketSummary{
 		Name:       in.Name,
@@ -340,6 +370,42 @@ func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary
 		Generation: in.Generation,
 		Region:     in.Region,
 		Owner:      in.Owner,
+	}
+}
+
+// translateAdminBucketsError maps the adapter's S3 admin error
+// vocabulary onto the admin-package sentinels the HTTP handler
+// matches against. Mirrors translateAdminTablesError on the Dynamo
+// side: structured failures (forbidden, not-leader, validation,
+// already-exists, etc.) become typed sentinels; everything else
+// is forwarded as-is and answered with 500 + a sanitised body.
+func translateAdminBucketsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrBucketsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrBucketsNotLeader
+	case errors.Is(err, adapter.ErrAdminBucketAlreadyExists):
+		return admin.ErrBucketsAlreadyExists
+	case errors.Is(err, adapter.ErrAdminBucketNotFound):
+		return admin.ErrBucketsNotFound
+	case errors.Is(err, adapter.ErrAdminBucketNotEmpty):
+		return admin.ErrBucketsNotEmpty
+	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
+		errors.Is(err, adapter.ErrAdminInvalidACL):
+		// Surface the adapter's wrapped message via *ValidationError
+		// so the HTTP handler emits 400 invalid_request with a
+		// useful explanation instead of leaking raw err.Error().
+		return &admin.ValidationError{Message: err.Error()}
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator; mapping it to the Bucket-side
+		// not-leader sentinel keeps the SPA's retry contract intact.
+		return admin.ErrBucketsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
 }
 

@@ -62,21 +62,28 @@ func buildLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConnCache
 // adminForwardServerDeps is the small bundle the gRPC ForwardServer
 // needs to be reachable from a follower's bridge. Collecting them in
 // a struct keeps startRaftServers' signature tractable as the wiring
-// surface grows. All fields are required; a missing one means the
-// ForwardServer is not registered (single-node / leader-only build).
+// surface grows. tables + roles are required; buckets is optional
+// (a build that ships without the S3 adapter sets it to nil and the
+// ForwardServer's S3 dispatch returns 501 for those operations).
 type adminForwardServerDeps struct {
-	tables admin.TablesSource
-	roles  admin.RoleStore
+	tables  admin.TablesSource
+	buckets admin.BucketsSource
+	roles   admin.RoleStore
 }
 
 // readyForRegistration reports whether the bundle has enough
-// collaborators to construct + register a ForwardServer. Both fields
-// must be non-nil; a nil TablesSource means the build ships without
-// the dynamo adapter, and a nil RoleStore means admin auth is not
-// configured. Either way, registering the gRPC service would 500
-// every forwarded call, so we silently skip registration instead.
+// collaborators to construct + register a ForwardServer.
+// RoleStore is always required (the principal re-evaluation step
+// has no fallback). At least one of TablesSource or BucketsSource
+// must be present — registering with neither would respond 501 to
+// every operation, which is functionally identical to not
+// registering at all. The dispatcher emits 501 for whichever
+// source is nil so an S3-only or Dynamo-only build still serves
+// its half of the admin surface (Codex P1 on PR #673: an S3-only
+// cluster previously skipped registration entirely and surfaced
+// follower forwards as gRPC Unimplemented / 503).
 func (d adminForwardServerDeps) readyForRegistration() bool {
-	return d.tables != nil && d.roles != nil
+	return d.roles != nil && (d.tables != nil || d.buckets != nil)
 }
 
 // registerAdminForwardServer attaches the leader-side gRPC
@@ -89,7 +96,11 @@ func registerAdminForwardServer(gs *grpc.Server, deps adminForwardServerDeps, lo
 	if !deps.readyForRegistration() {
 		return
 	}
-	pb.RegisterAdminForwardServer(gs, admin.NewForwardServer(deps.tables, deps.roles, logger))
+	srv := admin.NewForwardServer(deps.tables, deps.roles, logger)
+	if deps.buckets != nil {
+		srv = srv.WithBucketsSource(deps.buckets)
+	}
+	pb.RegisterAdminForwardServer(gs, srv)
 }
 
 // roleStoreFromFlags builds the same access-key → role map that

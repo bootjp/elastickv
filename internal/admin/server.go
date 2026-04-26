@@ -177,13 +177,21 @@ func buildDynamoHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handle
 }
 
 // buildS3HandlerForDeps is the parallel constructor for the S3
-// admin handler. Slice 1 is read-only; the next slice will plumb a
-// MapRoleStore and the LeaderForwarder through the same shape.
+// admin handler. Wires the live RoleStore so write endpoints
+// re-validate the principal on every request, plus the
+// LeaderForwarder so a follower hands ErrBucketsNotLeader writes
+// off to the leader transparently — both mirror the Dynamo side.
 func buildS3HandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
 	if deps.Buckets == nil {
 		return nil
 	}
-	return NewS3Handler(deps.Buckets).WithLogger(logger)
+	h := NewS3Handler(deps.Buckets).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
+	if deps.Forwarder != nil {
+		h = h.WithLeaderForwarder(deps.Forwarder)
+	}
+	return h
 }
 
 // buildSqsHandlerForDeps is the parallel constructor for the SQS
@@ -230,7 +238,10 @@ func (s *Server) APIHandler() http.Handler {
 //	GET    /admin/api/v1/dynamo/tables/{name}       (auth required)
 //	DELETE /admin/api/v1/dynamo/tables/{name}       (auth required, full role)
 //	GET    /admin/api/v1/s3/buckets                 (auth required)
+//	POST   /admin/api/v1/s3/buckets                 (auth required, full role)
 //	GET    /admin/api/v1/s3/buckets/{name}          (auth required)
+//	DELETE /admin/api/v1/s3/buckets/{name}          (auth required, full role)
+//	PUT    /admin/api/v1/s3/buckets/{name}/acl      (auth required, full role)
 //	GET    /admin/api/v1/keyviz/matrix              (auth required)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to

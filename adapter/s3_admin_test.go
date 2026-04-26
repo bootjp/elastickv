@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -97,6 +98,215 @@ func TestS3Server_AdminDescribeBucket_Missing(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 	require.Nil(t, got)
+}
+
+// fullAdminPrincipal returns a Full-role principal so write-path
+// adapter tests can dispatch without standing up the HTTP layer.
+// Mirrors fullAdminPrincipal in dynamodb_admin_test.go (kept
+// distinct so the S3 tests can diverge if the role model splits).
+func fullAdminBucketsPrincipal() AdminPrincipal {
+	return AdminPrincipal{AccessKey: "AKIA_FULL", Role: AdminRoleFull}
+}
+
+// readOnlyAdminBucketsPrincipal mirrors the above for the
+// read-only role.
+func readOnlyAdminBucketsPrincipal() AdminPrincipal {
+	return AdminPrincipal{AccessKey: "AKIA_RO", Role: AdminRoleReadOnly}
+}
+
+func TestS3Server_AdminCreateBucket_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	got, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "public-assets", s3AclPublicRead)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, "public-assets", got.Name)
+	require.Equal(t, s3AclPublicRead, got.ACL)
+	require.NotZero(t, got.CreatedAtHLC)
+	require.NotZero(t, got.Generation)
+	require.Equal(t, "AKIA_FULL", got.Owner,
+		"AdminCreateBucket must persist the principal access key as the bucket owner")
+
+	// Round-trip: AdminDescribeBucket should see what we just stored.
+	round, exists, err := server.AdminDescribeBucket(context.Background(), "public-assets")
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, s3AclPublicRead, round.ACL)
+}
+
+func TestS3Server_AdminCreateBucket_DefaultsACL(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	got, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "private-assets", "")
+	require.NoError(t, err)
+	require.Equal(t, s3AclPrivate, got.ACL,
+		"empty ACL must default to private (matches the SigV4 path)")
+}
+
+func TestS3Server_AdminCreateBucket_RejectsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	got, err := server.AdminCreateBucket(context.Background(),
+		readOnlyAdminBucketsPrincipal(), "any", s3AclPrivate)
+	require.ErrorIs(t, err, ErrAdminForbidden)
+	require.Nil(t, got)
+}
+
+func TestS3Server_AdminCreateBucket_RejectsInvalidACL(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	got, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "any", "public-write")
+	require.ErrorIs(t, err, ErrAdminInvalidACL)
+	require.Nil(t, got)
+}
+
+func TestS3Server_AdminCreateBucket_RejectsInvalidBucketName(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	got, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "BAD_NAME", s3AclPrivate)
+	require.ErrorIs(t, err, ErrAdminInvalidBucketName)
+	require.Nil(t, got)
+}
+
+func TestS3Server_AdminCreateBucket_AlreadyExists(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "duplicate", s3AclPrivate)
+	require.NoError(t, err)
+
+	_, err = server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "duplicate", s3AclPrivate)
+	require.ErrorIs(t, err, ErrAdminBucketAlreadyExists)
+}
+
+func TestS3Server_AdminPutBucketAcl_RoundTrips(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "orders", s3AclPrivate)
+	require.NoError(t, err)
+
+	err = server.AdminPutBucketAcl(context.Background(),
+		fullAdminBucketsPrincipal(), "orders", s3AclPublicRead)
+	require.NoError(t, err)
+
+	got, _, err := server.AdminDescribeBucket(context.Background(), "orders")
+	require.NoError(t, err)
+	require.Equal(t, s3AclPublicRead, got.ACL)
+}
+
+func TestS3Server_AdminPutBucketAcl_MissingBucket(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	err := server.AdminPutBucketAcl(context.Background(),
+		fullAdminBucketsPrincipal(), "missing", s3AclPublicRead)
+	require.ErrorIs(t, err, ErrAdminBucketNotFound)
+}
+
+func TestS3Server_AdminPutBucketAcl_RejectsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	err := server.AdminPutBucketAcl(context.Background(),
+		readOnlyAdminBucketsPrincipal(), "any", s3AclPrivate)
+	require.ErrorIs(t, err, ErrAdminForbidden)
+}
+
+func TestS3Server_AdminDeleteBucket_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "to-delete", s3AclPrivate)
+	require.NoError(t, err)
+
+	err = server.AdminDeleteBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "to-delete")
+	require.NoError(t, err)
+
+	_, exists, err := server.AdminDescribeBucket(context.Background(), "to-delete")
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func TestS3Server_AdminDeleteBucket_MissingBucket(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	err := server.AdminDeleteBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "no-such")
+	require.ErrorIs(t, err, ErrAdminBucketNotFound)
+}
+
+func TestS3Server_AdminDeleteBucket_RejectsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	err := server.AdminDeleteBucket(context.Background(),
+		readOnlyAdminBucketsPrincipal(), "any")
+	require.ErrorIs(t, err, ErrAdminForbidden)
+}
+
+func TestS3Server_AdminDeleteBucket_RejectsNonEmpty(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, err := server.AdminCreateBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "with-objects", s3AclPrivate)
+	require.NoError(t, err)
+
+	// Place an object via the SigV4 path so the deletion path sees
+	// a non-empty bucket. Reusing the existing handler avoids
+	// reaching into the storage layer's encoding directly.
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/with-objects/file.txt",
+		strings.NewReader("hello"))
+	req.Header.Set("Content-Type", "text/plain")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	err = server.AdminDeleteBucket(context.Background(),
+		fullAdminBucketsPrincipal(), "with-objects")
+	require.ErrorIs(t, err, ErrAdminBucketNotEmpty)
 }
 
 // TestS3Server_AdminListBuckets_PaginatesPastSinglePage pins the

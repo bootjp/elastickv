@@ -182,3 +182,72 @@ func TestGRPCForwardClient_FillsMissingContentType(t *testing.T) {
 		CreateTableRequest{TableName: "t", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}})
 	require.Equal(t, "application/json; charset=utf-8", res.ContentType)
 }
+
+func TestGRPCForwardClient_ForwardCreateBucket_HappyPath(t *testing.T) {
+	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
+		StatusCode:  http.StatusCreated,
+		Payload:     []byte(`{"bucket_name":"public-assets","acl":"public-read"}`),
+		ContentType: "application/json; charset=utf-8",
+	}}
+	dial := &stubConnFactory{conn: conn}
+	fwd, err := NewGRPCForwardClient(fixedResolver("leader.local:7000"), dial, "follower-2")
+	require.NoError(t, err)
+
+	in := CreateBucketRequest{BucketName: "public-assets", ACL: "public-read"}
+	res, err := fwd.ForwardCreateBucket(context.Background(),
+		AuthPrincipal{AccessKey: "AKIA_F", Role: RoleFull}, in)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, res.StatusCode)
+	require.Equal(t, pb.AdminOperation_ADMIN_OP_CREATE_BUCKET, conn.lastReq.GetOperation())
+	require.Equal(t, "follower-2", conn.lastReq.GetForwardedFrom())
+	var roundtripped CreateBucketRequest
+	require.NoError(t, json.Unmarshal(conn.lastReq.GetPayload(), &roundtripped))
+	require.Equal(t, in, roundtripped)
+}
+
+func TestGRPCForwardClient_ForwardDeleteBucket_HappyPath(t *testing.T) {
+	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
+		StatusCode:  http.StatusNoContent,
+		ContentType: "application/json; charset=utf-8",
+	}}
+	dial := &stubConnFactory{conn: conn}
+	fwd, _ := NewGRPCForwardClient(fixedResolver("leader.local:7000"), dial, "follower-3")
+
+	res, err := fwd.ForwardDeleteBucket(context.Background(),
+		AuthPrincipal{AccessKey: "AKIA_F", Role: RoleFull}, "orders")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, res.StatusCode)
+	require.Equal(t, pb.AdminOperation_ADMIN_OP_DELETE_BUCKET, conn.lastReq.GetOperation())
+	require.JSONEq(t, `{"name":"orders"}`, string(conn.lastReq.GetPayload()))
+}
+
+func TestGRPCForwardClient_ForwardPutBucketAcl_HappyPath(t *testing.T) {
+	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
+		StatusCode:  http.StatusNoContent,
+		ContentType: "application/json; charset=utf-8",
+	}}
+	dial := &stubConnFactory{conn: conn}
+	fwd, _ := NewGRPCForwardClient(fixedResolver("leader.local:7000"), dial, "follower-4")
+
+	res, err := fwd.ForwardPutBucketAcl(context.Background(),
+		AuthPrincipal{AccessKey: "AKIA_F", Role: RoleFull}, "orders", "public-read")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, res.StatusCode)
+	require.Equal(t, pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL, conn.lastReq.GetOperation())
+	// Both name and acl travel in the payload — see handlePutBucketAcl
+	// for the leader-side decode contract.
+	require.JSONEq(t, `{"name":"orders","acl":"public-read"}`, string(conn.lastReq.GetPayload()))
+}
+
+func TestGRPCForwardClient_BucketOps_NoLeaderReturnsErrLeaderUnavailable(t *testing.T) {
+	dial := &stubConnFactory{conn: &stubForwardConn{}}
+	fwd, _ := NewGRPCForwardClient(fixedResolver(""), dial, "f")
+
+	_, err := fwd.ForwardCreateBucket(context.Background(), AuthPrincipal{Role: RoleFull},
+		CreateBucketRequest{BucketName: "x"})
+	require.ErrorIs(t, err, ErrLeaderUnavailable)
+	_, err = fwd.ForwardDeleteBucket(context.Background(), AuthPrincipal{Role: RoleFull}, "x")
+	require.ErrorIs(t, err, ErrLeaderUnavailable)
+	_, err = fwd.ForwardPutBucketAcl(context.Background(), AuthPrincipal{Role: RoleFull}, "x", "private")
+	require.ErrorIs(t, err, ErrLeaderUnavailable)
+}
