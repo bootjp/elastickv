@@ -9,6 +9,8 @@ import { LoginPage } from "./pages/Login";
 import { NotFoundPage } from "./pages/NotFound";
 import { S3DetailPage } from "./pages/S3Detail";
 import { S3ListPage } from "./pages/S3List";
+import { SqsDetailPage } from "./pages/SqsDetail";
+import { SqsListPage } from "./pages/SqsList";
 
 export function App() {
   return (
@@ -25,6 +27,8 @@ export function App() {
           <Route index element={<DashboardPage />} />
           <Route path="dynamo" element={<DynamoListPage />} />
           <Route path="dynamo/:name" element={<DynamoDetailPage />} />
+          <Route path="sqs" element={<SqsListPage />} />
+          <Route path="sqs/:name" element={<SqsDetailPage />} />
           <Route path="s3" element={<S3ListPage />} />
           <Route path="s3/:name" element={<S3DetailPage />} />
           <Route path="*" element={<NotFoundPage />} />

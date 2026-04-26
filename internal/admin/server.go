@@ -61,6 +61,14 @@ type ServerDeps struct {
 	// off" state instead of an empty matrix.
 	KeyViz KeyVizSource
 
+	// Queues is the SQS admin source — covers list, describe, and
+	// delete via QueuesSource. Optional: a nil value disables
+	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them
+	// with 404). Same opt-in shape as Tables / Buckets; deployments
+	// that don't run the SQS adapter omit this without breaking the
+	// rest of the admin surface.
+	Queues QueuesSource
+
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
 	// /admin/assets/* and the SPA fallback in that case.
@@ -112,7 +120,8 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	// nil it serves a 503 keyviz_disabled, which the SPA renders as
 	// a clearer "feature off" state than an unknown_endpoint 404.
 	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger)
-	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, logger)
+	sqs := buildSqsHandlerForDeps(deps, logger)
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, sqs, logger)
 	router := NewRouter(mux, deps.StaticFS)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -177,6 +186,20 @@ func buildS3HandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
 	return NewS3Handler(deps.Buckets).WithLogger(logger)
 }
 
+// buildSqsHandlerForDeps is the parallel constructor for the SQS
+// admin handler. Read paths are open to any session; the DELETE
+// path re-evaluates the principal's role against the live MapRoleStore
+// on every request, so a downgraded key cannot keep mutating with a
+// still-valid JWT.
+func buildSqsHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
+	if deps.Queues == nil {
+		return nil
+	}
+	return NewSqsHandler(deps.Queues).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
+}
+
 // Handler returns an http.Handler that serves the full admin surface.
 // We wrap the router in BodyLimit at the top level so every endpoint
 // — including /admin/healthz and the static asset / SPA paths — is
@@ -215,14 +238,14 @@ func (s *Server) APIHandler() http.Handler {
 // audit path inside AuthService because the generic Audit middleware
 // cannot see the claimed actor at that point in the chain.
 //
-// dynamoHandler / s3Handler may be nil; in that case the corresponding
-// paths fall through to the unknown-endpoint 404, matching the
-// behaviour of any other unregistered admin path.
+// dynamoHandler / s3Handler / sqsHandler may be nil; in that case
+// the corresponding paths fall through to the unknown-endpoint 404,
+// matching the behaviour of any other unregistered admin path.
 //
 // keyvizHandler is always non-nil even when the sampler is disabled —
 // it serves 503 keyviz_disabled itself so the SPA gets a clearer
 // signal than an unknown_endpoint 404 from the catch-all.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler http.Handler, logger *slog.Logger) http.Handler {
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler, sqsHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -290,6 +313,14 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	if s3Handler != nil {
 		s3Chain = protect(s3Handler)
 	}
+	// SQS endpoints share the same protect chain rationale: GET
+	// reads are session-gated to keep cross-site fetches from
+	// enumerating queue names; DELETE goes through CSRF + the
+	// in-handler RoleFull check inside SqsHandler.
+	var sqsChain http.Handler
+	if sqsHandler != nil {
+		sqsChain = protect(sqsHandler)
+	}
 
 	routes := apiRouteTable{
 		login:   loginChain,
@@ -298,6 +329,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 		dynamo:  dynamoChain,
 		s3:      s3Chain,
 		keyviz:  keyvizChain,
+		sqs:     sqsChain,
 	}
 	return http.HandlerFunc(routes.dispatch)
 }
@@ -309,29 +341,55 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 // would otherwise push buildAPIMux's branch count past the limit.
 type apiRouteTable struct {
 	login, logout, cluster http.Handler
-	dynamo, s3             http.Handler
+	dynamo, s3, sqs        http.Handler
 	keyviz                 http.Handler
 }
 
 // dispatch is the receiver method httpHandlerFunc adapts. Logic is
-// the same path-prefix switch the call site previously inlined.
+// the same path-prefix switch the call site previously inlined; the
+// resource-prefix half of it lives in resourceHandlerFor so this
+// function stays under the cyclop ceiling as new resources land.
 func (t apiRouteTable) dispatch(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/admin/api/v1/auth/login":
+	switch r.URL.Path {
+	case "/admin/api/v1/auth/login":
 		t.login.ServeHTTP(w, r)
-	case r.URL.Path == "/admin/api/v1/auth/logout":
+		return
+	case "/admin/api/v1/auth/logout":
 		t.logout.ServeHTTP(w, r)
-	case r.URL.Path == "/admin/api/v1/cluster":
+		return
+	case "/admin/api/v1/cluster":
 		t.cluster.ServeHTTP(w, r)
-	case r.URL.Path == "/admin/api/v1/keyviz/matrix":
-		t.keyviz.ServeHTTP(w, r)
-	case t.dynamo != nil && isDynamoPath(r.URL.Path):
-		t.dynamo.ServeHTTP(w, r)
-	case t.s3 != nil && isS3Path(r.URL.Path):
-		t.s3.ServeHTTP(w, r)
+		return
+	}
+	if h := t.resourceHandlerFor(r.URL.Path); h != nil {
+		h.ServeHTTP(w, r)
+		return
+	}
+	writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+		"no admin API handler is registered for this path")
+}
+
+// resourceHandlerFor returns the handler that owns the URL path's
+// resource family, or nil when no resource matches. Pulled out of
+// dispatch so dispatch stays under cyclop=10 even as new admin
+// resources (Dynamo, S3, SQS, KeyViz, future) get added.
+//
+// KeyViz is *always* registered (the constructor wires a non-nil
+// handler that itself emits 503 keyviz_disabled when the underlying
+// sampler is nil), so the switch matches against an exact path
+// equality and never against a nil receiver.
+func (t apiRouteTable) resourceHandlerFor(path string) http.Handler {
+	switch {
+	case t.keyviz != nil && path == "/admin/api/v1/keyviz/matrix":
+		return t.keyviz
+	case t.dynamo != nil && isDynamoPath(path):
+		return t.dynamo
+	case t.s3 != nil && isS3Path(path):
+		return t.s3
+	case t.sqs != nil && isSqsPath(path):
+		return t.sqs
 	default:
-		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
-			"no admin API handler is registered for this path")
+		return nil
 	}
 }
 
@@ -341,6 +399,10 @@ func isDynamoPath(p string) bool {
 
 func isS3Path(p string) bool {
 	return p == pathS3Buckets || strings.HasPrefix(p, pathPrefixS3Buckets)
+}
+
+func isSqsPath(p string) bool {
+	return p == pathSqsQueues || strings.HasPrefix(p, pathPrefixSqsQueues)
 }
 
 func errMissing(field string) error {
