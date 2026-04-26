@@ -1,8 +1,26 @@
 # elastickv Admin Dashboard Design
 
-**Status:** Proposed
+**Status:** Partial — P1, P2, and P3 of the implementation plan have shipped; P4 ships its operator documentation alongside this rename.
 **Author:** bootjp
 **Date:** 2026-04-24
+**Last updated:** 2026-04-26 (renamed from `_proposed_` to `_partial_` after P1 + P2 + P3 landed)
+
+## Implementation status (as of 2026-04-26)
+
+| Phase | Status | Landed via |
+|---|---|---|
+| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–6) | ✅ shipped | #634, #635, #644, #648 |
+| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1), #669 (write paths slice 2a), #673 (AdminForward integration slice 2b) |
+| **P3** — React SPA + embed | ✅ shipped | #649, #650 |
+| **P4** — TLS, read-only role, CSRF, `docs/admin.md` | 🟡 mostly shipped — TLS / role / CSRF are live in P1, operator doc in #674 |
+
+Outstanding open items (kept here so future readers know what is still owed against the original proposal):
+
+- **AdminForward acceptance criterion 5** — rolling-upgrade compatibility flag (`admin.leader_forward_v2`). Deferred behind a cluster-version bump; not blocking dashboard usability today because every node forwards through the same `pb.AdminOperation` enum.
+- **S3 object browser** — explicitly called out as "next phase" in Section 2 Non-goals; no work item yet.
+- **Operator-visible TLS cert reload** — out of scope; restart-to-rotate is the documented model in `docs/admin.md`.
+
+When the rolling-upgrade flag lands, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
 
 ---
 
