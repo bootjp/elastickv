@@ -30,16 +30,41 @@ export function Modal({ title, open, onClose, children, busy }: ModalProps) {
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
 
+  // Focus capture / restore is tied to `open` ONLY. Folding `busy`
+  // into the same effect as the previous version did caused the
+  // cleanup to fire on every busy toggle (e.g. the user clicks Save
+  // and the parent flips busy=true): focus would briefly leave the
+  // dialog, previouslyFocusedRef would get clobbered with the
+  // trigger button, then the next run would snap focus back. Real
+  // bug for screen-reader users — the dialog became "exited" mid-
+  // operation. Splitting the effects keeps each invariant tied to
+  // its own state slice (Claude review on #650).
   useEffect(() => {
     if (!open) return;
-
     previouslyFocusedRef.current = (document.activeElement as HTMLElement | null) ?? null;
-    // Focus the first focusable element so keyboard users land
-    // inside the dialog instead of the page underneath. Run on the
-    // next tick so the dialog DOM exists and any autofocus has had
-    // a chance to settle.
+    // queueMicrotask defers focus until after sibling useEffect
+    // hooks (notably any autofocus on form fields inside the
+    // dialog children) have settled, so we focus the truly-first
+    // tab stop rather than racing with autofocus.
     queueMicrotask(() => focusFirstFocusable(dialogRef.current));
+    return () => {
+      // Restore focus to whoever opened the dialog. Guard against
+      // the trigger being unmounted (e.g. the dialog deleted the
+      // row whose button opened it) by checking isConnected.
+      const restore = previouslyFocusedRef.current;
+      previouslyFocusedRef.current = null;
+      if (restore && restore.isConnected) {
+        restore.focus();
+      }
+    };
+  }, [open]);
 
+  // Keyboard handler legitimately needs `busy` (Esc gates on it) and
+  // `onClose`, so it re-binds when either changes. Re-binding is
+  // cheap — one window listener swap per change — and unlike the
+  // focus effect it has no observable side effect on the user.
+  useEffect(() => {
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) {
         onClose();
@@ -65,19 +90,8 @@ export function Modal({ title, open, onClose, children, busy }: ModalProps) {
         first.focus();
       }
     };
-
     window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      // Restore focus to whoever opened the dialog. Guard against
-      // the trigger being unmounted (e.g. the dialog deleted the
-      // row whose button opened it) by checking isConnected.
-      const restore = previouslyFocusedRef.current;
-      previouslyFocusedRef.current = null;
-      if (restore && restore.isConnected) {
-        restore.focus();
-      }
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, [open, busy, onClose]);
 
   if (!open) return null;
