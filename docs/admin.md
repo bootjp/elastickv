@@ -42,7 +42,7 @@ with the access key + secret pair from the credentials file.
 | Flag | Description |
 |---|---|
 | `-adminEnabled` | Master on/off switch. Default `false`. |
-| `-adminSessionSigningKey` *or* `-adminSessionSigningKeyFile` *or* `ELASTICKV_ADMIN_SESSION_SIGNING_KEY` | Cluster-shared base64-encoded HS256 key (≥ 32 raw bytes / 44 base64 chars). **Must be the same on every node** — JWTs minted by node A are verified by node B during follower→leader forwarding, so a mismatch breaks the dashboard's read paths on follower nodes. The `*File` / env-var forms keep the secret out of `/proc/<pid>/cmdline`. |
+| `-adminSessionSigningKey` *or* `-adminSessionSigningKeyFile` *or* `ELASTICKV_ADMIN_SESSION_SIGNING_KEY` | Cluster-shared base64-encoded HS256 key — **exactly 64 raw bytes** (88 base64 chars with standard padding, or 86 with `RawURLEncoding`). The validator rejects any other length at startup with a precise error message. **Must be the same on every node** — JWTs minted by node A are verified by node B during follower→leader forwarding, so a mismatch breaks the dashboard's read paths on follower nodes. The `*File` / env-var forms keep the secret out of `/proc/<pid>/cmdline`. |
 | `-s3CredentialsFile` | JSON file with at least one access key + secret key pair. Same file the S3 adapter uses for SigV4; the admin dashboard reuses it for login authentication. |
 | `-adminFullAccessKeys` *and/or* `-adminReadOnlyAccessKeys` | Comma-separated allow-lists. Only access keys listed here may log into the dashboard, even if their SigV4 secret validates against the credentials file. Keys must not appear in both lists. |
 
@@ -176,17 +176,27 @@ should look at Raft leader-churn logs first.
 
 Every state-changing admin request emits a structured slog line at
 `INFO` level on the leader's stdout (or wherever the process slog
-handler is wired):
+handler is wired). Two shapes:
+
+**Leader-direct write** (`DynamoHandler` / `S3Handler` after a
+successful mutation):
 
 ```
-admin_audit actor=AKIA_ADMIN role=full method=POST path=/admin/api/v1/dynamo/tables status=201 duration=8.2ms
+admin_audit actor=AKIA_ADMIN role=full operation=create_bucket bucket=my-bucket
+admin_audit actor=AKIA_ADMIN role=full operation=delete_table table=orders
 ```
 
-For forwarded requests, an extra `forwarded_from=<node-id>` field
-identifies the follower that received the original HTTP call. CR
-and LF in the field are stripped at the entry point — a hostile
-follower cannot split a single audit line into two by smuggling
-control characters into its node ID.
+**Forwarded write** (logged by the leader's `ForwardServer` after a
+follower handed the request off):
+
+```
+admin_audit actor=AKIA_ADMIN role=full forwarded_from=n2 operation=put_bucket_acl bucket=my-bucket acl=public-read
+```
+
+`forwarded_from` is the originating follower's node ID. CR and LF
+in that field are stripped at the entry point — a hostile follower
+cannot split a single audit line into two by smuggling control
+characters into its node ID.
 
 Login and logout emit their own audit lines (`action=login` /
 `action=logout`) so the JWT's lifetime can be correlated with the
@@ -227,7 +237,7 @@ node's live role index picks up the change.
 
 The Raft cluster is mid-election. Re-issue the request after the
 `Retry-After: 1` header tells you to. If it persists past one or
-two seconds, check Raft leader status via the data-plane
+two seconds, check Raft leader status via the admin
 `/admin/api/v1/cluster` endpoint or `cmd/elastickv-admin`.
 
 ### `bucket_not_empty` on DELETE
@@ -246,6 +256,6 @@ to populate the embedded `dist` directory, then rebuild the binary.
 
 ## Cross-references
 
-- Design rationale: [docs/design/2026_04_24_partial_admin_dashboard.md](design/2026_04_24_partial_admin_dashboard.md)
+- Design rationale: [docs/design/2026_04_24_proposed_admin_dashboard.md](design/2026_04_24_proposed_admin_dashboard.md) (renamed to `_partial_` in PR #675; this link will follow once that lands)
 - Architecture overview: [docs/architecture_overview.md](architecture_overview.md)
 - AdminForward RPC contract: `proto/admin_forward.proto`
