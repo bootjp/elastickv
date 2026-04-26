@@ -25,13 +25,12 @@ const (
 // translates between the two so the admin package stays free of the
 // adapter dependency tree.
 type QueueSummary struct {
-	Name              string            `json:"name"`
-	IsFIFO            bool              `json:"is_fifo"`
-	Generation        uint64            `json:"generation"`
-	CreatedAt         time.Time         `json:"created_at,omitempty"`
-	Attributes        map[string]string `json:"attributes,omitempty"`
-	Counters          QueueCounters     `json:"counters"`
-	CountersTruncated bool              `json:"counters_truncated,omitempty"`
+	Name       string            `json:"name"`
+	IsFIFO     bool              `json:"is_fifo"`
+	Generation uint64            `json:"generation"`
+	CreatedAt  time.Time         `json:"created_at,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+	Counters   QueueCounters     `json:"counters"`
 }
 
 // QueueCounters mirrors the three Approximate* counters AWS exposes
@@ -159,6 +158,14 @@ func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "list_failed",
 			"failed to list queues; see server logs")
 		return
+	}
+	// Force the empty-result case to render as `{"queues": []}` rather
+	// than `{"queues": null}` (Gemini medium on PR #670). The SPA
+	// iterates the array directly and would crash on null. AdminListQueues
+	// returns nil when no queues exist, so the normalisation has to
+	// happen here before encoding.
+	if names == nil {
+		names = []string{}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
