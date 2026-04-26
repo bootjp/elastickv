@@ -138,9 +138,9 @@ The choice of FNV-1a is deliberate: it is fast (no SIMD setup), has no key, and 
 
 ### 3.4 Cross-shard placement
 
-Partitions live in **separate Raft groups** when the queue's shard config maps each partition to a different group. The existing `kv/shard_router.go` plus the multi-shard configuration flags (`--raftSqsMap`) already support this — each `(queueName, partition)` pair becomes its own routing key.
+Partitions live in **separate Raft groups** when the queue's shard config maps each partition to a different group. The *router infrastructure* (`kv/shard_router.go`) already supports multi-group routing keyed by an arbitrary byte string today, and each `(queueName, partition)` pair becomes its own routing key — no router changes are needed. The *configuration surface*, however, requires a new flag: the partition-to-Raft-group assignment is declared via `--sqsFifoPartitionMap` (see §5), **not** via the existing `--raftSqsMap` (which maps `raftAddr=sqsAddr` for `proxyToLeader` endpoint resolution and is unchanged by this design). Conflating the two flags would parse partition assignments as endpoint pairs and route to the wrong leader; keeping them separate is the reason §5 introduces a dedicated flag rather than overloading the existing one.
 
-For deployments that don't want one Raft group per partition (e.g. a small cluster with limited shard capacity), partitions can co-locate on the same group. The choice is operator-driven via the shard config; it does not affect correctness, only throughput scaling.
+For deployments that don't want one Raft group per partition (e.g. a small cluster with limited shard capacity), partitions can co-locate on the same group. The choice is operator-driven via `--sqsFifoPartitionMap`; it does not affect correctness, only throughput scaling.
 
 ---
 
@@ -182,23 +182,33 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
    request's RequestId (or random when absent) so successive calls
    from the same consumer rotate which partition they hit first.
    This avoids head-of-line bias toward partition 0 under load.
-3. For each partitionIndex in partitionOrder, until MaxNumberOfMessages
-   are collected or every partition has been tried:
-     a. Resolve the leader for (queue, partitionIndex).
-     b. If this node is the leader: scan locally, deliver candidates.
-     c. Otherwise: forward the request to the leader-of-partition via
+3. Set deadline := start + WaitTimeSeconds (capped at the AWS-defined
+   maximum of 20s). All sub-calls share this deadline.
+4. For each partitionIndex in partitionOrder, until MaxNumberOfMessages
+   are collected, the deadline expires, or every partition has been
+   tried:
+     a. Compute remainingWait := max(0, deadline - now()). Pass it as
+        WaitTimeSeconds to the sub-call (so the per-partition long-poll
+        is bounded by the remaining global budget).
+     b. Resolve the leader for (queue, partitionIndex).
+     c. If this node is the leader: scan locally, deliver candidates,
+        long-polling for at most remainingWait.
+     d. Otherwise: forward the request to the leader-of-partition via
         the existing leader-proxy machinery (proxyToLeader, extended
         to accept a partition argument so the proxy target is the
         right shard, not just "the queue's leader"). The proxied call
         carries an `X-Elastickv-Receive-Partition: <k>` header so the
         downstream handler knows to skip its own partition fanout and
-        scan only partition k.
-4. Aggregate the per-partition results, cap at MaxNumberOfMessages.
+        scan only partition k. The remainingWait value is passed as
+        the proxied call's WaitTimeSeconds.
+5. Aggregate the per-partition results, cap at MaxNumberOfMessages.
 ```
 
 The point is that a consumer pinned to a single endpoint **must still see messages from every partition**, even partitions whose leader is elsewhere — otherwise the SDK's "ReceiveMessage returned nothing, sleep and retry" assumption silently leaks messages forever (Codex P1 + Gemini medium on PR #664). The cost is one extra hop per non-local-leader partition; for the common deployment where partitions are co-located on one Raft group, every partition's leader is the same node and there is no fanout. For deployments that spread partitions across nodes, the proxy fanout is exactly what AWS does internally — clients see uniform behaviour regardless of topology.
 
-The proxy fanout is bounded: `partitionOrder` short-circuits as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message touches at most 1 remote leader (the one for the first non-empty partition in their rotation order). A FIFO with no in-flight messages costs N proxy round-trips to confirm empty, but FIFO consumers are expected to use long-poll (`WaitTimeSeconds`), which extends each call's budget.
+The proxy fanout is bounded: `partitionOrder` short-circuits as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message touches at most 1 remote leader (the one for the first non-empty partition in their rotation order). A FIFO with no in-flight messages costs at most N proxy round-trips to confirm empty.
+
+**Why the shared deadline matters (Claude P1 on PR #664 fifth-round review).** Without step 3, a naive implementation would pass the *original* `WaitTimeSeconds` to every sub-call, so an empty queue with `WaitTimeSeconds = 20` and `PartitionCount = 8` would hold the connection for up to **160 s** before returning empty — well past any reasonable client or load-balancer idle timeout, and a behaviour shift the SDK does not expect. With the shared deadline, the total wall-clock wait is bounded by the original `WaitTimeSeconds`: each sub-call takes whatever budget remains, the long-poll can finish early on the first non-empty partition, and the response always comes back within the AWS-documented bound. (Alternative considered: probe all partitions in parallel with a shared cancellation context, returning on the first non-empty result. Rejected for the proof PR because it changes the per-partition polling order — long-polled partitions see traffic in `partitionOrder` rotation today, and parallel probing would erase that ordering. Sequential with a shared deadline is simpler, preserves rotation, and matches AWS's internal fanout semantics.)
 
 ### 4.3 PurgeQueue / DeleteQueue on a partitioned FIFO
 
@@ -262,7 +272,7 @@ This is out of scope here.
 
 ## 8. Failure Modes and Edge Cases
 
-1. **Proxy RTT under spread deployment**: ReceiveMessage on a queue whose partitions are spread across multiple Raft groups pays one extra round-trip per non-local-leader partition (§4.2 proxies them server-side, so a consumer pinned to one endpoint still sees every partition's messages — no false-empty failure). The cost is bounded: a request for `MaxNumberOfMessages = 1` short-circuits as soon as the first non-empty partition responds, so the *typical* extra hop count is one. The pathological case is a queue with N partitions where the consumer is asking "is anything here?" against an empty queue — that costs N proxy round-trips before returning empty. Mitigation: long-poll (`WaitTimeSeconds`) extends each call's budget so the cost amortises; latency-sensitive deployments can co-locate partitions on fewer Raft groups (at the cost of less throughput parallelism). A single-partition or co-located deployment pays nothing.
+1. **Proxy RTT under spread deployment**: ReceiveMessage on a queue whose partitions are spread across multiple Raft groups pays one extra round-trip per non-local-leader partition (§4.2 proxies them server-side, so a consumer pinned to one endpoint still sees every partition's messages — no false-empty failure). The cost is bounded: a request for `MaxNumberOfMessages = 1` short-circuits as soon as the first non-empty partition responds, so the *typical* extra hop count is one. The pathological case is a queue with N partitions where the consumer is asking "is anything here?" against an empty queue — that costs at most N proxy round-trips before returning empty, and the **wall-clock wait is bounded by the original `WaitTimeSeconds`** (§4.2 step 3: a shared deadline is threaded through the fanout). Mitigation: latency-sensitive deployments can co-locate partitions on fewer Raft groups (at the cost of less throughput parallelism); a single-partition or co-located deployment pays nothing.
 
 2. **Partition-leader churn**: a leader change on partition 3 causes that partition's ReceiveMessage to fail-over while partitions 0–2 and 4–7 keep serving. Existing `proxyToLeader` machinery handles the transition.
 
