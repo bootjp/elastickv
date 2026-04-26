@@ -433,7 +433,6 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 // still drop leadership inside deleteQueueWithRetry's Dispatch; the
 // resulting ErrLeaderNotFound / ErrNotLeader / wrapped suffixes must
 // classify as 503 leader_unavailable, not the generic 500 fallthrough.
-// Codex P2 + Claude P1 on PR #670 confirmed the original gap.
 func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 	cases := []struct {
 		name string

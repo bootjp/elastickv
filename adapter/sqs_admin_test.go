@@ -8,13 +8,13 @@ import (
 
 const testQueueArn = "arn:aws:sqs:us-east-1:000000000000:orders"
 
-// TestAdminQueueSummary_CreatedAtUsesMillisNotHLC pins the regression
-// from the fifth-round Claude review on PR #670: the admin
-// AdminDescribeQueue path was producing CreatedAt from
-// hlcToTime(meta.CreatedAtHLC), but sqsQueueMeta documents HLC as
-// "unsuitable for wall-clock display" and the SigV4 path
-// (sqs_catalog.go:942) reads CreatedAtMillis. Two failure modes the
-// test pins:
+// TestAdminQueueSummary_CreatedAtUsesMillisNotHLC pins the
+// invariant that the admin AdminDescribeQueue path derives
+// CreatedAt from sqsQueueMeta.CreatedAtMillis (the canonical
+// wall-clock field), not from hlcToTime(CreatedAtHLC) — the meta
+// struct documents HLC as "unsuitable for wall-clock display" and
+// the SigV4 path (sqs_catalog.go:942) reads CreatedAtMillis. Two
+// failure modes the test pins:
 //
 //  1. CreatedAtMillis == 0 must yield a zero time.Time so the JSON
 //     encoder's omitempty drops the field and the SPA renders "—"
@@ -58,14 +58,13 @@ func TestAdminQueueSummary_CreatedAtUsesMillisNotHLC(t *testing.T) {
 	})
 }
 
-// TestMetaAttributesForAdmin_IncludesQueueArnAndLastModified pins the
-// gap from the seventh-round Claude review on PR #670: the prior
-// metaAttributesForAdmin docstring claimed parity with
-// queueMetaToAttributes("All") but neither QueueArn nor
-// LastModifiedTimestamp was emitted. QueueArn is the AWS-shaped
-// identifier the SPA shows for change-tracking; LastModifiedTimestamp
-// is updated on SetQueueAttributes and is the only handle operators
-// have on "when did somebody last touch this queue's config".
+// TestMetaAttributesForAdmin_IncludesQueueArnAndLastModified pins
+// the parity contract between metaAttributesForAdmin and
+// queueMetaToAttributes("All"): QueueArn (the AWS-shaped identifier
+// the SPA shows for change-tracking) and LastModifiedTimestamp
+// (updated on SetQueueAttributes — the only handle operators have
+// on "when did somebody last touch this queue's config") must both
+// be present.
 func TestMetaAttributesForAdmin_IncludesQueueArnAndLastModified(t *testing.T) {
 	t.Parallel()
 
