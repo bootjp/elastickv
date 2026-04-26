@@ -185,6 +185,22 @@ func TestS3Handler_ListBuckets_StorageErrorReturns500(t *testing.T) {
 		"server-side error detail must not leak to the client")
 }
 
+// TestS3Handler_ListBuckets_ForbiddenReturns403 mirrors the
+// describe-side coverage for the slice 2 role gate. handleList now
+// maps ErrBucketsForbidden to 403 (Gemini medium on PR #658); this
+// test pins that behaviour so a future refactor that drops the
+// sentinel match does not silently downgrade the response to a
+// generic 500.
+func TestS3Handler_ListBuckets_ForbiddenReturns403(t *testing.T) {
+	src := &stubBucketsSource{listErr: ErrBucketsForbidden}
+	h := newS3HandlerForTest(src)
+	req := httptest.NewRequest(http.MethodGet, pathS3Buckets, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Contains(t, rec.Body.String(), "forbidden")
+}
+
 func TestS3Handler_ListBuckets_RejectsNonGet(t *testing.T) {
 	// POST/PUT/DELETE on /buckets are reserved for the next slice;
 	// for now the handler returns 405 so a SPA bug that calls them

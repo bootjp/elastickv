@@ -85,11 +85,15 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, pathPrefixS3Buckets):
 		name := strings.TrimPrefix(r.URL.Path, pathPrefixS3Buckets)
 		// /buckets/{name}/acl is reserved for the next slice. Reject
-		// it with 405 here so a SPA bug that calls PUT /acl on this
-		// build sees a sensible error instead of mistakenly hitting
-		// the describe path.
+		// any sub-path with 404 here so a SPA bug that calls PUT /acl
+		// on this build sees a sensible error instead of mistakenly
+		// hitting the describe path with a "{name}/acl" string. The
+		// pinned test is TestS3Handler_DescribeBucket_SubpathReturns404
+		// (CodeRabbit minor on PR #658 caught the previous comment
+		// referring to 405).
 		if strings.Contains(name, "/") {
-			writeJSONError(w, http.StatusNotFound, "not_found", "")
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"no admin S3 handler is registered for this path")
 			return
 		}
 		switch r.Method {
