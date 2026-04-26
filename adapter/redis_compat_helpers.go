@@ -319,16 +319,27 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 // seeks across every collection family before returning. The fast path:
 //
 //  1. Probe only the prefixes for `expected` (typically 2-3 seeks).
-//  2. On hit, apply the TTL filter and return `expected`.
+//  2. On hit, run the same string-priority guard the wide-column
+//     fast-path callers use (hashFieldFastLookup, zsetMemberFastScore,
+//     setMemberFastExists, hashFieldFastExists). When a redisStrKey
+//     row also exists at the same user key, fall back to the slow
+//     path so the rawKeyTypeAt "string wins" tiebreaker fires and
+//     the caller gets WRONGTYPE / nil instead of the
+//     collection-specific answer. The guard is the narrow form (see
+//     hasHigherPriorityStringEncoding's doc comment): only redisStrKey
+//     is checked, the rarer HLL / legacy-bare-key dual-encoding cases
+//     remain a known residual risk shared with the other fast-path
+//     callers.
 //  3. On miss, fall back to the full keyTypeAt slow path so that
-//     wrongType collisions (the key exists under a different type) still
-//     surface as the correct redisValueType.
+//     wrongType collisions (the key exists under a different type)
+//     still surface as the correct redisValueType.
 //
 // Steady-state production: most XADD/XREAD/HSET/etc. calls are on a key
 // of the expected type, so step 1 hits and the slow-path 19 seeks shrink
-// to 2-3. The slow path stays in place for first-write and wrongType
-// cases, which keep their existing semantics — wrongTypeError detection
-// is preserved by the fall-through.
+// to 2-3 (plus the priority-guard ExistsAt). The slow path stays in
+// place for first-write and wrongType cases, which keep their existing
+// semantics — wrongTypeError detection is preserved by the
+// fall-through.
 func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
 	if expected == redisTypeNone {
 		return r.keyTypeAt(ctx, key, readTS)
@@ -337,10 +348,19 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 	if err != nil {
 		return redisTypeNone, err
 	}
-	if found {
-		return r.applyTTLFilter(ctx, key, readTS, expected)
+	if !found {
+		return r.keyTypeAt(ctx, key, readTS)
 	}
-	return r.keyTypeAt(ctx, key, readTS)
+	if expected != redisTypeString {
+		higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS)
+		if hErr != nil {
+			return redisTypeNone, hErr
+		}
+		if higher {
+			return r.keyTypeAt(ctx, key, readTS)
+		}
+	}
+	return r.applyTTLFilter(ctx, key, readTS, expected)
 }
 
 // probeExpectedType issues only the prefix probes for the given type.

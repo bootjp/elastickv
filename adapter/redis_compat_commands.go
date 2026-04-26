@@ -2042,7 +2042,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeHash)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 		if err != nil {
 			return err
 		}
@@ -2669,7 +2669,7 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeHash)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -2941,7 +2941,7 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeHash)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}
@@ -3262,7 +3262,7 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3332,7 +3332,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 	if err != nil {
 		return 0, err
 	}
@@ -3542,7 +3542,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeZSet)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3590,7 +3590,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeZSet)
+		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
@@ -3627,7 +3627,7 @@ func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
 		if err != nil {
 			return err
 		}
