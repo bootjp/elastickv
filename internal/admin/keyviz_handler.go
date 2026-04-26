@@ -88,7 +88,9 @@ type KeyVizRow struct {
 //	from_unix_ms - lower bound in unix ms; 0 or omitted means unbounded
 //	               on that side (NOT the Unix epoch)
 //	to_unix_ms   - upper bound in unix ms; same 0 = unbounded contract
-//	rows         - row budget; 0 means no cap, capped at 1024 (default: 0)
+//	rows         - row budget; default and maximum is 1024 (design §4.1).
+//	               Omitted / 0 / negative all yield the cap; explicit
+//	               values above the cap are silently clamped down.
 //
 // Returns 503 codes.Unavailable when no sampler is configured so the
 // SPA can distinguish "keyviz disabled" from "no data yet" (the
@@ -166,7 +168,12 @@ type keyVizParams struct {
 }
 
 func parseKeyVizParams(r *http.Request) (keyVizParams, error) {
-	p := keyVizParams{series: keyVizDefaultSeries}
+	// rows defaults to the cap so a normal SPA poll without the
+	// query parameter still respects the budget — leaving it at the
+	// zero value would let applyKeyVizRowBudget fall through to "no
+	// cap" and return every tracked route in one payload (Codex
+	// round-3 P1 on PR #660).
+	p := keyVizParams{series: keyVizDefaultSeries, rows: keyVizRowBudgetCap}
 	q := r.URL.Query()
 	if err := setKeyVizSeriesParam(&p, q.Get("series")); err != nil {
 		return keyVizParams{}, err
@@ -209,13 +216,17 @@ func setKeyVizTimeParam(dst *time.Time, name, raw string) error {
 
 func setKeyVizRowsParam(dst *int, raw string) error {
 	if raw == "" {
+		// Caller pre-set dst to the default cap; preserve it.
 		return nil
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return errors.New("rows must be a non-negative integer")
+	if err != nil {
+		return errors.New("rows must be an integer")
 	}
-	if n > keyVizRowBudgetCap {
+	if n <= 0 || n > keyVizRowBudgetCap {
+		// Explicit 0 / negative / above-cap all collapse to the cap
+		// (same as omitting the param) so callers can't disable the
+		// budget by passing pathological values.
 		n = keyVizRowBudgetCap
 	}
 	*dst = n

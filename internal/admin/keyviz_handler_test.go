@@ -291,6 +291,69 @@ func TestKeyVizHandlerRowsBudgetTieBreakDeterministic(t *testing.T) {
 	}
 }
 
+// TestKeyVizHandlerOmittedRowsAppliesDefaultCap pins Codex round-3 P1
+// on PR #660: when the SPA polls without ?rows=, the handler must
+// still apply the keyVizRowBudgetCap default — leaving p.rows at
+// zero would let applyKeyVizRowBudget fall through to "no cap" and
+// return every tracked route in one payload.
+func TestKeyVizHandlerOmittedRowsAppliesDefaultCap(t *testing.T) {
+	t.Parallel()
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{At: time.Unix(1_700_000_000, 0), Rows: stagedRowsForBudgetTest()},
+	}})
+	defer srv.Close()
+
+	for _, query := range []string{"", "?rows=0", "?rows=-1"} {
+		resp := keyVizGet(t, srv.URL+query)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var matrix KeyVizMatrix
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+		require.NoError(t, resp.Body.Close())
+		require.Len(t, matrix.Rows, keyVizRowBudgetCap,
+			"omitted/0/negative rows must apply the default cap (query=%q)", query)
+	}
+}
+
+// TestKeyVizHandlerClampsRowsBudgetToCap pins the above-cap branch of
+// setKeyVizRowsParam: an explicit rows= value greater than
+// keyVizRowBudgetCap must be silently clamped down so callers cannot
+// bypass the resource guard by asking for more rows than the cap.
+func TestKeyVizHandlerClampsRowsBudgetToCap(t *testing.T) {
+	t.Parallel()
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{At: time.Unix(1_700_000_000, 0), Rows: stagedRowsForBudgetTest()},
+	}})
+	defer srv.Close()
+
+	resp := keyVizGet(t, srv.URL+"?rows=9999")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var matrix KeyVizMatrix
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+	require.NoError(t, resp.Body.Close())
+	require.Len(t, matrix.Rows, keyVizRowBudgetCap,
+		"rows=9999 must clamp down to keyVizRowBudgetCap")
+}
+
+// stagedRowsForBudgetTest builds keyVizRowBudgetCap+5 distinct rows so
+// any test that exercises the budget cap can confirm truncation
+// occurred. The loop counter is uint64 to avoid an int→uint64
+// conversion that would need a gosec suppression; Start / End encode
+// the index as a 2-byte big-endian key.
+func stagedRowsForBudgetTest() []keyviz.MatrixRow {
+	const total uint64 = keyVizRowBudgetCap + 5
+	rows := make([]keyviz.MatrixRow, total)
+	for i := uint64(0); i < total; i++ {
+		n := i + 1
+		rows[i] = keyviz.MatrixRow{
+			RouteID: n,
+			Start:   []byte{byte(i >> 8), byte(i)},
+			End:     []byte{byte(n >> 8), byte(n)},
+			Writes:  n,
+		}
+	}
+	return rows
+}
+
 // TestKeyVizHandlerTimeBoundsParam exercises the from_unix_ms /
 // to_unix_ms query parameters: a non-zero pair filters columns to the
 // requested half-open window, while 0 means "unbounded on that side"
