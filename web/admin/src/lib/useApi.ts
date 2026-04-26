@@ -44,8 +44,10 @@ export function useApiQuery<T>(
         setLoading(false);
       })
       .catch((err: unknown) => {
+        // The cleanup function (below) sets `cancelled = true` *before*
+        // calling `ctrl.abort()`, so any abort path is already covered
+        // by the `cancelled` check above. No second guard needed.
         if (cancelled) return;
-        if (ctrl.signal.aborted) return;
         if (err instanceof ApiError) {
           if (err.status === 401) markUnauthorizedRef.current();
           setError(err);
