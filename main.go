@@ -19,10 +19,12 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -124,6 +126,15 @@ var (
 	adminSessionSigningKeyPreviousFile = flag.String("adminSessionSigningKeyPreviousFile", "", "Path to a file containing the base64-encoded previous admin HS256 key used for rotation")
 	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
 	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
+
+	// Key visualizer sampler flags. The sampler runs entirely in-memory
+	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
+	// by default — opt in with --keyvizEnabled. The other flags are
+	// no-ops when the sampler is disabled.
+	keyvizEnabled                = flag.Bool("keyvizEnabled", false, "Enable the in-memory key visualizer sampler that feeds AdminServer.GetKeyVizMatrix")
+	keyvizStep                   = flag.Duration("keyvizStep", keyviz.DefaultStep, "Flush interval / matrix-column resolution for the keyviz sampler")
+	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
+	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 )
 
 const adminTokenMaxBytes = 4 << 10
@@ -278,16 +289,26 @@ func run() error {
 	cleanup.Add(cancel)
 	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
 	cleanup.Add(func() { lockResolver.Close() })
+	sampler := buildKeyVizSampler()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
-		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver())
+		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
+		WithSampler(keyVizSamplerForCoordinator(sampler))
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
 		return err
 	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(sampler, cfg.engine)
 	eg, runCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
+	startKeyVizFlusher(runCtx, eg, sampler)
 	startMemoryWatchdog(runCtx, eg, cancel)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
@@ -314,6 +335,7 @@ func run() error {
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
+		keyvizSampler: sampler,
 	}); err != nil {
 		return err
 	}
@@ -643,15 +665,55 @@ type serversInput struct {
 	readTracker      *kv.ActiveTimestampTracker
 	metricsRegistry  *monitoring.Registry
 	cfg              runtimeConfig
+	// keyvizSampler is the in-memory key visualizer sampler, or nil
+	// when --keyvizEnabled is false. Threaded into setupAdminService
+	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
+	// coordinator already has its own copy from
+	// `WithSampler(...)` higher up in run().
+	keyvizSampler *keyviz.MemSampler
 }
 
 // startServers wires up the AdminServer, builds the runtime runner, and
 // kicks off both the per-group raft listeners and the admin HTTP listener.
 // Extracted from run() to keep cyclomatic complexity within budget.
 func startServers(in serversInput) error {
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers)
+	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
 		return err
+	}
+	// roleStore + connCache are gated on *adminEnabled. With admin
+	// disabled, building either is wasted work AND a security
+	// regression risk: a non-empty -adminFullAccessKeys flag would
+	// otherwise still flip forwardDeps.readyForRegistration() to
+	// true, registering the leader-side gRPC AdminForward service
+	// and re-exposing the table-write surface a follower-direct
+	// admin call could reach (Codex P1, CodeRabbit Major on #648).
+	// The HTTP admin listener already short-circuits in
+	// startAdminFromFlags when *adminEnabled is false; the gRPC path
+	// must do the same.
+	var (
+		roleStore admin.RoleStore
+		connCache *kv.GRPCConnCache
+	)
+	if *adminEnabled {
+		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
+		// connCache is shared between the follower-side LeaderForwarder
+		// (built inside startAdminFromFlags) and any future bridge that
+		// dials the leader's gRPC ports. Keeping a single instance per
+		// process means the two paths re-use TLS / HTTP/2 connections
+		// rather than each maintaining a parallel pool. The shutdown
+		// goroutine drains the cache on context cancellation so the
+		// accumulated HTTP/2 connections are not leaked when the
+		// process exits gracefully (Claude review on #648).
+		connCache = &kv.GRPCConnCache{}
+		cache := connCache
+		in.eg.Go(func() error {
+			<-in.ctx.Done()
+			if err := cache.Close(); err != nil {
+				return errors.Wrap(err, "close admin gRPC connection cache")
+			}
+			return nil
+		})
 	}
 	runner := runtimeServerRunner{
 		ctx:             in.ctx,
@@ -684,11 +746,24 @@ func startServers(in serversInput) error {
 		pprofAddress:    *pprofAddr,
 		pprofToken:      *pprofToken,
 		metricsRegistry: in.metricsRegistry,
+		roleStore:       roleStore,
 	}
 	if err := runner.start(); err != nil {
 		return err
 	}
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes); err != nil {
+	// runner.start() populates runner.dynamoServer for the admin
+	// listener's SigV4-bypass entrypoints (see adapter/dynamodb_admin.go).
+	// Passing nil here would leave the admin dashboard with no
+	// access to table metadata; the admin handler answers
+	// /admin/api/v1/dynamo/* with 404 in that case.
+	//
+	// in.coordinate + connCache are forwarded so the admin HTTP
+	// dynamo handler can construct its production LeaderForwarder
+	// (Phase 3 of design 3.3): when the local node is a follower,
+	// the handler hands ErrTablesNotLeader writes to the forwarder
+	// which dials the leader over the cached gRPC pool. Without these
+	// the handler falls back to 503 + Retry-After:1.
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, in.coordinate, connCache); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -698,6 +773,7 @@ func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
+	keyvizSampler *keyviz.MemSampler,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -720,6 +796,13 @@ func setupAdminService(
 	}
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
+	}
+	// Only register a real sampler. Passing a typed-nil *MemSampler
+	// would store a non-nil interface and make GetKeyVizMatrix
+	// return a successful empty response instead of Unavailable —
+	// operators want the explicit "keyviz disabled" signal.
+	if keyvizSampler != nil {
+		srv.RegisterSampler(keyvizSampler)
 	}
 	if *adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
@@ -935,7 +1018,9 @@ func startRaftServers(
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
 	adminGRPCOpts adminGRPCInterceptors,
+	forwardDeps adminForwardServerDeps,
 ) error {
+	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
 	// options appended below. Sized as a constant so the magic-number
 	// linter does not complain.
@@ -965,6 +1050,7 @@ func startRaftServers(
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
 		}
+		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
 		reflection.Register(gs)
@@ -1037,10 +1123,10 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, error) {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
+		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
 	}
 	dynamoServer := adapter.NewDynamoDBServer(
 		dynamoL,
@@ -1067,7 +1153,7 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		}
 		return errors.WithStack(err)
 	})
-	return nil
+	return dynamoServer, nil
 }
 
 func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
@@ -1207,11 +1293,44 @@ type runtimeServerRunner struct {
 	pprofAddress    string
 	pprofToken      string
 	metricsRegistry *monitoring.Registry
+
+	// dynamoServer is populated by start() and made available to
+	// startAdminFromFlags in this package so the admin listener can
+	// call SigV4-bypass admin entrypoints (see
+	// adapter/dynamodb_admin.go) without going through HTTP. The
+	// field is unexported on purpose — it is package-private state,
+	// not a public API. Nil until start() reaches the dynamo step.
+	dynamoServer *adapter.DynamoDBServer
+
+	// roleStore is the access-key → role index the leader-side
+	// gRPC AdminForward service uses to re-validate the principal
+	// on every forwarded write. Mirrors what admin.Config.RoleIndex
+	// produces inside startAdminFromFlags; built up-front in
+	// startServers so registerAdminForwardServer in startRaftServers
+	// does not need to wait for the (later) admin-config parse.
+	// Nil when no admin access keys are configured.
+	roleStore admin.RoleStore
 }
 
-func (r runtimeServerRunner) start() error {
+func (r *runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	// startDynamoDBServer must run BEFORE startRaftServers so the
+	// resulting DynamoDBServer is available to the leader-side gRPC
+	// AdminForward registration in startRaftServers (design 3.3).
+	// Both servers listen on different addresses; the dynamo HTTP
+	// listener accepting traffic before raft TCP listeners are up
+	// is no different from the existing startup-race semantics — a
+	// hit in that window already returned 503 before this reorder.
+	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	if err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	r.dynamoServer = dynamoServer
+	forwardDeps := adminForwardServerDeps{
+		tables: newDynamoTablesSource(r.dynamoServer),
+		roles:  r.roleStore,
 	}
 	if err := startRaftServers(
 		r.ctx,
@@ -1227,10 +1346,8 @@ func (r runtimeServerRunner) start() error {
 		},
 		r.adminServer,
 		r.adminGRPCOpts,
+		forwardDeps,
 	); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	if err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
@@ -1246,4 +1363,60 @@ func (r runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	return nil
+}
+
+// buildKeyVizSampler constructs the in-memory keyviz sampler from
+// flag-supplied options, or returns nil when --keyvizEnabled is
+// false. The coordinator's WithSampler and AdminServer's
+// RegisterSampler both treat a nil receiver as "keyviz disabled," so
+// this is the single decision point.
+func buildKeyVizSampler() *keyviz.MemSampler {
+	if !*keyvizEnabled {
+		return nil
+	}
+	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:                   *keyvizStep,
+		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
+		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
+	})
+}
+
+// keyVizSamplerForCoordinator wraps a *MemSampler in the
+// keyviz.Sampler interface understood by ShardedCoordinator. A nil
+// sampler returns a typed-nil interface value, so the coordinator's
+// `if c.sampler == nil` guard fires and the dispatch hot path skips
+// Observe with a single branch.
+func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
+// seedKeyVizRoutes copies the engine's current route catalogue into
+// the sampler so the first matrix snapshots have non-empty metadata.
+// No-op when the sampler is disabled. The coordinator's
+// distribution.Engine handles route mutations after this point;
+// route-watch propagation into the sampler is a follow-up (the
+// design's Phase 3 persistence work).
+func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
+	if s == nil || engine == nil {
+		return
+	}
+	for _, r := range engine.Stats() {
+		s.RegisterRoute(r.RouteID, r.Start, r.End)
+	}
+}
+
+// startKeyVizFlusher launches RunFlusher in the supplied errgroup
+// and harvests the in-progress step with a final Flush after the
+// goroutine returns, so a graceful shutdown does not lose the most
+// recent partial column. Nil-safe: a disabled sampler reduces the
+// goroutine to ctx-wait + a no-op Flush.
+func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
+	eg.Go(func() error {
+		keyviz.RunFlusher(ctx, s, s.Step())
+		s.Flush()
+		return nil
+	})
 }

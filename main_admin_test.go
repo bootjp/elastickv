@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -196,7 +198,7 @@ func TestStartAdminServer_DisabledNoOp(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
-	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, nil, nil, "")
 	require.NoError(t, err)
 }
 
@@ -209,7 +211,7 @@ func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
 		listen:  "127.0.0.1:0",
 		// missing signing key
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
 	require.Error(t, err)
 }
 
@@ -222,7 +224,7 @@ func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
 		listen:            "0.0.0.0:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS")
 }
@@ -236,7 +238,7 @@ func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
 		listen:            "127.0.0.1:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cluster info source")
 }
@@ -259,7 +261,7 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n1", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, "test")
 	require.NoError(t, err)
 
 	// Poll /admin/healthz until success or the test deadline.
@@ -302,7 +304,7 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n-tls", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, "test")
 	require.NoError(t, err)
 
 	transport := &http.Transport{TLSClientConfig: &tls.Config{
@@ -362,4 +364,65 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 	require.NoError(t, pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}))
 	require.NoError(t, keyOut.Close())
 	return certPath, keyPath
+}
+
+// TestTranslateAdminTablesError_LeaderChurn verifies that the
+// bridge maps transient leader-churn errors from the kv coordinator
+// (which AdminCreateTable/AdminDeleteTable can return after their
+// initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
+// rather than the generic 500 fallthrough. Codex P2 on PR #634.
+func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+	}{
+		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
+		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
+		{"wrapped not leader", errors.New("dispatch failed: not leader")},
+		{"wrapped leader not found", errors.New("dispatch: leader not found")},
+		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
+		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := translateAdminTablesError(tc.in)
+			require.ErrorIs(t, out, admin.ErrTablesNotLeader,
+				"input %q must map to ErrTablesNotLeader", tc.in)
+		})
+	}
+}
+
+// TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
+// the false-positive class Codex P2 flagged: a message that
+// happens to contain a leader phrase NOT at the suffix must NOT
+// be classified as leader-churn. Switching from strings.Contains
+// to strings.HasSuffix is what makes this test pass.
+func TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
+	cases := []string{
+		// Phrase mid-message — kv-internal sentinels never look
+		// like this; they always end with the canonical phrase.
+		"not leader: actually a downstream error",
+		"leader not found, but recovered automatically",
+		"leadership lost mid-snapshot, retried successfully",
+	}
+	for _, msg := range cases {
+		t.Run(msg, func(t *testing.T) {
+			out := translateAdminTablesError(errors.New(msg))
+			require.NotErrorIs(t, out, admin.ErrTablesNotLeader,
+				"mid-message leader phrase %q must not classify as leader-churn", msg)
+		})
+	}
+}
+
+// TestTranslateAdminTablesError_UnrelatedErrorPassesThrough confirms
+// the leader-churn detector does not swallow unrelated errors that
+// happen to mention the word "leader" outside the canonical phrases.
+func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
+	in := errors.New("team leader misconfigured")
+	out := translateAdminTablesError(in)
+	// Falls through to default — same error returned, NOT
+	// ErrTablesNotLeader.
+	require.NotErrorIs(t, out, admin.ErrTablesNotLeader)
+	require.Equal(t, in, out)
 }
