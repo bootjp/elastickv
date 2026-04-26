@@ -23,11 +23,10 @@ import (
 )
 
 const (
-	redisPairWidth       = 2
-	redisTripletWidth    = 3
-	pubsubPatternArgMin  = 3
-	pubsubFirstChannel   = 2
-	redisBusyPollBackoff = 10 * time.Millisecond
+	redisPairWidth      = 2
+	redisTripletWidth   = 3
+	pubsubPatternArgMin = 3
+	pubsubFirstChannel  = 2
 	// redisBlockWaitFallback is the safety-net poll interval that fires
 	// in blocking-command wait loops (XREAD BLOCK, BZPOPMIN — and the
 	// future BLPOP / BRPOP / BLMOVE) when no in-process write signal

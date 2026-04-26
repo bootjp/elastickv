@@ -917,7 +917,7 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	// pre-fix this would happily run for the full 5 s after Close()
 	// because iterCtx was rooted in context.Background(). Post-fix the
 	// handlerCtx.Err() guard at the top of each loop iteration kicks
-	// in within ~one redisBusyPollBackoff (10 ms) and we reply null.
+	// in within ~one redisBlockWaitFallback (100 ms) and we reply null.
 	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: "stream-shutdown",
 		ID:     "1-0",
